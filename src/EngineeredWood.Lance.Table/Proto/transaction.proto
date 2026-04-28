@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Curt Hagenlocher. All rights reserved.
+//
+// Minimal subset of lance-rs's protos/transaction.proto sufficient to
+// extract the index metadata we care about (CreateIndex operation).
+// proto3 unknown-field preservation lets us skip the dozen+ other
+// operations (Append, Delete, Overwrite, Rewrite, Merge, etc.) without
+// needing their definitions — they'll round-trip through the
+// UnknownFieldSet during parse.
+//
+// The operation `oneof` field numbers must match the upstream proto
+// exactly (CreateIndex == 103) so the wire data dispatches correctly.
+
+syntax = "proto3";
+
+import "table.proto";
+
+package lance.table;
+
+option csharp_namespace = "EngineeredWood.Lance.Table.Proto";
+
+// A transaction representing changes to a dataset. Lance writes one of
+// these for every commit, both inline in the manifest file (when
+// transaction_section is set) and as a sibling file in
+// `_transactions/{read_version}-{uuid}.txn`.
+message Transaction {
+  // Version of the dataset this transaction was built from.
+  uint64 read_version = 1;
+
+  // UUID identifying this transaction.
+  string uuid = 2;
+
+  // Optional version tag.
+  string tag = 3;
+
+  // Operations on indices: this oneof field number (103) matches the
+  // upstream `operation.create_index` slot. Other operation fields
+  // (100 Append, 101 Delete, 102 Overwrite, 104 Rewrite, ...) are
+  // intentionally absent — proto3 deserialises them as unknown fields
+  // and ignores them.
+  oneof operation {
+    CreateIndex create_index = 103;
+  }
+}
+
+// Add or replace secondary indices on the dataset. Used both to add a
+// brand-new index (`removed_indices` empty) and to drop one
+// (`new_indices` empty, `removed_indices` populated).
+message CreateIndex {
+  repeated IndexMetadata new_indices = 1;
+  repeated IndexMetadata removed_indices = 2;
+}

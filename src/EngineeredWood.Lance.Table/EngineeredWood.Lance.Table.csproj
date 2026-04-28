@@ -41,6 +41,9 @@
     <Protobuf Include="Proto\table.proto"
               GrpcServices="None"
               AdditionalImportDirs="..\EngineeredWood.Lance\Proto" />
+    <Protobuf Include="Proto\transaction.proto"
+              GrpcServices="None"
+              AdditionalImportDirs="Proto;..\EngineeredWood.Lance\Proto" />
   </ItemGroup>
 
   <ItemGroup>

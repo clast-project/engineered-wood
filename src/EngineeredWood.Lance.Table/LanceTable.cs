@@ -78,6 +78,42 @@ public sealed class LanceTable : IAsyncDisposable
     /// <summary>The number of fragments in the dataset.</summary>
     public int NumberOfFragments => _manifest.Fragments.Count;
 
+    /// <summary>
+    /// Discovers the secondary indices currently active on this dataset by
+    /// walking transaction history. Returns one <see cref="Indices.IndexInfo"/>
+    /// per index, sorted by name. Empty if no indices have been created (or
+    /// if every index-creating transaction has been vacuumed).
+    /// </summary>
+    public ValueTask<IReadOnlyList<Indices.IndexInfo>> GetIndicesAsync(
+        CancellationToken cancellationToken = default)
+        => Indices.IndexCatalog.DiscoverAsync(_fs, _manifest, cancellationToken);
+
+    /// <summary>
+    /// Open a BTREE scalar index by name. Convenience wrapper that calls
+    /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
+    /// and opens it via <see cref="Indices.BTreeIndex.OpenAsync"/>.
+    /// </summary>
+    public async ValueTask<Indices.BTreeIndex> OpenBTreeIndexAsync(
+        string indexName, CancellationToken cancellationToken = default)
+    {
+        var infos = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
+        Indices.IndexInfo? match = null;
+        foreach (var info in infos)
+        {
+            if (string.Equals(info.Name, indexName, StringComparison.Ordinal))
+            {
+                match = info;
+                break;
+            }
+        }
+        if (match is null)
+            throw new ArgumentException(
+                $"Index '{indexName}' was not found on this dataset. " +
+                $"Available: [{string.Join(", ", infos.Select(i => i.Name))}].");
+        return await Indices.BTreeIndex.OpenAsync(_fs, match.DirectoryPath, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Optional version tag attached at write time.</summary>
     public string? Tag => string.IsNullOrEmpty(_manifest.Tag) ? null : _manifest.Tag;
 

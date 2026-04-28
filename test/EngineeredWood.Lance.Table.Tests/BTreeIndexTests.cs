@@ -72,4 +72,45 @@ public class BTreeIndexTests
         await using var idx = await BTreeIndex.OpenAsync(FindIndexDir());
         Assert.IsType<Apache.Arrow.Types.Int32Type>(idx.ValueType);
     }
+
+    [Fact]
+    public async Task LanceTable_GetIndices_FindsBTreeIndex()
+    {
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        var indices = await table.GetIndicesAsync();
+        Assert.Single(indices);
+        var info = indices[0];
+        Assert.Equal("x_idx", info.Name);             // pylance default name = "{column}_idx"
+        Assert.Equal(new[] { "x" }, info.ColumnNames);
+        Assert.Equal(new uint[] { 0, 1, 2 }, info.FragmentIds);
+        Assert.Contains("BTreeIndexDetails", info.TypeUrl);
+        Assert.Equal($"_indices/{info.Uuid:D}", info.DirectoryPath);
+    }
+
+    [Fact]
+    public async Task LanceTable_OpenBTreeIndex_ByName()
+    {
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        await using var idx = await table.OpenBTreeIndexAsync("x_idx");
+        var hits = await idx.QueryEqualAsync(300);
+        Assert.Single(hits);
+        Assert.Equal(2u, hits[0].FragmentId);
+        Assert.Equal(2u, hits[0].RowOffset);
+    }
+
+    [Fact]
+    public async Task LanceTable_OpenBTreeIndex_UnknownNameThrows()
+    {
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.OpenBTreeIndexAsync("nonexistent_idx"));
+    }
+
+    [Fact]
+    public async Task LanceTable_GetIndices_NoIndicesReturnsEmpty()
+    {
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("simple_v21"));
+        var indices = await table.GetIndicesAsync();
+        Assert.Empty(indices);
+    }
 }
