@@ -239,6 +239,44 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # struct-of-struct, v2.1. Three layers per leaf: [item, inner_struct,
+    # outer_struct]. Both outer and inner struct can be null (cascades).
+    nested_struct_type = pa.struct([
+        ("inner", pa.struct([("a", pa.int32()), ("b", pa.int32())])),
+    ])
+    write_one("struct_of_struct_v21",
+              pa.table({"s": pa.array(
+                  [{"inner": {"a": 17, "b": 113}},
+                   {"inner": {"a": 29, "b": 227}},
+                   {"inner": {"a": 41, "b": 313}}],
+                  type=nested_struct_type)}),
+              version="2.1")
+    # Use varied / prime-spaced values so pylance picks Flat instead of Rle
+    # for the value compression. Keep the structure: row 1 has inner null,
+    # row 3 has outer struct null, plus a few all-valid rows.
+    write_one("struct_of_struct_nullable_v21",
+              pa.table({"s": pa.array(
+                  [{"inner": {"a": 17, "b": 113}},
+                   {"inner": None},                           # inner null
+                   None,                                       # outer null
+                   {"inner": {"a": 41, "b": 313}},
+                   {"inner": {"a": 53, "b": 419}},
+                   {"inner": {"a": 67, "b": 521}}],
+                  type=nested_struct_type)}),
+              version="2.1")
+
+    # struct-of-list, v2.1. Three layers per leaf: [item, list, outer_struct].
+    struct_of_list_type = pa.struct([("xs", pa.list_(pa.int32()))])
+    write_one("struct_of_list_v21",
+              pa.table({"s": pa.array(
+                  [{"xs": [1, 2, 3]},
+                   {"xs": []},
+                   {"xs": [4, 5]},
+                   None,                  # outer struct null
+                   {"xs": None}],         # outer struct valid, inner list null
+                  type=struct_of_list_type)}),
+              version="2.1")
+
     # Inner-only nullable: outer struct non-nullable in the Arrow schema,
     # one child non-nullable, the other nullable. Forces pylance to pick
     # different RepDefLayer combinations for siblings sharing the same

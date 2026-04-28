@@ -426,6 +426,103 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task StructOfStruct_NoNulls()
+    {
+        // struct<inner: struct<a: int32, b: int32>>. Three rows, all valid.
+        // Layers `[ALL_VALID, ALL_VALID, ALL_VALID]`, no def buffer — every
+        // row consumes a slot per leaf.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_of_struct_v21.lance"));
+        var outer = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(3, outer.Length);
+        Assert.Equal(0, outer.NullCount);
+        var inner = (Apache.Arrow.StructArray)outer.Fields[0];
+        Assert.Equal(3, inner.Length);
+        Assert.Equal(0, inner.NullCount);
+        var a = (Int32Array)inner.Fields[0];
+        var b = (Int32Array)inner.Fields[1];
+        Assert.Equal(new int?[] { 17, 29, 41 }, a.ToArray());
+        Assert.Equal(new int?[] { 113, 227, 313 }, b.ToArray());
+    }
+
+    [Fact]
+    public async Task StructOfStruct_NullableCascades()
+    {
+        // Six rows mixing all-valid, inner-null, and outer-null:
+        //   [{inner:{a:17,b:113}}, {inner:None}, None, {inner:{a:41,b:313}},
+        //    {inner:{a:53,b:419}}, {inner:{a:67,b:521}}]
+        // Layers all `NULLABLE_ITEM`; def values 0=valid, 2=inner-null,
+        // 3=outer-null. Every row gets a value slot (placeholder 0 for
+        // inner-null and outer-null), unlike list-bearing shapes.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_of_struct_nullable_v21.lance"));
+        var outer = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(6, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.False(outer.IsNull(0));
+        Assert.False(outer.IsNull(1));
+        Assert.True(outer.IsNull(2));   // outer-null row
+        Assert.False(outer.IsNull(3));
+
+        var inner = (Apache.Arrow.StructArray)outer.Fields[0];
+        Assert.Equal(6, inner.Length);
+        Assert.Equal(2, inner.NullCount);  // inner-null + outer-null cascade
+        Assert.False(inner.IsNull(0));
+        Assert.True(inner.IsNull(1));      // inner-null
+        Assert.True(inner.IsNull(2));      // cascaded from outer-null
+        Assert.False(inner.IsNull(3));
+
+        var a = (Int32Array)inner.Fields[0];
+        var b = (Int32Array)inner.Fields[1];
+        Assert.Equal(2, a.NullCount);
+        Assert.Equal(17, a.GetValue(0));
+        Assert.Null(a.GetValue(1));
+        Assert.Null(a.GetValue(2));
+        Assert.Equal(41, a.GetValue(3));
+        Assert.Equal(53, a.GetValue(4));
+        Assert.Equal(67, a.GetValue(5));
+        Assert.Equal(113, b.GetValue(0));
+        Assert.Null(b.GetValue(1));
+        Assert.Null(b.GetValue(2));
+        Assert.Equal(521, b.GetValue(5));
+    }
+
+    [Fact]
+    public async Task StructOfList_MixedNullsAndEmpties()
+    {
+        // struct<xs: list<int32>>. Five rows:
+        //   [{xs:[1,2,3]}, {xs:[]}, {xs:[4,5]}, None, {xs:None}]
+        // Layers `[ALL_VALID_ITEM, NULL_AND_EMPTY_LIST, NULLABLE_ITEM]`.
+        // def slots: 1=list-null, 2=list-empty, 3=outer-null. All three
+        // skip value slots; only def=0 produces a visible item.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_of_list_v21.lance"));
+        var outer = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(5, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(3));   // outer-null row
+        Assert.False(outer.IsNull(0));
+        Assert.False(outer.IsNull(4));
+
+        var list = (ListArray)outer.Fields[0];
+        Assert.Equal(5, list.Length);
+        // List null at row 3 (cascaded from outer) and row 4 (genuine list-null).
+        Assert.Equal(2, list.NullCount);
+        Assert.True(list.IsNull(3));
+        Assert.True(list.IsNull(4));
+        Assert.False(list.IsNull(1));   // empty list, valid
+
+        Assert.Equal(0, list.ValueOffsets[0]);
+        Assert.Equal(3, list.ValueOffsets[1]);
+        Assert.Equal(3, list.ValueOffsets[2]);  // empty list spans nothing
+        Assert.Equal(5, list.ValueOffsets[3]);
+        Assert.Equal(5, list.ValueOffsets[4]);  // outer-null spans nothing
+        Assert.Equal(5, list.ValueOffsets[5]);  // list-null spans nothing
+
+        var values = (Int32Array)list.Values;
+        Assert.Equal(5, values.Length);
+        Assert.Equal(0, values.NullCount);
+        Assert.Equal(new int?[] { 1, 2, 3, 4, 5 }, values.ToArray());
+    }
+
+    [Fact]
     public async Task FullZip_BigFsl_Float32_x4096()
     {
         // 5 rows × 4096 float32 = 80 KiB total, 16 KiB per row → FullZipLayout.
