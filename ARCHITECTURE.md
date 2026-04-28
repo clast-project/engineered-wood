@@ -40,6 +40,15 @@ src/
     Container/                          OCF read/write (sync + async)
     Data/                               RecordBatch assembly/encoding
     Encoding/                           AvroBinaryReader/Writer (ref struct)
+  EngineeredWood.Lance/                 Lance reader (v2.0 + v2.1, read-only)
+    Proto/                              file.proto, file2.proto, encodings_v2_0.proto,
+                                          encodings_v2_1.proto (verbatim from lance-format/lance)
+    Format/                             LanceFooter, OffsetSizeEntry, LanceVersion,
+                                          FieldColumnRange (field→column mapping)
+    Schema/                             LanceSchemaConverter (logical_type → Arrow)
+    Encodings/V20/                      Per-encoding decoders for v2.0 ArrayEncoding
+    Encodings/V21/                      MiniBlockLayout / FullZipLayout / PageLayout
+                                          dispatcher and CompressiveEncoding decoders
   EngineeredWood.DeltaLake/             Delta transaction log (low-level)
     Actions/                            AddFile, RemoveFile, MetadataAction, Protocol, etc.
     Log/                                NDJSON commit read/write, log compaction, in-commit timestamps
@@ -68,6 +77,9 @@ test/
   EngineeredWood.Orc.Benchmarks/            BenchmarkDotNet suites for ORC
   EngineeredWood.Avro.Tests/                xUnit tests for Avro
   EngineeredWood.Avro.Benchmarks/           BenchmarkDotNet suites for Avro
+  EngineeredWood.Lance.Tests/               xUnit tests for Lance, including a
+                                              compatibility sweep over committed
+                                              pylance-produced .lance files
   EngineeredWood.DeltaLake.Tests/           xUnit tests for the Delta log layer
   EngineeredWood.DeltaLake.Table.Tests/     xUnit tests for the Delta table API
   EngineeredWood.DeltaLake.Benchmarks/      BenchmarkDotNet suites for Delta Lake

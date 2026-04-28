@@ -7,10 +7,10 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
 
-namespace EngineeredWood.Parquet.Data;
+namespace EngineeredWood.Encodings;
 
 /// <summary>
-/// Decodes BYTE_STREAM_SPLIT encoded values.
+/// Decodes BYTE_STREAM_SPLIT encoded values — used by both Parquet and Lance.
 /// </summary>
 /// <remarks>
 /// The encoding splits each value's bytes across interleaved streams for better compression.
@@ -99,31 +99,25 @@ internal static class ByteStreamSplitDecoder
 
         for (; i < aligned; i += vecLen)
         {
-            // Load 32 bytes from each stream
             var v0 = Vector256.LoadUnsafe(ref src, (nuint)(s0 + i));
             var v1 = Vector256.LoadUnsafe(ref src, (nuint)(s1 + i));
             var v2 = Vector256.LoadUnsafe(ref src, (nuint)(s2 + i));
             var v3 = Vector256.LoadUnsafe(ref src, (nuint)(s3 + i));
 
-            // Interleave: [b0_0,b1_0,b2_0,b3_0, b0_1,b1_1,b2_1,b3_1, ...]
-            var lo01 = Avx2.UnpackLow(v0, v1);   // interleave low bytes of stream 0,1
-            var hi01 = Avx2.UnpackHigh(v0, v1);   // interleave high bytes of stream 0,1
+            var lo01 = Avx2.UnpackLow(v0, v1);
+            var hi01 = Avx2.UnpackHigh(v0, v1);
             var lo23 = Avx2.UnpackLow(v2, v3);
             var hi23 = Avx2.UnpackHigh(v2, v3);
 
-            // Now combine pairs: interleave 16-bit elements
             var a = Avx2.UnpackLow(lo01.AsInt16(), lo23.AsInt16()).AsByte();
             var b = Avx2.UnpackHigh(lo01.AsInt16(), lo23.AsInt16()).AsByte();
             var c = Avx2.UnpackLow(hi01.AsInt16(), hi23.AsInt16()).AsByte();
             var d = Avx2.UnpackHigh(hi01.AsInt16(), hi23.AsInt16()).AsByte();
 
-            // AVX2 unpack works within 128-bit lanes, so we need to fix lane ordering.
-            // Each 256-bit result has: [lane0_lo, lane1_lo] but we need sequential output.
-            // Permute to get final sequential order.
-            var r0 = Avx2.Permute2x128(a, b, 0x20); // vals 0-7
-            var r1 = Avx2.Permute2x128(c, d, 0x20); // vals 8-15
-            var r2 = Avx2.Permute2x128(a, b, 0x31); // vals 16-23
-            var r3 = Avx2.Permute2x128(c, d, 0x31); // vals 24-31
+            var r0 = Avx2.Permute2x128(a, b, 0x20);
+            var r1 = Avx2.Permute2x128(c, d, 0x20);
+            var r2 = Avx2.Permute2x128(a, b, 0x31);
+            var r3 = Avx2.Permute2x128(c, d, 0x31);
 
             int outOff = i * width;
             r0.StoreUnsafe(ref dst, (nuint)outOff);
@@ -132,7 +126,6 @@ internal static class ByteStreamSplitDecoder
             r3.StoreUnsafe(ref dst, (nuint)(outOff + 96));
         }
 
-        // Scalar tail
         for (; i < count; i++)
         {
             int off = i * width;
@@ -164,7 +157,6 @@ internal static class ByteStreamSplitDecoder
 
         for (; i < aligned; i += vecLen)
         {
-            // Load 32 bytes from each of the 8 streams
             var v0 = Vector256.LoadUnsafe(ref src, (nuint)(streamOffsets[0] + i));
             var v1 = Vector256.LoadUnsafe(ref src, (nuint)(streamOffsets[1] + i));
             var v2 = Vector256.LoadUnsafe(ref src, (nuint)(streamOffsets[2] + i));
@@ -174,7 +166,6 @@ internal static class ByteStreamSplitDecoder
             var v6 = Vector256.LoadUnsafe(ref src, (nuint)(streamOffsets[6] + i));
             var v7 = Vector256.LoadUnsafe(ref src, (nuint)(streamOffsets[7] + i));
 
-            // Level 1: interleave bytes → 16-bit pairs
             var lo01 = Avx2.UnpackLow(v0, v1);
             var hi01 = Avx2.UnpackHigh(v0, v1);
             var lo23 = Avx2.UnpackLow(v2, v3);
@@ -184,7 +175,6 @@ internal static class ByteStreamSplitDecoder
             var lo67 = Avx2.UnpackLow(v6, v7);
             var hi67 = Avx2.UnpackHigh(v6, v7);
 
-            // Level 2: interleave 16-bit → 32-bit quads
             var a0 = Avx2.UnpackLow(lo01.AsInt16(), lo23.AsInt16()).AsByte();
             var a1 = Avx2.UnpackHigh(lo01.AsInt16(), lo23.AsInt16()).AsByte();
             var a2 = Avx2.UnpackLow(hi01.AsInt16(), hi23.AsInt16()).AsByte();
@@ -194,7 +184,6 @@ internal static class ByteStreamSplitDecoder
             var b2 = Avx2.UnpackLow(hi45.AsInt16(), hi67.AsInt16()).AsByte();
             var b3 = Avx2.UnpackHigh(hi45.AsInt16(), hi67.AsInt16()).AsByte();
 
-            // Level 3: interleave 32-bit → 64-bit octets
             var c0 = Avx2.UnpackLow(a0.AsInt32(), b0.AsInt32()).AsByte();
             var c1 = Avx2.UnpackHigh(a0.AsInt32(), b0.AsInt32()).AsByte();
             var c2 = Avx2.UnpackLow(a1.AsInt32(), b1.AsInt32()).AsByte();
@@ -204,19 +193,14 @@ internal static class ByteStreamSplitDecoder
             var c6 = Avx2.UnpackLow(a3.AsInt32(), b3.AsInt32()).AsByte();
             var c7 = Avx2.UnpackHigh(a3.AsInt32(), b3.AsInt32()).AsByte();
 
-            // Fix AVX2 lane ordering with Permute2x128
-            // c0 lanes: vals 0-1, vals 16-17; c1 lanes: vals 2-3, vals 18-19
-            // c2 lanes: vals 4-5, vals 20-21; c3 lanes: vals 6-7, vals 22-23
-            // c4 lanes: vals 8-9, vals 24-25; c5 lanes: vals 10-11, vals 26-27
-            // c6 lanes: vals 12-13, vals 28-29; c7 lanes: vals 14-15, vals 30-31
-            var r0 = Avx2.Permute2x128(c0, c1, 0x20); // vals 0-3
-            var r1 = Avx2.Permute2x128(c2, c3, 0x20); // vals 4-7
-            var r2 = Avx2.Permute2x128(c4, c5, 0x20); // vals 8-11
-            var r3 = Avx2.Permute2x128(c6, c7, 0x20); // vals 12-15
-            var r4 = Avx2.Permute2x128(c0, c1, 0x31); // vals 16-19
-            var r5 = Avx2.Permute2x128(c2, c3, 0x31); // vals 20-23
-            var r6 = Avx2.Permute2x128(c4, c5, 0x31); // vals 24-27
-            var r7 = Avx2.Permute2x128(c6, c7, 0x31); // vals 28-31
+            var r0 = Avx2.Permute2x128(c0, c1, 0x20);
+            var r1 = Avx2.Permute2x128(c2, c3, 0x20);
+            var r2 = Avx2.Permute2x128(c4, c5, 0x20);
+            var r3 = Avx2.Permute2x128(c6, c7, 0x20);
+            var r4 = Avx2.Permute2x128(c0, c1, 0x31);
+            var r5 = Avx2.Permute2x128(c2, c3, 0x31);
+            var r6 = Avx2.Permute2x128(c4, c5, 0x31);
+            var r7 = Avx2.Permute2x128(c6, c7, 0x31);
 
             int outOff = i * width;
             r0.StoreUnsafe(ref dst, (nuint)outOff);
@@ -229,7 +213,6 @@ internal static class ByteStreamSplitDecoder
             r7.StoreUnsafe(ref dst, (nuint)(outOff + 224));
         }
 
-        // Scalar tail
         for (; i < count; i++)
         {
             int off = i * width;
@@ -239,6 +222,9 @@ internal static class ByteStreamSplitDecoder
     }
 #endif
 
+    /// <summary>
+    /// Scalar fallback and the only path for arbitrary type widths.
+    /// </summary>
     private static void Unsplit(ReadOnlySpan<byte> data, Span<byte> destination, int count, int width)
     {
         for (int stream = 0; stream < width; stream++)

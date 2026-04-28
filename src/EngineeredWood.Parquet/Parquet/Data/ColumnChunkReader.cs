@@ -6,6 +6,7 @@ using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Compression;
+using EngineeredWood.Encodings;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 

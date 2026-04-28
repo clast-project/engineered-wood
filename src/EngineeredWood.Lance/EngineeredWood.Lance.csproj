@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net8.0;netstandard2.0</TargetFrameworks>
+    <LangVersion>preview</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\EngineeredWood.Core\EngineeredWood.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="22.1.0" />
+    <PackageReference Include="Clast.FastLanes" Version="*" />
+    <PackageReference Include="Clast.Fsst" Version="0.1.2" />
+    <PackageReference Include="Google.Protobuf" Version="3.*" />
+    <PackageReference Include="Grpc.Tools" Version="2.*">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="PolySharp" Version="1.15.0">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Memory" Version="4.6.3" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Proto\file.proto" GrpcServices="None" />
+    <Protobuf Include="Proto\file2.proto" GrpcServices="None" />
+    <Protobuf Include="Proto\encodings_v2_0.proto" GrpcServices="None" />
+    <Protobuf Include="Proto\encodings_v2_1.proto" GrpcServices="None" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EngineeredWood.Lance.Table" />
+    <InternalsVisibleTo Include="EngineeredWood.Lance.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.Lance.Benchmarks" />
+  </ItemGroup>
+
+</Project>

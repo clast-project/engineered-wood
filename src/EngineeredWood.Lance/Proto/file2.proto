@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+//
+// Source: https://github.com/lance-format/lance/blob/main/protos/file2.proto
+// Only the csharp_namespace option has been added to the original.
+
+syntax = "proto3";
+
+package lance.file.v2;
+
+import "google/protobuf/empty.proto";
+
+option csharp_namespace = "EngineeredWood.Lance.Proto.V2";
+
+// # Lance v2.X File Format
+//
+// See the original file.proto comment block for the full file-layout
+// description. This file defines only the metadata envelope used by
+// v2.x (ColumnMetadata, Page, Encoding).
+
+// The deferred encoding is used to place the encoding itself in a different
+// part of the file.
+message DeferredEncoding {
+   // Location of the buffer containing the encoding.
+   uint64 buffer_location = 1;
+   uint64 buffer_length = 2;
+}
+
+// The encoding is placed directly in the metadata section
+message DirectEncoding {
+    // The bytes that make up the encoding embedded directly in the metadata
+    bytes encoding = 1;
+}
+
+// An encoding stores the information needed to decode a column or page.
+message Encoding {
+    oneof location {
+        // The encoding is stored elsewhere and not part of this protobuf message
+        DeferredEncoding indirect = 1;
+        // The encoding is stored within this protobuf message
+        DirectEncoding direct = 2;
+        // There is no encoding information
+        google.protobuf.Empty none = 3;
+    }
+}
+
+// Each column has a metadata block that is placed at the end of the file.
+message ColumnMetadata {
+
+  // This describes a page of column data.
+  message Page {
+    // The file offsets for each of the page buffers
+    repeated uint64 buffer_offsets = 1;
+    // The size (in bytes) of each of the page buffers
+    repeated uint64 buffer_sizes = 2;
+    // Logical length (e.g. # rows) of the page
+    uint64 length = 3;
+    // The encoding used to encode the page
+    Encoding encoding = 4;
+    // The priority of the page.
+    //
+    // For tabular data this will be the top-level row number of the first row
+    // in the page (and top-level rows should not split across pages).
+    uint64 priority = 5;
+  }
+  // Encoding information about the column itself.
+  Encoding encoding = 1;
+  // The pages in the column
+  repeated Page pages = 2;
+  // The file offsets of each of the column metadata buffers
+  repeated uint64 buffer_offsets = 3;
+  // The size (in bytes) of each of the column metadata buffers
+  repeated uint64 buffer_sizes = 4;
+}

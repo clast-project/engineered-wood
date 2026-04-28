@@ -1,10 +1,10 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro** — and table formats — **Delta Lake** and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
+A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, and **Lance** (read-only) — and table formats — **Delta Lake** and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
 ## Highlights
 
-- **Five formats, one Arrow surface.** Parquet, ORC, and Avro readers and writers all speak `Apache.Arrow.RecordBatch`, and Delta Lake and Iceberg sit on top of them.
+- **Six formats, one Arrow surface.** Parquet, ORC, and Avro readers and writers, plus a Lance reader, all speak `Apache.Arrow.RecordBatch`; Delta Lake and Iceberg sit on top of them.
 - **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, and scan planning in Iceberg from the same tree.
 - **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files or Azure Blob Storage.
@@ -29,6 +29,7 @@ src/
   EngineeredWood.Parquet/                Parquet reader and writer
   EngineeredWood.Orc/                    ORC reader and writer
   EngineeredWood.Avro/                   Avro reader and writer
+  EngineeredWood.Lance/                  Lance reader (v2.0 + v2.1)
   EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
   EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
   EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
@@ -155,6 +156,81 @@ All 19 ORC types are supported for both reading and writing:
 | snappy (with CRC32C) | yes | yes |
 | zstandard | yes | yes |
 | lz4 | yes | yes |
+
+## Features — Lance
+
+`EngineeredWood.Lance` is a clean-room reader for the
+[Lance](https://lance.org/format/) columnar file format. Reads only —
+writer support is gated on a multipart-upload abstraction we haven't
+designed yet. Implementation is driven by the protobufs and Rust source
+of [`lance-format/lance`](https://github.com/lance-format/lance) plus
+cross-validation against [pylance](https://pypi.org/project/pylance/)-
+produced files.
+
+### Versions
+
+- **v2.0** (footer bytes `(0, 3)` — pylance's default — and `(2, 0)`)
+- **v2.1** (footer bytes `(2, 1)` — pylance ≥ 0.38 default for new writes)
+
+v0.1 and v2.2 are rejected with explicit errors.
+
+### Reading
+
+- Public `LanceFileReader.OpenAsync(path)` parses the footer, GBO/CMO
+  tables, `FileDescriptor`, and per-column metadata.
+- `ReadColumnAsync(int fieldIndex)` returns the N-th top-level Arrow
+  field as an `IArrowArray`. For nested fields it reads every physical
+  column needed and assembles a single nested array.
+- Optimistic 64 KiB tail read brings the footer + metadata + global
+  buffer 0 in one I/O on cloud storage.
+
+### v2.0 encoding coverage
+
+| Encoding | Status |
+|---|---|
+| `Flat` | yes |
+| `Nullable` (NoNull / SomeNull / AllNull) | yes |
+| `Binary` (variable strings/binary, with `null_adjustment` nulls) | yes |
+| `Constant` | yes |
+| `FixedSizeBinary` | yes |
+| `Bitpacked` (simple LSB, signed/unsigned) | yes |
+| `Dictionary` (1-based indices with 0 = null) | yes |
+| `BitpackedForNonNeg` (Fastlanes, via `Clast.FastLanes`) | yes |
+| `FixedSizeList` | yes |
+| `SimpleStruct` (multi-column shred — no struct-level nulls per the v2.0 proto) | yes |
+| `List` / `LargeList` (with `null_offset_adjustment`) | yes |
+| `PackedStruct`, `Fsst`, miniblock-only encodings (`Rle`, `InlineBitpacking`, `OutOfLineBitpacking`, `GeneralMiniBlock`, `ByteStreamSplit`, `Block`) | not yet |
+
+### v2.1 encoding coverage
+
+| Layout / Encoding | Status |
+|---|---|
+| `MiniBlockLayout` with `Flat` values, primitive leaves, single layer (`ALL_VALID_ITEM` / `NULLABLE_ITEM`) | yes |
+| `MiniBlockLayout` with `Variable` (strings/binary, u32 offsets) | yes |
+| `MiniBlockLayout` with `InlineBitpacking` (Fastlanes per-chunk widths) | yes |
+| Single-column `ListType<primitive>` with rep/def (`ALL_VALID_LIST` / `NULLABLE_LIST` / `EMPTYABLE_LIST`) | yes |
+| `FullZipLayout` fixed-width with `Flat` or `FixedSizeList(Flat)` | yes |
+| `FullZipLayout` variable-width (`bits_per_offset` + `General`/ZSTD) | not yet |
+| `FullZipLayout` with rep/def | not yet |
+| `ConstantLayout` | not yet |
+| `BlobLayout` (two-level external blob storage) | not yet |
+| `OutOfLineBitpacking`, `Fsst`, v2.1 `Dictionary`/`Rle`/`ByteStreamSplit`/`General`/`PackedStruct` | not yet |
+| Multi-leaf structs, list-of-struct, deep nesting, multi-chunk Variable/list, `LargeListType`, repetition index | not yet |
+
+### Storage abstraction
+
+Reuses the existing offset-based `IRandomAccessFile` — Lance's reader
+needs `size()` + `get_range()` + coalesced `get_ranges()`, all of which
+the Core API already provides. Priority-aware scheduling and HTTP
+multi-range requests are perf optimizations not currently implemented.
+
+### Bit-packing dependency
+
+Lance's v2.0 `BitpackedForNonNeg` and v2.1 `InlineBitpacking` use the
+fastlanes 1024-element packing format. `EngineeredWood.Lance` consumes
+the [`Clast.FastLanes`](https://www.nuget.org/packages/Clast.FastLanes/)
+NuGet package (zero Lance/Arrow dependencies; bit-for-bit compatible
+with the Rust `lance_bitpacking` crate).
 
 ## Features — Delta Lake
 

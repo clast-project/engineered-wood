@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
+using EngineeredWood.Encodings;
 using EngineeredWood.Parquet.Data;
 
 namespace EngineeredWood.Benchmarks;
