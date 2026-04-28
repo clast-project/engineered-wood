@@ -102,14 +102,24 @@ internal static class MiniBlockLayoutDecoder
             generalZstd = true;
         }
 
-        if (targetType is Apache.Arrow.Types.ListType listType)
+        if (targetType is Apache.Arrow.Types.ListType or LargeListType)
         {
             if (generalZstd)
                 throw new NotImplementedException(
                     "MiniBlockLayout General(ZSTD) wrapping is not yet supported for list columns.");
             return DecodeListMiniBlock(
                 chunkData, chunks, hasDef, hasRep, hasLargeChunk,
-                layout.Layers, listType, valueEnc);
+                layout.Layers, targetType, valueEnc);
+        }
+        if (targetType is FixedSizeListType fslType
+            && valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList)
+        {
+            if (generalZstd)
+                throw new NotImplementedException(
+                    "MiniBlockLayout General(ZSTD) wrapping is not yet supported for FSL columns.");
+            return DecodeFslMiniBlock(
+                chunkData, chunks, hasDef, hasRep, hasLargeChunk,
+                layout, valueEnc.FixedSizeList, fslType, numItems);
         }
         if (targetType is StringType or BinaryType)
         {
@@ -153,9 +163,16 @@ internal static class MiniBlockLayoutDecoder
 
     private static void ValidateScope(MiniBlockLayout layout, IArrowType targetType)
     {
-        if (layout.NumBuffers != 1)
+        // FSL columns can carry an extra buffer per chunk (the inner-item
+        // validity bitmap when has_validity = true). Other shapes still
+        // require num_buffers = 1.
+        bool isFsl = targetType is FixedSizeListType
+                     && layout.ValueCompression?.CompressionCase
+                        == CompressiveEncoding.CompressionOneofCase.FixedSizeList;
+        ulong maxBuffers = isFsl ? 2UL : 1UL;
+        if (layout.NumBuffers < 1 || layout.NumBuffers > maxBuffers)
             throw new NotImplementedException(
-                $"MiniBlockLayout with num_buffers={layout.NumBuffers} is not yet supported.");
+                $"MiniBlockLayout with num_buffers={layout.NumBuffers} is not yet supported (target {targetType}).");
 
         // Lists have 2 layers [leaf, list]. Primitives and strings have 1 layer.
         bool isList = targetType is Apache.Arrow.Types.ListType or LargeListType;
@@ -1543,14 +1560,26 @@ internal static class MiniBlockLayoutDecoder
     /// Decodes a single-column v2.1 list of primitives. Layers are
     /// <c>[leaf, list]</c>. Rep=1 opens a new row boundary; def>0 marks an
     /// invisible placeholder (null or empty list, depending on the list
-    /// layer type).
+    /// layer type). Handles both <see cref="Apache.Arrow.Types.ListType"/>
+    /// (i32 offsets, <see cref="ListArray"/> output) and
+    /// <see cref="LargeListType"/> (i64 offsets, <see cref="LargeListArray"/>
+    /// output) — they differ only in offset width on the wire.
     /// </summary>
     private static IArrowArray DecodeListMiniBlock(
         ReadOnlySpan<byte> chunkData, List<MiniChunk> chunks,
         bool hasDef, bool hasRep, bool hasLargeChunk,
         Google.Protobuf.Collections.RepeatedField<RepDefLayer> layers,
-        Apache.Arrow.Types.ListType listType, CompressiveEncoding valueEnc)
+        IArrowType listType, CompressiveEncoding valueEnc)
     {
+        IArrowType itemType = listType switch
+        {
+            Apache.Arrow.Types.ListType lt => lt.ValueDataType,
+            LargeListType llt => llt.ValueDataType,
+            _ => throw new LanceFormatException(
+                $"DecodeListMiniBlock target {listType} is not a list type."),
+        };
+        bool isLargeList = listType is LargeListType;
+
         if (!hasRep)
             throw new LanceFormatException("List MiniBlockLayout must have rep_compression.");
         if (chunks.Count != 1)
@@ -1560,7 +1589,7 @@ internal static class MiniBlockLayoutDecoder
             throw new NotImplementedException(
                 $"List items with value_compression '{valueEnc.CompressionCase}' are not yet supported.");
 
-        int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, listType.ValueDataType);
+        int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, itemType);
 
         ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
 
@@ -1600,62 +1629,70 @@ internal static class MiniBlockLayoutDecoder
             cursor = AlignUp(cursor, MiniBlockAlignment);
         }
 
-        // Walk rep/def to derive row boundaries, validity, and visible count.
-        // Each rep=1 starts a new row; def[i] > 0 marks an invisible item
-        // (null or empty list per the outer RepDefLayer).
+        // Compute def-slot assignment for the layer shape. def=0 is always
+        // "fully valid"; subsequent defs go from innermost-nullable layer
+        // outward. For NULL_AND_EMPTY_LIST, null comes before empty.
+        RepDefLayer leafLayer = layers[0];
+        RepDefLayer listLayer = layers[1];
+        bool itemNullable = leafLayer == RepDefLayer.RepdefNullableItem;
+        bool listNullable = listLayer == RepDefLayer.RepdefNullableList
+                            || listLayer == RepDefLayer.RepdefNullAndEmptyList;
+        bool listEmptyable = listLayer == RepDefLayer.RepdefEmptyableList
+                             || listLayer == RepDefLayer.RepdefNullAndEmptyList;
+        int next = 1;
+        int leafNullDef = itemNullable ? next++ : -1;
+        int listNullDef = listNullable ? next++ : -1;
+        int listEmptyDef = listEmptyable ? next++ : -1;
+
+        // Walk rep/def to derive row boundaries, list validity, leaf validity,
+        // and visible count.
         var arrowOffsetList = new List<int>();
         var validityList = new List<bool>();
         arrowOffsetList.Add(0);
 
         int visibleCount = 0;
-        RepDefLayer listLayer = layers[1];
-        bool listNullable = listLayer == RepDefLayer.RepdefNullableList
-                            || listLayer == RepDefLayer.RepdefNullAndEmptyList;
-        bool listEmptyable = listLayer == RepDefLayer.RepdefEmptyableList
-                             || listLayer == RepDefLayer.RepdefNullAndEmptyList;
+        byte[]? leafValidity = itemNullable ? new byte[(checked(numLevels) + 7) / 8] : null;
+        int leafNullCount = 0;
 
         for (int i = 0; i < numLevels; i++)
         {
+            int defValue = def is null ? 0 : def[i];
+
             if (rep[i] == 1)
             {
                 if (arrowOffsetList.Count > 1 || i > 0)
                     arrowOffsetList.Add(visibleCount);
 
-                bool invisible = def is not null && def[i] > 0;
-                if (invisible)
+                if (defValue == listNullDef)
                 {
-                    if (listLayer == RepDefLayer.RepdefNullableList)
-                    {
-                        validityList.Add(false); // null list
-                    }
-                    else if (listLayer == RepDefLayer.RepdefEmptyableList)
-                    {
-                        validityList.Add(true); // empty list, valid
-                    }
-                    else if (listLayer == RepDefLayer.RepdefNullAndEmptyList)
-                    {
-                        throw new NotImplementedException(
-                            "NULL_AND_EMPTY_LIST disambiguation is not yet supported.");
-                    }
-                    else
-                    {
-                        throw new LanceFormatException(
-                            $"Invisible item with list layer {listLayer} is not expected.");
-                    }
-                    continue; // no value
+                    validityList.Add(false);  // null list
+                    continue;
                 }
-
+                if (defValue == listEmptyDef)
+                {
+                    validityList.Add(true);   // empty list, valid
+                    continue;
+                }
                 validityList.Add(true);
-                visibleCount++;
+                // fall through to per-item processing
+            }
+
+            // rep=0 (continuation) or rep=1 with a visible item.
+            if (defValue == 0)
+            {
+                if (leafValidity is not null)
+                    leafValidity[visibleCount >> 3] |= (byte)(1 << (visibleCount & 7));
+            }
+            else if (defValue == leafNullDef)
+            {
+                leafNullCount++;
             }
             else
             {
-                // rep=0 — continuation of current list (must be a valid item).
-                if (def is not null && def[i] != 0)
-                    throw new NotImplementedException(
-                        "Null leaf items inside a list (def != 0 with rep == 0) are not yet supported.");
-                visibleCount++;
+                throw new LanceFormatException(
+                    $"Unexpected def value {defValue} at level {i} for list (layers=[{leafLayer},{listLayer}]).");
             }
+            visibleCount++;
         }
         arrowOffsetList.Add(visibleCount);
 
@@ -1670,35 +1707,183 @@ internal static class MiniBlockLayoutDecoder
                 $"List value buffer {valueBufSize} < expected {valuesExpected} for {visibleCount} items.");
         var valueBytes = chunkBytes.Slice(cursor, valuesExpected).ToArray();
 
+        // The leaf validity bitmap was sized for numLevels; trim to visibleCount.
+        byte[]? trimmedLeafValidity = null;
+        if (leafValidity is not null)
+        {
+            trimmedLeafValidity = new byte[(visibleCount + 7) / 8];
+            System.Array.Copy(leafValidity, trimmedLeafValidity, trimmedLeafValidity.Length);
+        }
+        ArrowBuffer leafValidityBuf = (trimmedLeafValidity is not null && leafNullCount > 0)
+            ? new ArrowBuffer(trimmedLeafValidity)
+            : ArrowBuffer.Empty;
         var childData = new ArrayData(
-            listType.ValueDataType, visibleCount,
-            nullCount: 0, offset: 0,
-            new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) });
+            itemType, visibleCount,
+            nullCount: leafNullCount, offset: 0,
+            new[] { leafValidityBuf, new ArrowBuffer(valueBytes) });
         IArrowArray childArr = ArrowArrayFactory.BuildArray(childData);
 
-        var arrowOffsets = new byte[(numRows + 1) * sizeof(int)];
-        for (int i = 0; i <= numRows; i++)
-            BinaryPrimitives.WriteInt32LittleEndian(
-                arrowOffsets.AsSpan(i * 4, 4), arrowOffsetList[i]);
-
-        byte[]? bitmap = null;
-        int nullCount = 0;
-        for (int i = 0; i < numRows; i++) if (!validityList[i]) nullCount++;
-        if (nullCount > 0)
+        // Offset width depends on list flavour: int32 vs int64.
+        byte[] arrowOffsets;
+        if (isLargeList)
         {
-            bitmap = new byte[(numRows + 7) / 8];
-            for (int i = 0; i < numRows; i++)
-                if (validityList[i])
-                    bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            arrowOffsets = new byte[(numRows + 1) * sizeof(long)];
+            for (int i = 0; i <= numRows; i++)
+                BinaryPrimitives.WriteInt64LittleEndian(
+                    arrowOffsets.AsSpan(i * 8, 8), arrowOffsetList[i]);
+        }
+        else
+        {
+            arrowOffsets = new byte[(numRows + 1) * sizeof(int)];
+            for (int i = 0; i <= numRows; i++)
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    arrowOffsets.AsSpan(i * 4, 4), arrowOffsetList[i]);
         }
 
-        _ = listNullable; _ = listEmptyable; // Currently checked via explicit branches above.
+        byte[]? listBitmap = null;
+        int listNullCount = 0;
+        for (int i = 0; i < numRows; i++) if (!validityList[i]) listNullCount++;
+        if (listNullCount > 0)
+        {
+            listBitmap = new byte[(numRows + 7) / 8];
+            for (int i = 0; i < numRows; i++)
+                if (validityList[i])
+                    listBitmap[i >> 3] |= (byte)(1 << (i & 7));
+        }
 
-        ArrowBuffer validity = bitmap is null ? ArrowBuffer.Empty : new ArrowBuffer(bitmap);
+        ArrowBuffer listValidity = listBitmap is null ? ArrowBuffer.Empty : new ArrowBuffer(listBitmap);
         var listData = new ArrayData(
-            listType, numRows, nullCount, offset: 0,
-            new[] { validity, new ArrowBuffer(arrowOffsets) },
+            listType, numRows, listNullCount, offset: 0,
+            new[] { listValidity, new ArrowBuffer(arrowOffsets) },
             children: new[] { childArr.Data });
-        return new ListArray(listData);
+        return isLargeList ? new LargeListArray(listData) : new ListArray(listData);
+    }
+
+    /// <summary>
+    /// Decode a v2.1 <see cref="MiniBlockLayout"/> whose value compression is
+    /// <see cref="FixedSizeList"/>. Single layer <c>[NULLABLE_ITEM]</c> or
+    /// <c>[ALL_VALID_ITEM]</c> at the FSL-row level (so num_items = number of
+    /// FSL rows). Each chunk carries either one buffer (just the flat inner
+    /// values) or two (an inner-item validity bitmap + the flat values) when
+    /// <c>has_validity = true</c>.
+    /// </summary>
+    private static IArrowArray DecodeFslMiniBlock(
+        ReadOnlySpan<byte> chunkData, List<MiniChunk> chunks,
+        bool hasDef, bool hasRep, bool hasLargeChunk,
+        MiniBlockLayout layout, FixedSizeList fslEnc, FixedSizeListType fslType,
+        long numItems)
+    {
+        if (hasRep)
+            throw new LanceFormatException(
+                "FSL MiniBlockLayout must not have rep_compression (single-layer outer).");
+        if (chunks.Count != 1)
+            throw new NotImplementedException(
+                "Multi-chunk FSL mini-block decoding is not yet supported.");
+        if (fslEnc.Values?.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
+            throw new NotImplementedException(
+                "FSL MiniBlock with non-Flat inner values is not yet supported.");
+        if ((ulong)fslType.ListSize != fslEnc.ItemsPerValue)
+            throw new LanceFormatException(
+                $"FSL dimension mismatch: schema={fslType.ListSize} vs encoding={fslEnc.ItemsPerValue}.");
+
+        bool hasValidity = fslEnc.HasValidity;
+        ulong expectedBuffers = hasValidity ? 2UL : 1UL;
+        if (layout.NumBuffers != expectedBuffers)
+            throw new LanceFormatException(
+                $"FSL MiniBlock num_buffers={layout.NumBuffers} != expected {expectedBuffers} for has_validity={hasValidity}.");
+
+        int numRows = checked((int)numItems);
+        int itemsPerValue = checked((int)fslEnc.ItemsPerValue);
+        int totalInnerItems = checked(numRows * itemsPerValue);
+        int innerBytesPerItem = ResolveFlatBytesPerValue(fslEnc.Values, fslType.ValueDataType);
+
+        ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
+        int cursor = 0;
+        int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
+        if (numLevels != numRows)
+            throw new LanceFormatException(
+                $"FSL chunk num_levels={numLevels} != num_rows={numRows} (single-chunk path).");
+        int defSize = 0;
+        if (hasDef)
+        {
+            defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+        }
+        int validityBufSize = 0;
+        if (hasValidity)
+        {
+            validityBufSize = hasLargeChunk
+                ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += hasLargeChunk ? 4 : 2;
+        }
+        int valuesBufSize = hasLargeChunk
+            ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+            : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+        cursor += hasLargeChunk ? 4 : 2;
+        cursor = AlignUp(cursor, MiniBlockAlignment);
+
+        // Row-level validity from def buffer (def=0 row valid, def=1 row null).
+        byte[]? rowValidity = null;
+        int rowNullCount = 0;
+        if (hasDef)
+        {
+            if (defSize != numLevels * sizeof(ushort))
+                throw new NotImplementedException(
+                    $"FSL def buffer size {defSize} != {numLevels * 2} (non-Flat(16) def is not supported).");
+            rowValidity = new byte[(numRows + 7) / 8];
+            for (int i = 0; i < numRows; i++)
+            {
+                ushort d = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
+                if (d == 0) rowValidity[i >> 3] |= (byte)(1 << (i & 7));
+                else rowNullCount++;
+            }
+            cursor += defSize;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+        }
+
+        // Inner-item validity bitmap (when has_validity = true). The wire
+        // bitmap is contiguous over all FSL items; we copy it as-is and let
+        // the consumer index by visible-item position.
+        byte[]? innerValidity = null;
+        int innerNullCount = 0;
+        if (hasValidity)
+        {
+            int expectedValidityBytes = (totalInnerItems + 7) / 8;
+            if (validityBufSize < expectedValidityBytes)
+                throw new LanceFormatException(
+                    $"FSL inner validity buffer {validityBufSize} < expected {expectedValidityBytes} for {totalInnerItems} items.");
+            innerValidity = new byte[expectedValidityBytes];
+            chunkBytes.Slice(cursor, expectedValidityBytes).CopyTo(innerValidity);
+            for (int i = 0; i < totalInnerItems; i++)
+                if ((innerValidity[i >> 3] & (1 << (i & 7))) == 0)
+                    innerNullCount++;
+            cursor += validityBufSize;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+        }
+
+        int valueBytesNeeded = checked(totalInnerItems * innerBytesPerItem);
+        if (valuesBufSize < valueBytesNeeded)
+            throw new LanceFormatException(
+                $"FSL value buffer {valuesBufSize} < expected {valueBytesNeeded} for {totalInnerItems} items.");
+        var valueBytes = new byte[valueBytesNeeded];
+        chunkBytes.Slice(cursor, valueBytesNeeded).CopyTo(valueBytes);
+
+        ArrowBuffer innerValidityBuf = (innerValidity is not null && innerNullCount > 0)
+            ? new ArrowBuffer(innerValidity)
+            : ArrowBuffer.Empty;
+        var childData = new ArrayData(
+            fslType.ValueDataType, totalInnerItems, innerNullCount, offset: 0,
+            new[] { innerValidityBuf, new ArrowBuffer(valueBytes) });
+        IArrowArray childArr = ArrowArrayFactory.BuildArray(childData);
+
+        ArrowBuffer rowValidityBuf = (rowValidity is not null && rowNullCount > 0)
+            ? new ArrowBuffer(rowValidity)
+            : ArrowBuffer.Empty;
+        var fslData = new ArrayData(
+            fslType, numRows, rowNullCount, offset: 0,
+            new[] { rowValidityBuf },
+            children: new[] { childArr.Data });
+        return new FixedSizeListArray(fslData);
     }
 }

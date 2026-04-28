@@ -523,6 +523,71 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task LargeList_NullAndEmpty()
+    {
+        // pa.large_list(int32). On disk Lance v2.1 encodes this exactly like
+        // pa.list — same layers, same wire bytes — only the Arrow output
+        // differs (LargeListArray with i64 offsets). Five rows include a
+        // null list and an empty list to exercise NULL_AND_EMPTY_LIST
+        // disambiguation (def=1=null-list, def=2=empty-list).
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("large_list_int_v21.lance"));
+        Assert.IsType<Apache.Arrow.Types.LargeListType>(reader.Schema.FieldsList[0].DataType);
+
+        var list = (Apache.Arrow.LargeListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(5, list.Length);
+        Assert.Equal(1, list.NullCount);
+        Assert.False(list.IsNull(0));
+        Assert.False(list.IsNull(1));
+        Assert.False(list.IsNull(2));   // empty list, valid
+        Assert.True(list.IsNull(3));    // null list
+        Assert.False(list.IsNull(4));
+
+        // Offsets are i64 in a LargeListArray.
+        Assert.Equal(0, list.ValueOffsets[0]);
+        Assert.Equal(3, list.ValueOffsets[1]);
+        Assert.Equal(5, list.ValueOffsets[2]);
+        Assert.Equal(5, list.ValueOffsets[3]);  // empty
+        Assert.Equal(5, list.ValueOffsets[4]);  // null
+        Assert.Equal(6, list.ValueOffsets[5]);
+
+        var values = (Int32Array)list.Values;
+        Assert.Equal(new int?[] { 1, 2, 3, 4, 5, 6 }, values.ToArray());
+    }
+
+    [Fact]
+    public async Task Fsl_Int32_NullableRow()
+    {
+        // FixedSizeList<int32, list_size=3> with one whole-row null:
+        //   [[1,2,3], [4,5,6], None, [7,8,9]]
+        // Wire form: layers=[NULLABLE_ITEM] (single layer at the FSL row),
+        // num_buffers=2, value_compression=FSL(items=3, has_validity=true,
+        // values=Flat(32)). buf[0] is the inner-item validity bitmap (12
+        // bits, with the null row's three positions cleared); buf[1] is
+        // the flat int32 values with placeholder 0s at the null row.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("fsl_int_nullable_v21.lance"));
+        var fsl = (Apache.Arrow.FixedSizeListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, fsl.Length);
+        Assert.Equal(1, fsl.NullCount);
+        Assert.False(fsl.IsNull(0));
+        Assert.False(fsl.IsNull(1));
+        Assert.True(fsl.IsNull(2));
+        Assert.False(fsl.IsNull(3));
+
+        var values = (Int32Array)fsl.Values;
+        Assert.Equal(12, values.Length);
+        // Inner validity: items in positions 6..8 (= the null row) are
+        // null, the rest are valid.
+        Assert.Equal(3, values.NullCount);
+        Assert.Equal(1, values.GetValue(0));
+        Assert.Equal(6, values.GetValue(5));
+        Assert.Null(values.GetValue(6));
+        Assert.Null(values.GetValue(7));
+        Assert.Null(values.GetValue(8));
+        Assert.Equal(7, values.GetValue(9));
+        Assert.Equal(9, values.GetValue(11));
+    }
+
+    [Fact]
     public async Task FullZip_BigFsl_Float32_x4096()
     {
         // 5 rows × 4096 float32 = 80 KiB total, 16 KiB per row → FullZipLayout.

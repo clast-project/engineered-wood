@@ -239,6 +239,24 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # large_list: same data shape as list but Arrow LargeListType uses
+    # i64 offsets. On disk in Lance v2.1 the encoding should be identical
+    # to a regular list — only the Arrow schema metadata differs.
+    write_one("large_list_int_v21",
+              pa.table({"xs": pa.array(
+                  [[1, 2, 3], [4, 5], [], None, [6]],
+                  type=pa.large_list(pa.int32()))}),
+              version="2.1")
+
+    # FixedSizeList<int32, dim=3> with rows that are themselves null. Only
+    # whole-row null, not leaf null inside the FSL — pyarrow rejects the
+    # latter for fixed_size_list.
+    write_one("fsl_int_nullable_v21",
+              pa.table({"xs": pa.array(
+                  [[1, 2, 3], [4, 5, 6], None, [7, 8, 9]],
+                  type=pa.list_(pa.int32(), list_size=3))}),
+              version="2.1")
+
     # struct-of-struct, v2.1. Three layers per leaf: [item, inner_struct,
     # outer_struct]. Both outer and inner struct can be null (cascades).
     nested_struct_type = pa.struct([

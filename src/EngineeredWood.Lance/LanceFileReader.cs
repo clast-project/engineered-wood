@@ -272,9 +272,11 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     throw new NotImplementedException(
                         $"Field '{fieldPath}': list of {lt.ValueDataType.GetType().Name} is not yet supported for v2.1.");
                 return ValidateAndCountLeavesV21(lt.ValueDataType, $"{fieldPath}[]");
-            case LargeListType:
-                throw new NotImplementedException(
-                    $"Field '{fieldPath}': LargeListType is not yet supported for v2.1.");
+            case LargeListType llt:
+                if (llt.ValueDataType is Apache.Arrow.Types.ListType or LargeListType or FixedSizeListType)
+                    throw new NotImplementedException(
+                        $"Field '{fieldPath}': LargeList of {llt.ValueDataType.GetType().Name} is not yet supported for v2.1.");
+                return ValidateAndCountLeavesV21(llt.ValueDataType, $"{fieldPath}[]");
             case FixedSizeListType fsl:
                 if (fsl.ValueDataType is not FixedWidthType)
                     throw new NotImplementedException(
