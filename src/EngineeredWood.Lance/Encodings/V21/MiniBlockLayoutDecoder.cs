@@ -577,17 +577,23 @@ internal static class MiniBlockLayoutDecoder
     // --- v2.1 nested-leaf chunk reader: shared rep/def + per-leaf values ---
 
     /// <summary>
-    /// Read a single chunk of a leaf column belonging to a v2.1 nested
-    /// shape (list-of-struct, struct-of-struct, struct-of-list, etc.).
-    /// Returns the raw rep/def buffers and the leaf's value bytes; assembly
-    /// into Arrow arrays is the caller's job, since rep/def are shared
-    /// across all sibling leaves and must be reconciled there.
+    /// Read a leaf column belonging to a v2.1 nested shape (list-of-struct,
+    /// struct-of-struct, struct-of-list, etc.). Returns the raw rep/def
+    /// buffers and the leaf's value bytes; assembly into Arrow arrays is
+    /// the caller's job, since rep/def are shared across all sibling
+    /// leaves and must be reconciled there.
     ///
-    /// <para>Constraints: <c>num_buffers = 1</c>, single chunk per page,
-    /// no <c>dictionary</c>, value compression <see cref="Flat"/>. Layer
-    /// validation (item/struct/list shape, nullability matrix, etc.) is
-    /// the caller's responsibility — this method only enforces the wire
-    /// invariants common to every nested shape.</para>
+    /// <para>Walks every chunk in the page and concatenates their
+    /// rep/def levels and value bytes end-to-end. The returned arrays
+    /// have lengths equal to the page-level totals: <c>visibleItems =
+    /// layout.NumItems</c>; <c>rep.Length = def.Length</c> = sum of
+    /// per-chunk <c>num_levels</c> headers.</para>
+    ///
+    /// <para>Constraints: <c>num_buffers = 1</c>, no <c>dictionary</c>,
+    /// value compression <see cref="Flat"/>. Layer validation
+    /// (item/struct/list shape, nullability matrix, etc.) is the caller's
+    /// responsibility — this method only enforces the wire invariants
+    /// common to every nested shape.</para>
     /// </summary>
     public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, int ValueBytesPerItem, int VisibleItems)
         DecodeNestedLeafChunk(MiniBlockLayout layout, IArrowType childType, in PageContext context)
@@ -608,69 +614,99 @@ internal static class MiniBlockLayoutDecoder
         ReadOnlySpan<byte> chunkMeta = context.PageBuffers[0].Span;
         ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
         var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
-        if (chunks.Count != 1)
-            throw new NotImplementedException(
-                $"Multi-chunk nested-leaf reads are not yet supported (got {chunks.Count} chunks).");
 
         CompressiveEncoding valueEnc = layout.ValueCompression
             ?? throw new LanceFormatException("MiniBlockLayout has no value_compression.");
         int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, childType);
 
-        ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
-        int cursor = 0;
-        int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
-        int repSize = 0;
-        if (hasRep)
-        {
-            repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
-            cursor += 2;
-        }
-        int defSize = 0;
-        if (hasDef)
-        {
-            defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
-            cursor += 2;
-        }
-        int valueBufSize = hasLargeChunk
-            ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
-            : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
-        cursor += hasLargeChunk ? 4 : 2;
-        cursor = AlignUp(cursor, MiniBlockAlignment);
-
-        ushort[]? rep = null;
-        if (hasRep)
-        {
-            if (repSize != numLevels * sizeof(ushort))
-                throw new NotImplementedException(
-                    $"Nested-leaf rep buffer size {repSize} != {numLevels * 2} (non-Flat(16) rep is not supported).");
-            rep = new ushort[numLevels];
-            for (int i = 0; i < numLevels; i++)
-                rep[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
-            cursor += repSize;
-            cursor = AlignUp(cursor, MiniBlockAlignment);
-        }
-
-        ushort[]? def = null;
-        if (hasDef)
-        {
-            if (defSize != numLevels * sizeof(ushort))
-                throw new NotImplementedException(
-                    $"Nested-leaf def buffer size {defSize} != {numLevels * 2} (non-Flat(16) def is not supported).");
-            def = new ushort[numLevels];
-            for (int i = 0; i < numLevels; i++)
-                def[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
-            cursor += defSize;
-            cursor = AlignUp(cursor, MiniBlockAlignment);
-        }
-
-        // num_items in the layout counts visible items.
         int visibleItems = checked((int)numItems);
-        int valueBytesNeeded = visibleItems * valueBytesPerItem;
-        if (valueBufSize < valueBytesNeeded)
-            throw new LanceFormatException(
-                $"Nested-leaf value buffer {valueBufSize} < expected {valueBytesNeeded} for {visibleItems} visible items.");
-        var valueBytes = new byte[valueBytesNeeded];
-        chunkBytes.Slice(cursor, valueBytesNeeded).CopyTo(valueBytes);
+        var valueBytes = new byte[visibleItems * valueBytesPerItem];
+
+        // rep/def lengths sum across chunks; we don't know the total up
+        // front (per-chunk num_levels can vary, especially for list shapes
+        // where rep levels include list-level entries beyond visible items).
+        // Pre-walk the chunks once to total the level counts so we can
+        // allocate exact-size arrays.
+        int totalLevels = 0;
+        if (hasRep || hasDef)
+        {
+            long byteCursor = 0;
+            foreach (MiniChunk c in chunks)
+            {
+                int n = BinaryPrimitives.ReadUInt16LittleEndian(
+                    chunkData.Slice((int)byteCursor, 2));
+                totalLevels = checked(totalLevels + n);
+                byteCursor += (long)c.SizeBytes;
+            }
+        }
+
+        ushort[]? rep = hasRep ? new ushort[totalLevels] : null;
+        ushort[]? def = hasDef ? new ushort[totalLevels] : null;
+
+        long globalChunkByteOffset = 0;
+        int valueWritePos = 0;
+        int levelWritePos = 0;
+
+        foreach (MiniChunk chunk in chunks)
+        {
+            int chunkVisibleItems = checked((int)chunk.NumValues);
+            ReadOnlySpan<byte> chunkBytes = chunkData.Slice(
+                (int)globalChunkByteOffset, (int)chunk.SizeBytes);
+
+            int cursor = 0;
+            int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+            int repSize = 0;
+            if (hasRep)
+            {
+                repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int defSize = 0;
+            if (hasDef)
+            {
+                defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int valueBufSize = hasLargeChunk
+                ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += hasLargeChunk ? 4 : 2;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+
+            if (hasRep)
+            {
+                // Reuse the existing rep/def decompressor — it handles both
+                // Flat(u16) and InlineBitpacking(16). pylance often emits
+                // InlineBitpacking for rep on lists with > ~100 rows.
+                ushort[] chunkRep = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, repSize), numLevels, layout.RepCompression!);
+                chunkRep.AsSpan().CopyTo(rep.AsSpan(levelWritePos, numLevels));
+                cursor += repSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
+            if (hasDef)
+            {
+                ushort[] chunkDef = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, defSize), numLevels, layout.DefCompression!);
+                chunkDef.AsSpan().CopyTo(def.AsSpan(levelWritePos, numLevels));
+                cursor += defSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
+            int chunkValueBytes = chunkVisibleItems * valueBytesPerItem;
+            if (valueBufSize < chunkValueBytes)
+                throw new LanceFormatException(
+                    $"Nested-leaf chunk value buffer {valueBufSize} < expected " +
+                    $"{chunkValueBytes} for {chunkVisibleItems} visible items.");
+            chunkBytes.Slice(cursor, chunkValueBytes)
+                .CopyTo(valueBytes.AsSpan(valueWritePos));
+
+            valueWritePos += chunkValueBytes;
+            levelWritePos += numLevels;
+            globalChunkByteOffset += (long)chunk.SizeBytes;
+        }
 
         return (valueBytes, rep, def, valueBytesPerItem, visibleItems);
     }

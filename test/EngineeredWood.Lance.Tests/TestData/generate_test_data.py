@@ -136,6 +136,28 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # Large list<int32> → triggers a multi-chunk page on the leaf column.
+    # Use full-int32-range values via a PRNG-style formula so pylance
+    # picks Flat (not InlineBitpacking) for the leaf encoding. 100K rows
+    # of 1-5 ints each emits hundreds of mini-block chunks.
+    _big_list_int_data = []
+    _list_seed = 0x9e3779b9
+    _val_seed = 0x12345678
+    for _r in range(100_000):
+        _list_seed = (_list_seed * 1103515245 + 12345) & 0xFFFFFFFF
+        _list_len = 1 + (_list_seed >> 16) % 5
+        _row = []
+        for _ in range(_list_len):
+            _val_seed = (_val_seed * 1103515245 + 12345) & 0xFFFFFFFF
+            _row.append((_val_seed - 0x80000000) & 0xFFFFFFFF)
+            # Convert to signed int32
+            if _row[-1] >= 0x80000000:
+                _row[-1] -= 0x100000000
+        _big_list_int_data.append(_row)
+    write_one("big_list_int_v21",
+              pa.table({"xs": pa.array(_big_list_int_data,
+                                        type=pa.list_(pa.int32()))}),
+              version="2.1")
 
     # Phase 8: v2.1 FullZipLayout. Large fixed-size-list values trigger
     # pylance's FullZip encoding (one I/O per value, used for embeddings

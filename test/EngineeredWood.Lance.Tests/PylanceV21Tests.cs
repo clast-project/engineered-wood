@@ -124,6 +124,41 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task List_Int32_BigMultiChunk()
+    {
+        // 100K rows × 1-5 ints/list with full-int32-range values. pylance
+        // emits ~290 mini-block chunks for the single leaf page with
+        // InlineBitpacking-compressed rep/def streams; this exercises both
+        // multi-chunk concatenation in DecodeNestedLeafChunk and
+        // InlineBitpacking decompression of the rep/def buffers.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("big_list_int_v21.lance"));
+        Assert.Equal(100_000L, reader.NumberOfRows);
+
+        var arr = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(100_000, arr.Length);
+        Assert.Equal(0, arr.NullCount);
+
+        for (int i = 0; i < 100_000; i++)
+        {
+            int len = arr.GetValueLength(i);
+            Assert.InRange(len, 1, 5);
+        }
+        // Total leaf items in [N, 5N]; with avg list length ~3 we expect ~3N.
+        var values = (Int32Array)arr.Values;
+        Assert.InRange(values.Length, 100_000, 500_000);
+        // Values use the full int32 range (PRNG-style), so the mean of
+        // any reasonably-sized prefix should land near zero. Cheap check
+        // the data isn't a constant or zeros.
+        long sumAbs = 0;
+        int probe = Math.Min(values.Length, 1000);
+        for (int i = 0; i < probe; i++)
+            sumAbs += Math.Abs((long)values.GetValue(i)!.Value);
+        Assert.True(sumAbs > probe * 1_000_000L,
+            $"Expected wide-range int32 leaf values; got |Σ|={sumAbs} over {probe} samples.");
+    }
+
+    [Fact]
     public async Task List_Int32_WithNulls()
     {
         await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("list_nulls_v21.lance"));

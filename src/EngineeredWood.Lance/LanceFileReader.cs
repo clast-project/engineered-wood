@@ -476,6 +476,46 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         public int[]? Offsets { get; init; }
     }
 
+    private static byte[] ConcatBytes(IReadOnlyList<byte[]> parts)
+    {
+        long total = 0;
+        foreach (var p in parts) total += p.Length;
+        var result = new byte[checked((int)total)];
+        int pos = 0;
+        foreach (var p in parts)
+        {
+            p.CopyTo(result, pos);
+            pos += p.Length;
+        }
+        return result;
+    }
+
+    private static ushort[]? ConcatUshortStreams(IReadOnlyList<ushort[]?> parts)
+    {
+        // If any chunk has the stream, every chunk must (rep/def is uniform
+        // across pages of a column). Concatenate; treat all-null as null.
+        bool anyPresent = false;
+        long total = 0;
+        foreach (var p in parts)
+        {
+            if (p is not null)
+            {
+                anyPresent = true;
+                total += p.Length;
+            }
+        }
+        if (!anyPresent) return null;
+        var result = new ushort[checked((int)total)];
+        int pos = 0;
+        foreach (var p in parts)
+        {
+            if (p is null) continue;
+            System.Array.Copy(p, 0, result, pos, p.Length);
+            pos += p.Length;
+        }
+        return result;
+    }
+
     /// <summary>
     /// Recursive nested-tree walker. Decodes <paramref name="type"/> starting
     /// at physical column <paramref name="startColumn"/> and returns the
@@ -515,41 +555,64 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
             throw new LanceFormatException($"Leaf column {columnIndex} has no pages.");
-        if (cm.Pages.Count > 1)
-            throw new NotImplementedException(
-                $"Multi-page leaf reads are not yet supported (column {columnIndex}).");
 
-        var page = cm.Pages[0];
-        byte[] valueBytes;
-        ushort[]? rep;
-        ushort[]? def;
-        Proto.Encodings.V21.RepDefLayer[] layers;
-        int visibleItems;
-        var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
-            for (int k = 0; k < bufferOwners.Count; k++)
-                pageBuffers[k] = bufferOwners[k].Memory;
-            var pageContext = new PageContext(pageBuffers);
-            var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
-            if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
-                throw new NotImplementedException(
-                    $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
+        // Decode every page into (valueBytes, rep, def) and concatenate.
+        // The downstream cascade walker operates on the unified streams
+        // unchanged — it doesn't care about page boundaries because rep/def
+        // levels carry all the structural information.
+        Proto.Encodings.V21.RepDefLayer[]? layers = null;
+        int valueBytesPerItem = 0;
+        var perPageValues = new List<byte[]>(cm.Pages.Count);
+        var perPageRep = new List<ushort[]?>(cm.Pages.Count);
+        var perPageDef = new List<ushort[]?>(cm.Pages.Count);
+        int visibleItems = 0;
 
-            var mb = pageLayout.MiniBlockLayout;
-            var (vals, r, d, _, visible) = Encodings.V21.MiniBlockLayoutDecoder
-                .DecodeNestedLeafChunk(mb, leafType, pageContext);
-            valueBytes = vals;
-            rep = r;
-            def = d;
-            visibleItems = visible;
-            layers = mb.Layers.ToArray();
-        }
-        finally
+        foreach (var page in cm.Pages)
         {
-            foreach (var owner in bufferOwners) owner.Dispose();
+            var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
+                for (int k = 0; k < bufferOwners.Count; k++)
+                    pageBuffers[k] = bufferOwners[k].Memory;
+                var pageContext = new PageContext(pageBuffers);
+                var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
+                if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
+                    throw new NotImplementedException(
+                        $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
+
+                var mb = pageLayout.MiniBlockLayout;
+                var (vals, r, d, bpi, visible) = Encodings.V21.MiniBlockLayoutDecoder
+                    .DecodeNestedLeafChunk(mb, leafType, pageContext);
+
+                if (layers is null)
+                {
+                    layers = mb.Layers.ToArray();
+                    valueBytesPerItem = bpi;
+                }
+                else if (bpi != valueBytesPerItem)
+                {
+                    throw new LanceFormatException(
+                        $"Column {columnIndex}: page-level value width mismatch ({bpi} vs {valueBytesPerItem}).");
+                }
+
+                perPageValues.Add(vals);
+                perPageRep.Add(r);
+                perPageDef.Add(d);
+                visibleItems = checked(visibleItems + visible);
+            }
+            finally
+            {
+                foreach (var owner in bufferOwners) owner.Dispose();
+            }
         }
+
+        if (layers is null)
+            throw new LanceFormatException($"Leaf column {columnIndex} has no decodable pages.");
+
+        byte[] valueBytes = ConcatBytes(perPageValues);
+        ushort[]? rep = ConcatUshortStreams(perPageRep);
+        ushort[]? def = ConcatUshortStreams(perPageDef);
 
         int n = layers.Length;
         if (n == 0)
