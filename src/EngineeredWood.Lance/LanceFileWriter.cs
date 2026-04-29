@@ -71,8 +71,30 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private readonly List<Proto.Field> _fields = new();
     private readonly List<ColumnMetadata> _columns = new();
     private long _totalRows = -1;
+    private long _finalSizeBytes = -1;
     private bool _finalized;
     private bool _disposed;
+
+    /// <summary>
+    /// Schema fields accumulated from per-column writes, in declaration
+    /// order. Stable after <see cref="FinishAsync"/>; read by
+    /// <c>LanceDatasetWriter</c> when building a dataset manifest.
+    /// </summary>
+    internal IReadOnlyList<Proto.Field> SchemaFields => _fields;
+
+    /// <summary>
+    /// Number of rows written to the file (matches the row count of every
+    /// column). <c>0</c> if no columns have been added yet.
+    /// </summary>
+    internal long TotalRows => Math.Max(0L, _totalRows);
+
+    /// <summary>
+    /// Total file size in bytes after <see cref="FinishAsync"/>; <c>-1</c>
+    /// before finish completes.
+    /// </summary>
+    internal long FinalSizeBytes => _finalSizeBytes;
+
+    internal LanceVersion Version => _version;
 
     private LanceFileWriter(ISequentialFile file, bool ownsFile, LanceVersion version)
     {
@@ -397,10 +419,12 @@ public sealed class LanceFileWriter : IAsyncDisposable
             bool isLast = c == N - 1;
             if (isLast)
             {
-                // log_num_values is ignored for the last chunk (the reader
-                // computes its size as items_in_page - prior_values), but
-                // pick a representative power so meta dumps look sensible.
-                logNumValues = itemCount > 0 ? Log2Floor(itemCount) : 0;
+                // The reader spec says log_num_values is ignored for the last
+                // chunk (size = items_in_page - prior_values), but pylance
+                // always writes 0 there and its lance.dataset() decoder
+                // appears to rely on that. Match the convention so v2.1
+                // datasets we produce open via lance.dataset().
+                logNumValues = 0;
             }
             else
             {
@@ -423,8 +447,15 @@ public sealed class LanceFileWriter : IAsyncDisposable
                     cb.AsSpan(cursor, 2), checked((ushort)defByteLen));
                 cursor += 2;
             }
+            // Pylance writes valueBufSize ROUNDED UP to the 8-byte mini-block
+            // alignment, not the unpadded value length. Its lance.dataset()
+            // decoder reads the value buffer as a fixed-width slice and panics
+            // when the declared size is not a multiple of the element width
+            // (e.g. 4-byte u32 offsets for Variable encoding). Match the
+            // convention so our datasets open in lance.dataset().
+            int valueBufLenOnDisk = AlignUp(valueBufLen, MiniBlockAlignment);
             BinaryPrimitives.WriteUInt16LittleEndian(
-                cb.AsSpan(cursor, 2), checked((ushort)valueBufLen));
+                cb.AsSpan(cursor, 2), checked((ushort)valueBufLenOnDisk));
 
             if (hasDef)
             {
@@ -540,9 +571,20 @@ public sealed class LanceFileWriter : IAsyncDisposable
         _columns.Add(columnMeta);
 
         int fieldId = _fields.Count;
+        // pylance fills in the deprecated v1 `encoding` and leaves `type` at
+        // its proto3 default (0 = PARENT), even when writing v2.x files. The
+        // Lance file reader on the dataset code path uses `encoding` as a
+        // dispatch hint — strings/binary need VAR_BINARY or `lance.dataset()`
+        // panics trying to interpret the offsets+data buffer as a fixed-
+        // width slice. Match the convention so our datasets open in pylance.
+        var fieldEncoding = valueEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.Variable
+            ? Proto.Encoding.VarBinary
+            : Proto.Encoding.Plain;
         _fields.Add(new Proto.Field
         {
-            Type = Proto.Field.Types.Type.Leaf,
+            // Type left at default (PARENT). pylance does the same; the
+            // logical_type string is the real type discriminator.
             Name = name,
             Id = fieldId,
             // pylance marks top-level fields with parent_id = -1 (the
@@ -559,6 +601,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             // interpret the schema in a way that doesn't match the layer
             // shape we emit, so it panics on read.
             Nullable = true,
+            Encoding = fieldEncoding,
         });
     }
 
@@ -640,6 +683,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
 
         await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        _finalSizeBytes = _file.Position;
         _finalized = true;
     }
 
