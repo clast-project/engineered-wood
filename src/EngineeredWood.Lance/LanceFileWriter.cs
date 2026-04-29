@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using EngineeredWood.IO;
 using EngineeredWood.Lance.Format;
 using EngineeredWood.Lance.Proto;
@@ -16,9 +17,12 @@ namespace EngineeredWood.Lance;
 /// <summary>
 /// Writer for v2.1 Lance files. Phase 13 MVP: produces a single-file
 /// (no Lance dataset wrapper, no manifest) Lance v2.1 file containing
-/// one or more non-nullable Int32 columns with all rows packed into a
-/// single MiniBlockLayout page per column using <see cref="Flat"/>
-/// value compression.
+/// one or more non-nullable fixed-width primitive columns
+/// (<see cref="sbyte"/>, <see cref="short"/>, <see cref="int"/>,
+/// <see cref="long"/> and unsigned counterparts, <see cref="float"/>,
+/// <see cref="double"/>) with all rows packed into a single
+/// MiniBlockLayout page per column using <see cref="Flat"/> value
+/// compression.
 ///
 /// <para><b>What this writer covers</b>:</para>
 /// <list type="bullet">
@@ -34,7 +38,7 @@ namespace EngineeredWood.Lance;
 ///
 /// <para><b>What's deferred</b>:</para>
 /// <list type="bullet">
-///   <item>Other primitive types (Int64, Float, Double, ...).</item>
+///   <item>Booleans (bit-packed encoding, not byte-aligned).</item>
 ///   <item>Nullability (no def buffer yet).</item>
 ///   <item>Strings, binary, lists, structs, FSL.</item>
 ///   <item>Other encodings (Variable, FullZip, Bitpacking, FSST,
@@ -97,34 +101,83 @@ public sealed class LanceFileWriter : IAsyncDisposable
         return new LanceFileWriter(seq, ownsFile: true, LanceVersion.V2_1);
     }
 
+    /// <summary>Append a non-nullable <see cref="sbyte"/> column.</summary>
+    public Task WriteInt8ColumnAsync(string name, ReadOnlySpan<sbyte> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "int8", 8, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="byte"/> column.</summary>
+    public Task WriteUInt8ColumnAsync(string name, ReadOnlySpan<byte> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "uint8", 8, values.Length, values.ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="short"/> column.</summary>
+    public Task WriteInt16ColumnAsync(string name, ReadOnlySpan<short> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "int16", 16, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="ushort"/> column.</summary>
+    public Task WriteUInt16ColumnAsync(string name, ReadOnlySpan<ushort> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "uint16", 16, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
     /// <summary>
-    /// Append a non-nullable <see cref="System.Int32"/> column to the file.
+    /// Append a non-nullable <see cref="int"/> column to the file.
     /// Every column added must have the same length as the first; the
     /// length becomes the file's row count.
     /// </summary>
-    public async Task WriteInt32ColumnAsync(
-        string name, int[] values, CancellationToken cancellationToken = default)
+    public Task WriteInt32ColumnAsync(string name, ReadOnlySpan<int> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "int32", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="uint"/> column.</summary>
+    public Task WriteUInt32ColumnAsync(string name, ReadOnlySpan<uint> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "uint32", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="long"/> column.</summary>
+    public Task WriteInt64ColumnAsync(string name, ReadOnlySpan<long> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "int64", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="ulong"/> column.</summary>
+    public Task WriteUInt64ColumnAsync(string name, ReadOnlySpan<ulong> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "uint64", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="float"/> (Float32) column.</summary>
+    public Task WriteFloatColumnAsync(string name, ReadOnlySpan<float> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "float", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>Append a non-nullable <see cref="double"/> (Float64) column.</summary>
+    public Task WriteDoubleColumnAsync(string name, ReadOnlySpan<double> values, CancellationToken cancellationToken = default)
+        => WriteFlatPrimitiveColumnAsync(name, "double", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), cancellationToken);
+
+    /// <summary>
+    /// Single-page MiniBlockLayout + Flat encoding for any byte-aligned
+    /// fixed-width primitive. The caller serializes values to a
+    /// little-endian byte buffer (one item per <paramref name="bitsPerValue"/>
+    /// bits) and passes the row count + Lance logical-type string
+    /// (e.g. <c>"int32"</c>, <c>"float"</c>, <c>"double"</c>).
+    /// </summary>
+    private async Task WriteFlatPrimitiveColumnAsync(
+        string name,
+        string logicalType,
+        int bitsPerValue,
+        int numItems,
+        byte[] valueBytes,
+        CancellationToken cancellationToken)
     {
-        if (values is null) throw new ArgumentNullException(nameof(values));
         ThrowIfFinalized();
-        if (_totalRows < 0) _totalRows = values.Length;
-        else if (_totalRows != values.Length)
+        if (_totalRows < 0) _totalRows = numItems;
+        else if (_totalRows != numItems)
             throw new ArgumentException(
-                $"Column '{name}' has {values.Length} rows but earlier columns have {_totalRows}.",
-                nameof(values));
+                $"Column '{name}' has {numItems} rows but earlier columns have {_totalRows}.",
+                nameof(numItems));
 
         // --- Build the page's two buffers (chunk metadata + chunk data) ---
         // Chunk inner layout for ALL_VALID_ITEM, no rep, no def:
         //   u16 num_levels (=0)
         //   u16 valueBufSize
         //   pad to 8-byte alignment
-        //   value bytes (length × 4 for int32)
+        //   value bytes (length × bitsPerValue/8)
         //   pad to 8-byte alignment so divided_bytes is well-defined
-        int numItems = values.Length;
-        int valueBytes = numItems * sizeof(int);
+        int valueByteLen = valueBytes.Length;
         const int chunkHeaderLen = 4;  // 2 (num_levels) + 2 (valueBufSize)
         int chunkHeaderPadded = AlignUp(chunkHeaderLen, MiniBlockAlignment);
-        int chunkBeforePad = chunkHeaderPadded + valueBytes;
+        int chunkBeforePad = chunkHeaderPadded + valueByteLen;
         int chunkTotal = AlignUp(chunkBeforePad, MiniBlockAlignment);
         int dividedBytes = (chunkTotal / MiniBlockAlignment) - 1;
         if (dividedBytes < 0 || dividedBytes > 0xFFF)
@@ -141,12 +194,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // Buffer 1: chunk data.
         byte[] chunkData = new byte[chunkTotal];
         BinaryPrimitives.WriteUInt16LittleEndian(chunkData.AsSpan(0, 2), 0);                   // num_levels
-        BinaryPrimitives.WriteUInt16LittleEndian(chunkData.AsSpan(2, 2), checked((ushort)valueBytes));
-        // bytes 4..chunkHeaderPadded already zero
-        for (int i = 0; i < numItems; i++)
-            BinaryPrimitives.WriteInt32LittleEndian(
-                chunkData.AsSpan(chunkHeaderPadded + i * sizeof(int), sizeof(int)),
-                values[i]);
+        BinaryPrimitives.WriteUInt16LittleEndian(chunkData.AsSpan(2, 2), checked((ushort)valueByteLen));
+        valueBytes.CopyTo(chunkData.AsSpan(chunkHeaderPadded));
         // trailing padding already zero
 
         // --- Write the buffers, recording their absolute file offsets ---
@@ -165,7 +214,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         {
             ValueCompression = new CompressiveEncoding
             {
-                Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)bitsPerValue },
             },
             NumBuffers = 1,
             NumItems = (ulong)numItems,
@@ -174,7 +223,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         var pageLayout = new PageLayout { MiniBlockLayout = miniBlock };
 
-        var any = new Any
+        var pageAny = new Any
         {
             // The reader doesn't validate this URL — it parses Any.value
             // directly as PageLayout. Use the upstream-style URL anyway so
@@ -182,16 +231,16 @@ public sealed class LanceFileWriter : IAsyncDisposable
             TypeUrl = "/lance.encodings21.PageLayout",
             Value = pageLayout.ToByteString(),
         };
-        var encoding = new Proto.V2.Encoding
+        var pageEncoding = new Proto.V2.Encoding
         {
-            Direct = new DirectEncoding { Encoding = any.ToByteString() },
+            Direct = new DirectEncoding { Encoding = pageAny.ToByteString() },
         };
 
         // --- Build the Page proto ---
         var page = new ColumnMetadata.Types.Page
         {
             Length = (ulong)numItems,
-            Encoding = encoding,
+            Encoding = pageEncoding,
             Priority = 0,
         };
         page.BufferOffsets.Add((ulong)buf0Offset);
@@ -216,10 +265,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         };
 
         // --- Build the ColumnMetadata + accumulate the schema field ---
-        var columnMeta = new ColumnMetadata
-        {
-            Encoding = columnEncoding,
-        };
+        var columnMeta = new ColumnMetadata { Encoding = columnEncoding };
         columnMeta.Pages.Add(page);
         _columns.Add(columnMeta);
 
@@ -235,7 +281,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             // because the IsRoot check in our reader treats any
             // existing-field-id as a real reference.
             ParentId = -1,
-            LogicalType = "int32",
+            LogicalType = logicalType,
             // pylance writes nullable=true in the schema even when the
             // Arrow column is non-nullable; the actual presence of nulls is
             // encoded by the page's RepDefLayer (ALL_VALID_ITEM vs
