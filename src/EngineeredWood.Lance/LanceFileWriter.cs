@@ -285,6 +285,30 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
         if (array is FixedSizeListArray fsl)
             return WriteFixedSizeListColumnAsync(name, fsl, cancellationToken);
+        // Decimal128 and Decimal256 derive from FixedSizeBinaryType, so they
+        // match the FSB pattern below — but the schema's logical_type must be
+        // "decimal:{width}:{precision}:{scale}", not "fixed_size_binary:N".
+        // Dispatch them first so the FSB fallback only sees true FSB columns.
+        if (array is Decimal128Array dec128)
+        {
+            var dt = (Decimal128Type)dec128.Data.DataType;
+            return WriteFixedWidthFlatColumnAsync(
+                name, $"decimal:128:{dt.Precision}:{dt.Scale}", dt.ByteWidth,
+                dec128, cancellationToken);
+        }
+        if (array is Decimal256Array dec256)
+        {
+            var dt = (Decimal256Type)dec256.Data.DataType;
+            return WriteFixedWidthFlatColumnAsync(
+                name, $"decimal:256:{dt.Precision}:{dt.Scale}", dt.ByteWidth,
+                dec256, cancellationToken);
+        }
+        if (array is Apache.Arrow.Arrays.FixedSizeBinaryArray fsb)
+        {
+            int width = ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth;
+            return WriteFixedWidthFlatColumnAsync(
+                name, $"fixed_size_binary:{width}", width, fsb, cancellationToken);
+        }
         if (array is ListArray list)
         {
             int[] offsets = list.ValueOffsets.Slice(0, list.Length + 1).ToArray();
@@ -369,6 +393,23 @@ public sealed class LanceFileWriter : IAsyncDisposable
         string unit = TimeUnitToString(ts.Unit);
         string tz = string.IsNullOrEmpty(ts.Timezone) ? "-" : ts.Timezone;
         return $"timestamp:{unit}:{tz}";
+    }
+
+    /// <summary>
+    /// Helper: write a fixed-width column whose value bytes live contiguously
+    /// in <c>array.Data.Buffers[1]</c>. Used for the FSB-shaped types
+    /// (FixedSizeBinary, Decimal128, Decimal256) where the bytes are
+    /// already laid out width-per-row and we just need to slice and ship.
+    /// </summary>
+    private Task WriteFixedWidthFlatColumnAsync(
+        string name, string logicalType, int bytesPerValue,
+        IArrowArray array, CancellationToken cancellationToken)
+    {
+        byte[] bytes = new byte[array.Length * bytesPerValue];
+        array.Data.Buffers[1].Span.Slice(0, array.Length * bytesPerValue).CopyTo(bytes);
+        return WriteFlatPageAsync(
+            name, logicalType, bytesPerValue, array.Length, bytes,
+            ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
     private static byte[]? ExtractValidityBitmap(IArrowArray array)

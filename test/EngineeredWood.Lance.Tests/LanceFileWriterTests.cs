@@ -1197,6 +1197,108 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Decimal128_RoundTrip_ViaOurReader()
+    {
+        // Decimal128(precision=18, scale=3): three values + one null. Apache
+        // Arrow stores each as 16 bytes little-endian on Buffers[1]; the
+        // writer slices these directly and the reader re-builds them.
+        const int precision = 18;
+        const int scale = 3;
+        var dt = new Decimal128Type(precision, scale);
+        // Values (in scaled int representation): 12345 → 12.345; 99999 → 99.999;
+        // -1000 → -1.000; row 2 is null. We pack each as a 16-byte LE int128.
+        long[] scaled = { 12345L, 99999L, 0L, -1000L };
+        var bytes = new byte[scaled.Length * 16];
+        for (int i = 0; i < scaled.Length; i++)
+        {
+            // Sign-extend to 16 bytes: lower 8 bytes hold the value, upper 8
+            // are 0 for non-negative or 0xFF for negative.
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+                bytes.AsSpan(i * 16, 8), scaled[i]);
+            byte fill = scaled[i] < 0 ? (byte)0xFF : (byte)0x00;
+            for (int k = 0; k < 8; k++) bytes[i * 16 + 8 + k] = fill;
+        }
+        var validity = new byte[1] { 0b1011 };  // rows 0,1,3 valid; row 2 null
+        var data = new ArrayData(
+            dt, scaled.Length, 1, 0,
+            new[] { new ArrowBuffer(validity), new ArrowBuffer(bytes) });
+        var arr = new Decimal128Array(data);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-dec-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("amt", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var decType = Assert.IsType<Decimal128Type>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(precision, decType.Precision);
+            Assert.Equal(scale, decType.Scale);
+            var read = (Decimal128Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(4, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(2));
+            // GetValue returns SqlDecimal; check by re-reading the raw bytes.
+            for (int i = 0; i < 4; i++)
+            {
+                if (i == 2) continue;
+                long value = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
+                    read.Data.Buffers[1].Span.Slice(i * 16, 8));
+                Assert.Equal(scaled[i], value);
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task FixedSizeBinary_RoundTrip_ViaOurReader()
+    {
+        // 4-byte fixed-size binary (e.g. UUID-style fingerprint) with a null
+        // mid-stream. logical_type = "fixed_size_binary:4"; Flat(32) value
+        // encoding; the reader builds the array via BuildFixedWidthArray.
+        const int width = 4;
+        byte[] bytes = new byte[3 * width];
+        for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i + 1);
+        var validity = new byte[1] { 0b101 };  // row 0, 2 valid; row 1 null
+        var data = new ArrayData(
+            new FixedSizeBinaryType(width), 3, 1, 0,
+            new[] { new ArrowBuffer(validity), new ArrowBuffer(bytes) });
+        var fsb = new Apache.Arrow.Arrays.FixedSizeBinaryArray(data);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-fsb-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("h", fsb);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var fsbType = Assert.IsType<FixedSizeBinaryType>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(width, fsbType.ByteWidth);
+            var read = (Apache.Arrow.Arrays.FixedSizeBinaryArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.False(read.IsNull(0));
+            Assert.True(read.IsNull(1));
+            Assert.False(read.IsNull(2));
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, read.GetBytes(0).ToArray());
+            Assert.Equal(new byte[] { 9, 10, 11, 12 }, read.GetBytes(2).ToArray());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task ListString_RoundTrip_ViaOurReader()
     {
         // List<string> with a mix of valid, null, and empty list rows; one
