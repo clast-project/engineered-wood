@@ -614,7 +614,7 @@ internal static class MiniBlockLayoutDecoder
     /// responsibility — this method only enforces the wire invariants
     /// common to every nested shape.</para>
     /// </summary>
-    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems)
+    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems, int[]? VarOffsets, byte[]? VarData)
         DecodeNestedLeafChunk(MiniBlockLayout layout, IArrowType childType, in PageContext context)
     {
         if (layout.Dictionary is not null)
@@ -623,6 +623,19 @@ internal static class MiniBlockLayoutDecoder
 
         CompressiveEncoding valueEnc = layout.ValueCompression
             ?? throw new LanceFormatException("MiniBlockLayout has no value_compression.");
+
+        // Variable-width path (string/binary leaf inside a list/struct).
+        // Each chunk's value buffer is (chunkVisible+1) u32 offsets +
+        // concatenated data bytes; we accumulate into page-level offsets[]
+        // and a flat data byte buffer, then return them alongside the
+        // rep/def streams for the cascade walker. valueBytes is unused on
+        // this path.
+        bool isVariable = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Variable;
+        if (isVariable && childType is not (StringType or BinaryType))
+            throw new NotImplementedException(
+                $"Nested-leaf Variable encoding is only supported for String/Binary leaves (got {childType}).");
+        if (isVariable)
+            return DecodeNestedLeafChunkVariable(layout, valueEnc, context);
 
         // FSL with has_validity=true adds an extra inner-validity bitmap
         // buffer per chunk and bumps num_buffers from 1 to 2. The chunk
@@ -784,7 +797,158 @@ internal static class MiniBlockLayoutDecoder
             globalChunkByteOffset += (long)chunk.SizeBytes;
         }
 
-        return (valueBytes, rep, def, innerValidity, innerNullCount, valueBytesPerItem, visibleItems);
+        return (valueBytes, rep, def, innerValidity, innerNullCount, valueBytesPerItem, visibleItems,
+            /*VarOffsets*/ null, /*VarData*/ null);
+    }
+
+    /// <summary>
+    /// Variable-width branch of <see cref="DecodeNestedLeafChunk"/>: walks
+    /// every chunk in the page, parses each chunk's per-row offsets+data,
+    /// and accumulates them into a single page-level (offsets, data) pair
+    /// suitable for the cascade walker's variable-width leaf path.
+    /// </summary>
+    private static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems, int[]? VarOffsets, byte[]? VarData)
+        DecodeNestedLeafChunkVariable(MiniBlockLayout layout, CompressiveEncoding valueEnc, in PageContext context)
+    {
+        Variable variable = valueEnc.Variable;
+        if (variable.Values is not null)
+            throw new NotImplementedException(
+                "Nested-leaf Variable encoding with BufferCompression on values is not yet supported.");
+        if (variable.Offsets is null
+            || variable.Offsets.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat
+            || variable.Offsets.Flat.BitsPerValue != 32)
+            throw new NotImplementedException(
+                "Nested-leaf Variable encoding currently requires Flat(u32) offsets.");
+
+        if (layout.NumBuffers != 1)
+            throw new NotImplementedException(
+                $"Nested-leaf Variable MiniBlockLayout num_buffers={layout.NumBuffers} is not supported.");
+
+        bool hasRep = layout.RepCompression is not null;
+        bool hasDef = layout.DefCompression is not null;
+        long numItems = checked((long)layout.NumItems);
+        bool hasLargeChunk = layout.HasLargeChunk;
+
+        ReadOnlySpan<byte> chunkMeta = context.PageBuffers[0].Span;
+        ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
+        var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
+
+        int visibleItems = checked((int)numItems);
+
+        // Pre-pass to total rep/def levels (matches the fixed-width path).
+        int totalLevels = 0;
+        if (hasRep || hasDef)
+        {
+            long byteCursor = 0;
+            foreach (MiniChunk c in chunks)
+            {
+                int n = BinaryPrimitives.ReadUInt16LittleEndian(
+                    chunkData.Slice((int)byteCursor, 2));
+                totalLevels = checked(totalLevels + n);
+                byteCursor += (long)c.SizeBytes;
+            }
+        }
+        ushort[]? rep = hasRep ? new ushort[totalLevels] : null;
+        ushort[]? def = hasDef ? new ushort[totalLevels] : null;
+
+        var globalOffsets = new int[visibleItems + 1];
+        var dataChunks = new List<byte[]>(chunks.Count);
+        long globalChunkByteOffset = 0;
+        int rowCursor = 0;
+        int levelWritePos = 0;
+
+        foreach (MiniChunk chunk in chunks)
+        {
+            int chunkVisible = checked((int)chunk.NumValues);
+            ReadOnlySpan<byte> chunkBytes = chunkData.Slice(
+                (int)globalChunkByteOffset, (int)chunk.SizeBytes);
+
+            int cursor = 0;
+            int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+            int repSize = 0;
+            if (hasRep)
+            {
+                repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int defSize = 0;
+            if (hasDef)
+            {
+                defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int valueBufSize = hasLargeChunk
+                ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += hasLargeChunk ? 4 : 2;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+
+            if (hasRep)
+            {
+                ushort[] chunkRep = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, repSize), numLevels, layout.RepCompression!);
+                chunkRep.AsSpan().CopyTo(rep.AsSpan(levelWritePos, numLevels));
+                cursor += repSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+            if (hasDef)
+            {
+                ushort[] chunkDef = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, defSize), numLevels, layout.DefCompression!);
+                chunkDef.AsSpan().CopyTo(def.AsSpan(levelWritePos, numLevels));
+                cursor += defSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
+            // Value buffer = (chunkVisible+1) × u32 offsets within this
+            // chunk's value buffer + data bytes. Re-emit into page-level
+            // offsets[] with the running global data cursor.
+            ReadOnlySpan<byte> valueBuf = chunkBytes.Slice(cursor, valueBufSize);
+            int offsetsBytes = checked((chunkVisible + 1) * 4);
+            if (valueBuf.Length < offsetsBytes)
+                throw new LanceFormatException(
+                    $"Variable nested-leaf chunk value buffer too small: need {offsetsBytes} offset bytes, have {valueBuf.Length}.");
+
+            uint baseOffset = BinaryPrimitives.ReadUInt32LittleEndian(valueBuf.Slice(0, 4));
+            int globalDataBase = rowCursor == 0 ? 0 : globalOffsets[rowCursor];
+            int chunkDataLen = 0;
+            for (int i = 1; i <= chunkVisible; i++)
+            {
+                uint absolute = BinaryPrimitives.ReadUInt32LittleEndian(valueBuf.Slice(i * 4, 4));
+                if (absolute < baseOffset)
+                    throw new LanceFormatException(
+                        $"Variable offset {absolute} at index {i} is less than base {baseOffset}.");
+                int rel = checked((int)(absolute - baseOffset));
+                if (rel > chunkDataLen) chunkDataLen = rel;
+                globalOffsets[rowCursor + i] = checked(globalDataBase + rel);
+            }
+
+            int dataStart = checked((int)baseOffset);
+            if (dataStart + chunkDataLen > valueBuf.Length)
+                throw new LanceFormatException(
+                    $"Variable chunk data range [{dataStart}, {dataStart + chunkDataLen}) exceeds buffer length {valueBuf.Length}.");
+            var chunkSlice = new byte[chunkDataLen];
+            valueBuf.Slice(dataStart, chunkDataLen).CopyTo(chunkSlice);
+            dataChunks.Add(chunkSlice);
+
+            rowCursor += chunkVisible;
+            levelWritePos += numLevels;
+            globalChunkByteOffset += (long)chunk.SizeBytes;
+        }
+
+        int totalData = 0;
+        foreach (var d in dataChunks) totalData = checked(totalData + d.Length);
+        var data = new byte[totalData];
+        int writePos = 0;
+        foreach (var d in dataChunks)
+        {
+            d.CopyTo(data, writePos);
+            writePos += d.Length;
+        }
+
+        return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null, /*innerNullCount*/ 0,
+            /*ValueBytesPerItem*/ 0, visibleItems, globalOffsets, data);
     }
 
     /// <summary>

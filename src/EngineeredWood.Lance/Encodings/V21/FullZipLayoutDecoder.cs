@@ -48,16 +48,19 @@ internal static class FullZipLayoutDecoder
     /// FSL inner has_validity inside a list cascade, will throw with a
     /// clear NotImplementedException.</para>
     /// </summary>
-    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems)
+    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems, int[]? VarOffsets, byte[]? VarData)
         DecodeNestedLeafPage(
             FullZipLayout layout, IArrowType leafType, in PageContext context)
     {
-        if (layout.DetailsCase != FullZipLayout.DetailsOneofCase.BitsPerValue)
-            throw new NotImplementedException(
-                "FullZipLayout(variable-width) inside a list/struct cascade is not yet supported.");
-
         CompressiveEncoding valueEnc = layout.ValueCompression
             ?? throw new LanceFormatException("FullZipLayout has no value_compression.");
+
+        if (layout.DetailsCase == FullZipLayout.DetailsOneofCase.BitsPerOffset)
+            return DecodeNestedLeafPageVariable(layout, valueEnc, leafType, context);
+
+        if (layout.DetailsCase != FullZipLayout.DetailsOneofCase.BitsPerValue)
+            throw new LanceFormatException(
+                "FullZipLayout has no bits_per_value or bits_per_offset.");
 
         // Compute bytes_per_value of the payload AFTER the ctrl word.
         ulong bitsPerValue = layout.BitsPerValue;
@@ -205,7 +208,138 @@ internal static class FullZipLayoutDecoder
         // for primitive leaves it is the primitive width. Cascade walker
         // doesn't care which.
         return (valueBytes, rep, def, innerValidity, innerNullCount,
-            valueBytesPerVisibleItem, numVisible);
+            valueBytesPerVisibleItem, numVisible,
+            /*VarOffsets*/ null, /*VarData*/ null);
+    }
+
+    /// <summary>
+    /// Variable-width branch of <see cref="DecodeNestedLeafPage"/>: each
+    /// visible item's payload is a 4-byte little-endian length followed
+    /// by <c>length</c> data bytes. Walks the page byte-by-byte, extracts
+    /// the rep/def control words and per-visible-item payload slices, and
+    /// returns them as a packed (offsets, data) pair for the cascade
+    /// walker. FSST-compressed payloads aren't yet supported on this path.
+    /// </summary>
+    private static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems, int[]? VarOffsets, byte[]? VarData)
+        DecodeNestedLeafPageVariable(
+            FullZipLayout layout, CompressiveEncoding valueEnc,
+            IArrowType leafType, in PageContext context)
+    {
+        if (leafType is not (StringType or BinaryType))
+            throw new NotImplementedException(
+                $"FullZipLayout(variable-width) cascade is only supported for String/Binary leaves (got {leafType}).");
+        if (valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Fsst)
+            throw new NotImplementedException(
+                "FullZipLayout(variable-width, FSST-compressed) inside a cascade is not yet supported.");
+        if (valueEnc.CompressionCase != CompressiveEncoding.CompressionOneofCase.Variable)
+            throw new NotImplementedException(
+                $"FullZipLayout(variable-width) value_compression '{valueEnc.CompressionCase}' is not supported.");
+
+        ulong bitsPerOffset = layout.BitsPerOffset;
+        if (bitsPerOffset != 32)
+            throw new NotImplementedException(
+                $"FullZipLayout(variable-width) bits_per_offset={bitsPerOffset} is not supported (only 32).");
+        int bytesPerLength = checked((int)(bitsPerOffset / 8));
+
+        int numItems = checked((int)layout.NumItems);
+        int numVisible = checked((int)layout.NumVisibleItems);
+
+        int bitsRep = checked((int)layout.BitsRep);
+        int bitsDef = checked((int)layout.BitsDef);
+        int totalBits = bitsRep + bitsDef;
+        int ctrlBytes = totalBits switch
+        {
+            0 => 0,
+            <= 8 => 1,
+            <= 16 => 2,
+            <= 32 => 4,
+            _ => throw new NotImplementedException(
+                $"FullZipLayout ctrl word total_bits={totalBits} is not supported (max 32)."),
+        };
+        ulong defMask = bitsDef == 0 ? 0UL : ((1UL << bitsDef) - 1UL);
+
+        int maxVisibleDef = 0;
+        foreach (var layer in layout.Layers)
+        {
+            if (layer == RepDefLayer.RepdefNullableItem)
+                maxVisibleDef++;
+        }
+
+        ReadOnlySpan<byte> page = context.PageBuffers[0].Span;
+
+        var rep = bitsRep > 0 ? new ushort[numItems] : null;
+        var def = bitsDef > 0 ? new ushort[numItems] : null;
+        var offsets = new int[numVisible + 1];
+        // Pre-pass: compute total data size by walking ctrl + length pairs.
+        // We could combine this with the actual extraction, but a two-pass
+        // approach lets us allocate the data buffer at exact size and copy
+        // payloads without intermediate List<byte[]> allocation.
+        int byteCursor = 0;
+        int visibleSeen = 0;
+        long totalDataLen = 0;
+        for (int i = 0; i < numItems; i++)
+        {
+            if (byteCursor + ctrlBytes > page.Length)
+                throw new LanceFormatException(
+                    $"FullZipLayout(variable-width) page truncated at item {i} (ctrl word).");
+            ulong ctrl = ctrlBytes switch
+            {
+                1 => page[byteCursor],
+                2 => BinaryPrimitives.ReadUInt16LittleEndian(page.Slice(byteCursor, 2)),
+                4 => BinaryPrimitives.ReadUInt32LittleEndian(page.Slice(byteCursor, 4)),
+                _ => throw new InvalidOperationException(),
+            };
+            byteCursor += ctrlBytes;
+            ushort defVal = (ushort)(ctrl & defMask);
+            ushort repVal = (ushort)(ctrl >> bitsDef);
+            if (rep is not null) rep[i] = repVal;
+            if (def is not null) def[i] = defVal;
+
+            bool visible = defVal <= maxVisibleDef;
+            if (visible)
+            {
+                if (byteCursor + bytesPerLength > page.Length)
+                    throw new LanceFormatException(
+                        $"FullZipLayout(variable-width) page truncated at item {i} (length prefix).");
+                uint length = BinaryPrimitives.ReadUInt32LittleEndian(page.Slice(byteCursor, 4));
+                byteCursor += bytesPerLength;
+                if (byteCursor + length > page.Length)
+                    throw new LanceFormatException(
+                        $"FullZipLayout(variable-width) page truncated at item {i} (payload, length={length}).");
+                totalDataLen = checked(totalDataLen + length);
+                offsets[visibleSeen + 1] = checked((int)totalDataLen);
+                byteCursor += (int)length;
+                visibleSeen++;
+            }
+        }
+
+        if (visibleSeen != numVisible)
+            throw new LanceFormatException(
+                $"FullZipLayout(variable-width) walked {visibleSeen} visible items but layout declared {numVisible}.");
+
+        // Second pass: copy payloads into a contiguous data buffer.
+        byte[] data = new byte[checked((int)totalDataLen)];
+        byteCursor = 0;
+        int writePos = 0;
+        for (int i = 0; i < numItems; i++)
+        {
+            byteCursor += ctrlBytes;
+            ushort defVal = (ushort)(rep is null
+                ? (def![i])
+                : (def![i]));
+            bool visible = defVal <= maxVisibleDef;
+            if (visible)
+            {
+                uint length = BinaryPrimitives.ReadUInt32LittleEndian(page.Slice(byteCursor, 4));
+                byteCursor += bytesPerLength;
+                page.Slice(byteCursor, (int)length).CopyTo(data.AsSpan(writePos));
+                byteCursor += (int)length;
+                writePos += (int)length;
+            }
+        }
+
+        return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null,
+            /*innerNullCount*/ 0, /*ValueBytesPerItem*/ 0, numVisible, offsets, data);
     }
 
     private static int ResolveFslInnerByteSize(FixedSizeList fslEnc, FixedSizeListType fslType)

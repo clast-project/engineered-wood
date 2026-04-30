@@ -572,6 +572,8 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
     {
         if (type is FixedWidthType)
             return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
+        if (type is StringType or BinaryType)
+            return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
         if (type is FixedSizeListType fsl)
         {
             // FSL of primitives is a fixed-width "leaf" from the rep/def
@@ -618,6 +620,8 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         var perPageDef = new List<ushort[]?>(cm.Pages.Count);
         var perPageInnerValidity = new List<byte[]?>(cm.Pages.Count);
         var perPageInnerItemCount = new List<int>(cm.Pages.Count);
+        var perPageVarOffsets = new List<int[]?>(cm.Pages.Count);
+        var perPageVarData = new List<byte[]?>(cm.Pages.Count);
         int visibleItems = 0;
         int totalInnerNullCount = 0;
 
@@ -638,13 +642,15 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 int innerNullCount;
                 int bpi;
                 int visible;
+                int[]? varOffsets;
+                byte[]? varData;
                 Proto.Encodings.V21.RepDefLayer[] pageLayers;
                 switch (pageLayout.LayoutCase)
                 {
                     case Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout:
                     {
                         var mb = pageLayout.MiniBlockLayout;
-                        (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
+                        (vals, r, d, innerValidity, innerNullCount, bpi, visible, varOffsets, varData) =
                             Encodings.V21.MiniBlockLayoutDecoder
                                 .DecodeNestedLeafChunk(mb, leafType, pageContext);
                         pageLayers = mb.Layers.ToArray();
@@ -653,7 +659,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     case Proto.Encodings.V21.PageLayout.LayoutOneofCase.FullZipLayout:
                     {
                         var fz = pageLayout.FullZipLayout;
-                        (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
+                        (vals, r, d, innerValidity, innerNullCount, bpi, visible, varOffsets, varData) =
                             Encodings.V21.FullZipLayoutDecoder
                                 .DecodeNestedLeafPage(fz, leafType, pageContext);
                         pageLayers = fz.Layers.ToArray();
@@ -680,6 +686,8 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 perPageRep.Add(r);
                 perPageDef.Add(d);
                 perPageInnerValidity.Add(innerValidity);
+                perPageVarOffsets.Add(varOffsets);
+                perPageVarData.Add(varData);
                 int pageInnerItemCount = leafType is FixedSizeListType fslLeaf
                     ? checked(visible * fslLeaf.ListSize)
                     : 0;
@@ -700,6 +708,33 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         ushort[]? rep = ConcatUshortStreams(perPageRep);
         ushort[]? def = ConcatUshortStreams(perPageDef);
         byte[]? innerValidityFinal = ConcatBitmaps(perPageInnerValidity, perPageInnerItemCount);
+        // Variable-width leaf (string/binary): concatenate per-page offsets
+        // and data with running adjustment. Each page's offsets[0] is 0
+        // (relative within the page); we shift by the running total of
+        // bytes consumed by prior pages.
+        int[]? varOffsetsFinal = null;
+        byte[]? varDataFinal = null;
+        if (perPageVarOffsets[0] is not null)
+        {
+            int totalDataLen = 0;
+            foreach (var d in perPageVarData) totalDataLen += d?.Length ?? 0;
+            varOffsetsFinal = new int[visibleItems + 1];
+            varDataFinal = new byte[totalDataLen];
+            int dataWritePos = 0;
+            int rowWritePos = 0;
+            for (int p = 0; p < perPageVarOffsets.Count; p++)
+            {
+                int[] po = perPageVarOffsets[p]!;
+                byte[] pd = perPageVarData[p]!;
+                int pageVisible = po.Length - 1;
+                int dataBase = dataWritePos;
+                for (int i = 0; i <= pageVisible; i++)
+                    varOffsetsFinal[rowWritePos + i] = checked(dataBase + po[i]);
+                pd.CopyTo(varDataFinal, dataWritePos);
+                dataWritePos += pd.Length;
+                rowWritePos += pageVisible;
+            }
+        }
 
         int n = layers.Length;
         if (n == 0)
@@ -999,12 +1034,6 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         IArrowArray leafArr;
         if (leafType is FixedSizeListType leafFsl)
         {
-            // FSL leaf: the rep/def cascade produced a row-level validity
-            // bitmap at level 0 (treating each FSL row as one item). The
-            // value bytes are visibleItems * dim * inner-bytes wide; wrap
-            // them as the inner primitive array, then build the FSL. When
-            // FSL.has_validity = true, innerValidityFinal carries per-item
-            // nulls inside the FSL rows.
             int dim = leafFsl.ListSize;
             int rowCount = levelLengths[0];
             int innerCount = checked(rowCount * dim);
@@ -1020,6 +1049,27 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 new[] { rowValidity },
                 children: new[] { innerArr.Data });
             leafArr = new FixedSizeListArray(fslData);
+        }
+        else if (leafType is StringType or BinaryType)
+        {
+            // Variable-width leaf inside a list/struct cascade. Build a
+            // StringArray/BinaryArray from the page-concatenated offsets +
+            // data with the cascade-derived row validity.
+            if (varOffsetsFinal is null || varDataFinal is null)
+                throw new LanceFormatException(
+                    $"Column {columnIndex} has variable-width leaf type {leafType} but no variable offsets/data were produced.");
+            int rowCount = levelLengths[0];
+            var arrowOffsetsBytes = new byte[(rowCount + 1) * sizeof(int)];
+            for (int i = 0; i <= rowCount; i++)
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    arrowOffsetsBytes.AsSpan(i * 4, 4), varOffsetsFinal[i]);
+            ArrowBuffer rowValidity = leafValidity is null
+                ? ArrowBuffer.Empty
+                : new ArrowBuffer(leafValidity);
+            var data = new ArrayData(
+                leafType, rowCount, levelNullCounts[0], offset: 0,
+                new[] { rowValidity, new ArrowBuffer(arrowOffsetsBytes), new ArrowBuffer(varDataFinal) });
+            leafArr = ArrowArrayFactory.BuildArray(data);
         }
         else
         {

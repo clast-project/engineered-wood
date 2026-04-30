@@ -136,6 +136,35 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<medium-string> — strings long enough that pylance picks
+    # FullZipLayout with bits_per_offset=32 and plain Variable value
+    # compression (not FSST). Each visible item = 4-byte length prefix +
+    # `length` bytes of payload, ahead of which sits a per-row ctrl word.
+    import random as _r2
+    _r2.seed(2)
+    _mid_random_strings = [
+        ''.join(chr(_r2.randint(33, 126)) for _ in range(500))
+        for _ in range(15)
+    ]
+    write_one("list_medium_string_v21",
+              pa.table({"x": pa.array([
+                  _mid_random_strings[0:5],
+                  [],
+                  None,
+                  _mid_random_strings[5:9],
+                  _mid_random_strings[9:15],
+              ], type=pa.list_(pa.string()))}),
+              version="2.1")
+
+    # list<string> — pylance encodes via MiniBlockLayout with Variable
+    # value compression in a list cascade. Exercises the variable-width
+    # leaf path inside the recursive walker.
+    write_one("list_string_v21",
+              pa.table({"x": pa.array(
+                  [["alpha", "bb"], [], None, ["gamma", "", "delta"]],
+                  type=pa.list_(pa.string()))}),
+              version="2.1")
+
     # list<FSL<float32, 1024>> with per-float inner nulls — exercises the
     # FullZip-in-cascade FSL has_validity path. Per-row payload: 128 bytes
     # of inner validity + 4096 bytes of float values, prefixed by 1 ctrl

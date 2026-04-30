@@ -208,6 +208,76 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task FullZip_ListOfMediumString_Variable()
+    {
+        // list<medium-string> — pylance picks FullZipLayout with
+        // bits_per_offset=32 (variable-width) and plain Variable value
+        // compression. Each visible item: 4-byte length + payload, behind
+        // a per-row ctrl word. Cascade walker produces a StringArray leaf.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_medium_string_v21.lance"));
+        Assert.IsType<Apache.Arrow.Types.ListType>(reader.Schema.FieldsList[0].DataType);
+
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(5, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));
+
+        // Row sizes: 5 strings, 0 (empty), null, 4 strings, 6 strings → 15 visible.
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(5, outer.ValueOffsets[1]);
+        Assert.Equal(5, outer.ValueOffsets[2]);
+        Assert.Equal(5, outer.ValueOffsets[3]);
+        Assert.Equal(9, outer.ValueOffsets[4]);
+        Assert.Equal(15, outer.ValueOffsets[5]);
+
+        var leaf = (StringArray)outer.Values;
+        Assert.Equal(15, leaf.Length);
+        // Each leaf string is 500 chars long — spot-check a few.
+        Assert.Equal(500, leaf.GetString(0)!.Length);
+        Assert.Equal(500, leaf.GetString(7)!.Length);
+        Assert.Equal(500, leaf.GetString(14)!.Length);
+        // First and last char of row 0 / row 14 differ (random data).
+        char[] firstChars = new char[15];
+        for (int i = 0; i < 15; i++) firstChars[i] = leaf.GetString(i)![0];
+        // Most rows should have distinct first chars (PRNG over 33-126 = 94 options × 15).
+        Assert.True(new HashSet<char>(firstChars).Count >= 5,
+            $"Expected diverse first chars, got: {string.Concat(firstChars)}");
+    }
+
+    [Fact]
+    public async Task List_Of_String()
+    {
+        // list<string> — MiniBlockLayout with Variable value-compression
+        // in a list cascade. Tests the variable-width leaf path:
+        // chunk-level offsets are concatenated with running adjustment,
+        // and the cascade walker builds a StringArray (not a primitive
+        // FixedWidthArray) at the leaf.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_string_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));
+
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(2, outer.ValueOffsets[1]);
+        Assert.Equal(2, outer.ValueOffsets[2]);
+        Assert.Equal(2, outer.ValueOffsets[3]);
+        Assert.Equal(5, outer.ValueOffsets[4]);
+
+        var leaf = (StringArray)outer.Values;
+        Assert.Equal(5, leaf.Length);
+        Assert.Equal("alpha", leaf.GetString(0));
+        Assert.Equal("bb", leaf.GetString(1));
+        Assert.Equal("gamma", leaf.GetString(2));
+        Assert.Equal("", leaf.GetString(3));
+        Assert.Equal("delta", leaf.GetString(4));
+    }
+
+    [Fact]
     public async Task List_Int32_BigMultiChunk()
     {
         // 100K rows × 1-5 ints/list with full-int32-range values. pylance
