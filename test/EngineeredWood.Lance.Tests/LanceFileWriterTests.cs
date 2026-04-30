@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
@@ -562,6 +563,126 @@ public class LanceFileWriterTests
             Assert.Equal(rows * dim, readInner.Length);
             for (int i = 0; i < rows * dim; i++)
                 Assert.Equal(i, readInner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task DateTimeTypes_RoundTrip_ViaOurReader()
+    {
+        // Date32, Date64, Time32(s/ms), Time64(us/ns), Timestamp(us, no tz),
+        // Timestamp(us, UTC), Duration(ms). Each Arrow array goes through
+        // LanceFileWriter.WriteColumnAsync; the reader builds the right
+        // Arrow type from the logical-type string.
+        // Build the typed Arrow arrays from raw int32/int64 buffers so we
+        // can specify exact wire values without going through the Builders'
+        // DateTime/DateTimeOffset surfaces.
+        T Build32<T>(IArrowType type, int[] values, Func<ArrayData, T> ctor)
+            where T : IArrowArray
+        {
+            byte[] bytes = MemoryMarshal.AsBytes(values.AsSpan()).ToArray();
+            return ctor(new ArrayData(
+                type, values.Length, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) }));
+        }
+        T Build64<T>(IArrowType type, long[] values, Func<ArrayData, T> ctor)
+            where T : IArrowArray
+        {
+            byte[] bytes = MemoryMarshal.AsBytes(values.AsSpan()).ToArray();
+            return ctor(new ArrayData(
+                type, values.Length, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) }));
+        }
+
+        var d32 = Build32(Date32Type.Default,
+            new int[] { 0, 19000, 20000 }, d => new Date32Array(d));
+        var d64 = Build64(Date64Type.Default,
+            new long[] { 0, 86_400_000, 172_800_000 }, d => new Date64Array(d));
+        var t32s = Build32(new Time32Type(TimeUnit.Second),
+            new int[] { 0, 3600, 7200 }, d => new Time32Array(d));
+        var t32ms = Build32(new Time32Type(TimeUnit.Millisecond),
+            new int[] { 0, 86_400_000 - 1, 123 }, d => new Time32Array(d));
+        var t64us = Build64(new Time64Type(TimeUnit.Microsecond),
+            new long[] { 0, 1_000_000, 86_399_999_999 }, d => new Time64Array(d));
+        var t64ns = Build64(new Time64Type(TimeUnit.Nanosecond),
+            new long[] { 0, 1_000_000_000, 86_400_000_000_000 - 1 }, d => new Time64Array(d));
+        // Build TimestampArrays from raw int64 values directly (the Builder
+        // takes DateTimeOffset, but we want exact int64 control here).
+        TimestampArray BuildTs(TimestampType type, long[] values)
+        {
+            byte[] bytes = new byte[values.Length * 8];
+            for (int i = 0; i < values.Length; i++)
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+                    bytes.AsSpan(i * 8, 8), values[i]);
+            return new TimestampArray(new ArrayData(
+                type, values.Length, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) }));
+        }
+        var tsValues = new long[] { 0L, 1_700_000_000_000_000L, 1_800_000_000_000_000L };
+        var tsNoTz = BuildTs(new TimestampType(TimeUnit.Microsecond, (string?)null), tsValues);
+        var tsUtc = BuildTs(new TimestampType(TimeUnit.Microsecond, "UTC"), tsValues);
+        var dur = Build64(DurationType.Millisecond,
+            new long[] { 0, 1_000, 60_000 }, d => new DurationArray(d));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-dt-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("d32", d32);
+                await writer.WriteColumnAsync("d64", d64);
+                await writer.WriteColumnAsync("t32s", t32s);
+                await writer.WriteColumnAsync("t32ms", t32ms);
+                await writer.WriteColumnAsync("t64us", t64us);
+                await writer.WriteColumnAsync("t64ns", t64ns);
+                await writer.WriteColumnAsync("tsNoTz", tsNoTz);
+                await writer.WriteColumnAsync("tsUtc", tsUtc);
+                await writer.WriteColumnAsync("dur", dur);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(3, reader.NumberOfRows);
+            Assert.IsType<Date32Type>(reader.Schema.FieldsList[0].DataType);
+            Assert.IsType<Date64Type>(reader.Schema.FieldsList[1].DataType);
+            Assert.Equal(TimeUnit.Second, ((Time32Type)reader.Schema.FieldsList[2].DataType).Unit);
+            Assert.Equal(TimeUnit.Millisecond, ((Time32Type)reader.Schema.FieldsList[3].DataType).Unit);
+            Assert.Equal(TimeUnit.Microsecond, ((Time64Type)reader.Schema.FieldsList[4].DataType).Unit);
+            Assert.Equal(TimeUnit.Nanosecond, ((Time64Type)reader.Schema.FieldsList[5].DataType).Unit);
+            var tsNoTzType = (TimestampType)reader.Schema.FieldsList[6].DataType;
+            Assert.Equal(TimeUnit.Microsecond, tsNoTzType.Unit);
+            Assert.Null(tsNoTzType.Timezone);
+            var tsUtcType = (TimestampType)reader.Schema.FieldsList[7].DataType;
+            Assert.Equal("UTC", tsUtcType.Timezone);
+            Assert.Equal(TimeUnit.Millisecond, ((DurationType)reader.Schema.FieldsList[8].DataType).Unit);
+
+            int[] ReadInts(IArrowArray a)
+            {
+                var fw = (FixedWidthType)a.Data.DataType;
+                Assert.Equal(32, fw.BitWidth);
+                var span = MemoryMarshal.Cast<byte, int>(a.Data.Buffers[1].Span.Slice(0, a.Length * 4));
+                return span.ToArray();
+            }
+            long[] ReadLongs(IArrowArray a)
+            {
+                var fw = (FixedWidthType)a.Data.DataType;
+                Assert.Equal(64, fw.BitWidth);
+                var span = MemoryMarshal.Cast<byte, long>(a.Data.Buffers[1].Span.Slice(0, a.Length * 8));
+                return span.ToArray();
+            }
+
+            Assert.Equal(new[] { 0, 19000, 20000 }, ReadInts(await reader.ReadColumnAsync(0)));
+            Assert.Equal(new long[] { 0, 86_400_000, 172_800_000 }, ReadLongs(await reader.ReadColumnAsync(1)));
+            Assert.Equal(new[] { 0, 3600, 7200 }, ReadInts(await reader.ReadColumnAsync(2)));
+            Assert.Equal(new[] { 0, 86_400_000 - 1, 123 }, ReadInts(await reader.ReadColumnAsync(3)));
+            Assert.Equal(new long[] { 0, 1_000_000, 86_399_999_999 }, ReadLongs(await reader.ReadColumnAsync(4)));
+            Assert.Equal(new long[] { 0, 1_000_000_000, 86_400_000_000_000 - 1 }, ReadLongs(await reader.ReadColumnAsync(5)));
+            Assert.Equal(new long[] { 0, 1_700_000_000_000_000, 1_800_000_000_000_000 }, ReadLongs(await reader.ReadColumnAsync(6)));
+            Assert.Equal(new long[] { 0, 1_700_000_000_000_000, 1_800_000_000_000_000 }, ReadLongs(await reader.ReadColumnAsync(7)));
+            Assert.Equal(new long[] { 0, 1_000, 60_000 }, ReadLongs(await reader.ReadColumnAsync(8)));
         }
         finally
         {

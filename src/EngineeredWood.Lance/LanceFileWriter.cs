@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.Lance.Format;
 using EngineeredWood.Lance.Proto;
@@ -296,6 +297,23 @@ public sealed class LanceFileWriter : IAsyncDisposable
             UInt64Array a => ("uint64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
             FloatArray a => ("float", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
             DoubleArray a => ("double", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+
+            // Date / Time / Timestamp / Duration are fixed-width primitives
+            // backed by int32 or int64 with a Lance logical-type string
+            // that encodes the unit (and timezone for Timestamp). The
+            // reader's LanceSchemaConverter already understands these
+            // strings; the wire encoding is just Flat.
+            Date32Array a => ("date32:day", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Date64Array a => ("date64:ms", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time32Array a => ($"time:{TimeUnitToString(((Time32Type)a.Data.DataType).Unit)}",
+                              4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time64Array a => ($"time:{TimeUnitToString(((Time64Type)a.Data.DataType).Unit)}",
+                              8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            TimestampArray a => (TimestampLogicalType((TimestampType)a.Data.DataType),
+                                 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DurationArray a => ($"duration:{TimeUnitToString(((DurationType)a.Data.DataType).Unit)}",
+                                8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+
             _ => throw new NotSupportedException(
                 $"LanceFileWriter doesn't yet support Arrow array type '{array.GetType().Name}'."),
         };
@@ -303,6 +321,25 @@ public sealed class LanceFileWriter : IAsyncDisposable
         return WriteFlatPageAsync(
             name, logicalType, bytesPerValue, array.Length, valueBytes,
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
+    }
+
+    private static string TimeUnitToString(Apache.Arrow.Types.TimeUnit unit) => unit switch
+    {
+        Apache.Arrow.Types.TimeUnit.Second => "s",
+        Apache.Arrow.Types.TimeUnit.Millisecond => "ms",
+        Apache.Arrow.Types.TimeUnit.Microsecond => "us",
+        Apache.Arrow.Types.TimeUnit.Nanosecond => "ns",
+        _ => throw new NotSupportedException($"Unknown TimeUnit {unit}."),
+    };
+
+    private static string TimestampLogicalType(Apache.Arrow.Types.TimestampType ts)
+    {
+        // Lance writes "timestamp:{unit}:{tz}" with "-" as the placeholder
+        // for a missing timezone. Match exactly what pylance emits so the
+        // schema text round-trips byte-for-byte.
+        string unit = TimeUnitToString(ts.Unit);
+        string tz = string.IsNullOrEmpty(ts.Timezone) ? "-" : ts.Timezone;
+        return $"timestamp:{unit}:{tz}";
     }
 
     private static byte[]? ExtractValidityBitmap(IArrowArray array)
