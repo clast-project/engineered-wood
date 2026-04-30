@@ -281,6 +281,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteVariableColumnAsync(name, "string", sa, cancellationToken);
         if (array is BinaryArray ba)
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
+        if (array is FixedSizeListArray fsl)
+            return WriteFixedSizeListColumnAsync(name, fsl, cancellationToken);
 
         var (logicalType, bytesPerValue, valueBytes) = array switch
         {
@@ -314,34 +316,152 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Plans a multi-chunk Flat-encoded page. Picks the largest power-of-2
-    /// item count whose chunk fits in 32 KB, then carves the input value
-    /// bytes into chunks of that size (last chunk holds the remainder).
+    /// Plans a multi-chunk Flat-encoded page. Thin wrapper over
+    /// <see cref="WriteFixedWidthPageAsync"/>.
     /// </summary>
     private Task WriteFlatPageAsync(
         string name, string logicalType, int bytesPerValue,
         int numItems, byte[] valueBytes,
         byte[]? validityBitmap, int nullCount,
         CancellationToken cancellationToken)
+        => WriteFixedWidthPageAsync(
+            name, logicalType, bytesPerValue, FlatEncoding(bytesPerValue * 8),
+            numItems, valueBytes, validityBitmap, nullCount, cancellationToken);
+
+    /// <summary>
+    /// Plans a multi-chunk page for any value encoding that lays out
+    /// <paramref name="bytesPerItem"/>-byte items contiguously
+    /// (Flat values, FSL rows, etc.). Picks the largest power-of-2 item
+    /// count whose chunk fits in 32 KB, then carves the input value
+    /// bytes into chunks of that size.
+    /// </summary>
+    private Task WriteFixedWidthPageAsync(
+        string name, string logicalType, int bytesPerItem,
+        CompressiveEncoding valueEncoding,
+        int numItems, byte[] valueBytes,
+        byte[]? validityBitmap, int nullCount,
+        CancellationToken cancellationToken)
     {
         bool hasDef = nullCount > 0 && validityBitmap is not null;
-        int chunkSize = LargestPow2FlatChunkSize(bytesPerValue, hasDef);
+        int chunkSize = LargestPow2FlatChunkSize(bytesPerItem, hasDef);
 
         var chunks = new List<(int itemStart, int itemCount, byte[] valueBuf)>();
         int idx = 0;
-        while (idx < numItems)
+        // Fast path: if all items fit in a single chunk, emit one chunk
+        // covering everything. The spec lets the LAST chunk have any item
+        // count (only non-last chunks need power-of-2 sizes), so this is
+        // valid even when numItems isn't a power of 2 — and lets us avoid
+        // multi-chunk encoding for FSL (the reader's FSL path is single-
+        // chunk only) and similar layouts.
+        if (numItems > 0
+            && ChunkTotalBytes(numItems, numItems * bytesPerItem, hasDef) <= MaxChunkBytes)
         {
-            int items = Math.Min(numItems - idx, chunkSize);
-            byte[] chunkValBytes = new byte[items * bytesPerValue];
-            new ReadOnlySpan<byte>(valueBytes, idx * bytesPerValue, items * bytesPerValue)
+            byte[] chunkValBytes = new byte[numItems * bytesPerItem];
+            new ReadOnlySpan<byte>(valueBytes, 0, numItems * bytesPerItem)
                 .CopyTo(chunkValBytes);
-            chunks.Add((idx, items, chunkValBytes));
-            idx += items;
+            chunks.Add((0, numItems, chunkValBytes));
+        }
+        else
+        {
+            while (idx < numItems)
+            {
+                int items = Math.Min(numItems - idx, chunkSize);
+                byte[] chunkValBytes = new byte[items * bytesPerItem];
+                new ReadOnlySpan<byte>(valueBytes, idx * bytesPerItem, items * bytesPerItem)
+                    .CopyTo(chunkValBytes);
+                chunks.Add((idx, items, chunkValBytes));
+                idx += items;
+            }
         }
 
         return WriteMultiChunkPageAsync(
-            name, logicalType, FlatEncoding(bytesPerValue * 8), numItems, chunks,
+            name, logicalType, valueEncoding, numItems, chunks,
             validityBitmap, nullCount, cancellationToken);
+    }
+
+    private Task WriteFixedSizeListColumnAsync(
+        string name, FixedSizeListArray array, CancellationToken cancellationToken)
+    {
+        // v2.1 encodes FSL-of-primitive in a single column whose
+        // value_compression is FixedSizeList { items_per_value, values=Flat }.
+        // Each "item" from the chunker's perspective is one FSL row of
+        // dim*inner_bytes wide; the row-level rep/def cascade is just
+        // [ALL_VALID_ITEM] or [NULLABLE_ITEM]. Inner-element nulls would
+        // require has_validity=true plus an inner-validity bitmap per
+        // chunk — deferred (this is the simpler primitive-no-inner-nulls
+        // path; pylance handles the inner-nulls path on its own writer
+        // and our reader supports it).
+        if (array.Data.DataType is not Apache.Arrow.Types.FixedSizeListType fslType)
+            throw new InvalidOperationException(
+                $"FixedSizeListArray has unexpected data type {array.Data.DataType}.");
+        if (fslType.ValueDataType is not Apache.Arrow.Types.FixedWidthType innerFw)
+            throw new NotSupportedException(
+                $"LanceFileWriter only supports FixedSizeList of fixed-width primitives " +
+                $"(got inner {fslType.ValueDataType}).");
+
+        // Resolve the inner type's logical-type string so the schema
+        // matches what the reader's LanceSchemaConverter expects.
+        string innerLogical = innerFw switch
+        {
+            Apache.Arrow.Types.Int8Type => "int8",
+            Apache.Arrow.Types.UInt8Type => "uint8",
+            Apache.Arrow.Types.Int16Type => "int16",
+            Apache.Arrow.Types.UInt16Type => "uint16",
+            Apache.Arrow.Types.Int32Type => "int32",
+            Apache.Arrow.Types.UInt32Type => "uint32",
+            Apache.Arrow.Types.Int64Type => "int64",
+            Apache.Arrow.Types.UInt64Type => "uint64",
+            Apache.Arrow.Types.FloatType => "float",
+            Apache.Arrow.Types.DoubleType => "double",
+            _ => throw new NotSupportedException(
+                $"FixedSizeList inner type {innerFw} is not yet supported by the writer."),
+        };
+
+        int dim = fslType.ListSize;
+        int innerBytes = innerFw.BitWidth / 8;
+        int bytesPerRow = dim * innerBytes;
+        int numItems = array.Length;
+
+        // Inner array's value buffer holds dim*numItems items concatenated
+        // in row order. Apache.Arrow stores them on the child array's
+        // Buffers[1] (Buffers[0] = inner validity bitmap, which we don't
+        // emit for now since has_validity=false).
+        var innerValuesBuf = array.Values.Data.Buffers[1];
+        if (innerValuesBuf.IsEmpty)
+            throw new LanceFormatException(
+                "FixedSizeListArray inner values buffer is empty.");
+        int totalBytes = checked(numItems * bytesPerRow);
+        if (innerValuesBuf.Length < totalBytes)
+            throw new LanceFormatException(
+                $"FixedSizeListArray inner buffer {innerValuesBuf.Length} bytes < expected {totalBytes}.");
+        var valueBytes = new byte[totalBytes];
+        innerValuesBuf.Span.Slice(0, totalBytes).CopyTo(valueBytes);
+
+        // Inner array nulls would force has_validity=true; reject for now
+        // with a clear pointer (the reader-side cascade handles it).
+        if (array.Values.NullCount > 0)
+            throw new NotSupportedException(
+                "FixedSizeListArray with inner-element nulls (has_validity=true) " +
+                "is not yet supported by the writer.");
+
+        var valueEncoding = new CompressiveEncoding
+        {
+            FixedSizeList = new Proto.Encodings.V21.FixedSizeList
+            {
+                ItemsPerValue = (ulong)dim,
+                HasValidity = false,
+                Values = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)(innerBytes * 8) },
+                },
+            },
+        };
+        string logicalType = $"fixed_size_list:{innerLogical}:{dim}";
+
+        return WriteFixedWidthPageAsync(
+            name, logicalType, bytesPerRow, valueEncoding,
+            numItems, valueBytes,
+            ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
     private Task WriteVariableColumnAsync(
@@ -549,8 +669,15 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
             byte[] cb = new byte[chunkTotal];
             int cursor = 0;
+            // num_levels: for Flat/Variable item-shape chunks the reader
+            // only needs this when there are def levels. For the FSL
+            // value-compression path the reader instead asserts
+            // num_levels == num_rows even without def — set it to
+            // itemCount whenever the chunk is FSL-shaped (or has def).
+            bool isFsl = valueEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.FixedSizeList;
             BinaryPrimitives.WriteUInt16LittleEndian(
-                cb.AsSpan(cursor, 2), checked((ushort)(hasDef ? itemCount : 0)));
+                cb.AsSpan(cursor, 2), checked((ushort)((hasDef || isFsl) ? itemCount : 0)));
             cursor += 2;
             if (hasDef)
             {

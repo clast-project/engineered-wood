@@ -480,6 +480,160 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task FixedSizeListFloat_RoundTrip_ViaOurReader()
+    {
+        // FixedSizeList<float32, 4> with 3 rows. Tests the writer's FSL
+        // value-compression path: a single column with logical_type
+        // "fixed_size_list:float:4" and value_compression FSL{dim=4,
+        // values=Flat(32)}.
+        const int dim = 4;
+        var inner = new FloatArray.Builder()
+            .Append(0f).Append(1f).Append(2f).Append(3f)
+            .Append(10f).Append(11f).Append(12f).Append(13f)
+            .Append(20f).Append(21f).Append(22f).Append(23f)
+            .Build();
+        var fsl = new FixedSizeListArray(
+            new ArrayData(
+                new FixedSizeListType(new Field("item", FloatType.Default, nullable: true), dim),
+                length: 3, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty },
+                children: new[] { inner.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-fsl-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("emb", fsl);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(3, reader.NumberOfRows);
+            var fslType = Assert.IsType<FixedSizeListType>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(dim, fslType.ListSize);
+            Assert.IsType<FloatType>(fslType.ValueDataType);
+
+            var read = (FixedSizeListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(0, read.NullCount);
+            var readInner = (FloatArray)read.Values;
+            Assert.Equal(12, readInner.Length);
+            for (int i = 0; i < 12; i++)
+                Assert.Equal((float)((i / 4) * 10 + (i % 4)), readInner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task FixedSizeListInt32_LargeDim_RoundTrip_ViaOurReader()
+    {
+        // 5 rows × 1024 int32 = 20 KB. Each row exceeds the chunker's
+        // smallest unit but stays under MaxChunkBytes; single chunk.
+        const int dim = 1024;
+        const int rows = 5;
+        var inner = new Int32Array.Builder();
+        for (int row = 0; row < rows; row++)
+            for (int j = 0; j < dim; j++) inner.Append(row * dim + j);
+        var innerArr = inner.Build();
+        var fsl = new FixedSizeListArray(
+            new ArrayData(
+                new FixedSizeListType(new Field("item", Int32Type.Default, nullable: true), dim),
+                length: rows, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty },
+                children: new[] { innerArr.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-fsl-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("emb", fsl);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (FixedSizeListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(rows, read.Length);
+            var readInner = (Int32Array)read.Values;
+            Assert.Equal(rows * dim, readInner.Length);
+            for (int i = 0; i < rows * dim; i++)
+                Assert.Equal(i, readInner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task FixedSizeListFloat_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+
+        const int dim = 8;
+        var inner = new FloatArray.Builder();
+        for (int i = 0; i < 4 * dim; i++) inner.Append(i * 0.5f);
+        var fsl = new FixedSizeListArray(
+            new ArrayData(
+                new FixedSizeListType(new Field("item", FloatType.Default, nullable: true), dim),
+                length: 4, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty },
+                children: new[] { inner.Build().Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-pylance-fsl-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("emb", fsl);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'type': str(t.schema[0].type), 'flat': [list(x) for x in t['emb'].to_pylist()] }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(4, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.StartsWith("fixed_size_list", json.RootElement.GetProperty("type").GetString());
+            int idx = 0;
+            foreach (var row in json.RootElement.GetProperty("flat").EnumerateArray())
+            {
+                foreach (var v in row.EnumerateArray())
+                {
+                    Assert.Equal(idx * 0.5f, v.GetSingle());
+                    idx++;
+                }
+            }
+            Assert.Equal(4 * dim, idx);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task NullableInt32_RoundTrip_ViaOurReader()
     {
         string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");
