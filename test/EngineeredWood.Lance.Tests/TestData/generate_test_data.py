@@ -136,6 +136,33 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # struct<int32, FixedSizeList<float32, 3>> — FSL inside a struct.
+    _struct_fsl_t = pa.struct([
+        ("id", pa.int32()),
+        ("emb", pa.list_(pa.float32(), list_size=3)),
+    ])
+    write_one("struct_fsl_v21",
+              pa.table({"r": pa.array([
+                  {"id": 1, "emb": [1.0, 2.0, 3.0]},
+                  {"id": 2, "emb": [4.0, 5.0, 6.0]},
+                  {"id": 3, "emb": [7.0, 8.0, 9.0]},
+              ], type=_struct_fsl_t)}),
+              version="2.1")
+
+    # list<FixedSizeList<float32, 3>> — exercises the recursive walker's
+    # FSL dispatch. Mixed shapes: empty inner list, null outer row,
+    # and 1-2 FSL rows per outer list. has_validity stays false (no
+    # per-float nulls).
+    _list_fsl_t = pa.list_(pa.list_(pa.float32(), list_size=3))
+    write_one("list_fsl_float_v21",
+              pa.table({"lf": pa.array(
+                  [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                   [],
+                   None,
+                   [[7.0, 8.0, 9.0]]],
+                  type=_list_fsl_t)}),
+              version="2.1")
+
     # Large list<int32> → triggers a multi-chunk page on the leaf column.
     # Use full-int32-range values via a PRNG-style formula so pylance
     # picks Flat (not InlineBitpacking) for the leaf encoding. 100K rows

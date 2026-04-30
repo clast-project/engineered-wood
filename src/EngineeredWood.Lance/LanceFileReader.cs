@@ -264,19 +264,17 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     return total;
                 }
             case Apache.Arrow.Types.ListType lt:
-                if (lt.ValueDataType is FixedSizeListType)
-                    throw new NotImplementedException(
-                        $"Field '{fieldPath}': list of FixedSizeList is not yet supported for v2.1.");
                 return ValidateAndCountLeavesV21(lt.ValueDataType, $"{fieldPath}[]");
             case LargeListType llt:
-                if (llt.ValueDataType is FixedSizeListType)
-                    throw new NotImplementedException(
-                        $"Field '{fieldPath}': LargeList of FixedSizeList is not yet supported for v2.1.");
                 return ValidateAndCountLeavesV21(llt.ValueDataType, $"{fieldPath}[]");
             case FixedSizeListType fsl:
+                // v2.1 wraps FSL of primitive into a single column via the
+                // FSL value-compression. FSL of struct/list/FSL is a v2.2+
+                // feature and pylance refuses to write it in v2.1.
                 if (fsl.ValueDataType is not FixedWidthType)
                     throw new NotImplementedException(
-                        $"Field '{fieldPath}': FixedSizeListType with non-primitive items ({fsl.ValueDataType}) is not yet supported for v2.1.");
+                        $"Field '{fieldPath}': FixedSizeList<{fsl.ValueDataType}> requires Lance v2.2+ " +
+                        "(pylance only writes FSL-of-primitive in v2.1).");
                 return 1;
             default:
                 throw new NotImplementedException(
@@ -534,6 +532,19 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
     {
         if (type is FixedWidthType)
             return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
+        if (type is FixedSizeListType fsl)
+        {
+            // FSL of primitives is a fixed-width "leaf" from the rep/def
+            // walker's point of view: each visible item is one FSL row of
+            // dimension * inner-bytes. ResolveFlatBytesPerValue handles the
+            // bytes-per-item math; ReadV21NestedLeafAsync wraps the bytes
+            // in a FixedSizeListArray when leafType is FSL.
+            if (fsl.ValueDataType is not FixedWidthType)
+                throw new NotImplementedException(
+                    $"Recursive walker for FixedSizeList<{fsl.ValueDataType}> is not yet supported " +
+                    "(only FixedSizeList of primitive items in v2.1).");
+            return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
+        }
         if (type is StructType st)
             return await ReadV21NestedStructAsync(st, startColumn, cancellationToken).ConfigureAwait(false);
         if (type is Apache.Arrow.Types.ListType or LargeListType)
@@ -909,8 +920,33 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         byte[]? leafValidity = (levelBitmaps[0] is not null && levelNullCounts[0] > 0)
             ? levelBitmaps[0]
             : null;
-        var leafArr = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
-            leafType, levelLengths[0], valueBytes, leafValidity, levelNullCounts[0]);
+        IArrowArray leafArr;
+        if (leafType is FixedSizeListType leafFsl)
+        {
+            // FSL leaf: the rep/def cascade produced a row-level validity
+            // bitmap at level 0 (treating each FSL row as one item). The
+            // value bytes are visibleItems * dim * inner-bytes wide; wrap
+            // them as the inner primitive array, then build the FSL.
+            int dim = leafFsl.ListSize;
+            int rowCount = levelLengths[0];
+            int innerCount = checked(rowCount * dim);
+            var innerArr = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
+                leafFsl.ValueDataType, innerCount, valueBytes,
+                validityBitmap: null, nullCount: 0);
+            ArrowBuffer rowValidity = leafValidity is null
+                ? ArrowBuffer.Empty
+                : new ArrowBuffer(leafValidity);
+            var fslData = new ArrayData(
+                leafFsl, rowCount, levelNullCounts[0], offset: 0,
+                new[] { rowValidity },
+                children: new[] { innerArr.Data });
+            leafArr = new FixedSizeListArray(fslData);
+        }
+        else
+        {
+            leafArr = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
+                leafType, levelLengths[0], valueBytes, leafValidity, levelNullCounts[0]);
+        }
 
         // Build ancestor LevelInfos for layers 1..n-1.
         var ancestors = new LevelInfo[n - 1];

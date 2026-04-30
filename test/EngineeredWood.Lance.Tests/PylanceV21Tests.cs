@@ -124,6 +124,58 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_With_FixedSizeList_Float32()
+    {
+        // struct<int32, FSL<float32, 3>> — FSL inside a struct.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("struct_fsl_v21.lance"));
+        var st = (StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(3, st.Length);
+        Assert.Equal(0, st.NullCount);
+
+        var ids = (Int32Array)st.Fields[0];
+        Assert.Equal(new int?[] { 1, 2, 3 }, ids.ToArray());
+
+        var emb = (FixedSizeListArray)st.Fields[1];
+        Assert.Equal(3, emb.Length);
+        Assert.Equal(3, ((FixedSizeListType)emb.Data.DataType).ListSize);
+        var inner = (FloatArray)emb.Values;
+        Assert.Equal(9, inner.Length);
+        Assert.Equal(new float?[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f }, inner.ToArray());
+    }
+
+    [Fact]
+    public async Task List_Of_FixedSizeList_Float32()
+    {
+        // list<FSL<float32, 3>> — exercises FSL inside the recursive walker.
+        // Outer rows: [[1,2,3],[4,5,6]], [], null, [[7,8,9]].
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_fsl_float_v21.lance"));
+        Assert.IsType<Apache.Arrow.Types.ListType>(reader.Schema.FieldsList[0].DataType);
+
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));
+
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(2, outer.ValueOffsets[1]);  // row 0 has 2 FSL items
+        Assert.Equal(2, outer.ValueOffsets[2]);  // row 1 empty
+        Assert.Equal(2, outer.ValueOffsets[3]);  // row 2 null
+        Assert.Equal(3, outer.ValueOffsets[4]);  // row 3 has 1 FSL item
+
+        var fsls = (FixedSizeListArray)outer.Values;
+        Assert.Equal(3, fsls.Length);
+        Assert.Equal(0, fsls.NullCount);
+        Assert.Equal(3, ((FixedSizeListType)fsls.Data.DataType).ListSize);
+
+        var inner = (FloatArray)fsls.Values;
+        Assert.Equal(9, inner.Length);
+        Assert.Equal(new float?[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f }, inner.ToArray());
+    }
+
+    [Fact]
     public async Task List_Int32_BigMultiChunk()
     {
         // 100K rows × 1-5 ints/list with full-int32-range values. pylance

@@ -15,5 +15,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+## Temporary files
+tmp/
+
 ## Claude Code session state
 .claude/

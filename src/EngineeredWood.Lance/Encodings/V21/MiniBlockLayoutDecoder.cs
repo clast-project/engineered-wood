@@ -256,6 +256,25 @@ internal static class MiniBlockLayoutDecoder
         if (encoding is null)
             throw new LanceFormatException(
                 "MiniBlockLayout has no value_compression.");
+
+        // FSL value-compression: each "item" is one FSL row of
+        // dimension * inner-flat-bytes wide. The cascade walker treats it
+        // exactly like a fixed-width primitive of that width — the bytes
+        // are reassembled into a child Arrow array at the FSL level later.
+        if (encoding.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList
+            && targetType is FixedSizeListType fsl)
+        {
+            FixedSizeList fslEnc = encoding.FixedSizeList;
+            if (fslEnc.Values?.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
+                throw new NotImplementedException(
+                    "FSL MiniBlock with non-Flat inner values is not yet supported.");
+            if ((ulong)fsl.ListSize != fslEnc.ItemsPerValue)
+                throw new LanceFormatException(
+                    $"FSL dimension mismatch: schema={fsl.ListSize} vs encoding={fslEnc.ItemsPerValue}.");
+            int innerBytes = ResolveFlatBytesPerValue(fslEnc.Values, fsl.ValueDataType);
+            return checked((int)fslEnc.ItemsPerValue * innerBytes);
+        }
+
         if (encoding.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
             throw new NotImplementedException(
                 $"CompressiveEncoding '{encoding.CompressionCase}' is not yet supported (Phase 6 handles Flat).");
