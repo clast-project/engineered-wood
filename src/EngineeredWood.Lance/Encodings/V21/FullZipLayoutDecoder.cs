@@ -66,14 +66,25 @@ internal static class FullZipLayoutDecoder
                 $"FullZipLayout bits_per_value={bitsPerValue} is not yet supported (must be non-zero, byte-aligned).");
         int bytesPerValue = checked((int)(bitsPerValue / 8));
 
-        // FSL with inner has_validity inside a list/struct cascade hasn't
-        // come up yet — pylance would emit an inner-validity bitmap
-        // segment per row that we'd need to thread through. Reject for now.
+        // FSL with inner has_validity = true inside a list cascade: each
+        // visible row's payload starts with ceil(dim/8) inner-validity
+        // bits followed by dim*inner_bytes value bytes, exactly like the
+        // no-rep FSL has_validity FullZip case. We thread the inner
+        // validity bitmap through to the cascade walker.
         bool fslInnerValidity = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList
             && valueEnc.FixedSizeList.HasValidity;
+        int fslDim = 0;
+        int fslInnerByteSize = 0;
+        int fslInnerValidityBytesPerRow = 0;
         if (fslInnerValidity)
-            throw new NotImplementedException(
-                "FullZipLayout(FSL with has_validity=true) inside a list/struct cascade is not yet supported.");
+        {
+            if (leafType is not FixedSizeListType fslLeaf)
+                throw new LanceFormatException(
+                    $"FullZipLayout(FSL has_validity) cannot target non-FSL type {leafType}.");
+            fslDim = checked((int)valueEnc.FixedSizeList.ItemsPerValue);
+            fslInnerByteSize = ResolveFslInnerByteSize(valueEnc.FixedSizeList, fslLeaf);
+            fslInnerValidityBytesPerRow = (fslDim + 7) / 8;
+        }
 
         int numItems = checked((int)layout.NumItems);
         int numVisible = checked((int)layout.NumVisibleItems);
@@ -111,12 +122,24 @@ internal static class FullZipLayoutDecoder
         ReadOnlySpan<byte> page = context.PageBuffers[0].Span;
 
         // Walk every item's ctrl word; visible items consume bytes_per_value
-        // additional bytes of payload.
+        // additional bytes of payload. When FSL has_validity is on, the
+        // payload starts with ceil(dim/8) inner-validity bits before the
+        // dim*inner_bytes value bytes — strip and concat into a global
+        // bitmap covering numVisible * dim inner items.
         var rep = bitsRep > 0 ? new ushort[numItems] : null;
         var def = bitsDef > 0 ? new ushort[numItems] : null;
-        var valueBytes = new byte[checked(numVisible * bytesPerValue)];
+        int valueBytesPerVisibleItem = fslInnerValidity
+            ? fslDim * fslInnerByteSize
+            : bytesPerValue;
+        var valueBytes = new byte[checked(numVisible * valueBytesPerVisibleItem)];
+        byte[]? innerValidity = null;
+        int innerNullCount = 0;
+        if (fslInnerValidity)
+            innerValidity = new byte[(checked(numVisible * fslDim) + 7) / 8];
+
         int byteCursor = 0;
         int valueWritePos = 0;
+        int innerBitWritePos = 0;
         int visibleSeen = 0;
 
         for (int i = 0; i < numItems; i++)
@@ -143,10 +166,32 @@ internal static class FullZipLayoutDecoder
                 if (byteCursor + bytesPerValue > page.Length)
                     throw new LanceFormatException(
                         $"FullZipLayout page truncated at item {i} (value).");
-                page.Slice(byteCursor, bytesPerValue)
-                    .CopyTo(valueBytes.AsSpan(valueWritePos));
-                byteCursor += bytesPerValue;
-                valueWritePos += bytesPerValue;
+                if (fslInnerValidity)
+                {
+                    ReadOnlySpan<byte> rowInnerValidity = page.Slice(byteCursor, fslInnerValidityBytesPerRow);
+                    for (int j = 0; j < fslDim; j++)
+                    {
+                        bool valid = (rowInnerValidity[j >> 3] & (1 << (j & 7))) != 0;
+                        int outIdx = innerBitWritePos + j;
+                        if (valid)
+                            innerValidity![outIdx >> 3] |= (byte)(1 << (outIdx & 7));
+                        else
+                            innerNullCount++;
+                    }
+                    innerBitWritePos += fslDim;
+                    byteCursor += fslInnerValidityBytesPerRow;
+                    page.Slice(byteCursor, valueBytesPerVisibleItem)
+                        .CopyTo(valueBytes.AsSpan(valueWritePos));
+                    byteCursor += valueBytesPerVisibleItem;
+                    valueWritePos += valueBytesPerVisibleItem;
+                }
+                else
+                {
+                    page.Slice(byteCursor, bytesPerValue)
+                        .CopyTo(valueBytes.AsSpan(valueWritePos));
+                    byteCursor += bytesPerValue;
+                    valueWritePos += bytesPerValue;
+                }
                 visibleSeen++;
             }
         }
@@ -155,12 +200,27 @@ internal static class FullZipLayoutDecoder
             throw new LanceFormatException(
                 $"FullZipLayout walked {visibleSeen} visible items but layout declared {numVisible}.");
 
-        // For FSL leaves, valueBytesPerItem is one FSL row's worth of bytes;
+        // For FSL leaves, valueBytesPerItem is one FSL row's worth of bytes
+        // (excluding inner-validity, since that's threaded out separately);
         // for primitive leaves it is the primitive width. Cascade walker
         // doesn't care which.
-        int valueBytesPerItem = bytesPerValue;
-        return (valueBytes, rep, def, /*innerValidity*/ null, /*innerNullCount*/ 0,
-            valueBytesPerItem, numVisible);
+        return (valueBytes, rep, def, innerValidity, innerNullCount,
+            valueBytesPerVisibleItem, numVisible);
+    }
+
+    private static int ResolveFslInnerByteSize(FixedSizeList fslEnc, FixedSizeListType fslType)
+    {
+        if (fslEnc.Values?.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
+            throw new NotImplementedException(
+                "FullZipLayout(FSL has_validity) requires Flat inner values.");
+        ulong innerBits = fslEnc.Values.Flat.BitsPerValue;
+        if (innerBits == 0 || innerBits % 8 != 0)
+            throw new NotImplementedException(
+                $"FullZipLayout(FSL has_validity) inner bits_per_value={innerBits} must be byte-aligned.");
+        if (fslType.ValueDataType is not FixedWidthType innerFw || (ulong)innerFw.BitWidth != innerBits)
+            throw new LanceFormatException(
+                $"FSL inner Arrow type {fslType.ValueDataType} does not match encoding bits={innerBits}.");
+        return checked((int)(innerBits / 8));
     }
 
     public static IArrowArray Decode(

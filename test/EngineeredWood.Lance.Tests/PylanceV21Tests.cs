@@ -319,6 +319,42 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task FullZip_ListOfBigEmbeddings_Float32_x1024_WithInnerNulls()
+    {
+        // list<FSL<float32, 1024>> with per-float nulls — pylance encodes
+        // via FullZipLayout with bits_rep=1 + bits_def=2 + has_validity=true.
+        // Each visible row's payload starts with 128 bytes of inner-validity
+        // bits, followed by 4096 bytes of float values; the cascade walker
+        // threads inner validity through to the FSL child array.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_big_embeddings_inner_nulls_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+
+        var fsls = (FixedSizeListArray)outer.Values;
+        Assert.Equal(3, fsls.Length);
+        Assert.Equal(0, fsls.NullCount);
+
+        var inner = (FloatArray)fsls.Values;
+        Assert.Equal(3 * 1024, inner.Length);
+        Assert.Equal(2, inner.NullCount);
+        // Row 0 of outer has 2 FSLs: first one has null at index 5 →
+        // global inner index 5; second is all-valid.
+        Assert.Equal(0f, inner.GetValue(0));
+        Assert.Null(inner.GetValue(5));
+        Assert.Equal(6f, inner.GetValue(6));
+        // Second FSL of row 0: starts at inner index 1024.
+        Assert.Equal(1f, inner.GetValue(1024));
+        Assert.Equal(1024f, inner.GetValue(1024 + 1023));
+        // Row 3 (after empty + null) has 1 FSL with null at index 7 →
+        // global inner index 2048 + 7 = 2055.
+        Assert.Equal(2f, inner.GetValue(2048));
+        Assert.Null(inner.GetValue(2048 + 7));
+    }
+
+    [Fact]
     public async Task FullZip_NullableEmbeddings_Float32_x1024()
     {
         // 5 rows × 1024 float32, alternating valid/null: pylance encodes

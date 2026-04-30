@@ -136,6 +136,20 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<FSL<float32, 1024>> with per-float inner nulls — exercises the
+    # FullZip-in-cascade FSL has_validity path. Per-row payload: 128 bytes
+    # of inner validity + 4096 bytes of float values, prefixed by 1 ctrl
+    # byte. Outer-row null and empty-list rows skip the payload entirely.
+    write_one("list_big_embeddings_inner_nulls_v21",
+              pa.table({"x": pa.array([
+                  [[float(j) if j != 5 else None for j in range(1024)],
+                   [float(j + 1) for j in range(1024)]],
+                  [],
+                  None,
+                  [[float(j + 2) if j != 7 else None for j in range(1024)]],
+              ], type=pa.list_(pa.list_(pa.float32(), list_size=1024)))}),
+              version="2.1")
+
     # list<FixedSizeList<float32, 1024>> — pylance picks FullZipLayout
     # with bits_rep=1, bits_def=2 (NULL_AND_EMPTY_LIST). Each row in
     # buffer 0 starts with a 1-byte ctrl word (def in low 2 bits, rep in
