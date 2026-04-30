@@ -33,6 +33,136 @@ namespace EngineeredWood.Lance.Encodings.V21;
 /// </summary>
 internal static class FullZipLayoutDecoder
 {
+    /// <summary>
+    /// Walk a FullZipLayout page that lives inside a list/struct cascade and
+    /// produce raw rep/def streams + per-row value bytes for the existing
+    /// nested-leaf cascade walker. Each row in buffer 0 starts with a
+    /// control word that encodes <c>rep</c> in its high bits and <c>def</c>
+    /// in its low <c>bits_def</c> bits; visible items (those with
+    /// <c>def &lt;= max_visible_def</c>) are followed by
+    /// <c>bits_per_value/8</c> bytes of payload, while invisible items
+    /// (e.g. null/empty list rows) carry only the control word.
+    ///
+    /// <para>Currently supports the fixed-width path (FSL of primitive,
+    /// no inner has_validity). Variable-width FullZip with rep, plus
+    /// FSL inner has_validity inside a list cascade, will throw with a
+    /// clear NotImplementedException.</para>
+    /// </summary>
+    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems)
+        DecodeNestedLeafPage(
+            FullZipLayout layout, IArrowType leafType, in PageContext context)
+    {
+        if (layout.DetailsCase != FullZipLayout.DetailsOneofCase.BitsPerValue)
+            throw new NotImplementedException(
+                "FullZipLayout(variable-width) inside a list/struct cascade is not yet supported.");
+
+        CompressiveEncoding valueEnc = layout.ValueCompression
+            ?? throw new LanceFormatException("FullZipLayout has no value_compression.");
+
+        // Compute bytes_per_value of the payload AFTER the ctrl word.
+        ulong bitsPerValue = layout.BitsPerValue;
+        if (bitsPerValue == 0 || bitsPerValue % 8 != 0)
+            throw new NotImplementedException(
+                $"FullZipLayout bits_per_value={bitsPerValue} is not yet supported (must be non-zero, byte-aligned).");
+        int bytesPerValue = checked((int)(bitsPerValue / 8));
+
+        // FSL with inner has_validity inside a list/struct cascade hasn't
+        // come up yet — pylance would emit an inner-validity bitmap
+        // segment per row that we'd need to thread through. Reject for now.
+        bool fslInnerValidity = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList
+            && valueEnc.FixedSizeList.HasValidity;
+        if (fslInnerValidity)
+            throw new NotImplementedException(
+                "FullZipLayout(FSL with has_validity=true) inside a list/struct cascade is not yet supported.");
+
+        int numItems = checked((int)layout.NumItems);
+        int numVisible = checked((int)layout.NumVisibleItems);
+
+        int bitsRep = checked((int)layout.BitsRep);
+        int bitsDef = checked((int)layout.BitsDef);
+        int totalBits = bitsRep + bitsDef;
+        int ctrlBytes = totalBits switch
+        {
+            0 => 0,
+            <= 8 => 1,
+            <= 16 => 2,
+            <= 32 => 4,
+            _ => throw new NotImplementedException(
+                $"FullZipLayout ctrl word total_bits={totalBits} is not supported (max 32)."),
+        };
+        if (ctrlBytes == 0)
+            throw new LanceFormatException(
+                "FullZipLayout reached the nested-leaf path with bits_rep=bits_def=0; " +
+                "this layout has no rep/def to walk.");
+
+        ulong defMask = bitsDef == 0 ? 0UL : ((1UL << bitsDef) - 1UL);
+
+        // max_visible_def = sum of item-level def slots across layers
+        // (NULLABLE_ITEM contributes 1; ALL_VALID_ITEM contributes 0).
+        // List-level layers contribute defs above this threshold and mark
+        // invisible items.
+        int maxVisibleDef = 0;
+        foreach (var layer in layout.Layers)
+        {
+            if (layer == RepDefLayer.RepdefNullableItem)
+                maxVisibleDef++;
+        }
+
+        ReadOnlySpan<byte> page = context.PageBuffers[0].Span;
+
+        // Walk every item's ctrl word; visible items consume bytes_per_value
+        // additional bytes of payload.
+        var rep = bitsRep > 0 ? new ushort[numItems] : null;
+        var def = bitsDef > 0 ? new ushort[numItems] : null;
+        var valueBytes = new byte[checked(numVisible * bytesPerValue)];
+        int byteCursor = 0;
+        int valueWritePos = 0;
+        int visibleSeen = 0;
+
+        for (int i = 0; i < numItems; i++)
+        {
+            if (byteCursor + ctrlBytes > page.Length)
+                throw new LanceFormatException(
+                    $"FullZipLayout page truncated at item {i} (ctrl word).");
+            ulong ctrl = ctrlBytes switch
+            {
+                1 => page[byteCursor],
+                2 => BinaryPrimitives.ReadUInt16LittleEndian(page.Slice(byteCursor, 2)),
+                4 => BinaryPrimitives.ReadUInt32LittleEndian(page.Slice(byteCursor, 4)),
+                _ => throw new InvalidOperationException(),
+            };
+            byteCursor += ctrlBytes;
+            ushort defVal = (ushort)(ctrl & defMask);
+            ushort repVal = (ushort)(ctrl >> bitsDef);
+            if (rep is not null) rep[i] = repVal;
+            if (def is not null) def[i] = defVal;
+
+            bool visible = defVal <= maxVisibleDef;
+            if (visible)
+            {
+                if (byteCursor + bytesPerValue > page.Length)
+                    throw new LanceFormatException(
+                        $"FullZipLayout page truncated at item {i} (value).");
+                page.Slice(byteCursor, bytesPerValue)
+                    .CopyTo(valueBytes.AsSpan(valueWritePos));
+                byteCursor += bytesPerValue;
+                valueWritePos += bytesPerValue;
+                visibleSeen++;
+            }
+        }
+
+        if (visibleSeen != numVisible)
+            throw new LanceFormatException(
+                $"FullZipLayout walked {visibleSeen} visible items but layout declared {numVisible}.");
+
+        // For FSL leaves, valueBytesPerItem is one FSL row's worth of bytes;
+        // for primitive leaves it is the primitive width. Cascade walker
+        // doesn't care which.
+        int valueBytesPerItem = bytesPerValue;
+        return (valueBytes, rep, def, /*innerValidity*/ null, /*innerNullCount*/ 0,
+            valueBytesPerItem, numVisible);
+    }
+
     public static IArrowArray Decode(
         FullZipLayout layout, IArrowType targetType, in PageContext context)
     {

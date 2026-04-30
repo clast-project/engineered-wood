@@ -136,6 +136,21 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<FixedSizeList<float32, 1024>> — pylance picks FullZipLayout
+    # with bits_rep=1, bits_def=2 (NULL_AND_EMPTY_LIST). Each row in
+    # buffer 0 starts with a 1-byte ctrl word (def in low 2 bits, rep in
+    # bit 2); visible rows are followed by 4096-byte FSL payloads. The
+    # nested-leaf path now decodes this via DecodeNestedLeafPage.
+    _list_big_fsl_t = pa.list_(pa.list_(pa.float32(), list_size=1024))
+    write_one("list_big_embeddings_v21",
+              pa.table({"x": pa.array([
+                  [[float(j) for j in range(1024)], [float(j + 1) for j in range(1024)]],
+                  [],
+                  None,
+                  [[float(j + 2) for j in range(1024)]],
+              ], type=_list_big_fsl_t)}),
+              version="2.1")
+
     # FixedSizeList<float32, 1024> nullable — large embeddings with row
     # nulls trigger pylance's FullZipLayout with bits_def=1 + has_validity.
     _embed_dim = 1024

@@ -631,18 +631,43 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     pageBuffers[k] = bufferOwners[k].Memory;
                 var pageContext = new PageContext(pageBuffers);
                 var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
-                if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
-                    throw new NotImplementedException(
-                        $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
-
-                var mb = pageLayout.MiniBlockLayout;
-                var (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
-                    Encodings.V21.MiniBlockLayoutDecoder
-                        .DecodeNestedLeafChunk(mb, leafType, pageContext);
+                byte[] vals;
+                ushort[]? r;
+                ushort[]? d;
+                byte[]? innerValidity;
+                int innerNullCount;
+                int bpi;
+                int visible;
+                Proto.Encodings.V21.RepDefLayer[] pageLayers;
+                switch (pageLayout.LayoutCase)
+                {
+                    case Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout:
+                    {
+                        var mb = pageLayout.MiniBlockLayout;
+                        (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
+                            Encodings.V21.MiniBlockLayoutDecoder
+                                .DecodeNestedLeafChunk(mb, leafType, pageContext);
+                        pageLayers = mb.Layers.ToArray();
+                        break;
+                    }
+                    case Proto.Encodings.V21.PageLayout.LayoutOneofCase.FullZipLayout:
+                    {
+                        var fz = pageLayout.FullZipLayout;
+                        (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
+                            Encodings.V21.FullZipLayoutDecoder
+                                .DecodeNestedLeafPage(fz, leafType, pageContext);
+                        pageLayers = fz.Layers.ToArray();
+                        break;
+                    }
+                    default:
+                        throw new NotImplementedException(
+                            $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; " +
+                            "only MiniBlockLayout and FullZipLayout are supported.");
+                }
 
                 if (layers is null)
                 {
-                    layers = mb.Layers.ToArray();
+                    layers = pageLayers;
                     valueBytesPerItem = bpi;
                 }
                 else if (bpi != valueBytesPerItem)

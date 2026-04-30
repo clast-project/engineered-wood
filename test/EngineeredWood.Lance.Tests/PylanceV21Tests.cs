@@ -282,6 +282,43 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task FullZip_ListOfBigEmbeddings_Float32_x1024()
+    {
+        // list<FSL<float32, 1024>> — pylance encodes via FullZipLayout
+        // with bits_rep=1, bits_def=2 (NULL_AND_EMPTY_LIST). Each row of
+        // buffer 0 starts with a 1-byte ctrl word; visible items are
+        // followed by 4096-byte FSL payloads. Outer rows: 2 FSLs, [],
+        // null, [1 FSL] → 5 rep/def levels, 3 visible items.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_big_embeddings_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));   // empty list is valid
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(2, outer.ValueOffsets[1]);
+        Assert.Equal(2, outer.ValueOffsets[2]);
+        Assert.Equal(2, outer.ValueOffsets[3]);
+        Assert.Equal(3, outer.ValueOffsets[4]);
+
+        var fsls = (FixedSizeListArray)outer.Values;
+        Assert.Equal(3, fsls.Length);
+        Assert.Equal(1024, ((FixedSizeListType)fsls.Data.DataType).ListSize);
+        var inner = (FloatArray)fsls.Values;
+        Assert.Equal(3 * 1024, inner.Length);
+
+        // Row 0: floats 0..1023 then 1..1024.
+        Assert.Equal(0f, inner.GetValue(0));
+        Assert.Equal(1023f, inner.GetValue(1023));
+        Assert.Equal(1f, inner.GetValue(1024));
+        Assert.Equal(1024f, inner.GetValue(2047));
+        // Row 3 (after empty + null): floats 2..1025.
+        Assert.Equal(2f, inner.GetValue(2048));
+        Assert.Equal(1025f, inner.GetValue(3071));
+    }
+
+    [Fact]
     public async Task FullZip_NullableEmbeddings_Float32_x1024()
     {
         // 5 rows × 1024 float32, alternating valid/null: pylance encodes
