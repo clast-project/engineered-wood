@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Expressions;
 using EngineeredWood.Lance;
 
 namespace EngineeredWood.Lance.Table.Tests;
@@ -643,6 +644,202 @@ public class LanceDatasetWriterTests
             var json = System.Text.Json.JsonDocument.Parse(stdout);
             Assert.Equal(5, json.RootElement.GetProperty("rows").GetInt32());
             int[] expected = { 10, 12, 14, 16, 17 };
+            int i = 0;
+            foreach (var v in json.RootElement.GetProperty("data").EnumerateArray())
+                Assert.Equal(expected[i++], v.GetInt32());
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_RemovesMatchingRows()
+    {
+        // Two-fragment dataset with int values 1..4 and 5..8. DeleteAsync
+        // with `x > 3` should delete row 4 from fragment 0 (offset 3) and
+        // every row from fragment 1 (offsets 0..3).
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 5, 6, 7, 8 });
+                await ds.FinishAsync();
+            }
+
+            var pred = EngineeredWood.Expressions.Expressions.GreaterThan("x", LiteralValue.Of(3));
+            long newVersion = await LanceDatasetWriter.DeleteAsync(path, pred);
+            Assert.Equal(2L, newVersion);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 1, 2, 3 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_NoMatches_NoOp()
+    {
+        // Predicate matches no rows → no version bump, no deletion files.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            var pred = EngineeredWood.Expressions.Expressions.GreaterThan("x", LiteralValue.Of(100));
+            long version = await LanceDatasetWriter.DeleteAsync(path, pred);
+            Assert.Equal(1L, version);  // unchanged
+
+            string delDir = Path.Combine(path, "_deletions");
+            if (Directory.Exists(delDir))
+                Assert.Empty(Directory.GetFiles(delDir));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_StringEqual_AcrossFragments()
+    {
+        // string column; delete where name = "alice".
+        string path = MakeTempDatasetPath();
+        try
+        {
+            var sb1 = new StringArray.Builder();
+            sb1.Append("alice").Append("bob").Append("carol");
+            var sb2 = new StringArray.Builder();
+            sb2.Append("alice").Append("dave");
+
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteColumnAsync("name", sb1.Build());
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteColumnAsync("name", sb2.Build());
+                await ds.FinishAsync();
+            }
+
+            var pred = EngineeredWood.Expressions.Expressions.Equal("name", LiteralValue.Of("alice"));
+            await LanceDatasetWriter.DeleteAsync(path, pred);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            var names = new List<string>();
+            await foreach (var batch in table.ReadAsync())
+            {
+                int idx = batch.Schema.GetFieldIndex("name");
+                var arr = (StringArray)batch.Column(idx);
+                for (int i = 0; i < arr.Length; i++) names.Add(arr.GetString(i)!);
+            }
+            Assert.Equal(new[] { "bob", "carol", "dave" }, names);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_RejectsUnknownColumn()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            var pred = EngineeredWood.Expressions.Expressions.Equal("nope", LiteralValue.Of(0));
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await LanceDatasetWriter.DeleteAsync(path, pred));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_SkipsAlreadyDeletedRows()
+    {
+        // Pre-mark row 0 deleted. Then DeleteAsync with `x < 100` matches
+        // every row but skips row 0 since it's already deleted. The new
+        // deletion file should reference rows 1..4 only.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30, 40, 50 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 } });
+
+            var pred = EngineeredWood.Expressions.Expressions.LessThan("x", LiteralValue.Of(100));
+            await LanceDatasetWriter.DeleteAsync(path, pred);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Empty(survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteByPredicate_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x",
+                    new[] { 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 });
+                await ds.FinishAsync();
+            }
+            // Delete rows where x >= 15 (i.e., the last 5 values).
+            var pred = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual(
+                "x", LiteralValue.Of(15));
+            await LanceDatasetWriter.DeleteAsync(path, pred);
+
+            string script = "import sys, json, lance\n" +
+                $"ds = lance.dataset(r'{path}')\n" +
+                "data = ds.to_table().to_pydict()['x']\n" +
+                "out = { 'rows': len(data), 'data': data }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(5, json.RootElement.GetProperty("rows").GetInt32());
+            int[] expected = { 10, 11, 12, 13, 14 };
             int i = 0;
             foreach (var v in json.RootElement.GetProperty("data").EnumerateArray())
                 Assert.Equal(expected[i++], v.GetInt32());

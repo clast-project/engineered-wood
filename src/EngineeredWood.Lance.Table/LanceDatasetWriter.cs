@@ -5,6 +5,8 @@ using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using EngineeredWood.Expressions;
+using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.IO;
 using EngineeredWood.Lance.Format;
 using EngineeredWood.Lance.Table.Deletions;
@@ -649,6 +651,159 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
 
         return (long)newVersion;
+    }
+
+    /// <summary>
+    /// Deletes rows matching <paramref name="predicate"/> from the dataset
+    /// at <paramref name="datasetPath"/>. For each fragment, reads the
+    /// columns the predicate references, evaluates it, and collects the
+    /// row offsets where it returns true; those offsets are then written
+    /// out via <see cref="DeleteRowsAsync"/>. Returns the new version
+    /// number, or the current version when no rows match (no-op).
+    ///
+    /// <para>Rows already covered by an existing deletion file are
+    /// skipped (no point re-marking them). Predicate-evaluation
+    /// semantics match <see cref="LanceTable.ReadAsync(IReadOnlyList{string},
+    /// Predicate, CancellationToken)"/>: a null result counts as
+    /// not-true and the row stays.</para>
+    /// </summary>
+    public static async ValueTask<long> DeleteAsync(
+        string datasetPath, Predicate predicate,
+        CancellationToken cancellationToken = default)
+    {
+        if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        if (!Directory.Exists(datasetPath)
+            || !Directory.Exists(Path.Combine(datasetPath, "_versions")))
+            throw new InvalidOperationException(
+                $"Path '{datasetPath}' does not contain a Lance dataset.");
+
+        // Read the latest manifest + Arrow schema.
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            .ConfigureAwait(false);
+
+        var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
+        lanceSchema.Fields.AddRange(manifest.Fields);
+        var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+
+        // Resolve which top-level columns the predicate touches.
+        var refs = new HashSet<string>(StringComparer.Ordinal);
+        CollectColumnReferences(predicate, refs);
+        var readIndices = new List<int>(refs.Count);
+        var readFields = new List<Apache.Arrow.Field>(refs.Count);
+        foreach (string name in refs)
+        {
+            int idx = arrowSchema.GetFieldIndex(name);
+            if (idx < 0)
+                throw new ArgumentException(
+                    $"Filter references unknown column '{name}'. " +
+                    $"Available: [{string.Join(", ", arrowSchema.FieldsList.Select(f => f.Name))}].",
+                    nameof(predicate));
+            readIndices.Add(idx);
+            readFields.Add(arrowSchema.FieldsList[idx]);
+        }
+        var readSchema = new Apache.Arrow.Schema(readFields, metadata: null);
+        var evaluator = new ArrowRowEvaluator();
+
+        var perFragmentDeletes = new Dictionary<ulong, IReadOnlyList<int>>();
+
+        foreach (var fragment in manifest.Fragments)
+        {
+            DataFile file = fragment.Files[0];
+            string relPath = "data/" + file.Path;
+            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+                .ConfigureAwait(false);
+            await using var reader = await EngineeredWood.Lance.LanceFileReader
+                .OpenAsync(raf, ownsReader: false, cancellationToken)
+                .ConfigureAwait(false);
+
+            int rowCount = checked((int)reader.NumberOfRows);
+
+            // Skip rows already deleted — no point re-marking them, and it
+            // keeps the new deletion file minimal.
+            DeletionMask? existing = null;
+            if (fragment.DeletionFile is not null && fragment.DeletionFile.NumDeletedRows > 0)
+            {
+                existing = await DeletionFileReader.ReadAsync(
+                    fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            // Read just the columns the predicate references and evaluate.
+            var readArrays = new IArrowArray[readIndices.Count];
+            for (int i = 0; i < readIndices.Count; i++)
+                readArrays[i] = await reader
+                    .ReadColumnAsync(readIndices[i], cancellationToken)
+                    .ConfigureAwait(false);
+            var readBatch = new RecordBatch(readSchema, readArrays, rowCount);
+
+            BooleanArray mask = evaluator.EvaluatePredicate(predicate, readBatch);
+            var toDelete = new List<int>();
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (existing is not null && existing.IsDeleted(i)) continue;
+                bool? v = mask.IsNull(i) ? (bool?)null : mask.GetValue(i);
+                if (v == true) toDelete.Add(i);
+            }
+            if (toDelete.Count > 0)
+                perFragmentDeletes[fragment.Id] = toDelete;
+        }
+
+        if (perFragmentDeletes.Count == 0)
+            return (long)manifest.Version;
+
+        return await DeleteRowsAsync(datasetPath, perFragmentDeletes, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Walk a predicate tree collecting the names of every column it
+    /// references. Mirrors <see cref="LanceTable"/>'s private
+    /// <c>CollectColumnReferences</c>.
+    /// </summary>
+    private static void CollectColumnReferences(Predicate predicate, HashSet<string> sink)
+    {
+        switch (predicate)
+        {
+            case TruePredicate or FalsePredicate:
+                break;
+            case AndPredicate and:
+                foreach (var c in and.Children) CollectColumnReferences(c, sink);
+                break;
+            case OrPredicate or:
+                foreach (var c in or.Children) CollectColumnReferences(c, sink);
+                break;
+            case NotPredicate not:
+                CollectColumnReferences(not.Child, sink);
+                break;
+            case ComparisonPredicate cmp:
+                CollectColumnReferences(cmp.Left, sink);
+                CollectColumnReferences(cmp.Right, sink);
+                break;
+            case UnaryPredicate u:
+                CollectColumnReferences(u.Operand, sink);
+                break;
+            case SetPredicate s:
+                CollectColumnReferences(s.Operand, sink);
+                break;
+        }
+    }
+
+    private static void CollectColumnReferences(Expression expression, HashSet<string> sink)
+    {
+        switch (expression)
+        {
+            case UnboundReference u: sink.Add(u.Name); break;
+            case BoundReference b: sink.Add(b.Name); break;
+            case LiteralExpression: break;
+            case FunctionCall fc:
+                foreach (var arg in fc.Arguments) CollectColumnReferences(arg, sink);
+                break;
+            case Predicate p: CollectColumnReferences(p, sink); break;
+        }
     }
 
     /// <summary>
