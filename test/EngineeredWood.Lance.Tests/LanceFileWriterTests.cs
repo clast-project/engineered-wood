@@ -1560,6 +1560,303 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Struct_Of_Struct_RoundTrip_ViaOurReader()
+    {
+        // struct<inner: struct<x: int32>, label: string>. Both struct levels
+        // can be null; inner.x carries its own intrinsic nulls; label is
+        // non-null. Cascade depth = 2 layers above the int32 leaf, so def
+        // values 1, 2, 3 cover (x, inner, outer) nulls respectively.
+        const int rows = 5;
+        // Build inner.x: [10, 20, NULL, 40, 50]
+        var xBytes = new byte[rows * 4];
+        for (int i = 0; i < rows; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                xBytes.AsSpan(i * 4, 4), (i + 1) * 10);
+        var xValidity = new byte[1] { 0b11011 };  // x[2] null
+        var x = new Int32Array(new ArrayData(
+            Int32Type.Default, rows, 1, 0,
+            new[] { new ArrowBuffer(xValidity), new ArrowBuffer(xBytes) }));
+
+        // Inner struct: row 1 null
+        var innerType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: true),
+        });
+        var innerValidity = new byte[1] { 0b11101 };  // inner row 1 = null
+        var inner = new StructArray(new ArrayData(
+            innerType, rows, 1, 0,
+            new[] { new ArrowBuffer(innerValidity) },
+            new[] { x.Data }));
+
+        // Label: ["a", "b", "c", "d", "e"]
+        var labelBuilder = new StringArray.Builder();
+        labelBuilder.Append("a").Append("b").Append("c").Append("d").Append("e");
+        var label = labelBuilder.Build();
+
+        // Outer struct: row 4 null
+        var outerType = new StructType(new[]
+        {
+            new Field("inner", innerType, nullable: true),
+            new Field("label", StringType.Default, nullable: true),
+        });
+        var outerValidity = new byte[1] { 0b01111 };  // outer row 4 = null
+        var outer = new StructArray(new ArrayData(
+            outerType, rows, 1, 0,
+            new[] { new ArrowBuffer(outerValidity) },
+            new[] { inner.Data, label.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-sos-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("rec", outer);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (StructArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(rows, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(4));
+
+            // Inner struct: rows 1 and 4 null (1 = own null, 4 = outer cascade).
+            var rInner = (StructArray)read.Fields[0];
+            Assert.Equal(2, rInner.NullCount);
+            Assert.False(rInner.IsNull(0));
+            Assert.True(rInner.IsNull(1));
+            Assert.False(rInner.IsNull(2));
+            Assert.False(rInner.IsNull(3));
+            Assert.True(rInner.IsNull(4));
+
+            // x: cascade clears its bitmap at every layer ≥ 0; rows 1, 2, 4
+            // come back as null (1 = inner null, 2 = own null, 4 = outer null).
+            var rx = (Int32Array)rInner.Fields[0];
+            Assert.Equal(3, rx.NullCount);
+            Assert.False(rx.IsNull(0));
+            Assert.True(rx.IsNull(1));
+            Assert.True(rx.IsNull(2));
+            Assert.False(rx.IsNull(3));
+            Assert.True(rx.IsNull(4));
+            Assert.Equal(10, rx.GetValue(0));
+            Assert.Equal(40, rx.GetValue(3));
+
+            // Label: not nullable on its own, only shadowed by outer cascade.
+            var rlabel = (StringArray)read.Fields[1];
+            Assert.Equal(0, rlabel.NullCount);  // label has no own nulls
+            Assert.Equal("a", rlabel.GetString(0));
+            Assert.Equal("b", rlabel.GetString(1));
+            Assert.Equal("d", rlabel.GetString(3));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Struct_With_List_RoundTrip_ViaOurReader()
+    {
+        // struct<id: int32, tags: list<string>>. Outer struct has a null at
+        // row 1; the list at that row position should reflect the cascade
+        // (its offsets carry no items, the struct's own bitmap absorbs the
+        // null). Other rows show normal list contents.
+        const int rows = 4;
+
+        var idBuilder = new Int32Array.Builder();
+        idBuilder.Append(1).Append(2).Append(3).Append(4);
+        var id = idBuilder.Build();
+
+        // tags: row 0 = ["a", "b"], row 1 = (overridden by struct null),
+        //       row 2 = [], row 3 = ["c"]
+        var tagsList = BuildListString(
+            new[]
+            {
+                new[] { "a", "b" },
+                System.Array.Empty<string>(),  // placeholder for null struct row
+                System.Array.Empty<string>(),
+                new[] { "c" },
+            },
+            outerNullMask: null);  // tags itself isn't independently nullable
+
+        // Outer struct null at row 1.
+        var structValidity = new byte[1] { 0b1101 };
+        var structType = new StructType(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: true),
+            new Field("tags", new ListType(new Field("item", StringType.Default, nullable: true)), nullable: true),
+        });
+        var structArr = new StructArray(new ArrayData(
+            structType, rows, 1, 0,
+            new[] { new ArrowBuffer(structValidity) },
+            new[] { id.Data, tagsList.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-slist-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("rec", structArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (StructArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(rows, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(1));
+
+            var rId = (Int32Array)read.Fields[0];
+            Assert.Equal(1, rId.GetValue(0));
+            Assert.Equal(4, rId.GetValue(3));
+
+            // tags: row 0 = ["a","b"], row 1 = empty (cascade absorbed),
+            //       row 2 = empty, row 3 = ["c"]
+            var rTags = (ListArray)read.Fields[1];
+            Assert.Equal(rows, rTags.Length);
+            Assert.Equal(0, rTags.ValueOffsets[0]);
+            Assert.Equal(2, rTags.ValueOffsets[1]);  // a, b
+            Assert.Equal(2, rTags.ValueOffsets[2]);  // (cascade null = empty)
+            Assert.Equal(2, rTags.ValueOffsets[3]);  // empty
+            Assert.Equal(3, rTags.ValueOffsets[4]);  // c
+
+            var rInnerStrings = (StringArray)rTags.Values;
+            Assert.Equal(3, rInnerStrings.Length);
+            Assert.Equal("a", rInnerStrings.GetString(0));
+            Assert.Equal("b", rInnerStrings.GetString(1));
+            Assert.Equal("c", rInnerStrings.GetString(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static ListArray BuildListString(string[][] rows, bool[]? outerNullMask)
+    {
+        int totalInner = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = outerNullMask is not null && !outerNullMask[i];
+            if (!isNull) totalInner += rows[i].Length;
+        }
+        var sb = new StringArray.Builder();
+        var offsets = new List<int> { 0 };
+        int counter = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = outerNullMask is not null && !outerNullMask[i];
+            if (!isNull)
+            {
+                foreach (var s in rows[i]) { sb.Append(s); counter++; }
+            }
+            offsets.Add(counter);
+        }
+        var inner = sb.Build();
+
+        var offsetsBytes = new byte[offsets.Count * sizeof(int)];
+        for (int i = 0; i < offsets.Count; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (outerNullMask is not null)
+        {
+            var v = new byte[(rows.Length + 7) / 8];
+            for (int i = 0; i < rows.Length; i++)
+            {
+                if (outerNullMask[i]) v[i >> 3] |= (byte)(1 << (i & 7));
+                else nullCount++;
+            }
+            validity = new ArrowBuffer(v);
+        }
+
+        var listType = new ListType(new Field("item", StringType.Default, nullable: true));
+        var data = new ArrayData(
+            listType, rows.Length, nullCount, 0,
+            new[] { validity, new ArrowBuffer(offsetsBytes) },
+            children: new[] { inner.Data });
+        return new ListArray(data);
+    }
+
+    [Fact]
+    public async Task Struct_With_Fsl_RoundTrip_ViaOurReader()
+    {
+        // struct<id: int32, vec: fixed_size_list<float, 4>>. Outer struct
+        // has a null at row 1 — that cascade should clobber both leaves
+        // (id and vec) at row 1 in the read-back arrays.
+        const int rows = 3;
+        const int dim = 4;
+
+        var idBytes = new byte[rows * 4];
+        for (int i = 0; i < rows; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                idBytes.AsSpan(i * 4, 4), 100 + i);
+        var id = new Int32Array(new ArrayData(
+            Int32Type.Default, rows, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(idBytes) }));
+
+        var innerVec = new FloatArray.Builder();
+        for (int row = 0; row < rows; row++)
+            for (int j = 0; j < dim; j++) innerVec.Append(row * 10f + j);
+        var fsl = new FixedSizeListArray(new ArrayData(
+            new FixedSizeListType(new Field("item", FloatType.Default, nullable: true), dim),
+            rows, 0, 0,
+            new[] { ArrowBuffer.Empty },
+            children: new[] { innerVec.Build().Data }));
+
+        var outerValidity = new byte[1] { 0b101 };  // row 1 = null
+        var outerType = new StructType(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: true),
+            new Field("vec", fsl.Data.DataType, nullable: true),
+        });
+        var outer = new StructArray(new ArrayData(
+            outerType, rows, 1, 0,
+            new[] { new ArrowBuffer(outerValidity) },
+            new[] { id.Data, fsl.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-sfsl-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("rec", outer);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (StructArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(rows, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(1));
+
+            // Reader cascade behavior for FSL inside struct: the FSL itself
+            // has no intrinsic nulls so its NullCount stays 0; the struct
+            // cascade lives on read.NullBitmapBuffer only.
+            var rId = (Int32Array)read.Fields[0];
+            Assert.Equal(100, rId.GetValue(0));
+            Assert.Equal(102, rId.GetValue(2));
+
+            var rFsl = (FixedSizeListArray)read.Fields[1];
+            Assert.Equal(rows, rFsl.Length);
+            var rInner = (FloatArray)rFsl.Values;
+            Assert.Equal(rows * dim, rInner.Length);
+            // Row 0 vec: [0, 1, 2, 3]
+            for (int j = 0; j < dim; j++)
+                Assert.Equal((float)j, rInner.GetValue(j));
+            // Row 2 vec: [20, 21, 22, 23]
+            for (int j = 0; j < dim; j++)
+                Assert.Equal((float)(20 + j), rInner.GetValue(2 * dim + j));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Decimal128_RoundTrip_ViaOurReader()
     {
         // Decimal128(precision=18, scale=3): three values + one null. Apache

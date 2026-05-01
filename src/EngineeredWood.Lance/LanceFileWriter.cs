@@ -650,19 +650,36 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Writes a non-nested <see cref="StructArray"/>. Each child becomes its
-    /// own column with two-layer cascade <c>[itemLayer, structLayer]</c>;
-    /// <c>structLayer</c> propagates the struct row's own null bitmap into
-    /// every child via def values. Children must be one of the supported
-    /// leaf types (fixed-width primitives, string, binary, FSB,
-    /// Decimal128/256). Lists, FSL, and nested struct children inside a
-    /// struct are not yet supported by the writer.
+    /// Snapshot of the rep/def cascade above a field being emitted: the
+    /// outer Struct (and grandparent Struct, etc.) layers in innermost-first
+    /// order plus, for each top-level row, the index in <see cref="Layers"/>
+    /// of the OUTERMOST null ancestor at that row (-1 = all valid). When
+    /// emitting a leaf the writer selects the outermost null's def value so
+    /// the reader's cascade clears every layer bitmap from the leaf up
+    /// through that ancestor — matching Apache.Arrow's struct-null
+    /// propagation semantics.
+    /// </summary>
+    private readonly record struct AncestorCascade(
+        IReadOnlyList<RepDefLayer> Layers,
+        int[] OutermostNullAncestorPerRow);
+
+    private static AncestorCascade EmptyCascade(int rows)
+    {
+        var per = new int[rows];
+        System.Array.Fill(per, -1);
+        return new AncestorCascade(System.Array.Empty<RepDefLayer>(), per);
+    }
+
+    /// <summary>
+    /// Writes a top-level <see cref="StructArray"/>. Registers the parent
+    /// struct field, then recursively emits each child via
+    /// <see cref="WriteFieldRecursiveAsync"/>, threading the struct's own
+    /// null cascade into every descendant leaf.
     /// </summary>
     private async Task WriteStructColumnAsync(
         string name, StructArray array, CancellationToken cancellationToken)
     {
         ThrowIfFinalized();
-        var structType = (StructType)array.Data.DataType;
         int rows = array.Length;
         if (_totalRows < 0) _totalRows = rows;
         else if (_totalRows != rows)
@@ -670,11 +687,6 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"Column '{name}' has {rows} rows but earlier columns have {_totalRows}.",
                 nameof(name));
 
-        bool structNullable = array.NullCount > 0;
-        byte[]? structValidity = structNullable ? ExtractValidityBitmap(array) : null;
-
-        // Register the parent struct field BEFORE child fields so IDs flow
-        // parent → children, matching pylance's id assignment.
         int parentId = _fields.Count;
         _fields.Add(new Proto.Field
         {
@@ -686,87 +698,190 @@ public sealed class LanceFileWriter : IAsyncDisposable
             Encoding = Proto.Encoding.Plain,
         });
 
+        var cascade = ExtendCascadeWithStruct(EmptyCascade(rows), array, rows);
+        var structType = (StructType)array.Data.DataType;
         for (int i = 0; i < structType.Fields.Count; i++)
         {
-            var childField = structType.Fields[i];
-            var childArray = array.Fields[i];
-            await WriteStructChildColumnAsync(
-                childField.Name, parentId, childArray,
-                structNullable, structValidity, rows, cancellationToken)
+            await WriteFieldRecursiveAsync(
+                structType.Fields[i].Name, parentId,
+                array.Fields[i], cascade, rows, cancellationToken)
                 .ConfigureAwait(false);
         }
     }
 
     /// <summary>
-    /// Emits one column-metadata entry for a struct child. Builds a
-    /// page-level def stream that encodes both struct-row nulls and
-    /// child-element nulls, dispatches on the child's Arrow type to build
-    /// the value buffer (Flat / Variable / FSB-shaped flat), and registers
-    /// the child as a Lance Field whose parent_id points back to the struct.
+    /// Extend an ancestor cascade by adding a struct's own layer at the
+    /// front (innermost-first ordering). The struct's null bitmap merges
+    /// into the per-row cascade: a row is now flagged null at this
+    /// ancestor if either it was already flagged at a deeper layer (which
+    /// shifts up by one) or this struct itself is null at that row and no
+    /// inner ancestor was already null.
     /// </summary>
-    private async Task WriteStructChildColumnAsync(
-        string childName, int parentId,
-        IArrowArray childArray,
-        bool structNullable, byte[]? structValidity, int rows,
-        CancellationToken cancellationToken)
+    private static AncestorCascade ExtendCascadeWithStruct(
+        AncestorCascade old, StructArray structArr, int rows)
     {
-        bool childNullable = childArray.NullCount > 0;
-        byte[]? childValidity = childNullable ? ExtractValidityBitmap(childArray) : null;
-
-        var itemLayer = childNullable
-            ? RepDefLayer.RepdefNullableItem
-            : RepDefLayer.RepdefAllValidItem;
-        var structLayer = structNullable
+        bool nullable = structArr.NullCount > 0;
+        byte[]? validity = nullable ? ExtractValidityBitmap(structArr) : null;
+        var newLayer = nullable
             ? RepDefLayer.RepdefNullableItem
             : RepDefLayer.RepdefAllValidItem;
 
-        int next = 1;
-        int itemNullDef = childNullable ? next++ : 0;
-        int structNullDef = structNullable ? next++ : 0;
-        bool hasDef = childNullable || structNullable;
+        var newLayers = new List<RepDefLayer>(old.Layers.Count + 1) { newLayer };
+        newLayers.AddRange(old.Layers);
 
-        ushort[]? def = null;
-        if (hasDef)
+        var newPer = new int[rows];
+        for (int i = 0; i < rows; i++)
         {
-            def = new ushort[rows];
-            for (int i = 0; i < rows; i++)
+            int oldOuter = old.OutermostNullAncestorPerRow[i];
+            if (oldOuter >= 0)
             {
-                bool sNull = structNullable
-                    && (structValidity![i >> 3] & (1 << (i & 7))) == 0;
-                bool cNull = childNullable
-                    && (childValidity![i >> 3] & (1 << (i & 7))) == 0;
-                if (sNull) def[i] = (ushort)structNullDef;
-                else if (cNull) def[i] = (ushort)itemNullDef;
-                else def[i] = 0;
+                // Existing null was at oldOuter in old.Layers; that ancestor
+                // is now at index oldOuter+1 in the new (prepended) list,
+                // and remains the OUTERMOST null since nothing more outer
+                // has been added — we're only adding a new INNER ancestor.
+                newPer[i] = oldOuter + 1;
+            }
+            else if (nullable && (validity![i >> 3] & (1 << (i & 7))) == 0)
+            {
+                newPer[i] = 0;
+            }
+            else
+            {
+                newPer[i] = -1;
             }
         }
 
-        // Resolve child encoding + bytes. Strings/binary use Variable;
-        // fixed-width primitives, FSB, and Decimal use Flat.
+        return new AncestorCascade(newLayers, newPer);
+    }
+
+    /// <summary>
+    /// Emit the column(s) for one field under a parent (struct or root).
+    /// Dispatches by Arrow type:
+    /// <list type="bullet">
+    ///   <item>Nested <see cref="StructArray"/>: registers the intermediate
+    ///   struct field, extends the cascade, and recurses into each child.</item>
+    ///   <item><see cref="FixedSizeListArray"/> / leaf primitives / strings /
+    ///   binary / FSB / Decimal / Bool: emits exactly one column whose
+    ///   value encoding matches the type and whose def stream merges the
+    ///   ancestor cascade with the field's own nulls.</item>
+    /// </list>
+    /// List children inside a struct (which would add a list layer between
+    /// the leaf and the struct cascade) are deferred.
+    /// </summary>
+    private async Task WriteFieldRecursiveAsync(
+        string fieldName, int parentId, IArrowArray array,
+        AncestorCascade cascade, int rows, CancellationToken cancellationToken)
+    {
+        if (array is StructArray nestedStruct)
+        {
+            int sid = _fields.Count;
+            _fields.Add(new Proto.Field
+            {
+                Name = fieldName,
+                Id = sid,
+                ParentId = parentId,
+                LogicalType = "struct",
+                Nullable = true,
+                Encoding = Proto.Encoding.Plain,
+            });
+            var newCascade = ExtendCascadeWithStruct(cascade, nestedStruct, rows);
+            var nestedType = (StructType)nestedStruct.Data.DataType;
+            for (int i = 0; i < nestedType.Fields.Count; i++)
+            {
+                await WriteFieldRecursiveAsync(
+                    nestedType.Fields[i].Name, sid,
+                    nestedStruct.Fields[i], newCascade, rows, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if (array is ListArray childList)
+        {
+            int[] offsets = childList.ValueOffsets.Slice(0, childList.Length + 1).ToArray();
+            await WriteListColumnCommonAsync(
+                fieldName, parentLogical: "list",
+                outerLength: childList.Length, outerNullCount: childList.NullCount,
+                outerValidity: ExtractValidityBitmap(childList),
+                outerOffsets: offsets, innerValues: childList.Values,
+                listType: (Apache.Arrow.Types.ListType)childList.Data.DataType,
+                cancellationToken,
+                ancestorCascade: cascade, parentId: parentId)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (array is LargeListArray childLargeList)
+        {
+            var srcOffsets = childLargeList.ValueOffsets.Slice(0, childLargeList.Length + 1);
+            int[] offsets = new int[srcOffsets.Length];
+            for (int i = 0; i < srcOffsets.Length; i++)
+                offsets[i] = checked((int)srcOffsets[i]);
+            await WriteListColumnCommonAsync(
+                fieldName, parentLogical: "large_list",
+                outerLength: childLargeList.Length, outerNullCount: childLargeList.NullCount,
+                outerValidity: ExtractValidityBitmap(childLargeList),
+                outerOffsets: offsets, innerValues: childLargeList.Values,
+                listType: (LargeListType)childLargeList.Data.DataType,
+                cancellationToken,
+                ancestorCascade: cascade, parentId: parentId)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await WriteLeafFieldAsync(fieldName, parentId, array, cascade, rows, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Emits a single column for a leaf-shaped field (primitive, string,
+    /// binary, FSB, Decimal, Bool, FSL). Builds the layer list as
+    /// <c>[item_layer, ...ancestor_layers]</c>, computes per-layer def slot
+    /// positions, and walks rows producing a def value that encodes the
+    /// outermost ancestor null (when present), the field's own null, or 0.
+    /// </summary>
+    private async Task WriteLeafFieldAsync(
+        string fieldName, int parentId, IArrowArray array,
+        AncestorCascade cascade, int rows, CancellationToken cancellationToken)
+    {
+        if (array.Length != rows)
+            throw new InvalidOperationException(
+                $"Leaf field '{fieldName}' has {array.Length} rows but the parent reports {rows}.");
+
+        // Resolve value encoding + bytes via type dispatch. FSL is its own
+        // single-leaf shape with FSL value-compression; everything else
+        // is a flat or variable leaf.
         byte[] valueBytes;
         CompressiveEncoding valueEncoding;
         string innerLogical;
-        if (childArray is StringArray childStr)
+        if (array is FixedSizeListArray childFsl)
+        {
+            (valueBytes, valueEncoding, innerLogical) = BuildFslLeaf(childFsl);
+        }
+        else if (array is BooleanArray childBool)
+        {
+            (valueBytes, valueEncoding, innerLogical) = BuildBoolLeaf(childBool);
+        }
+        else if (array is StringArray childStr)
         {
             (valueBytes, valueEncoding, innerLogical) = BuildVariableLeafSingleChunk(childStr, "string");
         }
-        else if (childArray is BinaryArray childBin)
+        else if (array is BinaryArray childBin)
         {
             (valueBytes, valueEncoding, innerLogical) = BuildVariableLeafSingleChunk(childBin, "binary");
         }
-        else if (childArray is Decimal128Array dec128)
+        else if (array is Decimal128Array dec128)
         {
             var dt = (Decimal128Type)dec128.Data.DataType;
             (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
                 dec128, dt.ByteWidth, $"decimal:128:{dt.Precision}:{dt.Scale}");
         }
-        else if (childArray is Decimal256Array dec256)
+        else if (array is Decimal256Array dec256)
         {
             var dt = (Decimal256Type)dec256.Data.DataType;
             (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
                 dec256, dt.ByteWidth, $"decimal:256:{dt.Precision}:{dt.Scale}");
         }
-        else if (childArray is Apache.Arrow.Arrays.FixedSizeBinaryArray childFsb)
+        else if (array is Apache.Arrow.Arrays.FixedSizeBinaryArray childFsb)
         {
             int width = ((FixedSizeBinaryType)childFsb.Data.DataType).ByteWidth;
             (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
@@ -774,21 +889,66 @@ public sealed class LanceFileWriter : IAsyncDisposable
         }
         else
         {
-            // Fixed-width primitive (Int*, UInt*, Float, Double, Date/Time/...).
-            (valueBytes, valueEncoding, innerLogical) = BuildPrimitiveFlatLeaf(childArray);
+            (valueBytes, valueEncoding, innerLogical) = BuildPrimitiveFlatLeaf(array);
         }
 
-        // Single chunk only — same constraint as the list writer; multi-chunk
-        // for struct children is a follow-up.
-        var chunk = new PageChunk(0, rows, valueBytes, RepLevels: null, DefLevels: def);
-        var layers = new List<RepDefLayer> { itemLayer, structLayer };
+        // Build layers: item first, then ancestors innermost-first.
+        bool childNullable = array.NullCount > 0;
+        byte[]? childValidity = childNullable ? ExtractValidityBitmap(array) : null;
+        var itemLayer = childNullable
+            ? RepDefLayer.RepdefNullableItem
+            : RepDefLayer.RepdefAllValidItem;
+        var layers = new List<RepDefLayer>(cascade.Layers.Count + 1) { itemLayer };
+        layers.AddRange(cascade.Layers);
 
+        // Assign def slots in cascade-walker order (next++ across layers
+        // 0..n-1). ALL_VALID layers get -1 (no slot).
+        int[] layerNullDef = new int[layers.Count];
+        int next = 1;
+        for (int k = 0; k < layers.Count; k++)
+        {
+            layerNullDef[k] = layers[k] == RepDefLayer.RepdefNullableItem ? next++ : -1;
+        }
+        bool hasDef = false;
+        for (int k = 0; k < layerNullDef.Length; k++)
+            if (layerNullDef[k] >= 0) { hasDef = true; break; }
+
+        ushort[]? def = null;
+        if (hasDef)
+        {
+            def = new ushort[rows];
+            for (int i = 0; i < rows; i++)
+            {
+                int outer = cascade.OutermostNullAncestorPerRow[i];
+                if (outer >= 0)
+                {
+                    // outer indexes into cascade.Layers; full layers list
+                    // prepends item, so the absolute index is outer + 1.
+                    int slot = layerNullDef[outer + 1];
+                    if (slot < 0)
+                        throw new InvalidOperationException(
+                            $"Cascade marked row {i} null at ancestor {outer} " +
+                            "but the corresponding layer has no def slot.");
+                    def[i] = (ushort)slot;
+                }
+                else if (childNullable
+                    && (childValidity![i >> 3] & (1 << (i & 7))) == 0)
+                {
+                    def[i] = (ushort)layerNullDef[0];
+                }
+                else
+                {
+                    def[i] = 0;
+                }
+            }
+        }
+
+        var chunk = new PageChunk(0, rows, valueBytes, RepLevels: null, DefLevels: def);
         var page = await BuildAndWritePageAsync(
             valueEncoding, rows, new[] { chunk }, layers, cancellationToken)
             .ConfigureAwait(false);
 
-        // Register a single column for this child (the parent already has its
-        // schema field; we only add the child field + its column metadata).
+        // Register one column for this leaf.
         var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
         var columnAny = new Any
         {
@@ -809,13 +969,90 @@ public sealed class LanceFileWriter : IAsyncDisposable
             : Proto.Encoding.Plain;
         _fields.Add(new Proto.Field
         {
-            Name = childName,
+            Name = fieldName,
             Id = _fields.Count,
             ParentId = parentId,
             LogicalType = innerLogical,
             Nullable = true,
             Encoding = fieldEncoding,
         });
+    }
+
+    /// <summary>
+    /// Build the value buffer + encoding for an FSL-shaped leaf used inside
+    /// a struct (or other ancestor cascade). Mirrors
+    /// <see cref="WriteFixedSizeListColumnAsync"/>'s value-compression
+    /// shape but returns the bytes + encoding so the caller can wrap them
+    /// in a cascade-aware page.
+    /// </summary>
+    private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
+        BuildFslLeaf(FixedSizeListArray array)
+    {
+        var fslType = (FixedSizeListType)array.Data.DataType;
+        if (fslType.ValueDataType is not FixedWidthType innerFw)
+            throw new NotSupportedException(
+                $"FixedSizeList<{fslType.ValueDataType}> inside a struct requires a fixed-width inner type.");
+        if (array.Values.NullCount > 0)
+            throw new NotSupportedException(
+                "FixedSizeList with inner-element nulls (has_validity=true) " +
+                "inside a struct is not yet supported by the writer.");
+
+        string innerLogical = innerFw switch
+        {
+            Int8Type => "int8",
+            UInt8Type => "uint8",
+            Int16Type => "int16",
+            UInt16Type => "uint16",
+            Int32Type => "int32",
+            UInt32Type => "uint32",
+            Int64Type => "int64",
+            UInt64Type => "uint64",
+            FloatType => "float",
+            DoubleType => "double",
+            _ => throw new NotSupportedException(
+                $"FSL inner type {innerFw} is not yet supported by the writer."),
+        };
+
+        int dim = fslType.ListSize;
+        int innerBytes = innerFw.BitWidth / 8;
+        int rows = array.Length;
+        int totalBytes = checked(rows * dim * innerBytes);
+        var bytes = new byte[totalBytes];
+        array.Values.Data.Buffers[1].Span.Slice(0, totalBytes).CopyTo(bytes);
+        var encoding = new CompressiveEncoding
+        {
+            FixedSizeList = new Proto.Encodings.V21.FixedSizeList
+            {
+                ItemsPerValue = (ulong)dim,
+                HasValidity = false,
+                Values = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)(innerBytes * 8) },
+                },
+            },
+        };
+        return (bytes, encoding, $"fixed_size_list:{innerLogical}:{dim}");
+    }
+
+    /// <summary>
+    /// Bit-pack a <see cref="BooleanArray"/> into a Flat(1) value buffer for
+    /// use inside an ancestor cascade. Mirrors the top-level bool writer's
+    /// repacking of sliced inputs.
+    /// </summary>
+    private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
+        BuildBoolLeaf(BooleanArray array)
+    {
+        int len = array.Length;
+        var bytes = new byte[(len + 7) / 8];
+        var src = array.Data.Buffers[1].Span;
+        int srcOffset = array.Data.Offset;
+        for (int i = 0; i < len; i++)
+        {
+            int srcIdx = srcOffset + i;
+            if ((src[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0)
+                bytes[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        return (bytes, FlatEncoding(1), "bool");
     }
 
     private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
@@ -893,7 +1130,12 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int outerLength, int outerNullCount, byte[]? outerValidity,
         int[] outerOffsets, IArrowArray innerValues,
         Apache.Arrow.Types.NestedType listType,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        // When non-default the list is a child of an outer struct cascade.
+        // The cascade's per-row "outermost null ancestor" indicators add a
+        // null-def slot on top of the list's own layers.
+        AncestorCascade? ancestorCascade = null,
+        int parentId = -1)
     {
         IArrowType innerType = listType switch
         {
@@ -954,9 +1196,10 @@ public sealed class LanceFileWriter : IAsyncDisposable
         byte[]? innerValidity = anyInnerNull ? ExtractValidityBitmap(innerValues) : null;
 
         // Layer order is leaf-first, so layers[0] is the item layer and
-        // layers[1] is the list layer. The reader walks them outermost
-        // (highest index) to innermost (lowest), assigning def slots in
-        // ascending order — innermost layer gets the smallest def value.
+        // layers[1] is the list layer. Ancestor layers (struct cascade
+        // above the list) follow at indices 2..N. The reader walks them
+        // outermost-last → innermost-first, assigning def slots in
+        // ascending layer order.
         var itemLayer = anyInnerNull
             ? RepDefLayer.RepdefNullableItem
             : RepDefLayer.RepdefAllValidItem;
@@ -985,16 +1228,38 @@ public sealed class LanceFileWriter : IAsyncDisposable
         {
             listLayer = RepDefLayer.RepdefAllValidList;
         }
-        bool hasDef = anyInnerNull || anyNull || anyEmpty;
 
-        // Compute level count and visible items in one pass.
+        // Resolve ancestor layer slots. layerNullDef[2..] tracks the def
+        // slot for each ancestor; -1 for ALL_VALID ancestors.
+        IReadOnlyList<RepDefLayer> ancestorLayers = ancestorCascade?.Layers
+            ?? System.Array.Empty<RepDefLayer>();
+        int[] ancestorNullDef = new int[ancestorLayers.Count];
+        for (int k = 0; k < ancestorLayers.Count; k++)
+            ancestorNullDef[k] = ancestorLayers[k] == RepDefLayer.RepdefNullableItem
+                ? next++ : -1;
+
+        int[]? perRowAncestorOuter = ancestorCascade?.OutermostNullAncestorPerRow;
+        bool anyAncestorNull = false;
+        if (perRowAncestorOuter is not null)
+        {
+            for (int i = 0; i < outerRows; i++)
+                if (perRowAncestorOuter[i] >= 0) { anyAncestorNull = true; break; }
+        }
+        bool hasDef = anyInnerNull || anyNull || anyEmpty || anyAncestorNull;
+
+        // Compute level count and visible items in one pass. Ancestor-null
+        // rows behave like list-null rows for level counting (single rep
+        // event, no value slots consumed) — the def value comes from the
+        // outermost ancestor layer rather than the list's own layer.
         int totalLevels = 0;
         int visibleItems = 0;
         for (int i = 0; i < outerRows; i++)
         {
+            bool ancestorNull = perRowAncestorOuter is not null
+                && perRowAncestorOuter[i] >= 0;
             bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
-            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
-            if (isNull || len == 0) totalLevels += 1;
+            int len = (ancestorNull || isNull) ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            if (ancestorNull || isNull || len == 0) totalLevels += 1;
             else { totalLevels += len; visibleItems += len; }
         }
 
@@ -1007,10 +1272,26 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int writePos = 0;
         for (int i = 0; i < outerRows; i++)
         {
+            int ancestorIdx = perRowAncestorOuter is not null
+                ? perRowAncestorOuter[i] : -1;
+            bool ancestorNull = ancestorIdx >= 0;
             bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
-            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
-            int rowStart = isNull ? 0 : outerOffsets[i];
-            if (isNull)
+            int len = (ancestorNull || isNull) ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            int rowStart = (ancestorNull || isNull) ? 0 : outerOffsets[i];
+
+            if (ancestorNull)
+            {
+                // Outer struct cascade dominates — emit one event using the
+                // outermost ancestor's def slot.
+                rep[writePos] = 1;
+                int slot = ancestorNullDef[ancestorIdx];
+                if (slot < 0)
+                    throw new InvalidOperationException(
+                        $"Cascade marked row {i} null at ancestor {ancestorIdx} but the layer has no def slot.");
+                def![writePos] = (ushort)slot;
+                writePos++;
+            }
+            else if (isNull)
             {
                 rep[writePos] = 1;
                 def![writePos] = (ushort)listNullDef;
@@ -1046,14 +1327,24 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // string bytes; offsets[0] = (visibleItems+1)*4 (start of data).
         byte[] valueBytes;
         CompressiveEncoding valueEncoding;
+        // Helper: returns true if row i should contribute NO visible items
+        // (either ancestor cascade null, list null, or list empty).
+        bool RowSkipsValueSlots(int i)
+        {
+            if (perRowAncestorOuter is not null && perRowAncestorOuter[i] >= 0)
+                return true;
+            if (anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0)
+                return true;
+            return false;
+        }
+
         if (isVariableInner)
         {
             var binArr = (BinaryArray)innerValues;
             int totalDataLen = 0;
             for (int i = 0; i < outerRows; i++)
             {
-                bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
-                if (isNull) continue;
+                if (RowSkipsValueSlots(i)) continue;
                 int start = outerOffsets[i];
                 int end = outerOffsets[i + 1];
                 for (int k = start; k < end; k++)
@@ -1067,8 +1358,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             int visIdx = 0;
             for (int i = 0; i < outerRows; i++)
             {
-                bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
-                if (isNull) continue;
+                if (RowSkipsValueSlots(i)) continue;
                 int start = outerOffsets[i];
                 int end = outerOffsets[i + 1];
                 for (int k = start; k < end; k++)
@@ -1103,8 +1393,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 int outBytes = 0;
                 for (int i = 0; i < outerRows; i++)
                 {
-                    bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
-                    if (isNull) continue;
+                    if (RowSkipsValueSlots(i)) continue;
                     int start = outerOffsets[i];
                     int end = outerOffsets[i + 1];
                     int rowLen = end - start;
@@ -1136,7 +1425,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         var chunk = new PageChunk(0, visibleItems, valueBytes,
             RepLevels: rep, DefLevels: def);
-        var layers = new List<RepDefLayer> { itemLayer, listLayer };
+        var layers = new List<RepDefLayer>(2 + ancestorLayers.Count) { itemLayer, listLayer };
+        layers.AddRange(ancestorLayers);
 
         ThrowIfFinalized();
         if (_totalRows < 0) _totalRows = outerRows;
@@ -1149,7 +1439,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             valueEncoding, visibleItems, new[] { chunk }, layers, cancellationToken)
             .ConfigureAwait(false);
 
-        RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page });
+        RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page }, parentId);
     }
 
     private Task WriteVariableColumnAsync(
@@ -1608,7 +1898,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private void RegisterListColumn(
         string name, string parentLogical, string innerLogical,
         CompressiveEncoding valueEncoding,
-        IEnumerable<ColumnMetadata.Types.Page> pages)
+        IEnumerable<ColumnMetadata.Types.Page> pages,
+        int parentId = -1)
     {
         var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
         var columnAny = new Any
@@ -1625,12 +1916,12 @@ public sealed class LanceFileWriter : IAsyncDisposable
         foreach (var page in pages) columnMeta.Pages.Add(page);
         _columns.Add(columnMeta);
 
-        int parentId = _fields.Count;
+        int listFieldId = _fields.Count;
         _fields.Add(new Proto.Field
         {
             Name = name,
-            Id = parentId,
-            ParentId = -1,
+            Id = listFieldId,
+            ParentId = parentId,
             LogicalType = parentLogical,
             Nullable = true,
             Encoding = Proto.Encoding.Plain,
@@ -1642,8 +1933,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
         _fields.Add(new Proto.Field
         {
             Name = "item",
-            Id = parentId + 1,
-            ParentId = parentId,
+            Id = listFieldId + 1,
+            ParentId = listFieldId,
             LogicalType = innerLogical,
             Nullable = true,
             Encoding = innerFieldEncoding,
