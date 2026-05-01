@@ -381,4 +381,261 @@ public class LanceDatasetWriterTests
     {
         return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
     }
+
+    [Fact]
+    public async Task Append_AddsFragmentToExistingDataset()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            // Initial dataset: one fragment with [1, 2, 3].
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+
+            // Append a second fragment with [4, 5].
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 4, 5 });
+                await ds.FinishAsync();
+            }
+
+            // Reader should see version 2, two fragments, total 5 rows.
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(2, table.NumberOfFragments);
+            Assert.Equal(5L, table.NumberOfRows);
+            // ReadAsync streams one RecordBatch per fragment; concatenate.
+            var batches = await ToArrayBatchesAsync(table);
+            Assert.Equal(2, batches.Count);
+            Assert.Equal(new int?[] { 1, 2, 3 }, ((Int32Array)batches[0]).ToArray());
+            Assert.Equal(new int?[] { 4, 5 }, ((Int32Array)batches[1]).ToArray());
+
+            // _versions/ should now have two manifests (v1 and v2).
+            string versions = Path.Combine(path, "_versions");
+            Assert.Equal(2, Directory.GetFiles(versions, "*.manifest").Length);
+            // data/ should have two .lance files.
+            Assert.Equal(2, Directory.GetFiles(Path.Combine(path, "data"), "*.lance").Length);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Append_RejectsSchemaMismatch()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+
+            // Try to append with a different column name → must throw.
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            {
+                await using var ds = await LanceDatasetWriter.AppendAsync(path);
+                await ds.FileWriter.WriteInt32ColumnAsync("y", new[] { 2 });
+                await ds.FinishAsync();
+            });
+
+            // The bad write left a partial manifest absent — only v1 should remain.
+            string versions = Path.Combine(path, "_versions");
+            Assert.Single(Directory.GetFiles(versions, "*.manifest"));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Overwrite_ReplacesContentsAndAllowsSchemaChange()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            // Initial: column 'x' int32.
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+
+            // Overwrite with a totally different schema: column 'y' float.
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteFloatColumnAsync("y", new[] { 1.5f, 2.5f });
+                await ds.FinishAsync();
+            }
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(1, table.NumberOfFragments);
+            Assert.Equal(2L, table.NumberOfRows);
+            Assert.Equal("y", table.Schema.FieldsList[0].Name);
+            Assert.IsType<FloatType>(table.Schema.FieldsList[0].DataType);
+
+            // _versions/ has 2 manifests (v1 and v2 = overwritten).
+            string versions = Path.Combine(path, "_versions");
+            Assert.Equal(2, Directory.GetFiles(versions, "*.manifest").Length);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MultiFragment_InOneTransaction()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 100 });
+                await ds.FinishAsync();
+            }
+
+            // One manifest version with three fragments.
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(3, table.NumberOfFragments);
+            Assert.Equal(6L, table.NumberOfRows);
+
+            string versions = Path.Combine(path, "_versions");
+            Assert.Single(Directory.GetFiles(versions, "*.manifest"));
+            Assert.Equal(3, Directory.GetFiles(Path.Combine(path, "data"), "*.lance").Length);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Append_AfterMultiFragment_ChainsVersionsCorrectly()
+    {
+        // Combines multi-fragment-per-transaction with append: v1 has 2
+        // fragments; appending in v2 adds a 3rd.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 3, 4 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 5, 6, 7 });
+                await ds.FinishAsync();
+            }
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(3, table.NumberOfFragments);
+            Assert.Equal(7L, table.NumberOfRows);
+
+            // Sanity: manifest at v2 references three fragments with ids 0, 1, 2.
+            await using var v1 = await LanceTable.OpenAsync(path, version: 1);
+            Assert.Equal(2, v1.NumberOfFragments);
+            await using var v2 = await LanceTable.OpenAsync(path, version: 2);
+            Assert.Equal(3, v2.NumberOfFragments);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Append_RefusesIfNoExistingDataset()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            {
+                await using var ds = await LanceDatasetWriter.AppendAsync(path);
+            });
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Append_CrossValidatedAgainstPylance()
+    {
+        // Write v1 + append v2 with our writer, then have pylance read
+        // the dataset and confirm both versions are reachable and the
+        // latest version returns the union of both fragments' rows.
+        if (!IsPythonAvailable()) return;
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 40, 50 });
+                await ds.FinishAsync();
+            }
+
+            string script = "import sys, json, lance\n" +
+                $"ds = lance.dataset(r'{path}')\n" +
+                "out = { 'version': ds.version, 'rows': ds.count_rows(), " +
+                "'data': ds.to_table().to_pydict()['x'], " +
+                "'v1_rows': lance.dataset(r'" + path + "', version=1).count_rows() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(2, json.RootElement.GetProperty("version").GetInt32());
+            Assert.Equal(5, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal(3, json.RootElement.GetProperty("v1_rows").GetInt32());
+            int[] expected = { 10, 20, 30, 40, 50 };
+            int i = 0;
+            foreach (var v in json.RootElement.GetProperty("data").EnumerateArray())
+                Assert.Equal(expected[i++], v.GetInt32());
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static async Task<List<IArrowArray>> ToArrayBatchesAsync(LanceTable table)
+    {
+        var batches = new List<IArrowArray>();
+        await foreach (var batch in table.ReadAsync())
+            batches.Add(batch.Column(0));
+        return batches;
+    }
 }
