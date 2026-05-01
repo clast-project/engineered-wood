@@ -13,6 +13,7 @@ using EngineeredWood.Lance.Table.Deletions;
 using EngineeredWood.Lance.Table.Manifest;
 using EngineeredWood.Lance.Table.Proto;
 using Google.Protobuf;
+using PbTimestamp = Google.Protobuf.WellKnownTypes.Timestamp;
 using LanceField = EngineeredWood.Lance.Proto.Field;
 using LanceManifest = EngineeredWood.Lance.Table.Proto.Manifest;
 
@@ -316,6 +317,13 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         string datasetPath, LanceManifest manifest, byte[] transactionBytes,
         CancellationToken cancellationToken)
     {
+        // Stamp every manifest with its commit timestamp (UTC). Lance
+        // readers — including ours — use this for time-based time-travel
+        // (`OpenAsync(path, asOf: ...)`). Don't overwrite an existing
+        // timestamp; the manifest builder may already have set one (e.g.
+        // when copying a manifest forward without a real new commit).
+        if (manifest.Timestamp is null)
+            manifest.Timestamp = PbTimestamp.FromDateTime(DateTime.UtcNow);
         byte[] manifestBytes = manifest.ToByteArray();
         long bodySize = sizeof(uint) + transactionBytes.Length
                       + sizeof(uint) + manifestBytes.Length;

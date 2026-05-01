@@ -57,6 +57,17 @@ public sealed class LanceTable : IAsyncDisposable
     public ulong Version => _manifest.Version;
 
     /// <summary>
+    /// The commit timestamp recorded on this version's manifest, in UTC.
+    /// <see cref="DateTimeOffset.MinValue"/> if the manifest didn't carry
+    /// a timestamp (older writers may not have stamped them); time-travel
+    /// can't use those manifests.
+    /// </summary>
+    public DateTimeOffset CommitTimestamp =>
+        _manifest.Timestamp is null
+            ? DateTimeOffset.MinValue
+            : _manifest.Timestamp.ToDateTimeOffset();
+
+    /// <summary>
     /// Total row count across every fragment, with deletions applied
     /// (i.e., <c>physical_rows - num_deleted_rows</c> per fragment).
     /// </summary>
@@ -137,7 +148,7 @@ public sealed class LanceTable : IAsyncDisposable
         string directoryPath, CancellationToken cancellationToken = default)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
-        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, cancellationToken);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf: null, cancellationToken);
     }
 
     /// <summary>
@@ -150,7 +161,7 @@ public sealed class LanceTable : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
-        return OpenAsyncCore(fs, ownsFileSystem: true, version, cancellationToken);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version, asOf: null, cancellationToken);
     }
 
     /// <summary>
@@ -160,7 +171,7 @@ public sealed class LanceTable : IAsyncDisposable
     /// </summary>
     public static ValueTask<LanceTable> OpenAsync(
         ITableFileSystem fileSystem, CancellationToken cancellationToken = default)
-        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, cancellationToken);
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf: null, cancellationToken);
 
     /// <summary>
     /// Opens a Lance dataset at a specific historical version (time travel)
@@ -169,7 +180,27 @@ public sealed class LanceTable : IAsyncDisposable
     public static ValueTask<LanceTable> OpenAsync(
         ITableFileSystem fileSystem, ulong version,
         CancellationToken cancellationToken = default)
-        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version, cancellationToken);
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version, asOf: null, cancellationToken);
+
+    /// <summary>
+    /// Opens a Lance dataset at the latest version with
+    /// <c>commit_timestamp &lt;= asOf</c> from a directory on the local
+    /// filesystem. Useful for "what did the table look like at 8 AM
+    /// yesterday?" queries. Throws if no committed version is old enough.
+    /// </summary>
+    public static ValueTask<LanceTable> OpenAsync(
+        string directoryPath, DateTimeOffset asOf,
+        CancellationToken cancellationToken = default)
+    {
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf, cancellationToken);
+    }
+
+    /// <inheritdoc cref="OpenAsync(string, DateTimeOffset, CancellationToken)"/>
+    public static ValueTask<LanceTable> OpenAsync(
+        ITableFileSystem fileSystem, DateTimeOffset asOf,
+        CancellationToken cancellationToken = default)
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf, cancellationToken);
 
     /// <summary>
     /// Lists every available version number in the dataset, sorted
@@ -198,13 +229,19 @@ public sealed class LanceTable : IAsyncDisposable
 
     private static async ValueTask<LanceTable> OpenAsyncCore(
         ITableFileSystem fs, bool ownsFileSystem, ulong? version,
-        CancellationToken cancellationToken)
+        DateTimeOffset? asOf, CancellationToken cancellationToken)
     {
+        if (version is not null && asOf is not null)
+            throw new ArgumentException(
+                "Specify either a version or an asOf timestamp — not both.");
         ManifestFileEntry entry = version is { } v
             ? await ManifestPathResolver.ResolveByVersionAsync(fs, v, cancellationToken)
                 .ConfigureAwait(false)
-            : await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
-                .ConfigureAwait(false);
+            : asOf is { } t
+                ? await ManifestPathResolver.ResolveByTimestampAsync(fs, t, cancellationToken)
+                    .ConfigureAwait(false)
+                : await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+                    .ConfigureAwait(false);
         Proto.Manifest manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
 

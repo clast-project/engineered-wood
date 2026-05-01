@@ -77,6 +77,48 @@ internal static class ManifestPathResolver
     }
 
     /// <summary>
+    /// Returns the latest manifest with <c>timestamp &lt;= asOf</c>. Used
+    /// by the time-travel <c>OpenAsync(path, asOf: ...)</c> reader.
+    /// Throws <see cref="LanceTableFormatException"/> if no manifest is
+    /// old enough (i.e., the dataset didn't exist at that time).
+    ///
+    /// <para>Walks manifests newest-first and reads each one's
+    /// <c>timestamp</c> field; returns the first one whose stamp falls
+    /// at or before the request. Manifests without a timestamp are
+    /// skipped (an old writer that didn't stamp them can't participate
+    /// in time-travel).</para>
+    /// </summary>
+    public static async ValueTask<ManifestFileEntry> ResolveByTimestampAsync(
+        ITableFileSystem fs, DateTimeOffset asOf,
+        CancellationToken cancellationToken = default)
+    {
+        IReadOnlyList<ManifestFileEntry> entries = await ListAllAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        if (entries.Count == 0)
+            throw new LanceTableFormatException(
+                $"No manifest files found in '{VersionsDirectory}'. Is this a Lance dataset?");
+
+        DateTimeOffset asOfUtc = asOf.ToUniversalTime();
+        DateTimeOffset? earliestStamp = null;
+        foreach (var entry in entries)
+        {
+            var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+                .ConfigureAwait(false);
+            if (manifest.Timestamp is null) continue;
+            DateTimeOffset stamp = manifest.Timestamp.ToDateTimeOffset();
+            if (earliestStamp is null || stamp < earliestStamp) earliestStamp = stamp;
+            if (stamp <= asOfUtc) return entry;
+        }
+
+        string earliestText = earliestStamp is null
+            ? "(no manifests carry a timestamp)"
+            : earliestStamp.Value.ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+        throw new LanceTableFormatException(
+            $"No Lance manifest with timestamp <= {asOfUtc:o}. " +
+            $"Earliest available stamp: {earliestText}.");
+    }
+
+    /// <summary>
     /// Lists every manifest file in the dataset, ordered newest-first
     /// (highest version number first).
     /// </summary>

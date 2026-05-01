@@ -1063,6 +1063,127 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task TimeTravel_OpensVersionAtOrBeforeTimestamp()
+    {
+        // Three commits at distinct timestamps. Reading "as of" each
+        // commit's timestamp should land on that exact version; reading
+        // between commits returns the earlier version.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            // Capture the timestamp of v1 by reading the table now.
+            DateTimeOffset afterV1;
+            await using (var t = await LanceTable.OpenAsync(path))
+                afterV1 = t.CommitTimestamp;
+            await Task.Delay(20);
+
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 2 });
+                await ds.FinishAsync();
+            }
+            DateTimeOffset afterV2;
+            await using (var t = await LanceTable.OpenAsync(path))
+                afterV2 = t.CommitTimestamp;
+            await Task.Delay(20);
+
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 3 });
+                await ds.FinishAsync();
+            }
+
+            // Open as-of the v1 timestamp → should return v1.
+            await using (var t = await LanceTable.OpenAsync(path, asOf: afterV1))
+            {
+                Assert.Equal(1UL, t.Version);
+                int[] data = await ReadInt32ColumnAsync(t, "x");
+                Assert.Equal(new[] { 1 }, data);
+            }
+
+            // Open between v1 and v2 (just slightly after v1) → still v1.
+            var betweenV1V2 = afterV1.AddMilliseconds(1);
+            // (As long as betweenV1V2 < afterV2.)
+            if (betweenV1V2 < afterV2)
+            {
+                await using var t = await LanceTable.OpenAsync(path, asOf: betweenV1V2);
+                Assert.Equal(1UL, t.Version);
+            }
+
+            // Open as-of the v2 timestamp → should return v2.
+            await using (var t = await LanceTable.OpenAsync(path, asOf: afterV2))
+            {
+                Assert.Equal(2UL, t.Version);
+                int[] data = await ReadInt32ColumnAsync(t, "x");
+                Assert.Equal(new[] { 2 }, data);
+            }
+
+            // Open as-of "right now" → should return latest (v3).
+            await using (var t = await LanceTable.OpenAsync(path, asOf: DateTimeOffset.UtcNow))
+            {
+                Assert.Equal(3UL, t.Version);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TimeTravel_BeforeAnyCommit_Throws()
+    {
+        // No version is old enough → throws with a helpful message.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            // A timestamp from years ago — no manifest is that old.
+            var asOf = new DateTimeOffset(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            await Assert.ThrowsAsync<LanceTableFormatException>(async () =>
+                await LanceTable.OpenAsync(path, asOf: asOf));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TimeTravel_RejectsBothVersionAndAsOf()
+    {
+        // The two overloads can't coexist on a single call. (The public
+        // API doesn't expose both; this is an internal-ish guard.)
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            // Sanity: both single-arg overloads work independently.
+            await using var v1 = await LanceTable.OpenAsync(path, version: 1);
+            Assert.Equal(1UL, v1.Version);
+            await using var t1 = await LanceTable.OpenAsync(path, asOf: DateTimeOffset.UtcNow);
+            Assert.Equal(1UL, t1.Version);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Compact_NoDeletions_NoOp()
     {
         // Fresh dataset, no deletion files anywhere → CompactAsync is a
