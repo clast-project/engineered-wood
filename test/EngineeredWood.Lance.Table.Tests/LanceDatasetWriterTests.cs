@@ -1063,6 +1063,263 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task Compact_NoDeletions_NoOp()
+    {
+        // Fresh dataset, no deletion files anywhere → CompactAsync is a
+        // no-op (no version bump, no source/new fragments).
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Empty(result.SourceFragmentIds);
+            Assert.Empty(result.NewFragmentIds);
+            Assert.Equal(0, result.RowsRetained);
+            Assert.Equal(1L, result.Version);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_AfterDelete_ReplacesFragmentWithSurvivors()
+    {
+        // 1 fragment with 5 rows → delete 2 → compact rewrites the
+        // remaining 3 into a new fragment, drops the old one.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30, 40, 50 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 1, 3 } });
+
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Single(result.SourceFragmentIds);
+            Assert.Equal(0UL, result.SourceFragmentIds[0]);
+            Assert.Single(result.NewFragmentIds);
+            Assert.Equal(3, result.RowsRetained);
+            Assert.Equal(3L, result.Version);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(1, table.NumberOfFragments);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 10, 30, 50 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_FullyDeletedFragment_DropsIt()
+    {
+        // Delete every row in a fragment; compaction drops the fragment
+        // entirely (no new fragment produced) and the dataset becomes
+        // empty.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0, 1, 2 } });
+
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Single(result.SourceFragmentIds);
+            Assert.Empty(result.NewFragmentIds);
+            Assert.Equal(0, result.RowsRetained);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(0, table.NumberOfFragments);
+            Assert.Equal(0L, table.NumberOfRows);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_LeavesUnaffectedFragmentsAlone()
+    {
+        // 2 fragments, only one has deletions. Compaction should leave
+        // the clean one untouched and rewrite only the dirty one.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 100, 200, 300 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4 });
+                await ds.FinishAsync();
+            }
+            // Delete from fragment 1 only.
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [1] = new[] { 0, 2 } });
+
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Single(result.SourceFragmentIds);
+            Assert.Equal(1UL, result.SourceFragmentIds[0]);  // only fragment 1 was compacted
+            Assert.Single(result.NewFragmentIds);
+            Assert.Equal(2, result.RowsRetained);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            // 2 fragments: clean fragment 0 (3 rows) + new compacted (2 rows).
+            Assert.Equal(2, table.NumberOfFragments);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 100, 200, 300, 2, 4 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_PreservesPreviousVersionRowCount()
+    {
+        // After compaction, v1 (pre-delete) and v2 (post-delete) should
+        // still both be reachable with their original row counts.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 } });
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Equal(3L, result.Version);
+
+            await using var v1 = await LanceTable.OpenAsync(path, version: 1);
+            Assert.Equal(4L, v1.NumberOfRows);
+            await using var v2 = await LanceTable.OpenAsync(path, version: 2);
+            Assert.Equal(3L, v2.NumberOfRows);
+            await using var v3 = await LanceTable.OpenAsync(path, version: 3);
+            Assert.Equal(3L, v3.NumberOfRows);  // same survivors, just repacked
+            Assert.Equal(1, v3.NumberOfFragments);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_ThenVacuum_FreesOldFiles()
+    {
+        // The whole maintenance lifecycle: write, delete, compact, vacuum.
+        // After vacuum (RetainVersions=1), only the compacted data file
+        // and its manifest remain.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30, 40, 50 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0, 4 } });
+            await LanceDatasetWriter.CompactAsync(path);
+
+            // Pre-vacuum: 3 manifests (write + delete + compact); 2 data
+            // files (original + compacted); 1 deletion file.
+            string data = Path.Combine(path, "data");
+            string deletions = Path.Combine(path, "_deletions");
+            string versions = Path.Combine(path, "_versions");
+            Assert.Equal(3, Directory.GetFiles(versions, "*.manifest").Length);
+            Assert.Equal(2, Directory.GetFiles(data, "*.lance").Length);
+            Assert.Equal(1, Directory.GetFiles(deletions, "*.arrow").Length);
+
+            var vac = await LanceDatasetWriter.VacuumAsync(path);
+            // The original data file is now orphaned (latest manifest only
+            // references the compacted file). The deletion file is also
+            // orphaned (only referenced by v2's manifest, which we just
+            // pruned). Two manifests pruned (v1 + v2 → only v3 stays).
+            Assert.Single(Directory.GetFiles(data, "*.lance"));
+            Assert.Empty(Directory.GetFiles(deletions, "*.arrow"));
+            Assert.Single(Directory.GetFiles(versions, "*.manifest"));
+            Assert.Equal(1, vac.DataFilesDeleted.Count);
+            Assert.Equal(2, vac.ManifestsDeleted.Count);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 20, 30, 40 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x",
+                    new[] { 100, 200, 300, 400, 500, 600 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 1, 2, 4 } });
+            await LanceDatasetWriter.CompactAsync(path);
+
+            string script = "import sys, json, lance\n" +
+                $"ds = lance.dataset(r'{path}')\n" +
+                "out = { 'rows': ds.count_rows(), 'data': ds.to_table().to_pydict()['x'], " +
+                "'frags': len(ds.get_fragments()) }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(3, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal(1, json.RootElement.GetProperty("frags").GetInt32());
+            int[] expected = { 100, 400, 600 };
+            int i = 0;
+            foreach (var v in json.RootElement.GetProperty("data").EnumerateArray())
+                Assert.Equal(expected[i++], v.GetInt32());
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task DeleteByPredicate_CrossValidatedAgainstPylance()
     {
         if (!IsPythonAvailable()) return;

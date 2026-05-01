@@ -1106,6 +1106,208 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
+    /// Compacts fragments that carry a deletion file: reads the surviving
+    /// rows from each, writes them into a single fresh fragment, and
+    /// publishes a new manifest version that drops the source fragments
+    /// and adds the compacted one. Fragments without deletion files (and
+    /// therefore no tombstoned rows) are left untouched.
+    ///
+    /// <para>Returns a <see cref="LanceCompactionResult"/> describing the
+    /// fragment ids consumed and produced and the surviving row count;
+    /// when no fragments had deletion files the result reports an empty
+    /// source set and the unchanged version.</para>
+    ///
+    /// <para>Old data and deletion files remain on disk so prior
+    /// versions stay readable; <see cref="VacuumAsync"/> with
+    /// <see cref="LanceVacuumOptions.RetainVersions"/> = 1 reclaims them.
+    /// Same scope limitation as <see cref="UpdateAsync"/> — leaf-typed
+    /// columns only.</para>
+    /// </summary>
+    public static async ValueTask<LanceCompactionResult> CompactAsync(
+        string datasetPath, CancellationToken cancellationToken = default)
+    {
+        if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        if (!Directory.Exists(datasetPath)
+            || !Directory.Exists(Path.Combine(datasetPath, "_versions")))
+            throw new InvalidOperationException(
+                $"Path '{datasetPath}' does not contain a Lance dataset.");
+
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Identify fragments with at least one tombstoned row. Fragments
+        // without deletion files are well-packed already and aren't
+        // worth rewriting in this pass.
+        var compactable = manifest.Fragments
+            .Where(f => f.DeletionFile is not null && f.DeletionFile.NumDeletedRows > 0)
+            .ToList();
+        if (compactable.Count == 0)
+        {
+            return new LanceCompactionResult
+            {
+                SourceFragmentIds = System.Array.Empty<ulong>(),
+                NewFragmentIds = System.Array.Empty<ulong>(),
+                RowsRetained = 0,
+                Version = (long)manifest.Version,
+            };
+        }
+
+        var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
+        lanceSchema.Fields.AddRange(manifest.Fields);
+        var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+
+        // Per-column slices accumulated across all source fragments; we
+        // write them as a single new fragment at the end.
+        var perColumnSlices = new List<IArrowArray>[arrowSchema.FieldsList.Count];
+        for (int i = 0; i < perColumnSlices.Length; i++)
+            perColumnSlices[i] = new List<IArrowArray>();
+
+        long totalRetained = 0;
+        var sourceFragmentIds = new List<ulong>(compactable.Count);
+
+        foreach (var fragment in compactable)
+        {
+            DataFile file = fragment.Files[0];
+            string relPath = "data/" + file.Path;
+            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+                .ConfigureAwait(false);
+            await using var reader = await EngineeredWood.Lance.LanceFileReader
+                .OpenAsync(raf, ownsReader: false, cancellationToken)
+                .ConfigureAwait(false);
+
+            int rowCount = checked((int)reader.NumberOfRows);
+            var arrays = new IArrowArray[arrowSchema.FieldsList.Count];
+            for (int i = 0; i < arrays.Length; i++)
+                arrays[i] = await reader.ReadColumnAsync(i, cancellationToken)
+                    .ConfigureAwait(false);
+
+            var existingMask = await DeletionFileReader.ReadAsync(
+                fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                .ConfigureAwait(false);
+
+            var survivors = new List<int>();
+            for (int i = 0; i < rowCount; i++)
+                if (!existingMask.IsDeleted(i)) survivors.Add(i);
+
+            sourceFragmentIds.Add(fragment.Id);
+            if (survivors.Count == 0) continue;  // entire fragment tombstoned
+
+            for (int colIdx = 0; colIdx < arrays.Length; colIdx++)
+            {
+                IArrowArray taken = TakeRows(
+                    arrays[colIdx], survivors,
+                    arrowSchema.FieldsList[colIdx].DataType);
+                perColumnSlices[colIdx].Add(taken);
+            }
+            totalRetained += survivors.Count;
+        }
+
+        // Build the new fragments list: keep fragments without deletion
+        // files, drop the compacted source fragments, append the new
+        // compacted fragment (when there are surviving rows).
+        var newFragments = new List<DataFragment>(manifest.Fragments.Count);
+        ulong maxFragId = 0;
+        var sourceSet = new HashSet<ulong>(sourceFragmentIds);
+        foreach (var oldFrag in manifest.Fragments)
+        {
+            if (oldFrag.Id > maxFragId) maxFragId = oldFrag.Id;
+            if (sourceSet.Contains(oldFrag.Id)) continue;
+            newFragments.Add(oldFrag.Clone());
+        }
+
+        var newFragmentIds = new List<ulong>();
+        if (totalRetained > 0)
+        {
+            // Concatenate per-column slices and write a single new fragment.
+            var newFragArrays = new IArrowArray[perColumnSlices.Length];
+            for (int i = 0; i < perColumnSlices.Length; i++)
+                newFragArrays[i] = perColumnSlices[i].Count == 1
+                    ? perColumnSlices[i][0]
+                    : ArrowArrayConcatenator.Concatenate(perColumnSlices[i]);
+
+            string newDataFileName = Guid.NewGuid().ToString("N") + ".lance";
+            string newDataFilePath = Path.Combine(datasetPath, "data", newDataFileName);
+            LanceVersion newFileVersion;
+            IReadOnlyList<LanceField> newFileFields;
+            await using (var w = await EngineeredWood.Lance.LanceFileWriter
+                .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+            {
+                for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
+                    await w.WriteColumnAsync(
+                        arrowSchema.FieldsList[i].Name, newFragArrays[i], cancellationToken)
+                        .ConfigureAwait(false);
+                await w.FinishAsync(cancellationToken).ConfigureAwait(false);
+                newFileVersion = w.Version;
+                newFileFields = w.SchemaFields.Select(f => f.Clone()).ToList();
+            }
+            long newDataFileSize = new FileInfo(newDataFilePath).Length;
+
+            var newDataFileProto = new DataFile
+            {
+                Path = newDataFileName,
+                FileMajorVersion = (uint)newFileVersion.Major,
+                FileMinorVersion = (uint)newFileVersion.Minor,
+                FileSizeBytes = (ulong)newDataFileSize,
+            };
+            for (int i = 0; i < newFileFields.Count; i++)
+            {
+                newDataFileProto.Fields.Add(newFileFields[i].Id);
+                newDataFileProto.ColumnIndices.Add(i);
+            }
+            ulong newFragId = maxFragId + 1;
+            var compactedFragment = new DataFragment
+            {
+                Id = newFragId,
+                PhysicalRows = (ulong)totalRetained,
+            };
+            compactedFragment.Files.Add(newDataFileProto);
+            newFragments.Add(compactedFragment);
+            newFragmentIds.Add(newFragId);
+        }
+
+        // Publish the new manifest.
+        ulong newVersion = manifest.Version + 1;
+        string txnUuid = Guid.NewGuid().ToString();
+        string txnFileName = $"{manifest.Version}-{txnUuid}.txn";
+        var transaction = new Transaction
+        {
+            ReadVersion = manifest.Version,
+            Uuid = txnUuid,
+        };
+        byte[] transactionBytes = transaction.ToByteArray();
+        await File.WriteAllBytesAsync(
+            Path.Combine(datasetPath, "_transactions", txnFileName),
+            transactionBytes, cancellationToken).ConfigureAwait(false);
+
+        var newManifest = new LanceManifest
+        {
+            Version = newVersion,
+            TransactionFile = txnFileName,
+            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
+            {
+                FileFormat = "lance",
+                Version = "2.1",
+            },
+        };
+        newManifest.Fields.AddRange(manifest.Fields);
+        newManifest.Fragments.AddRange(newFragments);
+
+        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+            .ConfigureAwait(false);
+
+        return new LanceCompactionResult
+        {
+            SourceFragmentIds = sourceFragmentIds,
+            NewFragmentIds = newFragmentIds,
+            RowsRetained = totalRetained,
+            Version = (long)newVersion,
+        };
+    }
+
+    /// <summary>
     /// Write a Lance Arrow-IPC deletion file: a single record batch with
     /// one column of deleted row offsets in ascending order. The proto
     /// comment says "Int32Array" but pylance / lance-rs require a strict
@@ -1171,6 +1373,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         string versionsDir = Path.Combine(datasetPath, "_versions");
         string dataDir = Path.Combine(datasetPath, "data");
         string txnDir = Path.Combine(datasetPath, "_transactions");
+        string deletionsDir = Path.Combine(datasetPath, "_deletions");
 
         if (!Directory.Exists(datasetPath) || !Directory.Exists(versionsDir))
             throw new InvalidOperationException(
@@ -1189,9 +1392,11 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var droppedEntries = allEntries.Skip(retainCount).ToArray();
 
         // Read each retained manifest and collect the live data file
-        // names + the transaction filenames it references.
+        // names + the transaction filenames + deletion-file names it
+        // references.
         var liveDataFiles = new HashSet<string>(StringComparer.Ordinal);
         var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
+        var liveDeletionFiles = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in retainedEntries)
         {
             var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
@@ -1206,6 +1411,16 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     string baseName = Path.GetFileName(file.Path);
                     liveDataFiles.Add(baseName);
                 }
+                if (fragment.DeletionFile is not null)
+                {
+                    string ext = fragment.DeletionFile.FileType
+                        == DeletionFile.Types.DeletionFileType.Bitmap
+                        ? ".bin"
+                        : ".arrow";
+                    liveDeletionFiles.Add(
+                        $"{fragment.Id}-{fragment.DeletionFile.ReadVersion}-" +
+                        $"{fragment.DeletionFile.Id}{ext}");
+                }
             }
             if (!string.IsNullOrEmpty(manifest.TransactionFile))
                 liveTxnFiles.Add(Path.GetFileName(manifest.TransactionFile));
@@ -1214,6 +1429,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var deletedDataFiles = new List<string>();
         var deletedManifests = new List<string>();
         var deletedTxnFiles = new List<string>();
+        var deletedDeletionFiles = new List<string>();
         long bytesDeleted = 0;
 
         // Walk data/ — anything not referenced by a retained manifest is
@@ -1261,11 +1477,27 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             }
         }
 
+        // Walk _deletions/ — drop deletion files not referenced by any
+        // retained manifest's fragment.
+        if (Directory.Exists(deletionsDir))
+        {
+            foreach (string file in Directory.EnumerateFiles(deletionsDir))
+            {
+                string baseName = Path.GetFileName(file);
+                if (liveDeletionFiles.Contains(baseName)) continue;
+                long size = new FileInfo(file).Length;
+                if (!options.DryRun) File.Delete(file);
+                deletedDeletionFiles.Add(baseName);
+                bytesDeleted += size;
+            }
+        }
+
         return new LanceVacuumResult
         {
             DataFilesDeleted = deletedDataFiles,
             ManifestsDeleted = deletedManifests,
             TransactionsDeleted = deletedTxnFiles,
+            DeletionFilesDeleted = deletedDeletionFiles,
             BytesDeleted = bytesDeleted,
             DryRun = options.DryRun,
         };
@@ -1316,6 +1548,25 @@ public sealed record LanceVacuumOptions
 }
 
 /// <summary>
+/// Outcome of <see cref="LanceDatasetWriter.CompactAsync"/>: which
+/// fragment ids were rewritten, what new fragment id replaces them, and
+/// the surviving row count. <see cref="Version"/> is the manifest
+/// version after the compaction (= read version when no compaction was
+/// needed).
+/// </summary>
+public sealed record LanceCompactionResult
+{
+    /// <summary>Fragment ids that were read for surviving rows and dropped from the manifest.</summary>
+    public IReadOnlyList<ulong> SourceFragmentIds { get; init; } = System.Array.Empty<ulong>();
+    /// <summary>Fragment ids added to the manifest (typically a single id; empty when every source fragment had all its rows deleted).</summary>
+    public IReadOnlyList<ulong> NewFragmentIds { get; init; } = System.Array.Empty<ulong>();
+    /// <summary>Total surviving rows packed into the new fragment(s).</summary>
+    public long RowsRetained { get; init; }
+    /// <summary>Manifest version after compaction.</summary>
+    public long Version { get; init; }
+}
+
+/// <summary>
 /// Outcome of <see cref="LanceDatasetWriter.VacuumAsync"/> — lists the
 /// files removed (or that would be removed in dry-run mode) and the
 /// total bytes reclaimed.
@@ -1340,7 +1591,12 @@ public sealed record LanceVacuumResult
     /// </summary>
     public IReadOnlyList<string> TransactionsDeleted { get; init; }
         = System.Array.Empty<string>();
-    /// <summary>Total bytes reclaimed across all three buckets.</summary>
+    /// <summary>
+    /// Deletion filenames in <c>_deletions/</c> that were deleted.
+    /// </summary>
+    public IReadOnlyList<string> DeletionFilesDeleted { get; init; }
+        = System.Array.Empty<string>();
+    /// <summary>Total bytes reclaimed across all four buckets.</summary>
     public long BytesDeleted { get; init; }
     /// <summary>
     /// True if vacuum ran in dry-run mode — the file lists describe what
