@@ -1,12 +1,12 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, and **Lance** (read-only) — and table formats — **Delta Lake** and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
+A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, and **Lance** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
 ## Highlights
 
-- **Six formats, one Arrow surface.** Parquet, ORC, and Avro readers and writers, plus a Lance reader, all speak `Apache.Arrow.RecordBatch`; Delta Lake and Iceberg sit on top of them.
-- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, and scan planning in Iceberg from the same tree.
-- **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
+- **Four formats, one Arrow surface.** Parquet, ORC, Avro, and Lance readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
+- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, and predicate-based delete/update on Lance datasets from the same tree.
+- **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files or Azure Blob Storage.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
 - **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
@@ -29,7 +29,8 @@ src/
   EngineeredWood.Parquet/                Parquet reader and writer
   EngineeredWood.Orc/                    ORC reader and writer
   EngineeredWood.Avro/                   Avro reader and writer
-  EngineeredWood.Lance/                  Lance reader (v2.0 + v2.1)
+  EngineeredWood.Lance/                  Lance file reader and writer (v2.0 + v2.1 + v2.2)
+  EngineeredWood.Lance.Table/            Lance dataset / table API (manifests, fragments, time travel)
   EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
   EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
   EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
@@ -159,22 +160,25 @@ All 19 ORC types are supported for both reading and writing:
 
 ## Features — Lance
 
-`EngineeredWood.Lance` is a clean-room reader for the
-[Lance](https://lance.org/format/) columnar file format. Reads only —
-writer support is gated on a multipart-upload abstraction we haven't
-designed yet. Implementation is driven by the protobufs and Rust source
-of [`lance-format/lance`](https://github.com/lance-format/lance) plus
-cross-validation against [pylance](https://pypi.org/project/pylance/)-
-produced files.
+EngineeredWood ships two Lance layers: a file-level reader/writer
+(`EngineeredWood.Lance`) for individual `.lance` files and a dataset
+API (`EngineeredWood.Lance.Table`) for manifests, fragments, and
+transactional operations. Implementation is driven by the protobufs
+and Rust source of [`lance-format/lance`](https://github.com/lance-format/lance)
+plus cross-validation against [pylance](https://pypi.org/project/pylance/)-
+produced files; many of the writer paths are tested via "we write,
+pylance reads" round trips.
 
 ### Versions
 
-- **v2.0** (footer bytes `(0, 3)` — pylance's default — and `(2, 0)`)
+- **v2.0** (footer bytes `(0, 3)` — pylance's pre-0.38 default — and `(2, 0)`)
 - **v2.1** (footer bytes `(2, 1)` — pylance ≥ 0.38 default for new writes)
+- **v2.2** (footer bytes `(2, 2)` — required for Map type; the file
+  layout is otherwise identical to v2.1)
 
-v0.1 and v2.2 are rejected with explicit errors.
+v0.1 and any future v2.3+ are rejected with explicit errors.
 
-### Reading
+### File-level reading
 
 - Public `LanceFileReader.OpenAsync(path)` parses the footer, GBO/CMO
   tables, `FileDescriptor`, and per-column metadata.
@@ -183,6 +187,81 @@ v0.1 and v2.2 are rejected with explicit errors.
   column needed and assembles a single nested array.
 - Optimistic 64 KiB tail read brings the footer + metadata + global
   buffer 0 in one I/O on cloud storage.
+
+### File-level writing
+
+- `LanceFileWriter.CreateAsync(path)` writes a v2.1 file containing one
+  or more columns. Auto-bumps to v2.2 when a column requires it (Map).
+- `WriteColumnAsync(name, IArrowArray)` for single-page columns;
+  `WriteColumnAsync(name, IReadOnlyList<IArrowArray>)` for explicit
+  multi-page leaf columns. Each call appends to the schema in order.
+- Optional ZSTD compression on fixed-width primitive value buffers
+  (`LanceCompressionScheme.Zstd` ctor parameter) wraps Flat in
+  `General(ZSTD, Flat(N))` per chunk.
+- Pylance cross-validation passes for every writer surface — see
+  `LanceFileWriterTests.*_CrossValidatedAgainstPylance`.
+
+### Dataset / table layer
+
+`EngineeredWood.Lance.Table` wraps the file writer in the Lance dataset
+directory layout (`data/`, `_versions/`, `_transactions/`, `_deletions/`)
+and exposes the read side via `LanceTable`.
+
+#### Reading
+
+- `LanceTable.OpenAsync(path)` opens the latest manifest version;
+  overloads accept `version: ulong` or `asOf: DateTimeOffset` for
+  time travel.
+- `IAsyncEnumerable<RecordBatch>` streaming, column projection,
+  deletion-mask filtering applied during read.
+- **Predicate pushdown**: filter passed to `ReadAsync` evaluates against
+  each fragment via `ArrowRowEvaluator`. For indexed columns,
+  fragment-level pruning skips fragments whose B-tree or bitmap
+  index proves they can't match.
+- **Index reads**: B-tree and bitmap secondary index files (read-only —
+  we don't write indices yet).
+
+#### Writing
+
+- `LanceDatasetWriter.CreateAsync(path)` — fresh dataset; refuses to
+  clobber an existing one.
+- `LanceDatasetWriter.AppendAsync(path)` — adds new fragments alongside
+  the existing ones; schema must match.
+- `LanceDatasetWriter.OverwriteAsync(path)` — replaces dataset contents;
+  schema can change.
+- `NewFragmentAsync()` between batches splits a single transaction
+  into multiple fragments.
+- `DeleteRowsAsync(path, perFragmentRowOffsets)` — emits deletion files
+  (Arrow-IPC `{ row_id: uint32 }`) and bumps the manifest.
+- `DeleteAsync(path, predicate)` — predicate-based delete layered on
+  top of `DeleteRowsAsync`.
+- `UpdateAsync(path, predicate, assignments)` — delete-and-rewrite via
+  `ArrowRowEvaluator.EvaluateExpression`; matching rows are tombstoned
+  in their source fragments and reappear in a fresh appended fragment
+  with the assigned columns replaced.
+- `CompactAsync(path)` — repacks fragments carrying deletion files into
+  a single fresh fragment of survivors.
+- `VacuumAsync(path, options)` — removes data, manifest, transaction,
+  and deletion files no longer referenced by any retained version
+  (`RetainVersions`, `DryRun`).
+
+Every commit path stamps `manifest.timestamp` for time travel.
+
+### Type coverage
+
+| Arrow type | Read | Write | Notes |
+|---|---|---|---|
+| Int8/16/32/64, UInt8/16/32/64, Float, Double | yes | yes | |
+| Bool | yes | yes | bit-packed `Flat(1)`, single-chunk only on the writer |
+| String, Binary | yes | yes | |
+| FixedSizeBinary | yes | yes | |
+| Decimal128, Decimal256 | yes | yes | |
+| Date32, Date64, Time32, Time64, Timestamp, Duration | yes | yes | |
+| FixedSizeList | yes | yes | writer: primitive inner only; inner-element nulls (`has_validity=true`) reader-only |
+| List, LargeList | yes | yes | writer: primitive / string / binary inner; inner-element nulls supported |
+| Struct (recursive) | yes | yes | writer: nested struct, FSL, list children all supported |
+| Map (v2.2) | yes | yes | |
+| HalfFloat (Float16), LargeString, LargeBinary, Union | not yet | not yet | |
 
 ### v2.0 encoding coverage
 
@@ -197,25 +276,30 @@ v0.1 and v2.2 are rejected with explicit errors.
 | `Dictionary` (1-based indices with 0 = null) | yes |
 | `BitpackedForNonNeg` (Fastlanes, via `Clast.FastLanes`) | yes |
 | `FixedSizeList` | yes |
-| `SimpleStruct` (multi-column shred — no struct-level nulls per the v2.0 proto) | yes |
+| `SimpleStruct` (multi-column shred) | yes |
 | `List` / `LargeList` (with `null_offset_adjustment`) | yes |
-| `PackedStruct`, `Fsst`, miniblock-only encodings (`Rle`, `InlineBitpacking`, `OutOfLineBitpacking`, `GeneralMiniBlock`, `ByteStreamSplit`, `Block`) | not yet |
+| `PackedStruct`, `Fsst`, miniblock-only encodings (`Rle`, `InlineBitpacking`, `OutOfLineBitpacking`, `GeneralMiniBlock`, `ByteStreamSplit`, `Block`) | reader: not yet |
 
-### v2.1 encoding coverage
+### v2.1 / v2.2 encoding coverage
 
-| Layout / Encoding | Status |
-|---|---|
-| `MiniBlockLayout` with `Flat` values, primitive leaves, single layer (`ALL_VALID_ITEM` / `NULLABLE_ITEM`) | yes |
-| `MiniBlockLayout` with `Variable` (strings/binary, u32 offsets) | yes |
-| `MiniBlockLayout` with `InlineBitpacking` (Fastlanes per-chunk widths) | yes |
-| Single-column `ListType<primitive>` with rep/def (`ALL_VALID_LIST` / `NULLABLE_LIST` / `EMPTYABLE_LIST`) | yes |
-| `FullZipLayout` fixed-width with `Flat` or `FixedSizeList(Flat)` | yes |
-| `FullZipLayout` variable-width (`bits_per_offset` + `General`/ZSTD) | not yet |
-| `FullZipLayout` with rep/def | not yet |
-| `ConstantLayout` | not yet |
-| `BlobLayout` (two-level external blob storage) | not yet |
-| `OutOfLineBitpacking`, `Fsst`, v2.1 `Dictionary`/`Rle`/`ByteStreamSplit`/`General`/`PackedStruct` | not yet |
-| Multi-leaf structs, list-of-struct, deep nesting, multi-chunk Variable/list, `LargeListType`, repetition index | not yet |
+| Layout / Encoding | Read | Write |
+|---|---|---|
+| `MiniBlockLayout` with `Flat` values, primitive leaves, single layer (`ALL_VALID_ITEM` / `NULLABLE_ITEM`) | yes | yes |
+| `MiniBlockLayout` with `Variable` (strings/binary, u32 offsets) | yes | yes |
+| `MiniBlockLayout` with `Fsst` (FSST-compressed strings/binary) | yes | not yet (writer emits `Variable`) |
+| `MiniBlockLayout` with `InlineBitpacking` / `OutOfLineBitpacking` (Fastlanes) | yes | not yet (writer emits `Flat`) |
+| `MiniBlockLayout` with `Dictionary` (layout-level dictionary) | yes | not yet |
+| `MiniBlockLayout` with `General(ZSTD, Flat(N))` (per-chunk ZSTD wrap) | yes | yes (fixed-width primitive scope) |
+| `MiniBlockLayout` with `FixedSizeList` value-compression (FSL row encoding) | yes | yes (primitive inner; inner-null reader-only) |
+| `MiniBlockLayout` with rep/def cascades (every `RepDefLayer` combo, multi-list, struct-of-list) | yes | yes |
+| `MiniBlockLayout` with bool (`bits_per_value=1`) | yes | yes |
+| Multi-chunk pages with repetition index (`repetition_index_depth=1`) | yes | yes (lists) |
+| Multi-page columns | yes | yes (leaf shapes) |
+| `FullZipLayout` fixed-width with `Flat` / `FixedSizeList(Flat)` | yes | not yet |
+| `FullZipLayout` variable-width / nested-leaf cascades | yes | not yet |
+| `ConstantLayout` (all-null pages) | yes | not yet |
+| `BlobLayout` (two-level external blob storage) | not yet | not yet |
+| `Rle`, `ByteStreamSplit`, `PackedStruct` | not yet | not yet |
 
 ### Storage abstraction
 
@@ -231,6 +315,14 @@ fastlanes 1024-element packing format. `EngineeredWood.Lance` consumes
 the [`Clast.FastLanes`](https://www.nuget.org/packages/Clast.FastLanes/)
 NuGet package (zero Lance/Arrow dependencies; bit-for-bit compatible
 with the Rust `lance_bitpacking` crate).
+
+### Future work
+
+See [`doc/lance-future-work.md`](doc/lance-future-work.md) for the
+prioritised list of remaining gaps (encoding-level features the writer
+doesn't yet emit, Arrow types not yet covered, dataset-level features
+like fragment-level concurrency control and multi-fragment compaction
+targets).
 
 ## Features — Delta Lake
 
@@ -440,6 +532,77 @@ using var writer = new AvroWriterBuilder(arrowSchema)
 
 writer.Write(recordBatch);
 writer.Finish();
+```
+
+### Lance — File-level reading and writing
+
+```csharp
+using EngineeredWood.Lance;
+
+// Write a single Lance file with optional ZSTD on fixed-width columns.
+await using (var writer = await LanceFileWriter.CreateAsync(
+    "data.lance", compression: LanceCompressionScheme.Zstd))
+{
+    await writer.WriteColumnAsync("id", new[] { 1, 2, 3, 4, 5 });
+    await writer.WriteColumnAsync("name", stringArray);
+    await writer.FinishAsync();
+}
+
+// Read it back.
+await using var reader = await LanceFileReader.OpenAsync("data.lance");
+var idArr = (Apache.Arrow.Int32Array)await reader.ReadColumnAsync(0);
+```
+
+### Lance — Dataset / table layer
+
+```csharp
+using EngineeredWood.Lance.Table;
+using Ex = EngineeredWood.Expressions.Expressions;
+
+// Create a fresh dataset with two fragments in one transaction.
+await using (var ds = await LanceDatasetWriter.CreateAsync("/path/to/dataset"))
+{
+    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+    await ds.NewFragmentAsync();
+    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 4, 5, 6 });
+    await ds.FinishAsync();
+}
+
+// Append more data later.
+await using (var ds = await LanceDatasetWriter.AppendAsync("/path/to/dataset"))
+{
+    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 7, 8 });
+    await ds.FinishAsync();
+}
+
+// Predicate-based delete + update.
+await LanceDatasetWriter.DeleteAsync(
+    "/path/to/dataset", Ex.LessThan("x", LiteralValue.Of(3)));
+
+await LanceDatasetWriter.UpdateAsync(
+    "/path/to/dataset",
+    predicate: Ex.GreaterThanOrEqual("x", LiteralValue.Of(7)),
+    assignments: new Dictionary<string, Expression>
+    {
+        ["x"] = new LiteralExpression(LiteralValue.Of(0)),
+    });
+
+// Maintenance.
+await LanceDatasetWriter.CompactAsync("/path/to/dataset");
+await LanceDatasetWriter.VacuumAsync(
+    "/path/to/dataset", new LanceVacuumOptions { RetainVersions = 1 });
+
+// Read latest, by version, or as-of a timestamp.
+await using var latest = await LanceTable.OpenAsync("/path/to/dataset");
+await using var v3     = await LanceTable.OpenAsync("/path/to/dataset", version: 3);
+await using var asOf   = await LanceTable.OpenAsync(
+    "/path/to/dataset", asOf: DateTimeOffset.UtcNow.AddHours(-1));
+
+await foreach (var batch in latest.ReadAsync(
+    columns: ["x"], filter: Ex.GreaterThan("x", LiteralValue.Of(0))))
+{
+    // ...
+}
 ```
 
 ### Delta Lake — Reading and writing

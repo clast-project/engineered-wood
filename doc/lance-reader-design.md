@@ -1,11 +1,20 @@
 # Lance File Format Reader Design
 
-**Status:** Reader landed end-to-end on branch `Lance` (Phases 1–11). The
-companion `EngineeredWood.Lance.Table` package adds Lance dataset support
-(manifest read, projection, row-level filter, deletion files, time travel)
-on top of the file reader. Writer (Phase 13) is still out of scope; a
-priority-aware I/O scheduler (Phase 12) is deferred pending a workload
-that demands it.
+**Status:** Reader and writer both landed end-to-end (v2.0 / v2.1 / v2.2).
+The companion `EngineeredWood.Lance.Table` package adds the dataset
+surface (manifest read/write, fragments, deletion files, time travel
+by version and by timestamp, predicate-based delete/update, compact,
+vacuum). A priority-aware I/O scheduler (Phase 12) is deferred pending
+a workload that demands it. See
+[`doc/lance-future-work.md`](lance-future-work.md) for remaining gaps;
+the README's **Features — Lance** section is the canonical
+status-by-feature listing.
+
+> Note: this document is the original *design* doc for the reader and
+> is kept for historical context. Some "future work" callouts inside it
+> have since been implemented (writer, dataset operations, time travel,
+> Map type); trust the README and `doc/lance-future-work.md` for
+> current status.
 
 ## Overview
 

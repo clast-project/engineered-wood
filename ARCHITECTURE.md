@@ -40,15 +40,39 @@ src/
     Container/                          OCF read/write (sync + async)
     Data/                               RecordBatch assembly/encoding
     Encoding/                           AvroBinaryReader/Writer (ref struct)
-  EngineeredWood.Lance/                 Lance reader (v2.0 + v2.1, read-only)
+  EngineeredWood.Lance/                 Lance file reader and writer (v2.0 + v2.1 + v2.2)
     Proto/                              file.proto, file2.proto, encodings_v2_0.proto,
                                           encodings_v2_1.proto (verbatim from lance-format/lance)
     Format/                             LanceFooter, OffsetSizeEntry, LanceVersion,
                                           FieldColumnRange (field→column mapping)
-    Schema/                             LanceSchemaConverter (logical_type → Arrow)
+    Schema/                             LanceSchemaConverter (logical_type → Arrow,
+                                          including v2.2 "map" → Apache.Arrow.MapType)
     Encodings/V20/                      Per-encoding decoders for v2.0 ArrayEncoding
-    Encodings/V21/                      MiniBlockLayout / FullZipLayout / PageLayout
-                                          dispatcher and CompressiveEncoding decoders
+    Encodings/V21/                      MiniBlockLayout / FullZipLayout / ConstantLayout /
+                                          PageLayout dispatcher and CompressiveEncoding
+                                          decoders (Flat, Variable, Fsst, InlineBitpacking,
+                                          OutOfLineBitpacking, Dictionary, FSL, General/ZSTD,
+                                          plus bool bit-pack)
+    LanceFileWriter.cs                  Single-file writer: leaf primitives, FSL, List/
+                                          LargeList (incl. multi-chunk + repetition_index),
+                                          Struct (recursive), Map, Bool, optional ZSTD
+                                          wrap on Flat values
+  EngineeredWood.Lance.Table/           Lance dataset / table API (manifests, fragments,
+                                          versioned commits)
+    LanceTable.cs                       Open at latest / version / asOf timestamp; Read
+                                          with column projection + predicate pushdown +
+                                          fragment pruning via secondary indices; deletion
+                                          mask filtering during read
+    LanceDatasetWriter.cs               Create / Append / Overwrite, multi-fragment per
+                                          transaction, DeleteRowsAsync / DeleteAsync /
+                                          UpdateAsync / CompactAsync / VacuumAsync; every
+                                          commit stamps manifest.timestamp for time travel
+    Manifest/                           ManifestReader, ManifestPathResolver
+                                          (latest / by version / by timestamp)
+    Deletions/                          DeletionFile reader/writer (Arrow IPC + Roaring),
+                                          DeletionMask, RecordBatchRowFilter
+    Indices/                            B-tree + bitmap secondary index reads, IndexPruner
+    Proto/                              table.proto, transaction.proto (verbatim)
   EngineeredWood.DeltaLake/             Delta transaction log (low-level)
     Actions/                            AddFile, RemoveFile, MetadataAction, Protocol, etc.
     Log/                                NDJSON commit read/write, log compaction, in-commit timestamps
@@ -77,9 +101,15 @@ test/
   EngineeredWood.Orc.Benchmarks/            BenchmarkDotNet suites for ORC
   EngineeredWood.Avro.Tests/                xUnit tests for Avro
   EngineeredWood.Avro.Benchmarks/           BenchmarkDotNet suites for Avro
-  EngineeredWood.Lance.Tests/               xUnit tests for Lance, including a
-                                              compatibility sweep over committed
-                                              pylance-produced .lance files
+  EngineeredWood.Lance.Tests/               xUnit tests for Lance file-level reader
+                                              and writer, including a compatibility
+                                              sweep over committed pylance-produced
+                                              .lance files and writer→pylance
+                                              cross-validation
+  EngineeredWood.Lance.Table.Tests/         xUnit tests for the Lance dataset API
+                                              (Create / Append / Overwrite / Delete /
+                                              Update / Compact / Vacuum / time travel)
+  EngineeredWood.Lance.Benchmarks/          BenchmarkDotNet suites for Lance
   EngineeredWood.DeltaLake.Tests/           xUnit tests for the Delta log layer
   EngineeredWood.DeltaLake.Table.Tests/     xUnit tests for the Delta table API
   EngineeredWood.DeltaLake.Benchmarks/      BenchmarkDotNet suites for Delta Lake
