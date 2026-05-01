@@ -283,6 +283,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteVariableColumnAsync(name, "string", sa, cancellationToken);
         if (array is BinaryArray ba)
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
+        if (array is BooleanArray boolArr)
+            return WriteBoolColumnAsync(name, boolArr, cancellationToken);
         if (array is StructArray sarr)
             return WriteStructColumnAsync(name, sarr, cancellationToken);
         if (array is FixedSizeListArray fsl)
@@ -571,6 +573,80 @@ public sealed class LanceFileWriter : IAsyncDisposable
             name, logicalType, bytesPerRow, valueEncoding,
             numItems, valueBytes,
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
+    }
+
+    /// <summary>
+    /// Write a Boolean column. Values are bit-packed LSB-first (1 bit per
+    /// value, ceil(N/8) bytes total) and emitted with
+    /// <see cref="Flat"/> { BitsPerValue = 1 }. Nullable bools use a Flat(16)
+    /// def buffer with the same NULLABLE_ITEM cascade as other primitives.
+    /// Currently single-chunk only — at 1 bit per value the 32 KiB chunk
+    /// budget covers up to ~256K bools, comfortably handling typical pages.
+    /// </summary>
+    private async Task WriteBoolColumnAsync(
+        string name, BooleanArray array, CancellationToken cancellationToken)
+    {
+        ThrowIfFinalized();
+        int len = array.Length;
+        if (_totalRows < 0) _totalRows = len;
+        else if (_totalRows != len)
+            throw new ArgumentException(
+                $"Column '{name}' has {len} rows but earlier columns have {_totalRows}.",
+                nameof(name));
+
+        // Apache.Arrow's BooleanArray stores bits in Buffers[1], LSB-first
+        // within each byte, with array.Data.Offset giving the bit-offset of
+        // the first element (non-zero for sliced arrays). Repack into a
+        // fresh buffer that starts at bit 0.
+        int valueBytesLen = (len + 7) / 8;
+        byte[] valueBytes = new byte[valueBytesLen];
+        var srcBuf = array.Data.Buffers[1].Span;
+        int srcOffset = array.Data.Offset;
+        for (int i = 0; i < len; i++)
+        {
+            int srcIdx = srcOffset + i;
+            if ((srcBuf[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0)
+                valueBytes[i >> 3] |= (byte)(1 << (i & 7));
+        }
+
+        bool hasDef = array.NullCount > 0;
+        byte[]? validity = hasDef ? ExtractValidityBitmap(array) : null;
+        ushort[]? def = null;
+        if (hasDef)
+        {
+            def = new ushort[len];
+            for (int i = 0; i < len; i++)
+            {
+                bool valid = (validity![i >> 3] & (1 << (i & 7))) != 0;
+                def[i] = valid ? (ushort)0 : (ushort)1;
+            }
+        }
+
+        // Single-chunk budget check: header (8 padded) + def (when present)
+        // + value buffer (padded). Multi-chunk bool is a follow-up if anyone
+        // ever needs >256K bools per page.
+        int defByteLen = hasDef ? len * sizeof(ushort) : 0;
+        int chunkTotalBytes = AlignUp(
+            AlignUp(2 + (hasDef ? 2 : 0) + 2, MiniBlockAlignment)
+                + (hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0)
+                + AlignUp(valueBytesLen, MiniBlockAlignment),
+            MiniBlockAlignment);
+        if (chunkTotalBytes > MaxChunkBytes)
+            throw new NotSupportedException(
+                $"Bool column with {len} items exceeds 32 KiB chunk budget; " +
+                "multi-chunk bool pages are not yet supported by the writer.");
+
+        var chunk = new PageChunk(0, len, valueBytes, RepLevels: null, DefLevels: def);
+        var valueEncoding = FlatEncoding(1);
+        var layers = new List<RepDefLayer>
+        {
+            hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem,
+        };
+
+        var page = await BuildAndWritePageAsync(
+            valueEncoding, len, new[] { chunk }, layers, cancellationToken)
+            .ConfigureAwait(false);
+        RegisterColumn(name, "bool", valueEncoding, new[] { page });
     }
 
     /// <summary>

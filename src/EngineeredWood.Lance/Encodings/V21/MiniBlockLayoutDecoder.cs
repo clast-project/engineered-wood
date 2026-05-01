@@ -135,6 +135,18 @@ internal static class MiniBlockLayoutDecoder
                 chunkData, chunks, hasDef, hasLargeChunk,
                 valueEnc, layout.DefCompression, targetType, numItems);
         }
+        if (targetType is BooleanType)
+        {
+            // 1-bit Flat values, LSB-first within each byte. Decoded into an
+            // Arrow bool buffer with separately-derived validity (when the
+            // page has def levels).
+            if (generalZstd)
+                throw new NotImplementedException(
+                    "MiniBlockLayout General(ZSTD) wrapping is not yet supported for Boolean columns.");
+            return DecodeBoolMiniBlock(
+                chunkData, chunks, hasDef, hasLargeChunk,
+                valueEnc, layout.DefCompression, numItems);
+        }
         return DecodeFixedWidthMiniBlock(
             chunkData, chunks, hasDef, hasLargeChunk,
             valueEnc, layout.DefCompression, targetType, numItems, generalZstd);
@@ -229,6 +241,119 @@ internal static class MiniBlockLayoutDecoder
         }
 
         return BuildFixedWidthArray(targetType, length, valueBytes, validityBitmap, nullCount);
+    }
+
+    /// <summary>
+    /// Decode a MiniBlockLayout page targeting <see cref="BooleanType"/>.
+    /// Each chunk's value buffer holds <c>itemsInChunk</c> 1-bit values
+    /// packed LSB-first within bytes, occupying <c>ceil(items/8)</c> bytes.
+    /// We assemble a single page-level bit buffer by concatenating chunk
+    /// bits at the bit cursor, which keeps non-byte-aligned chunk sizes
+    /// (e.g. an unusual 4-item non-last chunk) correct without alignment
+    /// gaps between chunks.
+    /// </summary>
+    private static IArrowArray DecodeBoolMiniBlock(
+        ReadOnlySpan<byte> chunkData, List<MiniChunk> chunks,
+        bool hasDef, bool hasLargeChunk,
+        CompressiveEncoding valueEnc, CompressiveEncoding? defComp,
+        long numItems)
+    {
+        if (valueEnc.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat
+            || valueEnc.Flat.BitsPerValue != 1)
+        {
+            throw new NotImplementedException(
+                $"Bool MiniBlock requires Flat(bits_per_value=1); got " +
+                $"{valueEnc.CompressionCase}/{valueEnc.Flat?.BitsPerValue}.");
+        }
+
+        int length = checked((int)numItems);
+        byte[] valueBitmap = new byte[(length + 7) / 8];
+        byte[]? validityBitmap = hasDef ? new byte[(length + 7) / 8] : null;
+        int nullCount = 0;
+
+        long globalChunkByteOffset = 0;
+        int valueBitCursor = 0;
+
+        foreach (MiniChunk chunk in chunks)
+        {
+            int itemsInChunk = (int)chunk.NumValues;
+            ReadOnlySpan<byte> chunkBytes = chunkData.Slice(
+                (int)globalChunkByteOffset, (int)chunk.SizeBytes);
+
+            int cursor = 0;
+            int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+            int defSize = 0;
+            if (hasDef)
+            {
+                defSize = hasLargeChunk
+                    ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                    : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += hasLargeChunk ? 4 : 2;
+            }
+            int valueBufSize = hasLargeChunk
+                ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += hasLargeChunk ? 4 : 2;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+
+            if (hasDef)
+            {
+                ushort[] chunkDef = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, defSize), itemsInChunk, defComp!);
+                for (int i = 0; i < itemsInChunk; i++)
+                {
+                    int idx = valueBitCursor + i;
+                    if (chunkDef[i] != 0)
+                    {
+                        nullCount++;
+                    }
+                    else
+                    {
+                        validityBitmap![idx >> 3] |= (byte)(1 << (idx & 7));
+                    }
+                }
+                cursor += defSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
+            int chunkValueBytes = (itemsInChunk + 7) / 8;
+            if (valueBufSize < chunkValueBytes)
+                throw new LanceFormatException(
+                    $"Bool chunk value_buf_size={valueBufSize} < expected " +
+                    $"{chunkValueBytes} for {itemsInChunk} bits.");
+
+            ReadOnlySpan<byte> srcBits = chunkBytes.Slice(cursor, chunkValueBytes);
+            // Fast path: the chunk starts at a byte boundary in the global
+            // bit buffer AND has a multiple-of-8 item count. Then a memcpy
+            // suffices. Otherwise fall back to bit-by-bit OR.
+            if ((valueBitCursor & 7) == 0 && (itemsInChunk & 7) == 0)
+            {
+                srcBits.CopyTo(valueBitmap.AsSpan(valueBitCursor >> 3, chunkValueBytes));
+            }
+            else
+            {
+                for (int i = 0; i < itemsInChunk; i++)
+                {
+                    if (((srcBits[i >> 3] >> (i & 7)) & 1) != 0)
+                    {
+                        int idx = valueBitCursor + i;
+                        valueBitmap[idx >> 3] |= (byte)(1 << (idx & 7));
+                    }
+                }
+            }
+            valueBitCursor += itemsInChunk;
+
+            globalChunkByteOffset += (long)chunk.SizeBytes;
+        }
+
+        ArrowBuffer validity = validityBitmap is null
+            ? ArrowBuffer.Empty
+            : new ArrowBuffer(validityBitmap);
+        var data = new ArrayData(
+            BooleanType.Default, length, nullCount, 0,
+            new[] { validity, new ArrowBuffer(valueBitmap) });
+        return new BooleanArray(data);
     }
 
     private static int ResolveInlineBitpackingBytesPerValue(
@@ -583,8 +708,11 @@ internal static class MiniBlockLayoutDecoder
 
         if (targetType is BooleanType)
         {
-            throw new NotImplementedException(
-                "Boolean (bits_per_value=1) MiniBlock is not yet supported in Phase 6.");
+            // Should not reach here — Decode() routes BooleanType through
+            // DecodeBoolMiniBlock before this byte-aligned helper. Guard
+            // anyway in case a new caller forgets the dispatch.
+            throw new InvalidOperationException(
+                "BooleanType reached BuildFixedWidthArray; route bool pages through DecodeBoolMiniBlock instead.");
         }
 
         var data = new ArrayData(

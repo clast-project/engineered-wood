@@ -755,6 +755,137 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Bool_AllValid_RoundTrip_ViaOurReader()
+    {
+        // 200 booleans, no nulls. Bit-packed Flat(1) value buffer with no
+        // def — pure ALL_VALID_ITEM cascade. 200 isn't a multiple of 8, so
+        // this also exercises the trailing-bit handling.
+        var b = new BooleanArray.Builder();
+        for (int i = 0; i < 200; i++) b.Append((i % 3) == 0);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-bool-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("flag", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.IsType<BooleanType>(reader.Schema.FieldsList[0].DataType);
+            var read = (BooleanArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(200, read.Length);
+            Assert.Equal(0, read.NullCount);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal((i % 3) == 0, read.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Bool_WithNulls_RoundTrip_ViaOurReader()
+    {
+        // Mix of true/false/null. NULLABLE_ITEM cascade with Flat(16) defs
+        // and Flat(1) values.
+        var b = new BooleanArray.Builder();
+        b.Append(true).Append(false).AppendNull().Append(true).Append(false)
+         .AppendNull().AppendNull().Append(true);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-boolnull-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("flag", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (BooleanArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(8, read.Length);
+            Assert.Equal(3, read.NullCount);
+            Assert.True(read.GetValue(0));
+            Assert.False(read.GetValue(1));
+            Assert.True(read.IsNull(2));
+            Assert.True(read.GetValue(3));
+            Assert.False(read.GetValue(4));
+            Assert.True(read.IsNull(5));
+            Assert.True(read.IsNull(6));
+            Assert.True(read.GetValue(7));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Bool_CrossValidatedAgainstPylance()
+    {
+        // Verify our bool writer's wire format against the upstream Rust
+        // reader: pylance must read back the same nullable bool sequence.
+        if (!IsPythonAvailable()) return;
+
+        var b = new BooleanArray.Builder();
+        b.Append(true).Append(false).AppendNull().Append(true).Append(false)
+         .Append(true).AppendNull().Append(false);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-lance-pylance-bool-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("flag", arr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'type': str(t.schema[0].type), " +
+                "'data': t['flag'].to_pylist() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(8, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal("bool", json.RootElement.GetProperty("type").GetString());
+            var data = json.RootElement.GetProperty("data");
+            Assert.True(data[0].GetBoolean());
+            Assert.False(data[1].GetBoolean());
+            Assert.Equal(System.Text.Json.JsonValueKind.Null, data[2].ValueKind);
+            Assert.True(data[3].GetBoolean());
+            Assert.Equal(System.Text.Json.JsonValueKind.Null, data[6].ValueKind);
+            Assert.False(data[7].GetBoolean());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task ListInt32_CrossValidatedAgainstPylance()
     {
         // Verifies our list writer's wire format against the upstream

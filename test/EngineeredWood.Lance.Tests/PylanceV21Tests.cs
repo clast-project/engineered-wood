@@ -1399,6 +1399,49 @@ public class PylanceV21Tests
         }
     }
 
+    [Fact]
+    public async Task Bool_Small_NoNulls_V21()
+    {
+        // 8 booleans in a single chunk; pylance picks Flat(bits_per_value=1)
+        // for the value buffer with exactly one byte of bit-packed data.
+        // Layers = [ALL_VALID_ITEM]; chunk header has num_levels=0, no def.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("bool_small_v21.lance"));
+        Assert.Equal(LanceVersion.V2_1, reader.Version);
+        var arr = (BooleanArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(8, arr.Length);
+        Assert.Equal(0, arr.NullCount);
+        bool[] expected = { true, false, true, true, false, false, true, false };
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], arr.GetValue(i));
+    }
+
+    [Fact]
+    public async Task Bool_Large_WithNulls_V21()
+    {
+        // 1000 random booleans (~10% null). pylance writes def-levels as
+        // InlineBitpacking (1-bit defs since they're 0/1) and the value
+        // buffer as 125 bytes Flat(1). Validates both the bool decode path
+        // and the existing InlineBitpacking-def reader path interacting.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("bool_v21.lance"));
+        Assert.Equal(LanceVersion.V2_1, reader.Version);
+        var arr = (BooleanArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(1000, arr.Length);
+        Assert.True(arr.NullCount > 0);  // ~10% expected
+        // Spot-check the first few values against the deterministic Python
+        // RNG output (random.seed(42) → first 20 values).
+        bool?[] head = {
+            true, true, false, true, true, false, null, false, true, false,
+            null, false, true, true, null, null, false, false, false, false,
+        };
+        for (int i = 0; i < head.Length; i++)
+        {
+            if (head[i] is null) Assert.True(arr.IsNull(i));
+            else { Assert.False(arr.IsNull(i)); Assert.Equal(head[i], arr.GetValue(i)); }
+        }
+    }
+
     /// <summary>
     /// Mirror of generate_test_data.py's make_string: SHA-256 chain seeded
     /// with the row index, hex-encoded, truncated to <paramref name="size"/>.
