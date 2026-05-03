@@ -190,6 +190,41 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenRleFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Repetitive doubles → fastlanes.rle dispatches.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        var palette = new[] { 1.5, 2.71828, -3.14, 100.0 };
+        const int n = 2_048;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[(i / 64) % palette.Length]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenDictFile()
     {
         var validator = FindValidator();

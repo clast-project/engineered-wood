@@ -1436,6 +1436,113 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Rle_RepetitiveDoublesCompress()
+    {
+        // Float64 column with 5 distinct values cycling in 64-row runs.
+        // Floats can't be bitpacked/FoR/delta'd — RLE is the only compressing
+        // option for them. Should give substantial compression.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var palette = new[] { 1.5, 2.71828, -3.14, 100.0, 0.0001 };
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[(i / 64) % palette.Length]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 2,
+                $"RLE on a 5-distinct Double × 4096 column should give >2x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(palette[(i / 64) % palette.Length], read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Rle_FloatColumnRoundtrips()
+    {
+        // Float32 path: 8 distinct values each occupying 32-row runs. n must be
+        // ≥ 1024 so RLE applies structurally; here we use 2048.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("f", FloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var palette = new[] { 1.5f, 2.0f, -3.5f, 100.0f, 0.0001f, -0.5f, 42.0f, 99.99f };
+        var b = new FloatArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[(i / 32) % palette.Length]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(palette[(i / 32) % palette.Length], read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Rle_HighDistinctDoublesFallThrough()
+    {
+        // Mostly-unique doubles → RLE rejects, dispatch falls through to plain
+        // primitive (no other compressing encoding applies to floats today).
+        // Verify round-trip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(i * 13.7);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(i * 13.7, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_RepetitiveStringsCompress()
     {
         // Highly repetitive string column — only 5 distinct values, 1000 rows.
