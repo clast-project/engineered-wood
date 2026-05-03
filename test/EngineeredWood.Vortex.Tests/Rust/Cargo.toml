@@ -1,0 +1,31 @@
+[package]
+name = "vortex-fixtures"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Generates .vortex test fixtures for EngineeredWood.Vortex.Tests.
+# Run from this directory:  cargo run --release -- ../TestData
+# The binary writes one .vortex file per fixture into the given output dir.
+
+[[bin]]
+name = "vortex-fixtures"
+path = "src/main.rs"
+
+[[bin]]
+name = "vortex-validator"
+path = "src/validator.rs"
+
+[dependencies]
+vortex-array = "0.70"
+vortex-buffer = "0.70"
+vortex-file = "0.70"
+vortex-io = { version = "0.70", features = ["tokio"] }
+vortex-layout = "0.70"
+vortex-session = "0.70"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = "1"
+vortex-utils = "0.70"
+vortex-fastlanes = "0.70"
+vortex-pco = "0.70"
+futures = "0.3"

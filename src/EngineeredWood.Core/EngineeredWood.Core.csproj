@@ -52,6 +52,9 @@
     <InternalsVisibleTo Include="EngineeredWood.DeltaLake.Benchmarks" />
     <InternalsVisibleTo Include="EngineeredWood.Iceberg" />
     <InternalsVisibleTo Include="EngineeredWood.Iceberg.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.Vortex" />
+    <InternalsVisibleTo Include="EngineeredWood.Vortex.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.Vortex.Benchmarks" />
   </ItemGroup>
 
 </Project>

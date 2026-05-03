@@ -8,6 +8,7 @@
     <Project Path="src/EngineeredWood.Avro/EngineeredWood.Avro.csproj" />
     <Project Path="src/EngineeredWood.Lance/EngineeredWood.Lance.csproj" />
     <Project Path="src/EngineeredWood.Lance.Table/EngineeredWood.Lance.Table.csproj" />
+    <Project Path="src/EngineeredWood.Vortex/EngineeredWood.Vortex.csproj" />
     <Project Path="src/EngineeredWood.DeltaLake/EngineeredWood.DeltaLake.csproj" />
     <Project Path="src/EngineeredWood.DeltaLake.Table/EngineeredWood.DeltaLake.Table.csproj" />
     <Project Path="src/EngineeredWood.Iceberg/EngineeredWood.Iceberg.csproj" />
@@ -25,6 +26,7 @@
     <Project Path="test/EngineeredWood.Lance.Tests/EngineeredWood.Lance.Tests.csproj" />
     <Project Path="test/EngineeredWood.Lance.Benchmarks/EngineeredWood.Lance.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Lance.Table.Tests/EngineeredWood.Lance.Table.Tests.csproj" />
+    <Project Path="test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Tests/EngineeredWood.DeltaLake.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Benchmarks/EngineeredWood.DeltaLake.Benchmarks.csproj" />
