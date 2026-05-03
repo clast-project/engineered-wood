@@ -661,6 +661,54 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenNullableRunEndFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Mix of value runs and null runs. Leading + trailing null runs
+        // exercise the boundary handling at i=0 (seed) and i=n-1 (final
+        // close).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 1_500;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            // Pattern: [null × 100][1 × 200][null × 50][2 × 400][null × 100][3 × 650]
+            int phase =
+                i < 100 ? 0 :
+                i < 300 ? 1 :
+                i < 350 ? 0 :
+                i < 750 ? 2 :
+                i < 850 ? 0 :
+                3;
+            if (phase == 0) b.AppendNull();
+            else b.Append(phase);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenAlpFile()
     {
         var validator = FindValidator();

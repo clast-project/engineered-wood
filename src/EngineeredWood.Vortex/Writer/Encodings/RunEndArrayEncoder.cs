@@ -29,11 +29,14 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// monotonic ints) and values can pick whatever encoding suits the run
 /// values' distribution.</para>
 ///
-/// <para>Phase 1 scope: non-nullable, non-sliced primitive integer columns
-/// (Int8..Int64, UInt8..UInt64). Floats are deferred — ALP and fastlanes.rle
-/// already cover them. Bool / strings deferred until the reader's
-/// <see cref="EngineeredWood.Vortex.Encodings.RunEndArrayDecoder.Expand"/> grows
-/// matching cases.</para>
+/// <para>Scope: nullable + non-nullable, non-sliced primitive integer columns
+/// (Int8..Int64, UInt8..UInt64). For nullable inputs, runs that span only
+/// null rows collapse into a single null run regardless of the underlying
+/// (garbage) value bytes. The values child carries one validity bit per run,
+/// and the reader expands that bitmap row-wise during decode. Floats deferred
+/// — ALP and fastlanes.rle already cover them. Bool / strings deferred until
+/// the reader's <see cref="EngineeredWood.Vortex.Encodings.RunEndArrayDecoder.Expand"/>
+/// grows matching cases.</para>
 /// </summary>
 internal static class RunEndArrayEncoder
 {
@@ -49,15 +52,19 @@ internal static class RunEndArrayEncoder
         if (ElementSize(array) is not int elemSize) return false;
         var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0) return false;
-        if (data.GetNullCount() > 0) return false;
         int n = array.Length;
         if (n < 2) return false; // 0/1-row columns: nothing to RLE; constant catches the 1-row case anyway.
+        int nullCount = data.GetNullCount();
+        if (nullCount == n) return false; // all-null — nothing to runend.
 
-        int numRuns = CountRuns(data.Buffers[1].Span, n, elemSize);
+        int numRuns = CountRuns(array, elemSize);
         if (numRuns >= n) return false;
 
         int endsElemSize = SmallestUIntElemSize(n);
-        long runendBytes = (long)numRuns * (endsElemSize + elemSize);
+        // For nullable inputs the values child carries an extra validity buffer
+        // (one bit per run, packed). Approximate as `numRuns / 8` bytes.
+        long runendBytes = (long)numRuns * (endsElemSize + elemSize)
+            + (nullCount > 0 ? (numRuns + 7) / 8 : 0);
         long rawBytes = (long)n * elemSize;
         return runendBytes * 3 / 2 < rawBytes;
     }
@@ -72,8 +79,6 @@ internal static class RunEndArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0)
             throw new NotSupportedException("vortex.runend writer doesn't yet support sliced inputs.");
-        if (data.GetNullCount() > 0)
-            throw new NotSupportedException("vortex.runend writer doesn't yet support nullable inputs.");
 
         int n = array.Length;
         var (endsArr, valuesArr, endsPtype) = BuildRunEnds(array, elemSize, n);
@@ -143,56 +148,97 @@ internal static class RunEndArrayEncoder
         _ => throw new NotSupportedException(),
     };
 
-    private static int CountRuns(ReadOnlySpan<byte> src, int n, int elemSize)
+    /// <summary>
+    /// Counts runs in <paramref name="array"/>. A run boundary occurs whenever
+    /// either the validity OR (for valid rows) the value bit pattern differs
+    /// from the previous row. Adjacent null rows therefore collapse into a
+    /// single null run regardless of any garbage bytes in their value slots.
+    /// </summary>
+    private static int CountRuns(IArrowArray array, int elemSize)
     {
+        var data = ((Apache.Arrow.Array)array).Data;
+        var src = data.Buffers[1].Span;
+        int n = array.Length;
+        bool hasNulls = data.GetNullCount() > 0;
+        var validity = hasNulls ? data.Buffers[0].Span : default;
+
         int runs = 1;
-        long prev = ReadKey(src, 0, elemSize);
+        bool prevValid = !hasNulls || IsValidAt(validity, 0);
+        long prevKey = prevValid ? ReadKey(src, 0, elemSize) : 0;
         for (int i = 1; i < n; i++)
         {
-            long curr = ReadKey(src, i * elemSize, elemSize);
-            if (curr != prev)
+            bool curValid = !hasNulls || IsValidAt(validity, i);
+            long curKey = curValid ? ReadKey(src, i * elemSize, elemSize) : 0;
+            if (curValid != prevValid || (curValid && curKey != prevKey))
             {
                 runs++;
-                prev = curr;
+                prevValid = curValid;
+                prevKey = curKey;
             }
         }
         return runs;
     }
+
+    private static bool IsValidAt(ReadOnlySpan<byte> bitmap, int i) =>
+        (bitmap[i >> 3] & (1 << (i & 7))) != 0;
 
     private static (IArrowArray Ends, IArrowArray Values, byte EndsPtype)
         BuildRunEnds(IArrowArray array, int elemSize, int n)
     {
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
+        bool hasNulls = data.GetNullCount() > 0;
+        var validity = hasNulls ? data.Buffers[0].Span : default;
 
-        int numRuns = CountRuns(src, n, elemSize);
+        int numRuns = CountRuns(array, elemSize);
         byte endsPtype = EndsPtypeFor(n);
         int endsElemSize = SmallestUIntElemSize(n);
 
         var endsBytes = new byte[(long)numRuns * endsElemSize];
         var valuesBytes = new byte[(long)numRuns * elemSize];
+        // One validity bit per run; only allocated when the input has nulls.
+        byte[]? valuesValidityBytes = hasNulls ? new byte[(numRuns + 7) / 8] : null;
+        int valuesNullCount = 0;
 
         int runIdx = 0;
-        long prev = ReadKey(src, 0, elemSize);
-        // Seed values[0] with the first row's bit pattern.
-        src.Slice(0, elemSize).CopyTo(valuesBytes.AsSpan(0, elemSize));
+        bool prevValid = !hasNulls || IsValidAt(validity, 0);
+        long prevKey = prevValid ? ReadKey(src, 0, elemSize) : 0;
+        // Seed values[0] + values_validity[0] from row 0.
+        if (prevValid) src.Slice(0, elemSize).CopyTo(valuesBytes.AsSpan(0, elemSize));
+        if (valuesValidityBytes is not null)
+        {
+            if (prevValid) valuesValidityBytes[0] |= 1;
+            else valuesNullCount++;
+        }
         for (int i = 1; i < n; i++)
         {
-            long curr = ReadKey(src, i * elemSize, elemSize);
-            if (curr != prev)
+            bool curValid = !hasNulls || IsValidAt(validity, i);
+            long curKey = curValid ? ReadKey(src, i * elemSize, elemSize) : 0;
+            if (curValid != prevValid || (curValid && curKey != prevKey))
             {
-                // Close run runIdx at position i; start run runIdx+1 with row i's value.
+                // Close run runIdx at position i; start run runIdx+1.
                 WriteEnd(endsBytes.AsSpan(runIdx * endsElemSize, endsElemSize), (ulong)i, endsElemSize);
                 runIdx++;
-                src.Slice(i * elemSize, elemSize).CopyTo(valuesBytes.AsSpan(runIdx * elemSize, elemSize));
-                prev = curr;
+                if (curValid)
+                    src.Slice(i * elemSize, elemSize).CopyTo(valuesBytes.AsSpan(runIdx * elemSize, elemSize));
+                // (else leave the slot zeroed — masked by the run's validity bit)
+                if (valuesValidityBytes is not null)
+                {
+                    if (curValid) valuesValidityBytes[runIdx >> 3] |= (byte)(1 << (runIdx & 7));
+                    else valuesNullCount++;
+                }
+                prevValid = curValid;
+                prevKey = curKey;
             }
         }
         // Close the final run at position n.
         WriteEnd(endsBytes.AsSpan(runIdx * endsElemSize, endsElemSize), (ulong)n, endsElemSize);
 
         var ends = BuildUnsignedArray(endsBytes, numRuns, endsElemSize);
-        var values = BuildPrimitiveArray(array, valuesBytes, numRuns);
+        var valuesValidityBuf = valuesValidityBytes is null
+            ? ArrowBuffer.Empty
+            : new ArrowBuffer(valuesValidityBytes);
+        var values = BuildPrimitiveArray(array, valuesBytes, numRuns, valuesValidityBuf, valuesNullCount);
         return (ends, values, endsPtype);
     }
 
@@ -223,22 +269,25 @@ internal static class RunEndArrayEncoder
 
     /// <summary>
     /// Builds a typed Arrow array of the same kind as <paramref name="template"/>,
-    /// covering the run-values bytes. Validity is empty since this writer only
-    /// accepts non-nullable inputs.
+    /// covering the run-values bytes. <paramref name="validity"/> is the
+    /// per-run validity bitmap (one bit per run) — empty for non-nullable
+    /// inputs, populated when any run is null.
     /// </summary>
-    private static IArrowArray BuildPrimitiveArray(IArrowArray template, byte[] valuesBytes, int totalValues)
+    private static IArrowArray BuildPrimitiveArray(
+        IArrowArray template, byte[] valuesBytes, int totalValues,
+        ArrowBuffer validity, int nullCount)
     {
         var buf = new ArrowBuffer(valuesBytes);
         return template switch
         {
-            Int8Array => new Int8Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            UInt8Array => new UInt8Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            Int16Array => new Int16Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            UInt16Array => new UInt16Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            Int32Array => new Int32Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            UInt32Array => new UInt32Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            Int64Array => new Int64Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
-            UInt64Array => new UInt64Array(buf, ArrowBuffer.Empty, totalValues, 0, 0),
+            Int8Array => new Int8Array(buf, validity, totalValues, nullCount, 0),
+            UInt8Array => new UInt8Array(buf, validity, totalValues, nullCount, 0),
+            Int16Array => new Int16Array(buf, validity, totalValues, nullCount, 0),
+            UInt16Array => new UInt16Array(buf, validity, totalValues, nullCount, 0),
+            Int32Array => new Int32Array(buf, validity, totalValues, nullCount, 0),
+            UInt32Array => new UInt32Array(buf, validity, totalValues, nullCount, 0),
+            Int64Array => new Int64Array(buf, validity, totalValues, nullCount, 0),
+            UInt64Array => new UInt64Array(buf, validity, totalValues, nullCount, 0),
             _ => throw new NotSupportedException(),
         };
     }

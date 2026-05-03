@@ -2429,6 +2429,137 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task RunEnd_NullableInterleavedRoundtrips()
+    {
+        // Pattern: 3-row runs of {1, null, 2, null, 3, null, ...}. Each null
+        // run sits between value runs so we exercise validity transitions in
+        // both directions. 600 rows total, 200 runs.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int runLen = 3;
+        const int numRuns = 200;
+        const int n = runLen * numRuns;
+        var b = new Int32Array.Builder();
+        for (int run = 0; run < numRuns; run++)
+        {
+            bool isNull = (run % 2) == 1;
+            for (int j = 0; j < runLen; j++)
+            {
+                if (isNull) b.AppendNull();
+                else b.Append(run / 2);
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int run = i / runLen;
+                bool expectedNull = (run % 2) == 1;
+                if (expectedNull)
+                    Assert.False(read.IsValid(i), $"row {i} (run {run}) should be null");
+                else
+                    Assert.Equal(run / 2, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_NullableAdjacentNullsCollapseToOneRun()
+    {
+        // Verify that adjacent null rows collapse into a single null run
+        // regardless of the underlying value bytes. Build a column with one
+        // long initial null run (rows 0..49 — values are whatever the builder
+        // wrote, garbage as far as our run logic is concerned), then a value
+        // run of 7s, then more nulls. We only assert through the public Arrow
+        // surface that nulls round-trip correctly.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 200;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i < 50 || i >= 150) b.AppendNull();
+            else b.Append(7L);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (i < 50 || i >= 150)
+                    Assert.False(read.IsValid(i));
+                else
+                    Assert.Equal(7L, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_NullableLeadingAndTrailingNullRuns()
+    {
+        // Leading + trailing null runs check the boundary handling at i=0
+        // (seed loop) and i=n-1 (final WriteEnd close).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < 10; i++) b.AppendNull();           // leading nulls
+        for (int i = 10; i < 40; i++) b.Append(42u);
+        for (int i = 40; i < 70; i++) b.Append(99u);
+        for (int i = 70; i < n; i++) b.AppendNull();           // trailing nulls
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < 10; i++) Assert.False(read.IsValid(i));
+            for (int i = 10; i < 40; i++) Assert.Equal(42u, read.GetValue(i)!.Value);
+            for (int i = 40; i < 70; i++) Assert.Equal(99u, read.GetValue(i)!.Value);
+            for (int i = 70; i < n; i++) Assert.False(read.IsValid(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_RepetitiveStringsCompress()
     {
         // Highly repetitive string column — only 5 distinct values, 1000 rows.

@@ -244,6 +244,12 @@ internal static class BitPackedArrayEncoder
         for (int i = 0; i < freq.Length; i++) totalLen += freq[i];
         if (totalLen == 0) return 0; // empty / all-null column
 
+        // Match vortex's find_best_bit_width semantics: pick the smallest W
+        // that minimizes packed_cost(W) + exceptions_cost(W). Costs are tied
+        // at W=bestW vs W=native when the rounded byte count is identical
+        // (small arrays with no exceptions); ties don't update bestWidth, so
+        // bestWidth stays at the smaller W and FoR-style callers can rely on
+        // a strict `bestWidth < native` outcome whenever the histogram allows.
         long bestCost = totalLen * bytesPerException; // baseline = all exceptions
         int bestWidth = 0;
         long numPacked = 0;
@@ -259,9 +265,6 @@ internal static class BitPackedArrayEncoder
                 bestWidth = w;
             }
         }
-        // If even W=native didn't beat the baseline, "give up" (not compressible).
-        long nativeCost = (native * totalLen + 7) / 8;
-        if (bestCost >= nativeCost) bestWidth = native;
         return bestWidth;
     }
 

@@ -59,32 +59,45 @@ internal static class RunEndArrayDecoder
     /// <summary>
     /// Materializes a flat primitive array of <paramref name="rowCount"/> rows
     /// from run-end encoded <paramref name="ends"/> + <paramref name="values"/>.
+    /// When <paramref name="values"/> has a validity bitmap (some runs are null),
+    /// the output's validity is derived by expanding values_validity over runs:
+    /// the output's bit at row <c>i</c> equals values_validity[run_for_row_i].
     /// </summary>
     private static IArrowArray Expand(
         IArrowType expectedType, int rowCount, IArrowArray ends, IArrowArray values)
     {
         return (expectedType, values) switch
         {
-            (Int8Type, Int8Array v) => ExpandPrimitive<sbyte>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new Int8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int16Type, Int16Array v) => ExpandPrimitive<short>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new Int16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int32Type, Int32Array v) => ExpandPrimitive<int>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new Int32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int64Type, Int64Array v) => ExpandPrimitive<long>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new Int64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt8Type, UInt8Array v) => ExpandPrimitive<byte>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new UInt8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt16Type, UInt16Array v) => ExpandPrimitive<ushort>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new UInt16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt32Type, UInt32Array v) => ExpandPrimitive<uint>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new UInt32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt64Type, UInt64Array v) => ExpandPrimitive<ulong>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new UInt64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (FloatType, FloatArray v) => ExpandPrimitive<float>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new FloatArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (DoubleType, DoubleArray v) => ExpandPrimitive<double>(rowCount, ends, i => v.GetValue(i)!.Value,
-                (data, len) => new DoubleArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            (Int8Type, Int8Array v) => ExpandPrimitive<sbyte>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new Int8Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (Int16Type, Int16Array v) => ExpandPrimitive<short>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new Int16Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (Int32Type, Int32Array v) => ExpandPrimitive<int>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new Int32Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (Int64Type, Int64Array v) => ExpandPrimitive<long>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new Int64Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (UInt8Type, UInt8Array v) => ExpandPrimitive<byte>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new UInt8Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (UInt16Type, UInt16Array v) => ExpandPrimitive<ushort>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new UInt16Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (UInt32Type, UInt32Array v) => ExpandPrimitive<uint>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new UInt32Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (UInt64Type, UInt64Array v) => ExpandPrimitive<ulong>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new UInt64Array(new ArrowBuffer(data), val, len, nc, 0)),
+            (FloatType, FloatArray v) => ExpandPrimitive<float>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new FloatArray(new ArrowBuffer(data), val, len, nc, 0)),
+            (DoubleType, DoubleArray v) => ExpandPrimitive<double>(rowCount, ends, v,
+                i => v.GetValue(i) ?? default,
+                static (data, val, len, nc) => new DoubleArray(new ArrowBuffer(data), val, len, nc, 0)),
             _ => throw new NotSupportedException(
                 $"vortex.runend: expansion for ({expectedType}, {values.GetType().Name}) not yet implemented."),
         };
@@ -93,14 +106,28 @@ internal static class RunEndArrayDecoder
     private static IArrowArray ExpandPrimitive<T>(
         int rowCount,
         IArrowArray ends,
+        IArrowArray values,
         Func<int, T> getValue,
-        Func<byte[], int, IArrowArray> ctor)
+        Func<byte[], ArrowBuffer, int, int, IArrowArray> ctor)
         where T : struct
     {
         var bytes = new byte[(long)rowCount * Marshal.SizeOf<T>()];
         var span = MemoryMarshal.Cast<byte, T>(bytes.AsSpan());
+
+        var valuesData = ((Apache.Arrow.Array)values).Data;
+        bool valuesHaveNulls = valuesData.GetNullCount() > 0;
+        var valuesValidity = valuesHaveNulls ? valuesData.Buffers[0].Span : default;
+        int valuesOffset = valuesData.Offset;
+
+        // Output validity bitmap (LSB-first per byte). Allocated only when the
+        // values child has nulls — non-nullable values produce non-nullable rows.
+        byte[]? outValidity = valuesHaveNulls ? new byte[(rowCount + 7) / 8] : null;
+        int outNullCount = 0;
+
         int run = 0;
         int runEnd = GetIntAtIndex(ends, 0);
+        bool runIsValid = !valuesHaveNulls
+            || (valuesValidity[(valuesOffset + run) >> 3] & (1 << ((valuesOffset + run) & 7))) != 0;
         for (int i = 0; i < rowCount; i++)
         {
             while (i >= runEnd)
@@ -110,10 +137,23 @@ internal static class RunEndArrayDecoder
                     throw new VortexFormatException(
                         $"vortex.runend: row {i} exceeds last run end ({runEnd}).");
                 runEnd = GetIntAtIndex(ends, run);
+                runIsValid = !valuesHaveNulls
+                    || (valuesValidity[(valuesOffset + run) >> 3] & (1 << ((valuesOffset + run) & 7))) != 0;
             }
+            // For non-null runs, the typed GetValue returns the value; for
+            // null runs we leave the slot as default(T) since the validity
+            // bit will mask it. The caller's lambda coalesces null back to
+            // default to avoid an NPE on the typed accessor.
             span[i] = getValue(run);
+            if (outValidity is not null)
+            {
+                if (runIsValid) outValidity[i >> 3] |= (byte)(1 << (i & 7));
+                else outNullCount++;
+            }
         }
-        return ctor(bytes, rowCount);
+
+        var validityBuf = outValidity is null ? ArrowBuffer.Empty : new ArrowBuffer(outValidity);
+        return ctor(bytes, validityBuf, rowCount, outNullCount);
     }
 
     private static (int EndsPtype, ulong NumRuns, ulong Offset) ParseRunEndMetadata(ReadOnlySpan<byte> bytes)
