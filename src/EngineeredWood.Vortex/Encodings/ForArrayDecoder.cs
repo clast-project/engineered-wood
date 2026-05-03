@@ -47,52 +47,106 @@ internal static class ForArrayDecoder
         return AddReference(expectedType, encoded, rowCount, reference);
     }
 
+    /// <summary>
+    /// Adds the reference scalar to the encoded residuals to recover the
+    /// original values. Reads raw value bytes from <paramref name="encoded"/>'s
+    /// data buffer (avoiding any per-row null check) and preserves the
+    /// encoded child's validity bitmap so nullable FoR survives the read path.
+    /// Null-position residual bytes can be anything (the validity bitmap masks
+    /// them at the consumer); we still compute <c>ref + residual</c> at those
+    /// slots to keep the loop branch-free.
+    /// </summary>
     private static IArrowArray AddReference(
         IArrowType type, IArrowArray encoded, int rowCount, ScalarValueProto reference)
     {
-        return (type, reference.Kind, encoded) switch
+        var encData = ((Apache.Arrow.Array)encoded).Data;
+        var nullBuffer = encData.Buffers.Length > 0 ? encData.Buffers[0] : ArrowBuffer.Empty;
+        int nullCount = encData.GetNullCount();
+        if (nullCount < 0) nullCount = 0;
+
+        return (type, reference.Kind) switch
         {
-            (Int8Type, ScalarValueKind.Int64, Int8Array a) => Shift<sbyte>(rowCount, i => a.GetValue(i)!.Value,
-                (sbyte)reference.Int64Value, (b, n) => (sbyte)(b + n),
-                (data, len) => new Int8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int16Type, ScalarValueKind.Int64, Int16Array a) => Shift<short>(rowCount, i => a.GetValue(i)!.Value,
-                (short)reference.Int64Value, (b, n) => (short)(b + n),
-                (data, len) => new Int16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int32Type, ScalarValueKind.Int64, Int32Array a) => Shift<int>(rowCount, i => a.GetValue(i)!.Value,
-                (int)reference.Int64Value, (b, n) => b + n,
-                (data, len) => new Int32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (Int64Type, ScalarValueKind.Int64, Int64Array a) => Shift<long>(rowCount, i => a.GetValue(i)!.Value,
-                reference.Int64Value, (b, n) => b + n,
-                (data, len) => new Int64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt8Type, ScalarValueKind.UInt64, UInt8Array a) => Shift<byte>(rowCount, i => a.GetValue(i)!.Value,
-                (byte)reference.UInt64Value, (b, n) => (byte)(b + n),
-                (data, len) => new UInt8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt16Type, ScalarValueKind.UInt64, UInt16Array a) => Shift<ushort>(rowCount, i => a.GetValue(i)!.Value,
-                (ushort)reference.UInt64Value, (b, n) => (ushort)(b + n),
-                (data, len) => new UInt16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt32Type, ScalarValueKind.UInt64, UInt32Array a) => Shift<uint>(rowCount, i => a.GetValue(i)!.Value,
-                (uint)reference.UInt64Value, (b, n) => b + n,
-                (data, len) => new UInt32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
-            (UInt64Type, ScalarValueKind.UInt64, UInt64Array a) => Shift<ulong>(rowCount, i => a.GetValue(i)!.Value,
-                reference.UInt64Value, (b, n) => b + n,
-                (data, len) => new UInt64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            (Int8Type, ScalarValueKind.Int64) => ShiftSigned8(rowCount, encData, (sbyte)reference.Int64Value, nullBuffer, nullCount),
+            (Int16Type, ScalarValueKind.Int64) => ShiftSigned16(rowCount, encData, (short)reference.Int64Value, nullBuffer, nullCount),
+            (Int32Type, ScalarValueKind.Int64) => ShiftSigned32(rowCount, encData, (int)reference.Int64Value, nullBuffer, nullCount),
+            (Int64Type, ScalarValueKind.Int64) => ShiftSigned64(rowCount, encData, reference.Int64Value, nullBuffer, nullCount),
+            (UInt8Type, ScalarValueKind.UInt64) => ShiftUnsigned8(rowCount, encData, (byte)reference.UInt64Value, nullBuffer, nullCount),
+            (UInt16Type, ScalarValueKind.UInt64) => ShiftUnsigned16(rowCount, encData, (ushort)reference.UInt64Value, nullBuffer, nullCount),
+            (UInt32Type, ScalarValueKind.UInt64) => ShiftUnsigned32(rowCount, encData, (uint)reference.UInt64Value, nullBuffer, nullCount),
+            (UInt64Type, ScalarValueKind.UInt64) => ShiftUnsigned64(rowCount, encData, reference.UInt64Value, nullBuffer, nullCount),
             _ => throw new NotSupportedException(
                 $"fastlanes.for: unsupported combination ({type}, ref={reference.Kind}, encoded={encoded.GetType().Name})."),
         };
     }
 
-    private static IArrowArray Shift<T>(
-        int rowCount,
-        Func<int, T> getEncoded,
-        T reference,
-        Func<T, T, T> add,
-        Func<byte[], int, IArrowArray> ctor)
-        where T : unmanaged
+    private static Int8Array ShiftSigned8(int rowCount, ArrayData encData, sbyte reference, ArrowBuffer nullBuffer, int nullCount)
     {
-        var bytes = new byte[(long)rowCount * Marshal.SizeOf<T>()];
-        var span = MemoryMarshal.Cast<byte, T>(bytes.AsSpan());
-        for (int i = 0; i < rowCount; i++)
-            span[i] = add(reference, getEncoded(i));
-        return ctor(bytes, rowCount);
+        var src = MemoryMarshal.Cast<byte, sbyte>(encData.Buffers[1].Span.Slice(0, rowCount));
+        var bytes = new byte[rowCount];
+        var dst = MemoryMarshal.Cast<byte, sbyte>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = (sbyte)(reference + src[i]);
+        return new Int8Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static Int16Array ShiftSigned16(int rowCount, ArrayData encData, short reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, short>(encData.Buffers[1].Span.Slice(0, rowCount * 2));
+        var bytes = new byte[rowCount * 2];
+        var dst = MemoryMarshal.Cast<byte, short>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = (short)(reference + src[i]);
+        return new Int16Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static Int32Array ShiftSigned32(int rowCount, ArrayData encData, int reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, int>(encData.Buffers[1].Span.Slice(0, rowCount * 4));
+        var bytes = new byte[rowCount * 4];
+        var dst = MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = reference + src[i];
+        return new Int32Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static Int64Array ShiftSigned64(int rowCount, ArrayData encData, long reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, long>(encData.Buffers[1].Span.Slice(0, rowCount * 8));
+        var bytes = new byte[rowCount * 8];
+        var dst = MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = reference + src[i];
+        return new Int64Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static UInt8Array ShiftUnsigned8(int rowCount, ArrayData encData, byte reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = encData.Buffers[1].Span.Slice(0, rowCount);
+        var bytes = new byte[rowCount];
+        for (int i = 0; i < rowCount; i++) bytes[i] = (byte)(reference + src[i]);
+        return new UInt8Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static UInt16Array ShiftUnsigned16(int rowCount, ArrayData encData, ushort reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, ushort>(encData.Buffers[1].Span.Slice(0, rowCount * 2));
+        var bytes = new byte[rowCount * 2];
+        var dst = MemoryMarshal.Cast<byte, ushort>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = (ushort)(reference + src[i]);
+        return new UInt16Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static UInt32Array ShiftUnsigned32(int rowCount, ArrayData encData, uint reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, uint>(encData.Buffers[1].Span.Slice(0, rowCount * 4));
+        var bytes = new byte[rowCount * 4];
+        var dst = MemoryMarshal.Cast<byte, uint>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = reference + src[i];
+        return new UInt32Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
+    }
+
+    private static UInt64Array ShiftUnsigned64(int rowCount, ArrayData encData, ulong reference, ArrowBuffer nullBuffer, int nullCount)
+    {
+        var src = MemoryMarshal.Cast<byte, ulong>(encData.Buffers[1].Span.Slice(0, rowCount * 8));
+        var bytes = new byte[rowCount * 8];
+        var dst = MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+        for (int i = 0; i < rowCount; i++) dst[i] = reference + src[i];
+        return new UInt64Array(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
     }
 }

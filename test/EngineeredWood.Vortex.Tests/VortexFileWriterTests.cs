@@ -1436,6 +1436,140 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task For_NullablePositiveMinRoundtrips()
+    {
+        // Nullable Int32 column with values in [10_000, 10_500] and ~25% nulls.
+        // FoR shifts to make residuals fit in 9 bits; bitpacked child carries a
+        // validity bitmap. Reader must restore both values and null-ness.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 2_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 4 == 0) b.AppendNull();
+            else b.Append(10_000 + (i % 500));
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize,
+                $"Nullable FoR should compress over plain primitive. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            int expectedNulls = 0; for (int i = 0; i < n; i++) if (i % 4 == 0) expectedNulls++;
+            Assert.Equal(expectedNulls, read.NullCount);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 4 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(10_000 + (i % 500), read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task For_NullableNegativeValuesRoundtrips()
+    {
+        // Nullable Int64 with all NEGATIVE non-null values. Plain bitpacked
+        // alone rejects negatives; FoR shifts by min (most negative) to make
+        // residuals non-negative, then nullable bitpacked handles the rest.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(-1_000_000L + (i % 200)); // all non-null are negative
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 7 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(-1_000_000L + (i % 200), read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task For_AllNullColumnFallsThrough()
+    {
+        // All-null column — FoR has no min to subtract. Dispatch should reject
+        // FoR and let plain bitpacked (or primitive) handle it. Round-trip must
+        // preserve the all-null state.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.AppendNull();
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            Assert.Equal(n, read.NullCount);
+            for (int i = 0; i < n; i++) Assert.False(read.IsValid(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task For_FallsThroughWhenMinIsZero()
     {
         // Min=0, all non-negative — FoR offers no advantage, dispatch should

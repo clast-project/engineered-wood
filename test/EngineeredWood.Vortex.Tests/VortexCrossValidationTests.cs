@@ -199,16 +199,20 @@ public class VortexCrossValidationTests
         {
             new Field("ts", Int64Type.Default, nullable: false),
             new Field("offset_from_base", Int32Type.Default, nullable: false),
+            new Field("nullable_neg", Int64Type.Default, nullable: true),
         }, metadata: null);
         const int n = 1_500;
         var ts = new Int64Array.Builder();
         var off = new Int32Array.Builder();
+        var nn = new Int64Array.Builder();
         for (int i = 0; i < n; i++)
         {
-            ts.Append(1_700_000_000_000L + (i * 7L)); // narrow range, high min
-            off.Append(-200 + (i % 50));               // negative min
+            ts.Append(1_700_000_000_000L + (i * 7L));   // narrow range, high min
+            off.Append(-200 + (i % 50));                 // negative min
+            if (i % 5 == 0) nn.AppendNull();
+            else nn.Append(-100_000L + (i % 100));       // nullable + negative
         }
-        var batch = new RecordBatch(schema, new IArrowArray[] { ts.Build(), off.Build() }, n);
+        var batch = new RecordBatch(schema, new IArrowArray[] { ts.Build(), off.Build(), nn.Build() }, n);
 
         var path = Path.GetTempFileName();
         try
