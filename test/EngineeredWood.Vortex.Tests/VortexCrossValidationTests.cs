@@ -190,6 +190,40 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenDeltaFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Locally-constant pattern triggers fastlanes.delta dispatch.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("k", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var k = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) k.Append((uint)(i / 64) + 1_000_000u);
+        var batch = new RecordBatch(schema, new IArrowArray[] { k.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenForFile()
     {
         var validator = FindValidator();

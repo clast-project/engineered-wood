@@ -1436,6 +1436,149 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Delta_LocallyConstantUInt32Compresses()
+    {
+        // input[i] = i / 64 — every 64 consecutive rows share a value. Within
+        // each FastLanes lane (output positions p, p+LANES, p+2*LANES, ...),
+        // the source rows transpose(p), transpose(p+LANES), ... span a tight
+        // neighborhood, so within-lane deltas are 0 most of the time. The
+        // probe should accept this column and the bitpacked deltas child
+        // collapses to a tiny payload.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096; // 4 chunks
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append((uint)(i / 64));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 4,
+                $"Delta on a locally-constant column should give >4x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal((uint)(i / 64), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Delta_LinearMonotonicFallsThrough()
+    {
+        // Strictly-sorted with constant linear stride. The FastLanes layout
+        // permutes within-lane positions via FL_ORDER, so even for a strictly
+        // monotonic input the within-lane deltas wrap around (unsigned) and
+        // delta's profitability probe rejects. Dispatch falls through to FoR
+        // (which DOES work well for this shape). Test confirms round-trip
+        // succeeds either way.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 5_000;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(1_000_000_000u + (uint)(i * 7));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(1_000_000_000u + (uint)(i * 7), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Delta_LocallyConstantUInt64Roundtrips()
+    {
+        // UInt64 path: LANES=16. Same locally-constant pattern triggers delta.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt64Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var b = new UInt64Array.Builder();
+        for (int i = 0; i < n; i++) b.Append((ulong)(i / 64) + 1_000_000_000UL);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal((ulong)(i / 64) + 1_000_000_000UL, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Delta_ShortColumnFallsThrough()
+    {
+        // < 1024 rows — delta is structurally inapplicable (chunk size is 1024).
+        // Dispatch should fall through to FoR/bitpacked. Verify round-trip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 500;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(1_000_000_000u + (uint)(i * 7));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(1_000_000_000u + (uint)(i * 7), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task For_NullablePositiveMinRoundtrips()
     {
         // Nullable Int32 column with values in [10_000, 10_500] and ~25% nulls.

@@ -47,6 +47,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort DecimalEncodingIdx = 6;
     private const ushort ConstantEncodingIdx = 7;
     private const ushort ForEncodingIdx = 8;
+    private const ushort DeltaEncodingIdx = 9;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -56,7 +57,8 @@ public sealed class VortexFileWriter : IDisposable
         BitPacked: BitPackedEncodingIdx,
         Decimal: DecimalEncodingIdx,
         Constant: ConstantEncodingIdx,
-        For: ForEncodingIdx);
+        For: ForEncodingIdx,
+        Delta: DeltaEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -119,7 +121,7 @@ public sealed class VortexFileWriter : IDisposable
             var statsValues = ArrayStatsComputer.Compute(col);
             int? statsTicket = ArrayStatsEmitter.Emit(sb.Builder, statsValues);
 
-            int rootTicket = ArrayEncoderDispatch.Emit(sb, col, Indices, statsTicket, _compress);
+            int rootTicket = ArrayEncoderDispatch.Emit(sb, col, Indices, statsTicket, _compress, statsValues);
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
@@ -183,6 +185,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.Decimal,
                 VortexArrayEncodings.Constant,
                 VortexArrayEncodings.FastlanesFor,
+                VortexArrayEncodings.FastlanesDelta,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked },
             segmentSpecs: _sw.SegmentSpecs);

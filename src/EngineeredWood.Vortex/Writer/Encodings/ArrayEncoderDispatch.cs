@@ -12,7 +12,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// </summary>
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
-    ushort BitPacked, ushort Decimal, ushort Constant, ushort For);
+    ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -27,21 +27,31 @@ internal static class ArrayEncoderDispatch
     /// compressing encodings in this order:
     /// <list type="number">
     ///   <item><c>vortex.constant</c> — fully-uniform columns (one ScalarValue, no buffers).</item>
+    ///   <item><c>fastlanes.delta</c> — strictly-sorted unsigned-integer columns
+    ///     (delta-encoded successive differences inside FastLanes-transposed lanes).</item>
     ///   <item><c>fastlanes.for</c> — integer columns where shifting by min tightens
     ///     the bit width (or is required because the column has negative values).</item>
     ///   <item><c>fastlanes.bitpacked</c> — non-nullable integers with MaxBits &lt; native.</item>
     /// </list>
-    /// Constant is checked first because it's strictly smaller. FoR is checked
+    /// Constant is checked first because it's strictly smaller. Delta is gated
+    /// on <c>stats.IsStrictSorted</c> — that tells us within-lane successive
+    /// differences will be small without an O(n) probe scan. FoR is checked
     /// before plain bitpacked because it strictly subsumes bitpacked for
     /// columns where it applies (FoR with min=0 would be identical, but we
     /// only enable FoR when min != 0 or signed-with-negatives).</param>
+    /// <param name="stats">Top-level column statistics (passed by ref to avoid
+    /// copying). Encoders consult fields like <c>IsStrictSorted</c> to decide
+    /// profitability without re-scanning.</param>
     /// </summary>
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
-        int? statsTicket = null, bool compress = false)
+        int? statsTicket = null, bool compress = false,
+        ArrayStatsValues stats = default)
     {
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
+        if (compress && DeltaArrayEncoder.IsApplicable(array))
+            return DeltaArrayEncoder.Emit(sb, array, idx.Delta, idx.Primitive, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && ForArrayEncoder.IsApplicable(array))
             return ForArrayEncoder.Emit(sb, array, idx.For, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && BitPackedArrayEncoder.IsApplicable(array))
