@@ -123,6 +123,15 @@ public sealed class VortexFileWriter : IDisposable
     {
         public ulong NullCount { get; init; }
         public ulong NaNCount { get; init; }
+        /// <summary>
+        /// Sum of all Arrow buffer byte lengths (recursively across child
+        /// data). Approximates vortex's <c>Stat::UncompressedSizeInBytes</c>
+        /// which materializes the canonical form and reports its nbytes —
+        /// for the Apache.Arrow shapes we accept (primitive, bool, varbin,
+        /// list, struct, ...), the input array IS the canonical form, so
+        /// summing its buffers is exact.
+        /// </summary>
+        public ulong UncompressedSizeInBytes { get; init; }
         public byte[]? MinBytes { get; init; }
         public byte[]? MaxBytes { get; init; }
         public byte[]? SumBytes { get; init; }
@@ -142,28 +151,29 @@ public sealed class VortexFileWriter : IDisposable
     private enum ZoneStatScheme
     {
         /// <summary>
-        /// bitset = [0x40, 0x00] — bit 6 (NullCount).
-        /// zones struct = { null_count: u64 }.
+        /// bitset = [0xC0, 0x00] — bits 6 (NullCount), 7 (UncompressedSizeInBytes).
+        /// zones struct = { null_count: u64, uncompressed_size_in_bytes: u64 }.
         /// </summary>
         NullCountOnly,
 
         /// <summary>
-        /// bitset = [0x7F, 0x00] — bits 0..6 (IsConstant, IsSorted,
-        /// IsStrictSorted, Max, Min, Sum, NullCount).
+        /// bitset = [0xFF, 0x00] — bits 0..7 (IsConstant, IsSorted,
+        /// IsStrictSorted, Max, Min, Sum, NullCount, UncompressedSizeInBytes).
         /// zones struct = { is_constant: bool?, is_sorted: bool?,
         ///                  is_strict_sorted: bool?, max: T?,
         ///                  max_is_truncated: bool, min: T?,
         ///                  min_is_truncated: bool, sum: i64?/u64?,
-        ///                  null_count: u64 }.
+        ///                  null_count: u64, uncompressed_size_in_bytes: u64 }.
         /// </summary>
         IntFull,
 
         /// <summary>
-        /// bitset = [0x78, 0x01] — bits 3, 4, 5, 6 (Max, Min, Sum,
-        /// NullCount) plus bit 8 (NaNCount).
+        /// bitset = [0xF8, 0x01] — bits 3..7 (Max, Min, Sum, NullCount,
+        /// UncompressedSizeInBytes) plus bit 8 (NaNCount).
         /// zones struct = { max: T?, max_is_truncated: bool,
         ///                  min: T?, min_is_truncated: bool, sum: f64?,
-        ///                  null_count: u64, nan_count: u64 }.
+        ///                  null_count: u64, uncompressed_size_in_bytes: u64,
+        ///                  nan_count: u64 }.
         /// Sortedness flags are excluded for floats — NaN comparisons
         /// would make them unreliable, matching upstream's
         /// <c>ComputeIntOrdering</c> short-circuit on float types.
@@ -290,12 +300,12 @@ public sealed class VortexFileWriter : IDisposable
     /// </summary>
     private static byte[] BitsetForScheme(ZoneStatScheme scheme) => scheme switch
     {
-        // Bit 6 (NullCount).
-        ZoneStatScheme.NullCountOnly => new byte[] { 0x40, 0x00 },
-        // Bits 0..6 (IsConstant, IsSorted, IsStrictSorted, Max, Min, Sum, NullCount) = 0x7F.
-        ZoneStatScheme.IntFull => new byte[] { 0x7F, 0x00 },
-        // Bits 3..6 (Max, Min, Sum, NullCount) = 0x78, plus bit 8 (NaNCount) = 0x01.
-        ZoneStatScheme.FloatStandard => new byte[] { 0x78, 0x01 },
+        // Bits 6 (NullCount), 7 (UncompressedSizeInBytes) = 0xC0.
+        ZoneStatScheme.NullCountOnly => new byte[] { 0xC0, 0x00 },
+        // Bits 0..7 (IsConstant, IsSorted, IsStrictSorted, Max, Min, Sum, NullCount, UncompressedSizeInBytes) = 0xFF.
+        ZoneStatScheme.IntFull => new byte[] { 0xFF, 0x00 },
+        // Bits 3..7 (Max, Min, Sum, NullCount, UncompressedSizeInBytes) = 0xF8, plus bit 8 (NaNCount) = 0x01.
+        ZoneStatScheme.FloatStandard => new byte[] { 0xF8, 0x01 },
         _ => throw new NotSupportedException(),
     };
 
@@ -312,19 +322,51 @@ public sealed class VortexFileWriter : IDisposable
     /// Computes a per-batch <see cref="BatchStats"/> blob for the given
     /// column based on its <see cref="ZoneStatScheme"/>. Walks the column
     /// once for integer / float schemes; NullCountOnly just reads the
-    /// already-computed null count from <c>Data</c>.
+    /// already-computed null count from <c>Data</c>. UncompressedSizeInBytes
+    /// is computed for all schemes since it's a fast byte-counting walk
+    /// that doesn't depend on the column's element type.
     /// </summary>
     private static BatchStats ComputeBatchStats(Apache.Arrow.IArrowArray col, ZoneStatScheme scheme)
     {
         var data = ((Apache.Arrow.Array)col).Data;
         ulong nullCount = (ulong)data.GetNullCount();
-        if (scheme == ZoneStatScheme.NullCountOnly)
-            return new BatchStats { NullCount = nullCount };
-        if (scheme == ZoneStatScheme.IntFull)
-            return ComputeIntStats(col, data, nullCount);
-        if (scheme == ZoneStatScheme.FloatStandard)
-            return ComputeFloatStats(col, data, nullCount);
-        throw new NotSupportedException();
+        ulong uncompressedSize = ComputeUncompressedSize(data);
+        BatchStats baseStats = scheme switch
+        {
+            ZoneStatScheme.NullCountOnly => new BatchStats { NullCount = nullCount },
+            ZoneStatScheme.IntFull => ComputeIntStats(col, data, nullCount),
+            ZoneStatScheme.FloatStandard => ComputeFloatStats(col, data, nullCount),
+            _ => throw new NotSupportedException(),
+        };
+        return new BatchStats
+        {
+            NullCount = baseStats.NullCount,
+            NaNCount = baseStats.NaNCount,
+            UncompressedSizeInBytes = uncompressedSize,
+            MinBytes = baseStats.MinBytes,
+            MaxBytes = baseStats.MaxBytes,
+            SumBytes = baseStats.SumBytes,
+            IsConstant = baseStats.IsConstant,
+            IsSorted = baseStats.IsSorted,
+            IsStrictSorted = baseStats.IsStrictSorted,
+        };
+    }
+
+    /// <summary>
+    /// Sum of all Arrow buffer byte lengths, recursing through child data.
+    /// Approximates vortex's <c>Stat::UncompressedSizeInBytes</c>.
+    /// </summary>
+    private static ulong ComputeUncompressedSize(Apache.Arrow.ArrayData data)
+    {
+        ulong size = 0;
+        if (data.Buffers is not null)
+            foreach (var buf in data.Buffers) size += (ulong)buf.Length;
+        // Apache.Arrow.NET leaves Children null for primitive arrays — only
+        // nested types (struct, list, FSL, dictionary) populate it.
+        if (data.Children is not null)
+            foreach (var child in data.Children)
+                if (child is not null) size += ComputeUncompressedSize(child);
+        return size;
     }
 
     /// <summary>
@@ -587,11 +629,12 @@ public sealed class VortexFileWriter : IDisposable
 
     private uint EmitZonesSegmentNullCountOnly(List<BatchStats> stats)
     {
-        int numZones = stats.Count;
         var sb = new SegmentBuilder();
+        // Order (sorted by Stat enum): null_count(6), uncompressed_size_in_bytes(7).
         int ncTicket = EmitNullCountChild(sb, stats);
+        int sizeTicket = EmitUncompressedSizeChild(sb, stats);
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
-            sb.Builder, StructEncodingIdx, new[] { ncTicket });
+            sb.Builder, StructEncodingIdx, new[] { ncTicket, sizeTicket });
         return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
     }
 
@@ -603,8 +646,9 @@ public sealed class VortexFileWriter : IDisposable
             or Apache.Arrow.Types.Int64Type;
         var sb = new SegmentBuilder();
 
-        // Order: is_constant, is_sorted, is_strict_sorted, max, max_is_truncated,
-        //        min, min_is_truncated, sum, null_count.
+        // Order (sorted by Stat enum, with Min/Max followed by their truncation flags):
+        // is_constant(0), is_sorted(1), is_strict_sorted(2), max(3), max_is_truncated,
+        // min(4), min_is_truncated, sum(5), null_count(6), uncompressed_size_in_bytes(7).
         int isConstantTicket = EmitNullableBool(sb, stats, s => s.IsConstant);
         int isSortedTicket = EmitNullableBool(sb, stats, s => s.IsSorted);
         int isStrictSortedTicket = EmitNullableBool(sb, stats, s => s.IsStrictSorted);
@@ -618,12 +662,13 @@ public sealed class VortexFileWriter : IDisposable
         _ = isSigned;
         int sumTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.SumBytes, 8);
         int nullCountTicket = EmitNullCountChild(sb, stats);
+        int sizeTicket = EmitUncompressedSizeChild(sb, stats);
 
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
             sb.Builder, StructEncodingIdx,
             new[] { isConstantTicket, isSortedTicket, isStrictSortedTicket,
                     maxTicket, maxTruncTicket, minTicket, minTruncTicket,
-                    sumTicket, nullCountTicket });
+                    sumTicket, nullCountTicket, sizeTicket });
         return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
     }
 
@@ -632,18 +677,21 @@ public sealed class VortexFileWriter : IDisposable
         int byteWidth = _schema.FieldsList[columnIdx].DataType is Apache.Arrow.Types.FloatType ? 4 : 8;
         var sb = new SegmentBuilder();
 
+        // Order: max(3), max_is_truncated, min(4), min_is_truncated, sum(5),
+        // null_count(6), uncompressed_size_in_bytes(7), nan_count(8).
         int maxTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MaxBytes, byteWidth);
         int maxTruncTicket = EmitAllFalseBool(sb, stats.Count);
         int minTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MinBytes, byteWidth);
         int minTruncTicket = EmitAllFalseBool(sb, stats.Count);
         int sumTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.SumBytes, 8);
         int nullCountTicket = EmitNullCountChild(sb, stats);
+        int sizeTicket = EmitUncompressedSizeChild(sb, stats);
         int nanCountTicket = EmitNanCountChild(sb, stats);
 
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
             sb.Builder, StructEncodingIdx,
             new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket,
-                    sumTicket, nullCountTicket, nanCountTicket });
+                    sumTicket, nullCountTicket, sizeTicket, nanCountTicket });
         return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
     }
 
@@ -656,6 +704,20 @@ public sealed class VortexFileWriter : IDisposable
         var bytes = new byte[(long)n * 8];
         var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
         for (int i = 0; i < n; i++) span[i] = stats[i].NullCount;
+        ushort buf = sb.AddBuffer(bytes, alignmentExponent: 3);
+        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, buf);
+    }
+
+    /// <summary>
+    /// Emits the per-zone <c>uncompressed_size_in_bytes: u64</c> child
+    /// (always non-null).
+    /// </summary>
+    private static int EmitUncompressedSizeChild(SegmentBuilder sb, List<BatchStats> stats)
+    {
+        int n = stats.Count;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+        for (int i = 0; i < n; i++) span[i] = stats[i].UncompressedSizeInBytes;
         ushort buf = sb.AddBuffer(bytes, alignmentExponent: 3);
         return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, buf);
     }
