@@ -2761,6 +2761,153 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Fsst_RepetitiveSubstringsCompress()
+    {
+        // 1000 mostly-unique long strings sharing common substrings — dict
+        // rejects (1000 distinct values), but FSST trains a symbol table on
+        // the shared subsequences and packs each row into a few bytes plus
+        // escapes for the unique suffix. Expect >2× shrink.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+            b.Append($"https://www.example.com/path/to/resource/{i:D6}?query=value&session=abc123def456");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize * 2 < rawSize,
+                $"FSST on URL-shaped strings should give >2x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal($"https://www.example.com/path/to/resource/{i:D6}?query=value&session=abc123def456", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_NaturalEnglishTextRoundtrips()
+    {
+        // Natural-language repetitions: 200 sentences with the same prefix
+        // and varying tails. Verifies bulk-decompress reconstructs the
+        // original bytes for each row.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("sentence", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 200;
+        var sentences = new string[n];
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            sentences[i] = $"The quick brown fox jumps over the lazy dog at position {i} which is in run {i / 10}.";
+            b.Append(sentences[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++) Assert.Equal(sentences[i], read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_HighEntropyFallsThrough()
+    {
+        // Random-looking short strings — FSST can't find useful symbols, so
+        // the gate rejects and dispatch falls through to plain varbin.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        var rng = new Random(42);
+        var values = new string[n];
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            var bytes = new byte[8];
+            rng.NextBytes(bytes);
+            values[i] = Convert.ToHexString(bytes);
+            b.Append(values[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++) Assert.Equal(values[i], read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_ShortColumnDeferredToVarBin()
+    {
+        // Below MinRows=32 the gate rejects regardless of compressibility —
+        // symbol-table overhead dwarfs any win on tiny columns.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        var b = new StringArray.Builder();
+        for (int i = 0; i < 10; i++) b.Append($"https://example.com/path/{i}");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, 10);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < 10; i++) Assert.Equal($"https://example.com/path/{i}", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_RepetitiveStringsCompress()
     {
         // Highly repetitive string column — only 5 distinct values, 1000 rows.

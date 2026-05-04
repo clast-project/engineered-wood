@@ -326,6 +326,47 @@ internal static class ArrayNodeEmitter
             .EmitUOffset(bufIdxTicket)
             .EmitSOffsetTo(nodeVt);
     }
+
+    /// <summary>
+    /// Slots 0+1+2+3 with a multi-entry buffer-indices vector. Same vtable
+    /// shape as <see cref="EmitWithMetadataBufferAndChildren"/> — only the
+    /// buffer-vector ticket's payload changes, not the inline layout.
+    /// Used by <c>vortex.fsst</c> (3 buffers: symbols, symbol_lengths, codes).
+    /// </summary>
+    public static int EmitWithMetadataBuffersAndChildren(
+        BackwardsFlatBufferBuilder b, ushort encodingIdx, ushort[] bufIdxs,
+        int metadataTicket, int[] childTickets)
+    {
+        var childrenVecTicket = b.WriteUOffsetVector(childTickets);
+        var bufIdxTicket = b.WriteUInt16Vector(bufIdxs);
+        var nodeVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 12, 8, 4 });
+        return b.StartTable(alignment: 4, inlineSize: 18)
+            .EmitU16(encodingIdx)
+            .EmitUOffset(metadataTicket)
+            .EmitUOffset(childrenVecTicket)
+            .EmitUOffset(bufIdxTicket)
+            .EmitSOffsetTo(nodeVt);
+    }
+
+    /// <summary>
+    /// Slots 0+1+2+3+4 with a multi-entry buffer-indices vector and stats.
+    /// Vtable shape matches <see cref="EmitWithMetadataBufferChildrenAndStats"/>.
+    /// </summary>
+    public static int EmitWithMetadataBuffersChildrenAndStats(
+        BackwardsFlatBufferBuilder b, ushort encodingIdx, ushort[] bufIdxs,
+        int metadataTicket, int[] childTickets, int statsTicket)
+    {
+        var childrenVecTicket = b.WriteUOffsetVector(childTickets);
+        var bufIdxTicket = b.WriteUInt16Vector(bufIdxs);
+        var nodeVt = b.WriteUInt16s(new ushort[] { 14, 22, 20, 12, 8, 4, 16 });
+        return b.StartTable(alignment: 4, inlineSize: 22)
+            .EmitU16(encodingIdx)
+            .EmitUOffset(statsTicket)
+            .EmitUOffset(metadataTicket)
+            .EmitUOffset(childrenVecTicket)
+            .EmitUOffset(bufIdxTicket)
+            .EmitSOffsetTo(nodeVt);
+    }
 }
 
 /// <summary>
