@@ -350,6 +350,32 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         => ReadAllAsync(acceptedZones: null, cancellationToken);
 
     /// <summary>
+    /// Streams the file as Arrow <see cref="RecordBatch"/>es, pruned by
+    /// <paramref name="predicate"/> against the per-zone stats. Predicates
+    /// are conservative — zones whose stats prove no row can match are
+    /// skipped at decode time; zones with missing stats or matching ranges
+    /// are kept and the caller is expected to apply a row-level filter.
+    ///
+    /// <para>Equivalent to:
+    /// <c>ReadAllAsync(await predicate.EvaluateZonesAsync(this, ...))</c>
+    /// — the predicate evaluates lazily against each column's
+    /// <see cref="GetZoneStatsAsync"/> result.</para>
+    /// </summary>
+    public async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        Predicate predicate,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        if (_columnPlans.Length == 0) yield break;
+
+        int totalZones = _columnPlans[0].ChunkCount;
+        var accepted = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
+            .ConfigureAwait(false);
+        await foreach (var batch in ReadAllAsync(accepted, cancellationToken).ConfigureAwait(false))
+            yield return batch;
+    }
+
+    /// <summary>
     /// Streams the file as Arrow <see cref="RecordBatch"/>es, optionally
     /// filtered by zone. When <paramref name="acceptedZones"/> is non-null,
     /// only chunks whose zone index is in the set are decoded — letting

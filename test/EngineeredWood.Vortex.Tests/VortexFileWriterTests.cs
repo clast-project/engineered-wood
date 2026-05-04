@@ -1287,6 +1287,247 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Predicate_GreaterOrEqualPrunesByMax()
+    {
+        // 4 zones × 100 rows: zone 0 = 0..99, zone 1 = 100..199, zone 2 = 200..299, zone 3 = 300..349.
+        // Predicate `v >= 250` should keep zones 2 and 3 only (max 99 / 199 < 250 → drop).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var sizes = new[] { 100, 100, 100, 50 };
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    var b = new Int32Array.Builder();
+                    for (int i = 0; i < sz; i++) b.Append(rows + i);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.GreaterOrEqual(0, 250);
+            int batches = 0;
+            int totalRows = 0;
+            await foreach (var batch in reader.ReadAllAsync(pred))
+            {
+                batches++;
+                totalRows += batch.Length;
+            }
+            Assert.Equal(2, batches);
+            Assert.Equal(150, totalRows); // zones 2 (100) + 3 (50)
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Predicate_EqualKeepsZonesContainingValue()
+    {
+        // 3 zones × 50 rows: 0..49, 50..99, 100..149. Predicate v == 75
+        // keeps only zone 1 (range 50..99).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < 3; batchIdx++)
+                {
+                    var b = new Int32Array.Builder();
+                    for (int i = 0; i < 50; i++) b.Append(batchIdx * 50 + i);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, 50));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.Equal(0, 75);
+            int batches = 0;
+            await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
+            Assert.Equal(1, batches);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Predicate_AndIntersectsAcceptedZones()
+    {
+        // Two columns, predicates on each. Each batch is in [batchIdx*100, batchIdx*100 + 99]
+        // for both columns but offset.
+        // col 0: zone 0=[0..99], zone 1=[100..199], zone 2=[200..299], zone 3=[300..399].
+        // col 1: same.
+        // Predicate (col0 >= 200) AND (col1 < 300) → zones {2, 3} ∩ zones {0, 1, 2} = {2}.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: false),
+            new Field("b", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < 4; batchIdx++)
+                {
+                    var a = new Int32Array.Builder();
+                    var b = new Int32Array.Builder();
+                    int basev = batchIdx * 100;
+                    for (int i = 0; i < 100; i++) { a.Append(basev + i); b.Append(basev + i); }
+                    w.WriteBatch(new RecordBatch(schema,
+                        new IArrowArray[] { a.Build(), b.Build() }, 100));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.And(
+                Predicate.GreaterOrEqual(0, 200),
+                Predicate.Less(1, 300));
+            int batches = 0;
+            await foreach (var batch in reader.ReadAllAsync(pred))
+            {
+                batches++;
+                var aArr = (Int32Array)batch.Column(0);
+                Assert.Equal(200, aArr.GetValue(0)!.Value);
+            }
+            Assert.Equal(1, batches);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Predicate_OrUnionsAcceptedZones()
+    {
+        // col 0: 4 zones × 100 rows. (col0 < 100) OR (col0 >= 300) keeps zones 0 and 3.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < 4; batchIdx++)
+                {
+                    var bld = new Int32Array.Builder();
+                    int basev = batchIdx * 100;
+                    for (int i = 0; i < 100; i++) bld.Append(basev + i);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { bld.Build() }, 100));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.Or(
+                Predicate.Less(0, 100),
+                Predicate.GreaterOrEqual(0, 300));
+            int batches = 0;
+            await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
+            Assert.Equal(2, batches);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Predicate_IsNullDropsZonesWithoutNulls()
+    {
+        // 3 zones × 100 rows. Zone 1 has nulls; zones 0 and 2 don't.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < 3; batchIdx++)
+                {
+                    var b = new Int32Array.Builder();
+                    for (int i = 0; i < 100; i++)
+                    {
+                        if (batchIdx == 1 && i % 10 == 0) b.AppendNull();
+                        else b.Append(batchIdx * 100 + i);
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, 100));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.IsNull(0);
+            int batches = 0;
+            await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
+            Assert.Equal(1, batches); // only zone 1
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Predicate_NoZonedStatsKeepsAllChunks()
+    {
+        // File without preserveStats → predicate eval falls back to
+        // "keep all" since GetZoneStatsAsync returns null.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < 100; i++) b.Append(i);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, 100);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch); // no preserveStats
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            // Predicate would prune everything if stats were available, but
+            // with no stats we keep the chunk and let the caller filter.
+            var pred = Predicate.GreaterOrEqual(0, 1_000_000);
+            int batches = 0;
+            await foreach (var b2 in reader.ReadAllAsync(pred)) batches++;
+            Assert.Equal(1, batches);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task ZonePruning_GetZoneStatsExposesPerZoneMinMax()
     {
         // Build a 4-zone file with monotonically-increasing batches and
