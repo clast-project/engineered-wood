@@ -24,8 +24,9 @@ namespace EngineeredWood.Vortex.Encodings;
 ///   <item>Metadata <c>ALPRDMetadata { right_bit_width, dict_len, dict[u32 packed], left_parts_ptype, patches }</c></item>
 /// </list></para>
 ///
-/// <para>Phase 1 scope: f64 only (matches the only fixture today). f32 follows the same shape
-/// with right_parts as u32.</para>
+/// <para>Scope: f32 + f64. right_parts is u32 for FloatType, u64 for DoubleType;
+/// the dictionary stores u16 left patterns either way (CUT_LIMIT=16 caps the
+/// left part width). Other dtypes throw <see cref="NotSupportedException"/>.</para>
 /// </summary>
 internal static class AlpRdArrayDecoder
 {
@@ -36,9 +37,9 @@ internal static class AlpRdArrayDecoder
         IArrowType expectedType,
         long expectedRowCount)
     {
-        if (expectedType is not DoubleType)
+        if (expectedType is not (FloatType or DoubleType))
             throw new NotSupportedException(
-                $"vortex.alprd phase-1 supports DoubleType only, got {expectedType}.");
+                $"vortex.alprd supports FloatType / DoubleType, got {expectedType}.");
 
         if (node.BufferRefCount != 0)
             throw new VortexFormatException(
@@ -56,10 +57,11 @@ internal static class AlpRdArrayDecoder
         var leftParts = ArrayDecoder.DecodeNode(
             node.Child(0), serialized, arraySpecs, leftPartsType, expectedRowCount);
 
-        // For f64, right_parts is u64.
+        // right_parts width is determined by the parent dtype: u32 for f32, u64 for f64.
+        bool isF32 = expectedType is FloatType;
+        var rightPartsType = isF32 ? (IArrowType)UInt32Type.Default : UInt64Type.Default;
         var rightParts = ArrayDecoder.DecodeNode(
-            node.Child(1), serialized, arraySpecs, UInt64Type.Default, expectedRowCount);
-        var rightArr = (UInt64Array)rightParts;
+            node.Child(1), serialized, arraySpecs, rightPartsType, expectedRowCount);
 
         // Patch path (overwrites some left_parts with raw left bit patterns).
         IArrowArray? patchIndices = null;
@@ -82,18 +84,34 @@ internal static class AlpRdArrayDecoder
         if (patchIndices is not null && patchValues is not null)
             ApplyPatches(resolvedLeft, patchIndices, patchValues, (int)meta.PatchesOffset);
 
-        // Combine left << shift | right → f64 bit pattern.
-        var bytes = new byte[(long)rowCount * sizeof(double)];
-        var doubles = MemoryMarshal.Cast<byte, double>(bytes.AsSpan());
+        // Combine left << shift | right → float bit pattern.
         var shift = meta.RightBitWidth;
-        for (int i = 0; i < rowCount; i++)
+        if (isF32)
         {
-            ulong leftBits = resolvedLeft[i];
-            ulong combined = (leftBits << shift) | rightArr.GetValue(i)!.Value;
-            doubles[i] = BitConverter.Int64BitsToDouble(unchecked((long)combined));
+            var bytes = new byte[(long)rowCount * sizeof(float)];
+            var floats = MemoryMarshal.Cast<byte, float>(bytes.AsSpan());
+            var rightArr = (UInt32Array)rightParts;
+            for (int i = 0; i < rowCount; i++)
+            {
+                uint leftBits = (uint)resolvedLeft[i];
+                uint combined = (leftBits << shift) | rightArr.GetValue(i)!.Value;
+                floats[i] = Int32BitsToSingle(unchecked((int)combined));
+            }
+            return new FloatArray(new ArrowBuffer(bytes), ArrowBuffer.Empty, rowCount, 0, 0);
         }
-
-        return new DoubleArray(new ArrowBuffer(bytes), ArrowBuffer.Empty, rowCount, 0, 0);
+        else
+        {
+            var bytes = new byte[(long)rowCount * sizeof(double)];
+            var doubles = MemoryMarshal.Cast<byte, double>(bytes.AsSpan());
+            var rightArr = (UInt64Array)rightParts;
+            for (int i = 0; i < rowCount; i++)
+            {
+                ulong leftBits = resolvedLeft[i];
+                ulong combined = (leftBits << shift) | rightArr.GetValue(i)!.Value;
+                doubles[i] = BitConverter.Int64BitsToDouble(unchecked((long)combined));
+            }
+            return new DoubleArray(new ArrowBuffer(bytes), ArrowBuffer.Empty, rowCount, 0, 0);
+        }
     }
 
     /// <summary>
@@ -257,6 +275,19 @@ internal static class AlpRdArrayDecoder
                 throw new VortexFormatException(
                     $"Unsupported protobuf wire type {wireType} in ALPRDMetadata.");
         }
+    }
+
+    /// <summary>
+    /// <c>BitConverter.Int32BitsToSingle</c> is .NET 6+; on netstandard2.0
+    /// we reinterpret via the 4-byte buffer round-trip.
+    /// </summary>
+    private static float Int32BitsToSingle(int bits)
+    {
+#if NET6_0_OR_GREATER
+        return BitConverter.Int32BitsToSingle(bits);
+#else
+        return BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+#endif
     }
 
     private static IArrowType PtypeIntToArrowType(int ptype) => ptype switch

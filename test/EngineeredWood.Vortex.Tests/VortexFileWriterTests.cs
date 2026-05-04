@@ -2342,6 +2342,96 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task AlpRd_F32IrrationalRoundtrips()
+    {
+        // f32 mirror of the f64 test: bounded magnitudes around three pivots.
+        // ALP rejects, ALP-RD applies, right_parts go as u32, dictionary
+        // covers the small set of distinct top-bit patterns.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", FloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new FloatArray.Builder();
+        var rng = new Random(2026);
+        var expected = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float pivot = (i % 3) switch { 0 => 1.5f, 1 => 12.5f, _ => 100.5f };
+            expected[i] = pivot + (float)(rng.NextDouble() * 0.4);
+            b.Append(expected[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize,
+                $"ALP-RD on bounded-magnitude floats should compress vs raw. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AlpRd_F32WithPatchesRoundtrips()
+    {
+        // f32 with > MaxDictSize=8 distinct top patterns → guaranteed
+        // patches. Verifies the f32-specific encode loop preserves both the
+        // dictionary-encoded values and the raw u16 patches.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", FloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var pivots = new[]
+        {
+            1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f,
+        };
+        var values = new float[n];
+        var b = new FloatArray.Builder();
+        var rng = new Random(13);
+        for (int i = 0; i < n; i++)
+        {
+            values[i] = pivots[i % pivots.Length] * (1.0f + (float)(rng.NextDouble() * 0.1));
+            b.Append(values[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(values[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task AlpRd_DecimalLikeColumnDeferredToAlp()
     {
         // A decimal-shaped column that ALP claims (cleaner compression).

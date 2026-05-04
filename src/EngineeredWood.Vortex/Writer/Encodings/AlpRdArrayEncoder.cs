@@ -29,9 +29,10 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// patch_values) with patches. Metadata
 /// <c>ALPRDMetadata { right_bit_width, dict_len, dict[u32 packed], left_parts_ptype, patches? }</c>.</para>
 ///
-/// <para>Phase 1 scope: f64 only — matches the existing reader. f32 follows
-/// the same shape with right_parts as u32 and is straightforward to enable
-/// once the reader catches up. Non-nullable, non-sliced inputs only.</para>
+/// <para>Scope: f32 + f64. right_parts is u32 for FloatArray, u64 for
+/// DoubleArray; the dictionary stores u16 left patterns either way (CUT_LIMIT
+/// caps the left part width at 16 bits regardless of float type). Non-nullable,
+/// non-sliced inputs only.</para>
 ///
 /// <para>See "ALP: Adaptive Lossless floating-Point Compression" (Afroozeh &amp;
 /// Boncz, VLDB 2024), Section 3.4 (RD variant), and the upstream Rust
@@ -44,23 +45,25 @@ internal static class AlpRdArrayEncoder
 
     public static bool IsApplicable(IArrowArray array)
     {
-        if (array is not DoubleArray d) return false;
-        var data = d.Data;
+        if (array is not (FloatArray or DoubleArray)) return false;
+        var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0) return false;
         if (data.GetNullCount() > 0) return false; // phase 1: non-null
-        int n = d.Length;
+        int n = array.Length;
         // Need enough rows to amortize FastLanes' 1024-element chunk padding
         // (which forces left/right payloads up to a multiple of 128 × W bytes).
         if (n < 1024) return false;
 
         // Train and probe profitability against the ACTUAL padded byte cost.
-        // ALP-RD's intrinsic ratio is ~85% (49 bits / 64) for ideal data, so a
-        // simple bits-per-value × 1.5 gate (used elsewhere) can't ever fire.
-        // Instead, model the bitpacked children's padded byte size and accept
-        // whenever ALP-RD beats 90% of raw — typical compression on real data
-        // sits comfortably below that threshold.
-        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
-        var (rightBw, dict, exceptionCount) = FindBestDictionary(src);
+        // ALP-RD's intrinsic ratio is ~85% of raw for ideal data
+        // (e.g. 49 bits / 64 for f64), so a bits-per-value × 1.5 gate (used
+        // elsewhere) can't ever fire. Instead, model the bitpacked children's
+        // padded byte size and accept whenever ALP-RD beats 90% of raw.
+        bool isF32 = array is FloatArray;
+        int floatBytes = isF32 ? 4 : 8;
+        var (rightBw, dict, exceptionCount) = isF32
+            ? FindBestDictionaryF32(MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4)))
+            : FindBestDictionary(MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8)));
         if (rightBw == 0) return false;
 
         int leftBw = BitWidth(dict.Length == 0 ? 0 : dict.Length - 1);
@@ -69,29 +72,40 @@ internal static class AlpRdArrayEncoder
         // left_parts (left_bw) and right_parts (right_bw) bitpack this way.
         long leftPayload = (long)numChunks * 128 * leftBw;
         long rightPayload = (long)numChunks * 128 * rightBw;
-        // Patches: u32 index + u16 value, rounded up to ~8 bytes per exception
-        // including FB scaffolding amortization.
+        // Patches: bounded index + u16 value ≈ 8 bytes per exception.
         long patchPayload = (long)exceptionCount * 8;
         long compressedBytes = leftPayload + rightPayload + patchPayload;
-        long rawBytes = (long)n * 8;
+        long rawBytes = (long)n * floatBytes;
         return compressedBytes < rawBytes * 9 / 10;
     }
 
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx, int? statsTicket = null)
     {
-        if (array is not DoubleArray d)
+        if (array is not (FloatArray or DoubleArray))
             throw new NotSupportedException(
-                $"vortex.alprd writer requires DoubleArray (phase 1: f64 only), got {array.GetType().Name}.");
-        var data = d.Data;
+                $"vortex.alprd writer requires FloatArray or DoubleArray, got {array.GetType().Name}.");
+        var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0)
             throw new NotSupportedException("vortex.alprd writer doesn't yet support sliced inputs.");
         if (data.GetNullCount() > 0)
             throw new NotSupportedException("vortex.alprd writer doesn't yet support nullable inputs.");
 
-        int n = d.Length;
-        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
-        var (rightBw, dict, _) = FindBestDictionary(src);
+        bool isF32 = array is FloatArray;
+        int n = array.Length;
+
+        int rightBw;
+        ushort[] dict;
+        if (isF32)
+        {
+            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+            (rightBw, dict, _) = FindBestDictionaryF32(src);
+        }
+        else
+        {
+            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+            (rightBw, dict, _) = FindBestDictionary(src);
+        }
         if (rightBw == 0)
             throw new InvalidOperationException(
                 "vortex.alprd: no profitable dictionary found (caller should gate via IsApplicable).");
@@ -102,30 +116,43 @@ internal static class AlpRdArrayEncoder
         // pattern, and patch_values share the left_parts ptype on the wire.
         // A u8 left_parts would silently truncate patches to their low byte.
         int leftBw = BitWidth(dict.Length == 0 ? 0 : dict.Length - 1);
-        ulong rightMask = (1UL << rightBw) - 1;
         var dictLookup = BuildReverseDictionary(dict);
 
         var leftCodesBytes = new byte[(long)n * 2]; // U16
         var leftCodesSpan = MemoryMarshal.Cast<byte, ushort>(leftCodesBytes.AsSpan());
-        var rightPartsBytes = new byte[(long)n * 8]; // U64 for f64
-        var rightPartsSpan = MemoryMarshal.Cast<byte, ulong>(rightPartsBytes.AsSpan());
+        // right_parts width follows the float type: u32 for f32, u64 for f64.
+        int rightElemSize = isF32 ? 4 : 8;
+        var rightPartsBytes = new byte[(long)n * rightElemSize];
         var patchIdxList = new List<long>();
         var patchValList = new List<ushort>();
-        for (int i = 0; i < n; i++)
+        if (isF32)
         {
-            ulong bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(src[i]));
-            ulong right = bits & rightMask;
-            ushort left = (ushort)(bits >> rightBw);
-            rightPartsSpan[i] = right;
-            if (dictLookup.TryGetValue(left, out byte code))
+            uint rightMask = (uint)((1UL << rightBw) - 1);
+            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+            var rightPartsSpan = MemoryMarshal.Cast<byte, uint>(rightPartsBytes.AsSpan());
+            for (int i = 0; i < n; i++)
             {
-                leftCodesSpan[i] = code;
+                uint bits = unchecked((uint)SingleToInt32Bits(src[i]));
+                uint right = bits & rightMask;
+                ushort left = (ushort)(bits >> rightBw);
+                rightPartsSpan[i] = right;
+                if (dictLookup.TryGetValue(left, out byte code)) leftCodesSpan[i] = code;
+                else { leftCodesSpan[i] = 0; patchIdxList.Add(i); patchValList.Add(left); }
             }
-            else
+        }
+        else
+        {
+            ulong rightMask = (1UL << rightBw) - 1;
+            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+            var rightPartsSpan = MemoryMarshal.Cast<byte, ulong>(rightPartsBytes.AsSpan());
+            for (int i = 0; i < n; i++)
             {
-                leftCodesSpan[i] = 0; // overwritten by patches at read time
-                patchIdxList.Add(i);
-                patchValList.Add(left);
+                ulong bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(src[i]));
+                ulong right = bits & rightMask;
+                ushort left = (ushort)(bits >> rightBw);
+                rightPartsSpan[i] = right;
+                if (dictLookup.TryGetValue(left, out byte code)) leftCodesSpan[i] = code;
+                else { leftCodesSpan[i] = 0; patchIdxList.Add(i); patchValList.Add(left); }
             }
         }
 
@@ -133,8 +160,9 @@ internal static class AlpRdArrayEncoder
         // compress=true so they pick up bitpacked at left_bw / right_bw.
         var leftPartsArr = new UInt16Array(
             new ArrowBuffer(leftCodesBytes), ArrowBuffer.Empty, n, 0, 0);
-        var rightPartsArr = new UInt64Array(
-            new ArrowBuffer(rightPartsBytes), ArrowBuffer.Empty, n, 0, 0);
+        IArrowArray rightPartsArr = isF32
+            ? new UInt32Array(new ArrowBuffer(rightPartsBytes), ArrowBuffer.Empty, n, 0, 0)
+            : new UInt64Array(new ArrowBuffer(rightPartsBytes), ArrowBuffer.Empty, n, 0, 0);
 
         int leftTicket = ArrayEncoderDispatch.Emit(
             sb, leftPartsArr, idx, statsTicket: null, compress: true);
@@ -189,7 +217,7 @@ internal static class AlpRdArrayEncoder
     }
 
     /// <summary>
-    /// Searches all <c>p ∈ [1, 16]</c> (where <c>right_bw = 64 - p</c>),
+    /// Searches all <c>p ∈ [1, 16]</c> (where <c>right_bw = floatBits - p</c>),
     /// builds a dictionary of the most-frequent left bit patterns at each
     /// cut, and picks the cut minimizing
     /// <c>right_bw + left_bw + exception_overhead/n</c>. Returns the winning
@@ -207,7 +235,6 @@ internal static class AlpRdArrayEncoder
         for (int p = 1; p <= CutLimit; p++)
         {
             int rightBw = 64 - p;
-            // Count left-bit patterns at this cut.
             var counts = new Dictionary<ushort, int>();
             for (int i = 0; i < values.Length; i++)
             {
@@ -216,30 +243,71 @@ internal static class AlpRdArrayEncoder
                 counts.TryGetValue(left, out int c);
                 counts[left] = c + 1;
             }
-
-            // Sort by frequency descending; take top MaxDictSize as dict.
-            var sorted = counts.OrderByDescending(kv => kv.Value).ToList();
-            int dictLen = Math.Min(sorted.Count, MaxDictSize);
-            var dict = new ushort[dictLen];
-            for (int k = 0; k < dictLen; k++) dict[k] = sorted[k].Key;
-
-            int exceptionCount = 0;
-            for (int k = dictLen; k < sorted.Count; k++) exceptionCount += sorted[k].Value;
-
-            int leftBw = BitWidth(dictLen == 0 ? 0 : dictLen - 1);
-            // Same cost model as upstream: (right_bw) + (left_bw) +
-            // (exceptions * (POSITION_BITS + VALUE_BITS) / n).
-            // Matches estimate_compression_size in Rust.
-            double bitsPerVal = leftBw + rightBw + ((double)exceptionCount * 32 / values.Length);
-            if (bitsPerVal < bestSize)
-            {
-                bestSize = bitsPerVal;
-                bestRightBw = rightBw;
-                bestDict = dict;
-                bestExceptions = exceptionCount;
-            }
+            EvaluateCut(counts, rightBw, values.Length,
+                ref bestSize, ref bestRightBw, ref bestDict, ref bestExceptions);
         }
         return (bestRightBw, bestDict, bestExceptions);
+    }
+
+    /// <summary>
+    /// f32 variant of <see cref="FindBestDictionary(ReadOnlySpan{double})"/>:
+    /// shift width is 32 − p and the bit pattern comes from
+    /// <see cref="SingleToInt32Bits"/>.
+    /// </summary>
+    private static (int RightBw, ushort[] Dict, int ExceptionCount)
+        FindBestDictionaryF32(ReadOnlySpan<float> values)
+    {
+        double bestSize = double.MaxValue;
+        int bestRightBw = 0;
+        ushort[] bestDict = System.Array.Empty<ushort>();
+        int bestExceptions = 0;
+
+        for (int p = 1; p <= CutLimit; p++)
+        {
+            int rightBw = 32 - p;
+            var counts = new Dictionary<ushort, int>();
+            for (int i = 0; i < values.Length; i++)
+            {
+                uint bits = unchecked((uint)SingleToInt32Bits(values[i]));
+                ushort left = (ushort)(bits >> rightBw);
+                counts.TryGetValue(left, out int c);
+                counts[left] = c + 1;
+            }
+            EvaluateCut(counts, rightBw, values.Length,
+                ref bestSize, ref bestRightBw, ref bestDict, ref bestExceptions);
+        }
+        return (bestRightBw, bestDict, bestExceptions);
+    }
+
+    /// <summary>
+    /// Common cost-evaluation step shared by the f32 and f64 cut searches.
+    /// Sorts the histogram by frequency, picks the top
+    /// <see cref="MaxDictSize"/> as the dictionary, counts exceptions, and
+    /// updates the running best if this cut beats it.
+    /// </summary>
+    private static void EvaluateCut(
+        Dictionary<ushort, int> counts, int rightBw, int sampleN,
+        ref double bestSize, ref int bestRightBw, ref ushort[] bestDict, ref int bestExceptions)
+    {
+        var sorted = counts.OrderByDescending(kv => kv.Value).ToList();
+        int dictLen = Math.Min(sorted.Count, MaxDictSize);
+        var dict = new ushort[dictLen];
+        for (int k = 0; k < dictLen; k++) dict[k] = sorted[k].Key;
+
+        int exceptionCount = 0;
+        for (int k = dictLen; k < sorted.Count; k++) exceptionCount += sorted[k].Value;
+
+        int leftBw = BitWidth(dictLen == 0 ? 0 : dictLen - 1);
+        // Same cost model as upstream: right_bw + left_bw +
+        // exceptions * (POSITION_BITS + VALUE_BITS) / n.
+        double bitsPerVal = leftBw + rightBw + ((double)exceptionCount * 32 / sampleN);
+        if (bitsPerVal < bestSize)
+        {
+            bestSize = bitsPerVal;
+            bestRightBw = rightBw;
+            bestDict = dict;
+            bestExceptions = exceptionCount;
+        }
     }
 
     private static Dictionary<ushort, byte> BuildReverseDictionary(ushort[] dict)
@@ -247,6 +315,19 @@ internal static class AlpRdArrayEncoder
         var lookup = new Dictionary<ushort, byte>(dict.Length);
         for (int i = 0; i < dict.Length; i++) lookup[dict[i]] = (byte)i;
         return lookup;
+    }
+
+    /// <summary>
+    /// <c>BitConverter.SingleToInt32Bits</c> is .NET 6+; on netstandard2.0 we
+    /// reinterpret via the 4-byte buffer round-trip.
+    /// </summary>
+    private static int SingleToInt32Bits(float f)
+    {
+#if NET6_0_OR_GREATER
+        return BitConverter.SingleToInt32Bits(f);
+#else
+        return BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
+#endif
     }
 
     /// <summary>Number of bits to represent <paramref name="value"/> (0 → 1).</summary>
