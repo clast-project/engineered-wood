@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
-using System.Reflection;
 using Apache.Arrow;
 using Clast.Fsst;
 using EngineeredWood.Encodings;
@@ -29,10 +28,11 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// and emit a per-row validity child following the rule used by the existing
 /// reader (child[2] is a vortex.bool). Floats / binary deferred.</para>
 ///
-/// <para>Symbol-table extraction relies on reflection over Clast.Fsst's
-/// internal <c>SymbolTable</c> shape (NSymbols + Symbols[] of (Val, Icl)
-/// pairs). Clast.Fsst doesn't expose a typed accessor, but the field layout
-/// is stable across the 0.1.x package line we depend on.</para>
+/// <para>Symbol-table extraction uses the public
+/// <see cref="SymbolTable.SymbolCount"/> + <see cref="SymbolTable.ExportRaw"/>
+/// pair (Clast.Fsst 0.1.3+); the latter is symmetric with
+/// <see cref="FsstDecoder.FromSymbols"/> so the round-trip is just
+/// <c>ExportRaw(lengths, symbols)</c> → ship buffers → <c>FromSymbols(lengths, symbols)</c>.</para>
 /// </summary>
 internal static class FsstArrayEncoder
 {
@@ -71,9 +71,8 @@ internal static class FsstArrayEncoder
             return false;
         }
         var (compressed, _) = FsstEncoder.CompressBatch(table, rowBytes);
-        int nSymbols = ReadNSymbols(table);
         long fsstBytes = compressed.LongLength
-            + (long)nSymbols * 9 // symbols (8) + symbol_lengths (1) per slot
+            + (long)table.SymbolCount * 9 // symbols (8) + symbol_lengths (1) per slot
             + (long)(n + 1) * SmallestUIntElemSize(compressed.Length) // codes_offsets
             + (long)n * SmallestUIntElemSize(MaxRowLength(rowBytes)); // uncompressed_lengths
         return fsstBytes * 3 / 2 < total;
@@ -159,58 +158,19 @@ internal static class FsstArrayEncoder
     }
 
     /// <summary>
-    /// Reads <c>SymbolTable.NSymbols</c> via reflection over the public
-    /// fields. Clast.Fsst's <see cref="SymbolTable"/> is opaque (no typed
-    /// accessors) but the field name has been stable since 0.1.0.
-    /// </summary>
-    private static int ReadNSymbols(SymbolTable table)
-    {
-        var field = typeof(SymbolTable)
-            .GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .First(f => f.Name == "NSymbols");
-        return (int)field.GetValue(table)!;
-    }
-
-    /// <summary>
-    /// Extracts the symbol table into vortex's wire layout:
-    /// <list type="bullet">
-    ///   <item><c>symbols</c> — <c>NSymbols × 8</c> bytes; each entry is the
-    ///     <c>Symbol.Val</c> field (a UInt64 packed little-endian, with
-    ///     unused bytes zero-filled).</item>
-    ///   <item><c>symbol_lengths</c> — <c>NSymbols</c> bytes; length of the
-    ///     symbol with that code, derived from <c>Symbol.Icl</c>'s length
-    ///     field (bits 28..31).</item>
-    /// </list>
-    /// Reflection is used because Clast.Fsst doesn't expose typed accessors;
-    /// the field shape (Val: UInt64, Icl: UInt64; SymbolTable.Symbols, NSymbols)
-    /// has been stable since the 0.1.0 package version.
+    /// Extracts the symbol table into vortex's wire layout via Clast.Fsst's
+    /// public <see cref="SymbolTable.ExportRaw"/>: <c>lengths</c> ends up with
+    /// <c>SymbolCount</c> bytes (one length per code), <c>symbols</c> with
+    /// <c>SymbolCount × 8</c> bytes (each symbol's bytes packed LE,
+    /// zero-padded). Parameter order matches <see cref="FsstDecoder.FromSymbols"/>.
     /// </summary>
     private static (byte[] Symbols, byte[] Lengths) ExtractSymbols(SymbolTable table)
     {
-        var stFields = typeof(SymbolTable)
-            .GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .ToArray();
-        int nSymbols = (int)stFields.First(f => f.Name == "NSymbols").GetValue(table)!;
-        var symbolsArr = (System.Array)stFields.First(f => f.Name == "Symbols").GetValue(table)!;
-
-        var symbolType = typeof(SymbolTable).Assembly.GetType("Clast.Fsst.Symbol")!;
-        var valField = symbolType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .First(f => f.Name == "Val");
-        var iclField = symbolType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .First(f => f.Name == "Icl");
-
-        var symbolsBuf = new byte[nSymbols * 8];
-        var lengthsBuf = new byte[nSymbols];
-        for (int i = 0; i < nSymbols; i++)
-        {
-            var sym = symbolsArr.GetValue(i)!; // boxes the Symbol struct
-            ulong val = (ulong)valField.GetValue(sym)!;
-            ulong icl = (ulong)iclField.GetValue(sym)!;
-            int len = (int)((icl >> 28) & 0xF);
-            BinaryPrimitives.WriteUInt64LittleEndian(symbolsBuf.AsSpan(i * 8, 8), val);
-            lengthsBuf[i] = (byte)len;
-        }
-        return (symbolsBuf, lengthsBuf);
+        int n = table.SymbolCount;
+        var symbols = new byte[n * 8];
+        var lengths = new byte[n];
+        table.ExportRaw(lengths, symbols);
+        return (symbols, lengths);
     }
 
     /// <summary>

@@ -14,7 +14,7 @@
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="22.1.0" />
     <PackageReference Include="Clast.FastLanes" Version="0.1.1" />
-    <PackageReference Include="Clast.Fsst" Version="0.1.2" />
+    <PackageReference Include="Clast.Fsst" Version="0.1.3" />
     <PackageReference Include="Clast.Pcodec" Version="0.1.1" />
     <PackageReference Include="PolySharp" Version="1.15.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
