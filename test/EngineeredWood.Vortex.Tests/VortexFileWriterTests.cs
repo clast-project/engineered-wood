@@ -5527,4 +5527,171 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    [Fact]
+    public async Task Pco_DoublesRoundtrip()
+    {
+        // Bounded-magnitude doubles where pco's per-chunk mode-search
+        // (Classic / IntMult / FloatMult / FloatQuant) should comfortably beat
+        // raw f64 storage. Roundtrip must reconstruct every value bit-exactly
+        // — pco is lossless.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var rng = new Random(2026);
+        var expected = new double[n];
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            expected[i] = 100.0 + rng.NextDouble() * 50.0;
+            b.Append(expected[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var pcoPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(pcoPath))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long pcoSize = new FileInfo(pcoPath).Length;
+            Assert.True(pcoSize < rawSize,
+                $"pco should compress vs raw f64. raw={rawSize}, pco={pcoSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(pcoPath);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(pcoPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Pco_NullableInt64Roundtrips()
+    {
+        // Nullable int64 — pco compresses only the valid values; the
+        // validity bitmap rides as a separate child. Sprinkled nulls
+        // exercise the dense-buffer compaction path.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 2_048;
+        var b = new Int64Array.Builder();
+        var expected = new long?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) { b.AppendNull(); expected[i] = null; }
+            else { long v = (long)i * 1_000_000L - 500L; b.Append(v); expected[i] = v; }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Pco_Int32MultiChunkRoundtrips()
+    {
+        // > 1 << 18 = 262144 rows → forces multi-chunk encoding so the
+        // PcoMetadata serialization with multiple PcoChunkInfo entries gets
+        // exercised. Each chunk produces its own meta + page buffer pair;
+        // the decoder reassembles by walking the chunks vector.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 300_000;
+        var b = new Int32Array.Builder();
+        var rng = new Random(123);
+        var expected = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            expected[i] = rng.Next(int.MinValue / 2, int.MaxValue / 2);
+            b.Append(expected[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Pco_FloatRoundtrips()
+    {
+        // f32 mirror of the f64 test — covers PcoWrappedEncoder<float>.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", FloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var rng = new Random(7);
+        var expected = new float[n];
+        var b = new FloatArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            expected[i] = 50.0f + (float)rng.NextDouble() * 25.0f;
+            b.Append(expected[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }

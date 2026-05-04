@@ -14,7 +14,7 @@ internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
-    ushort FsstString, ushort AlpRd, ushort VarBinView);
+    ushort FsstString, ushort AlpRd, ushort VarBinView, ushort Pco);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -45,7 +45,8 @@ internal static class ArrayEncoderDispatch
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
         int? statsTicket = null, bool compress = false,
         ArrayStatsValues stats = default,
-        bool preferVarBinView = false)
+        bool preferVarBinView = false,
+        bool preferPco = false)
     {
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
@@ -53,6 +54,12 @@ internal static class ArrayEncoderDispatch
             return DictArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && FsstArrayEncoder.IsApplicable(array))
             return FsstArrayEncoder.Emit(sb, array, idx, statsTicket);
+        // Pco supersedes the float/integer compressing chain when the user
+        // opts in. Keep it after constant/dict/fsst (those are strictly
+        // better for their niches) but before ALP/RLE/FoR/bitpacked so a
+        // numeric column with preferPco=true reliably lands on pco.
+        if (compress && preferPco && PcoArrayEncoder.IsApplicable(array))
+            return PcoArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && AlpArrayEncoder.IsApplicable(array))
             return AlpArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && AlpRdArrayEncoder.IsApplicable(array))

@@ -1138,6 +1138,83 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenPcoDoubleFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Doubles compressed via vortex.pco. Pco is opt-in via preferPco=true,
+        // so only triggers when the user explicitly requests it. Bounded
+        // magnitudes ensure pco's mode-search picks a profitable mode.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new DoubleArray.Builder();
+        var rng = new Random(2026);
+        for (int i = 0; i < n; i++) b.Append(100.0 + rng.NextDouble() * 50.0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenPcoNullableInt64File()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Nullable i64 — vortex.pco with a validity child. Exercises the
+        // dense-buffer compaction path on the writer side and the
+        // sparse-splice path on the reader side.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 2_048;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) b.AppendNull();
+            else b.Append((long)i * 1_000_000L - 500L);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();

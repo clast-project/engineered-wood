@@ -57,6 +57,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort FsstStringEncodingIdx = 16;
     private const ushort AlpRdEncodingIdx = 17;
     private const ushort VarBinViewEncodingIdx = 18;
+    private const ushort PcoEncodingIdx = 19;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -76,7 +77,8 @@ public sealed class VortexFileWriter : IDisposable
         Sparse: SparseEncodingIdx,
         FsstString: FsstStringEncodingIdx,
         AlpRd: AlpRdEncodingIdx,
-        VarBinView: VarBinViewEncodingIdx);
+        VarBinView: VarBinViewEncodingIdx,
+        Pco: PcoEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -97,6 +99,7 @@ public sealed class VortexFileWriter : IDisposable
     private readonly bool _compress;
     private readonly bool _preferVarBinView;
     private readonly bool _preserveStats;
+    private readonly bool _preferPco;
     private bool _closed;
 
     /// <summary>
@@ -201,14 +204,24 @@ public sealed class VortexFileWriter : IDisposable
     /// readers skip whole zones without decoding them. Falls back to the
     /// non-zoned chunked layout when batch row counts aren't uniform (vortex
     /// requires all zones except the last to share <c>zone_len</c>).</param>
+    /// <param name="preferPco">When true, route eligible numeric columns
+    /// (i16/u16/i32/u32/i64/u64/f32/f64) through <c>vortex.pco</c> instead
+    /// of the format-specific compressing chain (ALP / ALP-RD / RLE / FoR /
+    /// bitpacked). Pco's per-chunk mode-search (Classic / IntMult / FloatMult /
+    /// FloatQuant) tends to beat the specific encoders on noisy real-world
+    /// numeric data; trades slower decode for typically tighter output.
+    /// Constant, dict, and FSST still take precedence — those strictly
+    /// subsume pco for their niches. Has no effect when
+    /// <paramref name="compress"/> is <c>false</c>.</param>
     public VortexFileWriter(
         Stream stream, Apache.Arrow.Schema schema,
         bool compress = false, bool preferVarBinView = false,
-        bool preserveStats = false)
+        bool preserveStats = false, bool preferPco = false)
     {
         _compress = compress;
         _preferVarBinView = preferVarBinView;
         _preserveStats = preserveStats;
+        _preferPco = preferPco;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
@@ -252,7 +265,8 @@ public sealed class VortexFileWriter : IDisposable
             int? statsTicket = ArrayStatsEmitter.Emit(sb.Builder, statsValues);
 
             int rootTicket = ArrayEncoderDispatch.Emit(
-                sb, col, Indices, statsTicket, _compress, statsValues, _preferVarBinView);
+                sb, col, Indices, statsTicket, _compress, statsValues,
+                _preferVarBinView, _preferPco);
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
@@ -903,6 +917,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.FsstString,
                 VortexArrayEncodings.AlpRD,
                 VortexArrayEncodings.VarBinView,
+                VortexArrayEncodings.Pco,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats },
             segmentSpecs: _sw.SegmentSpecs);
@@ -936,11 +951,11 @@ public sealed class VortexFileWriter : IDisposable
     public static void Write(
         Stream stream, RecordBatch batch,
         bool compress = false, bool preferVarBinView = false,
-        bool preserveStats = false)
+        bool preserveStats = false, bool preferPco = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
         using var writer = new VortexFileWriter(
-            stream, batch.Schema, compress, preferVarBinView, preserveStats);
+            stream, batch.Schema, compress, preferVarBinView, preserveStats, preferPco);
         writer.WriteBatch(batch);
         writer.Close();
     }
