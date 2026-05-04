@@ -783,6 +783,46 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenAlpRdFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Doubles where ALP can't find a profitable (e, f) — bounded
+        // magnitudes around three pivots. ALP rejects, ALP-RD applies.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new DoubleArray.Builder();
+        var rng = new Random(2026);
+        for (int i = 0; i < n; i++)
+        {
+            double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+            b.Append(pivot + rng.NextDouble() * 0.4);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenAlpFile()
     {
         var validator = FindValidator();

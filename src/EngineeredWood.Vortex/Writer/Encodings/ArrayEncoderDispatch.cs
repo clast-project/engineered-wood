@@ -14,7 +14,7 @@ internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
-    ushort FsstString);
+    ushort FsstString, ushort AlpRd);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -54,6 +54,8 @@ internal static class ArrayEncoderDispatch
             return FsstArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && AlpArrayEncoder.IsApplicable(array))
             return AlpArrayEncoder.Emit(sb, array, idx, statsTicket);
+        if (compress && AlpRdArrayEncoder.IsApplicable(array))
+            return AlpRdArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && RleArrayEncoder.IsApplicable(array))
             return RleArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && SparseArrayEncoder.IsApplicable(array))

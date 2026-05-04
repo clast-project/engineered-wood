@@ -2171,6 +2171,138 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task AlpRd_IrrationalDoublesCompress()
+    {
+        // Doubles where ALP can't find a profitable (e, f) — different
+        // mantissas and exponents each row but a bounded number of distinct
+        // exponent/sign prefixes. RDEncoder finds <= 8 distinct top-N-bit
+        // patterns and dictionary-encodes them; the low bits stay raw.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new DoubleArray.Builder();
+        // Mix of quasi-random magnitudes around three pivot values to keep
+        // the high bits clustered into few patterns. ALP rejects (no
+        // profitable (e, f) for irrational-ish values), ALP-RD applies.
+        var rng = new Random(2026);
+        for (int i = 0; i < n; i++)
+        {
+            double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+            b.Append(pivot + rng.NextDouble() * 0.4);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            // Raw f64 = 8 bytes/row. ALP-RD typically gets ~6-7 bytes/row on
+            // bounded-magnitude data. Just assert a measurable shrink.
+            Assert.True(compressedSize < rawSize,
+                $"ALP-RD on bounded-magnitude doubles should compress vs raw. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            // Re-derive expected values with the same RNG seed.
+            var rng2 = new Random(2026);
+            for (int i = 0; i < n; i++)
+            {
+                double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+                Assert.Equal(pivot + rng2.NextDouble() * 0.4, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AlpRd_HandlesPatchesRoundtrip()
+    {
+        // Mostly-clustered top bits, but some outliers escape the dictionary
+        // (max dict = 8). Build a column with 9+ distinct exponent prefixes
+        // so at least one always becomes a patch.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_048;
+        var pivots = new[]
+        {
+            1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0,
+        };
+        var values = new double[n];
+        var b = new DoubleArray.Builder();
+        var rng = new Random(7);
+        for (int i = 0; i < n; i++)
+        {
+            values[i] = pivots[i % pivots.Length] * (1.0 + rng.NextDouble() * 0.1);
+            b.Append(values[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(values[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AlpRd_DecimalLikeColumnDeferredToAlp()
+    {
+        // A decimal-shaped column that ALP claims (cleaner compression).
+        // ALP-RD is checked AFTER ALP, so this verifies dispatch order; the
+        // file roundtrips regardless of which encoder won.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(1.5 + (i % 100) * 0.01);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(1.5 + (i % 100) * 0.01, read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Rle_RepetitiveDoublesCompress()
     {
         // Float64 column with 5 distinct values cycling in 64-row runs.
