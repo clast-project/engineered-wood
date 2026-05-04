@@ -116,6 +116,107 @@ internal static class LayoutSerializer
     }
 
     /// <summary>
+    /// Like <see cref="SerializeStructChunked"/> but additionally wraps each
+    /// column in a <c>vortex.stats</c> layout carrying a per-zone stats
+    /// table. The stats layout has 2 children: the chunked data layout, and
+    /// a vortex.flat layout pointing to a segment with the zones array.
+    /// Metadata is <c>[u32 zone_len LE, bitset]</c>; for phase A the bitset
+    /// is <c>[0x40, 0x00]</c> — only Stat::NullCount (= bit 6) is present.
+    /// </summary>
+    /// <param name="zoneLen">Logical row count of each zone (= row count of
+    /// the first non-final batch). The trailing batch may be shorter.</param>
+    /// <param name="numZones">Number of zones (= batch count).</param>
+    /// <param name="perColumnZonesSegmentIdx">One segment-spec index per
+    /// column pointing at the zones-table segment for that column.</param>
+    public static byte[] SerializeStructStatsChunked(
+        ushort structEncodingIdx,
+        ushort statsEncodingIdx,
+        ushort chunkedEncodingIdx,
+        ushort flatEncodingIdx,
+        ulong totalRows,
+        int zoneLen,
+        int numZones,
+        IReadOnlyList<ulong> perBatchRowCount,
+        uint[][] perColumnSegmentIdx,
+        IReadOnlyList<uint> perColumnZonesSegmentIdx)
+    {
+        if (perColumnSegmentIdx.Length == 0)
+            throw new ArgumentException("perColumnSegmentIdx must be non-empty.", nameof(perColumnSegmentIdx));
+        if (perColumnZonesSegmentIdx.Count != perColumnSegmentIdx.Length)
+            throw new ArgumentException(
+                "perColumnZonesSegmentIdx must have one entry per column.",
+                nameof(perColumnZonesSegmentIdx));
+        int batchCount = perBatchRowCount.Count;
+
+        var b = new BackwardsFlatBufferBuilder();
+
+        // Phase A: only Stat::NullCount (= 6) is present. Bitset bytes layout
+        // matches upstream's `as_stat_bitset_bytes`: a packed 9-bit field
+        // covering all Stats, 2 bytes total. Bit 6 = 0x40 in byte 0.
+        var statsMetadata = new byte[6];
+        // u32 zone_len LE at bytes 0..3.
+        statsMetadata[0] = (byte)(zoneLen & 0xFF);
+        statsMetadata[1] = (byte)((zoneLen >> 8) & 0xFF);
+        statsMetadata[2] = (byte)((zoneLen >> 16) & 0xFF);
+        statsMetadata[3] = (byte)((zoneLen >> 24) & 0xFF);
+        statsMetadata[4] = 0x40; // NullCount
+        statsMetadata[5] = 0x00;
+        var statsMetadataTicket = b.WriteByteVector(statsMetadata);
+
+        var columnTickets = new int[perColumnSegmentIdx.Length];
+        for (int c = 0; c < perColumnSegmentIdx.Length; c++)
+        {
+            // Build the chunked data layout for this column.
+            var flatTickets = new int[batchCount];
+            for (int batch = 0; batch < batchCount; batch++)
+                flatTickets[batch] = EmitFlatLayout(
+                    b, flatEncodingIdx, perBatchRowCount[batch], perColumnSegmentIdx[c][batch]);
+            var dataChildrenTicket = b.WriteUOffsetVector(flatTickets);
+            var chunkedVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+            int dataLayoutTicket = b.StartTable(alignment: 8, inlineSize: 18)
+                .EmitU16(chunkedEncodingIdx)
+                .EmitU64(totalRows)
+                .EmitUOffset(dataChildrenTicket)
+                .EmitSOffsetTo(chunkedVt);
+
+            // Build the zones layout (vortex.flat with row_count = numZones).
+            int zonesLayoutTicket = EmitFlatLayout(
+                b, flatEncodingIdx, (ulong)numZones, perColumnZonesSegmentIdx[c]);
+
+            // Wrap in vortex.stats. Layout slots populated: 0=encoding (u16),
+            // 1=row_count (u64), 2=metadata (uoffset), 3=children (uoffset).
+            // Canonical FB inline body (low→high address):
+            //   offset 0..3:  soffset
+            //   offset 4..7:  metadata uoffset    (slot2)
+            //   offset 8..15: row_count u64       (slot1, 8-aligned)
+            //   offset 16..19: children uoffset   (slot3)
+            //   offset 20..21: encoding u16       (slot0)
+            //   inline_size = 22.
+            // vt: vt_size = 4 + 5*2 = 14 (header + slots 0..4), slot4=0 (absent).
+            var statsChildrenTicket = b.WriteUOffsetVector(new[] { dataLayoutTicket, zonesLayoutTicket });
+            var statsVt = b.WriteUInt16s(new ushort[] { 14, 22, 20, 8, 4, 16, 0 });
+            // Emit in high→low-offset order (BackwardsFlatBufferBuilder writes
+            // from the end of the inline body backwards):
+            columnTickets[c] = b.StartTable(alignment: 8, inlineSize: 22)
+                .EmitU16(statsEncodingIdx)             // offset 20..21
+                .EmitUOffset(statsChildrenTicket)      // offset 16..19
+                .EmitU64(totalRows)                    // offset 8..15
+                .EmitUOffset(statsMetadataTicket)      // offset 4..7
+                .EmitSOffsetTo(statsVt);               // offset 0..3
+        }
+
+        var rootChildrenTicket = b.WriteUOffsetVector(columnTickets);
+        var structVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+        var structTicket = b.StartTable(alignment: 8, inlineSize: 18)
+            .EmitU16(structEncodingIdx)
+            .EmitU64(totalRows)
+            .EmitUOffset(rootChildrenTicket)
+            .EmitSOffsetTo(structVt);
+
+        return b.Finish(structTicket);
+    }
+
+    /// <summary>
     /// Emits a vortex.flat Layout table (encoding, row_count, segments=[segIdx]).
     /// Returns the table ticket. Other slots (metadata, children) are absent.
     /// </summary>

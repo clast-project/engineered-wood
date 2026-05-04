@@ -864,6 +864,61 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenZonedStatsFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Multi-batch file with preserveStats: each column wrapped in
+        // vortex.stats(data, zones) carrying per-zone null_count. The
+        // Rust reader skips zones it doesn't need but validates the
+        // overall layout shape.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 200, 200, 200, 100 };
+
+        Int32Array BuildBatch(int startRow, int n)
+        {
+            var b = new Int32Array.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if ((startRow + i) % 7 == 0) b.AppendNull();
+                else b.Append(startRow + i);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(rows, sz) }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            int total = sizes.Sum();
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={total}", stdout);
+            Assert.Contains($"DONE total={total}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenVarBinViewFile()
     {
         var validator = FindValidator();

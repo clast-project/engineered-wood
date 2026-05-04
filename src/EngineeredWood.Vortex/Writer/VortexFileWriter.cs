@@ -82,15 +82,19 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort FlatLayoutIdx = 0;
     private const ushort StructLayoutIdx = 1;
     private const ushort ChunkedLayoutIdx = 2;
+    private const ushort StatsLayoutIdx = 3;
 
     private readonly Stream _stream;
     private readonly Apache.Arrow.Schema _schema;
     private readonly SegmentWriter _sw;
     /// <summary>One per column; each entry collects (segment_idx) per WriteBatch call.</summary>
     private readonly List<uint>[] _columnSegmentsByBatch;
+    /// <summary>One per column; per-batch null counts for the zoned-stats layout.</summary>
+    private readonly List<ulong>[] _columnNullCountsByBatch;
     private readonly List<ulong> _batchRowCounts = new();
     private readonly bool _compress;
     private readonly bool _preferVarBinView;
+    private readonly bool _preserveStats;
     private bool _closed;
 
     /// <summary>
@@ -107,18 +111,30 @@ public sealed class VortexFileWriter : IDisposable
     /// Useful for cross-tool interop with consumers that prefer Arrow's
     /// BinaryView shape; for short-string columns vortex.varbin is more
     /// compact (4 + len bytes/row vs varbinview's 16 + len bytes/row).</param>
+    /// <param name="preserveStats">When true, wrap each column in a
+    /// <c>vortex.stats</c> layout that carries a per-zone stats table
+    /// (currently just <c>null_count</c> per zone). Lets pruning-aware
+    /// readers skip whole zones without decoding them. Falls back to the
+    /// non-zoned chunked layout when batch row counts aren't uniform (vortex
+    /// requires all zones except the last to share <c>zone_len</c>).</param>
     public VortexFileWriter(
         Stream stream, Apache.Arrow.Schema schema,
-        bool compress = false, bool preferVarBinView = false)
+        bool compress = false, bool preferVarBinView = false,
+        bool preserveStats = false)
     {
         _compress = compress;
         _preferVarBinView = preferVarBinView;
+        _preserveStats = preserveStats;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
         _columnSegmentsByBatch = new List<uint>[schema.FieldsList.Count];
+        _columnNullCountsByBatch = new List<ulong>[schema.FieldsList.Count];
         for (int i = 0; i < _columnSegmentsByBatch.Length; i++)
+        {
             _columnSegmentsByBatch[i] = new List<uint>();
+            _columnNullCountsByBatch[i] = new List<ulong>();
+        }
 
         // Leading VTXF magic.
         var magicBytes = new byte[4];
@@ -153,8 +169,61 @@ public sealed class VortexFileWriter : IDisposable
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
+            // Capture this batch's null_count so we can build a per-zone stats
+            // table at Close. Apache.Arrow's typed array exposes NullCount via
+            // the underlying Data; using GetNullCount handles the lazy-count
+            // case for sliced columns even though we don't slice at the
+            // top-level here.
+            _columnNullCountsByBatch[i].Add((ulong)((Apache.Arrow.Array)col).Data.GetNullCount());
         }
         _batchRowCounts.Add(checked((ulong)batch.Length));
+    }
+
+    /// <summary>
+    /// Returns true iff the buffered batches form a valid zoned layout —
+    /// every non-final batch has the same row count and the final batch's
+    /// row count is &lt;= that. Vortex's zoned-layout spec requires zones
+    /// of identical length except for the trailing partial zone.
+    /// </summary>
+    private bool CanZoneBatches()
+    {
+        int n = _batchRowCounts.Count;
+        if (n == 0) return false;
+        if (n == 1) return true;
+        ulong first = _batchRowCounts[0];
+        for (int b = 1; b < n - 1; b++)
+            if (_batchRowCounts[b] != first) return false;
+        return _batchRowCounts[n - 1] <= first;
+    }
+
+    /// <summary>
+    /// Builds and appends the per-column zones segment carrying the per-zone
+    /// null_count table. The segment holds a <c>vortex.struct</c> ArrayNode
+    /// with a single <c>null_count</c> u64 child of length = batch count.
+    /// Returns the segment index.
+    /// </summary>
+    private uint EmitZonesSegment(int columnIdx)
+    {
+        var counts = _columnNullCountsByBatch[columnIdx];
+        int numZones = counts.Count;
+        var bytes = new byte[(long)numZones * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+        for (int i = 0; i < numZones; i++) span[i] = counts[i];
+        var nullCountArr = new Apache.Arrow.UInt64Array(
+            new Apache.Arrow.ArrowBuffer(bytes), Apache.Arrow.ArrowBuffer.Empty, numZones, 0, 0);
+
+        var sb = new SegmentBuilder();
+        // The zones table is a vortex.struct with one u64 child. We hand-emit
+        // both ArrayNodes here rather than going through StructArrayEncoder
+        // (which expects an Apache.Arrow.StructArray) — the wire shape is
+        // simple enough that hand-rolling is clearer than constructing an
+        // Apache.Arrow StructArray just to throw it away.
+        ushort u64BufIdx = sb.AddBuffer(bytes, alignmentExponent: 3);
+        int u64Ticket = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, u64BufIdx);
+        int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
+            sb.Builder, StructEncodingIdx, new[] { u64Ticket });
+        byte[] segBytes = sb.FinishSegment(structTicket);
+        return _sw.AppendSegment(segBytes, alignmentExponent: 0);
     }
 
     /// <summary>
@@ -173,19 +242,47 @@ public sealed class VortexFileWriter : IDisposable
         var dtypeBytes = DTypeSerializer.SerializeSchema(_schema);
         var dtypeBlock = _sw.AppendPostscriptBlock(dtypeBytes);
 
-        // 2. Layout. Single-batch → flat-per-column. Multi-batch → chunked-per-column.
+        // 2. Layout.
+        // Strategy:
+        //   - Single batch: vortex.struct(vortex.flat × N).
+        //   - Multi batch:  vortex.struct(vortex.chunked(vortex.flat × M) × N).
+        //   - With preserveStats AND zone-eligible batch sizes: each column is
+        //     additionally wrapped in vortex.stats(data, zones) so a
+        //     pruning-aware reader can skip whole zones via the zones table.
+        // preserveStats falls back to the non-zoned chunked layout when
+        // batch row counts aren't uniform (vortex requires all zones except
+        // the last to share zone_len).
+        bool zoned = _preserveStats && _columnSegmentsByBatch.Length > 0 && CanZoneBatches();
         byte[] layoutBytes;
-        if (_batchRowCounts.Count <= 1)
+        if (_batchRowCounts.Count == 0)
         {
-            // Even with zero batches, emit a struct-of-flat with 0-row flats.
+            throw new InvalidOperationException(
+                "Cannot finalize a Vortex file with zero batches written; write at least one batch first.");
+        }
+
+        if (zoned)
+        {
+            // Build per-column zones segment (one row per batch with the
+            // batch's null_count). Returns the segment index for each column.
+            var perColumnZonesSeg = new uint[_columnSegmentsByBatch.Length];
+            for (int c = 0; c < perColumnZonesSeg.Length; c++)
+                perColumnZonesSeg[c] = EmitZonesSegment(c);
+
+            int zoneLen = checked((int)_batchRowCounts[0]);
+            int numZones = _batchRowCounts.Count;
+            var perColumnSegByBatch = new uint[_columnSegmentsByBatch.Length][];
+            for (int i = 0; i < perColumnSegByBatch.Length; i++)
+                perColumnSegByBatch[i] = _columnSegmentsByBatch[i].ToArray();
+            layoutBytes = LayoutSerializer.SerializeStructStatsChunked(
+                StructLayoutIdx, StatsLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
+                totalRows, zoneLen, numZones,
+                _batchRowCounts, perColumnSegByBatch, perColumnZonesSeg);
+        }
+        else if (_batchRowCounts.Count == 1)
+        {
             var perColumnSeg = new uint[_columnSegmentsByBatch.Length];
             for (int i = 0; i < perColumnSeg.Length; i++)
-            {
-                if (_columnSegmentsByBatch[i].Count == 0)
-                    throw new InvalidOperationException(
-                        "Cannot finalize a Vortex file with zero batches written; write at least one batch first.");
                 perColumnSeg[i] = _columnSegmentsByBatch[i][0];
-            }
             layoutBytes = LayoutSerializer.SerializeStructFlat(
                 StructLayoutIdx, FlatLayoutIdx, totalRows, perColumnSeg);
         }
@@ -224,7 +321,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.AlpRD,
                 VortexArrayEncodings.VarBinView,
             },
-            layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked },
+            layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats },
             segmentSpecs: _sw.SegmentSpecs);
         var footerBlock = _sw.AppendPostscriptBlock(footerBytes);
 
@@ -255,10 +352,12 @@ public sealed class VortexFileWriter : IDisposable
     /// <summary>One-shot convenience: writes <paramref name="batch"/> as a single-batch file.</summary>
     public static void Write(
         Stream stream, RecordBatch batch,
-        bool compress = false, bool preferVarBinView = false)
+        bool compress = false, bool preferVarBinView = false,
+        bool preserveStats = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
-        using var writer = new VortexFileWriter(stream, batch.Schema, compress, preferVarBinView);
+        using var writer = new VortexFileWriter(
+            stream, batch.Schema, compress, preferVarBinView, preserveStats);
         writer.WriteBatch(batch);
         writer.Close();
     }

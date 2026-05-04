@@ -1135,6 +1135,148 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task PreserveStats_SingleBatchRoundtrips()
+    {
+        // Single-batch file with preserveStats: one zone covering all rows.
+        // Our reader's LayoutPlanner skips the zones child of vortex.stats,
+        // so this must round-trip identically to a non-zoned file.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var ids = new Int32Array.Builder();
+        var names = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            ids.Append(i);
+            if (i % 4 == 0) names.AppendNull();
+            else names.Append($"row-{i}");
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { ids.Build(), names.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preserveStats: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var idsRead = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            var namesRead = Assert.IsType<StringArray>(await reader.ReadColumnAsync(1));
+            Assert.Equal(n, idsRead.Length);
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(i, idsRead.GetValue(i));
+                if (i % 4 == 0) Assert.False(namesRead.IsValid(i));
+                else Assert.Equal($"row-{i}", namesRead.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task PreserveStats_MultipleUniformBatchesRoundtrip()
+    {
+        // Three batches of 200 rows each. zone_len = 200, three zones, each
+        // column's zones table has three null_count entries.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 200, 200, 200 };
+
+        Int32Array BuildBatch(int startRow, int n)
+        {
+            var b = new Int32Array.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if ((startRow + i) % 5 == 0) b.AppendNull();
+                else b.Append(startRow + i);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(rows, sz) }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            int total = sizes.Sum();
+            Assert.Equal(total, read.Length);
+            for (int i = 0; i < total; i++)
+            {
+                if (i % 5 == 0) Assert.False(read.IsValid(i));
+                else Assert.Equal(i, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task PreserveStats_NonUniformBatchesFallsBackToChunked()
+    {
+        // Batches of (300, 200, 100) rows — non-uniform → CanZoneBatches
+        // returns false → writer silently falls back to the existing
+        // chunked layout. Roundtrip is unchanged.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var sizes = new[] { 300, 200, 100 };
+        Int32Array BuildBatch(int startRow, int n)
+        {
+            var b = new Int32Array.Builder();
+            for (int i = 0; i < n; i++) b.Append(startRow + i);
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(rows, sz) }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            int total = sizes.Sum();
+            for (int i = 0; i < total; i++) Assert.Equal(i, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task ReadColumnAsync_ConcatenatesMultipleChunks()
     {
         // Three batches of different sizes. ReadColumnAsync should now read
