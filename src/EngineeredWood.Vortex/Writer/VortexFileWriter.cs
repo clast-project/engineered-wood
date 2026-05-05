@@ -187,6 +187,17 @@ public sealed class VortexFileWriter : IDisposable
         /// <c>ComputeIntOrdering</c> short-circuit on float types.
         /// </summary>
         FloatStandard,
+
+        /// <summary>
+        /// bitset = [0xD8, 0x00] — bits 3 (Max), 4 (Min), 6 (NullCount),
+        /// 7 (UncompressedSizeInBytes). Used for Utf8 / Binary columns
+        /// where lex-byte ordering provides meaningful min / max but
+        /// integer-style sortedness flags / sum aren't applicable.
+        /// zones struct = { max: T?, max_is_truncated: bool,
+        ///                  min: T?, min_is_truncated: bool,
+        ///                  null_count: u64, uncompressed_size_in_bytes: u64 }.
+        /// </summary>
+        StringFull,
     }
 
     /// <summary>
@@ -321,6 +332,8 @@ public sealed class VortexFileWriter : IDisposable
             => ZoneStatScheme.IntFull,
         Apache.Arrow.Types.FloatType or Apache.Arrow.Types.DoubleType
             => ZoneStatScheme.FloatStandard,
+        Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType
+            => ZoneStatScheme.StringFull,
         _ => ZoneStatScheme.NullCountOnly,
     };
 
@@ -337,6 +350,8 @@ public sealed class VortexFileWriter : IDisposable
         ZoneStatScheme.IntFull => new byte[] { 0xFF, 0x00 },
         // Bits 3..7 (Max, Min, Sum, NullCount, UncompressedSizeInBytes) = 0xF8, plus bit 8 (NaNCount) = 0x01.
         ZoneStatScheme.FloatStandard => new byte[] { 0xF8, 0x01 },
+        // Bits 3 (Max), 4 (Min), 6 (NullCount), 7 (UncompressedSizeInBytes) = 0xD8.
+        ZoneStatScheme.StringFull => new byte[] { 0xD8, 0x00 },
         _ => throw new NotSupportedException(),
     };
 
@@ -367,6 +382,7 @@ public sealed class VortexFileWriter : IDisposable
             ZoneStatScheme.NullCountOnly => new BatchStats { NullCount = nullCount },
             ZoneStatScheme.IntFull => ComputeIntStats(col, data, nullCount),
             ZoneStatScheme.FloatStandard => ComputeFloatStats(col, data, nullCount),
+            ZoneStatScheme.StringFull => ComputeStringStats(col, data, nullCount),
             _ => throw new NotSupportedException(),
         };
         return new BatchStats
@@ -603,6 +619,61 @@ public sealed class VortexFileWriter : IDisposable
         };
     }
 
+    /// <summary>
+    /// Single-pass compute of {Min, Max, NullCount} for a string / binary
+    /// column. Min and Max are the lex-byte min and max over non-null rows;
+    /// stored in <see cref="BatchStats.MinBytes"/> / <see cref="BatchStats.MaxBytes"/>
+    /// as their raw byte payload (UTF-8 for strings, opaque for binary).
+    /// Empty / all-null batches return null Min / Max — the zones-table
+    /// cells get their validity bit cleared.
+    /// </summary>
+    private static BatchStats ComputeStringStats(
+        Apache.Arrow.IArrowArray col, Apache.Arrow.ArrayData data, ulong nullCount)
+    {
+        int n = col.Length;
+        bool any = false;
+        byte[]? minBytes = null;
+        byte[]? maxBytes = null;
+        // StringArray and BinaryArray both expose GetBytes(int) returning
+        // ReadOnlySpan<byte>. Iterate via the typed interface so slicing
+        // (data.Offset != 0) is handled by Apache.Arrow.
+        for (int i = 0; i < n; i++)
+        {
+            ReadOnlySpan<byte> v;
+            switch (col)
+            {
+                case Apache.Arrow.StringArray s:
+                    if (!s.IsValid(i)) continue;
+                    v = s.GetBytes(i);
+                    break;
+                case Apache.Arrow.BinaryArray b:
+                    if (!b.IsValid(i)) continue;
+                    v = b.GetBytes(i);
+                    break;
+                default:
+                    return new BatchStats { NullCount = nullCount };
+            }
+
+            if (!any)
+            {
+                minBytes = v.ToArray();
+                maxBytes = (byte[])minBytes.Clone();
+                any = true;
+            }
+            else
+            {
+                if (v.SequenceCompareTo(minBytes!) < 0) minBytes = v.ToArray();
+                if (v.SequenceCompareTo(maxBytes!) > 0) maxBytes = v.ToArray();
+            }
+        }
+        return new BatchStats
+        {
+            NullCount = nullCount,
+            MinBytes = minBytes,
+            MaxBytes = maxBytes,
+        };
+    }
+
     private static void WriteIntLE(Span<byte> dest, long value, int byteWidth)
     {
         switch (byteWidth)
@@ -654,6 +725,7 @@ public sealed class VortexFileWriter : IDisposable
             ZoneStatScheme.NullCountOnly => EmitZonesSegmentNullCountOnly(stats),
             ZoneStatScheme.IntFull => EmitZonesSegmentIntFull(stats, columnIdx),
             ZoneStatScheme.FloatStandard => EmitZonesSegmentFloatStandard(stats, columnIdx),
+            ZoneStatScheme.StringFull => EmitZonesSegmentStringFull(stats, columnIdx),
             _ => throw new NotSupportedException(),
         };
     }
@@ -724,6 +796,86 @@ public sealed class VortexFileWriter : IDisposable
             new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket,
                     sumTicket, nullCountTicket, sizeTicket, nanCountTicket });
         return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
+    }
+
+    private uint EmitZonesSegmentStringFull(List<BatchStats> stats, int columnIdx)
+    {
+        bool isString = _schema.FieldsList[columnIdx].DataType is Apache.Arrow.Types.StringType;
+        var sb = new SegmentBuilder();
+
+        // Order (sorted by Stat enum, Min/Max followed by their truncation
+        // flags): max(3), max_is_truncated, min(4), min_is_truncated,
+        // null_count(6), uncompressed_size_in_bytes(7).
+        int maxTicket = EmitNullableVarBinColumn(sb, stats, s => s.MaxBytes, isString);
+        int maxTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        int minTicket = EmitNullableVarBinColumn(sb, stats, s => s.MinBytes, isString);
+        int minTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        int nullCountTicket = EmitNullCountChild(sb, stats);
+        int sizeTicket = EmitUncompressedSizeChild(sb, stats);
+
+        int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
+            sb.Builder, StructEncodingIdx,
+            new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket,
+                    nullCountTicket, sizeTicket });
+        return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
+    }
+
+    /// <summary>
+    /// Emits a nullable Utf8 / Binary child for the StringFull zones-table
+    /// scheme. Builds a synthetic <see cref="StringArray"/> /
+    /// <see cref="BinaryArray"/> from the per-batch byte arrays
+    /// (<see cref="BatchStats.MinBytes"/> / <see cref="BatchStats.MaxBytes"/>),
+    /// then routes through <see cref="VarBinArrayEncoder.Emit"/> so the
+    /// ArrayNode shape (offsets + values + validity) matches what the
+    /// reader expects.
+    /// </summary>
+    private int EmitNullableVarBinColumn(
+        SegmentBuilder sb, List<BatchStats> stats, Func<BatchStats, byte[]?> getter, bool isString)
+    {
+        int n = stats.Count;
+        int totalBytes = 0;
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var v = getter(stats[i]);
+            if (v is null) nullCount++;
+            else totalBytes += v.Length;
+        }
+
+        var offsetsBytes = new byte[(long)(n + 1) * 4];
+        var offsetsSpan = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(offsetsBytes.AsSpan());
+        var valuesBytes = totalBytes == 0 ? System.Array.Empty<byte>() : new byte[totalBytes];
+        var validityBytes = nullCount > 0 ? new byte[(n + 7) / 8] : System.Array.Empty<byte>();
+        int pos = 0;
+        for (int i = 0; i < n; i++)
+        {
+            offsetsSpan[i] = pos;
+            var v = getter(stats[i]);
+            if (v is not null)
+            {
+                if (v.Length > 0) Buffer.BlockCopy(v, 0, valuesBytes, pos, v.Length);
+                pos += v.Length;
+                if (validityBytes.Length > 0) validityBytes[i >> 3] |= (byte)(1 << (i & 7));
+            }
+        }
+        offsetsSpan[n] = pos;
+
+        IArrowArray arr;
+        var validityBuf = validityBytes.Length > 0 ? new ArrowBuffer(validityBytes) : ArrowBuffer.Empty;
+        if (isString)
+        {
+            arr = new StringArray(n,
+                new ArrowBuffer(offsetsBytes), new ArrowBuffer(valuesBytes),
+                validityBuf, nullCount, 0);
+        }
+        else
+        {
+            arr = new BinaryArray(Apache.Arrow.Types.BinaryType.Default, n,
+                new ArrowBuffer(offsetsBytes), new ArrowBuffer(valuesBytes),
+                validityBuf, nullCount, 0);
+        }
+        return VarBinArrayEncoder.Emit(
+            sb, arr, VarBinEncodingIdx, PrimitiveEncodingIdx, BoolEncodingIdx);
     }
 
     /// <summary>

@@ -6554,6 +6554,136 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task OurWriter_StringPredicatePrunesAcrossZones()
+    {
+        // Write 3 batches × 100 rows. Each batch's strings come from a
+        // disjoint lex-range so per-zone min/max are tight enough that a
+        // targeted predicate drops 2 of the 3 zones.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int rowsPerBatch = 100;
+        string[][] values =
+        {
+            // Zone 0: ax-a* (lex range ['ax-a000', 'ax-a099']).
+            BuildPattern("ax-a", rowsPerBatch),
+            // Zone 1: bx-a* (lex range ['bx-a000', 'bx-a099']).
+            BuildPattern("bx-a", rowsPerBatch),
+            // Zone 2: cx-a* (lex range ['cx-a000', 'cx-a099']).
+            BuildPattern("cx-a", rowsPerBatch),
+        };
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema, preserveStats: true);
+                foreach (var batch in values)
+                {
+                    var b = new StringArray.Builder();
+                    foreach (var s in batch) b.Append(s);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, batch.Length));
+                }
+                w.Close();
+            }
+
+            // Predicate Equal('bx-a050'): only zone 1's range covers it, so
+            // zones 0 + 2 should be dropped.
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.NotNull(stats);
+            Assert.IsType<StringArray>(stats!.Min);
+            Assert.IsType<StringArray>(stats.Max);
+            Assert.Equal(3, stats.ZoneCount);
+
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, "bx-a050"))) batches.Add(b);
+            try
+            {
+                var batch = Assert.Single(batches);
+                Assert.Equal(rowsPerBatch, batch.Length);
+                var col = Assert.IsType<StringArray>(batch.Column(0));
+                Assert.StartsWith("bx-a", col.GetString(0));
+            }
+            finally
+            {
+                foreach (var b in batches) b.Dispose();
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+
+        static string[] BuildPattern(string prefix, int n)
+        {
+            var arr = new string[n];
+            for (int i = 0; i < n; i++) arr[i] = $"{prefix}{i:D3}";
+            return arr;
+        }
+    }
+
+    [Fact]
+    public async Task OurWriter_BinaryPredicatePrunesAcrossZones()
+    {
+        // Mirror of the string test for BinaryArray. Each zone covers a
+        // disjoint byte-prefix range.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", BinaryType.Default, nullable: false),
+        }, metadata: null);
+        const int rowsPerBatch = 64;
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema, preserveStats: true);
+                for (byte zone = 0; zone < 3; zone++)
+                {
+                    var b = new BinaryArray.Builder();
+                    for (int i = 0; i < rowsPerBatch; i++)
+                    {
+                        // Each zone uses a distinct leading byte: 0x10 / 0x20 / 0x30.
+                        b.Append((ReadOnlySpan<byte>)new byte[] { (byte)(0x10 * (zone + 1)), (byte)i });
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, rowsPerBatch));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.NotNull(stats);
+            Assert.IsType<BinaryArray>(stats!.Min);
+            Assert.IsType<BinaryArray>(stats.Max);
+            Assert.Equal(3, stats.ZoneCount);
+
+            // Predicate Equal([0x20, 0x10]) — only zone 1 (leading byte 0x20).
+            var batches = new List<RecordBatch>();
+            var pat = new byte[] { 0x20, 0x10 };
+            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, pat))) batches.Add(b);
+            try
+            {
+                var batch = Assert.Single(batches);
+                var col = Assert.IsType<BinaryArray>(batch.Column(0));
+                Assert.Equal(0x20, col.GetBytes(0)[0]);
+            }
+            finally
+            {
+                foreach (var b in batches) b.Dispose();
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task BinaryFixture_ColumnRoundTrip()
     {
         // Sanity-check the read path itself before exercising predicates:

@@ -1558,6 +1558,45 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenStringStatsFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // String column with preserveStats=true exercises our StringFull
+        // zone-stats scheme: per-zone min/max emitted as nullable Utf8
+        // children of the zones-table struct. Validates that the bitset
+        // (0xD8) and child layout (max + max_is_truncated, min +
+        // min_is_truncated, null_count, uncompressed_size) match what
+        // vortex 0.70's reader expects.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.Append($"row-{i:D3}");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preserveStats: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();
