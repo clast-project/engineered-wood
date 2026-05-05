@@ -18,10 +18,12 @@ namespace EngineeredWood.Vortex.Encodings;
 /// data buffers come first, the views buffer comes last. So with N total
 /// buffers, indices 0..N-2 are data buffers and N-1 is views.</para>
 ///
-/// <para>Output: an Apache Arrow <see cref="StringArray"/> (i32 offsets +
-/// concatenated values). The view-format → contiguous-string conversion copies
-/// the data; a future optimization could produce a <c>StringViewArray</c> if
-/// Apache.Arrow grows one we can target.</para>
+/// <para>Output: an Apache Arrow <see cref="StringArray"/> (for
+/// <see cref="StringType"/>) or <see cref="BinaryArray"/> (for
+/// <see cref="BinaryType"/>) — the wire shape is identical, only the
+/// surfaced typed array differs. The view-format → contiguous-string
+/// conversion copies the data; a future optimization could produce a
+/// <c>StringViewArray</c> if Apache.Arrow grows one we can target.</para>
 /// </summary>
 internal static class VarBinViewArrayDecoder
 {
@@ -31,9 +33,9 @@ internal static class VarBinViewArrayDecoder
         IArrowType expectedType,
         long expectedRowCount)
     {
-        if (expectedType is not StringType)
+        if (expectedType is not StringType and not BinaryType)
             throw new NotSupportedException(
-                $"vortex.varbinview decoder currently only supports StringType, got {expectedType}.");
+                $"vortex.varbinview decoder currently only supports StringType / BinaryType, got {expectedType}.");
 
         var bufferCount = node.BufferRefCount;
         if (bufferCount < 1)
@@ -106,13 +108,11 @@ internal static class VarBinViewArrayDecoder
         }
         BinaryPrimitives.WriteInt32LittleEndian(offsetBytes.AsSpan(rowCount * 4), total);
 
-        return new StringArray(
-            rowCount,
-            new ArrowBuffer(offsetBytes),
-            new ArrowBuffer(values.ToArray()),
-            nullBuffer,
-            nullCount,
-            offset: 0);
+        var offsetsBuf = new ArrowBuffer(offsetBytes);
+        var valuesBuf = new ArrowBuffer(values.ToArray());
+        return expectedType is StringType
+            ? new StringArray(rowCount, offsetsBuf, valuesBuf, nullBuffer, nullCount, offset: 0)
+            : new BinaryArray(BinaryType.Default, rowCount, offsetsBuf, valuesBuf, nullBuffer, nullCount, offset: 0);
     }
 
     private static void Append(MemoryStream sink, ReadOnlySpan<byte> data)

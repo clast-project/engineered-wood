@@ -6554,6 +6554,134 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task BinaryFixture_ColumnRoundTrip()
+    {
+        // Sanity-check the read path itself before exercising predicates:
+        // open binary_col_64rows.vortex, decode column 0, verify each row's
+        // bytes match the deterministic Rust generator pattern.
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        Assert.IsType<BinaryType>(r.Schema.FieldsList[0].DataType);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync()) batches.Add(b);
+        try
+        {
+            var batch = Assert.Single(batches);
+            var col = Assert.IsType<BinaryArray>(batch.Column(0));
+            Assert.Equal(64, col.Length);
+            for (int i = 0; i < 64; i++)
+            {
+                var bytes = col.GetBytes(i);
+                Assert.Equal(8, bytes.Length);
+                Assert.Equal(0x10, bytes[0]);
+                Assert.Equal((byte)i, bytes[1]);
+                for (int k = 2; k < 8; k++) Assert.Equal(0, bytes[k]);
+            }
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task BinaryPredicate_OpensFixtureAndSeesStats()
+    {
+        // binary_col_64rows.vortex is a Rust-written single-column BinaryArray
+        // file with 64 rows of 8-byte payloads [0x10, i, 0, 0, 0, 0, 0, 0]
+        // (i = 0..63). Vortex's writer emits a vortex.stats wrapper, so the
+        // single zone carries lex-min = [0x10 0x00 ...] and lex-max =
+        // [0x10 0x3F ...]. This test sanity-checks GetZoneStatsAsync surfaces
+        // BinaryArray Min/Max — the actual predicate prune/keep logic is in
+        // the four BinaryPredicate_ tests below.
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        Assert.IsType<BinaryType>(r.Schema.FieldsList[0].DataType);
+        var stats = await r.GetZoneStatsAsync(0);
+        Assert.NotNull(stats);
+        Assert.IsType<BinaryArray>(stats!.Min);
+        Assert.IsType<BinaryArray>(stats.Max);
+    }
+
+    [Fact]
+    public async Task BinaryPredicate_EqualKeepsZoneInRange()
+    {
+        // [0x10 0x20 0…0] is lex-in [0x10 0x00 …, 0x10 0x3F …] so the zone is kept.
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var midValue = new byte[] { 0x10, 0x20, 0, 0, 0, 0, 0, 0 };
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, midValue))) batches.Add(b);
+        try
+        {
+            Assert.Single(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task BinaryPredicate_GreaterThanMaxPrunes()
+    {
+        // value > max ⇒ all zones drop. value = [0x11 0x00 …] which is
+        // lex-greater than max = [0x10 0x3F …].
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var pastMax = new byte[] { 0x11, 0, 0, 0, 0, 0, 0, 0 };
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Greater(0, pastMax))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task BinaryPredicate_LessThanMinPrunes()
+    {
+        // value < min ⇒ all zones drop. value = [0x0F 0xFF …] which is
+        // lex-less than min = [0x10 0x00 …].
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var beforeMin = new byte[] { 0x0F, 0xFF, 0, 0, 0, 0, 0, 0 };
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Less(0, beforeMin))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task BinaryPredicate_OutOfRangeEqualPrunes()
+    {
+        // Equal to a value past max ⇒ drops the zone (value > max).
+        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var unreachable = new byte[] { 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99 };
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, unreachable))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task StringPredicate_NotEqualKeepsRange()
     {
         // NotEqual is conservative: drops only when min == max == K. Here

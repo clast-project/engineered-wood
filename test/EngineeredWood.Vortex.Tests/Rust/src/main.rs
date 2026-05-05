@@ -106,6 +106,7 @@ async fn main() -> std::io::Result<()> {
     write_dict_string(&session, &out_dir.join("dict_string_64rows.vortex")).await?;
     write_fsst_string(&session, &out_dir.join("fsst_string_64rows.vortex")).await?;
     write_masked_int(&session, &out_dir.join("masked_int_1024rows.vortex")).await?;
+    write_binary_col(&session, &out_dir.join("binary_col_64rows.vortex")).await?;
 
     Ok(())
 }
@@ -1217,6 +1218,41 @@ async fn write_fsst_string(session: &VortexSession, path: &PathBuf) -> std::io::
         .await
         .expect("write");
 
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// 64-row binary column with deterministic byte payloads. Used to test
+/// the BytesComparisonPredicate's BinaryArray branch (the StringArray
+/// branch already has dict_string_64rows.vortex). Default writer settings
+/// → vortex's compressor picks vortex.varbinview (or similar) for storage
+/// AND emits vortex.stats with per-zone Min / Max for the column. The
+/// deterministic byte pattern lets the test predict the lex-min / lex-max
+/// without inspecting the file.
+async fn write_binary_col(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(64);
+    for i in 0..64u8 {
+        // Each row is 8 bytes: leading 0x10 + i + zeros — yields a stable
+        // lex-ordering [0x10 0x00 …, 0x10 0x01 …, …, 0x10 0x3F …].
+        rows.push(vec![0x10, i, 0, 0, 0, 0, 0, 0]);
+    }
+    let bins = VarBinViewArray::from_iter_bin(rows.iter().map(|r| r.as_slice())).into_array();
+    let data = StructArray::from_fields(&[("b", bins)])
+        .expect("from_fields")
+        .into_array();
+
+    // Default WriteOptions / no with_strategy — vortex's default TableStrategy
+    // wraps each column in vortex.stats so we get the per-zone Min / Max we
+    // need to test predicate pruning. (write_string_col uses a custom
+    // FlatLayoutStrategy explicitly to skip the stats wrapper, which we
+    // don't want here.)
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())
