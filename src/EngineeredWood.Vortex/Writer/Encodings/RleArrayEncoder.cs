@@ -29,11 +29,14 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// vtable as vortex.list / fastlanes.for / fastlanes.delta / vortex.dict
 /// (slots 0+1+2, with optional slot 4 for stats).</para>
 ///
-/// <para>Scope: non-nullable, sliced + non-sliced primitive numeric columns
-/// (Int8..Int64, UInt8..UInt64, Float32, Float64), length ≥ 1024. Indices are
-/// u8 when every chunk has ≤ 256 distinct values, u16 otherwise. Offsets are
-/// u64 for simplicity. Caller (dispatch) gates on a probe to ensure RLE
-/// actually compresses.</para>
+/// <para>Scope: nullable + non-nullable, sliced + non-sliced primitive
+/// numeric columns (Int8..Int64, UInt8..UInt64, Float32, Float64), length
+/// ≥ 1024. Indices are u8 when every chunk has ≤ 256 distinct values, u16
+/// otherwise. Offsets are u64 for simplicity. For nullable inputs the
+/// indices child carries the validity bitmap (matching upstream's
+/// <c>rle/vtable/validity.rs</c>: "RLE array's validity = its INDICES
+/// child's validity"). Null rows write index 0 — the reader skips lookups
+/// at null positions so the placeholder index never resolves.</para>
 /// </summary>
 internal static class RleArrayEncoder
 {
@@ -56,7 +59,6 @@ internal static class RleArrayEncoder
         if (array is null) return false;
         if (array is not FloatArray and not DoubleArray) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.GetNullCount() > 0) return false;
         int n = array.Length;
         if (n < ElementsPerChunk) return false;
         if (ElementSize(array) is not int elemSize) return false;
@@ -89,8 +91,6 @@ internal static class RleArrayEncoder
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.GetNullCount() > 0)
-            throw new NotSupportedException("fastlanes.rle writer doesn't yet support nullable inputs.");
         if (ElementSize(array) is not int elemSize)
             throw new NotSupportedException(
                 $"fastlanes.rle writer doesn't support Arrow {array.GetType().Name}.");
@@ -162,10 +162,14 @@ internal static class RleArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
         int off = data.Offset;
+        bool hasNulls = data.GetNullCount() > 0;
+        var validityBitmap = hasNulls ? data.Buffers[0].Span : default;
 
         // Phase 1: discover per-chunk unique-value lists. We need to know the
         // total values_len before allocating, AND the max per-chunk distinct
-        // count to pick u8 vs u16 for the indices.
+        // count to pick u8 vs u16 for the indices. Null rows are excluded
+        // from the dict — the index there is always 0 (placeholder; the
+        // reader skips lookups at null rows via the indices' validity bitmap).
         var perChunkDicts = new Dictionary<long, int>[numChunks];
         var perChunkValueKeys = new List<long>[numChunks];
         int totalValues = 0;
@@ -176,9 +180,11 @@ internal static class RleArrayEncoder
             int rowsInChunk = Math.Min(ElementsPerChunk, n - c * ElementsPerChunk);
             var dict = new Dictionary<long, int>();
             var keys = new List<long>();
-            // Real rows.
             for (int i = 0; i < rowsInChunk; i++)
             {
+                int absRow = off + c * ElementsPerChunk + i;
+                if (hasNulls && (validityBitmap[absRow >> 3] & (1 << (absRow & 7))) == 0)
+                    continue;
                 long key = ReadLongKey(src, chunkStart + i * elemSize, elemSize);
                 if (!dict.ContainsKey(key))
                 {
@@ -186,15 +192,14 @@ internal static class RleArrayEncoder
                     keys.Add(key);
                 }
             }
-            // Padding rows in the last chunk: the indices buffer covers a full
-            // 1024-row chunk, so reserve index 0 = padding-value (zero bytes).
-            // The decoder won't read past `expectedRowCount`, so the padded
-            // index slots are unobserved; we still need some valid index
-            // value to pack into the buffer.
-            if (rowsInChunk < ElementsPerChunk && keys.Count == 0)
+            // Two cases need a placeholder:
+            //   1. Trailing partial chunk's padding rows still get an index
+            //      value packed into the buffer (the decoder won't read them
+            //      but the bytes must be in-range for any future tooling).
+            //   2. All-null chunk: dict is empty, but every row's index slot
+            //      still needs a valid in-range value. Insert 0.
+            if ((rowsInChunk < ElementsPerChunk || keys.Count == 0) && keys.Count == 0)
             {
-                // Empty chunk shouldn't actually happen for our num-chunks math
-                // but be defensive: insert 0 as the placeholder.
                 dict[0] = 0;
                 keys.Add(0);
             }
@@ -213,6 +218,21 @@ internal static class RleArrayEncoder
         var valuesBytes = new byte[(long)totalValues * elemSize];
         var indicesBytes = new byte[(long)numChunks * ElementsPerChunk * indicesElemSize];
         var offsetsBytes = new byte[numChunks * 8]; // u64 each
+        // Indices validity bitmap: covers the FULL numChunks × 1024 buffer.
+        // Initialised all-bits-set so non-nullable inputs need no further
+        // work; for nullable inputs we clear bits at null positions below.
+        // Padding rows in the trailing partial chunk are also marked valid —
+        // the decoder bounds the visible window to the column's row count
+        // so those bits are unobservable.
+        var indicesValidityBytes = hasNulls
+            ? new byte[((long)numChunks * ElementsPerChunk + 7) >> 3]
+            : System.Array.Empty<byte>();
+        if (hasNulls)
+        {
+            // Mark all bits set; we'll clear nulls in Phase 4.
+            for (int i = 0; i < indicesValidityBytes.Length; i++) indicesValidityBytes[i] = 0xFF;
+        }
+        int indicesNullCount = 0;
 
         // Phase 4: fill them. For each chunk:
         //  - copy the chunk's unique-value bytes into the values buffer.
@@ -238,19 +258,34 @@ internal static class RleArrayEncoder
             int chunkIndicesStart = c * ElementsPerChunk * indicesElemSize;
             for (int i = 0; i < rowsInChunk; i++)
             {
+                int absRow = off + c * ElementsPerChunk + i;
+                if (hasNulls && (validityBitmap[absRow >> 3] & (1 << (absRow & 7))) == 0)
+                {
+                    // Null row: write placeholder index 0; clear validity bit
+                    // at logical position c*1024+i so the reader skips lookup.
+                    int logical = c * ElementsPerChunk + i;
+                    indicesValidityBytes[logical >> 3] &= (byte)~(1 << (logical & 7));
+                    indicesNullCount++;
+                    continue;
+                }
                 long key = ReadLongKey(src, chunkStart + i * elemSize, elemSize);
                 int localIdx = dict[key];
                 WriteIndex(indicesBytes.AsSpan(chunkIndicesStart + i * indicesElemSize, indicesElemSize),
                     localIdx, indicesAreU8);
             }
-            // Padding: any rows after rowsInChunk get index 0 (already zero in fresh array).
+            // Padding rows in the trailing partial chunk keep validity = 1
+            // (the placeholder set above) and index = 0 (default zero in
+            // freshly allocated buffer); the reader's row-count limit hides them.
         }
 
         // Build Arrow arrays for the children.
         IArrowArray valuesArray = BuildPrimitiveArray(array, valuesBytes, totalValues);
+        var indicesValidityBuf = hasNulls
+            ? new ArrowBuffer(indicesValidityBytes)
+            : ArrowBuffer.Empty;
         IArrowArray indicesArray = indicesAreU8
-            ? new UInt8Array(new ArrowBuffer(indicesBytes), ArrowBuffer.Empty, indicesBytes.Length, 0, 0)
-            : new UInt16Array(new ArrowBuffer(indicesBytes), ArrowBuffer.Empty, indicesBytes.Length / 2, 0, 0);
+            ? new UInt8Array(new ArrowBuffer(indicesBytes), indicesValidityBuf, indicesBytes.Length, indicesNullCount, 0)
+            : new UInt16Array(new ArrowBuffer(indicesBytes), indicesValidityBuf, indicesBytes.Length / 2, indicesNullCount, 0);
         IArrowArray offsetsArray = new UInt64Array(
             new ArrowBuffer(offsetsBytes), ArrowBuffer.Empty, numChunks, 0, 0);
 

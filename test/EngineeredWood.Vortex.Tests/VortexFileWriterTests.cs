@@ -6684,6 +6684,54 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task NullableRle_FloatsRoundtrip()
+    {
+        // Repetitive doubles with sprinkled nulls — fastlanes.rle is the
+        // only compressing path for floats today, so the gate should pick
+        // it up. Validity rides on the indices child; null rows write
+        // index 0 + cleared validity bit.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 4096;
+        var palette = new[] { 1.5, 2.71828, -3.14, 100.0, 0.0001 };
+        var b = new DoubleArray.Builder();
+        var expected = new double?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                var v = palette[(i / 64) % palette.Length];
+                b.Append(v);
+                expected[i] = v;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task PublicReadColumnAsync_ReadsSingleColumn()
     {
         // ReadColumnAsync was internal until chunk 9.61 — this test pins the
