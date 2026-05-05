@@ -316,11 +316,20 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Reads and decodes one top-level column from the file as a single
-    /// Apache Arrow array. For multi-chunk columns each chunk is read in
-    /// order and the results are concatenated via
+    /// Apache Arrow array, materialising every chunk that backs the
+    /// column. For multi-chunk columns each chunk is read in order and
+    /// the results are concatenated via
     /// <see cref="Apache.Arrow.ArrowArrayConcatenator"/>.
+    ///
+    /// <para>Use this when you only need one column from a multi-column
+    /// file — it avoids the per-batch cost of decoding every column on
+    /// each chunk that <see cref="ReadAllAsync(System.Threading.CancellationToken)"/>
+    /// pays. For column projection across multiple columns / chunked
+    /// streaming, use the
+    /// <see cref="ReadAllAsync(System.Collections.Generic.IReadOnlyList{int}, System.Threading.CancellationToken)"/>
+    /// projection overload instead.</para>
     /// </summary>
-    internal async Task<Apache.Arrow.IArrowArray> ReadColumnAsync(
+    public async Task<Apache.Arrow.IArrowArray> ReadColumnAsync(
         int fieldIndex, CancellationToken cancellationToken = default)
     {
         if ((uint)fieldIndex >= (uint)_columnPlans.Length)
@@ -347,7 +356,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         CancellationToken cancellationToken = default)
-        => ReadAllAsync(acceptedZones: null, cancellationToken);
+        => ReadAllCoreAsync(acceptedZones: null, columnIndices: null, cancellationToken);
 
     /// <summary>
     /// Streams the file as Arrow <see cref="RecordBatch"/>es, pruned by
@@ -366,12 +375,8 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (predicate is null) throw new ArgumentNullException(nameof(predicate));
-        if (_columnPlans.Length == 0) yield break;
-
-        int totalZones = _columnPlans[0].ChunkCount;
-        var accepted = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
-            .ConfigureAwait(false);
-        await foreach (var batch in ReadAllAsync(accepted, cancellationToken).ConfigureAwait(false))
+        await foreach (var batch in ReadAllWithPredicateAsync(
+            predicate, columnIndices: null, cancellationToken).ConfigureAwait(false))
             yield return batch;
     }
 
@@ -387,9 +392,100 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// <paramref name="acceptedZones"/> still filters the chunk index but
     /// the caller has no per-zone stats to drive the decision.</para>
     /// </summary>
-    public async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+    public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         ISet<int>? acceptedZones,
+        CancellationToken cancellationToken = default)
+        => ReadAllCoreAsync(acceptedZones, columnIndices: null, cancellationToken);
+
+    /// <summary>
+    /// Streams a column-projected view of the file: each emitted
+    /// <see cref="RecordBatch"/> contains only the columns whose indices
+    /// appear in <paramref name="columnIndices"/>, in the order given.
+    /// Skipped columns are never decoded — useful when the caller only
+    /// needs a few columns from a wide file.
+    /// </summary>
+    public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        IReadOnlyList<int> columnIndices,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateColumnIndices(columnIndices);
+        return ReadAllCoreAsync(acceptedZones: null, columnIndices, cancellationToken);
+    }
+
+    /// <summary>
+    /// Streams a column-projected view of the file, pruned by
+    /// <paramref name="predicate"/>. The predicate evaluates against the
+    /// underlying zone stats — its referenced columns don't need to be in
+    /// <paramref name="columnIndices"/>.
+    /// </summary>
+    public async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        IReadOnlyList<int> columnIndices,
+        Predicate predicate,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        ValidateColumnIndices(columnIndices);
+        await foreach (var batch in ReadAllWithPredicateAsync(
+            predicate, columnIndices, cancellationToken).ConfigureAwait(false))
+            yield return batch;
+    }
+
+    /// <summary>
+    /// Streams a column-projected view of the file, optionally filtered by
+    /// zone. <paramref name="acceptedZones"/> follows the same convention
+    /// as <see cref="ReadAllAsync(ISet{int}?, CancellationToken)"/>:
+    /// non-null limits the chunk indices decoded.
+    /// </summary>
+    public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        IReadOnlyList<int> columnIndices,
+        ISet<int>? acceptedZones,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateColumnIndices(columnIndices);
+        return ReadAllCoreAsync(acceptedZones, columnIndices, cancellationToken);
+    }
+
+    private void ValidateColumnIndices(IReadOnlyList<int> columnIndices)
+    {
+        if (columnIndices is null) throw new ArgumentNullException(nameof(columnIndices));
+        if (columnIndices.Count == 0)
+            throw new ArgumentException(
+                "Column projection list is empty; specify at least one column index.",
+                nameof(columnIndices));
+        for (int i = 0; i < columnIndices.Count; i++)
+        {
+            int idx = columnIndices[i];
+            if ((uint)idx >= (uint)_columnPlans.Length)
+                throw new ArgumentOutOfRangeException(nameof(columnIndices),
+                    $"columnIndices[{i}] = {idx} is outside [0, {_columnPlans.Length}).");
+        }
+    }
+
+    private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllWithPredicateAsync(
+        Predicate predicate, IReadOnlyList<int>? columnIndices,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (_columnPlans.Length == 0) yield break;
+        int totalZones = _columnPlans[0].ChunkCount;
+        var accepted = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
+            .ConfigureAwait(false);
+        await foreach (var batch in ReadAllCoreAsync(accepted, columnIndices, cancellationToken)
+            .ConfigureAwait(false))
+            yield return batch;
+    }
+
+    /// <summary>
+    /// Shared chunk-streaming loop. <paramref name="columnIndices"/>
+    /// defaults (null) to "all columns in schema order"; otherwise only the
+    /// listed columns are decoded and the emitted batch's schema is
+    /// projected to that subset. <paramref name="acceptedZones"/> defaults
+    /// (null) to "all chunks"; otherwise only chunks whose index is in the
+    /// set are emitted.
+    /// </summary>
+    private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllCoreAsync(
+        ISet<int>? acceptedZones,
+        IReadOnlyList<int>? columnIndices,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (_columnPlans.Length == 0)
             yield break;
@@ -403,23 +499,47 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
                     "Per-column chunking with mismatched chunk counts is not yet supported.");
         }
 
+        // Pre-compute the projected schema once. ValidateColumnIndices
+        // ensures the list is non-empty, so colsToRead >= 1 — the
+        // first-column rowCount fallback is always reachable.
+        var (projectedSchema, projectedIndices) = columnIndices is null
+            ? (Schema, null)
+            : ProjectSchema(columnIndices);
+
+        int colsToRead = projectedIndices?.Length ?? _columnPlans.Length;
+
         for (int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++)
         {
             if (acceptedZones is not null && !acceptedZones.Contains(chunkIdx)) continue;
-            var arrays = new Apache.Arrow.IArrowArray[_columnPlans.Length];
+            var arrays = new Apache.Arrow.IArrowArray[colsToRead];
             int rowCount = -1;
-            for (int colIdx = 0; colIdx < arrays.Length; colIdx++)
+            for (int outIdx = 0; outIdx < colsToRead; outIdx++)
             {
-                arrays[colIdx] = await ReadPlanChunkAsync(_columnPlans[colIdx], chunkIdx, cancellationToken)
+                int srcIdx = projectedIndices is null ? outIdx : projectedIndices[outIdx];
+                arrays[outIdx] = await ReadPlanChunkAsync(_columnPlans[srcIdx], chunkIdx, cancellationToken)
                     .ConfigureAwait(false);
-                var len = arrays[colIdx].Length;
+                var len = arrays[outIdx].Length;
                 if (rowCount < 0) rowCount = len;
                 else if (len != rowCount)
                     throw new VortexFormatException(
-                        $"Chunk {chunkIdx}: column 0 has {rowCount} rows but column {colIdx} has {len}.");
+                        $"Chunk {chunkIdx}: first read column has {rowCount} rows but column index {srcIdx} has {len}.");
             }
-            yield return new Apache.Arrow.RecordBatch(Schema, arrays, rowCount);
+            yield return new Apache.Arrow.RecordBatch(projectedSchema, arrays, rowCount);
         }
+    }
+
+    private (Apache.Arrow.Schema, int[]) ProjectSchema(IReadOnlyList<int> columnIndices)
+    {
+        var projectedFields = new Apache.Arrow.Field[columnIndices.Count];
+        var indices = new int[columnIndices.Count];
+        for (int i = 0; i < columnIndices.Count; i++)
+        {
+            int srcIdx = columnIndices[i];
+            projectedFields[i] = Schema.FieldsList[srcIdx];
+            indices[i] = srcIdx;
+        }
+        var projectedSchema = new Apache.Arrow.Schema(projectedFields, metadata: null);
+        return (projectedSchema, indices);
     }
 
     private async Task<Apache.Arrow.IArrowArray> ReadPlanChunkAsync(

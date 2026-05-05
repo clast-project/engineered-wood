@@ -6684,6 +6684,141 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task PublicReadColumnAsync_ReadsSingleColumn()
+    {
+        // ReadColumnAsync was internal until chunk 9.61 — this test pins the
+        // promoted public surface. Use multi_col_4rows.vortex (i32, i64, i32)
+        // and verify reading just column 1 (i64) yields the expected values.
+        var path = TestData.TestDataPath.Resolve("multi_col_4rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var col = await r.ReadColumnAsync(1);
+        var i64 = Assert.IsType<Int64Array>(col);
+        Assert.Equal(4, i64.Length);
+        for (int i = 0; i < 4; i++) Assert.Equal(42L, i64.GetValue(i)!.Value);
+    }
+
+    [Fact]
+    public async Task PublicReadColumnAsync_OutOfRangeThrows()
+    {
+        var path = TestData.TestDataPath.Resolve("multi_col_4rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            async () => await r.ReadColumnAsync(99));
+    }
+
+    [Fact]
+    public async Task ReadAllAsync_ProjectsColumns()
+    {
+        // multi_col_4rows.vortex schema: a (i32), b (i64), c (i32). Project
+        // [c, a] — verify the emitted batch has exactly those two columns
+        // in the requested order, with the rest skipped.
+        var path = TestData.TestDataPath.Resolve("multi_col_4rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        Assert.Equal(3, r.Schema.FieldsList.Count);
+
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(new[] { 2, 0 })) batches.Add(b);
+        try
+        {
+            var batch = Assert.Single(batches);
+            Assert.Equal(2, batch.ColumnCount);
+            // Schema is projected to the subset, in order.
+            Assert.Equal(r.Schema.FieldsList[2].Name, batch.Schema.FieldsList[0].Name);
+            Assert.Equal(r.Schema.FieldsList[0].Name, batch.Schema.FieldsList[1].Name);
+            // Both columns are i32 in this fixture — sanity-check types
+            // through the projected order.
+            Assert.IsType<Int32Array>(batch.Column(0));
+            Assert.IsType<Int32Array>(batch.Column(1));
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ReadAllAsync_ProjectionRejectsEmptyList()
+    {
+        var path = TestData.TestDataPath.Resolve("multi_col_4rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+        {
+            await foreach (var _ in r.ReadAllAsync(System.Array.Empty<int>())) { }
+        });
+    }
+
+    [Fact]
+    public async Task ReadAllAsync_ProjectionRejectsBadIndex()
+    {
+        var path = TestData.TestDataPath.Resolve("multi_col_4rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+        {
+            await foreach (var _ in r.ReadAllAsync(new[] { 0, 99 })) { }
+        });
+    }
+
+    [Fact]
+    public async Task ReadAllAsync_ProjectionWithPredicate()
+    {
+        // Combine projection + predicate. Build a 3-batch file with one
+        // string column "key" + one int column "value", then project just
+        // "value" while pruning by key. Each batch's "key" range is disjoint;
+        // the predicate hits exactly one zone.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: false),
+        }, metadata: null);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema, preserveStats: true);
+                for (int z = 0; z < 3; z++)
+                {
+                    var keys = new StringArray.Builder();
+                    var vals = new Int32Array.Builder();
+                    for (int i = 0; i < 50; i++)
+                    {
+                        keys.Append($"zone{z}-row{i:D3}");
+                        vals.Append(z * 1000 + i);
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { keys.Build(), vals.Build() }, 50));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            // Project "value" only (col index 1); predicate matches zone 1.
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(
+                new[] { 1 }, Predicate.Equal(0, "zone1-row025")))
+                batches.Add(b);
+            try
+            {
+                var batch = Assert.Single(batches);
+                Assert.Equal(1, batch.ColumnCount);
+                Assert.Equal("value", batch.Schema.FieldsList[0].Name);
+                var ints = Assert.IsType<Int32Array>(batch.Column(0));
+                Assert.Equal(50, ints.Length);
+                // Zone 1's first row → value = 1*1000 + 0 = 1000.
+                Assert.Equal(1000, ints.GetValue(0)!.Value);
+            }
+            finally
+            {
+                foreach (var b in batches) b.Dispose();
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task BinaryFixture_ColumnRoundTrip()
     {
         // Sanity-check the read path itself before exercising predicates:
