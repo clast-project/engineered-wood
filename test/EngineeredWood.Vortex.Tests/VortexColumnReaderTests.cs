@@ -1044,6 +1044,39 @@ public class VortexColumnReaderTests
     }
 
     [Fact]
+    public async Task ReadsMaskedColumn()
+    {
+        // masked_int_1024rows.vortex: vortex.masked wrapping a non-null u32
+        // child [0..1024) with an explicit validity bitmap. Decoder must
+        // overlay the bitmap onto the inner array's ArrayData (swapping
+        // Buffers[0] for the new mask) and re-wrap as a typed UInt32Array.
+        await using var reader = await VortexFileReader.OpenAsync(
+            TestDataPath.Resolve("masked_int_1024rows.vortex"));
+
+        var array = await reader.ReadColumnAsync(0);
+        var u32 = Assert.IsType<UInt32Array>(array);
+        Assert.Equal(1024, u32.Length);
+
+        // Validity pattern from the Rust generator: i % 5 != 0.
+        int expectedNullCount = 0;
+        for (int i = 0; i < 1024; i++)
+        {
+            bool valid = (i % 5) != 0;
+            if (!valid)
+            {
+                expectedNullCount++;
+                Assert.False(u32.IsValid(i));
+            }
+            else
+            {
+                Assert.True(u32.IsValid(i));
+                Assert.Equal((uint)i, u32.GetValue(i));
+            }
+        }
+        Assert.Equal(expectedNullCount, u32.NullCount);
+    }
+
+    [Fact]
     public async Task ReadAllAsync_YieldsSingleBatchForUnchunkedFile()
     {
         var expected = new[] { 42, -987_654_321, 2_147_483_647, -1, 12_345, -2_147_483_648 };

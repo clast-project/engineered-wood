@@ -105,6 +105,7 @@ async fn main() -> std::io::Result<()> {
     write_dict_int(&session, &out_dir.join("dict_int_64rows.vortex")).await?;
     write_dict_string(&session, &out_dir.join("dict_string_64rows.vortex")).await?;
     write_fsst_string(&session, &out_dir.join("fsst_string_64rows.vortex")).await?;
+    write_masked_int(&session, &out_dir.join("masked_int_1024rows.vortex")).await?;
 
     Ok(())
 }
@@ -1297,6 +1298,64 @@ async fn write_nullable_int(session: &VortexSession, path: &PathBuf) -> std::io:
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())
+}
+
+/// 1024-row u32 column wrapped in `vortex.masked`: a non-null primitive
+/// child with an explicit per-row validity bitmap as a sibling. Used to
+/// validate the `MaskedArrayDecoder`'s buffer-swap rebuild path. The child
+/// is constructed AS NON-NULL (every row valid in the underlying buffer) and
+/// the masked array overlays the bitmap on top — exactly the shape upstream
+/// emits when its compressor picks vortex.masked over an inline-validity
+/// alternative.
+async fn write_masked(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_array::arrays::masked::MaskedArray;
+
+    // Non-null child: monotone u32 values [0, 1, ..., 1023]. Picked so the
+    // reader can verify each row's value, since they're trivially recoverable
+    // from the row index.
+    let child_vals: Vec<u32> = (0..1024u32).collect();
+    let child = PrimitiveArray::from_iter(child_vals).into_array();
+
+    // Validity: every 5th row null (i % 5 == 0). 1024 / 5 ≈ 205 nulls. Mix
+    // makes the bitmap non-trivial without dominating either branch.
+    let validity = Validity::from_iter((0..1024).map(|i| i % 5 != 0));
+
+    let masked = MaskedArray::try_new(child, validity)
+        .expect("MaskedArray::try_new")
+        .into_array();
+    let data = StructArray::from_fields(&[("v", masked)])
+        .expect("from_fields")
+        .into_array();
+
+    // Whitelist primitive + bool + masked so the writer preserves the
+    // hand-constructed MaskedArray instead of canonicalising it back to
+    // vortex.primitive with inline validity.
+    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
+        vortex_utils::aliases::hash_set::HashSet::default();
+    allowed.insert(Id::new("vortex.primitive"));
+    allowed.insert(Id::new("vortex.bool"));
+    allowed.insert(Id::new("vortex.masked"));
+    let strategy = std::sync::Arc::new(TableStrategy::new(
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
+        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+    ));
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Convenience entry-point: thin wrapper to match the `write_*_int` naming
+/// pattern used elsewhere; the masked writer itself is dtype-agnostic.
+async fn write_masked_int(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    write_masked(session, path).await
 }
 
 /// All-equal i32 column. Vortex's compressor should pick `vortex.constant`

@@ -89,6 +89,8 @@ internal static class ArrayDecoder
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.ListView => ListViewArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
+            VortexArrayEncodings.Masked => MaskedArrayDecoder.Decode(
+                node, serialized, arraySpecs, expectedType, expectedRowCount),
             _ => throw new NotSupportedException(
                 $"Vortex array encoding '{encId}' is not yet implemented. " +
                 "Add a decoder and a fixture that exercises it."),
