@@ -1558,6 +1558,52 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenNullableAlpRdFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Nullable f64 ALP-RD column. Validates that the writer's null
+        // handling on left_parts (validity bitmap rebased to offset 0) and
+        // patch-skip-at-null behaviour produce a wire shape vortex 0.70
+        // accepts.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 4096;
+        var rng = new Random(2026);
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 11 == 0) b.AppendNull();
+            else
+            {
+                double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+                b.Append(pivot + rng.NextDouble() * 0.4);
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenStringStatsFile()
     {
         var validator = FindValidator();

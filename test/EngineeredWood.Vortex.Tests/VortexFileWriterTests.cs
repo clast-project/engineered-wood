@@ -6684,6 +6684,104 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task NullableAlpRd_DoublesRoundtrip()
+    {
+        // Bounded-magnitude nullable doubles: ALP-RD's IsApplicable cleared
+        // the nullable reject in chunk 9.62. Min row count ≥ 1024 (ALP-RD's
+        // chunk-padding gate). Validity rides on left_parts; reader pulls
+        // it through ExtractValidity.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 4096;
+        var rng = new Random(2026);
+        var b = new DoubleArray.Builder();
+        var expected = new double?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 11 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+                double v = pivot + rng.NextDouble() * 0.4;
+                b.Append(v);
+                expected[i] = v;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task NullableAlpRd_FloatsWithPatchesRoundtrip()
+    {
+        // f32 with > MaxDictSize=8 distinct top patterns → guaranteed
+        // patches, plus nulls. Verifies patches are NOT generated at null
+        // rows (writer skips them) and the reader's null-bitmap masks the
+        // (zero-coded) null rows correctly.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", FloatType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 2048;
+        var pivots = new[] { 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f };
+        var b = new FloatArray.Builder();
+        var expected = new float?[n];
+        var rng = new Random(13);
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 9 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                float v = pivots[i % pivots.Length] * (1.0f + (float)(rng.NextDouble() * 0.1));
+                b.Append(v);
+                expected[i] = v;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task NullableRle_FloatsRoundtrip()
     {
         // Repetitive doubles with sprinkled nulls — fastlanes.rle is the

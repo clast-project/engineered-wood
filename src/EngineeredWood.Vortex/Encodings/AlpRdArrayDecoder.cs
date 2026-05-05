@@ -84,34 +84,53 @@ internal static class AlpRdArrayDecoder
         if (patchIndices is not null && patchValues is not null)
             ApplyPatches(resolvedLeft, patchIndices, patchValues, (int)meta.PatchesOffset);
 
+        // Validity rides on the left_parts inner child (the writer's
+        // convention; right_parts stays non-nullable). Read raw underlying
+        // values with no GetValue() — null positions may have garbage
+        // right_parts and resolved-left bits, but the output's null
+        // bitmap masks them out.
+        var (nullBuffer, nullCount) = ExtractValidity(leftParts);
+
         // Combine left << shift | right → float bit pattern.
         var shift = meta.RightBitWidth;
         if (isF32)
         {
             var bytes = new byte[(long)rowCount * sizeof(float)];
             var floats = MemoryMarshal.Cast<byte, float>(bytes.AsSpan());
-            var rightArr = (UInt32Array)rightParts;
+            var rightSrc = MemoryMarshal.Cast<byte, uint>(
+                ((Apache.Arrow.Array)rightParts).Data.Buffers[1].Span);
+            int rightOff = ((Apache.Arrow.Array)rightParts).Data.Offset;
             for (int i = 0; i < rowCount; i++)
             {
                 uint leftBits = (uint)resolvedLeft[i];
-                uint combined = (leftBits << shift) | rightArr.GetValue(i)!.Value;
+                uint combined = (leftBits << shift) | rightSrc[rightOff + i];
                 floats[i] = Int32BitsToSingle(unchecked((int)combined));
             }
-            return new FloatArray(new ArrowBuffer(bytes), ArrowBuffer.Empty, rowCount, 0, 0);
+            return new FloatArray(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
         }
         else
         {
             var bytes = new byte[(long)rowCount * sizeof(double)];
             var doubles = MemoryMarshal.Cast<byte, double>(bytes.AsSpan());
-            var rightArr = (UInt64Array)rightParts;
+            var rightSrc = MemoryMarshal.Cast<byte, ulong>(
+                ((Apache.Arrow.Array)rightParts).Data.Buffers[1].Span);
+            int rightOff = ((Apache.Arrow.Array)rightParts).Data.Offset;
             for (int i = 0; i < rowCount; i++)
             {
                 ulong leftBits = resolvedLeft[i];
-                ulong combined = (leftBits << shift) | rightArr.GetValue(i)!.Value;
+                ulong combined = (leftBits << shift) | rightSrc[rightOff + i];
                 doubles[i] = BitConverter.Int64BitsToDouble(unchecked((long)combined));
             }
-            return new DoubleArray(new ArrowBuffer(bytes), ArrowBuffer.Empty, rowCount, 0, 0);
+            return new DoubleArray(new ArrowBuffer(bytes), nullBuffer, rowCount, nullCount, 0);
         }
+    }
+
+    private static (ArrowBuffer NullBuffer, int NullCount) ExtractValidity(IArrowArray array)
+    {
+        var data = (array as Apache.Arrow.Array)?.Data;
+        if (data is null || data.NullCount == 0 || data.Buffers.Length == 0)
+            return (ArrowBuffer.Empty, 0);
+        return (data.Buffers[0], data.NullCount);
     }
 
     /// <summary>
@@ -122,16 +141,39 @@ internal static class AlpRdArrayDecoder
     private static ulong[] ResolveLeftBits(IArrowArray leftParts, ushort[] dict, int rowCount)
     {
         var result = new ulong[rowCount];
+        // Read raw bytes rather than typed GetValue(i) so null rows don't
+        // throw — the column-level null bitmap masks them in the final
+        // output. Null-row index bytes can be anything but we still need
+        // a valid in-range dict lookup; the writer ensures null rows
+        // always store code 0, which is in range whenever the dict has
+        // any entry (by the encoder's invariant).
+        var data = ((Apache.Arrow.Array)leftParts).Data;
+        var src = data.Buffers[1].Span;
+        int off = data.Offset;
         switch (leftParts)
         {
-            case UInt8Array u8:
-                for (int i = 0; i < rowCount; i++) result[i] = dict[u8.GetValue(i)!.Value];
+            case UInt8Array:
+                for (int i = 0; i < rowCount; i++)
+                {
+                    int code = src[off + i];
+                    result[i] = code < dict.Length ? (ulong)dict[code] : 0UL;
+                }
                 break;
-            case UInt16Array u16:
-                for (int i = 0; i < rowCount; i++) result[i] = dict[u16.GetValue(i)!.Value];
+            case UInt16Array:
+                for (int i = 0; i < rowCount; i++)
+                {
+                    int code = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(
+                        src.Slice((off + i) * 2, 2));
+                    result[i] = code < dict.Length ? (ulong)dict[code] : 0UL;
+                }
                 break;
-            case UInt32Array u32:
-                for (int i = 0; i < rowCount; i++) result[i] = dict[checked((int)u32.GetValue(i)!.Value)];
+            case UInt32Array:
+                for (int i = 0; i < rowCount; i++)
+                {
+                    uint code = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                        src.Slice((off + i) * 4, 4));
+                    result[i] = code < (uint)dict.Length ? (ulong)dict[(int)code] : 0UL;
+                }
                 break;
             default:
                 throw new NotSupportedException(

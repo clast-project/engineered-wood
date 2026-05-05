@@ -29,10 +29,13 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// patch_values) with patches. Metadata
 /// <c>ALPRDMetadata { right_bit_width, dict_len, dict[u32 packed], left_parts_ptype, patches? }</c>.</para>
 ///
-/// <para>Scope: f32 + f64. right_parts is u32 for FloatArray, u64 for
-/// DoubleArray; the dictionary stores u16 left patterns either way (CUT_LIMIT
-/// caps the left part width at 16 bits regardless of float type). Non-nullable,
-/// non-sliced inputs only.</para>
+/// <para>Scope: f32 + f64; nullable + non-nullable; sliced + non-sliced.
+/// right_parts is u32 for FloatArray, u64 for DoubleArray; the dictionary
+/// stores u16 left patterns either way (CUT_LIMIT caps the left part
+/// width at 16 bits regardless of float type). For nullable inputs the
+/// validity bitmap rides on the <c>left_parts</c> inner child; null rows
+/// write zero into both left/right (any bits work since validity masks
+/// them) and contribute no patches.</para>
 ///
 /// <para>See "ALP: Adaptive Lossless floating-Point Compression" (Afroozeh &amp;
 /// Boncz, VLDB 2024), Section 3.4 (RD variant), and the upstream Rust
@@ -43,27 +46,83 @@ internal static class AlpRdArrayEncoder
     private const int MaxDictSize = 8;
     private const int CutLimit = 16;
 
+    /// <summary>
+    /// Compacts the non-null values from a sliced f32 column into a
+    /// fresh array of length <paramref name="validCount"/>. Used by the
+    /// dict-probe step so null-row garbage bits don't pollute the
+    /// histogram of left bit patterns.
+    /// </summary>
+    private static float[] BuildDenseFloats(
+        ReadOnlySpan<float> src, ReadOnlySpan<byte> validityBitmap, int srcOffset, int n, int validCount)
+    {
+        var dense = new float[validCount];
+        int j = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int abs = srcOffset + i;
+            if ((validityBitmap[abs >> 3] & (1 << (abs & 7))) != 0)
+                dense[j++] = src[i];
+        }
+        return dense;
+    }
+
+    /// <summary>f64 sibling of <see cref="BuildDenseFloats"/>.</summary>
+    private static double[] BuildDenseDoubles(
+        ReadOnlySpan<double> src, ReadOnlySpan<byte> validityBitmap, int srcOffset, int n, int validCount)
+    {
+        var dense = new double[validCount];
+        int j = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int abs = srcOffset + i;
+            if ((validityBitmap[abs >> 3] & (1 << (abs & 7))) != 0)
+                dense[j++] = src[i];
+        }
+        return dense;
+    }
+
     public static bool IsApplicable(IArrowArray array)
     {
         if (array is not (FloatArray or DoubleArray)) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.GetNullCount() > 0) return false; // phase 1: non-null
         int n = array.Length;
         int off = data.Offset;
         // Need enough rows to amortize FastLanes' 1024-element chunk padding
         // (which forces left/right payloads up to a multiple of 128 × W bytes).
         if (n < 1024) return false;
+        // All-null columns produce no useful dict; degrade to the next
+        // encoder rather than emit a degenerate ALP-RD.
+        if ((int)data.GetNullCount() >= n) return false;
 
         // Train and probe profitability against the ACTUAL padded byte cost.
         // ALP-RD's intrinsic ratio is ~85% of raw for ideal data
         // (e.g. 49 bits / 64 for f64), so a bits-per-value × 1.5 gate (used
         // elsewhere) can't ever fire. Instead, model the bitpacked children's
         // padded byte size and accept whenever ALP-RD beats 90% of raw.
+        // For nullable inputs we feed a dense-valid-values buffer to the
+        // dict probe so null-row garbage bits don't skew the histogram —
+        // the chunk-padded cost still uses the full row count n.
         bool isF32 = array is FloatArray;
         int floatBytes = isF32 ? 4 : 8;
-        var (rightBw, dict, exceptionCount) = isF32
-            ? FindBestDictionaryF32(MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4)))
-            : FindBestDictionary(MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8)));
+        bool hasNulls = data.GetNullCount() > 0;
+        int validCount = n - (int)data.GetNullCount();
+        int rightBw;
+        ushort[] dict;
+        int exceptionCount;
+        if (isF32)
+        {
+            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
+            (rightBw, dict, exceptionCount) = hasNulls
+                ? FindBestDictionaryF32(BuildDenseFloats(src, data.Buffers[0].Span, off, n, validCount))
+                : FindBestDictionaryF32(src);
+        }
+        else
+        {
+            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
+            (rightBw, dict, exceptionCount) = hasNulls
+                ? FindBestDictionary(BuildDenseDoubles(src, data.Buffers[0].Span, off, n, validCount))
+                : FindBestDictionary(src);
+        }
         if (rightBw == 0) return false;
 
         int leftBw = BitWidth(dict.Length == 0 ? 0 : dict.Length - 1);
@@ -86,24 +145,30 @@ internal static class AlpRdArrayEncoder
             throw new NotSupportedException(
                 $"vortex.alprd writer requires FloatArray or DoubleArray, got {array.GetType().Name}.");
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.GetNullCount() > 0)
-            throw new NotSupportedException("vortex.alprd writer doesn't yet support nullable inputs.");
 
         bool isF32 = array is FloatArray;
         int n = array.Length;
         int off = data.Offset;
+        int nullCount = (int)data.GetNullCount();
+        bool hasNulls = nullCount > 0;
+        var validityBitmap = hasNulls ? data.Buffers[0].Span : default;
+        int validCount = n - nullCount;
 
         int rightBw;
         ushort[] dict;
         if (isF32)
         {
             var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
-            (rightBw, dict, _) = FindBestDictionaryF32(src);
+            (rightBw, dict, _) = hasNulls
+                ? FindBestDictionaryF32(BuildDenseFloats(src, validityBitmap, off, n, validCount))
+                : FindBestDictionaryF32(src);
         }
         else
         {
             var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
-            (rightBw, dict, _) = FindBestDictionary(src);
+            (rightBw, dict, _) = hasNulls
+                ? FindBestDictionary(BuildDenseDoubles(src, validityBitmap, off, n, validCount))
+                : FindBestDictionary(src);
         }
         if (rightBw == 0)
             throw new InvalidOperationException(
@@ -131,6 +196,14 @@ internal static class AlpRdArrayEncoder
             var rightPartsSpan = MemoryMarshal.Cast<byte, uint>(rightPartsBytes.AsSpan());
             for (int i = 0; i < n; i++)
             {
+                if (hasNulls && (validityBitmap[(off + i) >> 3] & (1 << ((off + i) & 7))) == 0)
+                {
+                    // Null row: write zero into both children (the validity
+                    // bitmap on left_parts masks them); skip patch generation.
+                    rightPartsSpan[i] = 0;
+                    leftCodesSpan[i] = 0;
+                    continue;
+                }
                 uint bits = unchecked((uint)SingleToInt32Bits(src[i]));
                 uint right = bits & rightMask;
                 ushort left = (ushort)(bits >> rightBw);
@@ -146,6 +219,12 @@ internal static class AlpRdArrayEncoder
             var rightPartsSpan = MemoryMarshal.Cast<byte, ulong>(rightPartsBytes.AsSpan());
             for (int i = 0; i < n; i++)
             {
+                if (hasNulls && (validityBitmap[(off + i) >> 3] & (1 << ((off + i) & 7))) == 0)
+                {
+                    rightPartsSpan[i] = 0;
+                    leftCodesSpan[i] = 0;
+                    continue;
+                }
                 ulong bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(src[i]));
                 ulong right = bits & rightMask;
                 ushort left = (ushort)(bits >> rightBw);
@@ -156,9 +235,21 @@ internal static class AlpRdArrayEncoder
         }
 
         // Children: left_parts and right_parts go through the dispatcher with
-        // compress=true so they pick up bitpacked at left_bw / right_bw.
+        // compress=true so they pick up bitpacked at left_bw / right_bw. The
+        // column's validity bitmap rides on left_parts (rebased to offset 0
+        // to match the densely-packed encoded values); the reader extracts
+        // it from there. right_parts stays non-nullable — both children
+        // share validity semantically but only one needs to carry the
+        // bitmap on the wire.
+        ArrowBuffer leftValidityBuf = ArrowBuffer.Empty;
+        if (hasNulls)
+        {
+            var bitmap = EncoderHelpers.ExtractValidityBitmap(
+                validityBitmap, srcBitOffset: off, rowCount: n);
+            leftValidityBuf = new ArrowBuffer(bitmap);
+        }
         var leftPartsArr = new UInt16Array(
-            new ArrowBuffer(leftCodesBytes), ArrowBuffer.Empty, n, 0, 0);
+            new ArrowBuffer(leftCodesBytes), leftValidityBuf, n, nullCount, 0);
         IArrowArray rightPartsArr = isF32
             ? new UInt32Array(new ArrowBuffer(rightPartsBytes), ArrowBuffer.Empty, n, 0, 0)
             : new UInt64Array(new ArrowBuffer(rightPartsBytes), ArrowBuffer.Empty, n, 0, 0);
