@@ -1293,14 +1293,16 @@ public sealed class VortexFileWriter : IDisposable
         //     pruning-aware reader can skip whole zones via the zones table.
         //   - With preferDictLayout: each StringType column is wrapped in
         //     vortex.dict(values=flat, codes=chunked-of-flat × M); other
-        //     columns keep the chunked-flat default. Stats co-existence on
-        //     dict columns is deferred (zoned path skips dict columns'
-        //     stats wrapper).
+        //     columns keep the chunked-flat default.
+        //   - With preferDictLayout AND preserveStats AND zone-eligible
+        //     batch sizes: each column's data layout (dict OR chunked) is
+        //     additionally wrapped in vortex.stats(data, zones-flat) for
+        //     predicate pruning.
         // preserveStats falls back to the non-zoned chunked layout when
         // batch row counts aren't uniform (vortex requires all zones except
         // the last to share zone_len).
         bool hasDictColumns = dictLayoutInfo is not null;
-        bool zoned = _preserveStats && _columnSegmentsByBatch.Length > 0 && CanZoneBatches() && !hasDictColumns;
+        bool zoned = _preserveStats && _columnSegmentsByBatch.Length > 0 && CanZoneBatches();
         byte[] layoutBytes;
         if (_batchRowCounts.Count == 0)
         {
@@ -1313,9 +1315,30 @@ public sealed class VortexFileWriter : IDisposable
             var perColumnSegByBatch = new uint[_columnSegmentsByBatch.Length][];
             for (int i = 0; i < perColumnSegByBatch.Length; i++)
                 perColumnSegByBatch[i] = _columnSegmentsByBatch[i].ToArray();
-            layoutBytes = LayoutSerializer.SerializeStructDictMixed(
-                StructLayoutIdx, DictLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
-                totalRows, _batchRowCounts, perColumnSegByBatch, dictLayoutInfo!);
+            if (zoned)
+            {
+                var perColumnZonesSeg = new uint[_columnSegmentsByBatch.Length];
+                for (int c = 0; c < perColumnZonesSeg.Length; c++)
+                    perColumnZonesSeg[c] = EmitZonesSegment(c);
+
+                int zoneLen = checked((int)_batchRowCounts[0]);
+                int numZones = _batchRowCounts.Count;
+                var perColumnBitset = new byte[_columnSegmentsByBatch.Length][];
+                for (int i = 0; i < perColumnBitset.Length; i++)
+                    perColumnBitset[i] = BitsetForScheme(_columnStatScheme[i]);
+
+                layoutBytes = LayoutSerializer.SerializeStructDictMixedStats(
+                    StructLayoutIdx, StatsLayoutIdx, DictLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
+                    totalRows, zoneLen, numZones,
+                    _batchRowCounts, perColumnSegByBatch, dictLayoutInfo!,
+                    perColumnZonesSeg, perColumnBitset);
+            }
+            else
+            {
+                layoutBytes = LayoutSerializer.SerializeStructDictMixed(
+                    StructLayoutIdx, DictLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
+                    totalRows, _batchRowCounts, perColumnSegByBatch, dictLayoutInfo!);
+            }
         }
         else if (zoned)
         {

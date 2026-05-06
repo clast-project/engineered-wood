@@ -98,8 +98,13 @@ public class VortexFileReaderTests
     [Fact]
     public async Task RejectsMissingLeadingMagic()
     {
+#if NETCOREAPP2_0_OR_GREATER
         var bytes = await File.ReadAllBytesAsync(
             TestDataPath.Resolve("struct_int_3rows.vortex"));
+#else
+        var bytes = File.ReadAllBytes(TestDataPath.Resolve("struct_int_3rows.vortex"));
+        await Task.CompletedTask;
+#endif
         bytes[0] = (byte)'X';
 
         using var stream = new ByteArrayRandomAccessFile(bytes);

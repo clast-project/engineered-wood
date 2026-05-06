@@ -356,7 +356,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         CancellationToken cancellationToken = default)
-        => ReadAllCoreAsync(acceptedZones: null, columnIndices: null, cancellationToken);
+        => ReadAllCoreAsync(acceptedZones: null, columnIndices: null, rowOffset: 0, rowCount: long.MaxValue, cancellationToken);
 
     /// <summary>
     /// Streams the file as Arrow <see cref="RecordBatch"/>es, pruned by
@@ -395,7 +395,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         ISet<int>? acceptedZones,
         CancellationToken cancellationToken = default)
-        => ReadAllCoreAsync(acceptedZones, columnIndices: null, cancellationToken);
+        => ReadAllCoreAsync(acceptedZones, columnIndices: null, rowOffset: 0, rowCount: long.MaxValue, cancellationToken);
 
     /// <summary>
     /// Streams a column-projected view of the file: each emitted
@@ -409,7 +409,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ValidateColumnIndices(columnIndices);
-        return ReadAllCoreAsync(acceptedZones: null, columnIndices, cancellationToken);
+        return ReadAllCoreAsync(acceptedZones: null, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken);
     }
 
     /// <summary>
@@ -442,7 +442,58 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ValidateColumnIndices(columnIndices);
-        return ReadAllCoreAsync(acceptedZones, columnIndices, cancellationToken);
+        return ReadAllCoreAsync(acceptedZones, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken);
+    }
+
+    /// <summary>
+    /// Streams a row-range slice of the file: only logical rows in
+    /// <c>[rowOffset, rowOffset + rowCount)</c> are yielded. Chunks fully
+    /// outside the range incur zero I/O — they're identified by per-chunk
+    /// row counts already known at open time, so they're skipped without
+    /// reading any segments. Boundary chunks (at most two) are decoded
+    /// fully and then sliced via <see cref="Apache.Arrow.RecordBatch.Slice(int, int)"/>,
+    /// which is an O(1) per-array offset/length adjustment.
+    ///
+    /// <para>Composes with column projection and zone-pruning predicates;
+    /// when both are supplied the predicate runs first (over zone stats),
+    /// then the row-range further trims the surviving chunks.</para>
+    ///
+    /// <para>If <paramref name="rowOffset"/> is past the end of the file,
+    /// no batches are yielded. <paramref name="rowCount"/> is clamped to
+    /// what's available, so passing <see cref="long.MaxValue"/> reads
+    /// from <paramref name="rowOffset"/> to end.</para>
+    /// </summary>
+    public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        long rowOffset,
+        long rowCount,
+        IReadOnlyList<int>? columnIndices = null,
+        Predicate? predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (rowOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(rowOffset), rowOffset, "rowOffset must be ≥ 0.");
+        if (rowCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(rowCount), rowCount, "rowCount must be ≥ 0.");
+        if (columnIndices is not null) ValidateColumnIndices(columnIndices);
+        return ReadAllRangedAsync(rowOffset, rowCount, columnIndices, predicate, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllRangedAsync(
+        long rowOffset, long rowCount,
+        IReadOnlyList<int>? columnIndices,
+        Predicate? predicate,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        ISet<int>? acceptedZones = null;
+        if (predicate is not null && _columnPlans.Length > 0)
+        {
+            int totalZones = _columnPlans[0].ChunkCount;
+            acceptedZones = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        await foreach (var batch in ReadAllCoreAsync(
+            acceptedZones, columnIndices, rowOffset, rowCount, cancellationToken).ConfigureAwait(false))
+            yield return batch;
     }
 
     private void ValidateColumnIndices(IReadOnlyList<int> columnIndices)
@@ -469,7 +520,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         int totalZones = _columnPlans[0].ChunkCount;
         var accepted = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
             .ConfigureAwait(false);
-        await foreach (var batch in ReadAllCoreAsync(accepted, columnIndices, cancellationToken)
+        await foreach (var batch in ReadAllCoreAsync(accepted, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken)
             .ConfigureAwait(false))
             yield return batch;
     }
@@ -480,14 +531,21 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// listed columns are decoded and the emitted batch's schema is
     /// projected to that subset. <paramref name="acceptedZones"/> defaults
     /// (null) to "all chunks"; otherwise only chunks whose index is in the
-    /// set are emitted.
+    /// set are emitted. <paramref name="rowOffset"/> + <paramref name="rowCount"/>
+    /// further trim the surviving chunks to a logical row range — chunks
+    /// fully outside the range incur zero I/O; boundary chunks are decoded
+    /// and sliced via <see cref="Apache.Arrow.RecordBatch.Slice(int, int)"/>.
     /// </summary>
     private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllCoreAsync(
         ISet<int>? acceptedZones,
         IReadOnlyList<int>? columnIndices,
+        long rowOffset,
+        long rowCount,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (_columnPlans.Length == 0)
+            yield break;
+        if (rowCount == 0)
             yield break;
 
         int chunkCount = _columnPlans[0].ChunkCount;
@@ -508,23 +566,63 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
         int colsToRead = projectedIndices?.Length ?? _columnPlans.Length;
 
+        // Saturating end: rowOffset + rowCount may overflow long.MaxValue
+        // when the caller passes long.MaxValue (= "to end"). Saturate to
+        // long.MaxValue so the boundary check stays correct.
+        long rangeEnd = rowOffset > long.MaxValue - rowCount ? long.MaxValue : rowOffset + rowCount;
+        long cursor = 0;
+
         for (int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++)
         {
-            if (acceptedZones is not null && !acceptedZones.Contains(chunkIdx)) continue;
+            long chunkLen = checked((long)_columnPlans[0].ChunkRowCount(chunkIdx));
+            long chunkEnd = cursor + chunkLen;
+
+            if (acceptedZones is not null && !acceptedZones.Contains(chunkIdx))
+            {
+                cursor = chunkEnd;
+                continue;
+            }
+            // Wholly before the range — skip without I/O.
+            if (chunkEnd <= rowOffset)
+            {
+                cursor = chunkEnd;
+                continue;
+            }
+            // Past the range — done.
+            if (cursor >= rangeEnd)
+                yield break;
+
             var arrays = new Apache.Arrow.IArrowArray[colsToRead];
-            int rowCount = -1;
+            int decodedRowCount = -1;
             for (int outIdx = 0; outIdx < colsToRead; outIdx++)
             {
                 int srcIdx = projectedIndices is null ? outIdx : projectedIndices[outIdx];
                 arrays[outIdx] = await ReadPlanChunkAsync(_columnPlans[srcIdx], chunkIdx, cancellationToken)
                     .ConfigureAwait(false);
                 var len = arrays[outIdx].Length;
-                if (rowCount < 0) rowCount = len;
-                else if (len != rowCount)
+                if (decodedRowCount < 0) decodedRowCount = len;
+                else if (len != decodedRowCount)
                     throw new VortexFormatException(
-                        $"Chunk {chunkIdx}: first read column has {rowCount} rows but column index {srcIdx} has {len}.");
+                        $"Chunk {chunkIdx}: first read column has {decodedRowCount} rows but column index {srcIdx} has {len}.");
             }
-            yield return new Apache.Arrow.RecordBatch(projectedSchema, arrays, rowCount);
+            var batch = new Apache.Arrow.RecordBatch(projectedSchema, arrays, decodedRowCount);
+
+            // Slice at range boundaries. RecordBatch.Slice is O(1) — it just
+            // bumps offset/length on each ArrayData.
+            long localOffset = Math.Max(0, rowOffset - cursor);
+            long localEnd = Math.Min(chunkLen, rangeEnd - cursor);
+            if (localOffset > 0 || localEnd < chunkLen)
+            {
+                int sliceLen = checked((int)(localEnd - localOffset));
+                if (sliceLen > 0)
+                    yield return batch.Slice(checked((int)localOffset), sliceLen);
+            }
+            else
+            {
+                yield return batch;
+            }
+
+            cursor = chunkEnd;
         }
     }
 

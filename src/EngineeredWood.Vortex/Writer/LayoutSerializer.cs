@@ -329,6 +329,132 @@ internal static class LayoutSerializer
     }
 
     /// <summary>
+    /// Like <see cref="SerializeStructDictMixed"/> but additionally wraps
+    /// each column's data layout in <c>vortex.stats(data, zones-flat)</c>.
+    /// Co-exists dict-layout sharing with zone-pruning predicates: dict
+    /// columns get <c>vortex.stats(vortex.dict(values, codes-chunked), zones)</c>;
+    /// non-dict columns get <c>vortex.stats(vortex.chunked(...), zones)</c>.
+    /// The reader's <see cref="LayoutPlanner.WithZoneInfo"/> already attaches
+    /// <see cref="ZoneInfo"/> to either plan shape, so no reader changes
+    /// were needed.
+    /// </summary>
+    public static byte[] SerializeStructDictMixedStats(
+        ushort structEncodingIdx,
+        ushort statsEncodingIdx,
+        ushort dictEncodingIdx,
+        ushort chunkedEncodingIdx,
+        ushort flatEncodingIdx,
+        ulong totalRows,
+        int zoneLen,
+        int numZones,
+        IReadOnlyList<ulong> perBatchRowCount,
+        uint[][] perColumnSegmentIdx,
+        VortexFileWriter.DictColumnInfo[] dictColumns,
+        IReadOnlyList<uint> perColumnZonesSegmentIdx,
+        IReadOnlyList<byte[]> perColumnStatsBitset)
+    {
+        if (perColumnSegmentIdx.Length != dictColumns.Length)
+            throw new ArgumentException(
+                "perColumnSegmentIdx must align with dictColumns.", nameof(dictColumns));
+        if (perColumnZonesSegmentIdx.Count != perColumnSegmentIdx.Length)
+            throw new ArgumentException(
+                "perColumnZonesSegmentIdx must have one entry per column.",
+                nameof(perColumnZonesSegmentIdx));
+        if (perColumnStatsBitset.Count != perColumnSegmentIdx.Length)
+            throw new ArgumentException(
+                "perColumnStatsBitset must have one entry per column.",
+                nameof(perColumnStatsBitset));
+        int batchCount = perBatchRowCount.Count;
+
+        var b = new BackwardsFlatBufferBuilder();
+
+        // Per-column stats metadata: [u32 zone_len LE][bitset bytes].
+        var columnMetadataTickets = new int[perColumnSegmentIdx.Length];
+        for (int c = 0; c < columnMetadataTickets.Length; c++)
+        {
+            var bitset = perColumnStatsBitset[c];
+            var meta = new byte[4 + bitset.Length];
+            meta[0] = (byte)(zoneLen & 0xFF);
+            meta[1] = (byte)((zoneLen >> 8) & 0xFF);
+            meta[2] = (byte)((zoneLen >> 16) & 0xFF);
+            meta[3] = (byte)((zoneLen >> 24) & 0xFF);
+            bitset.CopyTo(meta, 4);
+            columnMetadataTickets[c] = b.WriteByteVector(meta);
+        }
+
+        Span<byte> dictMetaBuf = stackalloc byte[16];
+        var columnTickets = new int[perColumnSegmentIdx.Length];
+        for (int c = 0; c < perColumnSegmentIdx.Length; c++)
+        {
+            // Build chunked layout for the per-batch segments (codes for
+            // dict columns, raw data for non-dict).
+            var flatTickets = new int[batchCount];
+            for (int batch = 0; batch < batchCount; batch++)
+                flatTickets[batch] = EmitFlatLayout(
+                    b, flatEncodingIdx, perBatchRowCount[batch], perColumnSegmentIdx[c][batch]);
+            var chunkedChildrenTicket = b.WriteUOffsetVector(flatTickets);
+            var chunkedVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+            int chunkedTicket = b.StartTable(alignment: 8, inlineSize: 18)
+                .EmitU16(chunkedEncodingIdx)
+                .EmitU64(totalRows)
+                .EmitUOffset(chunkedChildrenTicket)
+                .EmitSOffsetTo(chunkedVt);
+
+            // Possibly wrap in vortex.dict.
+            int dataLayoutTicket;
+            if (dictColumns[c].ValuesSegmentIdx == 0 && dictColumns[c].DictRowCount == 0)
+            {
+                dataLayoutTicket = chunkedTicket;
+            }
+            else
+            {
+                int valuesFlatTicket = EmitFlatLayout(
+                    b, flatEncodingIdx, dictColumns[c].DictRowCount, dictColumns[c].ValuesSegmentIdx);
+
+                int metaPos = 0;
+                dictMetaBuf[metaPos++] = 0x08;
+                metaPos += Varint.WriteUnsigned(dictMetaBuf.Slice(metaPos), dictColumns[c].CodesPtype);
+                dictMetaBuf[metaPos++] = 0x10;
+                dictMetaBuf[metaPos++] = (byte)(dictColumns[c].IsNullableCodes ? 1 : 0);
+                int dictMetaTicket = b.WriteByteVector(dictMetaBuf.Slice(0, metaPos).ToArray());
+
+                var dictChildrenTicket = b.WriteUOffsetVector(new[] { valuesFlatTicket, chunkedTicket });
+                var dictVt = b.WriteUInt16s(new ushort[] { 14, 22, 20, 8, 4, 16, 0 });
+                dataLayoutTicket = b.StartTable(alignment: 8, inlineSize: 22)
+                    .EmitU16(dictEncodingIdx)
+                    .EmitUOffset(dictChildrenTicket)
+                    .EmitU64(totalRows)
+                    .EmitUOffset(dictMetaTicket)
+                    .EmitSOffsetTo(dictVt);
+            }
+
+            // Zones layout (vortex.flat with row_count = numZones).
+            int zonesLayoutTicket = EmitFlatLayout(
+                b, flatEncodingIdx, (ulong)numZones, perColumnZonesSegmentIdx[c]);
+
+            // Wrap data + zones in vortex.stats.
+            var statsChildrenTicket = b.WriteUOffsetVector(new[] { dataLayoutTicket, zonesLayoutTicket });
+            var statsVt = b.WriteUInt16s(new ushort[] { 14, 22, 20, 8, 4, 16, 0 });
+            columnTickets[c] = b.StartTable(alignment: 8, inlineSize: 22)
+                .EmitU16(statsEncodingIdx)
+                .EmitUOffset(statsChildrenTicket)
+                .EmitU64(totalRows)
+                .EmitUOffset(columnMetadataTickets[c])
+                .EmitSOffsetTo(statsVt);
+        }
+
+        var rootChildrenTicket = b.WriteUOffsetVector(columnTickets);
+        var structVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+        var structTicket = b.StartTable(alignment: 8, inlineSize: 18)
+            .EmitU16(structEncodingIdx)
+            .EmitU64(totalRows)
+            .EmitUOffset(rootChildrenTicket)
+            .EmitSOffsetTo(structVt);
+
+        return b.Finish(structTicket);
+    }
+
+    /// <summary>
     /// Emits a vortex.flat Layout table (encoding, row_count, segments=[segIdx]).
     /// Returns the table ticket. Other slots (metadata, children) are absent.
     /// </summary>

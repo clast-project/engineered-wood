@@ -44,12 +44,16 @@ public class VortexCrossValidationTests
         var psi = new ProcessStartInfo
         {
             FileName = validator,
-            ArgumentList = { fileArg },
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+#if NETCOREAPP2_1_OR_GREATER
+        psi.ArgumentList.Add(fileArg);
+#else
+        psi.Arguments = "\"" + fileArg.Replace("\"", "\\\"") + "\"";
+#endif
         using var p = Process.Start(psi)!;
         var stdout = p.StandardOutput.ReadToEnd();
         var stderr = p.StandardError.ReadToEnd();
@@ -1514,6 +1518,7 @@ public class VortexCrossValidationTests
         }
     }
 
+#if NET6_0_OR_GREATER
     [Fact]
     public void RustReader_OpensDotNetWrittenHalfFloatFile()
     {
@@ -1556,6 +1561,7 @@ public class VortexCrossValidationTests
             try { File.Delete(path); } catch { }
         }
     }
+#endif
 
     [Fact]
     public void RustReader_OpensDotNetWrittenNullableAlpRdFile()
@@ -1719,6 +1725,54 @@ public class VortexCrossValidationTests
             {
                 using var w = new VortexFileWriter(fs, schema, preferDictLayout: true);
                 var rng = new Random(123);
+                for (int batch = 0; batch < batchCount; batch++)
+                {
+                    var b = new StringArray.Builder();
+                    for (int i = 0; i < rowsPerBatch; i++)
+                        b.Append(palette[rng.Next(palette.Length)]);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, rowsPerBatch));
+                }
+                w.Close();
+            }
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            int total = rowsPerBatch * batchCount;
+            Assert.Contains($"OK rows={total}", stdout);
+            Assert.Contains($"DONE total={total}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenDictLayoutWithStatsFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // preferDictLayout AND preserveStats: each column's data layout is
+        // wrapped in vortex.stats(vortex.dict(values, codes-chunked), zones).
+        // Confirms vortex 0.70 accepts the dict-inside-stats layout shape.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("color", StringType.Default, nullable: false),
+        }, metadata: null);
+        var palette = new[] { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+        const int rowsPerBatch = 100;
+        const int batchCount = 3;
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema,
+                    preserveStats: true, preferDictLayout: true);
+                var rng = new Random(456);
                 for (int batch = 0; batch < batchCount; batch++)
                 {
                     var b = new StringArray.Builder();

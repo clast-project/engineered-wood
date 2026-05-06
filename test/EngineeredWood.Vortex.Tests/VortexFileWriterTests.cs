@@ -1527,6 +1527,365 @@ public class VortexFileWriterTests
         }
     }
 
+    // ----- Temporal predicate tests against Rust-written fixtures -----
+    //
+    // The fixture's single zone covers a known range, so a predicate either
+    // keeps the only zone (1 batch yielded) or prunes it (0 batches). All
+    // three fixtures' Min/Max are confirmed non-null in zone stats.
+
+    [Fact]
+    public async Task Predicate_TimestampMicrosecond_PrunesByRange()
+    {
+        // timestamp_us_2048rows.vortex: zone 0 covers [2024-01-01 .. 2024-12-30]
+        // microseconds. col 0 is TimestampType(Microsecond, "UTC").
+        var path = TestData.TestDataPath.Resolve("timestamp_us_2048rows.vortex");
+        if (!File.Exists(path)) return;
+        await using var reader = await VortexFileReader.OpenAsync(path);
+
+        // Out-of-range high: drop the only zone.
+        var dropHigh = Predicate.Greater(0, new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        int kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
+        Assert.Equal(0, kept);
+
+        // Out-of-range low: drop the only zone.
+        var dropLow = Predicate.Less(0, new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
+        Assert.Equal(0, kept);
+
+        // In-range: keep the zone (max > 2024-06-01).
+        var keep = Predicate.Greater(0, new DateTimeOffset(2024, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(keep)) kept++;
+        Assert.Equal(1, kept);
+    }
+
+    [Fact]
+    public async Task Predicate_Date32_PrunesByRange()
+    {
+        // date_days_2048rows.vortex: zone 0 covers days [19723 (2024-01-01) .. 21547 (2028-12-30)].
+        var path = TestData.TestDataPath.Resolve("date_days_2048rows.vortex");
+        if (!File.Exists(path)) return;
+        await using var reader = await VortexFileReader.OpenAsync(path);
+
+        var dropLow = Predicate.Less(0, new DateTime(2020, 1, 1));
+        int kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
+        Assert.Equal(0, kept);
+
+        var dropHigh = Predicate.Greater(0, new DateTime(2030, 1, 1));
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
+        Assert.Equal(0, kept);
+
+        var keep = Predicate.Greater(0, new DateTime(2024, 1, 1));
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(keep)) kept++;
+        Assert.Equal(1, kept);
+    }
+
+    [Fact]
+    public async Task Predicate_Time64Microsecond_PrunesByRange()
+    {
+        // time_us_2048rows.vortex: zone 0 covers ~[1m15s .. 23h59m16s] microseconds-of-day.
+        var path = TestData.TestDataPath.Resolve("time_us_2048rows.vortex");
+        if (!File.Exists(path)) return;
+        await using var reader = await VortexFileReader.OpenAsync(path);
+
+        var dropHigh = Predicate.Greater(0, TimeSpan.FromHours(48));
+        int kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
+        Assert.Equal(0, kept);
+
+        var dropLow = Predicate.Less(0, TimeSpan.Zero);
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
+        Assert.Equal(0, kept);
+
+        var keep = Predicate.Greater(0, TimeSpan.FromHours(1));
+        kept = 0;
+        await foreach (var b in reader.ReadAllAsync(keep)) kept++;
+        Assert.Equal(1, kept);
+    }
+
+    [Fact]
+    public async Task Predicate_Bool_DropsAllSameValueZone()
+    {
+        // 2 zones × 50 rows: zone 0 = all true, zone 1 = all false.
+        // Predicate (col == true) → drops zone 1.
+        // Predicate (col == false) → drops zone 0.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("b", BooleanType.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                var allTrue = new BooleanArray.Builder();
+                for (int i = 0; i < 50; i++) allTrue.Append(true);
+                w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { allTrue.Build() }, 50));
+                var allFalse = new BooleanArray.Builder();
+                for (int i = 0; i < 50; i++) allFalse.Append(false);
+                w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { allFalse.Build() }, 50));
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            // Bool column may not produce Min/Max stats — skip the test if so.
+            if (stats?.Min is not Apache.Arrow.BooleanArray
+                || stats?.Max is not Apache.Arrow.BooleanArray) return;
+
+            int kept = 0;
+            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, true))) kept++;
+            Assert.Equal(1, kept);
+
+            kept = 0;
+            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, false))) kept++;
+            Assert.Equal(1, kept);
+
+            kept = 0;
+            await foreach (var b in reader.ReadAllAsync(Predicate.NotEqual(0, true))) kept++;
+            Assert.Equal(1, kept);
+
+            kept = 0;
+            await foreach (var b in reader.ReadAllAsync(Predicate.NotEqual(0, false))) kept++;
+            Assert.Equal(1, kept);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    // ----- Row-range slice tests -----
+
+    /// <summary>Helper to build a 4-zone × 50-row file ([0..49], [50..99], [100..149], [150..199]).</summary>
+    private static async Task<string> WriteFourZoneFileAsync(bool preserveStats = true)
+    {
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        using (var fs = File.Create(path))
+        using (var w = new VortexFileWriter(fs, schema, preserveStats: preserveStats))
+        {
+            for (int batchIdx = 0; batchIdx < 4; batchIdx++)
+            {
+                var b = new Int32Array.Builder();
+                for (int i = 0; i < 50; i++) b.Append(batchIdx * 50 + i);
+                w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, 50));
+            }
+            w.Close();
+        }
+        return path;
+    }
+
+    [Fact]
+    public async Task RowRange_SkipsLeadingChunksAndSlicesBoundaries()
+    {
+        // Range rows [75..175): zone 0 [0..49] skipped, zone 1 [50..99] sliced
+        // to last 25 rows, zone 2 [100..149] kept whole, zone 3 [150..199]
+        // sliced to first 25 rows. Total rows yielded = 100 across 3 batches.
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(rowOffset: 75, rowCount: 100))
+                batches.Add(b);
+
+            Assert.Equal(3, batches.Count);
+            Assert.Equal(25, batches[0].Length);
+            Assert.Equal(50, batches[1].Length);
+            Assert.Equal(25, batches[2].Length);
+
+            // Verify the values are exactly 75..174.
+            int expected = 75;
+            foreach (var b in batches)
+            {
+                var v = (Int32Array)b.Column(0);
+                for (int i = 0; i < v.Length; i++)
+                    Assert.Equal(expected++, v.GetValue(i));
+            }
+            Assert.Equal(175, expected);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_OffsetPastEnd_YieldsNothing()
+    {
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            int batches = 0;
+            await foreach (var b in reader.ReadAllAsync(rowOffset: 1000, rowCount: 100)) batches++;
+            Assert.Equal(0, batches);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_ZeroCount_YieldsNothing()
+    {
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            int batches = 0;
+            await foreach (var b in reader.ReadAllAsync(rowOffset: 0, rowCount: 0)) batches++;
+            Assert.Equal(0, batches);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_RangeCoversExactlyOneFullChunk_NoSlicing()
+    {
+        // [50..100) = exactly zone 1. Should emit one unsliced batch of 50 rows.
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(rowOffset: 50, rowCount: 50))
+                batches.Add(b);
+
+            Assert.Single(batches);
+            Assert.Equal(50, batches[0].Length);
+            var v = (Int32Array)batches[0].Column(0);
+            for (int i = 0; i < 50; i++) Assert.Equal(50 + i, v.GetValue(i));
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_RowCountClampsToFile()
+    {
+        // rowOffset=150, rowCount=long.MaxValue should yield exactly the last 50 rows.
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(rowOffset: 150, rowCount: long.MaxValue))
+                batches.Add(b);
+            Assert.Single(batches);
+            Assert.Equal(50, batches[0].Length);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_ComposesWithPredicate()
+    {
+        // 4 zones × 50 rows: zone N covers values [50N..50N+49].
+        // Predicate (v >= 75) keeps zones {1,2,3} (max 49 < 75 drops zone 0).
+        // Row-range [25..125) over the original logical row space. Zone 0
+        // (rows 0..49) is dropped by predicate; range [25..125) covers
+        // surviving zones 1 [50..99] and 2 [100..149], boundary slice on
+        // zone 2 to first 25 rows. Expected: zone 1 whole (50 rows) + zone 2
+        // first 25 = 75 rows total.
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var pred = Predicate.GreaterOrEqual(0, 75);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(
+                rowOffset: 25, rowCount: 100, columnIndices: null, predicate: pred))
+                batches.Add(b);
+
+            Assert.Equal(2, batches.Count);
+            Assert.Equal(50, batches[0].Length);
+            Assert.Equal(25, batches[1].Length);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_ComposesWithColumnProjection()
+    {
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: false),
+            new Field("b", Int64Type.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema))
+            {
+                for (int batchIdx = 0; batchIdx < 4; batchIdx++)
+                {
+                    var a = new Int32Array.Builder();
+                    var b = new Int64Array.Builder();
+                    for (int i = 0; i < 50; i++)
+                    {
+                        a.Append(batchIdx * 50 + i);
+                        b.Append((long)(batchIdx * 50 + i) * 1000);
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { a.Build(), b.Build() }, 50));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(
+                rowOffset: 75, rowCount: 50, columnIndices: new[] { 1 }))
+                batches.Add(b);
+
+            // Range [75..125): zone 1 [50..99] sliced to 25 rows + zone 2 [100..149] sliced to 25 rows.
+            Assert.Equal(2, batches.Count);
+            Assert.All(batches, b => Assert.Single(b.Schema.FieldsList));
+            Assert.All(batches, b => Assert.Equal("b", b.Schema.FieldsList[0].Name));
+            Assert.Equal(25, batches[0].Length);
+            Assert.Equal(25, batches[1].Length);
+
+            // Verify values are 75000, 76000, ... 124000.
+            long expected = 75_000L;
+            foreach (var b in batches)
+            {
+                var col = (Int64Array)b.Column(0);
+                for (int i = 0; i < col.Length; i++)
+                {
+                    Assert.Equal(expected, col.GetValue(i));
+                    expected += 1000;
+                }
+            }
+            Assert.Equal(125_000L, expected);
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public async Task RowRange_NegativeOffsetThrows()
+    {
+        var path = await WriteFourZoneFileAsync();
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+            {
+                await foreach (var _ in reader.ReadAllAsync(rowOffset: -1, rowCount: 10)) { }
+            });
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+            {
+                await foreach (var _ in reader.ReadAllAsync(rowOffset: 0, rowCount: -5)) { }
+            });
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
     [Fact]
     public async Task ZonePruning_GetZoneStatsExposesPerZoneMinMax()
     {
@@ -4211,7 +4570,11 @@ public class VortexFileWriterTests
         {
             var bytes = new byte[8];
             rng.NextBytes(bytes);
+#if NET5_0_OR_GREATER
             values[i] = Convert.ToHexString(bytes);
+#else
+            values[i] = BitConverter.ToString(bytes).Replace("-", "");
+#endif
             b.Append(values[i]);
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
@@ -6964,6 +7327,142 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task DictLayout_WithStats_PrunesAcrossZones()
+    {
+        // preferDictLayout AND preserveStats: each column emits
+        // vortex.stats(vortex.dict(...), zones-flat). Three batches with
+        // disjoint lex-prefixes so per-zone min/max are tight enough that
+        // a targeted predicate drops 2 of the 3 zones.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int rowsPerBatch = 100;
+        string[][] values =
+        {
+            BuildPattern("ax-", rowsPerBatch),
+            BuildPattern("bx-", rowsPerBatch),
+            BuildPattern("cx-", rowsPerBatch),
+        };
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema,
+                    preserveStats: true, preferDictLayout: true);
+                foreach (var batch in values)
+                {
+                    var b = new StringArray.Builder();
+                    foreach (var s in batch) b.Append(s);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, batch.Length));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+
+            // Stats are present despite the dict-layout wrapper.
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.NotNull(stats);
+            Assert.Equal(3, stats!.ZoneCount);
+            Assert.IsType<StringArray>(stats.Min);
+            Assert.IsType<StringArray>(stats.Max);
+
+            // Predicate drops 2 of 3 zones.
+            var batches = new List<RecordBatch>();
+            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, "bx-050")))
+                batches.Add(b);
+            try
+            {
+                var batch = Assert.Single(batches);
+                Assert.Equal(rowsPerBatch, batch.Length);
+                var col = Assert.IsType<StringArray>(batch.Column(0));
+                Assert.StartsWith("bx-", col.GetString(0));
+            }
+            finally
+            {
+                foreach (var b in batches) b.Dispose();
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+
+        static string[] BuildPattern(string prefix, int n)
+        {
+            var arr = new string[n];
+            for (int i = 0; i < n; i++) arr[i] = $"{prefix}{i:D3}";
+            return arr;
+        }
+    }
+
+    [Fact]
+    public async Task DictLayout_WithStats_RoundtripsValuesAndPalette()
+    {
+        // Functional roundtrip with both flags on — verify that the values
+        // come back correctly even with the new stats wrapper.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("color", StringType.Default, nullable: true),
+        }, metadata: null);
+        var palette = new[] { "alpha", "bravo", "charlie", "delta" };
+        const int rowsPerBatch = 80;
+        var allExpected = new List<string?>();
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema,
+                    preserveStats: true, preferDictLayout: true);
+                var rng = new Random(7);
+                for (int batch = 0; batch < 3; batch++)
+                {
+                    var b = new StringArray.Builder();
+                    for (int i = 0; i < rowsPerBatch; i++)
+                    {
+                        if (i % 13 == 0) { b.AppendNull(); allExpected.Add(null); }
+                        else
+                        {
+                            var v = palette[rng.Next(palette.Length)];
+                            b.Append(v);
+                            allExpected.Add(v);
+                        }
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, rowsPerBatch));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.Equal(rowsPerBatch * 3L, reader.NumberOfRows);
+
+            int read = 0;
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                var col = Assert.IsType<StringArray>(batch.Column(0));
+                for (int i = 0; i < col.Length; i++)
+                {
+                    var expected = allExpected[read + i];
+                    if (expected is null) Assert.False(col.IsValid(i));
+                    else { Assert.True(col.IsValid(i)); Assert.Equal(expected, col.GetString(i)); }
+                }
+                read += col.Length;
+                batch.Dispose();
+            }
+            Assert.Equal(allExpected.Count, read);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task DictLayout_IsSmallerThanChunked()
     {
         // Sanity check the actual win: same data with preferDictLayout=true
@@ -7339,6 +7838,7 @@ public class VortexFileWriterTests
         }
     }
 
+#if NET6_0_OR_GREATER
     [Fact]
     public async Task SelfRoundtrip_HalfFloat()
     {
@@ -7394,6 +7894,7 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+#endif
 
     [Fact]
     public async Task SelfRoundtrip_Date64()

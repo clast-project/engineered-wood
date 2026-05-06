@@ -54,6 +54,8 @@ internal abstract class ColumnPlan
     public ZoneInfo? ZoneInfo { get; init; }
     public abstract ulong TotalRows { get; }
     public abstract int ChunkCount { get; }
+    /// <summary>Logical row count of the chunk at <paramref name="chunkIndex"/>.</summary>
+    public abstract ulong ChunkRowCount(int chunkIndex);
 
     protected ColumnPlan(IArrowType arrowType) { ArrowType = arrowType; }
 }
@@ -75,6 +77,8 @@ internal sealed class FlatColumnPlan : ColumnPlan
     {
         get { ulong sum = 0; foreach (var c in Chunks) sum += c.RowCount; return sum; }
     }
+
+    public override ulong ChunkRowCount(int chunkIndex) => Chunks[chunkIndex].RowCount;
 }
 
 /// <summary>
@@ -97,4 +101,5 @@ internal sealed class DictColumnPlan : ColumnPlan
 
     public override int ChunkCount => Codes.ChunkCount;
     public override ulong TotalRows => Codes.TotalRows;
+    public override ulong ChunkRowCount(int chunkIndex) => Codes.ChunkRowCount(chunkIndex);
 }

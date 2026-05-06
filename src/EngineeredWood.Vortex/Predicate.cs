@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace EngineeredWood.Vortex;
 
@@ -140,6 +141,110 @@ public abstract class Predicate
     public static Predicate NotEqual(int columnIdx, byte[] value)
         => new BytesComparisonPredicate(columnIdx, ComparisonOp.NotEqual,
             value ?? throw new ArgumentNullException(nameof(value)));
+
+    // -------------------- Factory: bool comparisons --------------------
+
+    /// <summary>
+    /// <c>column == value</c> on a <see cref="BooleanType"/> column. Zone is
+    /// dropped only when min == max ≠ value (every row in the zone disagrees);
+    /// kept otherwise. Equivalent to a numeric Equal but reads <c>Min</c> /
+    /// <c>Max</c> as <see cref="BooleanArray"/>.
+    /// </summary>
+    public static Predicate Equal(int columnIdx, bool value)
+        => new BoolComparisonPredicate(columnIdx, ComparisonOp.Equal, value);
+
+    /// <summary>
+    /// <c>column != value</c> on a <see cref="BooleanType"/> column. Drops a
+    /// zone only when every row matches the excluded value (<c>min == max == value</c>).
+    /// </summary>
+    public static Predicate NotEqual(int columnIdx, bool value)
+        => new BoolComparisonPredicate(columnIdx, ComparisonOp.NotEqual, value);
+
+    // -------------------- Factory: temporal comparisons --------------------
+    //
+    // DateTime overloads target Date32 / Date64 columns. The input's calendar
+    // date (DateTimeKind is ignored) is converted to days-since-epoch (Date32)
+    // or milliseconds-since-epoch (Date64) at evaluation time, using the
+    // column's actual dtype from the schema. This makes the same predicate
+    // work against either width without callers needing to know which.
+    //
+    // DateTimeOffset overloads target Timestamp columns; the offset is
+    // collapsed to UTC and converted to the column's TimeUnit ticks.
+    //
+    // TimeSpan overloads target Time32 / Time64 columns and convert to the
+    // column's TimeUnit ticks (raw, not epoch-anchored).
+
+    /// <summary><c>column &gt;= value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate GreaterOrEqual(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.GreaterOrEqual, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column &gt; value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate Greater(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Greater, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column &lt;= value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate LessOrEqual(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.LessOrEqual, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column &lt; value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate Less(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Less, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column == value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate Equal(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Equal, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column != value</c> on a Date32 / Date64 column.</summary>
+    public static Predicate NotEqual(int columnIdx, DateTime value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.NotEqual, TemporalKind.Date, value.Ticks);
+
+    /// <summary><c>column &gt;= value</c> on a Timestamp column.</summary>
+    public static Predicate GreaterOrEqual(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.GreaterOrEqual, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column &gt; value</c> on a Timestamp column.</summary>
+    public static Predicate Greater(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Greater, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column &lt;= value</c> on a Timestamp column.</summary>
+    public static Predicate LessOrEqual(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.LessOrEqual, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column &lt; value</c> on a Timestamp column.</summary>
+    public static Predicate Less(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Less, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column == value</c> on a Timestamp column.</summary>
+    public static Predicate Equal(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Equal, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column != value</c> on a Timestamp column.</summary>
+    public static Predicate NotEqual(int columnIdx, DateTimeOffset value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.NotEqual, TemporalKind.Timestamp, value.UtcTicks);
+
+    /// <summary><c>column &gt;= value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate GreaterOrEqual(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.GreaterOrEqual, TemporalKind.Time, value.Ticks);
+
+    /// <summary><c>column &gt; value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate Greater(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Greater, TemporalKind.Time, value.Ticks);
+
+    /// <summary><c>column &lt;= value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate LessOrEqual(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.LessOrEqual, TemporalKind.Time, value.Ticks);
+
+    /// <summary><c>column &lt; value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate Less(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Less, TemporalKind.Time, value.Ticks);
+
+    /// <summary><c>column == value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate Equal(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.Equal, TemporalKind.Time, value.Ticks);
+
+    /// <summary><c>column != value</c> on a Time32 / Time64 column.</summary>
+    public static Predicate NotEqual(int columnIdx, TimeSpan value)
+        => new TemporalComparisonPredicate(columnIdx, ComparisonOp.NotEqual, TemporalKind.Time, value.Ticks);
 
     // -------------------- Factory: nullability --------------------
 
@@ -372,6 +477,218 @@ internal sealed class BytesComparisonPredicate : Predicate
                 $"BytesComparisonPredicate doesn't handle Arrow array {array.GetType().Name}; "
                 + "string/binary predicates require StringArray or BinaryArray Min/Max stats."),
         };
+    }
+}
+
+/// <summary>Tags whether a temporal predicate target is a date (epoch days/ms),
+/// a timestamp (epoch ticks in unit), or a time-of-day (raw ticks in unit).</summary>
+internal enum TemporalKind { Date, Timestamp, Time }
+
+/// <summary>
+/// Predicate over Date32 / Date64 / Timestamp / Time32 / Time64 columns. The
+/// user-supplied value is captured as raw .NET ticks (DateTime.Ticks /
+/// DateTimeOffset.UtcTicks / TimeSpan.Ticks); at evaluation time we look up
+/// the column's actual Arrow dtype, convert the .NET ticks to the column's
+/// unit (epoch-anchored for date / timestamp, raw for time-of-day), and
+/// compare against the typed Min / Max from zone stats.
+/// </summary>
+internal sealed class TemporalComparisonPredicate : Predicate
+{
+    // Unix epoch in .NET ticks (1 tick = 100ns; epoch = 1970-01-01 UTC).
+    private const long UnixEpochTicks = 621355968000000000L;
+    private const long TicksPerSecond = 10_000_000L;
+    private const long TicksPerMillisecond = 10_000L;
+    private const long TicksPerMicrosecond = 10L;
+    // Conversion *from* nanoseconds — i.e. nanos = .NET ticks * 100.
+    private const long NanosPerTick = 100L;
+    private const long TicksPerDay = 864_000_000_000L;
+
+    private readonly int _columnIdx;
+    private readonly ComparisonOp _op;
+    private readonly TemporalKind _kind;
+    private readonly long _dotnetTicks;
+
+    public TemporalComparisonPredicate(int columnIdx, ComparisonOp op, TemporalKind kind, long dotnetTicks)
+    {
+        _columnIdx = columnIdx;
+        _op = op;
+        _kind = kind;
+        _dotnetTicks = dotnetTicks;
+    }
+
+    internal override async Task<HashSet<int>> EvaluateZonesAsync(
+        VortexFileReader reader, int totalZones, CancellationToken ct)
+    {
+        var stats = await reader.GetZoneStatsAsync(_columnIdx, ct).ConfigureAwait(false);
+        if (stats is null) return Predicate.AllZones(totalZones);
+
+        var dtype = reader.Schema.FieldsList[_columnIdx].DataType;
+        if (!TryConvertToColumnUnit(dtype, out long target))
+        {
+            // Predicate kind doesn't match column type — keep all zones
+            // conservatively. The decoded batches will reflect the dtype
+            // mismatch through normal Arrow type errors at consume time.
+            return Predicate.AllZones(totalZones);
+        }
+
+        var minArr = stats.Min;
+        var maxArr = stats.Max;
+        var accepted = new HashSet<int>();
+        for (int z = 0; z < stats.ZoneCount; z++)
+        {
+            bool keep = true;
+            switch (_op)
+            {
+                case ComparisonOp.GreaterOrEqual:
+                    if (ReadAsLong(maxArr, z) is long maxGe && maxGe < target) keep = false;
+                    break;
+                case ComparisonOp.Greater:
+                    if (ReadAsLong(maxArr, z) is long maxGt && maxGt <= target) keep = false;
+                    break;
+                case ComparisonOp.LessOrEqual:
+                    if (ReadAsLong(minArr, z) is long minLe && minLe > target) keep = false;
+                    break;
+                case ComparisonOp.Less:
+                    if (ReadAsLong(minArr, z) is long minLt && minLt >= target) keep = false;
+                    break;
+                case ComparisonOp.Equal:
+                    if (ReadAsLong(maxArr, z) is long maxEq && target > maxEq) keep = false;
+                    if (keep && ReadAsLong(minArr, z) is long minEq && target < minEq) keep = false;
+                    break;
+                case ComparisonOp.NotEqual:
+                    if (ReadAsLong(maxArr, z) is long maxNe
+                        && ReadAsLong(minArr, z) is long minNe
+                        && minNe == target && maxNe == target)
+                    {
+                        keep = false;
+                    }
+                    break;
+            }
+            if (keep) accepted.Add(z);
+        }
+        return accepted;
+    }
+
+    /// <summary>
+    /// Reads a single zone-stat cell from a typed Date / Time / Timestamp
+    /// Arrow array as the underlying integer ticks (days for Date32, ms for
+    /// Date64, unit-ticks for Time/Timestamp). Returns null for invalid
+    /// cells or when <paramref name="array"/> is null.
+    /// </summary>
+    private static long? ReadAsLong(IArrowArray? array, int index)
+    {
+        if (array is null) return null;
+        return array switch
+        {
+            // Apache.Arrow's Date32Array / Time32Array inherit from
+            // PrimitiveArray<int>; Date64Array / Time64Array / TimestampArray
+            // inherit from PrimitiveArray<long>. We read .Values directly to
+            // avoid Arrow's GetValue(...) overloads that may convert to
+            // DateTime / DateTimeOffset and lose the raw underlying ticks.
+            Apache.Arrow.PrimitiveArray<int> p32 => p32.IsValid(index) ? p32.Values[index] : (long?)null,
+            Apache.Arrow.PrimitiveArray<long> p64 => p64.IsValid(index) ? p64.Values[index] : (long?)null,
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Converts the captured .NET ticks to the column's unit ticks. Returns
+    /// false (caller keeps all zones) when the predicate kind is mismatched
+    /// against the column dtype.
+    /// </summary>
+    private bool TryConvertToColumnUnit(IArrowType dtype, out long result)
+    {
+        switch (_kind)
+        {
+            case TemporalKind.Date when dtype is Date32Type:
+                // i32 days since epoch.
+                result = (_dotnetTicks - UnixEpochTicks) / TicksPerDay;
+                return true;
+            case TemporalKind.Date when dtype is Date64Type:
+                // i64 milliseconds since epoch.
+                result = (_dotnetTicks - UnixEpochTicks) / TicksPerMillisecond;
+                return true;
+            case TemporalKind.Timestamp when dtype is TimestampType ts:
+                // i64 unit-ticks since epoch.
+                result = ConvertEpochAnchored(_dotnetTicks, ts.Unit);
+                return true;
+            case TemporalKind.Time when dtype is Time32Type t32:
+                result = ConvertRawTime(_dotnetTicks, t32.Unit);
+                return true;
+            case TemporalKind.Time when dtype is Time64Type t64:
+                result = ConvertRawTime(_dotnetTicks, t64.Unit);
+                return true;
+            default:
+                result = 0;
+                return false;
+        }
+    }
+
+    private static long ConvertEpochAnchored(long dotnetTicks, TimeUnit unit) => unit switch
+    {
+        TimeUnit.Second => (dotnetTicks - UnixEpochTicks) / TicksPerSecond,
+        TimeUnit.Millisecond => (dotnetTicks - UnixEpochTicks) / TicksPerMillisecond,
+        TimeUnit.Microsecond => (dotnetTicks - UnixEpochTicks) / TicksPerMicrosecond,
+        TimeUnit.Nanosecond => checked((dotnetTicks - UnixEpochTicks) * NanosPerTick),
+        _ => throw new NotSupportedException($"Unknown TimeUnit: {unit}."),
+    };
+
+    private static long ConvertRawTime(long dotnetTicks, TimeUnit unit) => unit switch
+    {
+        TimeUnit.Second => dotnetTicks / TicksPerSecond,
+        TimeUnit.Millisecond => dotnetTicks / TicksPerMillisecond,
+        TimeUnit.Microsecond => dotnetTicks / TicksPerMicrosecond,
+        TimeUnit.Nanosecond => checked(dotnetTicks * NanosPerTick),
+        _ => throw new NotSupportedException($"Unknown TimeUnit: {unit}."),
+    };
+}
+
+/// <summary>
+/// Predicate over <see cref="BooleanType"/> columns. Reads <c>Min</c> /
+/// <c>Max</c> as <see cref="BooleanArray"/> and applies the standard
+/// equal / not-equal pruning rules.
+/// </summary>
+internal sealed class BoolComparisonPredicate : Predicate
+{
+    private readonly int _columnIdx;
+    private readonly ComparisonOp _op;
+    private readonly bool _value;
+
+    public BoolComparisonPredicate(int columnIdx, ComparisonOp op, bool value)
+    {
+        _columnIdx = columnIdx;
+        _op = op;
+        _value = value;
+    }
+
+    internal override async Task<HashSet<int>> EvaluateZonesAsync(
+        VortexFileReader reader, int totalZones, CancellationToken ct)
+    {
+        var stats = await reader.GetZoneStatsAsync(_columnIdx, ct).ConfigureAwait(false);
+        if (stats is null) return Predicate.AllZones(totalZones);
+
+        var minArr = stats.Min as BooleanArray;
+        var maxArr = stats.Max as BooleanArray;
+        var accepted = new HashSet<int>();
+        for (int z = 0; z < stats.ZoneCount; z++)
+        {
+            bool? min = (minArr is not null && minArr.IsValid(z)) ? minArr.GetValue(z) : (bool?)null;
+            bool? max = (maxArr is not null && maxArr.IsValid(z)) ? maxArr.GetValue(z) : (bool?)null;
+
+            bool keep;
+            if (_op == ComparisonOp.Equal)
+            {
+                // Drop only when min == max != value (every row disagrees).
+                keep = !(min.HasValue && max.HasValue && min.Value == max.Value && min.Value != _value);
+            }
+            else // NotEqual
+            {
+                // Drop only when min == max == value (every row matches the excluded).
+                keep = !(min.HasValue && max.HasValue && min.Value == max.Value && min.Value == _value);
+            }
+            if (keep) accepted.Add(z);
+        }
+        return accepted;
     }
 }
 
