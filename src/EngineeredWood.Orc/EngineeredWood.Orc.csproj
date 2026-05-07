@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" Version="22.1.0" />
+    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
     <PackageReference Include="Google.Protobuf" Version="3.*" />
     <PackageReference Include="Grpc.Tools" Version="2.*">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

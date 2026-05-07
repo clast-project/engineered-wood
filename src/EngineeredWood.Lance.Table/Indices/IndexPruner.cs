@@ -40,7 +40,7 @@ internal static class IndexPruner
     /// Returns the set of fragment ids that may contain rows matching
     /// the filter, or <c>null</c> when no useful pruning is possible.
     /// </summary>
-    public static async ValueTask<IReadOnlySet<uint>?> ComputeCandidatesAsync(
+    public static async ValueTask<HashSet<uint>?> ComputeCandidatesAsync(
         Predicate filter,
         IReadOnlyList<IndexInfo> indices,
         ITableFileSystem fs,
@@ -81,7 +81,7 @@ internal static class IndexPruner
         }
     }
 
-    private static async ValueTask<IReadOnlySet<uint>?> VisitAsync(
+    private static async ValueTask<HashSet<uint>?> VisitAsync(
         Predicate predicate,
         IReadOnlyDictionary<string, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,
@@ -137,7 +137,7 @@ internal static class IndexPruner
         }
     }
 
-    private static async ValueTask<IReadOnlySet<uint>?> VisitComparisonAsync(
+    private static async ValueTask<HashSet<uint>?> VisitComparisonAsync(
         ComparisonPredicate cp,
         IReadOnlyDictionary<string, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,
@@ -188,7 +188,7 @@ internal static class IndexPruner
         return ToFragmentSet(hits);
     }
 
-    private static async ValueTask<IReadOnlySet<uint>?> VisitInAsync(
+    private static async ValueTask<HashSet<uint>?> VisitInAsync(
         SetPredicate sp,
         IReadOnlyDictionary<string, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,

@@ -367,7 +367,7 @@ public sealed class LanceTable : IAsyncDisposable
         // over indexed columns, skip fragments whose index proves they
         // contain no matches. A null result means "no useful pruning"
         // and we scan every fragment as before.
-        IReadOnlySet<uint>? candidateFragments = null;
+        HashSet<uint>? candidateFragments = null;
         if (filter is not null)
         {
             var indices = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);

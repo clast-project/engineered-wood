@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" Version="22.1.0" />
+    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
     <PackageReference Include="Clast.FastLanes" Version="*" />
     <PackageReference Include="Clast.Fsst" Version="0.1.2" />
     <PackageReference Include="Google.Protobuf" Version="3.*" />

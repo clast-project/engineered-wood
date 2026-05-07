@@ -1,110 +1,37 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Buffers;
-using System.Linq.Expressions;
-using System.Reflection;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Memory;
 
 namespace EngineeredWood.Arrow;
 
 /// <summary>
-/// A <see cref="MemoryManager{T}"/> backed by aligned native memory allocated via
-/// <see cref="NativeMemory.AlignedAlloc"/>. Disposing frees the native memory.
+/// Forwards <see cref="INativeAllocationTracker.Track"/> notifications from
+/// <see cref="Apache.Arrow.Memory.NativeBuffer{TItem,TTracker}"/> into the static
+/// <see cref="NativeMemoryTracker"/> counters. Stateless struct so the JIT can
+/// specialise and avoid virtual dispatch.
 /// </summary>
-internal sealed class NativeMemoryManager : MemoryManager<byte>
+internal struct EngineeredWoodAllocationTracker : INativeAllocationTracker
 {
-    private unsafe void* _pointer;
-    private int _length;
-
-    public unsafe NativeMemoryManager(int length, int alignment, bool zeroFill)
-    {
-        _length = length;
-#if NET6_0_OR_GREATER
-        _pointer = NativeMemory.AlignedAlloc((nuint)length, (nuint)alignment);
-        if (zeroFill)
-            NativeMemory.Clear(_pointer, (nuint)length);
-#else
-        _pointer = (void*)Marshal.AllocHGlobal(length);
-        if (zeroFill)
-            Unsafe.InitBlockUnaligned(ref *(byte*)_pointer, 0, (uint)length);
-#endif
-        NativeMemoryTracker.OnAlloc(length);
-    }
-
-    public override Span<byte> GetSpan()
-    {
-        unsafe
-        {
-            return new Span<byte>(_pointer, _length);
-        }
-    }
-
-    public override MemoryHandle Pin(int elementIndex = 0)
-    {
-        unsafe
-        {
-            return new MemoryHandle((byte*)_pointer + elementIndex, pinnable: this);
-        }
-    }
-
-    public override void Unpin() { }
-
-    protected override void Dispose(bool disposing)
-    {
-        unsafe
-        {
-            if (_pointer != null)
-            {
-                NativeMemoryTracker.OnFree(_length);
-#if NET6_0_OR_GREATER
-                NativeMemory.AlignedFree(_pointer);
-#else
-                Marshal.FreeHGlobal((IntPtr)_pointer);
-#endif
-                _pointer = null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Reallocates the native buffer to <paramref name="newLength"/> bytes in place,
-    /// preserving existing data. Equivalent to <c>_aligned_realloc</c>.
-    /// </summary>
-    public unsafe void Reallocate(int newLength)
-    {
-        int oldLength = _length;
-#if NET6_0_OR_GREATER
-        _pointer = NativeMemory.AlignedRealloc(_pointer, (nuint)newLength, 64);
-#else
-        void* newPtr = (void*)Marshal.AllocHGlobal(newLength);
-        Buffer.MemoryCopy(_pointer, newPtr, newLength, Math.Min(oldLength, newLength));
-        Marshal.FreeHGlobal((IntPtr)_pointer);
-        _pointer = newPtr;
-#endif
-        _length = newLength;
-        NativeMemoryTracker.OnRealloc(oldLength, newLength);
-    }
+    public void Track(int count, long bytes) => NativeMemoryTracker.OnTrack(bytes);
 }
 
 /// <summary>
 /// A pre-sized native-memory buffer for accumulating column values.
 /// Values are written into the buffer via <see cref="Span"/>; calling <see cref="Build"/>
 /// transfers ownership to an <see cref="ArrowBuffer"/> (zero-copy).
-/// TODO: Why doesn't this slice by the length?
 /// </summary>
-internal sealed class NativeBuffer<T> : IDisposable where T : struct
+/// <remarks>
+/// Thin facade over <see cref="Apache.Arrow.Memory.NativeBuffer{TItem,TTracker}"/>
+/// (Apache.Arrow 23.0.0+). Exists to (1) keep <c>zeroFill</c> defaulting to <c>true</c>
+/// and amortised 2x grow semantics that match the rest of the codebase, and (2) wire in
+/// our <see cref="NativeMemoryTracker"/> so existing benchmarks and diagnostics keep
+/// working.
+/// </remarks>
+internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
 {
-    private static readonly Func<IMemoryOwner<byte>, ArrowBuffer> s_createBuffer = BuildCreateBuffer();
-    private const int Alignment = 64;
-
-    private NativeMemoryManager? _owner;
-    private int _byteLength;
-
-    /// <summary>Number of <typeparamref name="T"/> elements that fit in the buffer.</summary>
-    public int Length { get; private set; }
+    private Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>? _inner;
 
     /// <summary>Creates a native buffer sized for <paramref name="elementCount"/> elements of <typeparamref name="T"/>.</summary>
     /// <param name="elementCount">Number of elements.</param>
@@ -112,86 +39,56 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     /// will overwrite all bytes (e.g. value buffers for non-nullable columns).</param>
     public NativeBuffer(int elementCount, bool zeroFill = true)
     {
-        int elementSize = Unsafe.SizeOf<T>();
-        _byteLength = checked(elementCount * elementSize);
-        Length = elementCount;
-        _owner = new NativeMemoryManager(_byteLength, Alignment, zeroFill);
+        _inner = new Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>(
+            elementCount, zeroFill, default);
     }
+
+    /// <summary>Number of <typeparamref name="T"/> elements that fit in the buffer.</summary>
+    public int Length => _inner!.Length;
 
     /// <summary>Gets a <see cref="Span{T}"/> over the native buffer.</summary>
-    public Span<T> Span
-    {
-        get
-        {
-            var byteSpan = _owner!.Memory.Span;
-            return MemoryMarshal.Cast<byte, T>(byteSpan);
-        }
-    }
+    public Span<T> Span => _inner!.Span;
 
     /// <summary>Gets a <see cref="Span{T}"/> over the raw bytes of the native buffer.</summary>
-    public Span<byte> ByteSpan => _owner!.Memory.Span.Slice(0, _byteLength);
+    public Span<byte> ByteSpan => _inner!.ByteSpan;
 
     /// <summary>
     /// Transfers ownership to an <see cref="ArrowBuffer"/>. This instance becomes unusable.
     /// </summary>
     public ArrowBuffer Build(int usedBytes = -1)
     {
-        var owner = _owner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
-        _owner = null;
-        return s_createBuffer(owner);
+        var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
+        _inner = null;
+        return inner.Build();
     }
 
     /// <summary>
     /// Grows the buffer to hold at least <paramref name="newElementCount"/> elements,
-    /// preserving existing data.
+    /// preserving existing data. Newly added bytes are not zero-filled — callers that need
+    /// zeroed memory must overwrite or zero them explicitly.
     /// </summary>
     public void Grow(int newElementCount)
     {
-        if (newElementCount <= Length)
+        var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
+        if (newElementCount <= inner.Length)
             return;
 
-        // Exponential growth (2x) to amortise repeated grows
-        // TODO: There might be a size that's big enough to work for this case but not too big to overflow.
-        // We could use that instead of blindly doubling.
-        int newCount = Math.Max(newElementCount, checked(Length * 2));
-        int elementSize = Unsafe.SizeOf<T>();
-        int needed = checked(newCount * elementSize);
-
-        var owner = _owner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
-        owner.Reallocate(needed);
-
-        _byteLength = needed;
-        Length = newCount;
+        // Exponential growth (2x) to amortise repeated grows.
+        int newCount = Math.Max(newElementCount, checked(inner.Length * 2));
+        inner.Grow(newCount, zeroFill: false);
     }
 
     public void Dispose()
     {
-        IDisposable? disposable = _owner;
-        disposable?.Dispose();
-        _owner = null;
-    }
-
-    private static Func<IMemoryOwner<byte>, ArrowBuffer> BuildCreateBuffer()
-    {
-        // ArrowBuffer has an internal constructor: ArrowBuffer(IMemoryOwner<byte>)
-        // We use a compiled expression to call it efficiently.
-        var ctor = typeof(ArrowBuffer).GetConstructor(
-            BindingFlags.Instance | BindingFlags.NonPublic,
-            binder: null,
-            types: [typeof(IMemoryOwner<byte>)],
-            modifiers: null)
-            ?? throw new InvalidOperationException(
-                "Could not find ArrowBuffer(IMemoryOwner<byte>) constructor.");
-
-        var param = Expression.Parameter(typeof(IMemoryOwner<byte>), "owner");
-        var newExpr = Expression.New(ctor, param);
-        return Expression.Lambda<Func<IMemoryOwner<byte>, ArrowBuffer>>(newExpr, param).Compile();
+        _inner?.Dispose();
+        _inner = null;
     }
 }
 
 /// <summary>
-/// Thread-safe tracker for native (unmanaged) memory allocated by <see cref="NativeMemoryManager"/>.
-/// Provides live and peak counters for use in benchmarks and diagnostics.
+/// Thread-safe tracker for native (unmanaged) memory allocated by
+/// <see cref="NativeBuffer{T}"/>. Provides live and peak counters for use in
+/// benchmarks and diagnostics.
 /// </summary>
 public static class NativeMemoryTracker
 {
@@ -216,26 +113,23 @@ public static class NativeMemoryTracker
         Volatile.Write(ref s_totalAllocated, 0);
     }
 
-    internal static void OnAlloc(int bytes)
+    /// <summary>
+    /// Forwarded from <see cref="EngineeredWoodAllocationTracker.Track"/>. Positive
+    /// <paramref name="bytes"/> are allocations (or grow deltas); negative are frees
+    /// (or shrink deltas).
+    /// </summary>
+    internal static void OnTrack(long bytes)
     {
-        Interlocked.Add(ref s_totalAllocated, bytes);
-        long live = Interlocked.Add(ref s_liveBytes, bytes);
-        UpdatePeak(live);
-    }
-
-    internal static void OnFree(int bytes)
-    {
-        Interlocked.Add(ref s_liveBytes, -bytes);
-    }
-
-    internal static void OnRealloc(int oldBytes, int newBytes)
-    {
-        int delta = newBytes - oldBytes;
-        if (delta > 0)
-            Interlocked.Add(ref s_totalAllocated, delta);
-        long live = Interlocked.Add(ref s_liveBytes, delta);
-        if (delta > 0)
+        if (bytes > 0)
+        {
+            Interlocked.Add(ref s_totalAllocated, bytes);
+            long live = Interlocked.Add(ref s_liveBytes, bytes);
             UpdatePeak(live);
+        }
+        else if (bytes < 0)
+        {
+            Interlocked.Add(ref s_liveBytes, bytes);
+        }
     }
 
     private static void UpdatePeak(long candidate)

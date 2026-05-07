@@ -20,9 +20,9 @@ internal sealed class LanceArrowCompressionFactory : ICompressionCodecFactory
     public static LanceArrowCompressionFactory Instance { get; } = new();
 
     public ICompressionCodec CreateCodec(CompressionCodecType compressionCodecType)
-        => CreateCodec(compressionCodecType, compressionLevel: 0);
+        => CreateCodec(compressionCodecType, compressionLevel: null);
 
-    public ICompressionCodec CreateCodec(CompressionCodecType compressionCodecType, int compressionLevel)
+    public ICompressionCodec CreateCodec(CompressionCodecType compressionCodecType, int? compressionLevel)
         => compressionCodecType switch
         {
             CompressionCodecType.Zstd => new ZstdCodec(),
@@ -35,6 +35,11 @@ internal sealed class LanceArrowCompressionFactory : ICompressionCodecFactory
     {
         public int Decompress(ReadOnlyMemory<byte> source, Memory<byte> destination)
             => EwDecompressor.Decompress(EwCodec.Zstd, source.Span, destination.Span);
+
+        public void Compress(ReadOnlyMemory<byte> source, Stream destination)
+            => throw new NotSupportedException(
+                "LanceArrowCompressionFactory is decompress-only; pylance deletion files are read, not written, through Arrow IPC.");
+
         public void Dispose() { }
     }
 
@@ -42,6 +47,11 @@ internal sealed class LanceArrowCompressionFactory : ICompressionCodecFactory
     {
         public int Decompress(ReadOnlyMemory<byte> source, Memory<byte> destination)
             => EwDecompressor.Decompress(EwCodec.Lz4, source.Span, destination.Span);
+
+        public void Compress(ReadOnlyMemory<byte> source, Stream destination)
+            => throw new NotSupportedException(
+                "LanceArrowCompressionFactory is decompress-only; pylance deletion files are read, not written, through Arrow IPC.");
+
         public void Dispose() { }
     }
 }
