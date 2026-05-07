@@ -216,10 +216,12 @@ public class HandCraftedV21Tests
         long offFooter = offGboTable + 16;   // 1 global buffer × 16 bytes
 
         using var ms = new MemoryStream();
-        ms.Write(fdBytes);
-        ms.Write(chunkMeta);
-        ms.Write(chunkBytes_concat);
-        ms.Write(cmBytes);
+        // Use the (byte[], int, int) overload — it exists on every TFM,
+        // unlike the span-based Write(ReadOnlySpan<byte>) which is net5+.
+        ms.Write(fdBytes, 0, fdBytes.Length);
+        ms.Write(chunkMeta, 0, chunkMeta.Length);
+        ms.Write(chunkBytes_concat, 0, chunkBytes_concat.Length);
+        ms.Write(cmBytes, 0, cmBytes.Length);
 
         // CMO table: one entry per column (offset, size).
         WriteOffsetSize(ms, offColMeta, cmBytes.Length);
@@ -237,7 +239,7 @@ public class HandCraftedV21Tests
             Version: LanceVersion.V2_1);
         byte[] footerBytes = new byte[LanceFooter.Size];
         footer.WriteTo(footerBytes);
-        ms.Write(footerBytes);
+        ms.Write(footerBytes, 0, footerBytes.Length);
 
         return ms.ToArray();
     }
@@ -250,7 +252,8 @@ public class HandCraftedV21Tests
         Span<byte> buf = stackalloc byte[16];
         BinaryPrimitives.WriteInt64LittleEndian(buf.Slice(0, 8), offset);
         BinaryPrimitives.WriteInt64LittleEndian(buf.Slice(8, 8), size);
-        ms.Write(buf.ToArray());
+        byte[] arr = buf.ToArray();
+        ms.Write(arr, 0, arr.Length);
     }
 
     /// <summary>

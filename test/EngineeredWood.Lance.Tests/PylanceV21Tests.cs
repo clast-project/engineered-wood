@@ -1484,7 +1484,9 @@ public class PylanceV21Tests
         byte[] h = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(seed.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         while (sb.Length < size)
         {
-            sb.Append(Convert.ToHexString(h).ToLowerInvariant());
+            // BitConverter.ToString is available on every TFM (Convert.ToHexString
+            // is net5+ only). Lowercased to match the prior call's semantics.
+            sb.Append(BitConverter.ToString(h).Replace("-", "").ToLowerInvariant());
             h = sha.ComputeHash(h);
         }
         sb.Length = size;
