@@ -25,21 +25,48 @@ internal static class NestedAssembler
     /// <param name="leafDefLevels">Raw definition levels per leaf (null for required leaves).</param>
     /// <param name="leafRepLevels">Raw repetition levels per leaf (null for non-repeated leaves).</param>
     /// <param name="rowCount">Number of rows in the row group.</param>
+    /// <param name="extensionRegistry">
+    /// Optional Arrow extension registry. When supplied and the registry knows
+    /// <c>arrow.parquet.variant</c>, top-level groups annotated with the
+    /// Parquet <c>VARIANT</c> logical type are returned as
+    /// <see cref="VariantArray"/> rather than the bare storage
+    /// <see cref="StructArray"/>. Deeply nested VARIANT groups (inside
+    /// list/map) are not yet wrapped.
+    /// </param>
     /// <returns>Top-level arrays matching the root's children.</returns>
     public static IArrowArray[] Assemble(
         SchemaNode root,
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
-        int rowCount)
+        int rowCount,
+        ExtensionTypeRegistry? extensionRegistry = null)
     {
         var result = new IArrowArray[root.Children.Count];
         int leafIndex = 0;
 
         for (int i = 0; i < root.Children.Count; i++)
-            result[i] = AssembleNode(root.Children[i], leafArrays, leafDefLevels, leafRepLevels, rowCount, ref leafIndex);
+        {
+            var child = root.Children[i];
+            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, rowCount, ref leafIndex);
+            result[i] = WrapTopLevelExtension(array, child, extensionRegistry);
+        }
 
         return result;
+    }
+
+    private static IArrowArray WrapTopLevelExtension(
+        IArrowArray array, SchemaNode node, ExtensionTypeRegistry? registry)
+    {
+        if (registry is null) return array;
+        if (node.Element.LogicalType is LogicalType.VariantType
+            && array is StructArray sa
+            && registry.TryGetDefinition("arrow.parquet.variant", out var def)
+            && def.TryCreateType(sa.Data.DataType, metadata: string.Empty, out var ext))
+        {
+            return ext.CreateArray(sa);
+        }
+        return array;
     }
 
     private static IArrowArray AssembleNode(

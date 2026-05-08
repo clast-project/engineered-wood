@@ -698,7 +698,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         var topLevelArrays = NestedAssembler.Assemble(
-            ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, ctx.RowCount);
+            ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, ctx.RowCount,
+            _options.ExtensionRegistry);
 
         return BuildRecordBatch(ctx.TopLevelFields!, topLevelArrays, ctx.RowCount);
     }

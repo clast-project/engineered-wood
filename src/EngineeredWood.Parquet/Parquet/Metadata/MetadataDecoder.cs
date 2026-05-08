@@ -174,6 +174,7 @@ internal static class MetadataDecoder
     private static readonly LogicalType CachedBson = new LogicalType.BsonType();
     private static readonly LogicalType CachedUuid = new LogicalType.UuidType();
     private static readonly LogicalType CachedFloat16 = new LogicalType.Float16Type();
+    private static readonly LogicalType CachedVariant = new LogicalType.VariantType();
 
     private static LogicalType ReadLogicalType(ref ThriftCompactReader reader)
     {
@@ -240,6 +241,10 @@ internal static class MetadataDecoder
                 case 15: // FLOAT16
                     SkipEmptyStruct(ref reader);
                     result = CachedFloat16;
+                    break;
+                case 16: // VARIANT
+                    SkipEmptyStruct(ref reader);
+                    result = CachedVariant;
                     break;
                 default:
                     reader.Skip(type);

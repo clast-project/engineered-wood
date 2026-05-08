@@ -87,7 +87,28 @@ internal static class ArrowSchemaConverter
             childFields[i] = NodeToArrowField(node.Children[i], options);
 
         var structType = new StructType(childFields);
-        return new Apache.Arrow.Field(node.Name, structType, nullable);
+        IArrowType groupType = MaybeWrapAsExtensionStruct(structType, node.Element.LogicalType, options);
+        return new Apache.Arrow.Field(node.Name, groupType, nullable);
+    }
+
+    /// <summary>
+    /// When a group has a logical-type annotation that maps to an Arrow
+    /// extension over <see cref="StructType"/> (currently <c>VARIANT → arrow.parquet.variant</c>),
+    /// and the caller has registered that extension via
+    /// <see cref="ParquetReadOptions.ExtensionRegistry"/>, return the wrapped
+    /// extension type. Otherwise return the bare struct.
+    /// </summary>
+    private static IArrowType MaybeWrapAsExtensionStruct(
+        StructType storage, LogicalType? logicalType, ParquetReadOptions? options)
+    {
+        if (options?.ExtensionRegistry is { } reg
+            && logicalType is LogicalType.VariantType
+            && reg.TryGetDefinition("arrow.parquet.variant", out var def)
+            && def.TryCreateType(storage, metadata: string.Empty, out var ext))
+        {
+            return ext;
+        }
+        return storage;
     }
 
     internal static bool IsListNode(SchemaNode node) =>

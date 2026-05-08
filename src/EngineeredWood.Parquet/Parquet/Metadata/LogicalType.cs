@@ -30,6 +30,7 @@ public abstract record LogicalType
     public sealed record BsonType : LogicalType;
     public sealed record UuidType : LogicalType;
     public sealed record Float16Type : LogicalType;
+    public sealed record VariantType : LogicalType;
 
     public sealed record DecimalType(int Scale, int Precision) : LogicalType;
     public sealed record TimeType(bool IsAdjustedToUtc, TimeUnit Unit) : LogicalType;

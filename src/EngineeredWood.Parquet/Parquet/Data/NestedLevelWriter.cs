@@ -76,6 +76,21 @@ internal static class NestedLevelWriter
         int[]? parentDefLevels, int[]? parentRepLevels,
         int parentCount)
     {
+        // ExtensionType (e.g. VariantType wrapping StructType): unwrap to the
+        // storage array and continue with the storage type. The schema-side
+        // mapping in ArrowToSchemaConverter has already emitted the matching
+        // logical-type annotation; here we only care about the physical
+        // layout, which is the storage type's.
+        if (field.DataType is ExtensionType ext)
+        {
+            var storageField = new Field(field.Name, ext.StorageType, field.IsNullable);
+            var storageArray = array is ExtensionArray ea ? ea.Storage : array;
+            DecomposeRecursive(storageArray, storageField, path, leaves,
+                parentDefLevel, parentRepLevel,
+                parentDefLevels, parentRepLevels, parentCount);
+            return;
+        }
+
         switch (field.DataType)
         {
             case StructType:

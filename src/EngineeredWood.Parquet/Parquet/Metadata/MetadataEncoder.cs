@@ -207,6 +207,10 @@ internal static class MetadataEncoder
                 writer.WriteFieldHeader(ThriftType.Struct, 15);
                 WriteEmptyStruct(writer);
                 break;
+            case LogicalType.VariantType:
+                writer.WriteFieldHeader(ThriftType.Struct, 16);
+                WriteEmptyStruct(writer);
+                break;
             // UnknownLogicalType is not written — it only exists for forward-compat on read
         }
 

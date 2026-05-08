@@ -55,6 +55,15 @@ internal static class ArrowToSchemaConverter
             case MapType mapType:
                 AddMapField(elements, field.Name, repetition, mapType, fieldId);
                 return;
+
+            // ExtensionType over a nested storage type: emit the storage as a
+            // group, with the matching Parquet logical-type annotation. The
+            // VARIANT extension takes this path; future extensions over List/
+            // Map (none defined yet) would as well.
+            case ExtensionType ext when ext.StorageType is StructType extStruct:
+                AddStructField(elements, field.Name, repetition, extStruct, fieldId,
+                    logicalType: GetExtensionLogicalType(ext));
+                return;
         }
 
         var (physicalType, typeLength, logicalType, convertedType, scale, precision) =
@@ -96,7 +105,8 @@ internal static class ArrowToSchemaConverter
 
     private static void AddStructField(
         List<SchemaElement> elements, string name,
-        FieldRepetitionType repetition, StructType structType, int? fieldId = null)
+        FieldRepetitionType repetition, StructType structType, int? fieldId = null,
+        LogicalType? logicalType = null)
     {
         elements.Add(new SchemaElement
         {
@@ -104,11 +114,24 @@ internal static class ArrowToSchemaConverter
             RepetitionType = repetition,
             NumChildren = structType.Fields.Count,
             FieldId = fieldId,
+            LogicalType = logicalType,
         });
 
         foreach (var child in structType.Fields)
             AddField(elements, child);
     }
+
+    /// <summary>
+    /// Maps an Arrow <see cref="ExtensionType"/> name to the Parquet logical
+    /// type annotation that should ride with the storage layout. Returns null
+    /// for any extension we don't have a specialised mapping for; callers
+    /// then write the bare storage with no annotation.
+    /// </summary>
+    private static LogicalType? GetExtensionLogicalType(ExtensionType ext) => ext.Name switch
+    {
+        "arrow.parquet.variant" => new LogicalType.VariantType(),
+        _ => null,
+    };
 
     private static void AddListField(
         List<SchemaElement> elements, string name,
