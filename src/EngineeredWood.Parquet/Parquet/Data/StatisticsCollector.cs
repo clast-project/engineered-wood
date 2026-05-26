@@ -22,26 +22,57 @@ internal static class StatisticsCollector
     /// <summary>
     /// Computes statistics for a column chunk.
     /// </summary>
+    /// <param name="floatingPointTotalOrder">
+    /// When <see langword="true"/>, FLOAT/DOUBLE min/max follow IEEE 754 total
+    /// order: an all-NaN chunk records the NaN value as its bounds rather than
+    /// omitting them. When <see langword="false"/> (the TYPE_ORDER default) an
+    /// all-NaN chunk omits min/max. NaN is excluded from the bounds either way,
+    /// and a <c>nan_count</c> is always recorded for FLOAT/DOUBLE columns.
+    /// </param>
     public static Statistics Compute(
         IArrowArray array,
         PhysicalType physicalType,
         int typeLength,
         int[]? defLevels,
         int nonNullCount,
-        int rowCount)
+        int rowCount,
+        bool floatingPointTotalOrder = false)
     {
         long nullCount = rowCount - nonNullCount;
+        bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
 
         if (nonNullCount == 0)
-            return new Statistics { NullCount = nullCount };
+        {
+            // No values ⇒ no NaN. nan_count is mandatory for FP columns even at zero.
+            return new Statistics { NullCount = nullCount, NanCount = isFloatingPoint ? 0L : null };
+        }
+
+        // Floating-point columns are scanned separately so the NaN count, min,
+        // and max all come from a single pass.
+        if (isFloatingPoint)
+        {
+            var (fpMin, fpMax, nanCount) = physicalType == PhysicalType.Float
+                ? ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder)
+                : ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder);
+
+            return new Statistics
+            {
+                NullCount = nullCount,
+                Min = fpMin,
+                Max = fpMax,
+                MinValue = fpMin,
+                MaxValue = fpMax,
+                IsMinValueExact = fpMin != null ? true : (bool?)null,
+                IsMaxValueExact = fpMax != null ? true : (bool?)null,
+                NanCount = nanCount,
+            };
+        }
 
         var (minBytes, maxBytes, minExact, maxExact) = physicalType switch
         {
             PhysicalType.Boolean => WithExact(ComputeBooleanMinMax(array, defLevels)),
             PhysicalType.Int32 => WithExact(ComputeMinMax<int>(array, defLevels, CompareInt32)),
             PhysicalType.Int64 => WithExact(ComputeMinMax<long>(array, defLevels, CompareInt64)),
-            PhysicalType.Float => WithExact(ComputeFloatMinMax(array, defLevels)),
-            PhysicalType.Double => WithExact(ComputeDoubleMinMax(array, defLevels)),
             PhysicalType.ByteArray => ComputeByteArrayMinMaxTruncated(array, defLevels),
             PhysicalType.FixedLenByteArray => ComputeFlbaMinMaxTruncated(array, defLevels, typeLength),
             _ => (null, null, true, true),
@@ -331,17 +362,25 @@ internal static class StatisticsCollector
         return (minBytes, maxBytes);
     }
 
-    private static (byte[]?, byte[]?) ComputeFloatMinMax(IArrowArray array, int[]? defLevels)
+    private static (byte[]?, byte[]?, long) ComputeFloatMinMax(
+        IArrowArray array, int[]? defLevels, bool totalOrder)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
         bool first = true;
         float min = 0, max = 0;
+        long nanCount = 0;
+        float firstNaN = 0;
 
         for (int i = 0; i < array.Length; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             float val = valueBuffer[i];
-            if (float.IsNaN(val)) continue; // NaN excluded from stats
+            if (float.IsNaN(val))
+            {
+                if (nanCount == 0) firstNaN = val;
+                nanCount++;
+                continue; // NaN excluded from min/max
+            }
             if (first)
             {
                 min = max = val;
@@ -363,31 +402,37 @@ internal static class StatisticsCollector
             }
         }
 
-        if (first) return (null, null); // all NaN
+        if (first)
+        {
+            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk
+            // records the NaN as both bounds; under TYPE_ORDER, min/max are omitted.
+            if (totalOrder && nanCount > 0)
+                return (FloatToBytes(firstNaN), FloatToBytes(firstNaN), nanCount);
+            return (null, null, nanCount);
+        }
 
-        var minBytes = new byte[4];
-        var maxBytes = new byte[4];
-#if NET8_0_OR_GREATER
-        BinaryPrimitives.WriteSingleLittleEndian(minBytes, min);
-        BinaryPrimitives.WriteSingleLittleEndian(maxBytes, max);
-#else
-        BitConverter.GetBytes(min).CopyTo(minBytes, 0);
-        BitConverter.GetBytes(max).CopyTo(maxBytes, 0);
-#endif
-        return (minBytes, maxBytes);
+        return (FloatToBytes(min), FloatToBytes(max), nanCount);
     }
 
-    private static (byte[]?, byte[]?) ComputeDoubleMinMax(IArrowArray array, int[]? defLevels)
+    private static (byte[]?, byte[]?, long) ComputeDoubleMinMax(
+        IArrowArray array, int[]? defLevels, bool totalOrder)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
         bool first = true;
         double min = 0, max = 0;
+        long nanCount = 0;
+        double firstNaN = 0;
 
         for (int i = 0; i < array.Length; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             double val = valueBuffer[i];
-            if (double.IsNaN(val)) continue;
+            if (double.IsNaN(val))
+            {
+                if (nanCount == 0) firstNaN = val;
+                nanCount++;
+                continue;
+            }
             if (first)
             {
                 min = max = val;
@@ -409,18 +454,36 @@ internal static class StatisticsCollector
             }
         }
 
-        if (first) return (null, null);
+        if (first)
+        {
+            if (totalOrder && nanCount > 0)
+                return (DoubleToBytes(firstNaN), DoubleToBytes(firstNaN), nanCount);
+            return (null, null, nanCount);
+        }
 
-        var minBytes = new byte[8];
-        var maxBytes = new byte[8];
+        return (DoubleToBytes(min), DoubleToBytes(max), nanCount);
+    }
+
+    private static byte[] FloatToBytes(float value)
+    {
+        var bytes = new byte[4];
 #if NET8_0_OR_GREATER
-        BinaryPrimitives.WriteDoubleLittleEndian(minBytes, min);
-        BinaryPrimitives.WriteDoubleLittleEndian(maxBytes, max);
+        BinaryPrimitives.WriteSingleLittleEndian(bytes, value);
 #else
-        BitConverter.GetBytes(min).CopyTo(minBytes, 0);
-        BitConverter.GetBytes(max).CopyTo(maxBytes, 0);
+        BitConverter.GetBytes(value).CopyTo(bytes, 0);
 #endif
-        return (minBytes, maxBytes);
+        return bytes;
+    }
+
+    private static byte[] DoubleToBytes(double value)
+    {
+        var bytes = new byte[8];
+#if NET8_0_OR_GREATER
+        BinaryPrimitives.WriteDoubleLittleEndian(bytes, value);
+#else
+        BitConverter.GetBytes(value).CopyTo(bytes, 0);
+#endif
+        return bytes;
     }
 
     private static (byte[]?, byte[]?, bool, bool) ComputeByteArrayMinMaxTruncated(

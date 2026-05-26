@@ -139,6 +139,36 @@ public class CrossValidationTests : IDisposable
     }
 
     [Fact]
+    public async Task EWWrite_PSRead_Float_Ieee754TotalOrder()
+    {
+        // Opt-in IEEE754 total order writes the new ColumnOrder union member and a
+        // nan_count. A legacy reader (ParquetSharp) must still read the column's
+        // values without error, even if it ignores the unfamiliar ordering.
+        var path = TempPath("ew-float-total-order.parquet");
+        var values = new float[] { 0f, 1.5f, -3.14f, float.NaN, 42f };
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", FloatType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+            [new FloatArray.Builder().AppendRange(values).Build()], values.Length);
+
+        await WriteEW(path, batch,
+            new ParquetWriteOptions { FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder });
+
+        using var reader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = reader.RowGroup(0);
+        using var col = rg.Column(0).LogicalReader<float>();
+        var buffer = new float[values.Length];
+        col.ReadBatch(buffer);
+        Assert.Equal(0f, buffer[0]);
+        Assert.Equal(1.5f, buffer[1]);
+        Assert.Equal(-3.14f, buffer[2]);
+        Assert.True(float.IsNaN(buffer[3]));
+        Assert.Equal(42f, buffer[4]);
+    }
+
+    [Fact]
     public async Task EWWrite_PSRead_Double()
     {
         var path = TempPath("ew-double.parquet");

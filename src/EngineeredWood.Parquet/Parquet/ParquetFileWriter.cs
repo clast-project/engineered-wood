@@ -371,6 +371,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             RowGroups = _rowGroups,
             CreatedBy = _options.CreatedBy,
             KeyValueMetadata = _options.KeyValueMetadata,
+            ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
         };
 
         // Encode footer to Thrift

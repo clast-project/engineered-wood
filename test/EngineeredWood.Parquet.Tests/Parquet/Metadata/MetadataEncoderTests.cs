@@ -224,6 +224,79 @@ public class MetadataEncoderTests
     }
 
     [Fact]
+    public void RoundTrip_NanCountAndColumnOrders()
+    {
+        var original = new FileMetaData
+        {
+            Version = 2,
+            Schema =
+            [
+                new SchemaElement { Name = "schema", NumChildren = 2 },
+                new SchemaElement
+                {
+                    Name = "id",
+                    Type = PhysicalType.Int32,
+                    RepetitionType = FieldRepetitionType.Required,
+                },
+                new SchemaElement
+                {
+                    Name = "measure",
+                    Type = PhysicalType.Double,
+                    RepetitionType = FieldRepetitionType.Required,
+                },
+            ],
+            NumRows = 10,
+            RowGroups =
+            [
+                new RowGroup
+                {
+                    Columns =
+                    [
+                        new ColumnChunk
+                        {
+                            FileOffset = 4,
+                            MetaData = new ColumnMetaData
+                            {
+                                Type = PhysicalType.Double,
+                                Encodings = [Encoding.Plain],
+                                PathInSchema = ["measure"],
+                                Codec = CompressionCodec.Uncompressed,
+                                NumValues = 10,
+                                TotalUncompressedSize = 80,
+                                TotalCompressedSize = 80,
+                                DataPageOffset = 4,
+                                Statistics = new Statistics
+                                {
+                                    NullCount = 0,
+                                    MinValue = BitConverter.GetBytes(-1.5),
+                                    MaxValue = BitConverter.GetBytes(9.0),
+                                    NanCount = 3,
+                                },
+                            },
+                        },
+                    ],
+                    TotalByteSize = 80,
+                    NumRows = 10,
+                },
+            ],
+            ColumnOrders = [ColumnOrder.TypeDefined, ColumnOrder.Ieee754TotalOrder],
+            CreatedBy = "EngineeredWood",
+        };
+
+        byte[] encoded = MetadataEncoder.EncodeFileMetaData(original);
+        var decoded = MetadataDecoder.DecodeFileMetaData(encoded);
+
+        var stats = decoded.RowGroups[0].Columns[0].MetaData!.Statistics!;
+        Assert.Equal(3, stats.NanCount);
+        Assert.Equal(BitConverter.GetBytes(-1.5), stats.MinValue);
+
+        Assert.NotNull(decoded.ColumnOrders);
+        Assert.Equal(
+            [ColumnOrder.TypeDefined, ColumnOrder.Ieee754TotalOrder],
+            decoded.ColumnOrders);
+    }
+
+    [Fact]
     public void RoundTrip_LogicalTypes_Time()
     {
         var original = new FileMetaData

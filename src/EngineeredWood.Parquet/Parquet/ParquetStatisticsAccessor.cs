@@ -25,7 +25,8 @@ namespace EngineeredWood.Parquet;
 /// sort order) when present, falling back to the legacy <c>min</c>/<c>max</c>
 /// fields for backwards compatibility on signed numeric types only.
 /// </remarks>
-public sealed class ParquetStatisticsAccessor : IStatisticsAccessor<RowGroup>
+public sealed class ParquetStatisticsAccessor
+    : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>
 {
     private readonly SchemaDescriptor _schema;
     private readonly Dictionary<string, int> _nameToLeafIndex;
@@ -52,6 +53,9 @@ public sealed class ParquetStatisticsAccessor : IStatisticsAccessor<RowGroup>
 
     public long? GetNullCount(RowGroup rg, string column) =>
         TryGetColumn(rg, column, out _, out var stats) ? stats!.NullCount : null;
+
+    public long? GetNanCount(RowGroup rg, string column) =>
+        TryGetColumn(rg, column, out _, out var stats) ? stats!.NanCount : null;
 
     public long? GetValueCount(RowGroup rg, string column) => rg.NumRows;
 
@@ -140,10 +144,8 @@ public sealed class ParquetStatisticsAccessor : IStatisticsAccessor<RowGroup>
                 ? (LiteralValue?)LiteralValue.Of(bytes[0] != 0) : null,
             PhysicalType.Int32 => DecodeInt32(bytes, logical),
             PhysicalType.Int64 => DecodeInt64(bytes, logical),
-            PhysicalType.Float => bytes.Length >= 4
-                ? (LiteralValue?)LiteralValue.Of(ReadFloatLittleEndian(bytes)) : null,
-            PhysicalType.Double => bytes.Length >= 8
-                ? (LiteralValue?)LiteralValue.Of(ReadDoubleLittleEndian(bytes)) : null,
+            PhysicalType.Float => DecodeFloat(bytes),
+            PhysicalType.Double => DecodeDouble(bytes),
             PhysicalType.ByteArray => DecodeByteArray(bytes, logical),
             PhysicalType.FixedLenByteArray => DecodeFixedLenByteArray(desc, bytes, logical),
             // INT96 sort order is undefined per the Parquet spec.
@@ -152,11 +154,28 @@ public sealed class ParquetStatisticsAccessor : IStatisticsAccessor<RowGroup>
         };
     }
 
-    private static float ReadFloatLittleEndian(byte[] bytes) =>
-        MemoryMarshal.Read<float>(bytes);
+    /// <summary>
+    /// Decodes a FLOAT bound, returning <see langword="null"/> for a NaN bound.
+    /// A NaN min/max (possible only under IEEE 754 total order, when every value
+    /// is NaN) is not a usable range endpoint, so the evaluator treats it as
+    /// unknown rather than pruning on it.
+    /// </summary>
+    private static LiteralValue? DecodeFloat(byte[] bytes)
+    {
+        if (bytes.Length < 4) return null;
+        float value = MemoryMarshal.Read<float>(bytes);
+        if (float.IsNaN(value)) return null;
+        return LiteralValue.Of(value);
+    }
 
-    private static double ReadDoubleLittleEndian(byte[] bytes) =>
-        MemoryMarshal.Read<double>(bytes);
+    /// <summary>Decodes a DOUBLE bound, returning <see langword="null"/> for a NaN bound.</summary>
+    private static LiteralValue? DecodeDouble(byte[] bytes)
+    {
+        if (bytes.Length < 8) return null;
+        double value = MemoryMarshal.Read<double>(bytes);
+        if (double.IsNaN(value)) return null;
+        return LiteralValue.Of(value);
+    }
 
     private static LiteralValue? DecodeInt32(byte[] bytes, LogicalType? logical)
     {

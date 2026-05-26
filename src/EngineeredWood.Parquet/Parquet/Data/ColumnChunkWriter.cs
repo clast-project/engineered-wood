@@ -156,13 +156,19 @@ internal static class ColumnChunkWriter
                 maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options);
         }
 
-        // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total))
-        var stats = dictResult != null
+        // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
+        // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
+        // not just the distinct dictionary entries.
+        bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+        bool floatingPointTotalOrder =
+            options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+        var stats = dictResult != null && !isFloatingPoint
             ? StatisticsCollector.ComputeFromDictEntries(
                 dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
                 physicalType, typeLength, rowCount - nonNullCount)
             : StatisticsCollector.Compute(
-                array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount);
+                array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
+                floatingPointTotalOrder);
         result.MetaData.Statistics = stats;
 
         // Build Bloom filter if enabled for this column.

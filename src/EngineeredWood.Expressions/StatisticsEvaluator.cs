@@ -374,10 +374,47 @@ public static class StatisticsEvaluator
             }
             case UnaryOperator.IsNaN:
             case UnaryOperator.IsNotNaN:
-                // NaN counts are not in standard statistics; cannot decide.
-                return FilterResult.Unknown;
+                return EvaluateNaN(unary.Op, column!, stats, accessor);
             default:
                 return FilterResult.Unknown;
+        }
+    }
+
+    /// <summary>
+    /// Resolves IsNaN / IsNotNaN using a NaN count when the accessor exposes one
+    /// (<see cref="INanCountAccessor{TStats}"/>). NaN values are non-null, so a
+    /// definitive AlwaysTrue/AlwaysFalse also requires the absence of nulls.
+    /// </summary>
+    private static FilterResult EvaluateNaN<TStats>(
+        UnaryOperator op, string column, TStats stats, IStatisticsAccessor<TStats> accessor)
+    {
+        if (accessor is not INanCountAccessor<TStats> nanAccessor)
+            return FilterResult.Unknown;
+
+        long? nanCount = nanAccessor.GetNanCount(stats, column);
+        if (!nanCount.HasValue)
+            return FilterResult.Unknown; // unknown ⇒ NaNs may be present
+
+        long? nullCount = accessor.GetNullCount(stats, column);
+        long? valueCount = accessor.GetValueCount(stats, column);
+
+        bool noNaN = nanCount.Value == 0;
+        bool noNull = nullCount is 0;
+        // Every non-null value is NaN (only decidable when both counts are known).
+        bool allNaN = nullCount.HasValue && valueCount.HasValue && nanCount.Value > 0
+            && nanCount.Value == valueCount.Value - nullCount.Value;
+
+        if (op == UnaryOperator.IsNaN)
+        {
+            if (noNaN) return FilterResult.AlwaysFalse;
+            if (allNaN && noNull) return FilterResult.AlwaysTrue;
+            return FilterResult.Unknown;
+        }
+        else // IsNotNaN
+        {
+            if (noNaN && noNull) return FilterResult.AlwaysTrue;
+            if (allNaN && noNull) return FilterResult.AlwaysFalse;
+            return FilterResult.Unknown;
         }
     }
 

@@ -30,6 +30,7 @@ internal static class MetadataDecoder
         IReadOnlyList<RowGroup>? rowGroups = null;
         IReadOnlyList<KeyValue>? keyValueMetadata = null;
         string? createdBy = null;
+        IReadOnlyList<ColumnOrder>? columnOrders = null;
 
         while (true)
         {
@@ -56,6 +57,9 @@ internal static class MetadataDecoder
                 case 6: // created_by: string
                     createdBy = reader.ReadString();
                     break;
+                case 7: // column_orders: list<ColumnOrder>
+                    columnOrders = ReadColumnOrderList(ref reader);
+                    break;
                 default:
                     reader.Skip(type);
                     break;
@@ -72,7 +76,55 @@ internal static class MetadataDecoder
             RowGroups = rowGroups ?? throw new ParquetFormatException("FileMetaData missing required field: row_groups"),
             KeyValueMetadata = keyValueMetadata,
             CreatedBy = createdBy,
+            ColumnOrders = columnOrders,
         };
+    }
+
+    private static ColumnOrder[] ReadColumnOrderList(ref ThriftCompactReader reader)
+    {
+        var (elemType, count) = reader.ReadListHeader();
+        var array = new ColumnOrder[count];
+        for (int i = 0; i < count; i++)
+        {
+            if (elemType == ThriftType.Struct)
+            {
+                array[i] = ReadColumnOrder(ref reader);
+            }
+            else
+            {
+                reader.Skip(elemType);
+                array[i] = ColumnOrder.Undefined;
+            }
+        }
+        return array;
+    }
+
+    /// <summary>
+    /// Reads a single <c>ColumnOrder</c> union. The union is encoded as a struct
+    /// with exactly one (empty-struct) field set; an unrecognized or absent
+    /// member decodes to <see cref="ColumnOrder.Undefined"/>.
+    /// </summary>
+    private static ColumnOrder ReadColumnOrder(ref ThriftCompactReader reader)
+    {
+        reader.PushStruct();
+
+        var order = ColumnOrder.Undefined;
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+
+            order = fid switch
+            {
+                1 => ColumnOrder.TypeDefined,        // TYPE_ORDER: TypeDefinedOrder
+                2 => ColumnOrder.Ieee754TotalOrder,  // IEEE_754_TOTAL_ORDER: IEEE754TotalOrder
+                _ => order,                          // unknown future member
+            };
+            reader.Skip(type); // consume the (empty) member struct
+        }
+
+        reader.PopStruct();
+        return order;
     }
 
     private static SchemaElement[] ReadSchemaList(ref ThriftCompactReader reader)
@@ -606,6 +658,7 @@ internal static class MetadataDecoder
         byte[]? minValue = null;
         bool? isMaxValueExact = null;
         bool? isMinValueExact = null;
+        long? nanCount = null;
 
         while (true)
         {
@@ -638,6 +691,9 @@ internal static class MetadataDecoder
                 case 8: // is_min_value_exact: bool
                     isMinValueExact = reader.ReadBool();
                     break;
+                case 9: // nan_count: i64 (PARQUET-2249)
+                    nanCount = reader.ReadZigZagInt64();
+                    break;
                 default:
                     reader.Skip(type);
                     break;
@@ -656,6 +712,7 @@ internal static class MetadataDecoder
             MinValue = minValue,
             IsMaxValueExact = isMaxValueExact,
             IsMinValueExact = isMinValueExact,
+            NanCount = nanCount,
         };
     }
 

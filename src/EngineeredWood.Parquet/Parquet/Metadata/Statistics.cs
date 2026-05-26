@@ -32,4 +32,17 @@ public sealed class Statistics
 
     /// <summary>Whether min value is exact (not truncated).</summary>
     public bool? IsMinValueExact { get; init; }
+
+    /// <summary>
+    /// Count of NaN values in the column. Only meaningful for the FLOAT and
+    /// DOUBLE physical types (and the FLOAT16 logical type). NaNs are excluded
+    /// from <see cref="Min"/>/<see cref="Max"/> and <see cref="MinValue"/>/
+    /// <see cref="MaxValue"/> under the default TYPE_ORDER ordering.
+    /// <para>
+    /// <see langword="null"/> means the writer did not record a NaN count; per
+    /// PARQUET-2249 readers MUST then assume NaNs may be present (i.e. treat the
+    /// count as unknown rather than zero).
+    /// </para>
+    /// </summary>
+    public long? NanCount { get; init; }
 }

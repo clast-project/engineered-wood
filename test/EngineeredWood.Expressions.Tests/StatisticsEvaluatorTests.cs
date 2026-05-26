@@ -18,9 +18,10 @@ public class StatisticsEvaluatorTests
             string col,
             LiteralValue? min = null, LiteralValue? max = null,
             long? nullCount = null, long? valueCount = null,
-            bool minExact = true, bool maxExact = true)
+            bool minExact = true, bool maxExact = true,
+            long? nanCount = null)
         {
-            Columns[col] = new ColumnStats(min, max, nullCount, valueCount, minExact, maxExact);
+            Columns[col] = new ColumnStats(min, max, nullCount, valueCount, minExact, maxExact, nanCount);
             return this;
         }
     }
@@ -28,9 +29,11 @@ public class StatisticsEvaluatorTests
     private sealed record ColumnStats(
         LiteralValue? Min, LiteralValue? Max,
         long? NullCount, long? ValueCount,
-        bool MinExact, bool MaxExact);
+        bool MinExact, bool MaxExact,
+        long? NanCount);
 
-    private sealed class TestAccessor : IStatisticsAccessor<TestStats>
+    private sealed class TestAccessor
+        : IStatisticsAccessor<TestStats>, INanCountAccessor<TestStats>
     {
         public LiteralValue? GetMinValue(TestStats s, string c) =>
             s.Columns.TryGetValue(c, out var v) ? v.Min : null;
@@ -44,6 +47,8 @@ public class StatisticsEvaluatorTests
             !s.Columns.TryGetValue(c, out var v) || v.MinExact;
         public bool IsMaxExact(TestStats s, string c) =>
             !s.Columns.TryGetValue(c, out var v) || v.MaxExact;
+        public long? GetNanCount(TestStats s, string c) =>
+            s.Columns.TryGetValue(c, out var v) ? v.NanCount : null;
     }
 
     private static readonly TestAccessor Accessor = new();
@@ -235,6 +240,72 @@ public class StatisticsEvaluatorTests
     {
         var stats = new TestStats().With("x", nullCount: 50, valueCount: 50);
         Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.IsNotNull("x"), stats));
+    }
+
+    // ── IS NaN / IS NOT NaN ──
+
+    private static UnaryPredicate IsNaN(string col) =>
+        Expressions.IsNaN(new UnboundReference(col));
+
+    private static UnaryPredicate IsNotNaN(string col) =>
+        Expressions.IsNotNaN(new UnboundReference(col));
+
+    [Fact]
+    public void IsNaN_NanCountZero_AlwaysFalse()
+    {
+        var stats = new TestStats().With("x", nanCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(IsNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNaN_AllValuesNaN_NoNulls_AlwaysTrue()
+    {
+        var stats = new TestStats().With("x", nullCount: 0, valueCount: 10, nanCount: 10);
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(IsNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNaN_SomeNaN_Unknown()
+    {
+        var stats = new TestStats().With("x", nullCount: 0, valueCount: 10, nanCount: 3);
+        Assert.Equal(FilterResult.Unknown, Eval(IsNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNaN_AllNaNButHasNulls_Unknown()
+    {
+        // NaNs cover every non-null value, but the nulls make IsNaN not provably all-true.
+        var stats = new TestStats().With("x", nullCount: 2, valueCount: 12, nanCount: 10);
+        Assert.Equal(FilterResult.Unknown, Eval(IsNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNaN_UnknownNanCount_Unknown()
+    {
+        // No nan_count recorded ⇒ NaNs may be present.
+        var stats = new TestStats().With("x", nullCount: 0, valueCount: 10);
+        Assert.Equal(FilterResult.Unknown, Eval(IsNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNotNaN_NanCountZero_NoNulls_AlwaysTrue()
+    {
+        var stats = new TestStats().With("x", nullCount: 0, valueCount: 10, nanCount: 0);
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(IsNotNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNotNaN_AllValuesNaN_NoNulls_AlwaysFalse()
+    {
+        var stats = new TestStats().With("x", nullCount: 0, valueCount: 10, nanCount: 10);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(IsNotNaN("x"), stats));
+    }
+
+    [Fact]
+    public void IsNotNaN_NanCountZeroButHasNulls_Unknown()
+    {
+        var stats = new TestStats().With("x", nullCount: 2, valueCount: 12, nanCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(IsNotNaN("x"), stats));
     }
 
     // ── In / NotIn ──

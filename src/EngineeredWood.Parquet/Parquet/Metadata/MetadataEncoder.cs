@@ -63,7 +63,45 @@ internal static class MetadataEncoder
             writer.WriteString(metadata.CreatedBy);
         }
 
+        // Field 7: column_orders (optional, list<ColumnOrder>)
+        if (metadata.ColumnOrders is { Count: > 0 })
+        {
+            writer.WriteFieldHeader(ThriftType.List, 7);
+            WriteColumnOrderList(writer, metadata.ColumnOrders);
+        }
+
         writer.WriteStructStop();
+        writer.PopStruct();
+    }
+
+    private static void WriteColumnOrderList(
+        ThriftCompactWriter writer, IReadOnlyList<ColumnOrder> orders)
+    {
+        writer.WriteListHeader(ThriftType.Struct, orders.Count);
+        for (int i = 0; i < orders.Count; i++)
+            WriteColumnOrder(writer, orders[i]);
+    }
+
+    /// <summary>
+    /// Writes a single <c>ColumnOrder</c> union: a struct whose one set field is
+    /// an empty member struct. <see cref="ColumnOrder.Undefined"/> writes an
+    /// empty union (no member set), which readers treat as unknown ordering.
+    /// </summary>
+    private static void WriteColumnOrder(ThriftCompactWriter writer, ColumnOrder order)
+    {
+        writer.PushStruct();
+        switch (order)
+        {
+            case ColumnOrder.TypeDefined:
+                writer.WriteFieldHeader(ThriftType.Struct, 1); // TYPE_ORDER
+                writer.WriteStructStop();                      // empty TypeDefinedOrder
+                break;
+            case ColumnOrder.Ieee754TotalOrder:
+                writer.WriteFieldHeader(ThriftType.Struct, 2); // IEEE_754_TOTAL_ORDER
+                writer.WriteStructStop();                      // empty IEEE754TotalOrder
+                break;
+        }
+        writer.WriteStructStop(); // union stop
         writer.PopStruct();
     }
 
@@ -509,6 +547,13 @@ internal static class MetadataEncoder
         // Field 8: is_min_value_exact (optional, bool)
         if (stats.IsMinValueExact.HasValue)
             writer.WriteBoolField(8, stats.IsMinValueExact.Value);
+
+        // Field 9: nan_count (optional, i64) — PARQUET-2249
+        if (stats.NanCount.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I64, 9);
+            writer.WriteZigZagInt64(stats.NanCount.Value);
+        }
 
         writer.WriteStructStop();
         writer.PopStruct();

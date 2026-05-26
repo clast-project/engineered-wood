@@ -287,6 +287,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             RowGroups = _rowGroups,
             CreatedBy = _options.CreatedBy,
             KeyValueMetadata = _options.KeyValueMetadata,
+            ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
         };
 
         byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);

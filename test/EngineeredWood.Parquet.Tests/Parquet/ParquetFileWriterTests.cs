@@ -1180,6 +1180,7 @@ public class ParquetFileWriterTests : IDisposable
         {
             Assert.NotNull(stats);
             Assert.Equal(0L, stats.NullCount);
+            Assert.Equal(2L, stats.NanCount); // two NaN values, excluded from min/max
             // Min should be -0.0, max should be 3.14
             float min = BitConverter.ToSingle(stats.MinValue!, 0);
             float max = BitConverter.ToSingle(stats.MaxValue!, 0);
@@ -1206,7 +1207,159 @@ public class ParquetFileWriterTests : IDisposable
             Assert.NotNull(stats);
             Assert.Equal(BitConverter.GetBytes(-2.5), stats.MinValue);
             Assert.Equal(BitConverter.GetBytes(100.0), stats.MaxValue);
+            Assert.Equal(0L, stats.NanCount); // mandatory for FP columns even when zero
         });
+    }
+
+    [Fact]
+    public async Task Statistics_Float_AllNaN_TypeOrder_OmitsMinMaxButRecordsNanCount()
+    {
+        string path = TempPath("stats_all_nan.parquet");
+        var builder = new FloatArray.Builder();
+        builder.Append(float.NaN);
+        builder.Append(float.NaN);
+        builder.Append(float.NaN);
+
+        var batch = MakeBatch(
+            new Field("x", FloatType.Default, nullable: false),
+            builder.Build());
+
+        await WriteAndVerifyStats(path, batch, stats =>
+        {
+            Assert.NotNull(stats);
+            // TYPE_ORDER: all values NaN ⇒ min/max omitted, but nan_count recorded.
+            Assert.Null(stats.MinValue);
+            Assert.Null(stats.MaxValue);
+            Assert.Equal(3L, stats.NanCount);
+        });
+    }
+
+    [Fact]
+    public async Task Statistics_Float_DictionaryEncoded_CountsAllNaNOccurrences()
+    {
+        // A low-cardinality FP column would dictionary-encode; nan_count must still
+        // reflect every occurrence, not the distinct dictionary entries.
+        string path = TempPath("stats_dict_nan.parquet");
+        var builder = new FloatArray.Builder();
+        for (int i = 0; i < 100; i++)
+        {
+            builder.Append(i % 3 == 0 ? float.NaN : 1.0f);
+        }
+
+        var batch = MakeBatch(
+            new Field("x", FloatType.Default, nullable: false),
+            builder.Build());
+
+        await WriteAndVerifyStats(path, batch, stats =>
+        {
+            Assert.NotNull(stats);
+            Assert.Equal(34L, stats.NanCount); // indices 0,3,...,99 ⇒ 34 values
+            Assert.Equal(1.0f, BitConverter.ToSingle(stats.MaxValue!, 0));
+        });
+    }
+
+    [Fact]
+    public async Task ColumnOrders_DefaultsToTypeDefinedForEveryColumn()
+    {
+        string path = TempPath("column_orders_default.parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("i", Int32Type.Default, nullable: false))
+            .Field(new Field("f", FloatType.Default, nullable: false))
+            .Field(new Field("s", StringType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+        [
+            new Int32Array.Builder().AppendRange([1, 2, 3]).Build(),
+            new FloatArray.Builder().AppendRange([1f, 2f, 3f]).Build(),
+            new StringArray.Builder().Append("a").Append("b").Append("c").Build(),
+        ], 3);
+
+        var orders = await WriteAndReadColumnOrders(path, batch);
+        Assert.Equal(
+            [ColumnOrder.TypeDefined, ColumnOrder.TypeDefined, ColumnOrder.TypeDefined],
+            orders);
+    }
+
+    [Fact]
+    public async Task ColumnOrders_Ieee754TotalOrder_AppliesToFloatingPointColumnsOnly()
+    {
+        string path = TempPath("column_orders_total.parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("i", Int32Type.Default, nullable: false))
+            .Field(new Field("f", FloatType.Default, nullable: false))
+            .Field(new Field("d", DoubleType.Default, nullable: false))
+            .Field(new Field("s", StringType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+        [
+            new Int32Array.Builder().AppendRange([1, 2, 3]).Build(),
+            new FloatArray.Builder().AppendRange([1f, 2f, 3f]).Build(),
+            new DoubleArray.Builder().AppendRange([1.0, 2.0, 3.0]).Build(),
+            new StringArray.Builder().Append("a").Append("b").Append("c").Build(),
+        ], 3);
+
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder,
+        };
+
+        var orders = await WriteAndReadColumnOrders(path, batch, options);
+        Assert.Equal(
+        [
+            ColumnOrder.TypeDefined,        // i
+            ColumnOrder.Ieee754TotalOrder,  // f
+            ColumnOrder.Ieee754TotalOrder,  // d
+            ColumnOrder.TypeDefined,        // s
+        ], orders);
+    }
+
+    private async Task<IReadOnlyList<ColumnOrder>> WriteAndReadColumnOrders(
+        string path, RecordBatch batch, ParquetWriteOptions? options = null)
+    {
+        options ??= new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.NotNull(metadata.ColumnOrders);
+        return metadata.ColumnOrders!;
+    }
+
+    [Fact]
+    public async Task Statistics_Float_Ieee754TotalOrder_AllNaN_WritesNanBounds()
+    {
+        string path = TempPath("stats_total_order.parquet");
+        var builder = new FloatArray.Builder();
+        builder.Append(float.NaN);
+        builder.Append(float.NaN);
+
+        var batch = MakeBatch(
+            new Field("x", FloatType.Default, nullable: false),
+            builder.Build());
+
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder,
+        };
+
+        await WriteAndVerifyStats(path, batch, stats =>
+        {
+            Assert.NotNull(stats);
+            Assert.Equal(2L, stats.NanCount);
+            // Total order: an all-NaN chunk records NaN as both bounds.
+            Assert.NotNull(stats.MinValue);
+            Assert.True(float.IsNaN(BitConverter.ToSingle(stats.MinValue!, 0)));
+            Assert.True(float.IsNaN(BitConverter.ToSingle(stats.MaxValue!, 0)));
+        }, options);
     }
 
     [Fact]

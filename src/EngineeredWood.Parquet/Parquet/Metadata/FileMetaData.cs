@@ -25,4 +25,12 @@ public sealed class FileMetaData
 
     /// <summary>Application that created this file.</summary>
     public string? CreatedBy { get; init; }
+
+    /// <summary>
+    /// Sort order for each leaf column's min/max statistics (footer field 7),
+    /// one entry per column in row-group column order. <see langword="null"/>
+    /// when the file omitted the field, in which case readers assume
+    /// <see cref="ColumnOrder.TypeDefined"/>.
+    /// </summary>
+    public IReadOnlyList<ColumnOrder>? ColumnOrders { get; init; }
 }

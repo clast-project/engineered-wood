@@ -68,6 +68,28 @@ public enum ByteArrayEncoding
 }
 
 /// <summary>
+/// Sort order recorded for FLOAT, DOUBLE, and FLOAT16 columns' min/max
+/// statistics (the Parquet <c>ColumnOrder</c> union, PARQUET-2249).
+/// </summary>
+public enum FloatingPointColumnOrder
+{
+    /// <summary>
+    /// <c>TypeDefinedOrder</c> — the historical ordering. NaN is excluded from
+    /// min/max and a <c>nan_count</c> is recorded. Readable by every Parquet
+    /// implementation; this is the default.
+    /// </summary>
+    TypeDefined,
+
+    /// <summary>
+    /// <c>IEEE754TotalOrder</c> — the spec-recommended total order
+    /// (<c>-0 &lt; +0</c>; NaN bounds only when every non-null value is NaN).
+    /// Readers that do not recognize this union member will ignore min/max for
+    /// the affected columns, losing predicate pushdown on them.
+    /// </summary>
+    Ieee754TotalOrder,
+}
+
+/// <summary>
 /// Options that control how Arrow data is written to Parquet files.
 /// </summary>
 public sealed record ParquetWriteOptions
@@ -203,6 +225,27 @@ public sealed record ParquetWriteOptions
     /// nesting. Default is <see langword="true"/>.
     /// </summary>
     public bool OmitPathInSchema { get; init; } = true;
+
+    /// <summary>
+    /// Sort order recorded for FLOAT/DOUBLE columns in the footer's
+    /// <c>column_orders</c> field. Default is
+    /// <see cref="FloatingPointColumnOrder.TypeDefined"/>, which every reader
+    /// understands; a <c>nan_count</c> is written for floating-point columns
+    /// under either setting. Use
+    /// <see cref="FloatingPointColumnOrder.Ieee754TotalOrder"/> for the
+    /// spec-recommended total order at the cost of pushdown on readers that do
+    /// not recognize it.
+    /// </summary>
+    public FloatingPointColumnOrder FloatingPointOrder { get; init; } = FloatingPointColumnOrder.TypeDefined;
+
+    /// <summary>
+    /// Maps <see cref="FloatingPointOrder"/> to the metadata-level
+    /// <see cref="Metadata.ColumnOrder"/> recorded for FLOAT/DOUBLE columns.
+    /// </summary>
+    internal Metadata.ColumnOrder FloatColumnOrder =>
+        FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder
+            ? Metadata.ColumnOrder.Ieee754TotalOrder
+            : Metadata.ColumnOrder.TypeDefined;
 
     /// <summary>
     /// Returns whether the given column should have a Bloom filter.
