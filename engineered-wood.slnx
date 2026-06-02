@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/EngineeredWood.Core/EngineeredWood.Core.csproj" />
+    <Project Path="src/EngineeredWood.AWS/EngineeredWood.AWS.csproj" />
     <Project Path="src/EngineeredWood.Azure/EngineeredWood.Azure.csproj" />
     <Project Path="src/EngineeredWood.Parquet/EngineeredWood.Parquet.csproj" />
     <Project Path="src/EngineeredWood.Parquet.TestTool/EngineeredWood.Parquet.TestTool.csproj" />
@@ -24,11 +25,14 @@
     <Project Path="test/EngineeredWood.Avro.Tests/EngineeredWood.Avro.Tests.csproj" />
     <Project Path="test/EngineeredWood.Avro.Benchmarks/EngineeredWood.Avro.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Lance.Tests/EngineeredWood.Lance.Tests.csproj" />
+    <Project Path="test/EngineeredWood.IO.Tests/EngineeredWood.IO.Tests.csproj" />
     <Project Path="test/EngineeredWood.Lance.Benchmarks/EngineeredWood.Lance.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Lance.Table.Tests/EngineeredWood.Lance.Table.Tests.csproj" />
     <Project Path="test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Tests/EngineeredWood.DeltaLake.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj" />
+    <Project Path="test/EngineeredWood.AWS.Tests/EngineeredWood.AWS.Tests.csproj" />
+    <Project Path="test/EngineeredWood.Azure.Tests/EngineeredWood.Azure.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Benchmarks/EngineeredWood.DeltaLake.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Iceberg.Tests/EngineeredWood.Iceberg.Tests.csproj" />
     <Project Path="test/EngineeredWood.Expressions.Tests/EngineeredWood.Expressions.Tests.csproj" />
