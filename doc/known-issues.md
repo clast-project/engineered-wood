@@ -63,9 +63,6 @@ and `ListViewType`.
 
 **Metadata fields not produced on write:**
 
-- `FileMetaData.column_orders` (field 7) is never written, and is skipped
-  on read. Readers treating its absence as "undefined" may fall back to
-  the deprecated signed `min`/`max` for unsigned / UTF-8 columns.
 - `ColumnMetaData.encoding_stats` (field 13) is never populated.
 - `ColumnMetaData.key_value_metadata` (field 8, per-column) is neither
   read nor written.
@@ -76,22 +73,17 @@ and `ListViewType`.
 
 ### Correctness / interop issues
 
-**Nanosecond timestamp / time on write.** For `TimestampType` with
-`TimeUnit.Nanosecond` and `Time64Type` with `TimeUnit.Nanosecond`,
-`ArrowToSchemaConverter` sets `ConvertedType.TimestampMicros` /
-`TimeMicros`. The spec has no converted-type equivalent for nanoseconds
-— the field should be omitted and only the inline `LogicalType` used.
-Files we write will be interpreted as microseconds by tools that trust
-`converted_type`.
-
 **Nanosecond time on read.** `ArrowSchemaConverter` maps any non-millis
 `TIME` logical type to `Time32Type(Microsecond)`; nanosecond values are
 silently truncated to microseconds.
 
-**Deprecated `min`/`max` always written.** `StatisticsCollector` emits
-both the deprecated `min`/`max` fields (signed byte ordering) and the
-newer `min_value`/`max_value`. Legacy readers that honor the deprecated
-fields will see incorrect ordering for unsigned-int and UTF-8 columns.
+**Deprecated `min`/`max` restricted to signed-order types.** The
+deprecated `Statistics.min`/`max` fields (defined with signed byte
+ordering) are emitted only for types whose logical ordering IS the
+signed ordering (booleans, signed ints incl. date/time/timestamp,
+floats); UTF-8 / binary / unsigned / decimal-FLBA columns get only
+`min_value`/`max_value` (parquet-mr behavior), so a legacy signed-order
+reader can no longer mis-prune them.
 
 ### Known runtime issue: concatenated Gzip members on .NET Framework
 
@@ -382,8 +374,11 @@ checkpoints.
 `_delta_log/` from deletion. Abandoned DV `.bin` files written into
 `_delta_log/` are never cleaned up.
 
-**Schema round-trip.** `SchemaConverter.FromArrowField` drops per-field
-metadata (including column-mapping IDs) when converting Arrow → Delta.
+**Schema round-trip.** `SchemaConverter.FromArrowField` preserves
+per-field metadata (comments, column-mapping IDs, invariants) when
+converting Arrow → Delta, filtering out `PARQUET:*` transport keys
+(e.g. `PARQUET:field_id`). `ToArrowField` (Delta → Arrow) still drops
+metadata.
 
 ### Correctness / interop issues
 

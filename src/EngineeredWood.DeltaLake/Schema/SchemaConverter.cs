@@ -99,7 +99,26 @@ public static class SchemaConverter
             Name = field.Name,
             Type = FromArrowType(field.DataType),
             Nullable = field.IsNullable,
+            // Preserve per-field metadata (comments, delta.columnMapping.id/physicalName, invariants, ...) —
+            // dropping it silently loses column-mapping identities on any Arrow -> Delta round-trip. Writer
+            // internals (the parquet codec's "PARQUET:*" keys, e.g. PARQUET:field_id) are transport hints, not
+            // Delta schema metadata — those are filtered out.
+            Metadata = FilterArrowMetadata(field.Metadata),
         };
+
+    private static Dictionary<string, string>? FilterArrowMetadata(IReadOnlyDictionary<string, string>? metadata)
+    {
+        if (metadata is null || metadata.Count == 0)
+            return null;
+        Dictionary<string, string>? result = null;
+        foreach (var kv in metadata)
+        {
+            if (kv.Key.StartsWith("PARQUET:", StringComparison.Ordinal))
+                continue;
+            (result ??= new Dictionary<string, string>())[kv.Key] = kv.Value;
+        }
+        return result;
+    }
 
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {

@@ -69,12 +69,17 @@ internal static class NestedLevelWriter
         return leaves;
     }
 
+    // parentValueMap (optional): level index -> this array's value index, or -1 where an ANCESTOR is absent.
+    // Produced by STRUCT parents: a null struct row still OCCUPIES a child slot (Arrow struct children are 1:1
+    // with parent rows), unlike a null/empty list — sequential "consume only when present" indexing therefore
+    // misaligns every child value after a null struct row (and corrupted the written file). Null = derive
+    // sequentially (the historical list semantics, still correct for children of lists/maps).
     private static void DecomposeRecursive(
         IArrowArray array, Field field, List<string> path,
         List<LeafColumn> leaves,
         int parentDefLevel, int parentRepLevel,
         int[]? parentDefLevels, int[]? parentRepLevels,
-        int parentCount)
+        int parentCount, int[]? parentValueMap = null)
     {
         // ExtensionType (e.g. VariantType wrapping StructType): unwrap to the
         // storage array and continue with the storage type. The schema-side
@@ -87,7 +92,7 @@ internal static class NestedLevelWriter
             var storageArray = array is ExtensionArray ea ? ea.Storage : array;
             DecomposeRecursive(storageArray, storageField, path, leaves,
                 parentDefLevel, parentRepLevel,
-                parentDefLevels, parentRepLevels, parentCount);
+                parentDefLevels, parentRepLevels, parentCount, parentValueMap);
             return;
         }
 
@@ -96,25 +101,25 @@ internal static class NestedLevelWriter
             case StructType:
                 DecomposeStruct(array, field, path, leaves,
                     parentDefLevel, parentRepLevel,
-                    parentDefLevels, parentRepLevels, parentCount);
+                    parentDefLevels, parentRepLevels, parentCount, parentValueMap);
                 break;
 
             case ListType:
                 DecomposeList(array, field, path, leaves,
                     parentDefLevel, parentRepLevel,
-                    parentDefLevels, parentRepLevels, parentCount);
+                    parentDefLevels, parentRepLevels, parentCount, parentValueMap);
                 break;
 
             case MapType:
                 DecomposeMap(array, field, path, leaves,
                     parentDefLevel, parentRepLevel,
-                    parentDefLevels, parentRepLevels, parentCount);
+                    parentDefLevels, parentRepLevels, parentCount, parentValueMap);
                 break;
 
             default:
                 DecomposeLeaf(array, field, path, leaves,
                     parentDefLevel, parentRepLevel,
-                    parentDefLevels, parentRepLevels, parentCount);
+                    parentDefLevels, parentRepLevels, parentCount, parentValueMap);
                 break;
         }
     }
@@ -124,7 +129,7 @@ internal static class NestedLevelWriter
         List<LeafColumn> leaves,
         int parentDefLevel, int parentRepLevel,
         int[]? parentDefLevels, int[]? parentRepLevels,
-        int parentCount)
+        int parentCount, int[]? parentValueMap = null)
     {
         int maxDefLevel = parentDefLevel + (field.IsNullable ? 1 : 0);
         int maxRepLevel = parentRepLevel;
@@ -168,9 +173,12 @@ internal static class NestedLevelWriter
             repLevels = parentRepLevels != null ? new int[levelCount] : (maxRepLevel > 0 ? new int[levelCount] : null);
             nonNullCount = 0;
 
-            // valueMap[i] = array index for level entry i, or -1 if phantom
+            // valueMap[i] = array index for level entry i, or -1 if phantom. A STRUCT parent supplies the
+            // mapping explicitly (a null struct row still occupies a child slot); without one, values are
+            // consumed sequentially per present level (list semantics).
             var valueMap = new int[levelCount];
             int valueIdx = 0;
+            bool identityMap = true;
 
             for (int i = 0; i < levelCount; i++)
             {
@@ -183,12 +191,16 @@ internal static class NestedLevelWriter
                     // Parent is null/absent — phantom entry
                     defLevels[i] = pDef;
                     valueMap[i] = -1;
+                    identityMap = false;
                 }
                 else
                 {
                     // Parent is present — this maps to an actual array value
-                    valueMap[i] = valueIdx;
-                    if (!field.IsNullable || !array.IsNull(valueIdx))
+                    int idx = parentValueMap?[i] ?? valueIdx++;
+                    valueMap[i] = idx;
+                    if (idx != i)
+                        identityMap = false;
+                    if (!field.IsNullable || !array.IsNull(idx))
                     {
                         defLevels[i] = maxDefLevel;
                         nonNullCount++;
@@ -197,13 +209,12 @@ internal static class NestedLevelWriter
                     {
                         defLevels[i] = maxDefLevel - 1;
                     }
-                    valueIdx++;
                 }
             }
 
-            // If level count exceeds array length (repeated columns with phantoms),
-            // expand the array to match level count so value encoding can index by level position
-            if (levelCount > array.Length)
+            // Value encoding indexes the array BY LEVEL POSITION — whenever the level->value mapping is not the
+            // identity (phantoms, or a non-trivial struct/list mapping), rebuild the array in level order.
+            if (!identityMap || levelCount > array.Length)
                 leafArray = ExpandArray(array, valueMap, levelCount);
         }
 
@@ -246,8 +257,21 @@ internal static class NestedLevelWriter
                 return ExpandFixedBytes(denseArray, valueMap, expandedLength,
                     ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth);
             default:
-                // For other types, try generic fixed-width
-                return ExpandFixedWidth<long>(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
+            {
+                // Every other fixed-width type expands by its ACTUAL byte width (the old generic <long> path
+                // read 8-byte strides over narrower buffers — corrupting Int8/Int16/Date32/Time32/... once an
+                // expansion triggered). A genuinely unsupported type throws rather than corrupt.
+                int byteWidth = denseArray.Data.DataType switch
+                {
+                    Int8Type or UInt8Type => 1,
+                    Int16Type or UInt16Type or HalfFloatType => 2,
+                    UInt32Type or Date32Type or Time32Type => 4,
+                    UInt64Type or Date64Type or Time64Type or TimestampType or DurationType => 8,
+                    _ => throw new NotSupportedException(
+                        $"NestedLevelWriter.ExpandArray: unsupported leaf type {denseArray.Data.DataType.TypeId}"),
+                };
+                return ExpandFixedBytes(denseArray, valueMap, expandedLength, byteWidth);
+            }
         }
     }
 
@@ -388,21 +412,31 @@ internal static class NestedLevelWriter
         List<LeafColumn> leaves,
         int parentDefLevel, int parentRepLevel,
         int[]? parentDefLevels, int[]? parentRepLevels,
-        int parentCount)
+        int parentCount, int[]? parentValueMap = null)
     {
         var structArray = (StructArray)array;
         var structType = (StructType)field.DataType;
         int myDefLevel = parentDefLevel + (field.IsNullable ? 1 : 0);
         int myRepLevel = parentRepLevel;
 
-        // Compute def/rep levels for children
+        // Compute def/rep levels for children — and the CHILD VALUE MAP: an Arrow struct's children are 1:1
+        // with the struct's rows, so a NULL struct row still occupies a child slot. childValueMap[i] therefore
+        // maps every level with a struct row (present OR null) to that row's index; -1 only where an ancestor
+        // is absent. Children index their arrays through it (sequential consume-when-present misaligns after a
+        // null struct row).
         int levelCount = parentDefLevels?.Length ?? parentCount;
         int[]? myDefLevels = null;
+        int[]? childValueMap = null;
 
         if (field.IsNullable || parentDefLevels != null)
         {
             myDefLevels = new int[levelCount];
+            childValueMap = new int[levelCount];
             int valueIdx = 0;
+            // A SLICED struct's children are NOT sliced with it (StructArray.Fields wraps Data.Children
+            // directly), so the child index = the struct's logical index + the struct's own offset. The struct's
+            // own IsNull applies its offset internally, so it takes the un-shifted index.
+            int childOffset = structArray.Data.Offset;
 
             for (int i = 0; i < levelCount; i++)
             {
@@ -412,17 +446,13 @@ internal static class NestedLevelWriter
                 {
                     // Ancestor is null
                     myDefLevels[i] = pDef;
+                    childValueMap[i] = -1;
+                    continue;
                 }
-                else if (field.IsNullable && structArray.IsNull(valueIdx))
-                {
-                    myDefLevels[i] = myDefLevel - 1;
-                    valueIdx++;
-                }
-                else
-                {
-                    myDefLevels[i] = myDefLevel;
-                    valueIdx++;
-                }
+
+                int idx = parentValueMap?[i] ?? valueIdx++;
+                childValueMap[i] = childOffset + idx;
+                myDefLevels[i] = field.IsNullable && structArray.IsNull(idx) ? myDefLevel - 1 : myDefLevel;
             }
         }
 
@@ -434,7 +464,7 @@ internal static class NestedLevelWriter
 
             path.Add(childField.Name);
             DecomposeRecursive(childArray, childField, path, leaves,
-                myDefLevel, myRepLevel, myDefLevels, parentRepLevels, parentCount);
+                myDefLevel, myRepLevel, myDefLevels, parentRepLevels, parentCount, childValueMap);
             path.RemoveAt(path.Count - 1);
         }
     }
@@ -444,7 +474,7 @@ internal static class NestedLevelWriter
         List<LeafColumn> leaves,
         int parentDefLevel, int parentRepLevel,
         int[]? parentDefLevels, int[]? parentRepLevels,
-        int parentCount)
+        int parentCount, int[]? parentValueMap = null)
     {
         var listArray = (ListArray)array;
         var listType = (ListType)field.DataType;
@@ -465,7 +495,8 @@ internal static class NestedLevelWriter
         var repList = new List<int>();
         int inputCount = parentDefLevels?.Length ?? parentCount;
 
-        int slotIdx = 0; // index into listArray slots
+        int slotIdx = 0; // index into listArray slots (a STRUCT parent supplies the mapping explicitly —
+                         // a null struct row still occupies a list slot)
         for (int i = 0; i < inputCount; i++)
         {
             int pDef = parentDefLevels?[i] ?? parentDefLevel;
@@ -476,19 +507,21 @@ internal static class NestedLevelWriter
                 // Ancestor is null — emit phantom entry
                 defList.Add(pDef);
                 repList.Add(pRep);
+                continue;
             }
-            else if (field.IsNullable && listArray.IsNull(slotIdx))
+
+            int slot = parentValueMap?[i] ?? slotIdx++;
+            if (field.IsNullable && listArray.IsNull(slot))
             {
                 // List itself is null
                 defList.Add(listDefLevel - 1);
                 repList.Add(pRep);
-                slotIdx++;
             }
             else
             {
                 // List is present
-                int start = offsets[slotIdx];
-                int end = offsets[slotIdx + 1];
+                int start = offsets[slot];
+                int end = offsets[slot + 1];
                 int length = end - start;
 
                 if (length == 0)
@@ -505,8 +538,6 @@ internal static class NestedLevelWriter
                         repList.Add(j == 0 ? pRep : repeatedRepLevel);
                     }
                 }
-
-                slotIdx++;
             }
         }
 
@@ -527,7 +558,7 @@ internal static class NestedLevelWriter
         List<LeafColumn> leaves,
         int parentDefLevel, int parentRepLevel,
         int[]? parentDefLevels, int[]? parentRepLevels,
-        int parentCount)
+        int parentCount, int[]? parentValueMap = null)
     {
         var mapArray = (MapArray)array;
         var mapType = (MapType)field.DataType;
@@ -548,7 +579,7 @@ internal static class NestedLevelWriter
         var repList = new List<int>();
         int inputCount = parentDefLevels?.Length ?? parentCount;
 
-        int slotIdx = 0;
+        int slotIdx = 0; // a STRUCT parent supplies the mapping (a null struct row still occupies a map slot)
         for (int i = 0; i < inputCount; i++)
         {
             int pDef = parentDefLevels?[i] ?? parentDefLevel;
@@ -558,17 +589,19 @@ internal static class NestedLevelWriter
             {
                 defList.Add(pDef);
                 repList.Add(pRep);
+                continue;
             }
-            else if (field.IsNullable && mapArray.IsNull(slotIdx))
+
+            int slot = parentValueMap?[i] ?? slotIdx++;
+            if (field.IsNullable && mapArray.IsNull(slot))
             {
                 defList.Add(mapDefLevel - 1);
                 repList.Add(pRep);
-                slotIdx++;
             }
             else
             {
-                int start = offsets[slotIdx];
-                int end = offsets[slotIdx + 1];
+                int start = offsets[slot];
+                int end = offsets[slot + 1];
                 int length = end - start;
 
                 if (length == 0)
@@ -584,8 +617,6 @@ internal static class NestedLevelWriter
                         repList.Add(j == 0 ? pRep : repeatedRepLevel);
                     }
                 }
-
-                slotIdx++;
             }
         }
 

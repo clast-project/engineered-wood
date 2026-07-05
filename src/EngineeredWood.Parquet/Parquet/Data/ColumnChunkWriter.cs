@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using Clast.BloomFilter;
 using EngineeredWood.Compression;
 using EngineeredWood.Parquet.BloomFilter;
@@ -169,6 +170,24 @@ internal static class ColumnChunkWriter
             : StatisticsCollector.Compute(
                 array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
                 floatingPointTotalOrder);
+        // The DEPRECATED min/max fields are defined with SIGNED byte ordering. Our values are computed with the
+        // CORRECT logical ordering (they mirror min_value/max_value), so a legacy reader that honors the
+        // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
+        // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
+        // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
+        if (!SignedOrderMatchesLogical(array.Data.DataType))
+        {
+            stats = new Statistics
+            {
+                NullCount = stats.NullCount,
+                MinValue = stats.MinValue,
+                MaxValue = stats.MaxValue,
+                IsMinValueExact = stats.IsMinValueExact,
+                IsMaxValueExact = stats.IsMaxValueExact,
+                NanCount = stats.NanCount,
+                DistinctCount = stats.DistinctCount,
+            };
+        }
         result.MetaData.Statistics = stats;
 
         // Build Bloom filter if enabled for this column.
@@ -841,7 +860,11 @@ internal static class ColumnChunkWriter
 
         if (nonNullCount == 0)
         {
-            encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding);
+            // Zero defined values (an all-null page — e.g. every row's struct ancestor is null). The V2 delta
+            // encodings (DELTA_BINARY_PACKED / DELTA_LENGTH_BYTE_ARRAY / ...) require a non-empty HEADER even
+            // for zero values — declaring them with a 0-byte payload makes readers fail with buffer underruns.
+            // PLAIN is the only encoding whose empty representation is valid for every type.
+            encoding = Encoding.Plain;
             EnsureValuesBuffer(0);
             return 0;
         }
@@ -1329,6 +1352,18 @@ internal static class ColumnChunkWriter
     /// so value encoding methods can check != 0 for presence.
     /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel <= 1.
     /// </summary>
+    // True when the type's SIGNED byte ordering equals its logical ordering — the precondition for emitting
+    // the deprecated Statistics.min/max fields (see the call site).
+    private static bool SignedOrderMatchesLogical(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        BooleanType => true,
+        Int8Type or Int16Type or Int32Type or Int64Type => true,
+        FloatType or DoubleType or HalfFloatType => true,
+        Date32Type or Date64Type or Time32Type or Time64Type or TimestampType or DurationType => true,
+        Decimal32Type or Decimal64Type => true, // INT32/INT64 physical — signed numeric ordering
+        _ => false, // UTF-8 strings/binary (unsigned lexical), unsigned ints, decimal FLBA, nested, ...
+    };
+
     private static int[]? NormalizeDefLevels(int[]? defLevels, int maxDefLevel)
     {
         if (defLevels == null)

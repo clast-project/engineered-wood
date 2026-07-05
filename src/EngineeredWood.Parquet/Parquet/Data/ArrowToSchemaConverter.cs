@@ -244,9 +244,13 @@ internal static class ArrowToSchemaConverter
                 new LogicalType.TimestampType(
                     ts.Timezone != null,
                     MapTimeUnit(ts.Unit)),
+                // The deprecated converted_type has NO nanosecond variant — labeling ns as micros makes
+                // converted_type-trusting readers misinterpret the values 1000x. Omit it for ns (per spec:
+                // only the inline LogicalType describes nanoseconds).
                 ts.Unit switch
                 {
                     Apache.Arrow.Types.TimeUnit.Millisecond => ConvertedType.TimestampMillis,
+                    Apache.Arrow.Types.TimeUnit.Nanosecond => (ConvertedType?)null,
                     _ => ConvertedType.TimestampMicros,
                 },
                 null, null),
@@ -258,7 +262,8 @@ internal static class ArrowToSchemaConverter
 
             Time64Type t64 => (PhysicalType.Int64, null,
                 new LogicalType.TimeType(false, MapTimeUnit(t64.Unit)),
-                ConvertedType.TimeMicros,
+                // No converted_type nanosecond variant exists — omit for ns (see the timestamp note above).
+                t64.Unit == Apache.Arrow.Types.TimeUnit.Nanosecond ? (ConvertedType?)null : ConvertedType.TimeMicros,
                 null, null),
 
             HalfFloatType => (PhysicalType.FixedLenByteArray, 2,
