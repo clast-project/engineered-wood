@@ -247,7 +247,14 @@ internal static class MetadataEncoder
                 break;
             case LogicalType.VariantType:
                 writer.WriteFieldHeader(ThriftType.Struct, 16);
-                WriteEmptyStruct(writer);
+                // VariantType { 1: optional i8 specification_version }: written EXPLICITLY as 1 — Spark's
+                // parquet variant reader rejects an annotation without it (generic FAILED_READ_FILE), while
+                // lenient readers (delta-kernel, DuckDB) accept either form. DuckDB's writer sets it too.
+                writer.PushStruct();
+                writer.WriteFieldHeader(ThriftType.Byte, 1);
+                writer.WriteByte(1);
+                writer.WriteStructStop();
+                writer.PopStruct();
                 break;
             // UnknownLogicalType is not written — it only exists for forward-compat on read
         }
