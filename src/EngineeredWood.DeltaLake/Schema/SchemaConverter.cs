@@ -43,7 +43,16 @@ public static class SchemaConverter
     private static Field ToArrowField(StructField field)
     {
         var arrowType = ToArrowType(field.Type);
-        return new Field(field.Name, arrowType, field.Nullable);
+        // Preserve per-field Delta metadata (comments, column-mapping id/physicalName, invariants) on the
+        // Arrow field — the reverse of FromArrowField's preservation, so schemas round-trip losslessly.
+        Dictionary<string, string>? meta = null;
+        if (field.Metadata is { Count: > 0 } src)
+        {
+            meta = new Dictionary<string, string>(src.Count);
+            foreach (var kvp in src)
+                meta[kvp.Key] = kvp.Value;
+        }
+        return new Field(field.Name, arrowType, field.Nullable, meta);
     }
 
     /// <summary>
