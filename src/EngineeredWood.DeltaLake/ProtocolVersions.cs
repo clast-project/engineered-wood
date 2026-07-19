@@ -40,6 +40,14 @@ public static class ProtocolVersions
         "checkConstraints",
         "generatedColumns",
         "changeDataFeed",
+        // Clustered (liquid-clustering) tables: the feature is advisory LAYOUT — the spec permits plain
+        // (unclustered) appends and DML by writers that do not implement clustering; a later clustering
+        // OPTIMIZE reclusters them. The obligations a non-clustering writer has are already met here: the
+        // `delta.clustering` domainMetadata (the clustering-columns spec) is preserved through commits AND
+        // checkpoints (SnapshotBuilder / CheckpointWriter carry all domains), and `add.clusteringProvider`
+        // round-trips (AddFile / ActionSerializer). Writing CLUSTERED files (Hilbert layout + provider
+        // tagging) is NOT implemented — this is interop, not a clustering writer.
+        "clustering",
         "columnMapping",
         "deletionVectors",
         "domainMetadata",

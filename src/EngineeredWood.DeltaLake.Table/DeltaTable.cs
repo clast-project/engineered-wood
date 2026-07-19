@@ -98,10 +98,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaTableOptions? options = null,
         IReadOnlyList<string>? partitionColumns = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
+        IReadOnlyList<string>? clusteringColumns = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
+
+        // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES
+        // PARTITIONED BY; no engine creates a table carrying both, so readers' clustering-info resolution
+        // is undefined on the combination). A partitioned table can still be physically SORTED at write
+        // time — it just must not DECLARE clustering.
+        if (clusteringColumns is { Count: > 0 } && partitionColumns is { Count: > 0 })
+        {
+            throw new DeltaFormatException(
+                "Liquid clustering and partitioning are mutually exclusive — a partitioned table cannot "
+                + "declare clustering columns.");
+        }
 
         // Check that the table doesn't already exist
         long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
@@ -164,6 +176,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             writerFeatures.Add("identityColumns");
         }
 
+        // Clustered (liquid-clustering) table: a WRITER-only feature ('clustering' — readers read normally)
+        // whose clustering-columns spec rides the delta.clustering system domain, so domainMetadata is a
+        // dependency. The domain action joins commit 0 below. This library does not WRITE clustered layouts;
+        // a clustering engine's OPTIMIZE (Spark) uses the declaration to (re)cluster.
+        if (clusteringColumns is { Count: > 0 })
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("clustering");
+            if (!writerFeatures.Contains("domainMetadata"))
+                writerFeatures.Add("domainMetadata");
+        }
+
         // Column mapping is BOTH a reader and writer feature. Once any other feature has forced
         // table-features mode (reader v3 / writer v7) it MUST be listed in BOTH lists too — a v7 protocol
         // with no columnMapping entry reads as "column mapping not supported". Absent any other feature,
@@ -199,6 +223,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             },
         };
 
+        if (clusteringColumns is { Count: > 0 })
+        {
+            actions.Add(BuildClusteringDomain(deltaSchema, clusteringColumns, columnMappingMode));
+        }
+
         // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
         // the history (and resolvable by timestamp time travel) rather than being the one silent version.
         var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
@@ -220,6 +249,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Apache.Arrow.Schema schema,
         DeltaTableOptions? options = null,
         IReadOnlyList<string>? partitionColumns = null,
+        IReadOnlyList<string>? clusteringColumns = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -233,6 +263,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
 
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
+            clusteringColumns: clusteringColumns,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
@@ -459,6 +490,138 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, _log, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
+    }
+
+    /// <summary>
+    /// The ALTER CLUSTER BY analog: declares, re-keys, or (null/empty) removes the table's clustering
+    /// declaration — the <c>delta.clustering</c> domain — as ONE metadata commit. Callers supply LOGICAL
+    /// column names (resolved to physical through the mapped schema). Declaring clustering on a PARTITIONED
+    /// table throws (mutually exclusive). Upgrades the protocol with the WRITER-ONLY
+    /// <c>clustering</c>/<c>domainMetadata</c> features when missing — the reader side is left untouched,
+    /// since neither is a reader feature. <paramref name="extraActions"/> (e.g. a caller's table-property
+    /// update) join the same commit. Returns the committed version, or the current one when there was
+    /// nothing to change and no extra actions.
+    /// </summary>
+    public async ValueTask<long> SetClusteringColumnsAsync(
+        IReadOnlyList<string>? logicalColumns,
+        IReadOnlyList<DeltaAction>? extraActions = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var actions = new List<DeltaAction>();
+
+        if (logicalColumns is { Count: > 0 })
+        {
+            if (snapshot.Metadata.PartitionColumns.Count > 0)
+            {
+                throw new DeltaFormatException(
+                    "Liquid clustering and partitioning are mutually exclusive — a partitioned table "
+                    + "cannot declare clustering columns.");
+            }
+
+            var upgrade = UpgradeProtocolForWriterFeatures(
+                snapshot.Protocol, ["clustering", "domainMetadata"]);
+            if (upgrade is not null)
+                actions.Add(upgrade);
+
+            actions.Add(BuildClusteringDomain(
+                snapshot.Schema, logicalColumns, ColumnMapping.GetMode(snapshot.Metadata.Configuration)));
+        }
+        else if (snapshot.DomainMetadata.ContainsKey(ClusteringDomain))
+        {
+            actions.Add(new DomainMetadata
+            {
+                Domain = ClusteringDomain,
+                Configuration = "{}",
+                Removed = true,
+            });
+        }
+
+        if (extraActions is { Count: > 0 })
+            actions.AddRange(extraActions);
+        if (actions.Count == 0)
+            return snapshot.Version; // nothing to change
+
+        long newVersion = snapshot.Version + 1;
+        var final = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration,
+            logicalColumns is { Count: > 0 } ? "SET SORTED BY" : "RESET SORTED BY");
+        await _log.WriteCommitAsync(newVersion, final, cancellationToken).ConfigureAwait(false);
+
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
+            .ConfigureAwait(false);
+        return newVersion;
+    }
+
+    /// <summary>The Delta system domain carrying a table's liquid-clustering column spec.</summary>
+    private const string ClusteringDomain = "delta.clustering";
+
+    // The clustering-columns spec, byte-shaped like Spark's own (each column a PATH array — these are
+    // top-level names — plus the redundant domainName field Spark includes):
+    //   {"clusteringColumns":[["a"],["b"]],"domainName":"delta.clustering"}
+    // CRITICAL: the domain stores PHYSICAL names. OSS Delta's ClusteringColumnInfo resolves them against
+    // the schema's physical names and None.get-crashes on a logical name under column mapping (observed
+    // live on Fabric Spark 4.1, breaking DESCRIBE DETAIL and OPTIMIZE). Callers supply LOGICAL names,
+    // resolved here through the already-mapping-assigned schema; without mapping physical == logical.
+    private static DomainMetadata BuildClusteringDomain(
+        Schema.StructType deltaSchema, IReadOnlyList<string> clusteringColumns, ColumnMappingMode mode)
+    {
+        var sb = new System.Text.StringBuilder("{\"clusteringColumns\":[");
+        for (int i = 0; i < clusteringColumns.Count; i++)
+        {
+            var field = deltaSchema.Fields.FirstOrDefault(
+                f => string.Equals(f.Name, clusteringColumns[i], StringComparison.OrdinalIgnoreCase));
+            if (field is null)
+            {
+                throw new DeltaFormatException(
+                    $"Clustering column '{clusteringColumns[i]}' is not a column of the table.");
+            }
+            string physical = ColumnMapping.GetPhysicalName(field, mode);
+            if (i > 0)
+                sb.Append(',');
+            sb.Append("[\"").Append(physical.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"]");
+        }
+        sb.Append("],\"domainName\":\"").Append(ClusteringDomain).Append("\"}");
+
+        return new DomainMetadata
+        {
+            Domain = ClusteringDomain,
+            Configuration = sb.ToString(),
+            Removed = false,
+        };
+    }
+
+    /// <summary>
+    /// Protocol upgrade for WRITER-ONLY features (clustering / domainMetadata): bumps minWriterVersion to 7
+    /// with the legacy writer features enumerated, and appends the missing ones. The READER side is left
+    /// exactly as it was — adding a writer-only feature to readerFeatures would wrongly lock readers out
+    /// (a legacy reader-1 table stays reader-1 while becoming writer-7).
+    /// </summary>
+    private static ProtocolAction? UpgradeProtocolForWriterFeatures(
+        ProtocolAction current, IReadOnlyList<string> features)
+    {
+        var missing = features.Where(f => current.WriterFeatures?.Contains(f) != true).ToList();
+        if (missing.Count == 0)
+            return null;
+
+        var writerFeatures = new List<string>(
+            current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
+        foreach (var feature in missing)
+        {
+            if (!writerFeatures.Contains(feature))
+                writerFeatures.Add(feature);
+        }
+
+        return new ProtocolAction
+        {
+            MinReaderVersion = current.MinReaderVersion,
+            MinWriterVersion = 7,
+            ReaderFeatures = current.ReaderFeatures,
+            WriterFeatures = writerFeatures,
+        };
     }
 
     /// <summary>True when the type contains a <c>timestamp_ntz</c> column at any nesting depth.</summary>
