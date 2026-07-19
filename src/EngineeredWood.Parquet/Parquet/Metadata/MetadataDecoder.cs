@@ -11,6 +11,13 @@ namespace EngineeredWood.Parquet.Metadata;
 /// </summary>
 internal static class MetadataDecoder
 {
+    // Field dispatch is guarded by the WIRE type (`case N when type == ...`): a field id whose encoded
+    // type doesn't match the parquet.thrift declaration falls through to `default` and is skipped, the
+    // same way Thrift-generated readers behave. Old or foreign writers reuse field ids with different
+    // types — e.g. Impala's dict-page-offset-zero.parquet carries a LIST at ColumnMetaData field 15,
+    // which modern parquet.thrift assigns to bloom_filter_length: i32; reading the list header as a
+    // varint desynchronizes the whole stream.
+
     /// <summary>
     /// Decodes a <see cref="FileMetaData"/> from the raw Thrift-encoded footer bytes.
     /// </summary>
@@ -39,25 +46,25 @@ internal static class MetadataDecoder
 
             switch (fieldId)
             {
-                case 1: // version: i32
+                case 1 when type == ThriftType.I32: // version: i32
                     version = reader.ReadZigZagInt32();
                     break;
-                case 2: // schema: list<SchemaElement>
+                case 2 when type == ThriftType.List: // schema: list<SchemaElement>
                     schema = ReadSchemaList(ref reader);
                     break;
-                case 3: // num_rows: i64
+                case 3 when type == ThriftType.I64: // num_rows: i64
                     numRows = reader.ReadZigZagInt64();
                     break;
-                case 4: // row_groups: list<RowGroup>
+                case 4 when type == ThriftType.List: // row_groups: list<RowGroup>
                     rowGroups = ReadRowGroupList(ref reader);
                     break;
-                case 5: // key_value_metadata: list<KeyValue>
+                case 5 when type == ThriftType.List: // key_value_metadata: list<KeyValue>
                     keyValueMetadata = ReadKeyValueList(ref reader);
                     break;
-                case 6: // created_by: string
+                case 6 when type == ThriftType.Binary: // created_by: string
                     createdBy = reader.ReadString();
                     break;
-                case 7: // column_orders: list<ColumnOrder>
+                case 7 when type == ThriftType.List: // column_orders: list<ColumnOrder>
                     columnOrders = ReadColumnOrderList(ref reader);
                     break;
                 default:
@@ -163,34 +170,34 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // type: PhysicalType enum (i32)
+                case 1 when type == ThriftType.I32: // type: PhysicalType enum (i32)
                     physicalType = (PhysicalType)reader.ReadZigZagInt32();
                     break;
-                case 2: // type_length: i32
+                case 2 when type == ThriftType.I32: // type_length: i32
                     typeLength = reader.ReadZigZagInt32();
                     break;
-                case 3: // repetition_type: FieldRepetitionType enum (i32)
+                case 3 when type == ThriftType.I32: // repetition_type: FieldRepetitionType enum (i32)
                     repetitionType = (FieldRepetitionType)reader.ReadZigZagInt32();
                     break;
-                case 4: // name: string
+                case 4 when type == ThriftType.Binary: // name: string
                     name = reader.ReadString();
                     break;
-                case 5: // num_children: i32
+                case 5 when type == ThriftType.I32: // num_children: i32
                     numChildren = reader.ReadZigZagInt32();
                     break;
-                case 6: // converted_type: ConvertedType enum (i32)
+                case 6 when type == ThriftType.I32: // converted_type: ConvertedType enum (i32)
                     convertedType = (ConvertedType)reader.ReadZigZagInt32();
                     break;
-                case 7: // scale: i32
+                case 7 when type == ThriftType.I32: // scale: i32
                     scale = reader.ReadZigZagInt32();
                     break;
-                case 8: // precision: i32
+                case 8 when type == ThriftType.I32: // precision: i32
                     precision = reader.ReadZigZagInt32();
                     break;
-                case 9: // field_id: i32
+                case 9 when type == ThriftType.I32: // field_id: i32
                     fieldId = reader.ReadZigZagInt32();
                     break;
-                case 10: // logicalType: LogicalType union
+                case 10 when type == ThriftType.Struct: // logicalType: LogicalType union
                     logicalType = ReadLogicalType(ref reader);
                     break;
                 default:
@@ -242,59 +249,59 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // STRING
+                case 1 when type == ThriftType.Struct: // STRING
                     SkipEmptyStruct(ref reader);
                     result = CachedString;
                     break;
-                case 2: // MAP
+                case 2 when type == ThriftType.Struct: // MAP
                     SkipEmptyStruct(ref reader);
                     result = CachedMap;
                     break;
-                case 3: // LIST
+                case 3 when type == ThriftType.Struct: // LIST
                     SkipEmptyStruct(ref reader);
                     result = CachedList;
                     break;
-                case 4: // ENUM
+                case 4 when type == ThriftType.Struct: // ENUM
                     SkipEmptyStruct(ref reader);
                     result = CachedEnum;
                     break;
-                case 5: // DECIMAL
+                case 5 when type == ThriftType.Struct: // DECIMAL
                     result = ReadDecimalLogicalType(ref reader);
                     break;
-                case 6: // DATE
+                case 6 when type == ThriftType.Struct: // DATE
                     SkipEmptyStruct(ref reader);
                     result = CachedDate;
                     break;
-                case 7: // TIME
+                case 7 when type == ThriftType.Struct: // TIME
                     result = ReadTimeLogicalType(ref reader);
                     break;
-                case 8: // TIMESTAMP
+                case 8 when type == ThriftType.Struct: // TIMESTAMP
                     result = ReadTimestampLogicalType(ref reader);
                     break;
-                case 10: // INTEGER
+                case 10 when type == ThriftType.Struct: // INTEGER
                     result = ReadIntLogicalType(ref reader);
                     break;
-                case 11: // UNKNOWN (null type)
+                case 11 when type == ThriftType.Struct: // UNKNOWN (null type)
                     SkipEmptyStruct(ref reader);
                     result = new LogicalType.UnknownLogicalType(fid);
                     break;
-                case 12: // JSON
+                case 12 when type == ThriftType.Struct: // JSON
                     SkipEmptyStruct(ref reader);
                     result = CachedJson;
                     break;
-                case 13: // BSON
+                case 13 when type == ThriftType.Struct: // BSON
                     SkipEmptyStruct(ref reader);
                     result = CachedBson;
                     break;
-                case 14: // UUID
+                case 14 when type == ThriftType.Struct: // UUID
                     SkipEmptyStruct(ref reader);
                     result = CachedUuid;
                     break;
-                case 15: // FLOAT16
+                case 15 when type == ThriftType.Struct: // FLOAT16
                     SkipEmptyStruct(ref reader);
                     result = CachedFloat16;
                     break;
-                case 16: // VARIANT
+                case 16 when type == ThriftType.Struct: // VARIANT
                     SkipEmptyStruct(ref reader);
                     result = CachedVariant;
                     break;
@@ -332,8 +339,8 @@ internal static class MetadataDecoder
             if (type == ThriftType.Stop) break;
             switch (fid)
             {
-                case 1: scale = reader.ReadZigZagInt32(); break;
-                case 2: precision = reader.ReadZigZagInt32(); break;
+                case 1 when type == ThriftType.I32: scale = reader.ReadZigZagInt32(); break;
+                case 2 when type == ThriftType.I32: precision = reader.ReadZigZagInt32(); break;
                 default: reader.Skip(type); break;
             }
         }
@@ -351,9 +358,9 @@ internal static class MetadataDecoder
             if (type == ThriftType.Stop) break;
             switch (fid)
             {
-                case 1: SkipEmptyStruct(ref reader); unit = TimeUnit.Millis; break;
-                case 2: SkipEmptyStruct(ref reader); unit = TimeUnit.Micros; break;
-                case 3: SkipEmptyStruct(ref reader); unit = TimeUnit.Nanos; break;
+                case 1 when type == ThriftType.Struct: SkipEmptyStruct(ref reader); unit = TimeUnit.Millis; break;
+                case 2 when type == ThriftType.Struct: SkipEmptyStruct(ref reader); unit = TimeUnit.Micros; break;
+                case 3 when type == ThriftType.Struct: SkipEmptyStruct(ref reader); unit = TimeUnit.Nanos; break;
                 default: reader.Skip(type); break;
             }
         }
@@ -372,8 +379,8 @@ internal static class MetadataDecoder
             if (type == ThriftType.Stop) break;
             switch (fid)
             {
-                case 1: isAdjustedToUtc = reader.ReadBool(); break;
-                case 2: unit = ReadTimeUnit(ref reader); break;
+                case 1 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: isAdjustedToUtc = reader.ReadBool(); break;
+                case 2 when type == ThriftType.Struct: unit = ReadTimeUnit(ref reader); break;
                 default: reader.Skip(type); break;
             }
         }
@@ -392,8 +399,8 @@ internal static class MetadataDecoder
             if (type == ThriftType.Stop) break;
             switch (fid)
             {
-                case 1: isAdjustedToUtc = reader.ReadBool(); break;
-                case 2: unit = ReadTimeUnit(ref reader); break;
+                case 1 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: isAdjustedToUtc = reader.ReadBool(); break;
+                case 2 when type == ThriftType.Struct: unit = ReadTimeUnit(ref reader); break;
                 default: reader.Skip(type); break;
             }
         }
@@ -412,8 +419,8 @@ internal static class MetadataDecoder
             if (type == ThriftType.Stop) break;
             switch (fid)
             {
-                case 1: bitWidth = checked((int)reader.ReadByte()); break;
-                case 2: isSigned = reader.ReadBool(); break;
+                case 1 when type == ThriftType.Byte: bitWidth = checked((int)reader.ReadByte()); break;
+                case 2 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: isSigned = reader.ReadBool(); break;
                 default: reader.Skip(type); break;
             }
         }
@@ -453,25 +460,25 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // columns: list<ColumnChunk>
+                case 1 when type == ThriftType.List: // columns: list<ColumnChunk>
                     columns = ReadColumnChunkList(ref reader);
                     break;
-                case 2: // total_byte_size: i64
+                case 2 when type == ThriftType.I64: // total_byte_size: i64
                     totalByteSize = reader.ReadZigZagInt64();
                     break;
-                case 3: // num_rows: i64
+                case 3 when type == ThriftType.I64: // num_rows: i64
                     numRows = reader.ReadZigZagInt64();
                     break;
-                case 4: // sorting_columns: list<SortingColumn>
+                case 4 when type == ThriftType.List: // sorting_columns: list<SortingColumn>
                     sortingColumns = ReadSortingColumnList(ref reader);
                     break;
                 case 5: // file_offset: i64 (deprecated, skip)
                     reader.Skip(type);
                     break;
-                case 6: // total_compressed_size: i64
+                case 6 when type == ThriftType.I64: // total_compressed_size: i64
                     totalCompressedSize = reader.ReadZigZagInt64();
                     break;
-                case 7: // ordinal: i16
+                case 7 when type == ThriftType.I16: // ordinal: i16
                     ordinal = reader.ReadI16();
                     break;
                 default:
@@ -522,13 +529,13 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // file_path: string
+                case 1 when type == ThriftType.Binary: // file_path: string
                     filePath = reader.ReadString();
                     break;
-                case 2: // file_offset: i64
+                case 2 when type == ThriftType.I64: // file_offset: i64
                     fileOffset = reader.ReadZigZagInt64();
                     break;
-                case 3: // meta_data: ColumnMetaData
+                case 3 when type == ThriftType.Struct: // meta_data: ColumnMetaData
                     metaData = ReadColumnMetaData(ref reader);
                     break;
                 default:
@@ -572,49 +579,49 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // type: PhysicalType
+                case 1 when type == ThriftType.I32: // type: PhysicalType
                     physicalType = (PhysicalType)reader.ReadZigZagInt32();
                     break;
-                case 2: // encodings: list<Encoding>
+                case 2 when type == ThriftType.List: // encodings: list<Encoding>
                     encodings = ReadEncodingList(ref reader);
                     break;
-                case 3: // path_in_schema: list<string>
+                case 3 when type == ThriftType.List: // path_in_schema: list<string>
                     pathInSchema = ReadStringList(ref reader);
                     break;
-                case 4: // codec: CompressionCodec
+                case 4 when type == ThriftType.I32: // codec: CompressionCodec
                     codec = ParquetCodecFromThrift(reader.ReadZigZagInt32());
                     break;
-                case 5: // num_values: i64
+                case 5 when type == ThriftType.I64: // num_values: i64
                     numValues = reader.ReadZigZagInt64();
                     break;
-                case 6: // total_uncompressed_size: i64
+                case 6 when type == ThriftType.I64: // total_uncompressed_size: i64
                     totalUncompressedSize = reader.ReadZigZagInt64();
                     break;
-                case 7: // total_compressed_size: i64
+                case 7 when type == ThriftType.I64: // total_compressed_size: i64
                     totalCompressedSize = reader.ReadZigZagInt64();
                     break;
                 case 8: // key_value_metadata: list<KeyValue> (skip)
                     reader.Skip(type);
                     break;
-                case 9: // data_page_offset: i64
+                case 9 when type == ThriftType.I64: // data_page_offset: i64
                     dataPageOffset = reader.ReadZigZagInt64();
                     break;
-                case 10: // index_page_offset: i64
+                case 10 when type == ThriftType.I64: // index_page_offset: i64
                     indexPageOffset = reader.ReadZigZagInt64();
                     break;
-                case 11: // dictionary_page_offset: i64
+                case 11 when type == ThriftType.I64: // dictionary_page_offset: i64
                     dictionaryPageOffset = reader.ReadZigZagInt64();
                     break;
-                case 12: // statistics: Statistics
+                case 12 when type == ThriftType.Struct: // statistics: Statistics
                     statistics = ReadStatistics(ref reader);
                     break;
                 case 13: // encoding_stats: list<PageEncodingStats> (skip)
                     reader.Skip(type);
                     break;
-                case 14: // bloom_filter_offset: i64
+                case 14 when type == ThriftType.I64: // bloom_filter_offset: i64
                     bloomFilterOffset = reader.ReadZigZagInt64();
                     break;
-                case 15: // bloom_filter_length: i32
+                case 15 when type == ThriftType.I32: // bloom_filter_length: i32
                     bloomFilterLength = checked((int)reader.ReadZigZagInt32());
                     break;
                 default:
@@ -667,31 +674,31 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: // max: binary (deprecated)
+                case 1 when type == ThriftType.Binary: // max: binary (deprecated)
                     max = reader.ReadBinary().ToArray();
                     break;
-                case 2: // min: binary (deprecated)
+                case 2 when type == ThriftType.Binary: // min: binary (deprecated)
                     min = reader.ReadBinary().ToArray();
                     break;
-                case 3: // null_count: i64
+                case 3 when type == ThriftType.I64: // null_count: i64
                     nullCount = reader.ReadZigZagInt64();
                     break;
-                case 4: // distinct_count: i64
+                case 4 when type == ThriftType.I64: // distinct_count: i64
                     distinctCount = reader.ReadZigZagInt64();
                     break;
-                case 5: // max_value: binary
+                case 5 when type == ThriftType.Binary: // max_value: binary
                     maxValue = reader.ReadBinary().ToArray();
                     break;
-                case 6: // min_value: binary
+                case 6 when type == ThriftType.Binary: // min_value: binary
                     minValue = reader.ReadBinary().ToArray();
                     break;
-                case 7: // is_max_value_exact: bool
+                case 7 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: // is_max_value_exact: bool
                     isMaxValueExact = reader.ReadBool();
                     break;
-                case 8: // is_min_value_exact: bool
+                case 8 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: // is_min_value_exact: bool
                     isMinValueExact = reader.ReadBool();
                     break;
-                case 9: // nan_count: i64 (PARQUET-2249)
+                case 9 when type == ThriftType.I64: // nan_count: i64 (PARQUET-2249)
                     nanCount = reader.ReadZigZagInt64();
                     break;
                 default:
@@ -762,8 +769,8 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: key = reader.ReadString(); break;
-                case 2: value = reader.ReadString(); break;
+                case 1 when type == ThriftType.Binary: key = reader.ReadString(); break;
+                case 2 when type == ThriftType.Binary: value = reader.ReadString(); break;
                 default: reader.Skip(type); break;
             }
         }
@@ -804,9 +811,9 @@ internal static class MetadataDecoder
 
             switch (fid)
             {
-                case 1: columnIndex = reader.ReadZigZagInt32(); break;
-                case 2: descending = reader.ReadBool(); break;
-                case 3: nullsFirst = reader.ReadBool(); break;
+                case 1 when type == ThriftType.I32: columnIndex = reader.ReadZigZagInt32(); break;
+                case 2 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: descending = reader.ReadBool(); break;
+                case 3 when type is ThriftType.BooleanTrue or ThriftType.BooleanFalse: nullsFirst = reader.ReadBool(); break;
                 default: reader.Skip(type); break;
             }
         }
