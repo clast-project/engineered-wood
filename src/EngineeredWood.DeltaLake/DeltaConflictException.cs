@@ -16,4 +16,14 @@ public class DeltaConflictException : Exception
     {
         AttemptedVersion = attemptedVersion;
     }
+
+    /// <summary>
+    /// Raised when optimistic-concurrency validation aborts a transaction: a concurrent commit
+    /// invalidated something this transaction read or removed. The message names the specific conflict.
+    /// </summary>
+    public DeltaConflictException(string message)
+        : base(message)
+    {
+        AttemptedVersion = -1;
+    }
 }

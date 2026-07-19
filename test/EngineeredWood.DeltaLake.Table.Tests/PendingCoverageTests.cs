@@ -95,10 +95,11 @@ public class PendingCoverageTests
     // delete/delete, metadata change, and the dataChange=false compaction exemption — are now live in
     // ConflictCheckerTests, against the ConflictChecker that slice 9 layer 1 introduced.
     //
-    // STILL PARKED (integration): those are pure input→verdict tests. The end-to-end transaction path —
-    // a transaction that reads, has a concurrent commit land in the log, and then either rebases onto it
-    // and commits or aborts — lands with the DeltaTransaction API (slice 9 layer 1, step 2) and its
-    // integration tests. When it does, add the two-concurrent-transaction test here.
+    // UN-PARKED (integration): the end-to-end transaction path — a transaction that reads, has a
+    // concurrent commit land in the log, then either rebases onto it and commits or aborts — is now live
+    // in DeltaTransactionTests (two overlapping transactions: disjoint files both commit, same file the
+    // second aborts). Remaining gap: that path currently covers DELETE only; staging appends/updates on
+    // a transaction, and row-level (same-file disjoint-row) concurrency, are still parked below.
 
     // ── Row-level concurrency — pr-4 RowLevelConcurrencyTests ──
 

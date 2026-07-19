@@ -1015,6 +1015,97 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    #region Transactions
+
+    /// <summary>
+    /// Begins an optimistic-concurrency transaction pinned to the current table version.
+    ///
+    /// <para>The returned <see cref="DeltaTransaction"/> records what it reads; on
+    /// <see cref="DeltaTransaction.CommitAsync"/> it is validated against every commit that landed since
+    /// this call. If none of them invalidated its reads it commits (rebasing onto the newer version if
+    /// necessary); otherwise it aborts with a <see cref="DeltaConflictException"/> — first committer
+    /// wins. Use this when a write depends on a read that a concurrent writer could invalidate; the
+    /// auto-committing <see cref="DeleteAsync"/> / write methods are the single-shot equivalent.</para>
+    /// </summary>
+    public DeltaTransaction StartTransaction(
+        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+    {
+        ThrowIfDisposed();
+        return new DeltaTransaction(this, CurrentSnapshot, isolationLevel);
+    }
+
+    /// <summary>
+    /// Runs the optimistic-concurrency commit loop for <paramref name="transaction"/>. Attempts the
+    /// commit at the version after the transaction's read version; on a collision it reads the
+    /// intervening commits, runs the <see cref="Concurrency.ConflictChecker"/>, and either aborts (a
+    /// real conflict) or rebases onto the latest version and retries (no conflict — the staged actions
+    /// remain valid, since nothing the transaction read or removed was touched).
+    /// </summary>
+    internal async ValueTask<long> CommitTransactionAsync(
+        DeltaTransaction transaction, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+
+        var baseSnapshot = transaction.BaseSnapshot;
+        var dataActions = transaction.DataActions;
+        if (dataActions.Count == 0)
+            return baseSnapshot.Version; // nothing staged — no commit
+
+        // A rebased add would need its baseRowId recomputed against the advanced high-water mark, which
+        // is not implemented yet. A row-tracking transaction may still commit if it wins the FIRST
+        // attempt (no rebase); on any rebase it aborts rather than write a wrong baseRowId.
+        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            baseSnapshot.Metadata.Configuration);
+
+        // A DELETE reads exactly the files it removes, so the removed paths are both the read-set
+        // (concurrentDeleteRead) and the planned removes (delete/delete).
+        var reads = new Concurrency.ReadSet { Files = transaction.RemovedPaths };
+        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
+
+        long attemptVersion = baseSnapshot.Version + 1;
+        const int maxAttempts = 100;
+        for (int attempt = 0; ; attempt++)
+        {
+            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                dataActions, baseSnapshot.Metadata.Configuration, transaction.Operation);
+            try
+            {
+                await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
+                    .ConfigureAwait(false);
+                _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+                    CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+                return attemptVersion;
+            }
+            catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
+            {
+                long latest = await _log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
+
+                var concurrent = new List<(long, IReadOnlyList<DeltaAction>)>();
+                for (long v = baseSnapshot.Version + 1; v <= latest; v++)
+                {
+                    concurrent.Add((v,
+                        await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false)));
+                }
+
+                var verdict = Concurrency.ConflictChecker.Check(
+                    reads, transaction.RemovedPaths, pruner, transaction.IsolationLevel, concurrent);
+                if (verdict.HasConflict)
+                    throw new DeltaConflictException(verdict.Message!);
+
+                if (rowTracking)
+                {
+                    throw new DeltaConflictException(
+                        "Cannot rebase a row-tracking transaction onto a concurrent commit "
+                        + "(baseRowId reassignment is not yet supported); retry the operation.");
+                }
+
+                attemptVersion = latest + 1; // no conflict — rebase and retry
+            }
+        }
+    }
+
+    #endregion
+
     #region Delete and Update
 
     /// <summary>
@@ -1032,8 +1123,44 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         HonorWriterFeatures(isAppend: false); // DELETE is a data change
 
         var snapshot = CurrentSnapshot;
+        var plan = await ComputeDeleteActionsAsync(snapshot, predicate, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (plan.DataActions.Count == 0)
+            return (0, snapshot.Version);
+
+        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
+            plan.DataActions, snapshot.Metadata.Configuration, "DELETE");
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
+            .ConfigureAwait(false);
+
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        return (plan.TotalDeleted, newVersion);
+    }
+
+    /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, and the row
+    /// count — everything a commit needs, but without committing. Shared by the auto-committing
+    /// <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    internal sealed record DeleteActions(
+        IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted);
+
+    /// <summary>
+    /// Computes the actions for a DELETE against <paramref name="snapshot"/> WITHOUT committing. The
+    /// removed-file paths double as a transaction's read-set: a DELETE reads exactly the files it
+    /// rewrites, so a concurrent commit that removed one of them is the conflict that must abort it.
+    /// </summary>
+    internal async ValueTask<DeleteActions> ComputeDeleteActionsAsync(
+        Snapshot.Snapshot snapshot,
+        Func<RecordBatch, BooleanArray> predicate,
+        CancellationToken cancellationToken)
+    {
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalDeleted = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -1106,6 +1233,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
             });
+            removedPaths.Add(addFile.Path);
 
             actions.Add(addFile with
             {
@@ -1127,20 +1255,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (actions.Count == 0)
-            return (0, snapshot.Version);
-
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "DELETE");
-
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
-            .ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        return (totalDeleted, newVersion);
+        return new DeleteActions(actions, removedPaths, totalDeleted);
     }
 
     /// <summary>
