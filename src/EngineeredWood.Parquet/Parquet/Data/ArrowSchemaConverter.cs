@@ -274,12 +274,12 @@ internal static class ArrowSchemaConverter
                     _ => Apache.Arrow.Types.TimeUnit.Microsecond,
                 },
                 ts.IsAdjustedToUtc ? TimeZoneInfo.Utc : null),
-            LogicalType.TimeType time => new Time32Type(
-                time.Unit switch
-                {
-                    Metadata.TimeUnit.Millis => Apache.Arrow.Types.TimeUnit.Millisecond,
-                    _ => Apache.Arrow.Types.TimeUnit.Microsecond,
-                }),
+            // Arrow requires Time32 for second/millisecond units and Time64 for micro/nanosecond units —
+            // a Time32 with a micro/nano unit is a malformed type (4-byte buffer read with 8-byte semantics),
+            // mishandled crossing the Arrow C-data-interface. Match on the unit accordingly.
+            LogicalType.TimeType { Unit: Metadata.TimeUnit.Millis } => new Time32Type(Apache.Arrow.Types.TimeUnit.Millisecond),
+            LogicalType.TimeType { Unit: Metadata.TimeUnit.Nanos } => new Time64Type(Apache.Arrow.Types.TimeUnit.Nanosecond),
+            LogicalType.TimeType => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
             LogicalType.EnumType => Apache.Arrow.Types.StringType.Default,
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
             LogicalType.UuidType => MakeUuidArrowType(options),
