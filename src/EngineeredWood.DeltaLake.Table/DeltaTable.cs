@@ -204,6 +204,227 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
     }
 
+    #region Schema Evolution
+
+    /// <summary>
+    /// Schema evolution — appends a nullable column. Writes a metadata-only commit (a new
+    /// <see cref="MetadataAction"/> whose schema = the current schema ++ <paramref name="newColumn"/>); NO data
+    /// files are rewritten. Old files lack the column, so the read path backfills it as all-NULL. The column
+    /// must be nullable (existing rows have no value for it). On a column-mapping table the new field is
+    /// assigned a fresh column id (maxColumnId + 1) and physical name — recursively, so a struct/array/map
+    /// column arrives with ids on every descendant — and <c>delta.columnMapping.maxColumnId</c> is bumped.
+    /// Returns the new version.
+    /// </summary>
+    public async ValueTask<long> AddColumnAsync(
+        Field newColumn, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        if (!newColumn.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
+
+        var snapshot = CurrentSnapshot;
+        var config = snapshot.Metadata.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        foreach (var f in snapshot.Schema.Fields)
+        {
+            if (string.Equals(f.Name, newColumn.Name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
+        }
+
+        // Convert the incoming Arrow field to a Delta field (via a one-field schema — reuses the type mapping).
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema([newColumn], null)).Fields[0];
+
+        string newSchemaString;
+        var newConfig = config;
+        if (mappingMode == ColumnMappingMode.None)
+        {
+            // Plain table: append the field; old files backfill NULL on read.
+            var fields = new List<StructField>(snapshot.Schema.Fields) { newDeltaField };
+            newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = fields });
+        }
+        else
+        {
+            // Column-mapping table: assign the new field a fresh column id + physical name RECURSIVELY (the
+            // create-time assigner), so a struct/array/map-typed column arrives with ids on every descendant —
+            // a top-level-only assignment would commit spec-violating metadata that strict readers reject.
+            // Existing fields keep their id/physicalName; maxColumnId advances past the last assigned id.
+            var (mappedField, lastId) = AssignMappedField(snapshot.Schema, config, newDeltaField);
+            var fields = new List<StructField>(snapshot.Schema.Fields) { mappedField };
+            newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = fields });
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
+            "ADD COLUMNS",
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Renames a column as a metadata-only commit (a new <c>metaData</c> action changing only the field's
+    /// logical name; NO data files are rewritten). ONLY supported on a <b>column-mapping</b> table: the field
+    /// keeps its <c>delta.columnMapping.id</c> + <c>physicalName</c>, so existing data files (stored under the
+    /// physical name, or matched by field id in id mode) are read unchanged under the new logical name. A
+    /// non-mapping table would have to rewrite every file (the logical name IS the physical parquet name), so
+    /// it is rejected. Throws if <paramref name="oldName"/> is absent or <paramref name="newName"/> exists.
+    /// Returns the new version.
+    /// </summary>
+    public async ValueTask<long> RenameColumnAsync(
+        string oldName, string newName, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+
+        var schema = snapshot.Schema;
+        StructField? target = null;
+        foreach (var f in schema.Fields)
+        {
+            if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newName}' already exists.");
+            if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                target = f;
+        }
+        if (target is null)
+            throw new InvalidOperationException($"Column '{oldName}' does not exist.");
+
+        var newFields = new List<StructField>(schema.Fields.Count);
+        foreach (var f in schema.Fields)
+        {
+            newFields.Add(ReferenceEquals(f, target)
+                ? new StructField
+                {
+                    Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata,
+                }
+                : f);
+        }
+        string newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = newFields });
+
+        // metaData.partitionColumns holds LOGICAL names (Spark convention) — renaming a partition column must
+        // update it too, else the reader/writer treat the renamed column as an ordinary data column.
+        var newPartitionColumns = snapshot.Metadata.PartitionColumns;
+        if (newPartitionColumns.Contains(oldName))
+        {
+            newPartitionColumns = newPartitionColumns
+                .Select(pc => string.Equals(pc, oldName, StringComparison.Ordinal) ? newName : pc)
+                .ToList();
+        }
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with
+            {
+                SchemaString = newSchemaString,
+                PartitionColumns = newPartitionColumns,
+            },
+            "RENAME COLUMN",
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drops a column as a metadata-only commit (a new <c>metaData</c> action removing the field; NO data files
+    /// are rewritten — old files still carry the physical column, which the read path reconciles away against
+    /// the current schema). ONLY supported on a <b>column-mapping</b> table: without mapping, dropping a column
+    /// would require rewriting every data file, and the name could not be safely reused. The dropped field's
+    /// column id is retired (maxColumnId is NOT decremented), so a later ADD COLUMN never reuses it. Throws if
+    /// the column is absent, is a partition column, or is the table's only column. Returns the new version.
+    /// </summary>
+    public async ValueTask<long> DropColumnAsync(
+        string name, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+        foreach (var pc in snapshot.Metadata.PartitionColumns)
+        {
+            if (string.Equals(pc, name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Cannot drop partition column '{name}'.");
+        }
+
+        var newFields = new List<StructField>(snapshot.Schema.Fields.Count);
+        bool found = false;
+        foreach (var f in snapshot.Schema.Fields)
+        {
+            if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+            newFields.Add(f);
+        }
+        if (!found)
+            throw new InvalidOperationException($"Column '{name}' does not exist.");
+        if (newFields.Count == 0)
+            throw new InvalidOperationException("Cannot drop the table's only column.");
+
+        string newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = newFields });
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString },
+            "DROP COLUMNS",
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    // Commits a single metaData action (the shape every metadata-only schema change takes) and refreshes.
+    private async ValueTask<long> CommitMetadataOnlyAsync(
+        Snapshot.Snapshot snapshot,
+        MetadataAction newMetadata,
+        string operation,
+        CancellationToken cancellationToken)
+    {
+        var actions = Log.InCommitTimestamp.EnsureCommitInfo(
+            [newMetadata], snapshot.Metadata.Configuration, operation);
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
+
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        return newVersion;
+    }
+
+    // Assigns column-mapping metadata (id + physical name) to a NEW field being added to a mapped table —
+    // recursively, via the create-time assigner, so struct/array/map descendants all get their own ids. Ids
+    // continue past the table's current maxColumnId (schema-derived OR the config key, whichever is higher).
+    // Returns the mapped field + the last assigned id (the new maxColumnId).
+    private static (StructField Field, int LastId) AssignMappedField(
+        StructType baseSchema, IReadOnlyDictionary<string, string>? config, StructField field)
+    {
+        int maxId = ColumnMapping.GetMaxColumnId(baseSchema);
+        if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
+            && int.TryParse(maxStr, out var cfgMax))
+        {
+            maxId = Math.Max(maxId, cfgMax);
+        }
+        var (assigned, lastId) = ColumnMapping.AssignColumnMapping(
+            new StructType { Fields = [field] }, maxId);
+        return (assigned.Fields[0], lastId);
+    }
+
+    #endregion
+
     #region Domain Metadata
 
     /// <summary>
@@ -1259,6 +1480,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // Strip internal row tracking column if present
             var (cleanResult, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(result);
+
+            // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
+            // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
+            // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
+            var expectedFields = (columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
+                : snapshot.ArrowSchema).FieldsList;
+            cleanResult = SchemaEvolution.BackfillMissingColumns(cleanResult, expectedFields);
+
             yield return cleanResult;
         }
     }
