@@ -57,23 +57,16 @@ public sealed class DeletionVectorReader
     }
 
     /// <summary>
-    /// Reads a file-based DV with UUID-relative path.
-    /// Path format: {random-prefix}{base85-encoded-uuid}
-    /// Resolved to: _delta_log/deletion_vector_{uuid}.bin
+    /// Reads a file-based DV with a UUID-relative path. The path derivation lives in
+    /// <see cref="DeletionVectorPath"/> because VACUUM must resolve it identically — a divergence
+    /// there means vacuum deletes a live DV and its masked rows silently reappear.
     /// </summary>
     private async ValueTask<byte[]> ReadUuidFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
-        // Spec: pathOrInlineDv = "<random prefix (optional)><z85-encoded uuid>" (uuid = the LAST 20 chars);
-        // the file lives in the TABLE ROOT (next to the data files, NOT _delta_log/) at
-        // "<prefix>/deletion_vector_<uuid>.bin" — the prefix, when present, is a directory (like the
-        // random data-file prefixes Spark writes).
-        string pathOrUuid = dv.PathOrInlineDv;
-        string uuid = DecodeUuidFromPath(pathOrUuid);
-        string prefix = pathOrUuid.Length > 20 ? pathOrUuid.Substring(0, pathOrUuid.Length - 20) : "";
-        string filePath = prefix.Length > 0
-            ? $"{prefix}/deletion_vector_{uuid}.bin"
-            : $"deletion_vector_{uuid}.bin";
+        string filePath = DeletionVectorPath.GetRelativePath(dv)
+            ?? throw new DeltaFormatException(
+                $"Deletion vector storage type '{dv.StorageType}' has no table-relative path.");
 
         return await ReadDvFileAsync(filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
             .ConfigureAwait(false);
@@ -128,35 +121,4 @@ public sealed class DeletionVectorReader
         return result;
     }
 
-    /// <summary>
-    /// Decodes a UUID from the Z85-encoded path segment.
-    /// The path is a Base85-encoded 16-byte UUID.
-    /// </summary>
-    private static string DecodeUuidFromPath(string encodedPath)
-    {
-        // The encoded path may have a random prefix before the Z85-encoded UUID
-        // Z85-encoded 16 bytes = 20 characters
-        if (encodedPath.Length < 20)
-            throw new DeltaFormatException(
-                $"UUID path too short: '{encodedPath}'");
-
-        // The last 20 characters are the Z85-encoded UUID
-        string uuidEncoded = encodedPath[^20..];
-        byte[] uuidBytes = Base85.Decode(uuidEncoded);
-
-        if (uuidBytes.Length != 16)
-            throw new DeltaFormatException(
-                $"Expected 16-byte UUID, got {uuidBytes.Length} bytes.");
-
-        // The file-name UUID is the canonical (BIG-ENDIAN / Java) rendering of the 16 bytes.
-        // .NET's Guid(byte[]) shuffles the first three groups little-endian — format by hand instead.
-        var sb = new StringBuilder(36);
-        for (int i = 0; i < 16; i++)
-        {
-            if (i is 4 or 6 or 8 or 10)
-                sb.Append('-');
-            sb.Append(uuidBytes[i].ToString("x2"));
-        }
-        return sb.ToString();
-    }
 }

@@ -330,6 +330,86 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([100L, 101L, 200L], scores);
     }
 
+    // ── VACUUM: a destructive operation validated by the reference implementation. ──
+
+    /// <summary>
+    /// <para>Spark writes a table and DELETEs a row, producing a deletion-vector <c>.bin</c>. EW then
+    /// vacuums with zero retention — the most aggressive setting there is — and Spark reads again.</para>
+    ///
+    /// <para>This is the acceptance test for the vacuum rewrite. EW must resolve a DV path written by
+    /// ANOTHER engine (Z85-encoded UUID, possibly with a directory prefix) well enough to protect the
+    /// file. Get it wrong and the <c>.bin</c> is swept, the mask disappears, and the deleted row
+    /// silently returns as live data. EW's own reader would report the same wrong answer, so only a
+    /// foreign reader can catch it — and only after a vacuum that actually deleted something.</para>
+    /// </summary>
+    [Fact]
+    public void SparkWrittenDeletionVector_SurvivesEwVacuum()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 1L, "us" },
+                new object[] { 2L, "eu" },
+                new object[] { 3L, "apac" },
+                new object[] { 4L, "us" },
+            },
+            options = new Dictionary<string, string> { ["delta.enableDeletionVectors"] = "true" },
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+        });
+
+        int binsBefore = Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories).Length;
+        Assert.True(binsBefore > 0, "expected Spark to write a deletion-vector .bin");
+
+        VacuumViaEw();
+
+        Assert.Equal(binsBefore, Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories).Length);
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal([(1L, "us"), (3L, "apac"), (4L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// The complementary direction: after EW collects genuinely orphaned files, the reference
+    /// implementation must still read the table. A vacuum that deletes one file too many shows up here
+    /// as a read failure rather than as wrong data.
+    /// </summary>
+    [Fact]
+    public async Task EwVacuumed_SparkStillReadsTable()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema))
+        {
+            await table.WriteAsync([IdRegionBatch([1, 2], ["us", "eu"])]);
+            await table.WriteAsync([IdRegionBatch([3, 4], ["apac", "us"])], DeltaWriteMode.Overwrite);
+
+            var vacuumed = await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: false);
+            Assert.NotEmpty(vacuumed.FilesToDelete);
+        }
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal([(3L, "apac"), (4L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>Opens the Spark-written table with EW and vacuums it at zero retention.</summary>
+    private void VacuumViaEw()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var task = Task.Run(async () =>
+        {
+            await using var table = await DeltaTable.OpenAsync(fs);
+            await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: false);
+        });
+
+        task.GetAwaiter().GetResult();
+    }
+
     // ── Fail-closed on features EW cannot evaluate. ──
 
     /// <summary>

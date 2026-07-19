@@ -1951,10 +1951,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // features this implementation doesn't recognize.
         ProtocolVersions.ValidateVacuumSupport(CurrentSnapshot.Protocol);
 
-        var retention = retentionPeriod ?? _options.VacuumRetention;
+        // Precedence: explicit argument (Spark's RETAIN N HOURS), else the table's own
+        // delta.deletedFileRetentionDuration, else the library default. Measured against
+        // delta-spark 4.0.0: a RETAIN-less VACUUM on a table with the property set to
+        // "interval 0 seconds" collects a just-orphaned file immediately, so the property really is
+        // the default retention rather than an independent protection window.
+        var retention = retentionPeriod
+            ?? DeletedFileRetention(CurrentSnapshot.Metadata.Configuration)
+            ?? _options.VacuumRetention;
+
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The table's <c>delta.deletedFileRetentionDuration</c> as a <see cref="TimeSpan"/>, or null when
+    /// unset or unparseable. Unparseable falls through to the caller's default rather than throwing —
+    /// an odd property value must not make a table impossible to vacuum.
+    /// </summary>
+    private static TimeSpan? DeletedFileRetention(IReadOnlyDictionary<string, string>? configuration)
+    {
+        if (configuration is null
+            || !configuration.TryGetValue("delta.deletedFileRetentionDuration", out string? raw))
+        {
+            return null;
+        }
+
+        return IntervalParser.TryParse(raw, out var parsed) ? parsed : null;
     }
 
     private async IAsyncEnumerable<RecordBatch> ReadFileAsync(

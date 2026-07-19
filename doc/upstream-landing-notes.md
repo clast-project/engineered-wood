@@ -265,6 +265,47 @@ test reads whole tables, which never consults statistics at all.
 
 ## Deferred follow-ups (do after the PR-landing work)
 
+### A. VACUUM spec alignment — DONE (2026-07-19)
+
+Landed. **The plan recorded below was wrong on its central point**, and measuring beat reading again:
+
+- The plan said the keep-set should include "unexpired `RemoveFile` tombstones". **It must not.**
+  Measured against Spark 4.0.1 / delta-spark 4.0.0: `VACUUM ... RETAIN 0 HOURS` deletes a file
+  orphaned seconds earlier, with the tombstone still fresh in the log. That matches the documented
+  contract — vacuum removes files not referenced by the CURRENT version, which is precisely what ends
+  time travel past the retention window. Implementing tombstone protection made two existing tests
+  fail, which is how the error surfaced.
+- `delta.deletedFileRetentionDuration` is the **default retention** for a RETAIN-less vacuum, not an
+  independent protection window. Measured: with the property at `interval 0 seconds`, a RETAIN-less
+  `VACUUM` collects a just-orphaned file immediately. It is now honored in `DeltaTable.VacuumAsync`
+  (explicit argument > table property > `DeltaTableOptions.VacuumRetention`), parsed by the new
+  `IntervalParser` (months/years deliberately rejected as calendar-relative).
+
+What actually shipped: keep-set = the current version's `add` paths **plus their deletion-vector
+paths**; sweep everything under the table root with **no extension filter**; exclude `_delta_log/`
+and `_change_data/`.
+
+Two findings beyond the original scope:
+
+- **A latent data-loss bug in the OLD implementation.** CDF files live in `_change_data/`, are
+  referenced by `cdc` actions, and so never appear in `ActiveFiles` — but they ARE `.parquet`, so the
+  old vacuum deleted readable change-data-feed history once past retention. `_change_data/` is now
+  excluded outright. That under-deletes (expired CDF is never collected); a proper keep-set needs the
+  snapshot to track `cdc` actions, which it does not.
+- **Absolute-path (`p`) deletion vectors now make vacuum refuse.** Their targets cannot be resolved
+  against the table root from the action alone, so vacuum cannot prove they lie outside the swept
+  directory — and deleting a live DV silently resurrects every row it masked. EW never writes `p`
+  vectors; such a table came from another engine.
+
+The DV path derivation moved to a shared `DeletionVectorPath` used by BOTH the reader and vacuum. If
+those two ever disagreed, vacuum would delete a live vector — there must be exactly one implementation.
+
+Validated end to end by `SparkWrittenDeletionVector_SurvivesEwVacuum` (Spark writes a DV, EW vacuums
+at zero retention, Spark re-reads and the masked row is still masked) and `EwVacuumed_SparkStillReadsTable`.
+
+<details>
+<summary>Original plan (kept for the record — note the tombstone error above)</summary>
+
 ### A. VACUUM spec alignment (`VacuumExecutor.cs`)
 
 EW's `VacuumExecutor` diverges from official Delta (under-deletes): it only considers `.parquet` files
@@ -284,6 +325,8 @@ unexpired tombstones' data+DV paths (use `Snapshot.Tombstones`, added in slice 3
 Behavioral change to flag to Curt: EW VACUUM will then actually delete orphaned DV `.bin` and removed
 data files past retention (it doesn't today). Correct/spec-matching; default 7-day retention protects
 recent files. Ship with tests. Curt's preference: match the official implementation, not EW's.
+
+</details>
 
 ### B. Percent-encode non-ASCII in `DeltaPath.Encode` — RESEARCH DONE (2026-07-19)
 

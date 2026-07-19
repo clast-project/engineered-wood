@@ -3,6 +3,8 @@
 
 using System.Text.Json;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using DeltaSnapshot = EngineeredWood.DeltaLake.Snapshot.Snapshot;
 using EngineeredWood.IO;
@@ -31,40 +33,51 @@ internal static class VacuumExecutor
         bool dryRun,
         CancellationToken cancellationToken)
     {
-        // Collect all referenced file paths from the current snapshot. add.path is URL-encoded, so decode to
-        // the on-disk name before comparing against the physical directory listing (below).
-        var referencedPaths = new HashSet<string>(StringComparer.Ordinal);
+        // ── Mark: the keep-set is the CURRENT version's files, plus their deletion vectors. ──
+        //
+        // Tombstones do NOT protect their files. That is measured, not assumed: Spark 4.0 /
+        // delta-spark 4.0.0 delete a file orphaned seconds earlier under VACUUM RETAIN 0 HOURS, with
+        // the tombstone still fresh in the log. It matches the documented contract — vacuum removes
+        // files not referenced by the CURRENT version and thereby ends time travel past the retention
+        // window. `delta.deletedFileRetentionDuration` governs the DEFAULT retention (applied by the
+        // caller), not membership of this set.
+        //
+        // What each entry must contribute is its DATA path AND its deletion-vector path. Missing the
+        // DV path is how a vacuum silently corrupts a table: the .bin disappears, the mask with it,
+        // and every row it hid returns as live data with nothing logged anywhere.
+        var keep = new HashSet<string>(StringComparer.Ordinal);
+
         foreach (var addFile in snapshot.ActiveFiles.Values)
-            referencedPaths.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path));
-
-        // List all data files in the table directory
-        // Data files are Parquet files not in _delta_log/
-        var allFiles = new List<TableFileInfo>();
-        await foreach (var file in fs.ListAsync("", cancellationToken).ConfigureAwait(false))
         {
-            // Skip log files and non-parquet files
-            if (file.Path.StartsWith("_delta_log/", StringComparison.Ordinal) ||
-                file.Path.StartsWith("_delta_log\\", StringComparison.Ordinal))
-                continue;
-
-            if (!file.Path.EndsWith(".parquet", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            allFiles.Add(file);
+            // add.path is URL-encoded; decode to the on-disk name before comparing against the listing.
+            keep.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path));
+            AddDeletionVectorPath(keep, addFile.DeletionVector);
         }
 
-        // Find unreferenced files older than the retention period
+        // A tombstone's DV is NOT kept — it masked rows in a file no longer part of the table, so it is
+        // exactly the orphaned .bin this rewrite exists to collect. But a `p`-type vector anywhere in
+        // the log still has to be rejected, because we cannot prove it lies outside the sweep.
+        foreach (var tombstone in snapshot.Tombstones.Values)
+            RejectIfAbsolute(tombstone.DeletionVector);
+
+        // ── Sweep: everything under the table root, with NO extension filter. ──
+        //
+        // The old `.parquet`-only filter is why orphaned deletion_vector_*.bin leaked forever. Dropping
+        // it means non-parquet files are now collectable, so the exclusions below carry real weight.
         var cutoff = DateTimeOffset.UtcNow - retentionPeriod;
         var filesToDelete = new List<string>();
         long bytesToDelete = 0;
 
-        foreach (var file in allFiles)
+        await foreach (var file in fs.ListAsync("", cancellationToken).ConfigureAwait(false))
         {
-            if (!referencedPaths.Contains(file.Path) && file.LastModified < cutoff)
-            {
-                filesToDelete.Add(file.Path);
-                bytesToDelete += file.Size;
-            }
+            if (IsExcludedDirectory(file.Path))
+                continue;
+
+            if (keep.Contains(file.Path) || file.LastModified >= cutoff)
+                continue;
+
+            filesToDelete.Add(file.Path);
+            bytesToDelete += file.Size;
         }
 
         int deleted = 0;
@@ -106,6 +119,57 @@ internal static class VacuumExecutor
             FilesDeleted = deleted,
         };
     }
+
+    /// <summary>
+    /// Adds a deletion vector's backing file to the keep-set. Inline vectors live in the log and have
+    /// no file of their own.
+    /// </summary>
+    private static void AddDeletionVectorPath(HashSet<string> keep, DeletionVector? dv)
+    {
+        RejectIfAbsolute(dv);
+
+        string? path = dv is null ? null : DeletionVectorPath.GetRelativePath(dv);
+        if (path is not null)
+            keep.Add(path);
+    }
+
+    /// <summary>
+    /// Absolute-path (<c>p</c>) vectors cannot be resolved against the table root from the action
+    /// alone. Vacuum would have to guess whether each one lies inside the directory it is about to
+    /// sweep, and a wrong guess deletes a live deletion vector — silently resurrecting every row it
+    /// masks. Refusing is the only safe answer; EngineeredWood never writes <c>p</c> vectors, so a
+    /// table containing them came from another engine.
+    /// </summary>
+    private static void RejectIfAbsolute(DeletionVector? dv)
+    {
+        if (dv is not null && DeletionVectorPath.IsAbsolute(dv))
+        {
+            throw new NotSupportedException(
+                "This table contains absolute-path deletion vectors (storageType 'p'), whose targets "
+                + "cannot be resolved against the table root. Vacuum cannot prove they lie outside the "
+                + "swept directory, and deleting a live deletion vector would silently resurrect every "
+                + "row it masks. Vacuum is refused for this table.");
+        }
+    }
+
+    /// <summary>
+    /// Directories vacuum must never sweep.
+    ///
+    /// <para><c>_delta_log/</c> is the log itself — its lifetime is governed by
+    /// <c>delta.logRetentionDuration</c> and log cleanup, not by vacuum.</para>
+    ///
+    /// <para><c>_change_data/</c> holds change-data-feed files, which are referenced by <c>cdc</c>
+    /// actions rather than <c>add</c> actions and so never appear in the snapshot's active files.
+    /// Sweeping it would delete live CDF history — which the previous implementation did, since those
+    /// files are <c>.parquet</c> and absent from <c>ActiveFiles</c>. Excluding the directory
+    /// under-deletes (expired CDF is never collected) but cannot destroy readable history; building a
+    /// proper CDF keep-set needs the snapshot to track <c>cdc</c> actions, which it does not yet.</para>
+    /// </summary>
+    private static bool IsExcludedDirectory(string path) =>
+        path.StartsWith("_delta_log/", StringComparison.Ordinal)
+        || path.StartsWith("_delta_log\\", StringComparison.Ordinal)
+        || path.StartsWith(CdfConfig.ChangeDataDir + "/", StringComparison.Ordinal)
+        || path.StartsWith(CdfConfig.ChangeDataDir + "\\", StringComparison.Ordinal);
 
     // Writes a commitInfo-only commit, retrying past versions a concurrent writer takes (the commit carries
     // no data actions, so re-attempting at the next version is always safe). Returns the committed version.

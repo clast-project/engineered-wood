@@ -351,7 +351,7 @@ effectively unused on write.
 
 **Table-property honoring.** The following properties are accepted in
 table metadata but not acted on by the runtime: `delta.logRetentionDuration`,
-`delta.deletedFileRetentionDuration`, `delta.enableExpiredLogCleanup`,
+`delta.enableExpiredLogCleanup`,
 `delta.randomizeFilePrefixes`, `delta.checkpointInterval` (as a table
 property; the .NET option `DeltaTableOptions.CheckpointInterval` does
 work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
@@ -400,11 +400,20 @@ and `DropColumnAsync` exist as metadata-only commits. Still missing:
 nullability change, and adding a column to a nested struct. Column mapping
 mode is fixed at `CreateAsync`.
 
-**Orphan deletion-vector files.** `VacuumExecutor` excludes
-`_delta_log/` from deletion. Abandoned DV `.bin` files written into
-`_delta_log/` are never cleaned up. More broadly, `VacuumExecutor`
-under-deletes relative to the spec — see the VACUUM alignment plan in
-[`upstream-landing-notes.md`](upstream-landing-notes.md).
+**Vacuum does not collect expired change-data-feed files.** `_change_data/`
+is excluded from the sweep because CDF files are referenced by `cdc`
+actions, which never appear in the snapshot's active files — a keep-set
+built from `add` actions alone does not cover them, and sweeping the
+directory would destroy readable history. Building a proper CDF keep-set
+needs the snapshot to track `cdc` actions, which it does not yet. This
+under-deletes; it cannot lose data.
+
+**Vacuum refuses tables with absolute-path deletion vectors.** A
+`storageType: "p"` vector cannot be resolved against the table root from
+the action alone, so vacuum cannot prove it lies outside the directory it
+is about to sweep. It throws `NotSupportedException` rather than guessing —
+deleting a live deletion vector would silently resurrect every row it
+masked. EngineeredWood never writes `p` vectors.
 
 ### Correctness / interop issues
 
