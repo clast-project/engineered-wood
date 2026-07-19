@@ -975,6 +975,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ExtendedFileMetadata = true,
                 PartitionValues = addFile.PartitionValues,
                 Size = addFile.Size,
+                // Keyed by (path, deletionVector) — see the Overwrite remove. The rewritten file already
+                // has the DV's deletions applied, so the source must be removed under its DV-qualified key.
+                DeletionVector = addFile.DeletionVector,
             });
 
             actions.Add(new AddFile
@@ -1236,6 +1239,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     ExtendedFileMetadata = true,
                     PartitionValues = existingFile.PartitionValues,
                     Size = existingFile.Size,
+                    // The active set is keyed by (path, deletionVector) — a remove that omits the DV does not
+                    // reconcile against a DV-carrying add, leaving the file active and DUPLICATING its rows.
+                    DeletionVector = existingFile.DeletionVector,
                 });
             }
         }

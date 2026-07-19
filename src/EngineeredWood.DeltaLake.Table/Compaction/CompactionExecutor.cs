@@ -63,20 +63,38 @@ internal static class CompactionExecutor
             targetSchema = new Apache.Arrow.Schema(physFields, null);
         }
 
-        // Read all data from candidate files, widening types if needed
+        // Read all LIVE data from candidate files, widening types if needed. A candidate may carry a deletion
+        // vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded — compacting the
+        // raw parquet would RESURRECT every deleted row.
+        var dvReader = new DeletionVectors.DeletionVectorReader(fs);
         var allBatches = new List<RecordBatch>();
         foreach (var addFile in candidates)
         {
+            var deletedRows = addFile.DeletionVector is not null
+                ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : null;
+
             await using var file = await fs.OpenReadAsync(
                 EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
 
+            long batchStartRow = 0;
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
+                var liveBatch = batch;
+                if (deletedRows is not null)
+                {
+                    liveBatch = DeletionVectors.DeletionVectorFilter.Filter(
+                        liveBatch, deletedRows, batchStartRow);
+                    batchStartRow += batch.Length;
+                    if (liveBatch.Length == 0)
+                        continue; // every row in this batch was deleted
+                }
+
                 // Widen values from old files to match current schema
-                var outBatch = TypeWidening.ValueWidener.WidenBatch(batch, targetSchema);
+                var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
                 if (mappingMode != ColumnMappingMode.None)
                 {
                     // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own
@@ -115,6 +133,9 @@ internal static class CompactionExecutor
                 ExtendedFileMetadata = true,
                 PartitionValues = oldFile.PartitionValues,
                 Size = oldFile.Size,
+                // Keyed by (path, deletionVector) — a remove omitting the DV leaves the compacted-away file
+                // active and duplicates its rows.
+                DeletionVector = oldFile.DeletionVector,
             });
         }
 
