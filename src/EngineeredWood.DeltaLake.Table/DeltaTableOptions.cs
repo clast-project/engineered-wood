@@ -36,6 +36,21 @@ public sealed record DeltaTableOptions
     /// <summary>Whether to collect per-column statistics on write. Default: true.</summary>
     public bool CollectStats { get; init; } = true;
 
+    /// <summary>
+    /// Whether a <c>variant</c> column's parquet group carries the <c>VARIANT</c> logical-type
+    /// annotation. Default: <see langword="true"/>.
+    /// <para>The Delta spec defines a variant's physical layout as a plain <c>struct&lt;value,
+    /// metadata&gt;</c> and does not require the parquet annotation, so both settings produce
+    /// spec-conforming files that this library and delta-rs read either way.</para>
+    /// <para><b>true (default)</b> emits the annotation — what Databricks/Spark 4.1+ (where variant is
+    /// GA) and DuckDB write and expect. <b>false</b> omits it, writing the bare struct-of-binary for
+    /// compatibility with Spark 4.0.x, whose parquet reader predates the VARIANT logical type and
+    /// throws a <c>NullPointerException</c> on an annotated group. Set false only when targeting a
+    /// reader stuck on that experimental-variant era; it costs nothing with modern readers but also
+    /// buys nothing there.</para>
+    /// </summary>
+    public bool EmitVariantLogicalType { get; init; } = true;
+
     /// <summary>Optional pluggable writer for data-file bytes. When set, the table delegates parquet file
     /// production to it (e.g. a host's native parquet writer) instead of the built-in <c>ParquetFileWriter</c>;
     /// all other write logic (partitioning, row tracking, stats, the <c>add</c> action, the commit) is unchanged.

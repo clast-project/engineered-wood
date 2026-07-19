@@ -57,10 +57,15 @@ public class VariantTests : IDisposable
             values.Length);
     }
 
-    // Variant primitive encodings (basic_type=primitive): boolean true / false, int8(42).
-    private static byte[] True => [0x0C];
-    private static byte[] False => [0x08];
-    private static byte[] Int8Val => [0x0C + 0x04, 42]; // primitive header for int8, then the value
+    // Valid variant primitive encodings. A primitive value byte is (type_id << 2) | basic_type, with
+    // basic_type 0 = primitive; type_id 1 = boolean-true, 2 = boolean-false, 3 = int8 (one trailing
+    // byte). These must be SPEC-VALID, not just round-trippable: EngineeredWood and delta-rs treat the
+    // value as opaque bytes and never validate it, but Spark decodes it and rejects a malformed value
+    // with MALFORMED_VARIANT — an earlier revision of this file used [0x0C] (a truncated int8) as
+    // "true" and only external validation caught it.
+    private static byte[] True => [0x04];              // (1 << 2) | 0
+    private static byte[] False => [0x08];             // (2 << 2) | 0
+    private static byte[] Int8Val => [0x0C, 0x2A];     // (3 << 2) | 0, then the int8 value 42
 
     private static async Task<List<RecordBatch>> ReadAllAsync(DeltaTable table)
     {
@@ -90,6 +95,80 @@ public class VariantTests : IDisposable
         Assert.True(v.IsNull(2));
         Assert.Equal(True, v.GetValueBytes(0).ToArray());
         Assert.Equal(False, v.GetValueBytes(1).ToArray());
+        Assert.Equal(EmptyMetadata, v.GetMetadataBytes(0).ToArray());
+    }
+
+    /// <summary>Reads the sole data file's parquet schema and returns whether the <c>v</c> group carries
+    /// the VARIANT logical-type annotation.</summary>
+    private async Task<bool> VariantGroupIsAnnotated()
+    {
+        string file = Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories).Single();
+        await using var raf = new EngineeredWood.IO.Local.LocalRandomAccessFile(file);
+        await using var reader = new Parquet.ParquetFileReader(raf, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+        var group = meta.Schema.First(s => s.Name == "v");
+        return group.LogicalType is Parquet.Metadata.LogicalType.VariantType;
+    }
+
+    [Fact]
+    public async Task Default_WritesAnnotatedParquet()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema());
+        await table.WriteAsync([VariantBatch(True, False)]);
+
+        // Default (EmitVariantLogicalType = true): the group carries the annotation — what Spark 4.1+
+        // and DuckDB expect.
+        Assert.True(await VariantGroupIsAnnotated());
+    }
+
+    [Fact]
+    public async Task EmitVariantLogicalTypeFalse_WritesUnannotatedButStillRoundTrips()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var options = DeltaTableOptions.Default with { EmitVariantLogicalType = false };
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), options: options);
+        await table.WriteAsync([VariantBatch(True, Int8Val, null)]);
+
+        // Spark-4.0.x-compatible: no annotation on the parquet group...
+        Assert.False(await VariantGroupIsAnnotated());
+
+        // ...but EW still reads it as a variant, because the read path recovers the type from the Delta
+        // schema (VariantColumnCoercion), not from the annotation. This is the round-trip that would have
+        // silently degraded to a struct before the coercion existed.
+        var read = await ReadAllAsync(table);
+        var v = Assert.IsType<VariantArray>(read[0].Column(1));
+        Assert.Equal(True, v.GetValueBytes(0).ToArray());
+        Assert.Equal(Int8Val, v.GetValueBytes(1).ToArray());
+        Assert.True(v.IsNull(2));
+    }
+
+    [Fact]
+    public void Coerce_WrapsUnannotatedStruct_MappingChildrenByName()
+    {
+        // A file written with children in Spark's (value, metadata) order — the opposite of EW's. The
+        // Arrow VariantType factory is POSITIONAL, so coercion must reorder by NAME or the two binaries
+        // are silently swapped. Pin that here rather than trusting field order.
+        var storageType = new Apache.Arrow.Types.StructType(
+        [
+            new Field("value", BinaryType.Default, false),
+            new Field("metadata", BinaryType.Default, false),
+        ]);
+        var valueArr = new BinaryArray.Builder().Append((ReadOnlySpan<byte>)Int8Val).Build();
+        var metaArr = new BinaryArray.Builder().Append((ReadOnlySpan<byte>)EmptyMetadata).Build();
+        var storage = new StructArray(storageType, 1, [valueArr, metaArr], ArrowBuffer.Empty, 0);
+
+        // Schema declares the column variant; the batch carries the bare, value-first struct.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("v", VariantType.Default, true))
+            .Build();
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("v", storageType, true)).Build(),
+            [storage], 1);
+
+        var coerced = VariantColumnCoercion.Coerce(batch, schema);
+        var v = Assert.IsType<VariantArray>(coerced.Column(0));
+        Assert.Equal(Int8Val, v.GetValueBytes(0).ToArray());        // value, not metadata
         Assert.Equal(EmptyMetadata, v.GetMetadataBytes(0).ToArray());
     }
 

@@ -1246,6 +1246,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(
                     batch, snapshot.Schema, mappingMode);
                 var (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(physicalBatch);
+                // Drop the VARIANT annotation for a Spark 4.0.x-compatible table (bytes unchanged; the
+                // read path recovers the type from the schema). Stats use outputBatches, not these.
+                if (!_options.EmitVariantLogicalType)
+                    cleanBatch = VariantColumnCoercion.StripAnnotation(cleanBatch);
                 writeBatches.Add(cleanBatch);
             }
 
@@ -1810,12 +1814,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 long fileSize;
 
+                // For a Spark 4.0.x-compatible table, drop the VARIANT logical-type annotation by writing
+                // the bare storage struct. Bytes are identical; only the parquet schema differs, and the
+                // read path recovers the variant type from the Delta schema. Stats above use dataBatch, so
+                // this does not touch them.
+                var writeBatch = _options.EmitVariantLogicalType
+                    ? physicalBatch
+                    : VariantColumnCoercion.StripAnnotation(physicalBatch);
+
                 if (_options.DataFileWriter is { } dataFileWriter)
                 {
                     // Delegate the parquet bytes to the host writer; it places the file at the location the
                     // table filesystem maps `fileName` to and returns its byte size.
                     fileSize = await dataFileWriter.WriteAsync(
-                        [physicalBatch], fileName, cancellationToken).ConfigureAwait(false);
+                        [writeBatch], fileName, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -1823,7 +1835,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(physicalBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
                         .ConfigureAwait(false);
 
                     // DisposeAsync writes the Parquet footer before we read Position
@@ -2259,10 +2271,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
             // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
             // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
-            var expectedFields = (columns is not null
+            var expectedSchema = columns is not null
                 ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
-                : snapshot.ArrowSchema).FieldsList;
-            cleanResult = SchemaEvolution.BackfillMissingColumns(cleanResult, expectedFields);
+                : snapshot.ArrowSchema;
+            cleanResult = SchemaEvolution.BackfillMissingColumns(cleanResult, expectedSchema.FieldsList);
+
+            // Present variant columns per the Delta SCHEMA, not the parquet annotation: an unannotated
+            // file (Spark 4.0.x, a spec-minimal writer, or our own output under
+            // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
+            // not wrap. Without this the column would silently read as a struct rather than a variant.
+            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
 
             yield return cleanResult;
         }
