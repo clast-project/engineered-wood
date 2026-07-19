@@ -23,6 +23,7 @@ change diverges from the original PR.
 | 4 — Spec path encoding (`DeltaPath`) | `74bc1aa` | Hive-escaped partition dirs + URL-encoded `add.path`, decoded at every read site + vacuum. Hand-ported cross-cutting wiring. **See non-ASCII follow-up below.** |
 | 5 — writer features + protocol declaration | `cc8d6fe`, `c1b1474`, `70d2384`, `8e3fa8d` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. `70d2384`: declare schema-driven features (timestampNtz/identityColumns/columnMapping-in-v7) at `CreateAsync` + protocol upgrade on `AddColumnAsync`. `8e3fa8d`: `delta.rowTracking` HWM emission + `SnapshotBuilder` reconciliation. **Did NOT allowlist variantType/rowTracking** as supported features (need later slices). |
 | 6 — column mapping | `aa3f0e2`, `7a327f0`, `4754a72` | `aa3f0e2`: physical names in BOTH modes + new `ColumnMappingRecursive.ToPhysical/ToLogical` (nested struct children) + numeric `delta.columnMapping.id`. `7a327f0`: compaction re-stamps field ids & widens against the physical-named target schema. `4754a72`: `AddColumnAsync`/`RenameColumnAsync`/`DropColumnAsync` metadata-only + `SchemaEvolution.BackfillMissingColumns` read-path reconcile. **See slice-6 leftovers below.** |
+| 7 (PARTIAL) — pluggable codec seam | `9302723` | `IDataFileWriter` + `IDataFileReader` on `DeltaTableOptions`, both default-null. Wired into the write path, the CoW UPDATE rewrite, compaction, and `ReadFileAsync` (via the extracted `ProcessFileBatchesAsync`). `CleanField` preserves `ARROW:extension:*`. **`IDataFileRewriter` NOT landed — see below.** |
 | 8 (PARTIAL) — misc reader/DML correctness | `adc3b44`, `8cbf8d2`, `e025880`, `ebeb841`, `e83a232`, `d79abc7`, `1883f51`, `7bf3f6c`, `e0567cb`, `4cd1f06` | Thrift wire-type guards (+ALP test gating; Parquet 585/585, was 573). Empty-page snappy stream. ListVersions ascending. S3 conditional rename. Row-filter type coverage. Nested stats end-to-end. TIME→Time64. DV-qualified removes + compaction DV exclusion. `DecimalOutputKind` read option. Always-on commitInfo + `GetHistoryAsync`. **See slice-8 leftovers below.** |
 
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
@@ -58,7 +59,15 @@ superset of master's `DeltaTable.cs` work but its `CheckpointReader` (drops slic
 `remove.deletionVector`) and `CompactionExecutor` (regresses slice 4's path encoding) are NOT — never take
 those wholesale.
 
-### Strategic decision pending for the remainder (slices 7 and 9)
+### Slice-7 leftover (deliberately not landed)
+
+- **`IDataFileRewriter`** — the third seam interface. Its `ReadRewriteAsync` contract requires the transient
+  rowid (`(fileOrdinal << 40) | position`, so the host can match rows for an UPDATE substitution) and the
+  `RowTrackingRewrite` record for materializing ids through a rewrite. Both come from the "row tracking
+  preserved through every rewrite" thread that was excluded from slice 8. Shipping the interface without
+  them would be public surface the implementation cannot honour. Land the two together.
+
+### Strategic decision pending for the remainder (slice 9)
 
 Slices 1–6 are landed piecemeal and fully tested, so the "foundation-first vs piecemeal" question is now
 only about 7–9 — and piecemeal has held up better than expected (slices 5 and 6 both landed without the
@@ -70,11 +79,10 @@ only about 7–9 — and piecemeal has held up better than expected (slices 5 an
    (spec/interop bug fixes, safe writes to Spark tables, spec-correct column mapping + schema evolution,
    a usable table history). A defensible stopping point.
 
-Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first) and 9
-(row-level concurrency — **STRATEGIC**, most complex). The refactor they wanted is now landed, so each can
-be taken on its own merits. What remains of slice 8 is the OCC/conflict-checker material, which belongs
-with 9. Variant support (`VariantTransport`, 316 lines) is an independent third thing the PR carries —
-master has no variant anywhere, so it is its own decision too.
+Remaining: slice 9 (row-level concurrency — **STRATEGIC**, most complex), which also absorbs slice 8's
+OCC/conflict-checker material and the row-tracking-through-rewrite thread that `IDataFileRewriter` needs.
+Variant support (`VariantTransport`, 316 lines) is an independent third thing the PR carries — master has
+no variant anywhere, so it remains its own decision.
 
 ### Slice-6 leftovers (deliberately not landed)
 
