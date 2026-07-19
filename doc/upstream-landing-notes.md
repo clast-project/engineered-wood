@@ -99,8 +99,14 @@ obligation.
 4. **`IDataFileRewriter`** + row-tracking-through-rewrite — only if the seam survives (1).
 5. **Clustering bits coupled to `CommitDataFilesAsync`** — `dataChange`/`clusteringProvider` params and
    `WrittenDataFile.Tags` -> `add.tags`. Need the buffered-transaction API from slice 9.
-6. **Stale `doc/known-issues.md`** — the VARIANT entry is wrong; the writer-feature table needs
-   `clustering` and `variantType` corrected too.
+6. ~~**Stale `doc/known-issues.md`**~~ — DONE (2026-07-19). Re-verified claim by claim against the
+   code, not against these notes. Roughly a dozen entries described gaps that had since been closed:
+   Parquet VARIANT + UUID emission + nanosecond TIME; Delta's writer-feature table (appendOnly /
+   invariants / checkConstraints / generatedColumns / clustering are all supported-as-listed now,
+   with `HonorWriterFeatures` failing closed when ACTIVE), rowTracking domain emission, nested stats
+   + string truncation, checkpoint tags/DV/tombstones, `ToArrowField` metadata, the ALTER APIs, and
+   the create-time/ALTER protocol upgrades. Added the non-ASCII path encoding and the
+   column-mapping protocol-shape divergence as interop entries, and a "last verified" stamp.
 
 ## External validation — tier 1 (delta-rs) landed 2026-07-19
 

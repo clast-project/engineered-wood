@@ -11,6 +11,16 @@ pushdown, see [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
 For the forward-looking encryption design, see
 [`encryption-design.md`](encryption-design.md).
 
+> **Last verified against the code: 2026-07-19.** The Parquet and Delta
+> sections were re-checked claim by claim on that date; roughly a dozen
+> entries described gaps that had since been closed. If you are relying on
+> an entry here, confirm it against the code before acting on it — this file
+> records absences, and absences are exactly what nothing fails when they
+> stop being true. The Delta entries additionally have external coverage now
+> (delta-rs and PySpark) in
+> `test/EngineeredWood.DeltaLake.Table.Tests/Interop/`; see
+> [`upstream-landing-notes.md`](upstream-landing-notes.md).
+
 ---
 
 ## Parquet
@@ -41,15 +51,16 @@ fails to read.
 
 **Logical type emission on write:**
 
-- `UUID` is not emitted. Arrow `FixedSizeBinaryType(16)` is written as a
-  plain FLBA with no annotation in `ArrowToSchemaConverter`.
 - `JSON` and `ENUM` are never emitted (Arrow has no enum type and we
   always write `StringType` as `StringType`).
+- `UUID` is emitted only via the opt-in extension path — an Arrow field
+  carrying the `arrow.uuid` extension type maps to `LogicalType.UuidType`
+  + FLBA(16) (`ArrowToSchemaConverter`). A bare
+  `FixedSizeBinaryType(16)` with no extension is still written as an
+  unannotated FLBA, which is the correct conservative behavior.
 
-**Geospatial and Variant types.** The `GEOMETRY` / `GEOGRAPHY` types
-added to the Parquet spec in late 2024 are not supported. The `VARIANT`
-logical type is not supported. Neither read nor write paths recognize
-these annotations.
+**Geospatial types.** The `GEOMETRY` / `GEOGRAPHY` types added to the
+Parquet spec in late 2024 are not supported on either path.
 
 **Encoding strategies on write.** The decoder supports
 `BYTE_STREAM_SPLIT` for `INT32`/`INT64`/`FIXED_LEN_BYTE_ARRAY`, but
@@ -72,10 +83,6 @@ and `ListViewType`.
 - `Statistics.distinct_count` is never computed or written.
 
 ### Correctness / interop issues
-
-**Nanosecond time on read.** `ArrowSchemaConverter` maps any non-millis
-`TIME` logical type to `Time32Type(Microsecond)`; nanosecond values are
-silently truncated to microseconds.
 
 **Deprecated `min`/`max` restricted to signed-order types.** The
 deprecated `Statistics.min`/`max` fields (defined with signed byte
@@ -280,29 +287,52 @@ features appear in the Delta protocol but are absent from
 
 | Feature | Role | Impact |
 |---|---|---|
-| `checkConstraints` | Writer | Tables with CHECK constraints rejected on write. |
-| `generatedColumns` | Writer | Tables with generated columns rejected on write. |
-| `invariants` | Writer | Legacy invariant constraints not validated. |
-| `appendOnly` | Writer | Append-only enforcement not applied. |
 | `allowColumnDefaults` / `columnDefaults` | Writer | Column default values on write not supported. |
-| `clustering` (liquid clustering) | Writer | Not supported. |
-| `variantType` | Reader-Writer | Variant (semi-structured) column type not supported. |
+| `variantType` | Reader-Writer | Variant column type not supported AT THE DELTA LAYER. Note the Parquet layer does support VARIANT via the opt-in `arrow.parquet.variant` extension; the gap is Delta-side plumbing, not the codec. |
 | `collations` | Writer | String collations not supported. |
 | `catalogOwned` / `catalogOwned-preview` | Reader-Writer | Catalog-owned contracts not supported on either side. |
 | `coordinatedCommits` / `managedCommits` | Writer | No commit-coordinator client; plain rename-based commits only. |
 | `checkpointProtection` | Reader-Writer | Vacuum-guarded checkpoints not honored. |
 
-CHECK-constraint and generated-column support additionally depend on a
-Spark SQL expression parser (Phase 9 of the predicate-pushdown design),
-which is not started. Even with the feature gate lifted, the runtime
-could not evaluate the expressions.
+**Enforcement features: supported-as-listed, fail-closed when active.**
+`appendOnly`, `invariants`, `checkConstraints`, `generatedColumns` and
+`changeDataFeed` ARE in `SupportedWriterFeatures`, because a v7 protocol
+enumerates the legacy writer-v2/v3 features explicitly and merely LISTING
+them imposes no obligation. `DeltaTable.HonorWriterFeatures` distinguishes
+listed from ACTIVE: `delta.appendOnly=true` blocks non-append data changes,
+and an active `delta.constraints.*` / `delta.invariants` /
+`delta.generationExpression` REJECTS the write rather than committing
+possibly-violating data (Delta enforces these at write time only, so one
+bad commit poisons the table for every later reader).
 
-**`rowTracking` classification.** `rowTracking` is a reader-writer
-feature in the spec but is only listed in `SupportedWriterFeatures`.
-Tables with `rowTracking` in `readerFeatures` will be rejected by
-`ValidateReadSupport`. The writer also does not emit the
-`delta.rowTracking` domain metadata that the spec requires for the
-row-ID high-water mark.
+Evaluating those expressions still depends on a Spark SQL parser (Phase 9
+of the predicate-pushdown design), which is not started — so a table that
+actively uses them is refused, not silently mishandled. The key names this
+guard keys on are pinned against real Spark output by
+`SparkWritten_CheckConstraint_EwRefusesToWrite` and
+`SparkWritten_GeneratedColumn_EwRefusesToWrite`.
+
+**Liquid clustering is interop-only.** `clustering` IS in
+`SupportedWriterFeatures`, and the spec permits a non-clustering writer to
+append and run DML against a clustered table (a later OPTIMIZE reclusters).
+EW meets those obligations — the `delta.clustering` domain survives commits
+and checkpoints, and `add.clusteringProvider` round-trips — and
+`CreateAsync(clusteringColumns:)` / `SetClusteringColumnsAsync` declare the
+layout. But EW does NOT write clustered layouts: no Hilbert-curve ordering,
+no provider tagging on written files. Rows land wherever they land until a
+clustering engine reorganizes them.
+
+Note the domain stores PHYSICAL column names, because OSS Delta
+`None.get`-crashes on logical ones. Verified end to end by
+`EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
+`DESCRIBE DETAIL` resolves the declaration back to the logical names.
+
+**`rowTracking` read-side classification.** `rowTracking` is a
+reader-writer feature in the spec but is listed only in
+`SupportedWriterFeatures`, so a table carrying it in `readerFeatures` is
+still rejected by `ValidateReadSupport`. (The writer side is done: the
+`delta.rowTracking` domain metadata carrying the row-ID high-water mark IS
+emitted and reconciled — see `RowTracking/RowTrackingConfig.cs`.)
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single
@@ -328,26 +358,30 @@ work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
 
 **Stats collection gaps.**
 
-- No string-stat truncation. `StatsCollector` writes unbounded min/max
-  strings, bloating commits for wide-text columns.
 - `tightBounds` is never written.
-- Stats do not recurse into nested struct / list / map leaf fields; only
-  top-level primitives get stats.
 - `stats_parsed` is built by `StatsParsedBuilder` for checkpoint writes
   but `CheckpointReader.ExtractAdd` reads only the JSON `stats` string.
+- `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
+  are ignored; every eligible column gets stats.
 
-**CommitInfo.** `InCommitTimestamp.CreateCommitInfo` populates only
-`timestamp`, `operation`, `inCommitTimestamp`. Spec-standard fields
-never emitted: `operationParameters`, `readVersion`, `isolationLevel`,
-`operationMetrics`, `engineInfo`, `userId`, `userName`, `txnId`,
-`clusterId`, `notebook`.
+(String-stat truncation and nested-struct recursion are both implemented —
+`StatsCollector.TruncateMaxString` and `CollectStruct`. Nested stats are
+verified externally: `EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows`
+asserts Spark prunes on `payload.score` and still returns every matching row.)
 
-**Post-creation protocol upgrades.** `DeltaTable.CreateAsync` bumps
-reader/writer versions only at create time when column mapping is
-requested. There is no public API for enabling `deletionVectors` /
-`rowTracking` / `typeWidening` / `inCommitTimestamp` on an existing
-table, or for adding entries to `protocol.readerFeatures` /
-`writerFeatures` after create.
+**CommitInfo.** `InCommitTimestamp.CreateCommitInfo` emits `timestamp`,
+`operation`, `inCommitTimestamp`, `engineInfo` and `operationParameters`
+(at minimum an empty object, which strict readers require). Spec-standard
+fields still never emitted: `readVersion`, `isolationLevel`,
+`operationMetrics`, `userId`, `userName`, `txnId`, `clusterId`, `notebook`.
+
+**Post-creation protocol upgrades — partial.** `AddColumnAsync` and
+`SetClusteringColumnsAsync` upgrade the protocol as needed via
+`UpgradeProtocolForFeatures` / `UpgradeProtocolForWriterFeatures`, and
+`CreateAsync` declares schema-driven features (`timestampNtz`,
+`identityColumns`, `columnMapping`) up front. There is still no general
+public API for enabling `deletionVectors` / `rowTracking` / `typeWidening` /
+`inCommitTimestamp` on an existing table.
 
 **Exactly-once transactional writes.** `SetTransaction` actions are
 read, written, and reconciled in snapshots, but `DeltaTable` has no
@@ -360,25 +394,17 @@ RESTORE (committing a time-travel state as the current version), no
 CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no
 raw incremental-by-version-range read outside of CDF.
 
-**Schema evolution API.** No public ALTER TABLE for
-add/drop/rename/reorder columns, change nullability, or add a column to
-a nested struct. Column mapping mode is fixed at `CreateAsync`.
-
-**Checkpoint content gaps.** `CheckpointWriter` drops `tags` and
-`deletionVector` from `AddFile` when building the checkpoint Parquet,
-and never emits a `remove` struct for unexpired tombstones. The spec
-requires tombstones within the retention window to be preserved in
-checkpoints.
+**Schema evolution API — partial.** `AddColumnAsync`, `RenameColumnAsync`
+and `DropColumnAsync` exist as metadata-only commits. Still missing:
+`SetSchemaAsync` (adopt a whole incoming schema), column reorder,
+nullability change, and adding a column to a nested struct. Column mapping
+mode is fixed at `CreateAsync`.
 
 **Orphan deletion-vector files.** `VacuumExecutor` excludes
 `_delta_log/` from deletion. Abandoned DV `.bin` files written into
-`_delta_log/` are never cleaned up.
-
-**Schema round-trip.** `SchemaConverter.FromArrowField` preserves
-per-field metadata (comments, column-mapping IDs, invariants) when
-converting Arrow → Delta, filtering out `PARQUET:*` transport keys
-(e.g. `PARQUET:field_id`). `ToArrowField` (Delta → Arrow) still drops
-metadata.
+`_delta_log/` are never cleaned up. More broadly, `VacuumExecutor`
+under-deletes relative to the spec — see the VACUUM alignment plan in
+[`upstream-landing-notes.md`](upstream-landing-notes.md).
 
 ### Correctness / interop issues
 
@@ -396,6 +422,25 @@ recognized on read for non-string types — parsing will throw.
 rebuilds sidecar paths as `_delta_log/_sidecars/{name}` by a slash
 check, which is fragile for paths that contain slashes in unexpected
 places.
+
+**Non-ASCII characters left literal in `add.path`.** `DeltaPath.Encode`
+escapes only `% space # ?` and control characters. Measured against
+delta-rs 1.6.2, the reference encoding is TWO layers: the on-disk Hive
+directory percent-encodes non-ASCII as UTF-8 bytes (`region=caf%C3%A9`),
+and `add.path` then percent-encodes that again (`region=caf%25C3%25A9`).
+EW's output diverges from both. Low severity in practice — delta-rs reads
+EW's literal form fine (`EwWritten_NonAsciiPartition_DeltaRsReadsSameRows`
+passes) — but it is a producer-side divergence from Spark. Ground truth is
+pinned by `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`.
+
+**Column-mapping protocol shape differs from Spark's.** EW emits the
+legacy `minReader=2`/`minWriter=5` pair; Spark emits a hybrid
+(`minReader=2`, `minWriter=7`, `writerFeatures: [columnMapping, invariants,
+appendOnly]`). Both are spec-legal and Spark reads EW's form. Note that
+delta-rs cannot read column-mapped tables in EITHER form — it is an
+unimplemented feature there, not a declaration mismatch — so changing this
+would not widen reader support. See
+[`upstream-landing-notes.md`](upstream-landing-notes.md).
 
 ---
 
