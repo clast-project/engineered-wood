@@ -16,8 +16,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 ///
 /// <para>These tests deliberately do NOT duplicate tier 1. Each one covers something delta-rs
 /// structurally cannot: reading the legacy column-mapping protocol, <c>DESCRIBE DETAIL</c>,
-/// clustering metadata, or Spark <i>mutating</i> an EW-written table. Anything delta-rs can check
-/// belongs in <see cref="DeltaRsInteropTests"/>, which runs in seconds instead of minutes.</para>
+/// clustering metadata, Spark <i>mutating</i> an EW-written table, or data skipping with the count of
+/// files actually touched. Anything delta-rs can check belongs in <see cref="DeltaRsInteropTests"/>,
+/// which runs in seconds.</para>
 /// </summary>
 public class SparkInteropTests : IDisposable
 {
@@ -269,5 +270,87 @@ public class SparkInteropTests : IDisposable
         await using var table = await DeltaTable.OpenAsync(fs);
 
         Assert.Equal([(1L, "us"), (3L, "apac"), (4L, "us")], await ReadAllViaEw(table));
+    }
+
+    // ── Data skipping. Wrong stats lose rows silently; only a pruning engine notices. ──
+
+    /// <summary>
+    /// <para>Spark consults each file's <c>minValues</c>/<c>maxValues</c> and skips files whose range
+    /// cannot match the predicate. If EW records a range that is too narrow, Spark drops a file it
+    /// should have read and the query returns fewer rows — with no error anywhere.</para>
+    ///
+    /// <para>Asserting <c>files_scanned &lt; files_total</c> is what keeps this honest: row
+    /// correctness alone would also pass on an engine that never pruned, proving nothing.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_MinMaxStats_SparkSkipsFilesWithoutLosingRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+        await table.WriteAsync([IdRegionBatch([200], ["us"])]);
+
+        var result = Spark.Invoke("scan", new { path = _tempDir, filter = "id >= 100" });
+
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32());
+        Assert.Equal([(100L, "eu"), (101L, "apac"), (200L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// <para>The same thing one level down. Slice 8 landed nested stats end-to-end
+    /// (<c>minValues.payload.score</c> and friends), and nothing external has ever read them — a
+    /// round-trip cannot, because EW's own reader does not prune on them.</para>
+    ///
+    /// <para>Nested stats are the easier ones to get wrong: the paths have to be built recursively and
+    /// a struct that is skipped or mis-keyed produces a log that still parses and still round-trips.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, NestedSchema);
+        await table.WriteAsync([NestedBatch([1, 2], [10, 11])]);
+        await table.WriteAsync([NestedBatch([3, 4], [100, 101])]);
+        await table.WriteAsync([NestedBatch([5], [200])]);
+
+        var result = Spark.Invoke("scan", new { path = _tempDir, filter = "payload.score >= 100" });
+
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32());
+
+        var scores = result.GetProperty("rows").EnumerateArray()
+            .Select(r => r.GetProperty("payload").GetProperty("score").GetInt64())
+            .OrderBy(v => v).ToList();
+        Assert.Equal([100L, 101L, 200L], scores);
+    }
+
+    private static Apache.Arrow.Schema NestedSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("payload", new Apache.Arrow.Types.StructType(
+        [
+            new Field("score", Int64Type.Default, false),
+            new Field("label", StringType.Default, false),
+        ]), false))
+        .Build();
+
+    private static RecordBatch NestedBatch(long[] ids, long[] scores)
+    {
+        var idArray = new Int64Array.Builder().AppendRange(ids).Build();
+        var scoreArray = new Int64Array.Builder().AppendRange(scores).Build();
+        var labelBuilder = new StringArray.Builder();
+        foreach (long s in scores)
+            labelBuilder.Append($"s{s}");
+
+        var structType = (Apache.Arrow.Types.StructType)NestedSchema.GetFieldByName("payload").DataType;
+        var payload = new StructArray(
+            structType, ids.Length, [scoreArray, labelBuilder.Build()], ArrowBuffer.Empty, nullCount: 0);
+
+        return new RecordBatch(NestedSchema, [idArray, payload], ids.Length);
     }
 }

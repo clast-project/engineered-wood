@@ -60,18 +60,40 @@ def cmd_probe(args):
 
 
 def cmd_read(args):
-    """Read a table EW wrote and report exactly what delta-rs decoded."""
+    """Read a table EW wrote and report exactly what delta-rs decoded.
+
+    Optional `filters` ([[column, op, value], ...]) exercises the pruning path: delta-rs uses the
+    per-file stats in the log to skip files before reading them, so a filtered read is the only way
+    to find out whether those stats are TRUE. A read of the whole table never consults them.
+    """
     from deltalake import DeltaTable
     dt = DeltaTable(args["path"])
     if "version" in args:
         dt.load_as_version(args["version"])
-    tbl = dt.to_pyarrow_table()
+    filters = [tuple(f) for f in args["filters"]] if args.get("filters") else None
+    tbl = dt.to_pyarrow_table(filters=filters)
     return {
         "version": dt.version(),
         "row_count": tbl.num_rows,
         "columns": [f.name for f in tbl.schema],
         "rows": _rows(tbl),
     }
+
+
+def cmd_add_stats(args):
+    """Per-file statistics as delta-rs parses them out of the log.
+
+    Flattened to num_records / `min.<col>` / `max.<col>` / `null_count.<col>` per file. This is the
+    direct oracle for EW's stats writer: wrong min/max does not raise anywhere, it just makes a
+    foreign engine skip a file it should have read, and the query quietly returns fewer rows.
+    """
+    import pyarrow as pa
+    from deltalake import DeltaTable
+
+    dt = DeltaTable(args["path"])
+    # get_add_actions returns an arro3 Table; go through the C stream into pyarrow.
+    stats = pa.table(dt.get_add_actions(flatten=True))
+    return {"files": stats.to_pylist()}
 
 
 def cmd_describe(args):
@@ -183,6 +205,7 @@ COMMANDS = {
     "describe": cmd_describe,
     "checkpoint_only_read": cmd_checkpoint_only_read,
     "raw_log": cmd_raw_log,
+    "add_stats": cmd_add_stats,
     "write": cmd_write,
 }
 

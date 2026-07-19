@@ -177,11 +177,35 @@ def cmd_sql(args):
             "detail": _detail(spark, args["path"])}
 
 
+def cmd_scan(args):
+    """Read under a filter and report BOTH the rows and how many files Spark actually touched.
+
+    Data skipping is the one place where wrong statistics cause silently wrong ANSWERS rather than
+    an error: Spark consults each file's min/max in the log and skips files whose range cannot match,
+    so bad stats mean missing rows and no complaint from anyone.
+
+    inputFiles() after a filter reflects that skipping, which is what keeps these tests honest. Row
+    correctness alone would also pass on an engine that never pruned; asserting files_scanned dropped
+    proves the pruning path was genuinely exercised.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    df = spark.read.format("delta").load(path)
+    filtered = df.filter(args["filter"])
+    return {
+        "files_total": len(df.inputFiles()),
+        "files_scanned": len(filtered.inputFiles()),
+        "row_count": filtered.count(),
+        "rows": _rows(filtered),
+    }
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
     "write": cmd_write,
     "sql": cmd_sql,
+    "scan": cmd_scan,
 }
 
 

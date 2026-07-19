@@ -214,6 +214,106 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
     }
 
+    // ── Statistics and pruning. ──
+
+    /// <summary>
+    /// <para>Per-file <c>minValues</c>/<c>maxValues</c>/<c>nullCount</c> must describe what is
+    /// actually in each file. This is the one class of bug where being wrong produces no error
+    /// anywhere: a foreign engine trusts the stats, skips a file whose recorded range cannot match the
+    /// predicate, and the query returns FEWER ROWS with nothing to indicate anything went wrong.</para>
+    ///
+    /// <para>Every other test in this suite reads whole tables, which never consults statistics at
+    /// all — so nothing external has ever checked them. Here delta-rs parses the stats out of the log
+    /// and we compare them against the values EW wrote.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_PerFileStats_DescribeTheFilesTheyBelongTo()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+
+        // Three commits => three files with disjoint, known id ranges.
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+        await table.WriteAsync([IdRegionBatch([200], ["us"])]);
+
+        var files = DeltaRs.Invoke("add_stats", new { path = _tempDir })
+            .GetProperty("files").EnumerateArray().ToList();
+        Assert.Equal(3, files.Count);
+
+        var expected = new Dictionary<long, (long Max, long Records)>
+        {
+            [10] = (12, 3),
+            [100] = (101, 2),
+            [200] = (200, 1),
+        };
+
+        foreach (var file in files)
+        {
+            long min = file.GetProperty("min.id").GetInt64();
+            Assert.True(expected.ContainsKey(min), $"unexpected min.id {min}");
+            var (expectedMax, expectedRecords) = expected[min];
+
+            Assert.Equal(expectedMax, file.GetProperty("max.id").GetInt64());
+            Assert.Equal(expectedRecords, file.GetProperty("num_records").GetInt64());
+            Assert.Equal(0, file.GetProperty("null_count.id").GetInt64());
+            Assert.Equal(0, file.GetProperty("null_count.region").GetInt64());
+        }
+    }
+
+    /// <summary>
+    /// A filtered read must return every matching row. delta-rs prunes files against the log's stats
+    /// before opening them, so an over-tight min/max shows up here as missing rows — the failure mode
+    /// <see cref="EwWritten_PerFileStats_DescribeTheFilesTheyBelongTo"/> guards from the other side.
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_FilteredRead_PrunesWithoutLosingRows()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+        await table.WriteAsync([IdRegionBatch([200], ["us"])]);
+
+        // Spans two of the three files, so a file that should be kept is adjacent to one that
+        // should be dropped — the shape where an off-by-one in min/max actually bites.
+        var result = DeltaRs.Invoke("read", new
+        {
+            path = _tempDir,
+            filters = new object[] { new object[] { "id", ">=", 100 } },
+        });
+
+        Assert.Equal([(100L, "eu"), (101L, "apac"), (200L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// The partition-pruning equivalent: partition values are matched as strings against directory
+    /// names, so this also exercises the <c>DeltaPath</c> encoding from the query side rather than the
+    /// write side.
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_PartitionFilteredRead_ReturnsAllMatchingRows()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, partitionColumns: ["region"]);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3, 4], ["us", "eu", "us", "apac"])]);
+
+        var result = DeltaRs.Invoke("read", new
+        {
+            path = _tempDir,
+            filters = new object[] { new object[] { "region", "=", "us" } },
+        });
+
+        Assert.Equal([(1L, "us"), (3L, "us")], RowsFromJson(result));
+    }
+
     // ── Protocol / writer features — slices 5 (`c1b1474`, `70d2384`) and 6 (`aa3f0e2`). ──
 
     /// <summary>

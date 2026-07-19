@@ -184,6 +184,34 @@ so a half-configured machine gets a precise reason instead of a JVM stack trace.
 `HADOOP_HOME` alone is insufficient on Windows: `hadoop.dll` must be on `PATH` or Hadoop throws
 `UnsatisfiedLinkError: NativeIO$Windows.access0`; `Spark.BuildEnvironment()` handles that for callers.
 
+## Tier 2 (DuckDB) — DROPPED, and why
+
+The original three-tier plan had DuckDB's delta extension as tier 2. It is not worth building:
+
+- **delta-rs already IS delta-kernel-rs.** The installed `deltalake` 1.6.2 binary embeds the
+  `delta-kernel-rs` crate, and every log-replay bug found in this effort surfaced as
+  `DeltaError: Kernel error: ...`. DuckDB's delta extension is the same kernel, so its log-replay
+  coverage is entirely subsumed by tier 1.
+- Genuinely DuckDB-only would be (a) a third Parquet reader and (b) predicate pushdown through a
+  foreign planner. (a) is already covered at the right layer by
+  `test/EngineeredWood.Parquet.Compatibility/` (92-file cross-tool validation). (b) is real and
+  valuable — but reachable from the tiers that already exist, which is what the stats/pruning tests
+  below do.
+
+**Statistics and pruning coverage (added 2026-07-19, in place of tier 2).** This is the failure mode
+that motivated the axis: wrong `minValues`/`maxValues` raise nothing anywhere — a pruning engine just
+skips a file it should have read and the query silently returns FEWER ROWS. Every earlier interop
+test reads whole tables, which never consults statistics at all.
+
+- Tier 1 — `EwWritten_PerFileStats_DescribeTheFilesTheyBelongTo` compares per-file
+  min/max/nullCount/numRecords (via `DeltaTable.get_add_actions(flatten=True)`) against what EW
+  actually wrote; plus filtered-read and partition-filtered-read correctness.
+- Tier 3 — `EwWritten_MinMaxStats_SparkSkipsFilesWithoutLosingRows` and
+  `EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows` assert BOTH the right rows and
+  that `files_scanned < files_total`. The file count is what keeps them honest: row correctness alone
+  would also pass on an engine that never pruned. Nested stats (slice 8) had never been read by
+  anything outside EW; they are correct.
+
 ## Deferred follow-ups (do after the PR-landing work)
 
 ### A. VACUUM spec alignment (`VacuumExecutor.cs`)
