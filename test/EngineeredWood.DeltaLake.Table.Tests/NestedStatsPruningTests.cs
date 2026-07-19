@@ -5,6 +5,8 @@ using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Schema;
+using EngineeredWood.Expressions;
 using EngineeredWood.IO.Local;
 using ArrowStructType = Apache.Arrow.Types.StructType;
 using Ex = EngineeredWood.Expressions.Expressions;
@@ -119,6 +121,148 @@ public class NestedStatsPruningTests : IDisposable
 
         Assert.False(stats.MinValues!.ContainsKey("s.a"));
         Assert.False(stats.NullCount!.ContainsKey("s.a"));
+    }
+
+    // ── Pruner-level unit tests (exercise the decision directly, not just end-to-end) ──
+
+    private static AddFile MakeAdd(string stats) => new()
+    {
+        Path = "part-0.parquet",
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 1,
+        ModificationTime = 0,
+        DataChange = true,
+        Stats = stats,
+    };
+
+    private static EngineeredWood.DeltaLake.Schema.StructType PrunerSchema(
+        IReadOnlyDictionary<string, string>? sMeta = null,
+        IReadOnlyDictionary<string, string>? aMeta = null) => new()
+    {
+        Fields =
+        [
+            new StructField
+            {
+                Name = "id", Type = new PrimitiveType { TypeName = "long" }, Nullable = false,
+            },
+            new StructField
+            {
+                Name = "s",
+                Type = new EngineeredWood.DeltaLake.Schema.StructType
+                {
+                    Fields =
+                    [
+                        new StructField
+                        {
+                            Name = "a", Type = new PrimitiveType { TypeName = "integer" },
+                            Nullable = true, Metadata = aMeta?.ToDictionary(k => k.Key, v => v.Value),
+                        },
+                        new StructField
+                        {
+                            Name = "b", Type = new PrimitiveType { TypeName = "string" }, Nullable = true,
+                        },
+                    ],
+                },
+                Nullable = true,
+                Metadata = sMeta?.ToDictionary(k => k.Key, v => v.Value),
+            },
+        ],
+    };
+
+    private const string NestedStats =
+        """{"numRecords":10,"minValues":{"id":1,"s":{"a":5,"b":"aaa"}},"maxValues":{"id":10,"s":{"a":9,"b":"zzz"}},"nullCount":{"id":0,"s":{"a":0,"b":10}}}""";
+
+    [Fact]
+    public void NestedComparison_PrunesAndKeeps()
+    {
+        var pruner = new DeltaFilePruner(PrunerSchema(), []);
+        var add = MakeAdd(NestedStats);
+
+        // s.a is bounded [5, 9] — outside prunes, inside keeps.
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(7))));
+        Assert.False(pruner.ShouldInclude(add, Ex.GreaterThan("s.a", LiteralValue.Of(9))));
+        Assert.True(pruner.ShouldInclude(add, Ex.LessThan("s.a", LiteralValue.Of(6))));
+        // String leaf, byte-order bounds ["aaa", "zzz"].
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.b", LiteralValue.Of("zzzz"))));
+    }
+
+    [Fact]
+    public void NestedNullCount_Prunes()
+    {
+        var pruner = new DeltaFilePruner(PrunerSchema(), []);
+        var add = MakeAdd(NestedStats);
+
+        // s.a has no nulls; s.b is all-null (10 of 10). This is the arm that silently did nothing
+        // while nested nullCount objects were dropped at parse.
+        Assert.False(pruner.ShouldInclude(add, Ex.IsNull("s.a")));
+        Assert.True(pruner.ShouldInclude(add, Ex.IsNull("s.b")));
+        Assert.False(pruner.ShouldInclude(add, Ex.IsNotNull("s.b")));
+    }
+
+    [Fact]
+    public void ColumnMapping_ResolvesDottedPhysicalKeys()
+    {
+        // Stats keyed by PHYSICAL names at every level; the predicate references logical "s.a".
+        var pruner = new DeltaFilePruner(
+            PrunerSchema(
+                sMeta: new Dictionary<string, string> { [ColumnMapping.PhysicalNameKey] = "col-s" },
+                aMeta: new Dictionary<string, string> { [ColumnMapping.PhysicalNameKey] = "col-a" }),
+            []);
+        var add = MakeAdd(
+            """{"numRecords":10,"minValues":{"col-s":{"col-a":5}},"maxValues":{"col-s":{"col-a":9}},"nullCount":{"col-s":{"col-a":0}}}""");
+
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(7))));
+    }
+
+    [Fact]
+    public void DottedNameCollision_IsPoisonedNotGuessed()
+    {
+        // A literal top-level column named "s.a" alongside struct leaf s.a is ambiguous — never prune.
+        var schema = new EngineeredWood.DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new StructField
+                {
+                    Name = "s.a", Type = new PrimitiveType { TypeName = "integer" }, Nullable = true,
+                },
+                new StructField
+                {
+                    Name = "s",
+                    Type = new EngineeredWood.DeltaLake.Schema.StructType
+                    {
+                        Fields =
+                        [
+                            new StructField
+                            {
+                                Name = "a", Type = new PrimitiveType { TypeName = "integer" },
+                                Nullable = true,
+                            },
+                        ],
+                    },
+                    Nullable = true,
+                },
+            ],
+        };
+        var pruner = new DeltaFilePruner(schema, []);
+        // Stats that would prune under EITHER interpretation — the file must still be kept.
+        var add = MakeAdd(
+            """{"numRecords":10,"minValues":{"s.a":100,"s":{"a":100}},"maxValues":{"s.a":200,"s":{"a":200}},"nullCount":{"s.a":0,"s":{"a":0}}}""");
+
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+    }
+
+    [Fact]
+    public void MissingNestedStats_KeepsFile()
+    {
+        // Pruning is superset-safe: an unresolvable reference evaluates Unknown, so the file is kept.
+        var pruner = new DeltaFilePruner(PrunerSchema(), []);
+        var add = MakeAdd(
+            """{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"nullCount":{"id":0}}""");
+
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
     }
 
     // The point of all of it: a predicate on a nested leaf prunes files.
