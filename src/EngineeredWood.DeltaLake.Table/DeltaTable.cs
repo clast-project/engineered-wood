@@ -1371,6 +1371,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(snapshot.Metadata with { SchemaString = updatedSchemaString });
         }
 
+        // Row tracking: persist the advanced high-water mark as the delta.rowTracking domainMetadata (the
+        // spec-required source of truth; deriving it from active files alone under-counts after removes, so
+        // a mixed writer could reassign already-used row ids).
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        {
+            actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+        }
+
         // Prepend CommitInfo with inCommitTimestamp if enabled
         var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
             actions, snapshot.Metadata.Configuration, "WRITE");

@@ -288,7 +288,12 @@ public sealed class SnapshotBuilder
             DomainMetadata = new Dictionary<string, DomainMetadata>(_domainMetadata),
             Tombstones = new Dictionary<string, RemoveFile>(_tombstones),
             InCommitTimestamp = _inCommitTimestamp,
-            RowIdHighWaterMark = RowTracking.RowTrackingConfig.ComputeHighWaterMark(activeFiles),
+            // The delta.rowTracking domainMetadata is the spec source of truth for the high-water mark;
+            // the active-file derivation alone under-counts after removes (a later writer could then
+            // reassign used row ids). Take the max so either source protects the invariant.
+            RowIdHighWaterMark = System.Math.Max(
+                RowTracking.RowTrackingConfig.ComputeHighWaterMark(activeFiles),
+                (RowTracking.RowTrackingConfig.TryReadHighWaterMark(_domainMetadata) ?? -1) + 1),
         };
     }
 }

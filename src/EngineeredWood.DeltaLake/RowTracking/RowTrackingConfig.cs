@@ -32,6 +32,46 @@ public static class RowTrackingConfig
         configuration.TryGetValue(EnableKey, out string? value) &&
         string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The row-tracking domain-metadata domain name (spec).</summary>
+    public const string DomainName = "delta.rowTracking";
+
+    /// <summary>
+    /// Builds the <c>delta.rowTracking</c> domainMetadata action recording the new high-water mark. The
+    /// domain stores the HIGHEST ASSIGNED row id (spec), while <paramref name="nextAvailableRowId"/> is
+    /// engineered-wood's internal "next id to assign".
+    /// </summary>
+    public static Actions.DomainMetadata BuildHighWaterMarkAction(long nextAvailableRowId) => new()
+    {
+        Domain = DomainName,
+        Configuration = "{\"rowIdHighWaterMark\":"
+            + (nextAvailableRowId - 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + "}",
+        Removed = false,
+    };
+
+    /// <summary>
+    /// Reads the highest-assigned row id from the <c>delta.rowTracking</c> domain metadata, or null when
+    /// the domain is absent/removed/unparsable.
+    /// </summary>
+    public static long? TryReadHighWaterMark(
+        IReadOnlyDictionary<string, Actions.DomainMetadata> domainMetadata)
+    {
+        if (!domainMetadata.TryGetValue(DomainName, out var dm) || dm.Removed || dm.Configuration is null)
+            return null;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(dm.Configuration);
+            if (doc.RootElement.TryGetProperty("rowIdHighWaterMark", out var v)
+                && v.ValueKind == System.Text.Json.JsonValueKind.Number && v.TryGetInt64(out long h))
+            {
+                return h;
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+        }
+        return null;
+    }
+
     /// <summary>
     /// Computes the row ID high water mark from the active file set.
     /// The next available row ID is <c>highWaterMark</c>.

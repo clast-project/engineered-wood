@@ -192,6 +192,14 @@ internal static class CompactionExecutor
             }
         }
 
+        // Row tracking: OPTIMIZE assigns fresh row ids to the compacted files, so it advances the
+        // delta.rowTracking high-water mark too (same reasoning as the write path).
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        {
+            actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+                .BuildHighWaterMarkAction(nextRowId));
+        }
+
         // Commit
         long newVersion = snapshot.Version + 1;
         await log.WriteCommitAsync(newVersion, actions, cancellationToken)
