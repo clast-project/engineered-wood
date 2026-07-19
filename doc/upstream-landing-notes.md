@@ -22,6 +22,7 @@ change diverges from the original PR.
 | 3 — Spec checkpoint content + tombstone DVs | `b41f5ad` | Preserve add.deletionVector/baseRowId/features/config, NULLABLE action structs, retained tombstones. **Added `remove.deletionVector` round-trip** beyond the PR. Row-tracking HWM reconciliation deliberately excluded (deferred to slice 5). |
 | 4 — Spec path encoding (`DeltaPath`) | `74bc1aa` | Hive-escaped partition dirs + URL-encoded `add.path`, decoded at every read site + vacuum. Hand-ported cross-cutting wiring. **See non-ASCII follow-up below.** |
 | 5 — writer features + protocol declaration | `cc8d6fe`, `c1b1474`, `70d2384`, `8e3fa8d` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. `70d2384`: declare schema-driven features (timestampNtz/identityColumns/columnMapping-in-v7) at `CreateAsync` + protocol upgrade on `AddColumnAsync`. `8e3fa8d`: `delta.rowTracking` HWM emission + `SnapshotBuilder` reconciliation. **Did NOT allowlist variantType/rowTracking** as supported features (need later slices). |
+| 8 (PARTIAL) — misc reader/DML correctness | `adc3b44`, `8cbf8d2`, `e025880`, `ebeb841`, `e83a232`, `d79abc7`, `1883f51`, `7bf3f6c` | Thrift wire-type guards (+ALP test gating; Parquet 585/585, was 573). Empty-page snappy stream. ListVersions ascending. S3 conditional rename. Row-filter type coverage. Nested stats end-to-end. TIME→Time64. DV-qualified removes + compaction DV exclusion. **See slice-8 leftovers below.** |
 | 6 — column mapping | `aa3f0e2`, `7a327f0`, `4754a72` | `aa3f0e2`: physical names in BOTH modes + new `ColumnMappingRecursive.ToPhysical/ToLogical` (nested struct children) + numeric `delta.columnMapping.id`. `7a327f0`: compaction re-stamps field ids & widens against the physical-named target schema. `4754a72`: `AddColumnAsync`/`RenameColumnAsync`/`DropColumnAsync` metadata-only + `SchemaEvolution.BackfillMissingColumns` read-path reconcile. **See slice-6 leftovers below.** |
 
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
@@ -69,8 +70,27 @@ reads, Time64, nested stats), 9 (row-level concurrency — **STRATEGIC**, most c
   correctness bug. Land as one commit covering writer + pruner + read path together.
 - **`SetSchemaAsync`**, the nested-struct `AddFieldAsync` variant, and the buffered-transaction
   (deferred-commit) forms of the ALTER operations — the last are slice-9-coupled.
-- Compaction's non-mapping thread from the same PR diff (DV exclusion, row-tracking id materialization,
-  pluggable reader/writer, HWM action, OPTIMIZE commitInfo) belongs to slices 7/8/9.
+- Compaction's non-mapping thread from the same PR diff (row-tracking id materialization, pluggable
+  reader/writer) belongs to slices 7/9. The DV exclusion landed in slice 8 (`7bf3f6c`), the HWM action in
+  slice 5 (`8e3fa8d`).
+
+### Slice-8 leftovers (deliberately not landed)
+
+- **Decimal reads always surfacing Decimal128/256.** The PR drops the narrow Decimal32/Decimal64 Arrow
+  types entirely — the rationale is that C-data-interface consumers (DuckDB) misread them, the exported
+  format string being taken as 128-bit over a 4/8-byte buffer. That's real, but engineered-wood added
+  Decimal32/64 support deliberately, and the change rewrites four `DecimalReadTests`. **A fidelity
+  trade-off for Curt to decide, not a straight bug fix.** If adopted, it's a ~15-line change to
+  `ArrowSchemaConverter.MakeDecimalType` plus the test updates.
+- **`GetHistoryAsync`** and the always-on `commitInfo` on every commit path (OPTIMIZE's `operation:
+  OPTIMIZE`, VACUUM's `VACUUM START`/`VACUUM END` pair). Independent of the refactor; worth landing, just
+  not reached. Note `CompactionExecutor`'s commitInfo is a prerequisite for plain-table timestamp travel
+  through a compaction commit.
+- **OCC retry-safe writes / `DeltaConflictException` plumbing** — entangled with slice 9's conflict
+  checker; land with it.
+- Everything the PR files under slice 8 that is really slice 9: logical rebase (`CheckLogicalRebaseAsync`),
+  the buffered-transaction seams (`WriteDataFilesAsync`/`CommitDataFilesAsync`/the `Compute*` family),
+  repartition-on-overwrite, and row-tracking preservation through every rewrite.
 
 ## Deferred follow-ups (do after the PR-landing work)
 
