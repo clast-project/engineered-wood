@@ -102,6 +102,45 @@ obligation.
 6. **Stale `doc/known-issues.md`** — the VARIANT entry is wrong; the writer-feature table needs
    `clustering` and `variantType` corrected too.
 
+## External validation — tier 1 (delta-rs) landed 2026-07-19
+
+Until now all Delta validation was round-trip only, which proves reader and writer agree on a dialect,
+not that the dialect is Delta. `test/EngineeredWood.DeltaLake.Table.Tests/Interop/` now drives
+delta-rs (pip `deltalake`, validated against 1.6.2) as an independent oracle: `delta_rs_driver.py`
+(read / describe / raw_log / checkpoint_only_read / write), `DeltaRs.cs` (locator + invoker), and
+`DeltaRsInteropTests.cs` (6 tests). Absent `deltalake` the tests no-op; set
+`EW_REQUIRE_DELTA_INTEROP=1` in CI so a missing toolchain fails loudly instead of silently reverting
+the suite to round-trip-only.
+
+**Its first run failed 5 of 6, all real bugs, all invisible to round-tripping:**
+
+1. **`ParquetWriteOptions.OmitPathInSchema` defaulted to `true`** — so EW omitted `path_in_schema`,
+   which the current Parquet spec requires. *Every parquet file EW wrote — data files and Delta
+   checkpoints alike — was rejected by pyarrow, ParquetSharp and delta-kernel-rs as a corrupt thrift
+   footer.* EW's own reader tolerates the omission, so nothing caught it. Tellingly, every existing
+   cross-validation site set `OmitPathInSchema = false` by hand ("ParquetSharp requires
+   path_in_schema") — the external tests were opted out of the broken default, so the default itself
+   was never externally validated. Now defaults to `false` and is marked `[Experimental("EWPARQUET0002")]`
+   so enabling it requires a deliberate pragma.
+2. **`metaData.format.options` omitted when empty** — delta-kernel-rs decodes it as a non-nullable map
+   and fails the entire log read. Every EW-written table was unreadable by delta-rs and DuckDB.
+3. **`metaData.configuration` omitted when null** — same failure mode, same fix.
+4. **`ActionSerializer` threw on explicit JSON nulls** — delta-rs writes `"baseRowId": null,
+   "tags": null, …` where EW omits the fields; `DeserializeAdd` called `GetInt64()` on the Null token.
+   *EW could not open any delta-rs-written table.* Fixed centrally in `ReadObject`: an explicit null
+   means "absent" for every Delta action field.
+
+Suites after the fixes: DeltaLake 180, Delta Table 243 (+6 interop, 27 skipped), Parquet 590,
+Iceberg 241, Lance.Table 92 — all green on net10.0/net8.0, all TFMs build.
+
+**Known tier-1 blind spot**: EW declares column mapping with the legacy `minReader=2`/`minWriter=5`
+numbering. That is spec-legal, but delta-rs 1.6.2 supports only reader version 1 or 3-with-features
+and declines to open the table, so it cannot validate physical-name resolution — that needs tier 3
+(PySpark). `EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3` pins the commit shape
+off-disk and asserts the rejection reason, so it will fail if delta-rs ever gains support. Worth
+considering separately: emitting v3/v7 with a `columnMapping` reader feature would make these tables
+readable by delta-rs and DuckDB too.
+
 ## Deferred follow-ups (do after the PR-landing work)
 
 ### A. VACUUM spec alignment (`VacuumExecutor.cs`)
@@ -124,7 +163,28 @@ Behavioral change to flag to Curt: EW VACUUM will then actually delete orphaned 
 data files past retention (it doesn't today). Correct/spec-matching; default 7-day retention protects
 recent files. Ship with tests. Curt's preference: match the official implementation, not EW's.
 
-### B. Percent-encode non-ASCII in `DeltaPath.Encode`
+### B. Percent-encode non-ASCII in `DeltaPath.Encode` — RESEARCH DONE (2026-07-19)
+
+**The research pass this section asked for has been run**, against delta-rs 1.6.2 rather than by
+reading Spark source. Ground truth is now pinned as an assertion in
+`DeltaRsInteropTests.DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`. The encoding is **two
+layers**, which is the part a from-first-principles fix would most likely get wrong:
+
+| value | on-disk directory (Hive escape) | `add.path` (re-encoded) |
+|---|---|---|
+| `café` | `region=caf%C3%A9` | `region=caf%25C3%25A9/…` |
+| `日本` | `region=%E6%97%A5%E6%9C%AC` | `region=%25E6%2597%25A5%25E6%259C%25AC/…` |
+| `a b#c?d` | `region=a%20b%23c%3Fd` | `region=a%2520b%2523c%253Fd/…` |
+
+So `add.path` = percent-encode(hive-escape(value)) — every `%` produced by layer 1 becomes `%25` in
+layer 2. Non-ASCII is encoded as UTF-8 bytes, confirming this section's hypothesis.
+
+**Severity is lower than assumed**: `EwWritten_NonAsciiPartition_DeltaRsReadsSameRows` PASSES today —
+delta-rs reads EW's literal-non-ASCII form fine. The divergence is in what EW *produces*, so it bites
+strict readers and byte-level comparisons rather than delta-rs. Still worth fixing for Spark parity;
+no longer urgent.
+
+### B (original notes)
 
 `DeltaPath.Encode` (`src/EngineeredWood.DeltaLake/DeltaPath.cs`) currently escapes only
 `% space # ?` + control chars and leaves **non-ASCII characters literal**. Spark/delta-rs percent-encode

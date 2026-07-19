@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <None Update="TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Interop\**\*.py" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
