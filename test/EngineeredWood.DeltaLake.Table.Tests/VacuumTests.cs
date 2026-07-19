@@ -148,6 +148,18 @@ public class VacuumTests : IDisposable
         string orphan = Path.Combine(_tempDir, "deletion_vector_11111111-2222-3333-4444-555555555555.bin");
         File.WriteAllBytes(orphan, new byte[] { 1, 2, 3, 4 });
 
+        // Backdate the orphan so the sweep is deterministic. With zero retention the cutoff IS "now",
+        // and vacuum keeps files whose mtime is not strictly older than it (matching Spark). On .NET
+        // Framework DateTime.UtcNow is quantised to the ~15.6 ms system tick while the NTFS timestamp
+        // is finer, so a file written microseconds ago compares NOT-older-than the cutoff and is kept —
+        // measured at 182/200 iterations on net472 vs 0/200 on net8.0. The sibling tests dodge this only
+        // because a second write plus a commit gives the clock time to tick over; this one orphans and
+        // vacuums back to back, so it lost the race every time the JIT was already warm (i.e. whenever
+        // the rest of the class ran first — which is why it passed in isolation and failed in the suite).
+        // Backdating removes the race without weakening what is under test: that an orphaned .bin is a
+        // vacuum CANDIDATE at all. Retention timing itself is covered by Vacuum_DryRun_ListsFilesToDelete.
+        File.SetLastWriteTimeUtc(orphan, DateTime.UtcNow.AddMinutes(-1));
+
         var result = await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: false);
 
         Assert.Contains(result.FilesToDelete,

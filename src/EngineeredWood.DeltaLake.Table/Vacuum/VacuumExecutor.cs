@@ -64,6 +64,14 @@ internal static class VacuumExecutor
         //
         // The old `.parquet`-only filter is why orphaned deletion_vector_*.bin leaked forever. Dropping
         // it means non-parquet files are now collectable, so the exclusions below carry real weight.
+        // Keep-if-not-strictly-older matches delta-spark (`modificationTime < deleteBeforeTimestamp`),
+        // including at the boundary. Caveat at NEAR-ZERO retention on .NET Framework: DateTime.UtcNow is
+        // quantised to the ~15.6 ms system tick there, while an NTFS timestamp is finer, so a file
+        // orphaned microseconds ago can compare NOT-older-than the cutoff and survive this pass. It is
+        // collected by the next VACUUM once the clock ticks past it, so this costs a retry, not data.
+        // .NET 8+ reads a precise clock and does not show it. Deliberately not "corrected" here: matching
+        // Spark's comparison matters more than winning a sub-tick race, and any realistic retention
+        // (hours/days) dwarfs the granularity.
         var cutoff = DateTimeOffset.UtcNow - retentionPeriod;
         var filesToDelete = new List<string>();
         long bytesToDelete = 0;
