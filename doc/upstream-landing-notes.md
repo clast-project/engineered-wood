@@ -62,41 +62,126 @@ superset of master's `DeltaTable.cs` work but its `CheckpointReader` (drops slic
 `remove.deletionVector`) and `CompactionExecutor` (regresses slice 4's path encoding) are NOT — never take
 those wholesale.
 
-### The seam question — REOPENED (2026-07-19)
+### The seam question — RESOLVED as to *why*, decision still open (2026-07-19)
 
-The slice-7 rationale I first recorded was **wrong**, and the corrected version changes the decision:
+**Superseded twice.** The original slice-7 rationale was wrong; so was its first correction. Full
+write-up with sources and quotes: **`doc/codec-seam-investigation.md`**. Summary of the corrected
+position:
 
-- Master's **Parquet** layer already supports VARIANT (opt-in `arrow.parquet.variant` extension,
-  `VariantArrayRoundTripTests`). `doc/known-issues.md` still says otherwise — **that file is stale**.
-- The PR's variant support runs through **engineered-wood's own codec**, not DuckDB's:
-  `VariantTransport`'s comment says *"this is what lets the BUILT-IN parquet codec read and write variant
-  columns"*. The seam is NOT what makes VARIANT work.
-- The actual gap is a **registration** gap: VARIANT decoding is gated on an `ExtensionTypeRegistry`, and the
-  Delta rewrite path supplies none — so its reader sees a VARIANT-annotated group as a bare struct and a
-  rewrite strips the annotation. That is what `ThrowIfVariantRewrite` guards, and why setting BOTH seams
-  lifts the guard.
-- **Therefore**: registering the variant extension on the Delta layer's internal reader may close the same
-  hole with no new public API. Unverified — shredded reassembly may need more.
-- The PR ships the seam with **no implementations and no tests anywhere**; the real consumer is the
-  out-of-tree `mssql_net`/ArrowNet DuckDB extension. The `CodecSeamTests` on master are the first tests it
-  has ever had.
+- The seam is **not about VARIANT**. It exists so a host can swap out engineered-wood's Parquet codec
+  entirely. The consumer — published 2026-07-19 as
+  `https://github.com/cmettler/fabricator-extension` — plugs in DuckDB's `COPY … (FORMAT parquet)`.
+  Its `docs/native-delta-write.md` is the design doc, and its motivation is explicit: *"Every
+  engineered-wood defect this project hit lived in its parquet layer, never its `_delta_log` layer
+  [...] this de-risks the part of engineered-wood whose future is uncertain (its parquet codec)."*
+- **Chronology settles it**: `IDataFileWriter` landed downstream 2026-07-04; VARIANT landed 2026-07-06
+  and merely *reused* the existing seam (`docs/variant-support.md`: *"UPDATE / copy-on-write DELETE /
+  OPTIMIZE — LIFTED via the `IDataFileReader` codec seam"*). cmettler in the PR thread: *"This is a
+  simple abstraction to plugin a different parquet codec."*
+- The registration gap described in the previous version of this section **is real**, and is a
+  standalone data-integrity bug (see Remaining work #1) — but closing it does **not** remove the seam's
+  reason to exist. That inference was the error.
+- What DuckDB's writer actually buys downstream is narrow: bloom filters (we write none), its
+  encoding/footer maturity, a codec-name mapping, `ROW_GROUP_SIZE`. Notably **not**: encryption, custom
+  footer metadata, DV bytes, or stats — downstream routes stats back through our `StatsCollector`
+  because DuckDB's `RETURN_STATS` gives decoded VARCHAR min/max that can round.
+- The seam still ships with **no in-tree implementations**; `CodecSeamTests` on master remain its only
+  tests.
 
-Curt has asked cmettler for more detail. Working assumption: **the seam comes out** once the variant
-extension is registered. `9302723` is a clean single commit to revert; the `ProcessFileBatchesAsync`
-extraction underneath is behaviour-preserving and should be KEPT either way.
+**No working assumption recorded — this is now a product decision**, not a technical one: whether
+"engineered-wood as a Delta metadata engine with bring-your-own codec" is a story to support. `9302723`
+is a clean single commit to revert; the `ProcessFileBatchesAsync` extraction underneath is
+behaviour-preserving and should be KEPT either way. `doc/codec-seam-investigation.md` §6 frames both
+branches.
 
-Two contract gaps found while auditing (fix or delete with the seam): the writer's `relativePath` never
-states whether it is URL-encoded (call site passes the RAW name; the reader's doc says "URL-decoded" —
-the asymmetry invites the wrong guess), and directory creation for partition subdirs is an unstated
-obligation.
+Audit findings from the same investigation (fix if the seam stays, delete with it otherwise) are
+enumerated in that document §5: `relativePath` encoding unspecified with the two write call sites
+disagreeing, partition-directory creation an unstated obligation, `PARQUET:field_id` /
+`ARROW:extension:*` field metadata load-bearing but undocumented, and `CodecSeamTests` covering no
+partitioned case. One finding there is **independent of the seam**: the copy-on-write UPDATE rewrite
+writes to the table root with no partition subdirectory while its `add` carries `PartitionValues`
+(`DeltaTable.cs:1189`) — pre-existing, present in the built-in branch too, untested.
 
 ### Remaining work
 
-1. **Variant**: register the extension on the Delta layer's reader; verify the rewrite gap closes; then
-   revert `9302723` (keeping `ProcessFileBatchesAsync`). If it does NOT close, the seam earns its place.
-2. **`VariantTransport`** (~316 lines) — shredded read/write at the Delta layer. Independent of the seam.
+1. ~~**Variant registration**~~ — **investigated and RETRACTED (2026-07-19); there is no bug.** It is
+   true that the Delta layer passes `ParquetReadOptions.Default` (null `ExtensionRegistry`), but the
+   path is unreachable: the Delta *schema* layer rejects a variant column in both directions before any
+   parquet reader exists — `"variant"` throws `Unknown Delta primitive type` on read, and `VariantType`
+   (an `ExtensionType`, **not** a `StructType`) throws `Cannot convert Arrow type` on write. We already
+   fail closed; `pr-4`'s `ThrowIfVariantRewrite` has nothing to guard here. Now pinned by two
+   `SchemaConverterTests` cases (DeltaLake 199 -> 201), which also assert the not-StructType-derived
+   property — if that ever changes upstream, `FromArrowType`'s `ArrowStructType` arm *would* silently
+   map variant to a Delta struct. Variant at the Delta layer is therefore a **feature** (see 2), not a
+   defect to fix.
+1a. ~~**Shredded VARIANT reads are silently empty (Parquet layer)**~~ — **FIXED (2026-07-19).** A real
+   bug, found while checking (1). The reader wrapped a shredded column as `VariantArray` but never
+   reassembled: `value` is empty, the data is in `typed_value`, so `GetValueBytes` returned 0 bytes
+   while `IsNull` was false — a valid row holding an empty variant. 61 of 131 corpus cases failed. The
+   pre-existing sweep test passed throughout because it only checks annotation-vs-wrapping agreement
+   and never reads a value.
+
+   Fix: `Parquet/Data/VariantShredding.cs` reassembles via `Apache.Arrow.Operations` 23.0.0 (new
+   `PackageReference`; ships net462/netstandard2.0/net8.0, so every TFM is covered, and the net10.0
+   AOT/trim gate stays warning-free). `NestedAssembler` calls it after wrapping. The result is an
+   ordinary unshredded `VariantArray` — correct and uniform, but the shredded layout is not preserved,
+   so a caller cannot inspect `typed_value` afterwards. If that is ever needed (predicate pushdown into
+   `typed_value`), it should become an explicit opt-in on `ParquetReadOptions` rather than the default.
+
+   Verified by `VariantCorpus_MatchesReferenceVariants`, driven by the corpus's `cases.json`: **135
+   rows match semantically, 36 byte-exact, all 6 declared error cases now throw** (malformed shredding
+   was previously accepted and turned into garbage). Comparison is semantic (both sides rendered to
+   JSON) because reassembly legitimately re-canonicalizes metadata — offset-size bits, dictionary
+   pruning; byte-exactness is additionally required only for unshredded columns, which pass through
+   untouched. The three cases the corpus marks *"not valid according to the spec and implementations
+   can choose to error, or read the shredded value"* are treated as implementation-defined: Arrow reads
+   the shredded value where Iceberg prefers the residual, and both are conformant.
+
+2. ~~**Variant at the Delta layer**~~ — **DONE (2026-07-19).** Delta `variant` columns now work end to
+   end, without the codec seam and without PR #4's `VariantTransport`.
+
+   - **Schema**: `SchemaConverter` maps `"variant"` ⇄ Arrow `VariantType` (the
+     `arrow.parquet.variant` extension over `struct<metadata, value>`). The `VariantType` arm precedes
+     an `ExtensionType` catch-all that THROWS for any other extension — an unknown extension must not
+     degrade to its storage type, which would silently drop its meaning.
+   - **Protocol**: `variantType` allowlisted as a reader+writer feature; declared at CREATE and on
+     ALTER. **`CreateAsync` now shares `RequiredSchemaFeatures` with the ALTER path** instead of
+     hand-rolling a `timestampNtz` check — the divergence was why variant was declared on ALTER but not
+     at CREATE, and the same trap would catch the next schema-driven feature.
+   - **Read**: `DeltaTable` routes every data-file read through options carrying a registry that knows
+     the variant extension (`_dataFileReadOptions`). Without it a VARIANT group decodes as a bare
+     struct — silently contradicting the table's declared schema. A caller-supplied registry is
+     CLONED, never mutated, and its other extensions are preserved.
+   - **DML / maintenance**: extension arms added to both `TakeRows` copies
+     (`DeletionVectorFilter`, `PartitionUtils`), which filter through the storage and re-wrap. Without
+     these, DELETE/UPDATE threw, and so did any partitioned write of a table containing a variant
+     column *even when variant was not the partition column* (`BuildFilteredBatch` takes rows from
+     every non-partition column).
+   - **Silent-corruption fixes found by audit, not by tests**: `DeletionVectorFilter.CreateEmptyArray`
+     returned a `StringArray` for any unrecognised type (wrong-typed column vs its own schema when a
+     batch is fully deleted); `ValueWidener.BuildNullArray` did the same for a missing column;
+     `ValueWidener.TypesMatch` returned true for ANY two extension types, since all report
+     `TypeId.Extension`. All three now handle extensions explicitly.
+   - **Stats**: min/max correctly omitted (no dispatch arm ⇒ skipped), `nullCount`/`numRecords` still
+     emitted — pinned by test rather than left to luck.
+   - **`ParquetReadOptions` is now a `record`** (matching its `ParquetWriteOptions` sibling) so a layer
+     deriving options gets a compiler-generated copy of every member. A hand-written copy would
+     silently drop any option added later.
+
+   Covered by `VariantTests` (9 tests: round-trip, feature declaration, schema JSON, stats, DELETE,
+   partitioned write, compaction, ADD COLUMN backfill, variant-partition-column rejection) plus 4
+   `SchemaConverterTests`. **Still open at the Parquet layer**: variant is wrapped for **top-level
+   columns only** (`NestedAssembler` documents that variants nested inside list/map are not wrapped),
+   and there is **no shredding on write** — EW emits the storage struct as-is, which is spec-legal but
+   an interop asymmetry against Spark/DuckDB. Neither is required for correctness.
+
+   Not yet validated against an external reader — the tier-1/3 interop suites (delta-rs, PySpark) do
+   not cover variant. That is the natural next step.
 3. **Slice 9** (row-level concurrency — **STRATEGIC**) — absorbs slice 8's OCC/conflict-checker material.
-4. **`IDataFileRewriter`** + row-tracking-through-rewrite — only if the seam survives (1).
+4. **The seam decision** — keep-and-fix vs revert `9302723`; see the seam question above and
+   `doc/codec-seam-investigation.md`. `IDataFileRewriter` + row-tracking-through-rewrite only if it
+   survives, and it is a categorically larger commitment than the other two (it delegates DML
+   *semantics*, not encoding).
 5. **Clustering bits coupled to `CommitDataFilesAsync`** — `dataChange`/`clusteringProvider` params and
    `WrittenDataFile.Tags` -> `add.tags`. Need the buffered-transaction API from slice 9.
 6. ~~**Stale `doc/known-issues.md`**~~ — DONE (2026-07-19). Re-verified claim by claim against the
