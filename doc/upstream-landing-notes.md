@@ -21,7 +21,7 @@ change diverges from the original PR.
 | 2 — Spec DV serialization | `c4a5a07` | 64-bit RoaringBitmapArray + on-disk `.bin` framing. **Both legacy fallbacks removed** (library never shipped → no legacy EW DVs; fallbacks were fragile/OOM-prone). |
 | 3 — Spec checkpoint content + tombstone DVs | `b41f5ad` | Preserve add.deletionVector/baseRowId/features/config, NULLABLE action structs, retained tombstones. **Added `remove.deletionVector` round-trip** beyond the PR. Row-tracking HWM reconciliation deliberately excluded (deferred to slice 5). |
 | 4 — Spec path encoding (`DeltaPath`) | `74bc1aa` | Hive-escaped partition dirs + URL-encoded `add.path`, decoded at every read site + vacuum. Hand-ported cross-cutting wiring. **See non-ASCII follow-up below.** |
-| 5 (PARTIAL) — writer-feature enforcement | `cc8d6fe`, `c1b1474` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. Lets EW write to Spark writer-v7 tables safely. **Did NOT allowlist variantType/rowTracking** (need later slices). |
+| 5 — writer features + protocol declaration | `cc8d6fe`, `c1b1474`, `70d2384`, `8e3fa8d` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. `70d2384`: declare schema-driven features (timestampNtz/identityColumns/columnMapping-in-v7) at `CreateAsync` + protocol upgrade on `AddColumnAsync`. `8e3fa8d`: `delta.rowTracking` HWM emission + `SnapshotBuilder` reconciliation. **Did NOT allowlist variantType/rowTracking** as supported features (need later slices). |
 | 6 — column mapping | `aa3f0e2`, `7a327f0`, `4754a72` | `aa3f0e2`: physical names in BOTH modes + new `ColumnMappingRecursive.ToPhysical/ToLogical` (nested struct children) + numeric `delta.columnMapping.id`. `7a327f0`: compaction re-stamps field ids & widens against the physical-named target schema. `4754a72`: `AddColumnAsync`/`RenameColumnAsync`/`DropColumnAsync` metadata-only + `SchemaEvolution.BackfillMissingColumns` read-path reconcile. **See slice-6 leftovers below.** |
 
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
@@ -32,27 +32,29 @@ the main checkout).
 ## The inflection point (slice 5 onward)
 
 Slices 1–4 were cleanly separable from the PR's central `DeltaTable.cs` write-path refactor
-(`WriteCoreAsync` + the commit seams). Slice 5 onward weave *into* that refactor and into each other.
-The remaining slice-5 pieces were deferred because they're refactor-/slice-6-coupled:
+(`WriteCoreAsync` + the commit seams). Slice 5 onward weave *into* that refactor and into each other —
+but slices 5 and 6 were nonetheless landed piecemeal without taking the refactor, by hand-porting each
+thread onto master's existing write path. Slice 5 is now **complete**; the three pieces that were
+deferred as refactor-/slice-6-coupled all landed once slice 6 supplied `AddColumnAsync`:
 
-- **Create-time feature declaration** (declare timestampNtz/variantType/identityColumns reader+writer
-  features at `CreateAsync` when the schema needs them) — needs write-path hooks.
-- **Row-tracking HWM emission** (emit the `delta.rowTracking` domainMetadata high-water mark on every
-  id-assigning commit) + the `SnapshotBuilder.Build` `Max(ComputeHighWaterMark, TryReadHighWaterMark+1)`
-  reconciliation. `RowTrackingConfig.TryReadHighWaterMark`/`BuildHighWaterMarkAction` are PR additions
-  NOT yet landed.
-- **Protocol-upgrade-on-ALTER** (AddColumn/SetSchema emit a protocol upgrade) — **UNBLOCKED** as of slice 6:
-  `AddColumnAsync` now exists (`4754a72`), so `UpgradeProtocolForFeatures` + `RequiredSchemaFeatures` can land
-  next. (`SetSchemaAsync` still doesn't exist — see slice-6 leftovers.)
+- ~~Create-time feature declaration~~ — `70d2384`. `variantType` omitted (no variant support on master;
+  the `RequiredSchemaFeatures` hook is in place for when there is).
+- ~~Row-tracking HWM emission + `SnapshotBuilder` reconciliation~~ — `8e3fa8d`.
+- ~~Protocol-upgrade-on-ALTER~~ — `70d2384` (on `AddColumnAsync`; `SetSchemaAsync` still doesn't exist —
+  see slice-6 leftovers).
 
-### Strategic decision pending for the remainder (slice-5-rest + 6–9)
+### Strategic decision pending for the remainder (slices 7–9)
 
-1. **Foundation-first** — take pr-4's `DeltaTable` `WriteCoreAsync` refactor as a base commit, then land
-   the remainder near-verbatim. Efficient for "all of it", but a big step that pulls the strategic
-   pieces (codec seam, concurrency) forward and abandons the small-reviewable-commit character.
-2. **Continue piecemeal** — keep hand-porting separable bits; more surgery per unit of value, rising risk.
-3. **Pause** — slices 1–5(enforcement) are a coherent, high-value, fully-tested set (standalone
-   spec/interop bug fixes + safe writes to Spark tables). A defensible stopping point.
+Slices 1–6 are landed piecemeal and fully tested, so the "foundation-first vs piecemeal" question is now
+only about 7–9 — and piecemeal has held up better than expected (slices 5 and 6 both landed without the
+`WriteCoreAsync` refactor). Options:
+
+1. **Continue piecemeal** — slice 8 is a bag of independent bug fixes and is the natural next unit; it
+   needs no refactor.
+2. **Foundation-first for 7+9** — the codec seam and row-level concurrency are the two that genuinely
+   want pr-4's `WriteCoreAsync` refactor underneath. Take it as a base commit before those.
+3. **Pause** — slices 1–6 are a coherent, high-value, fully-tested set (standalone spec/interop bug fixes,
+   safe writes to Spark tables, spec-correct column mapping + schema evolution). A defensible stopping point.
 
 Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first), 8 (misc
 reader/DML: S3 conditional-write fix, ListVersions ascending sort, thrift wire-type guards, Decimal128
