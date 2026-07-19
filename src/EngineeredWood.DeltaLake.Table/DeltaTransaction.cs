@@ -40,6 +40,10 @@ public sealed class DeltaTransaction
     // than a fixed label. A single-operation transaction reports that operation; a mixed one reports
     // "WRITE" (Delta's operation field is one string, and no engine has a name for a fused DELETE+INSERT).
     private readonly HashSet<string> _operations = new(StringComparer.Ordinal);
+    // Analyzable read predicates staged by the Expressions.Predicate overloads of DeleteAsync/UpdateAsync.
+    // They become the transaction's ReadSet.Predicates so a concurrent add matching one is a
+    // concurrentAppend conflict. Left empty by the functional-predicate and append-only paths.
+    private readonly List<Expressions.Predicate> _readPredicates = [];
     private bool _committed;
 
     internal DeltaTransaction(
@@ -61,6 +65,8 @@ public sealed class DeltaTransaction
     internal IReadOnlyList<DeltaAction> DataActions => _dataActions;
 
     internal ISet<string> RemovedPaths => _removedPaths;
+
+    internal IReadOnlyList<Expressions.Predicate> ReadPredicates => _readPredicates;
 
     internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
 
@@ -121,6 +127,31 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Stages a delete of the rows matching an analyzable <see cref="Expressions.Predicate"/>. Beyond the
+    /// functional overload the predicate is recorded as a read dependency: a concurrent commit that adds a
+    /// file matching it aborts this transaction (concurrentAppend), precise to the isolation level. Files
+    /// whose statistics prove no row matches are skipped without being read. Returns the rows matched.
+    /// </summary>
+    public async ValueTask<long> DeleteAsync(
+        Expressions.Predicate predicate, CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        var plan = await _table.ComputeDeleteActionsAsync(
+            _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate)
+            .ConfigureAwait(false);
+
+        _dataActions.AddRange(plan.DataActions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _readPredicates.Add(predicate);
+        _operations.Add("DELETE");
+
+        return plan.TotalDeleted;
+    }
+
+    /// <summary>
     /// Stages an update of the rows matching <paramref name="predicate"/> via <paramref name="updater"/>,
     /// evaluated against this transaction's pinned read version. Like a delete it reads exactly the files
     /// it rewrites, so a concurrent commit that removed one of them aborts the commit.
@@ -142,6 +173,33 @@ public sealed class DeltaTransaction
         _dataActions.AddRange(plan.Actions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
+        _operations.Add("UPDATE");
+
+        return plan.TotalUpdated;
+    }
+
+    /// <summary>
+    /// Stages an update of the rows matching an analyzable <see cref="Expressions.Predicate"/> via
+    /// <paramref name="updater"/>. Like the analyzable delete, the predicate is recorded as a read
+    /// dependency (concurrentAppend precision) and files that cannot match are skipped. Returns the rows
+    /// matched.
+    /// </summary>
+    public async ValueTask<long> UpdateAsync(
+        Expressions.Predicate predicate,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        var plan = await _table.ComputeUpdateActionsAsync(
+            _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
+            prunePredicate: predicate).ConfigureAwait(false);
+
+        _dataActions.AddRange(plan.Actions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _readPredicates.Add(predicate);
         _operations.Add("UPDATE");
 
         return plan.TotalUpdated;

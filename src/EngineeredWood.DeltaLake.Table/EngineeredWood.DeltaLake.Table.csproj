@@ -12,6 +12,9 @@
     <ProjectReference Include="..\EngineeredWood.Core\EngineeredWood.Core.csproj" />
     <ProjectReference Include="..\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
     <ProjectReference Include="..\EngineeredWood.DeltaLake\EngineeredWood.DeltaLake.csproj" />
+    <!-- Row-level predicate evaluation (Expressions.Predicate -> BooleanArray mask) for the
+         analyzable DeleteAsync/UpdateAsync overloads; also gives the OCC checker a real read predicate. -->
+    <ProjectReference Include="..\EngineeredWood.Expressions.Arrow\EngineeredWood.Expressions.Arrow.csproj" />
   </ItemGroup>
 
   <ItemGroup>

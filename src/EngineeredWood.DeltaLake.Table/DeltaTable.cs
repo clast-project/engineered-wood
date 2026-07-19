@@ -1052,7 +1052,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
 
-        var reads = new Concurrency.ReadSet { Files = transaction.RemovedPaths };
+        // Files = what a staged delete/update rewrote (concurrentDeleteRead). Predicates = the analyzable
+        // read predicates staged on this transaction (empty for functional-predicate or append-only work);
+        // a concurrent add matching one is a concurrentAppend conflict, precise to the isolation level. The
+        // pruner the checker needs is built inside CommitOccAsync from the base snapshot.
+        var reads = new Concurrency.ReadSet
+        {
+            Files = transaction.RemovedPaths,
+            Predicates = transaction.ReadPredicates,
+        };
 
         return CommitOccAsync(
             baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
@@ -1140,6 +1148,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     #region Delete and Update
 
+    // The row-level predicate evaluator turning an analyzable Expressions.Predicate into the
+    // Func<RecordBatch, BooleanArray> mask the DELETE/UPDATE machinery consumes. Stateless (no function
+    // registry), so one shared instance is safe. Evaluates by LOGICAL column name, which is exactly what
+    // the compute paths hand the predicate (they rename batches to logical names first).
+    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator = new();
+
+    /// <summary>Adapts an analyzable predicate to the per-row mask delegate: a row is selected when the
+    /// predicate evaluates to TRUE (SQL three-valued logic — NULL/unknown is not selected).</summary>
+    internal static Func<RecordBatch, BooleanArray> MaskFor(Expressions.Predicate predicate) =>
+        batch => RowEvaluator.EvaluatePredicate(predicate, batch);
+
     /// <summary>
     /// Deletes rows matching the predicate using deletion vectors.
     /// The predicate receives each batch (with logical column names) and returns
@@ -1165,6 +1184,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return (rowsDeleted, version);
     }
 
+    /// <summary>
+    /// Deletes rows matching an analyzable <see cref="Expressions.Predicate"/>. Beyond the functional
+    /// overload this gives the writer a predicate it can reason about: files whose statistics prove no row
+    /// matches are skipped without being read, and — because the predicate is recorded as the operation's
+    /// read-set — a concurrent commit that adds a file matching it is detected as a conflict
+    /// (concurrentAppend). Under the default <see cref="IsolationLevel.WriteSerializable"/> a concurrent
+    /// blind append is still exempt; under <see cref="IsolationLevel.Serializable"/> it conflicts.
+    /// Returns the number of rows deleted and the committed version.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        Expressions.Predicate predicate,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var transaction = StartTransaction();
+        long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
+            .ConfigureAwait(false);
+        long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (rowsDeleted, version);
+    }
+
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, and the row
     /// count — everything a commit needs, but without committing. Shared by the auto-committing
     /// <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
@@ -1175,11 +1215,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Computes the actions for a DELETE against <paramref name="snapshot"/> WITHOUT committing. The
     /// removed-file paths double as a transaction's read-set: a DELETE reads exactly the files it
     /// rewrites, so a concurrent commit that removed one of them is the conflict that must abort it.
+    /// <para>When <paramref name="prunePredicate"/> is supplied (the analyzable-predicate overloads pass
+    /// it), files whose statistics prove no row can match are skipped without being opened. This never
+    /// changes the removed-file set — a pruned file could not have contained a matching row, so it would
+    /// not have been rewritten anyway — it only avoids reading files that cannot contribute.</para>
     /// </summary>
     internal async ValueTask<DeleteActions> ComputeDeleteActionsAsync(
         Snapshot.Snapshot snapshot,
         Func<RecordBatch, BooleanArray> predicate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Expressions.Predicate? prunePredicate = null)
     {
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
@@ -1187,9 +1232,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long totalDeleted = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        var pruner = prunePredicate is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
+            if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
+                continue; // stats prove no row here matches — nothing to delete, skip the read
+
             var rawDeletedRows = addFile.DeletionVector is not null
                 ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
                     .ConfigureAwait(false)
@@ -1287,26 +1337,51 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// preserved unchanged. Affected files are rewritten.
     /// Returns the number of rows updated and the committed version.
     /// </summary>
-    public async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+    public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
+        => UpdateCoreAsync(predicate, updater, prunePredicate: null, readPredicates: [], cancellationToken);
+
+    /// <summary>
+    /// Updates rows matching an analyzable <see cref="Expressions.Predicate"/>. As with the analyzable
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>, files whose statistics prove no
+    /// row matches are skipped without being read, and the predicate becomes the operation's read-set so a
+    /// concurrent commit adding a file that matches it is a conflict (concurrentAppend), precise to the
+    /// isolation level. Returns the number of rows updated and the committed version.
+    /// </summary>
+    public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+        Expressions.Predicate predicate,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+        => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
+            readPredicates: [predicate], cancellationToken);
+
+    private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
+        Func<RecordBatch, BooleanArray> predicate,
+        Func<RecordBatch, RecordBatch> updater,
+        Expressions.Predicate? prunePredicate,
+        IReadOnlyList<Expressions.Predicate> readPredicates,
+        CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
         ValidateWritable(snapshot, isAppend: false); // UPDATE is a data change
 
-        var plan = await ComputeUpdateActionsAsync(snapshot, predicate, updater, cancellationToken)
-            .ConfigureAwait(false);
+        var plan = await ComputeUpdateActionsAsync(
+            snapshot, predicate, updater, cancellationToken, prunePredicate).ConfigureAwait(false);
 
         bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
 
         // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
-        // read-set (concurrentDeleteRead) and its planned removes (delete/delete). Route it through the OCC
-        // loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit instead of throwing.
+        // read-set (concurrentDeleteRead) and its planned removes (delete/delete). The analyzable overload
+        // additionally records its read predicate so a concurrent add that matches it conflicts. Route it
+        // through the OCC loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit
+        // instead of throwing.
         long committed = await CommitOccAsync(
-            snapshot, plan.Actions, new Concurrency.ReadSet { Files = plan.RemovedPaths },
+            snapshot, plan.Actions,
+            new Concurrency.ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
             plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
             rebaseSafe: !rowTracking, cancellationToken).ConfigureAwait(false);
 
@@ -1323,24 +1398,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Computes the actions for an UPDATE against <paramref name="snapshot"/> WITHOUT committing. Like a
     /// DELETE, the removed-file paths double as the read-set: an UPDATE reads exactly the files it rewrites,
     /// so a concurrent commit that removed one of them is the conflict that must abort it.
+    /// <para><paramref name="prunePredicate"/> skips files whose statistics prove no row can match, exactly
+    /// as in <see cref="ComputeDeleteActionsAsync"/> — a pruned file has no matching row to update, so the
+    /// removed-file set is unchanged; only the read is avoided.</para>
     /// </summary>
     internal async ValueTask<UpdateActions> ComputeUpdateActionsAsync(
         Snapshot.Snapshot snapshot,
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Expressions.Predicate? prunePredicate = null)
     {
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        var pruner = prunePredicate is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns);
 
         // ColumnMappingRecursive reads the physical names / field ids off the schema itself — no flat maps needed.
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
+            if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
+                continue; // stats prove no row here matches — nothing to update, skip the read
+
             // Read file data with DV filtering
             var batches = new List<RecordBatch>();
             await foreach (var batch in ReadFileAsync(
