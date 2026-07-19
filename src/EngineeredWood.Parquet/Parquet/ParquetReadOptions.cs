@@ -57,7 +57,14 @@ public enum DecimalOutputKind
 /// <summary>
 /// Options that control how Parquet data is read and mapped to Apache Arrow types.
 /// </summary>
-public sealed class ParquetReadOptions
+/// <remarks>
+/// A <c>record</c> (like its <see cref="ParquetWriteOptions"/> sibling) so callers can derive one set
+/// of options from another with <c>with</c>. That matters for correctness, not just convenience: a
+/// layer that needs to adjust ONE option — e.g. the Delta table registering the
+/// <c>arrow.parquet.variant</c> extension — gets a compiler-generated copy of every other member, so
+/// adding an option here can never silently drop it on the derived path.
+/// </remarks>
+public sealed record ParquetReadOptions
 {
     /// <summary>Default options: all features disabled, producing standard Arrow types.</summary>
     public static readonly ParquetReadOptions Default = new();
