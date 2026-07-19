@@ -822,12 +822,10 @@ internal static class ColumnChunkWriter
     /// </summary>
     private static int CompressTo(ReadOnlySpan<byte> data, ParquetWriteOptions options)
     {
-        if (data.Length == 0)
-        {
-            EnsureCompressBuffer(0);
-            return 0;
-        }
-
+        // An EMPTY section still needs a VALID compressed stream: a 0-byte payload declared compressed is
+        // rejected by strict decoders (snappy's empty stream is the single 0x00 length varint — SQL Server
+        // fails an all-null V2 page's zero-byte values section with "Corrupt snappy compressed data";
+        // Delta CHECKPOINT files are full of all-null column chunks). Let the codec encode emptiness.
         int maxLen = Compressor.GetMaxCompressedLength(options.Compression, data.Length);
         EnsureCompressBuffer(maxLen);
         return Compressor.Compress(
