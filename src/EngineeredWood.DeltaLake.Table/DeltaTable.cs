@@ -1098,7 +1098,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
     // (older engineered-wood commits) canonicalize identically. A null value (Delta's "row is null in this
     // partition column") is marked distinctly from an empty string.
-    private static string CanonicalPartitionKey(
+    internal static string CanonicalPartitionKey(
         IReadOnlyDictionary<string, string> values,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
     {

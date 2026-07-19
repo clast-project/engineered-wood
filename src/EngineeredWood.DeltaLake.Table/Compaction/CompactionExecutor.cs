@@ -53,45 +53,124 @@ internal static class CompactionExecutor
         IDataFileWriter? dataFileWriter = null,
         IDataFileReader? dataFileReader = null)
     {
-        // Select small files as compaction candidates
-        var candidates = snapshot.ActiveFiles.Values
+        // Select small files as compaction candidates and group them BY PARTITION: a data file belongs to
+        // exactly ONE partition (its add.partitionValues), so each group must compact independently. Mixing
+        // partitions into one file stamped with a single partition's values silently corrupted the partition
+        // column of every other row. Unpartitioned tables form a single group (behaviour unchanged).
+        // Canonical keys tolerate mixed logical/physical partitionValues vintages under column mapping.
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = mappingMode != ColumnMappingMode.None
+            ? ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode)
+            : null;
+        var groups = snapshot.ActiveFiles.Values
             .Where(f => f.Size < options.MinFileSize)
             .OrderBy(f => f.Size)
             .Take(options.MaxFilesPerCommit)
+            .GroupBy(f => DeltaTable.CanonicalPartitionKey(f.PartitionValues, logicalToPhysical))
+            .Select(g => g.ToList())
+            .Where(g => g.Count >= 2) // a partition with a single small file is not worth compacting
             .ToList();
 
-        if (candidates.Count < 2)
-            return null; // Not worth compacting a single file
+        if (groups.Count == 0)
+            return null;
 
-        // Build target schema for type widening during compaction
+        // Build target schema for type widening during compaction — EXCLUDING partition columns: per the
+        // Delta layout, data files do not carry them (values live in add.partitionValues; readers re-add
+        // them). Backfilling them as all-NULL columns wrote junk columns into the compacted file and
+        // misaligned the batches against the file's real column set.
         var targetSchema = SchemaConverter.ToArrowSchema(
             DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString));
+        if (snapshot.Metadata.PartitionColumns.Count > 0)
+        {
+            var partSet = new HashSet<string>(snapshot.Metadata.PartitionColumns, StringComparer.Ordinal);
+            targetSchema = new Apache.Arrow.Schema(
+                targetSchema.FieldsList.Where(f => !partSet.Contains(f.Name)).ToList(), null);
+        }
 
         // Column mapping: the data files store PHYSICAL column names (both name and id mode), and the compacted
         // file must keep them + re-stamp each column's parquet field_id — readers resolve by
         // physicalName/field_id, so a compacted file without them reads as all-NULL. Widening therefore has to
         // match on the physical-renamed target schema (the logical-named one matches nothing on disk, which
         // silently skipped widening under mapping).
-        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
         {
-            var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
             var physFields = new List<Field>(targetSchema.FieldsList.Count);
             foreach (var f in targetSchema.FieldsList)
             {
-                physFields.Add(logicalToPhysical.TryGetValue(f.Name, out var p) && p != f.Name
+                physFields.Add(logicalToPhysical!.TryGetValue(f.Name, out var p) && p != f.Name
                     ? new Field(p, f.DataType, f.IsNullable)
                     : f);
             }
             targetSchema = new Apache.Arrow.Schema(physFields, null);
         }
 
-        // Read all LIVE data from candidate files, widening types if needed. A candidate may carry a deletion
-        // vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded — compacting the
-        // raw parquet would RESURRECT every deleted row.
         var dvReader = new DeletionVectors.DeletionVectorReader(fs);
+        var actions = new List<DeltaAction>();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        bool rowTrackingEnabled = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        bool anyAdds = false;
+
+        foreach (var group in groups)
+        {
+            (bool compacted, nextRowId) = await CompactGroupAsync(
+                fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
+                dvReader, actions, now, rowTrackingEnabled, nextRowId,
+                dataFileWriter, dataFileReader, cancellationToken).ConfigureAwait(false);
+            anyAdds |= compacted;
+        }
+
+        if (!anyAdds)
+            return null;
+
+        // Row tracking: OPTIMIZE assigns fresh row ids to the compacted files, so it advances the
+        // delta.rowTracking high-water mark too (same reasoning as the write path).
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        {
+            actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+                .BuildHighWaterMarkAction(nextRowId));
+        }
+
+        // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes.
+        long newVersion = snapshot.Version + 1;
+        var commitActions = InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "OPTIMIZE");
+        await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
+            .ConfigureAwait(false);
+
+        return newVersion;
+    }
+
+    /// <summary>
+    /// Compacts ONE partition group's candidate files (the whole table when unpartitioned): reads the live
+    /// rows, appends the group's remove + add actions (adds carry the group's partitionValues and land in
+    /// the group's Hive directory), and returns whether anything was compacted plus the advanced
+    /// row-tracking id cursor.
+    /// </summary>
+    private static async ValueTask<(bool Compacted, long NextRowId)> CompactGroupAsync(
+        ITableFileSystem fs,
+        DeltaSnapshot snapshot,
+        CompactionOptions options,
+        ParquetWriteOptions parquetOptions,
+        ParquetReadOptions parquetReadOptions,
+        IReadOnlyList<AddFile> group,
+        Apache.Arrow.Schema targetSchema,
+        ColumnMappingMode mappingMode,
+        DeletionVectors.DeletionVectorReader dvReader,
+        List<DeltaAction> actions,
+        long now,
+        bool rowTrackingEnabled,
+        long nextRowId,
+        IDataFileWriter? dataFileWriter,
+        IDataFileReader? dataFileReader,
+        CancellationToken cancellationToken)
+    {
+        // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
+        // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
+        // compacting the raw parquet would RESURRECT every deleted row.
         var allBatches = new List<RecordBatch>();
-        foreach (var addFile in candidates)
+        foreach (var addFile in group)
         {
             var deletedRows = addFile.DeletionVector is not null
                 ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
@@ -163,14 +242,10 @@ internal static class CompactionExecutor
         }
 
         if (allBatches.Count == 0)
-            return null;
+            return (false, nextRowId); // every live row DV-deleted — leave the group's files alone
 
-        // Write compacted data into new files
-        var actions = new List<DeltaAction>();
-        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        // Remove old files (with dataChange: false since this is rearrangement)
-        foreach (var oldFile in candidates)
+        // Remove the group's old files (with dataChange: false since this is rearrangement)
+        foreach (var oldFile in group)
         {
             actions.Add(new RemoveFile
             {
@@ -186,23 +261,28 @@ internal static class CompactionExecutor
             });
         }
 
-        // Row tracking state
-        bool rowTrackingEnabled = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
-
         // Earliest defaultRowCommitVersion from source files (preserved through compaction)
-        long? earliestCommitVersion = candidates
+        long? earliestCommitVersion = group
             .Where(c => c.DefaultRowCommitVersion.HasValue)
             .Select(c => c.DefaultRowCommitVersion!.Value)
             .DefaultIfEmpty(-1)
             .Min();
         if (earliestCommitVersion == -1) earliestCommitVersion = null;
 
+        // The group's Hive directory: one partition = one directory, so the compacted file joins its
+        // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
+        // is never double-encoded); the physical write path is the decoded form. Empty for an
+        // unpartitioned table (files at the table root).
+        string encodedDir = "";
+        int dirSlash = group[0].Path.LastIndexOf('/');
+        if (dirSlash >= 0)
+            encodedDir = group[0].Path.Substring(0, dirSlash + 1);
+        string physicalDir = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir);
+
         // Write new compacted file(s)
         // Group batches to target file size (approximate by row count)
         long totalRows = allBatches.Sum(b => (long)b.Length);
-        long totalBytes = candidates.Sum(f => f.Size);
+        long totalBytes = group.Sum(f => f.Size);
         double bytesPerRow = totalRows > 0 ? (double)totalBytes / totalRows : 0;
         long rowsPerFile = bytesPerRow > 0
             ? Math.Max(1, (long)(options.TargetFileSize / bytesPerRow))
@@ -220,7 +300,8 @@ internal static class CompactionExecutor
 
             if (currentRowCount >= rowsPerFile || batchIdx == allBatches.Count)
             {
-                string fileName = $"{Guid.NewGuid():N}.parquet";
+                string baseName = $"{Guid.NewGuid():N}.parquet";
+                string fileName = physicalDir + baseName;
                 long fileSize;
                 long fileBaseRowId = nextRowId;
 
@@ -253,8 +334,8 @@ internal static class CompactionExecutor
 
                 actions.Add(new AddFile
                 {
-                    Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
-                    PartitionValues = candidates[0].PartitionValues,
+                    Path = encodedDir + baseName,
+                    PartitionValues = group[0].PartitionValues,
                     Size = fileSize,
                     ModificationTime = now,
                     DataChange = false,
@@ -268,23 +349,6 @@ internal static class CompactionExecutor
             }
         }
 
-        // Row tracking: OPTIMIZE assigns fresh row ids to the compacted files, so it advances the
-        // delta.rowTracking high-water mark too (same reasoning as the write path).
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
-        {
-            actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
-                .BuildHighWaterMarkAction(nextRowId));
-        }
-
-        // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes.
-        // This was the ONLY silent one: history showed a null operation for a compaction, and timestamp time
-        // travel had no timestamp to resolve through the commit.
-        long newVersion = snapshot.Version + 1;
-        var commitActions = InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "OPTIMIZE");
-        await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
-            .ConfigureAwait(false);
-
-        return newVersion;
+        return (true, nextRowId);
     }
 }
