@@ -177,6 +177,28 @@ def cmd_sql(args):
             "detail": _detail(spark, args["path"])}
 
 
+def cmd_create(args):
+    """Create an empty table via the DeltaTable builder.
+
+    Needed for generated columns specifically: `CREATE TABLE delta.`path`` rejects GENERATED ALWAYS AS
+    with UNSUPPORTED_FEATURE.TABLE_OPERATION, so the builder API is the only path-based way to make one.
+
+    `columns` entries are {name, type, generated_always_as?, nullable?}.
+    """
+    from delta.tables import DeltaTable
+
+    spark = _spark()
+    builder = DeltaTable.create(spark).location(_uri(args["path"]))
+    for col in args["columns"]:
+        if col.get("generated_always_as"):
+            builder = builder.addColumn(
+                col["name"], col["type"], generatedAlwaysAs=col["generated_always_as"])
+        else:
+            builder = builder.addColumn(col["name"], col["type"])
+    builder.execute()
+    return {"detail": _detail(spark, args["path"])}
+
+
 def cmd_scan(args):
     """Read under a filter and report BOTH the rows and how many files Spark actually touched.
 
@@ -206,6 +228,7 @@ COMMANDS = {
     "write": cmd_write,
     "sql": cmd_sql,
     "scan": cmd_scan,
+    "create": cmd_create,
 }
 
 

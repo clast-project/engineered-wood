@@ -330,6 +330,87 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([100L, 101L, 200L], scores);
     }
 
+    // ── Fail-closed on features EW cannot evaluate. ──
+
+    /// <summary>
+    /// <para>A CHECK constraint carries arbitrary SQL that EW cannot evaluate, so
+    /// <c>HonorWriterFeatures</c> rejects the write rather than committing possibly-violating data —
+    /// Delta constraints are enforced at write time only, so one bad commit poisons the table for
+    /// every reader afterwards.</para>
+    ///
+    /// <para>That check keys on the <c>delta.constraints.</c> configuration prefix, which is an
+    /// ASSUMPTION about what Spark emits. If the real key ever differed, the guard would silently
+    /// never fire and EW would write straight through it. This pins the assumption against a
+    /// constraint Spark actually created.</para>
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_CheckConstraint_EwRefusesToWrite()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, score long",
+            rows = new object[] { new object[] { 1L, 50L } },
+            sql = new[] { "ALTER TABLE delta.`{path}` ADD CONSTRAINT score_pos CHECK (score > 0)" },
+        });
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("score", Int64Type.Default, false))
+            .Build();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        var ids = new Int64Array.Builder().Append(2L).Build();
+        var scores = new Int64Array.Builder().Append(-1L).Build();
+        var batch = new RecordBatch(schema, [ids, scores], 1);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([batch]));
+        Assert.Contains("score_pos", ex.Message);
+    }
+
+    /// <summary>
+    /// The same fail-closed contract for generated columns, whose expression lives in FIELD metadata
+    /// rather than table configuration — a separate code path with its own assumed key
+    /// (<c>delta.generationExpression</c>). Writing without computing the generated value would
+    /// produce a column that silently disagrees with its own definition.
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_GeneratedColumn_EwRefusesToWrite()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        Spark.Invoke("create", new
+        {
+            path = _tempDir,
+            columns = new object[]
+            {
+                new { name = "id", type = "LONG" },
+                new { name = "doubled", type = "LONG", generated_always_as = "id * 2" },
+            },
+        });
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("doubled", Int64Type.Default, false))
+            .Build();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        var ids = new Int64Array.Builder().Append(5L).Build();
+        var doubled = new Int64Array.Builder().Append(999L).Build(); // deliberately not 10
+        var batch = new RecordBatch(schema, [ids, doubled], 1);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([batch]));
+        Assert.Contains("doubled", ex.Message);
+    }
+
     private static Apache.Arrow.Schema NestedSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
         .Field(new Field("payload", new Apache.Arrow.Types.StructType(

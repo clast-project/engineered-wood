@@ -134,12 +134,57 @@ Suites after the fixes: DeltaLake 180, Delta Table 243 (+6 interop, 27 skipped),
 Iceberg 241, Lance.Table 92 — all green on net10.0/net8.0, all TFMs build.
 
 **Known tier-1 blind spot**: EW declares column mapping with the legacy `minReader=2`/`minWriter=5`
-numbering. That is spec-legal, but delta-rs 1.6.2 supports only reader version 1 or 3-with-features
-and declines to open the table, so it cannot validate physical-name resolution — that needs tier 3
-(PySpark), which now covers it. `EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3`
-pins the commit shape off-disk and asserts the rejection reason, so it will fail if delta-rs ever
-gains support. Worth considering separately: emitting v3/v7 with a `columnMapping` reader feature
-would make these tables readable by delta-rs and DuckDB too.
+numbering, and delta-rs 1.6.2 declines to open it, so it cannot validate physical-name resolution —
+that needs tier 3 (PySpark), which now covers it.
+`EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3` pins the commit shape off-disk
+and asserts the rejection reason, so it will fail if delta-rs ever gains support.
+
+**CORRECTION (2026-07-19)**: an earlier revision of this section claimed that emitting v3/v7 with a
+`columnMapping` reader feature "would make these tables readable by delta-rs and DuckDB too". **That is
+false.** delta-rs 1.6.2 cannot read column mapping in ANY declaration form — measured, both rejected:
+
+| Declaration | delta-rs |
+|---|---|
+| reader 2 (legacy) | `minimum reader version is 2 but deltalake only supports 1 or 3 with {timestampNtz, variantType, variantType-preview}` |
+| reader 3 + `columnMapping` readerFeature | `these reader features … are not yet supported by the deltalake reader` |
+
+It is an unimplemented-feature gap, not a declaration gap. (delta-rs also rejects `deletionVectors`
+as a reader feature through this API — tier 1's reach over feature-gated tables is narrow, and such
+tables mostly belong to tier 3.) The v2/v5-vs-v3/v7 question is therefore **not** an interop
+blocker; see the protocol-shape note below for what actually remains of it.
+
+### Column-mapping protocol shape — what Spark really writes
+
+Measured against Spark 4.0.1 / delta-spark 4.0.0. For plain column mapping Spark emits a **hybrid**,
+not the legacy pair:
+
+```json
+{"minReaderVersion": 2, "minWriterVersion": 7,
+ "writerFeatures": ["columnMapping", "invariants", "appendOnly"]}
+```
+
+Legacy on the reader side, table-features on the writer side, no `readerFeatures` at all. Add another
+feature (e.g. deletionVectors) and it becomes reader 3 / writer 7 with both lists populated.
+
+So the comment in `DeltaTable.cs` claiming "reader v2 / writer v5, no lists is what Spark itself
+writes" was **wrong** and has been corrected in place.
+
+What remains is cosmetic, and the case for changing is weak:
+
+- EW's `minWriterVersion=5` implies `checkConstraints`/`generatedColumns` among others, but the
+  obligation those impose is CONDITIONAL on the table actually declaring a constraint or a generated
+  column. A writer lacking them writes correct data to a table that uses neither.
+- EW already fails closed when they ARE active: `HonorWriterFeatures` rejects the write on
+  `delta.constraints.*`, `delta.invariants` and `delta.generationExpression`. Both key assumptions
+  are now pinned against real Spark output by `SparkWritten_CheckConstraint_EwRefusesToWrite` and
+  `SparkWritten_GeneratedColumn_EwRefusesToWrite` — Spark does use exactly those keys.
+- Spark reads EW's v2/v5 form fine (`EwWritten_ColumnMapping_SparkResolvesPhysicalNamesToLogical`).
+
+**Recommendation: leave it alone.** Matching Spark's hybrid would buy byte-compatibility with the
+reference implementation and nothing measurable. Full v3/v7 is strictly worse — it raises the reader
+bar 2→3 for no gain, since delta-rs cannot read it either way. Read-side needs no work regardless: EW
+detects column mapping from `delta.columnMapping.mode` in the configuration, not from the protocol
+version, so it already reads Spark's hybrid form.
 
 ## External validation — tier 3 (PySpark) landed 2026-07-19
 

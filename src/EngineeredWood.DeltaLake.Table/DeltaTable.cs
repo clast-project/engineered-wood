@@ -197,8 +197,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         // Column mapping is BOTH a reader and writer feature. Once any other feature has forced
         // table-features mode (reader v3 / writer v7) it MUST be listed in BOTH lists too — a v7 protocol
-        // with no columnMapping entry reads as "column mapping not supported". Absent any other feature,
-        // the legacy versioning set above (reader v2 / writer v5, no lists) is what Spark itself writes.
+        // with no columnMapping entry reads as "column mapping not supported".
+        //
+        // Absent any other feature we emit the legacy pair (reader v2 / writer v5, no lists). NOTE that
+        // this is NOT what Spark writes: measured against delta-spark 4.0.0, Spark emits a hybrid --
+        // reader 2 (legacy) with writer 7 and writerFeatures [columnMapping, invariants, appendOnly].
+        // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
+        // cosmetic, because writer v5's extra implied features only impose obligations on tables that
+        // actually declare a constraint or generated column, and HonorWriterFeatures already fails
+        // closed on those. See doc/upstream-landing-notes.md for the full measurement.
         if (columnMappingMode != ColumnMappingMode.None &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
