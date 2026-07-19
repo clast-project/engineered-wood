@@ -22,8 +22,8 @@ change diverges from the original PR.
 | 3 — Spec checkpoint content + tombstone DVs | `b41f5ad` | Preserve add.deletionVector/baseRowId/features/config, NULLABLE action structs, retained tombstones. **Added `remove.deletionVector` round-trip** beyond the PR. Row-tracking HWM reconciliation deliberately excluded (deferred to slice 5). |
 | 4 — Spec path encoding (`DeltaPath`) | `74bc1aa` | Hive-escaped partition dirs + URL-encoded `add.path`, decoded at every read site + vacuum. Hand-ported cross-cutting wiring. **See non-ASCII follow-up below.** |
 | 5 — writer features + protocol declaration | `cc8d6fe`, `c1b1474`, `70d2384`, `8e3fa8d` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. `70d2384`: declare schema-driven features (timestampNtz/identityColumns/columnMapping-in-v7) at `CreateAsync` + protocol upgrade on `AddColumnAsync`. `8e3fa8d`: `delta.rowTracking` HWM emission + `SnapshotBuilder` reconciliation. **Did NOT allowlist variantType/rowTracking** as supported features (need later slices). |
-| 8 (PARTIAL) — misc reader/DML correctness | `adc3b44`, `8cbf8d2`, `e025880`, `ebeb841`, `e83a232`, `d79abc7`, `1883f51`, `7bf3f6c` | Thrift wire-type guards (+ALP test gating; Parquet 585/585, was 573). Empty-page snappy stream. ListVersions ascending. S3 conditional rename. Row-filter type coverage. Nested stats end-to-end. TIME→Time64. DV-qualified removes + compaction DV exclusion. **See slice-8 leftovers below.** |
 | 6 — column mapping | `aa3f0e2`, `7a327f0`, `4754a72` | `aa3f0e2`: physical names in BOTH modes + new `ColumnMappingRecursive.ToPhysical/ToLogical` (nested struct children) + numeric `delta.columnMapping.id`. `7a327f0`: compaction re-stamps field ids & widens against the physical-named target schema. `4754a72`: `AddColumnAsync`/`RenameColumnAsync`/`DropColumnAsync` metadata-only + `SchemaEvolution.BackfillMissingColumns` read-path reconcile. **See slice-6 leftovers below.** |
+| 8 (PARTIAL) — misc reader/DML correctness | `adc3b44`, `8cbf8d2`, `e025880`, `ebeb841`, `e83a232`, `d79abc7`, `1883f51`, `7bf3f6c`, `e0567cb`, `4cd1f06` | Thrift wire-type guards (+ALP test gating; Parquet 585/585, was 573). Empty-page snappy stream. ListVersions ascending. S3 conditional rename. Row-filter type coverage. Nested stats end-to-end. TIME→Time64. DV-qualified removes + compaction DV exclusion. `DecimalOutputKind` read option. Always-on commitInfo + `GetHistoryAsync`. **See slice-8 leftovers below.** |
 
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
 TFMs. GOTCHA: `parquet-testing` is a git submodule — worktrees don't auto-populate it, and without it
@@ -44,22 +44,21 @@ deferred as refactor-/slice-6-coupled all landed once slice 6 supplied `AddColum
 - ~~Protocol-upgrade-on-ALTER~~ — `70d2384` (on `AddColumnAsync`; `SetSchemaAsync` still doesn't exist —
   see slice-6 leftovers).
 
-### Strategic decision pending for the remainder (slices 7–9)
+### Strategic decision pending for the remainder (slices 7 and 9)
 
 Slices 1–6 are landed piecemeal and fully tested, so the "foundation-first vs piecemeal" question is now
 only about 7–9 — and piecemeal has held up better than expected (slices 5 and 6 both landed without the
 `WriteCoreAsync` refactor). Options:
 
-1. **Continue piecemeal** — slice 8 is a bag of independent bug fixes and is the natural next unit; it
-   needs no refactor.
-2. **Foundation-first for 7+9** — the codec seam and row-level concurrency are the two that genuinely
+1. **Foundation-first for 7+9** — the codec seam and row-level concurrency are the two that genuinely
    want pr-4's `WriteCoreAsync` refactor underneath. Take it as a base commit before those.
-3. **Pause** — slices 1–6 are a coherent, high-value, fully-tested set (standalone spec/interop bug fixes,
-   safe writes to Spark tables, spec-correct column mapping + schema evolution). A defensible stopping point.
+2. **Pause** — slices 1–6 plus slice 8's independent fixes are a coherent, high-value, fully-tested set
+   (spec/interop bug fixes, safe writes to Spark tables, spec-correct column mapping + schema evolution,
+   a usable table history). A defensible stopping point.
 
-Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first), 8 (misc
-reader/DML: S3 conditional-write fix, ListVersions ascending sort, thrift wire-type guards, Decimal128
-reads, Time64, nested stats), 9 (row-level concurrency — **STRATEGIC**, most complex).
+Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first) and 9
+(row-level concurrency — **STRATEGIC**, most complex). Both want the refactor; everything separable from
+it has now landed. What remains of slice 8 is the OCC/conflict-checker material, which belongs with 9.
 
 ### Slice-6 leftovers (deliberately not landed)
 
@@ -81,10 +80,9 @@ reads, Time64, nested stats), 9 (row-level concurrency — **STRATEGIC**, most c
   `ParquetReadOptions.DecimalOutput` (`DecimalOutputKind.Default` | `.Decimal128`) makes the widening the
   caller's choice, so C-data-interface consumers get what they need without costing everyone else the
   physical-width fidelity. Delta callers reach it via `DeltaTableOptions.ParquetReadOptions`.
-- **`GetHistoryAsync`** and the always-on `commitInfo` on every commit path (OPTIMIZE's `operation:
-  OPTIMIZE`, VACUUM's `VACUUM START`/`VACUUM END` pair). Independent of the refactor; worth landing, just
-  not reached. Note `CompactionExecutor`'s commitInfo is a prerequisite for plain-table timestamp travel
-  through a compaction commit.
+- ~~`GetHistoryAsync` and the always-on `commitInfo`~~ — landed (`4cd1f06`), covering OPTIMIZE, the VACUUM
+  `START`/`END` pair, and CREATE TABLE (the last is beyond the PR — version 0 was left as the only silent
+  commit otherwise). Plain-table timestamp time travel now works.
 - **OCC retry-safe writes / `DeltaConflictException` plumbing** — entangled with slice 9's conflict
   checker; land with it.
 - Everything the PR files under slice 8 that is really slice 9: logical rebase (`CheckLogicalRebaseAsync`),
