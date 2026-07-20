@@ -49,8 +49,11 @@ What follows is the forward view; everything below this section is the chronolog
 5. **Layer 3 (B) — row-level concurrency across rewrites** (4 × `RowLevelConcurrency`:
    `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
    `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`, `BufferedFlow_…`). Deferred behind the
-   row-tracking write fail-fast; needs a spec-conformant row-tracking writer first
-   (`doc/row-tracking-conformance-brief.md`). `BufferedFlow_…` additionally needs #2.
+   row-tracking write fail-fast. **This is a PORT + VALIDATE, not greenfield**: `pr-4` already implements
+   row-tracking-through-rewrite + the remap (`RemapRowsAcrossRewriteAsync`); master lacks it because the
+   write-path refactor was landed refactor-only. Master's row tracking is read-only (#8). The work is: port
+   pr-4's writer/remap, ADD a `CreateAsync` enablement pr-4 lacks, and add the Spark validation pr-4 never had.
+   Full brief: `doc/row-tracking-conformance-brief.md`. `BufferedFlow_…` additionally needs #2.
 
 **Standalone bugs / interop gaps (still live, not parked)**
 
@@ -70,9 +73,11 @@ What follows is the forward view; everything below this section is the chronolog
    `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`; the fix to `DeltaPath.Encode` is **not applied**. Low
    urgency — delta-rs reads EW's literal form fine; it bites strict readers / byte comparisons and Spark
    parity.
-8. **Row tracking is read-only** (2026-07-20). A spec-conformant writer (materialized-column naming, id
-   preservation through rewrites, tier-3 Spark validation) is deferred and is the prerequisite for #5. Full
-   brief: `doc/row-tracking-conformance-brief.md`.
+8. **Row tracking is read-only on master** (2026-07-20). Writes to a `delta.enableRowTracking=true` table are
+   refused (`RejectRowTrackingWrite`) rather than silently corrupting it. Note master's brokenness is a landing
+   artifact — `pr-4` implements the rewrite writer + id preservation; it just wasn't taken (and has no interop
+   validation). Landing it (= #5's prerequisite) is port + enablement + Spark validation. Full brief:
+   `doc/row-tracking-conformance-brief.md`.
 
 **Resolved as "no action" (recorded so they are not re-litigated)**
 

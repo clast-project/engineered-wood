@@ -220,27 +220,31 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
 - **(B) Rewrite-preservation (UPDATE, compaction remap) — DEFERRED behind a write fail-fast (2026-07-20).**
-  **The full future-implementation brief is `doc/row-tracking-conformance-brief.md` — read that when building (B).**
-  Investigation found the foundation isn't there: EW's row tracking is **EW-internal and not spec-conformant**
-  — `ComputeUpdateActionsAsync` strips the internal row-id column and builds an `AddFile` with **no
-  `BaseRowId`/`DefaultRowCommitVersion`** (copy-on-write loses row ids); the write path materializes a
-  hardcoded non-spec `__delta_row_id` column (not the spec's metadata-named materialized column, no field id);
-  compaction only weakly re-assigns ids; and there is **no interop coverage at all**. There is also no
-  `CreateAsync` surface to enable row tracking — the only way to reach the write path is opening a foreign
-  (Spark/Databricks) row-tracking table, which is exactly where writing wrong would corrupt real invariants.
+  **The full brief is `doc/row-tracking-conformance-brief.md` — read that when building (B).**
+  **CORRECTION (2026-07-20): this is a PORT + VALIDATE, not greenfield.** The `pr-4` branch ALREADY implements
+  row-tracking-through-rewrite (the `RowTrackingWriter` materialization overloads, the `materializeIds` UPDATE/
+  DELETE/compaction paths keyed off `delta.rowTracking.materializedRowIdColumnName`, and the remap —
+  `RemapRowsAcrossRewriteAsync` inside `RebaseDvDmlActionsAsync`, its "v2"; "v1" == the DV re-union already
+  landed as Layer 3 (A)). pr-4's own tests are green. **Master lacks it only because the write-path refactor
+  was landed refactor-only (`808b944`), stripping the buffered-transaction/logical-rebase machinery — and the
+  row-tracking materialization went out with it.** So master's `ComputeUpdateActionsAsync` strips the row-id
+  column and builds an `AddFile` with **no `BaseRowId`/`DefaultRowCommitVersion`** (loses ids) — that is a
+  *landing artifact*, not pr-4's design. Two gaps remain even after a port: pr-4 **consumes** the
+  materialized-column metadata but never **generates** it (no `CreateAsync` enablement — handles a foreign
+  row-tracking table, can't create one), and pr-4 has **no interop coverage** (spec-conformance unproven). The
+  only way to reach master's write path is opening a foreign (Spark/Databricks) row-tracking table, exactly
+  where writing wrong would corrupt real invariants.
   **Decision (user):** rather than ship a half-built feature, make row tracking **READ-ONLY** — refuse any
   data-changing write to a `delta.enableRowTracking=true` table (`DeltaTable.RejectRowTrackingWrite`, gating
   `ValidateWritable` + `CompactAsync`, `NotSupportedException`). Reads are unaffected. This is strictly safer
   than the prior silent corruption. `RowTrackingTests`/`RowTrackingHighWaterMarkTests` reworked: write/compact
   paths assert the refusal; the read-side HWM-reconciliation test is preserved by seeding the log directly
   (`SeedTwoFileTableAsync`).
-  **When (B) is actually built** it needs, in order: spec-conformant row tracking (materialized-column naming
-  via `delta.rowTracking.materializedRowIdColumnName` metadata + field ids, stop writing the spurious column
-  for default-id files, tier-3 Spark validation of `baseRowId`/materialized artifacts); then rewrite-
-  preservation — UPDATE preserves row order + `baseRowId` (single-file, no materialized column needed;
-  positions stay stable, so the (A) resolver remaps by matching a removed file to its successor by `baseRowId`
-  range), compaction carries each surviving row's **original** id through a real materialized column; then
-  remap-by-row-id in the resolver + relax `rebaseSafe` for row-tracking deletes. Only then un-skip
+  **When (B) is actually built** (per the brief), in order: (1) port pr-4's rewrite-writer + remap onto
+  master's `CommitOccAsync`/`ResolveRowLevelDeletesAsync`; (2) ADD a `CreateAsync` enablement that generates
+  the materialized-column-name metadata (pr-4 lacks this); (3) tier-3 Spark/delta-rs validation of
+  `baseRowId`/materialized artifacts (pr-4 lacks this — highest risk); (4) relax `rebaseSafe` for row-tracking
+  deletes and lift the gate. Only then un-skip
   `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
   `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`. Closing (B) also retires **limitation 2**
   (`rebaseSafe: false` for row tracking).
