@@ -20,4 +20,59 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!--
+    Shared NuGet packaging metadata for every publishable library under src/.
+    Applied to all src projects; the non-library TestTool opts out with
+    <IsPackable>false</IsPackable> in its own csproj.
+
+    Version is 0.1.0 (preliminary). EngineeredWood is pre-1.0 and the public
+    API is explicitly unstable — the release notes and per-package descriptions
+    say so, and consumers are told to pin an exact version.
+  -->
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Authors>clast-project</Authors>
+    <Company>clast-project</Company>
+    <Product>EngineeredWood</Product>
+    <Copyright>Copyright (c) clast-project</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/clast-project/engineered-wood</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/clast-project/engineered-wood</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>arrow;parquet;orc;avro;lance;vortex;delta-lake;iceberg;columnar;analytics</PackageTags>
+    <PackageReleaseNotes>Preliminary 0.1.0 release. EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <!-- Pack the repository README into every package for the nuget.org listing. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <!--
+    Per-package descriptions, keyed on the project name (available before this
+    file is imported). Keeping them here avoids editing 15 csproj files; each
+    ends with the same pre-1.0 caveat that appears in the release notes.
+  -->
+  <PropertyGroup>
+    <_PreRelease>Preliminary 0.1.0 — APIs may change before 1.0.0.</_PreRelease>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Core'">Shared abstractions for EngineeredWood: offset-based (range-oriented) I/O, pure-managed compression (Snappy/Zstd/LZ4/Brotli), and Apache Arrow helpers. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Expressions'">Format-agnostic expression and predicate trees with a statistics evaluator, driving columnar predicate pushdown across EngineeredWood formats. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Expressions.Arrow'">Row-level evaluation of EngineeredWood expression trees against Apache Arrow RecordBatches, with full SQL three-valued null semantics. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Parquet'">A pure-managed Apache Parquet reader and writer for .NET that speaks Apache Arrow, with predicate pushdown, column statistics, and Bloom filters. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Orc'">A pure-managed Apache ORC reader and writer for .NET that speaks Apache Arrow. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Avro'">A pure-managed Apache Avro reader and writer for .NET (OCF plus SOE/Confluent/Apicurio streaming) that speaks Apache Arrow. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Lance'">A reader and writer for the Lance columnar file format (v2.0 / v2.1 / v2.2) that speaks Apache Arrow. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Lance.Table'">The Lance dataset/table API — manifests, fragments, time travel, and predicate-based delete/update — on top of EngineeredWood.Lance. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Vortex'">A reader, writer, and predicate-based zone-pruning API for the Vortex columnar file format that speaks Apache Arrow. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake'">A low-level Delta Lake transaction-log API for .NET — actions, checkpoints, and statistics for metadata consumers. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake.Table'">A high-level Delta Lake table API (Reader v3 / Writer v7) with Arrow read/write, deletion vectors, column mapping, and predicate pushdown. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Iceberg'">Apache Iceberg metadata (v1/v2/v3), manifest read/write, and predicate-aware scan planning for .NET (metadata-only). $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Azure'">Azure Blob Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Gcs'">Google Cloud Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Aws'">Amazon S3 I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
+  </PropertyGroup>
+
 </Project>

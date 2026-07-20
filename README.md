@@ -2,6 +2,12 @@
 
 A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, and **Vortex** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
+> **Status — preliminary (0.1.0).** EngineeredWood is pre-1.0 and under active
+> development. The published NuGet packages are versioned `0.1.0`, and
+> **every public API is subject to change — without notice and without a
+> deprecation cycle — until 1.0.0.** If you depend on a package, pin an exact
+> version. Feedback on the API surface is welcome while it's still malleable.
+
 ## Highlights
 
 - **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
@@ -862,6 +868,24 @@ benchmarks require .NET 8 or .NET 10 (some also run on `net472`).
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed guide to the source code, implementation choices, and internal structure.
+
+## Acknowledgements
+
+EngineeredWood stands on the shoulders of projects that showed what a
+well-built columnar library looks like:
+
+- [**arrow-rs**](https://github.com/apache/arrow-rs) — the reference for the
+  offset-based, range-oriented I/O model and columnar buffer management that
+  shape EngineeredWood's reader design.
+- [**hardwood**](https://github.com/hardwood-hq/hardwood) — a fast,
+  minimal-dependency implementation of Apache Parquet whose "few dependencies,
+  no native code" philosophy directly inspired EngineeredWood's pure-managed,
+  zero-native-dependency approach.
+
+The individual format and table-spec readers/writers are built from the public
+specifications and protobuf/Thrift/FlatBuffers definitions, and cross-validated
+against each ecosystem's reference tools — pyarrow, delta-rs, PySpark, pylance,
+and the Rust `vortex-array` crate among them.
 
 ## License
 

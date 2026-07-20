@@ -6,7 +6,7 @@ Nothing here has been acted on; `doc/upstream-landing-notes.md` still carries th
 
 ## Sources
 
-- cmettler's PR #4 thread (`https://github.com/CurtHagenlocher/engineered-wood/pull/4`), in particular
+- cmettler's PR #4 thread (`https://github.com/clast-project/engineered-wood/pull/4`), in particular
   the exchange of 2026-07-19.
 - The downstream consumer, published 2026-07-19: `https://github.com/cmettler/fabricator-extension`
   — a DuckDB extension hosting a C# bridge over CoreCLR. Its `docs/native-delta-write.md` (the design

@@ -1,7 +1,7 @@
 # Landing cmettler PR #4 — progress & remaining work
 
 Working notes for the effort to land Christoph Mettler's PR #4
-(`https://github.com/CurtHagenlocher/engineered-wood/pull/4`, branch `pr-4`, 55 commits,
+(`https://github.com/clast-project/engineered-wood/pull/4`, branch `pr-4`, 55 commits,
 ~9.7k additions) onto `master` **slice by slice**. The PR's own review decomposition is in
 `doc/upstream-candidates.md` on the `pr-4` branch (9 slices). Overall the PR is high quality —
 mostly spec-compliance / interop bug fixes validated against Spark 4.x, delta-kernel-rs and DuckDB;

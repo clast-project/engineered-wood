@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) Curt Hagenlocher. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 //
 // Minimal subset of lance-rs's protos/transaction.proto sufficient to
 // extract the index metadata we care about (CreateIndex operation).
