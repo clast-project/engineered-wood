@@ -13,6 +13,73 @@ cross-cutting thread) and committing as one focused change — not a clean cherr
 authored as Christoph Mettler with a `Co-Authored-By: Claude` trailer and a body note where the
 change diverges from the original PR.
 
+---
+
+## Remaining gaps at a glance (consolidated — as of 2026-07-20)
+
+The bulk of PR #4 has landed. Slices 1–8, 10, 11 are in (table below), and **slice 9** (the strategic
+optimistic-concurrency / row-level-concurrency thread) has since landed through **Layer 3 (A)** — see
+`doc/slice9-concurrency-resume.md` for that whole arc (ConflictChecker, `DeltaTransaction`, auto-committer
+OCC, analyzable-predicate DELETE/UPDATE, row-level DV union, and the opt-in deletion-vectors declaration).
+What follows is the forward view; everything below this section is the chronological landing record.
+
+**Open product decision**
+
+1. **Codec seam — keep-and-fix vs revert `9302723`.** `IDataFileWriter`/`IDataFileReader` shipped on
+   `DeltaTableOptions` with **no in-tree implementations** (only `CodecSeamTests`). Whether "engineered-wood
+   as a Delta metadata engine with a bring-your-own Parquet codec" is a story to support is unresolved. If
+   KEPT: fix the seam audit findings (`doc/codec-seam-investigation.md` §5.3–6 — `relativePath` encoding
+   contract, partition-directory-creation obligation, the load-bearing `PARQUET:field_id`/`ARROW:extension:*`
+   field-metadata contract, and partitioned `CodecSeamTests` coverage). **`IDataFileRewriter` (the *execution*
+   seam) was deliberately NOT landed** — it delegates DML semantics, not encoding, and cannot be honoured
+   without row-tracking-through-rewrite (now deferred, see #5/#8) and declines column-mapped/schema-evolved
+   files. The `ProcessFileBatchesAsync` extraction underneath is behaviour-preserving and stays either way.
+   Full framing: `doc/codec-seam-investigation.md` §6.
+
+**Deferred features (parked as skipped tests in `PendingCoverageTests.cs` — 17 total)**
+
+2. **Buffered multi-statement transaction seam** (10 × `BufferedTxn`). `WriteDataFilesAsync` /
+   `CommitDataFilesAsync` / the `Compute*` family / `ReadRowsByRowIdsAsync` / `ReconcileBatchToFields`, and
+   identity-value chaining across statements (a fused atomic ALTER+INSERT+DELETE at one version). Explicitly
+   **not needed for OCC correctness**; deferred.
+3. **`CommitDataFilesAsync(dataChange:, clusteringProvider:)` + the clustering rewrite-commit shape**
+   (1 × `CommitDataFiles`). `WrittenDataFile.Tags` → `add.tags`. Slice-10 leftover, **gated on #2**.
+4. **`SetSchemaAsync`** (2 × `SetSchema`). Adopt a whole incoming schema as a metadata-only commit (compute
+   drops+adds; no-op when logically identical). Slice-8 leftover, standalone.
+5. **Layer 3 (B) — row-level concurrency across rewrites** (4 × `RowLevelConcurrency`:
+   `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
+   `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`, `BufferedFlow_…`). Deferred behind the
+   row-tracking write fail-fast; needs a spec-conformant row-tracking writer first
+   (`doc/row-tracking-conformance-brief.md`). `BufferedFlow_…` additionally needs #2.
+
+**Standalone bugs / interop gaps (still live, not parked)**
+
+6. **CoW UPDATE writes to the wrong directory on partitioned tables.** `ComputeUpdateActionsAsync`
+   (`DeltaTable.cs:1683`) builds the rewrite filename as a bare `{Guid:N}.parquet` with **no partition
+   subdirectory**, while its `add` carries `PartitionValues` and the append path uses
+   `PartitionUtils.BuildPartitionPath`. Pre-existing, present in the built-in branch too, **no test**.
+   Concrete and fixable now, independent of every decision above.
+7. **Non-ASCII characters left literal in `add.path`** (Deferred follow-up B). Research DONE — the reference
+   encoding is two-layer (Hive-escape then percent-encode), pinned by
+   `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`; the fix to `DeltaPath.Encode` is **not applied**. Low
+   urgency — delta-rs reads EW's literal form fine; it bites strict readers / byte comparisons and Spark
+   parity.
+8. **Row tracking is read-only** (2026-07-20). A spec-conformant writer (materialized-column naming, id
+   preservation through rewrites, tier-3 Spark validation) is deferred and is the prerequisite for #5. Full
+   brief: `doc/row-tracking-conformance-brief.md`.
+
+**Resolved as "no action" (recorded so they are not re-litigated)**
+
+- **Column-mapping protocol shape** (EW's legacy v2/v5 vs Spark's v2/writer-7 hybrid) — measured; recommend
+  **leave it alone** (Spark reads EW's form; v3/v7 is strictly worse; delta-rs can't read column mapping
+  either way). See "Column-mapping protocol shape" below.
+- **Variant registration "bug"** — investigated and RETRACTED; EW fails closed. Variant is now a shipped
+  feature (`VariantTests` / `VariantInteropTests`).
+- **pr-4's `CheckpointReader` / `CompactionExecutor`** — deliberately NOT taken; they regress landed fixes
+  (slice-3 `remove.deletionVector`, slice-4 path encoding). Never take wholesale.
+
+---
+
 ## Landed on master (as of 2026-07-18)
 
 | Slice | Commit(s) | Notes |
