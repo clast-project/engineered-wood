@@ -391,13 +391,5 @@ public sealed class TableOperations
             : 0;
     }
 
-    private static long GenerateSnapshotId()
-    {
-        return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000
-#if NET6_0_OR_GREATER
-            + Random.Shared.Next(1000);
-#else
-            + new Random().Next(1000);
-#endif
-    }
+    private static long GenerateSnapshotId() => SnapshotIdFactory.Generate();
 }

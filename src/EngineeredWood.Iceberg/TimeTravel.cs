@@ -88,12 +88,7 @@ public static class TimeTravel
             throw new InvalidOperationException("Cannot cherry-pick into a table with no current snapshot");
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var newSnapshotId = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000
-#if NET6_0_OR_GREATER
-            + Random.Shared.Next(1000);
-#else
-            + new Random().Next(1000);
-#endif
+        var newSnapshotId = SnapshotIdFactory.Generate();
 
         var cherryPicked = new Snapshot(
             SnapshotId: newSnapshotId,
