@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
@@ -376,5 +377,114 @@ public class ArrowRowEvaluatorTests
             batch);
 
         Assert.Equal([false, true, false], ToList(r));
+    }
+
+    // ── Date / timestamp / decimal columns ──
+
+    private static readonly DateTime Utc1970 = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    private static RecordBatch Date32Column(string name, params DateTime?[] dates)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field(name, Date32Type.Default, true)).Build();
+        var b = new Date32Array.Builder();
+        foreach (var d in dates)
+        {
+            if (d.HasValue) b.Append(DateTime.SpecifyKind(d.Value, DateTimeKind.Utc));
+            else b.AppendNull();
+        }
+        return new RecordBatch(schema, [b.Build()], dates.Length);
+    }
+
+    private static RecordBatch TimestampColumn(string name, params DateTimeOffset?[] values)
+    {
+        var type = new TimestampType(TimeUnit.Microsecond, "UTC");
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field(name, type, true)).Build();
+        var b = new TimestampArray.Builder(type);
+        foreach (var v in values)
+        {
+            if (v.HasValue) b.Append(v.Value);
+            else b.AppendNull();
+        }
+        return new RecordBatch(schema, [b.Build()], values.Length);
+    }
+
+    // Builds a decimal column directly from unscaled integers so both in-range and beyond-System.Decimal
+    // (high-precision) values can be placed; mirrors the raw little-endian two's-complement layout the
+    // format writers use.
+    private static RecordBatch Decimal128Column(
+        string name, int precision, int scale, params BigInteger?[] unscaled)
+    {
+        var type = new Decimal128Type(precision, scale);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field(name, type, true)).Build();
+        const int w = 16;
+        var bytes = new byte[unscaled.Length * w];
+        var nulls = new ArrowBuffer.BitmapBuilder();
+        int nullCount = 0;
+        for (int i = 0; i < unscaled.Length; i++)
+        {
+            if (unscaled[i] is null) { nulls.Append(false); nullCount++; continue; }
+            nulls.Append(true);
+            var bi = unscaled[i]!.Value;
+            var dest = bytes.AsSpan(i * w, w);
+            dest.Fill(bi.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+            bi.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+            var bb = bi.ToByteArray();
+            bb.AsSpan(0, Math.Min(bb.Length, w)).CopyTo(dest);
+#endif
+        }
+        var data = new ArrayData(type, unscaled.Length, nullCount, 0,
+            [nulls.Build(), new ArrowBuffer(bytes)]);
+        return new RecordBatch(schema, [new Decimal128Array(data)], unscaled.Length);
+    }
+
+    [Fact]
+    public void DateColumn_ComparedWithDateTimeOffsetLiteral()
+    {
+        var batch = Date32Column("d",
+            new DateTime(2021, 1, 1), new DateTime(2021, 6, 1), new DateTime(2021, 12, 31), null);
+        var r = Eval.EvaluatePredicate(
+            Ex.GreaterThan("d", new DateTimeOffset(2021, 3, 1, 0, 0, 0, TimeSpan.Zero)), batch);
+        Assert.Equal([false, true, true, null], ToList(r));
+    }
+
+    [Fact]
+    public void TimestampColumn_ComparedWithDateTimeOffsetLiteral()
+    {
+        var batch = TimestampColumn("ts",
+            new DateTimeOffset(2024, 1, 15, 10, 30, 0, TimeSpan.Zero),
+            new DateTimeOffset(2024, 6, 20, 14, 45, 30, TimeSpan.Zero),
+            null);
+        var r = Eval.EvaluatePredicate(
+            Ex.GreaterThanOrEqual("ts", new DateTimeOffset(2024, 6, 1, 0, 0, 0, TimeSpan.Zero)), batch);
+        Assert.Equal([false, true, null], ToList(r));
+    }
+
+    [Fact]
+    public void DecimalColumn_InRange_ComparedWithDecimalLiteral()
+    {
+        var batch = Decimal128Column("amt", 10, 2, 1234, 5678, null); // 12.34, 56.78, null
+        var r = Eval.EvaluatePredicate(Ex.GreaterThan("amt", 20m), batch);
+        Assert.Equal([false, true, null], ToList(r));
+    }
+
+    [Fact]
+    public void DecimalColumn_HighPrecision_ExceedsSystemDecimal()
+    {
+        // decimal(38,0): 10^30 overflows System.Decimal and must round-trip via BigInteger; 50 fits.
+        var huge = BigInteger.Pow(10, 30);
+        var batch = Decimal128Column("big", 38, 0, huge, 50);
+        var r = Eval.EvaluatePredicate(Ex.GreaterThan("big", 100m), batch);
+        Assert.Equal([true, false], ToList(r));
+    }
+
+    [Fact]
+    public void DecimalColumn_ComparedWithIntegerLiteral()
+    {
+        var batch = Decimal128Column("amt", 10, 2, 500, 1500); // 5.00, 15.00
+        var r = Eval.EvaluatePredicate(Ex.GreaterThan("amt", 10), batch); // int literal
+        Assert.Equal([false, true], ToList(r));
     }
 }

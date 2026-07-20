@@ -249,6 +249,47 @@ public class LiteralValueTests
         Assert.Equal(0, a.CompareTo(b));
     }
 
+    // ── Cross-type: decimal / high-precision decimal / integer ──
+
+    [Fact]
+    public void Compare_Decimal_Vs_HighPrecisionDecimal()
+    {
+        // A plain decimal literal against a high-precision decimal column value (10^30, scale 0).
+        var small = LiteralValue.Of(100m);
+        var huge = LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 30), 0);
+        Assert.True(small.CompareTo(huge) < 0);
+        Assert.True(huge.CompareTo(small) > 0);
+    }
+
+    [Fact]
+    public void Compare_Decimal_Vs_HighPrecisionDecimal_Equal()
+    {
+        // 12.34 as System.Decimal vs the same value as unscaled 1234 * 10^-2.
+        Assert.Equal(0, LiteralValue.Of(12.34m).CompareTo(
+            LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse("1234"), 2)));
+    }
+
+    [Fact]
+    public void Compare_Integer_Vs_Decimal_Exact()
+    {
+        // 10 (int) vs 5.00 / 15.00 (decimal) — exact, not via lossy double.
+        Assert.True(((LiteralValue)10).CompareTo(LiteralValue.Of(5.00m)) > 0);
+        Assert.True(((LiteralValue)10).CompareTo(LiteralValue.Of(15.00m)) < 0);
+        Assert.Equal(0, ((LiteralValue)10).CompareTo(LiteralValue.Of(10m)));
+    }
+
+#if NET6_0_OR_GREATER
+    [Fact]
+    public void Compare_DateOnly_Vs_DateTimeOffset_AsUtcMidnight()
+    {
+        var date = LiteralValue.Of(new DateOnly(2021, 6, 1));
+        var midnight = LiteralValue.Of(new DateTimeOffset(2021, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        var later = LiteralValue.Of(new DateTimeOffset(2021, 6, 1, 12, 0, 0, TimeSpan.Zero));
+        Assert.Equal(0, date.CompareTo(midnight));
+        Assert.True(date.CompareTo(later) < 0);
+    }
+#endif
+
     // ── Operators ──
 
     [Fact]

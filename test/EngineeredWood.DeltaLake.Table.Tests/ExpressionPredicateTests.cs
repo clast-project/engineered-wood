@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake;
@@ -202,5 +203,134 @@ public class ExpressionPredicateTests : IDisposable
         await tx1.CommitAsync(); // rebases past tx2 — different file, no conflict
 
         Assert.Empty(await ReadRows(table));
+    }
+
+    // ── Temporal + decimal column predicates, end to end through Delta ──
+
+    private static Apache.Arrow.Schema IdAmountSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("amt", new Decimal128Type(12, 2), false))
+        .Build();
+
+    private static RecordBatch AmountBatch(long[] ids, decimal[] amounts)
+    {
+        var idArray = new Int64Array.Builder().AppendRange(ids).Build();
+        const int width = 16;
+        var bytes = new byte[amounts.Length * width];
+        for (int i = 0; i < amounts.Length; i++)
+        {
+            var unscaled = new BigInteger(amounts[i] * 100m); // scale 2
+            var dest = bytes.AsSpan(i * width, width);
+            dest.Fill(unscaled.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+            unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+            var bb = unscaled.ToByteArray();
+            bb.AsSpan(0, Math.Min(bb.Length, width)).CopyTo(dest);
+#endif
+        }
+        var data = new ArrayData(new Decimal128Type(12, 2), amounts.Length, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(bytes)]);
+        return new RecordBatch(IdAmountSchema, [idArray, new Decimal128Array(data)], ids.Length);
+    }
+
+    private static async Task<List<long>> ReadIds(DeltaTable table)
+    {
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var col = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                ids.Add(col.GetValue(i)!.Value);
+        }
+        ids.Sort();
+        return ids;
+    }
+
+    /// <summary>A DELETE whose predicate is over a decimal column runs end to end: the predicate is
+    /// evaluated per row against the Decimal128 column read back from the data file.</summary>
+    [Fact]
+    public async Task DeleteByDecimalPredicate_EndToEnd()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema);
+        await table.WriteAsync([AmountBatch([1, 2, 3], [12.34m, 56.78m, 5.00m])]);
+
+        var (deleted, _) = await table.DeleteAsync(Ex.GreaterThan("amt", 20m));
+
+        Assert.Equal(1, deleted); // only 56.78 > 20
+        Assert.Equal([1L, 3L], await ReadIds(table));
+    }
+
+    private static Apache.Arrow.Schema IdDateSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("d", Date32Type.Default, false))
+        .Build();
+
+    private static RecordBatch DateBatch(long[] ids, DateTime[] dates)
+    {
+        var idArray = new Int64Array.Builder().AppendRange(ids).Build();
+        var b = new Date32Array.Builder();
+        foreach (var d in dates)
+            b.Append(DateTime.SpecifyKind(d, DateTimeKind.Utc));
+        return new RecordBatch(IdDateSchema, [idArray, b.Build()], ids.Length);
+    }
+
+    /// <summary>A DELETE whose predicate is over a date column, evaluated as UTC-midnight instants.</summary>
+    [Fact]
+    public async Task DeleteByDatePredicate_EndToEnd()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema);
+        await table.WriteAsync([DateBatch(
+            [1, 2, 3],
+            [new DateTime(2021, 1, 1), new DateTime(2021, 6, 1), new DateTime(2021, 12, 31)])]);
+
+        var (deleted, _) = await table.DeleteAsync(
+            Ex.GreaterThanOrEqual("d", new DateTimeOffset(2021, 6, 1, 0, 0, 0, TimeSpan.Zero)));
+
+        Assert.Equal(2, deleted); // 2021-06-01 and 2021-12-31
+        Assert.Equal([1L], await ReadIds(table));
+    }
+
+    private static Apache.Arrow.Schema IdTsSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("ts", new TimestampType(TimeUnit.Microsecond, "UTC"), false))
+        .Build();
+
+    private static RecordBatch TsBatch(long[] ids, DateTimeOffset[] timestamps)
+    {
+        var idArray = new Int64Array.Builder().AppendRange(ids).Build();
+        var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        foreach (var t in timestamps)
+            b.Append(t);
+        return new RecordBatch(IdTsSchema, [idArray, b.Build()], ids.Length);
+    }
+
+    /// <summary>
+    /// End-to-end precision for a temporal predicate: a Serializable transaction deletes
+    /// <c>ts &gt;= June</c>; a concurrent append of a January row lands first. The appended file's
+    /// timestamp statistics prove it holds nothing at or after June, so it does not match the delete's
+    /// recorded read predicate — no conflict, the delete rebases and lands. This exercises the whole
+    /// chain: timestamp row evaluation, timestamp stats decoding, and the checker's predicate match.
+    /// </summary>
+    [Fact]
+    public async Task Serializable_ConcurrentTimestampAppendDisjoint_Lands()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdTsSchema);
+        await table.WriteAsync([TsBatch([1], [new DateTimeOffset(2024, 6, 15, 0, 0, 0, TimeSpan.Zero)])]);
+
+        var tx = table.StartTransaction(IsolationLevel.Serializable);
+        long matched = await tx.DeleteAsync(
+            Ex.GreaterThanOrEqual("ts", new DateTimeOffset(2024, 6, 1, 0, 0, 0, TimeSpan.Zero)));
+        Assert.Equal(1, matched);
+
+        // Concurrent append of a January row — provably before June by its stats.
+        await table.WriteAsync([TsBatch([2], [new DateTimeOffset(2024, 1, 10, 0, 0, 0, TimeSpan.Zero)])]);
+
+        await tx.CommitAsync(); // no conflict — the append cannot satisfy ts >= June
+
+        Assert.Equal([2L], await ReadIds(table)); // id 1 (June) deleted, id 2 (January) survives
     }
 }

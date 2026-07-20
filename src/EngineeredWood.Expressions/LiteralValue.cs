@@ -355,9 +355,84 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         if (TryAsDouble(a, out double ad) && TryAsDouble(b, out double bd))
             return ad.CompareTo(bd);
 
+        // Exact decimal comparison across Decimal / HighPrecisionDecimal (and integers), so a plain
+        // decimal literal compares against a high-precision decimal column value, and vice versa, without
+        // going through lossy double. Two same-kind values never reach here (handled above); this path is
+        // for the mixed pairs. Float/double are deliberately excluded — that would be a lossy compare.
+        if (TryAsScaledInteger(a, out var au, out int asc) && TryAsScaledInteger(b, out var bu, out int bsc))
+            return CompareScaledIntegers(au, asc, bu, bsc);
+
+#if NET6_0_OR_GREATER
+        // A calendar date (DateOnly) compares against an instant (DateTimeOffset) as UTC midnight —
+        // consistent with how date columns are surfaced as UTC-midnight DateTimeOffset values.
+        if (TryAsInstant(a, out var ax) && TryAsInstant(b, out var bx))
+            return ax.CompareTo(bx);
+#endif
+
         throw new InvalidOperationException(
             $"Cannot compare LiteralValue of kind {a._kind} with kind {b._kind}.");
     }
+
+    // Views a value as an exact (unscaledValue × 10^-scale) integer: integers (scale 0), System.Decimal,
+    // or a high-precision decimal. Excludes float/double (inexact) and everything non-numeric.
+    private static bool TryAsScaledInteger(LiteralValue v, out BigInteger unscaled, out int scale)
+    {
+        switch (v._kind)
+        {
+            case Kind.Int32: unscaled = v._inline.Int32; scale = 0; return true;
+            case Kind.Int64: unscaled = v._inline.Int64; scale = 0; return true;
+            case Kind.UInt32: unscaled = v._inline.UInt32; scale = 0; return true;
+            case Kind.UInt64: unscaled = v._inline.UInt64; scale = 0; return true;
+            case Kind.Decimal: (unscaled, scale) = DecimalToUnscaled((decimal)v._ref!); return true;
+            case Kind.HighPrecisionDecimal: unscaled = (BigInteger)v._ref!; scale = v._inline.Int32; return true;
+        }
+        unscaled = default;
+        scale = 0;
+        return false;
+    }
+
+    private static (BigInteger Unscaled, int Scale) DecimalToUnscaled(decimal value)
+    {
+        int[] bits = decimal.GetBits(value);
+        int scale = (bits[3] >> 16) & 0x7F;
+        bool negative = (bits[3] & unchecked((int)0x80000000)) != 0;
+        var magnitude = (new BigInteger((uint)bits[2]) << 64)
+            | (new BigInteger((uint)bits[1]) << 32)
+            | new BigInteger((uint)bits[0]);
+        return (negative ? -magnitude : magnitude, scale);
+    }
+
+    private static int CompareScaledIntegers(BigInteger au, int ascale, BigInteger bu, int bscale)
+    {
+        if (ascale == bscale)
+            return au.CompareTo(bu);
+
+        int diff = ascale - bscale;
+        if (diff > 0)
+            bu *= BigInteger.Pow(10, diff);
+        else
+            au *= BigInteger.Pow(10, -diff);
+
+        return au.CompareTo(bu);
+    }
+
+#if NET6_0_OR_GREATER
+    private static bool TryAsInstant(LiteralValue v, out DateTimeOffset instant)
+    {
+        switch (v._kind)
+        {
+            case Kind.DateTimeOffset:
+                instant = v.AsDateTimeOffset;
+                return true;
+            case Kind.DateOnly:
+                var d = v._inline.DateOnly;
+                instant = new DateTimeOffset(d.Year, d.Month, d.Day, 0, 0, 0, TimeSpan.Zero);
+                return true;
+        }
+        instant = default;
+        return false;
+    }
+#endif
 
     private static bool TryAsInt64(LiteralValue v, out long result)
     {
@@ -400,18 +475,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     {
         var (au, ascale) = a.AsHighPrecisionDecimal;
         var (bu, bscale) = b.AsHighPrecisionDecimal;
-
-        if (ascale == bscale)
-            return au.CompareTo(bu);
-
-        // Rescale to common scale
-        int diff = ascale - bscale;
-        if (diff > 0)
-            bu *= BigInteger.Pow(10, diff);
-        else
-            au *= BigInteger.Pow(10, -diff);
-
-        return au.CompareTo(bu);
+        return CompareScaledIntegers(au, ascale, bu, bscale);
     }
 
     public static bool operator <(LiteralValue left, LiteralValue right) => left.CompareTo(right) < 0;

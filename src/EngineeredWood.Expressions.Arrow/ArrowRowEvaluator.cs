@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
@@ -335,6 +336,47 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     else result[i] = LiteralValue.Of(a.GetBytes(i).ToArray());
                 }
                 break;
+            // Temporal + decimal columns map to the SAME LiteralValue kinds a stats/JSON decoder would
+            // produce for the corresponding logical types (DateTimeOffset for date and timestamp; decimal
+            // or high-precision decimal for decimal), so a predicate literal compares identically whether
+            // it is tested against a per-row column value here or against file statistics elsewhere.
+            case Date32Array a:
+                // Date32 = days since the Unix epoch; a calendar date is UTC midnight of that day.
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null
+                        : (LiteralValue?)LiteralValue.Of(Epoch.AddDays(a.GetValue(i)!.Value));
+                break;
+            case Date64Array a:
+                // Date64 = milliseconds since the Unix epoch (a whole number of days per the Arrow spec).
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null
+                        : (LiteralValue?)LiteralValue.Of(Epoch.AddMilliseconds(a.GetValue(i)!.Value));
+                break;
+            case TimestampArray a:
+                // GetTimestamp honours the column's unit and timezone, yielding the instant as a
+                // DateTimeOffset (UTC) — the same instant the stats decoder recovers from the ISO string.
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null
+                        : (LiteralValue?)LiteralValue.Of(a.GetTimestamp(i)!.Value);
+                break;
+            // Decimal32/64 (precision <= 18) always fit System.Decimal, so no high-precision path is
+            // needed; a reader may narrow a small-precision decimal column to one of these.
+            case Decimal32Array a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetValue(i)!.Value);
+                break;
+            case Decimal64Array a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetValue(i)!.Value);
+                break;
+            case Decimal128Array a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)DecimalLiteral(a, i);
+                break;
+            case Decimal256Array a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)DecimalLiteral(a, i);
+                break;
             default:
                 throw new NotSupportedException(
                     $"Cannot evaluate over Arrow array of type {array.Data.DataType.Name}.");
@@ -477,4 +519,41 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         LiteralValue.Kind.Double => double.IsNaN(v.AsDouble),
         _ => false,
     };
+
+    private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    // A decimal column value: the common in-range case as System.Decimal (how a decimal literal and a
+    // stats decoder also represent it); a value that overflows System.Decimal falls back to its exact
+    // unscaled BigInteger plus the column's scale, read straight from the fixed-width little-endian value
+    // buffer — the same raw layout the format writers use.
+    private static LiteralValue DecimalLiteral(Decimal128Array a, int index)
+    {
+        try { return LiteralValue.Of(a.GetValue(index)!.Value); }
+        catch (OverflowException)
+        {
+            int scale = ((Decimal128Type)a.Data.DataType).Scale;
+            return LiteralValue.HighPrecisionDecimalOf(
+                ToBigInteger(a.ValueBuffer.Span.Slice(index * 16, 16)), scale);
+        }
+    }
+
+    private static LiteralValue DecimalLiteral(Decimal256Array a, int index)
+    {
+        try { return LiteralValue.Of(a.GetValue(index)!.Value); }
+        catch (OverflowException)
+        {
+            int scale = ((Decimal256Type)a.Data.DataType).Scale;
+            return LiteralValue.HighPrecisionDecimalOf(
+                ToBigInteger(a.ValueBuffer.Span.Slice(index * 32, 32)), scale);
+        }
+    }
+
+    private static BigInteger ToBigInteger(ReadOnlySpan<byte> littleEndianTwosComplement)
+    {
+#if NET6_0_OR_GREATER
+        return new BigInteger(littleEndianTwosComplement, isUnsigned: false, isBigEndian: false);
+#else
+        return new BigInteger(littleEndianTwosComplement.ToArray());
+#endif
+    }
 }
