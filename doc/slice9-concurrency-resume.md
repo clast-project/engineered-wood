@@ -220,6 +220,7 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
 - **(B) Rewrite-preservation (UPDATE, compaction remap) — DEFERRED behind a write fail-fast (2026-07-20).**
+  **The full future-implementation brief is `doc/row-tracking-conformance-brief.md` — read that when building (B).**
   Investigation found the foundation isn't there: EW's row tracking is **EW-internal and not spec-conformant**
   — `ComputeUpdateActionsAsync` strips the internal row-id column and builds an `AddFile` with **no
   `BaseRowId`/`DefaultRowCommitVersion`** (copy-on-write loses row ids); the write path materializes a

@@ -341,7 +341,8 @@ reconciled on read (`RowTracking/RowTrackingConfig.cs`). A spec-conformant
 writer (materialized-column naming via metadata, id preservation through
 rewrites, tier-3 Spark validation) is the deferred **Layer 3 (B)** work; it
 is also the prerequisite for row-tracking optimistic-concurrency rebase (the
-`rebaseSafe: false` limitation). There is also no `CreateAsync` surface to
+`rebaseSafe: false` limitation). Full future-implementation brief:
+`doc/row-tracking-conformance-brief.md`. There is also no `CreateAsync` surface to
 ENABLE row tracking — the only way to reach a row-tracking table is opening
 one a foreign engine created.
 
