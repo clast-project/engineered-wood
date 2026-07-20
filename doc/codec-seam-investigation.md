@@ -244,4 +244,67 @@ deliberately rather than on the assumption that variant was the whole story. `93
 commit to revert; the `ProcessFileBatchesAsync` extraction underneath is behaviour-preserving and should
 be **kept either way**.
 
-Either way, fix (1) — it is a silent data-integrity bug with no bearing on the API question.
+Either way, the standalone items that survive the decision are the codec-seam contract obligations in
+§5.3–6 (both framings keep reader+writer); §5.1 was retracted (no bug), §5.1a and §5.2 are fixed.
+
+## 7. A more consistent split — two framings, and where the rewriter earns its keep
+
+*A recommendation to weigh, **not** the recommendation. The abstraction-level mismatch below is real, but
+which resolution is right turns on a question this document cannot settle: **who owns query execution.***
+
+**The observation.** `IDataFileReader`/`IDataFileWriter` sit at the CODEC level (Arrow batch ⇄ parquet
+bytes). `IDataFileRewriter` sits at the EXECUTION level — it runs the DELETE filter / UPDATE substitution in
+DuckDB SQL (`read_parquet(… file_row_number) WHERE file_row_number NOT IN (…)`, a `LEFT JOIN` for UPDATE).
+Two levels in one seam. Whether that is an *inconsistency* depends entirely on which boundary you think the
+seam draws.
+
+**Framing 1 — the seam is "parquet serialization" (codec).** Then the rewriter is the odd one out, and the
+consistent split is: keep reader+writer, **drop the rewriter**, and model the remaining true rewrites
+(copy-on-write UPDATE on non-DV tables; per-file compaction) as **read → transform-in-EW → write**. Every
+seam becomes bytes↔batches; EW owns all DML semantics, which also deletes the rewriter's column-mapping /
+schema-evolution / row-tracking-through-rewrite coupling. Grounded: DV is the DEFAULT DML mode downstream, so
+the rewriter is already off the default path (a DV DELETE writes only a bitmap; UPDATE is merge-on-read), and
+the highest-value native rewrite — clustered OPTIMIZE with a whole-query `ORDER BY` — already runs OUTSIDE
+the interface. What you give up is DuckDB executing the DML transform in SQL — which is exactly what made the
+seam an execution seam. **This framing assumes EW is the DML front-end** (a C# caller supplies the
+predicate/updater as delegates).
+
+**Framing 2 — the seam is "compute + bulk IO" (DuckDB is the query engine).** Then reader (DuckDB scans),
+writer (DuckDB encodes) and rewriter (DuckDB transforms) are ALL "DuckDB does compute; EW owns `_delta_log` +
+DV bitmaps + stats + OCC" — consistent along the OWNERSHIP axis, differing only in data shape
+(batch / batch / operation). Here the rewriter is not an anomaly; it is the DML member of a compute seam, and
+you would expect MORE execution entry points, not fewer. **This framing assumes DuckDB is the DML front-end**
+(users write SQL against Delta tables; the extension is DuckDB-native) — which is what fabricator actually is.
+
+**Where the execution seam solves something genuinely hard in EW — the deciding case: joins and MERGE.**
+This is the test that separates the framings, because it is where "transform-in-EW" stops being a pure
+per-row function and becomes a *relational* computation against data EW does not have:
+
+- **Read-side joins** (`SELECT … FROM delta JOIN duck_table …`) are clean under either framing: DuckDB scans
+  the Delta table (file list + DV positions from EW) and joins in DuckDB. No rewrite; the codec reader suffices.
+- **Write-side joins / MERGE** are the hard case. `UPDATE delta SET x = d.y FROM duck_table d WHERE
+  delta.k = d.k`, or a full `MERGE … WHEN MATCHED UPDATE/DELETE WHEN NOT MATCHED INSERT`, derives the new
+  values (and the matched set) from a JOIN against another table. Under **Framing 1**, EW would have to pull
+  the source table into Arrow and run the join **in C#** — a spilling hash-join executor EW does not have and
+  should not grow; it would be re-implementing DuckDB. Under **Framing 2** the rewriter is the natural
+  vehicle: DuckDB evaluates the join / `SET` expression (against any DuckDB table, subquery, function or UDF),
+  keys the new values by transient rowid, and the rewrite applies them — exactly the `LEFT JOIN against
+  (position → new SET values)` shape fabricator already uses. MERGE composes from the three seams the host
+  orchestrates: matched-update via the rewriter, not-matched-insert via the writer, matched-delete via a DV.
+
+  The general principle: **the execution seam earns its keep exactly when the DML transform is a query, not a
+  pure function of the source row** — joins, MERGE, correlated subqueries, SQL/UDF-rich `SET`/`WHERE`,
+  aggregation-derived updates. A codec-only seam can only carry transforms EW can express as a delegate; once
+  the front-end is SQL, re-hosting those semantics in EW is a non-goal.
+
+**So the decision is really: who owns query execution for DML?** If EW is (or should stay) the DML
+front-end, Framing 1 (codec-only) is cleaner and smaller, and joins/MERGE are simply out of scope. If a
+DuckDB-fronted Delta table that participates in joins and MERGE against DuckDB tables is a capability worth
+having, Framing 2 is the architecture, the rewriter is consistent within it, and "a more consistent split"
+means *naming the compute-vs-metadata boundary and expecting execution entry points* — not collapsing to
+codec. The mismatch this section opened with is a mismatch only under Framing 1; under Framing 2 it dissolves.
+
+Either framing keeps the §5.3–6 codec obligations, and either can ship without the rewriter *today* — Framing
+1 permanently, Framing 2 until join/MERGE DML is actually wanted. What should NOT happen is keeping the
+rewriter as-is while *assuming* Framing 1: that is the abstraction-level mismatch with no owning story, which
+is the state this section exists to flag.

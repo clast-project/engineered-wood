@@ -34,7 +34,8 @@ What follows is the forward view; everything below this section is the chronolog
    seam) was deliberately NOT landed** — it delegates DML semantics, not encoding, and cannot be honoured
    without row-tracking-through-rewrite (now deferred, see #5/#8) and declines column-mapped/schema-evolved
    files. The `ProcessFileBatchesAsync` extraction underneath is behaviour-preserving and stays either way.
-   Full framing: `doc/codec-seam-investigation.md` §6.
+   Full framing: `doc/codec-seam-investigation.md` §6, and §7 (a two-framing recommendation — codec-only vs a
+   DuckDB-owns-compute seam — turning on whether join/MERGE DML against DuckDB tables is a wanted capability).
 
 **Deferred features (parked as skipped tests in `PendingCoverageTests.cs` — 17 total)**
 
