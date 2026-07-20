@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace EngineeredWood.Expressions.Arrow;
 
@@ -22,11 +23,24 @@ public interface IRowEvaluator
 
     /// <summary>
     /// Evaluates a value expression against every row. The returned array's
-    /// type depends on the expression kind: column references return the
+    /// type is inferred from the values: column references return the
     /// underlying column, literals return a constant array, function calls
-    /// return whatever the registered function produces.
+    /// return whatever the registered function produces. Value kinds whose
+    /// Arrow type cannot be reconstructed from the value alone (decimal,
+    /// timestamp, date, unsigned integers) are not supported by this overload —
+    /// use <see cref="EvaluateExpression(Expression, RecordBatch, IArrowType)"/>.
     /// </summary>
     IArrowArray EvaluateExpression(Expression expression, RecordBatch batch);
+
+    /// <summary>
+    /// Evaluates a value expression against every row and materializes it as
+    /// <paramref name="targetType"/>. Supplying the target Arrow type resolves
+    /// the metadata a bare value cannot carry — a decimal's precision/scale and
+    /// physical width, a timestamp's unit and timezone, date vs timestamp — so
+    /// decimal, timestamp and date results (in addition to the inferrable
+    /// primitives) can be produced faithfully.
+    /// </summary>
+    IArrowArray EvaluateExpression(Expression expression, RecordBatch batch, IArrowType targetType);
 }
 
 /// <summary>

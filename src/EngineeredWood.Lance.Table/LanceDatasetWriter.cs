@@ -829,9 +829,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// version returned).</para>
     ///
     /// <para><b>Scope</b>: schemas of leaf columns only — primitives
-    /// (int / uint / float / double / etc.), strings, binary, and bool.
-    /// Nested types (struct / list / FSL / map) in the schema cause an
-    /// <see cref="NotSupportedException"/> because the row-by-row take
+    /// (int / uint / float / double), strings, binary, bool, date, timestamp,
+    /// and decimal. Nested types (struct / list / FSL / map) in the schema
+    /// cause an <see cref="NotSupportedException"/> because the row-by-row take
     /// helper only handles leaf shapes today.</para>
     /// </summary>
     public static async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
@@ -921,7 +921,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             foreach (var kv in assignments)
             {
                 int colIdx = nameToIdx[kv.Key];
-                assignedArrays[colIdx] = evaluator.EvaluateExpression(kv.Value, batch);
+                // Supply the target column's Arrow type so a decimal / date / timestamp assignment
+                // materializes with the right precision-scale / unit-timezone (a bare value cannot carry it).
+                assignedArrays[colIdx] = evaluator.EvaluateExpression(
+                    kv.Value, batch, arrowSchema.FieldsList[colIdx].DataType);
             }
 
             // For each schema column, take the values at matching indices —
@@ -1105,12 +1108,73 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 }
                 return b.Build();
             }
+            case Date32Array a:
+            {
+                var b = new Date32Array.Builder().Reserve(indices.Count);
+                foreach (int i in indices)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(Epoch.AddDays(a.GetValue(i)!.Value));
+                }
+                return b.Build();
+            }
+            case Date64Array a:
+            {
+                var b = new Date64Array.Builder().Reserve(indices.Count);
+                foreach (int i in indices)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(Epoch.AddMilliseconds(a.GetValue(i)!.Value));
+                }
+                return b.Build();
+            }
+            case TimestampArray a:
+            {
+                var b = new TimestampArray.Builder((Apache.Arrow.Types.TimestampType)a.Data.DataType)
+                    .Reserve(indices.Count);
+                foreach (int i in indices)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetTimestamp(i)!.Value);
+                }
+                return b.Build();
+            }
+            case Decimal128Array a:
+                return TakeFixedWidth(a, a.ValueBuffer, indices, 16, d => new Decimal128Array(d));
+            case Decimal256Array a:
+                return TakeFixedWidth(a, a.ValueBuffer, indices, 32, d => new Decimal256Array(d));
             default:
                 throw new NotSupportedException(
                     $"UpdateAsync's row-take helper doesn't yet support column type " +
                     $"'{expectedType}' (source array: {source.GetType().Name}). " +
-                    "Currently supported: Int / UInt / Float / Double / Bool / String / Binary.");
+                    "Currently supported: Int / UInt / Float / Double / Bool / String / Binary / " +
+                    "Date32 / Date64 / Timestamp / Decimal128 / Decimal256.");
         }
+    }
+
+    private static readonly DateTime Epoch = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    // Slices a fixed-width (decimal) array by copying each selected value's raw bytes verbatim, so full
+    // precision is preserved regardless of the decimal's magnitude.
+    private static IArrowArray TakeFixedWidth(
+        Apache.Arrow.Array source, ArrowBuffer valueBuffer, IReadOnlyList<int> indices, int width,
+        Func<ArrayData, IArrowArray> create)
+    {
+        var bytes = new byte[indices.Count * width];
+        var validity = new ArrowBuffer.BitmapBuilder();
+        int nullCount = 0;
+        var src = valueBuffer.Span;
+        for (int k = 0; k < indices.Count; k++)
+        {
+            int i = indices[k];
+            if (source.IsNull(i)) { validity.Append(false); nullCount++; continue; }
+            validity.Append(true);
+            src.Slice(i * width, width).CopyTo(bytes.AsSpan(k * width, width));
+        }
+        var data = new ArrayData(
+            source.Data.DataType, indices.Count, nullCount, 0,
+            new[] { validity.Build(), new ArrowBuffer(bytes) });
+        return create(data);
     }
 
     /// <summary>

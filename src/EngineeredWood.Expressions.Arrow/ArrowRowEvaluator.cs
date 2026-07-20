@@ -44,6 +44,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         return MaterializeAsArray(values, batch.Length);
     }
 
+    public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch, IArrowType targetType)
+    {
+        var values = EvalExpression(expression, batch);
+        return MaterializeAsArray(values, batch.Length, targetType);
+    }
+
     // ── Predicate evaluation ──
 
     private bool?[] EvalPredicate(Predicate predicate, RecordBatch batch)
@@ -459,6 +465,125 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     $"Cannot materialize LiteralValue kind {kind.Value} as Arrow array.");
         }
     }
+
+    // Materialize against a caller-supplied Arrow type. The decimal / temporal cases need metadata a bare
+    // LiteralValue cannot carry (precision/scale/width, unit/timezone, date-vs-timestamp); every other type
+    // is inferrable, so it falls through to the type-inferring overload.
+    private static IArrowArray MaterializeAsArray(LiteralValue?[] values, int length, IArrowType targetType) =>
+        targetType switch
+        {
+            Decimal128Type dt => BuildDecimalArray(values, length, dt.Scale, 16,
+                data => new Decimal128Array(data), dt),
+            Decimal256Type dt => BuildDecimalArray(values, length, dt.Scale, 32,
+                data => new Decimal256Array(data), dt),
+            TimestampType tt => BuildTimestampArray(values, length, tt),
+            Date32Type => BuildDate32Array(values, length),
+            Date64Type => BuildDate64Array(values, length),
+            _ => MaterializeAsArray(values, length),
+        };
+
+    private static IArrowArray BuildDecimalArray(
+        LiteralValue?[] values, int length, int scale, int byteWidth,
+        Func<ArrayData, IArrowArray> create, IArrowType type)
+    {
+        var bytes = new byte[length * byteWidth];
+        var validity = new ArrowBuffer.BitmapBuilder();
+        int nullCount = 0;
+        for (int i = 0; i < length; i++)
+        {
+            if (!values[i].HasValue)
+            {
+                validity.Append(false);
+                nullCount++;
+                continue;
+            }
+            validity.Append(true);
+            BigInteger unscaled = ToUnscaled(values[i]!.Value, scale);
+            var dest = bytes.AsSpan(i * byteWidth, byteWidth);
+            dest.Fill(unscaled.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+            unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+            byte[] le = unscaled.ToByteArray();
+            le.AsSpan(0, Math.Min(le.Length, byteWidth)).CopyTo(dest);
+#endif
+        }
+        var data = new ArrayData(type, length, nullCount, 0, [validity.Build(), new ArrowBuffer(bytes)]);
+        return create(data);
+    }
+
+    private static IArrowArray BuildTimestampArray(LiteralValue?[] values, int length, TimestampType type)
+    {
+        var b = new TimestampArray.Builder(type);
+        for (int i = 0; i < length; i++)
+        {
+            if (values[i].HasValue) b.Append(ToDateTimeOffset(values[i]!.Value));
+            else b.AppendNull();
+        }
+        return b.Build();
+    }
+
+    private static IArrowArray BuildDate32Array(LiteralValue?[] values, int length)
+    {
+        var b = new Date32Array.Builder();
+        for (int i = 0; i < length; i++)
+        {
+            if (values[i].HasValue) b.Append(ToDateTimeOffset(values[i]!.Value).UtcDateTime);
+            else b.AppendNull();
+        }
+        return b.Build();
+    }
+
+    private static IArrowArray BuildDate64Array(LiteralValue?[] values, int length)
+    {
+        var b = new Date64Array.Builder();
+        for (int i = 0; i < length; i++)
+        {
+            if (values[i].HasValue) b.Append(ToDateTimeOffset(values[i]!.Value).UtcDateTime);
+            else b.AppendNull();
+        }
+        return b.Build();
+    }
+
+    // A decimal/integer value as an unscaled integer at the target column scale.
+    private static BigInteger ToUnscaled(LiteralValue v, int targetScale) => v.Type switch
+    {
+        LiteralValue.Kind.HighPrecisionDecimal => Rescale(
+            v.AsHighPrecisionDecimal.UnscaledValue, v.AsHighPrecisionDecimal.Scale, targetScale),
+        LiteralValue.Kind.Decimal => RescaleDecimal(v.AsDecimal, targetScale),
+        LiteralValue.Kind.Int32 => Rescale(v.AsInt32, 0, targetScale),
+        LiteralValue.Kind.Int64 => Rescale(v.AsInt64, 0, targetScale),
+        _ => throw new NotSupportedException($"Cannot materialize {v.Type} as a decimal."),
+    };
+
+    private static BigInteger RescaleDecimal(decimal value, int targetScale)
+    {
+        int[] bits = decimal.GetBits(value);
+        int scale = (bits[3] >> 16) & 0x7F;
+        bool negative = (bits[3] & unchecked((int)0x80000000)) != 0;
+        var magnitude = (new BigInteger((uint)bits[2]) << 64)
+            | (new BigInteger((uint)bits[1]) << 32)
+            | new BigInteger((uint)bits[0]);
+        return Rescale(negative ? -magnitude : magnitude, scale, targetScale);
+    }
+
+    private static BigInteger Rescale(BigInteger unscaled, int fromScale, int toScale)
+    {
+        if (toScale > fromScale) return unscaled * BigInteger.Pow(10, toScale - fromScale);
+        if (toScale < fromScale) return unscaled / BigInteger.Pow(10, fromScale - toScale);
+        return unscaled;
+    }
+
+    private static DateTimeOffset ToDateTimeOffset(LiteralValue v) => v.Type switch
+    {
+        LiteralValue.Kind.DateTimeOffset => v.AsDateTimeOffset,
+#if NET6_0_OR_GREATER
+        // A calendar date is UTC midnight — symmetric with how date columns are read as DateTimeOffset.
+        LiteralValue.Kind.DateOnly => new DateTimeOffset(
+            v.AsDateOnly.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero),
+#endif
+        _ => throw new NotSupportedException($"Cannot materialize {v.Type} as a date/timestamp."),
+    };
 
     private static IArrowArray BuildAllNullStrings(int length)
     {

@@ -2047,4 +2047,126 @@ public class LanceDatasetWriterTests
             batches.Add(batch.Column(0));
         return batches;
     }
+
+    // ── UpdateAsync over decimal / date / timestamp columns ──
+
+    private static Decimal128Array MakeDecimal128(int scale, params decimal?[] values)
+    {
+        var type = new Decimal128Type(12, scale);
+        const int w = 16;
+        var bytes = new byte[values.Length * w];
+        var validity = new ArrowBuffer.BitmapBuilder();
+        int nullCount = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i] is null) { validity.Append(false); nullCount++; continue; }
+            validity.Append(true);
+            long unscaled = (long)(values[i]!.Value * (decimal)Math.Pow(10, scale));
+            var bi = new System.Numerics.BigInteger(unscaled);
+            var dest = bytes.AsSpan(i * w, w);
+            dest.Fill(bi.Sign < 0 ? (byte)0xFF : (byte)0x00);
+            var le = bi.ToByteArray();
+            le.AsSpan(0, Math.Min(le.Length, w)).CopyTo(dest);
+        }
+        var data = new ArrayData(type, values.Length, nullCount, 0,
+            new[] { validity.Build(), new ArrowBuffer(bytes) });
+        return new Decimal128Array(data);
+    }
+
+    private static TimestampArray MakeTimestamps(params DateTimeOffset[] values)
+    {
+        var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    [Fact]
+    public async Task Update_AssignsDecimalColumn()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FileWriter.WriteColumnAsync("amt", MakeDecimal128(2, 10.00m, 20.00m, 30.00m));
+                await ds.FinishAsync();
+            }
+
+            var pred = Expressions.Expressions.GreaterThan("id", LiteralValue.Of(1));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["amt"] = new LiteralExpression(LiteralValue.Of(99.99m)),
+            };
+            var (rows, _) = await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+            Assert.Equal(2L, rows);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            var map = new Dictionary<int, decimal>();
+            await foreach (var batch in table.ReadAsync())
+            {
+                var id = (Int32Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+                var amt = (Decimal128Array)batch.Column(batch.Schema.GetFieldIndex("amt"));
+                for (int i = 0; i < batch.Length; i++)
+                    map[id.GetValue(i)!.Value] = amt.GetValue(i)!.Value;
+            }
+
+            Assert.Equal(10.00m, map[1]);  // unchanged
+            Assert.Equal(99.99m, map[2]);  // assigned decimal materialized with the column's scale
+            Assert.Equal(99.99m, map[3]);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_PreservesUnassignedDecimalAndTimestampColumns()
+    {
+        string path = MakeTempDatasetPath();
+        var t1 = new DateTimeOffset(2024, 1, 10, 0, 0, 0, TimeSpan.Zero);
+        var t2 = new DateTimeOffset(2024, 6, 20, 14, 45, 30, TimeSpan.Zero);
+        var t3 = new DateTimeOffset(2024, 12, 31, 23, 59, 59, TimeSpan.Zero);
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FileWriter.WriteColumnAsync("amt", MakeDecimal128(2, 10.00m, 20.00m, 30.00m));
+                await ds.FileWriter.WriteColumnAsync("ts", MakeTimestamps(t1, t2, t3));
+                await ds.FinishAsync();
+            }
+
+            // Every row matches; only 'id' is assigned, so the decimal and timestamp columns must pass
+            // through the row-take helper for the rewritten rows (in original order).
+            var pred = Expressions.Expressions.GreaterThan("id", LiteralValue.Of(0));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["id"] = new LiteralExpression(LiteralValue.Of(99)),
+            };
+            await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+
+            var amounts = new List<decimal>();
+            var stamps = new List<DateTimeOffset>();
+            await using var table = await LanceTable.OpenAsync(path);
+            await foreach (var batch in table.ReadAsync())
+            {
+                var amt = (Decimal128Array)batch.Column(batch.Schema.GetFieldIndex("amt"));
+                var ts = (TimestampArray)batch.Column(batch.Schema.GetFieldIndex("ts"));
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    amounts.Add(amt.GetValue(i)!.Value);
+                    stamps.Add(ts.GetTimestamp(i)!.Value);
+                }
+            }
+
+            Assert.Equal(new[] { 10.00m, 20.00m, 30.00m }, amounts);
+            Assert.Equal(new[] { t1, t2, t3 }, stamps);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
 }

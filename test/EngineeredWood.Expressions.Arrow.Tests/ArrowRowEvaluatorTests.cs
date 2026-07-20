@@ -487,4 +487,81 @@ public class ArrowRowEvaluatorTests
         var r = Eval.EvaluatePredicate(Ex.GreaterThan("amt", 10), batch); // int literal
         Assert.Equal([false, true], ToList(r));
     }
+
+    // ── EvaluateExpression with a target Arrow type (materialization) ──
+
+    private static BigInteger Unscaled(Decimal128Array a, int i)
+    {
+        var bytes = a.ValueBuffer.Span.Slice(i * 16, 16);
+#if NET6_0_OR_GREATER
+        return new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+#else
+        return new BigInteger(bytes.ToArray());
+#endif
+    }
+
+    [Fact]
+    public void EvaluateExpression_TargetDecimal_MaterializesColumn()
+    {
+        var batch = Decimal128Column("amt", 12, 2, 1234, 5678, null); // 12.34, 56.78, null
+        var result = Eval.EvaluateExpression(Ex.Ref("amt"), batch, new Decimal128Type(12, 2));
+
+        var arr = Assert.IsType<Decimal128Array>(result);
+        Assert.Equal(3, arr.Length);
+        Assert.Equal(12.34m, arr.GetValue(0));
+        Assert.Equal(56.78m, arr.GetValue(1));
+        Assert.True(arr.IsNull(2));
+    }
+
+    [Fact]
+    public void EvaluateExpression_TargetDecimal_RescalesToTargetScale()
+    {
+        var batch = Decimal128Column("amt", 12, 2, 1234); // 12.34 at scale 2
+        var result = Eval.EvaluateExpression(Ex.Ref("amt"), batch, new Decimal128Type(12, 4));
+
+        var arr = Assert.IsType<Decimal128Array>(result);
+        Assert.Equal(new Decimal128Type(12, 4).Scale, ((Decimal128Type)arr.Data.DataType).Scale);
+        Assert.Equal(123400, (long)Unscaled(arr, 0)); // 12.34 -> 123400 at scale 4
+        Assert.Equal(12.34m, arr.GetValue(0));
+    }
+
+    [Fact]
+    public void EvaluateExpression_TargetDecimal_HighPrecisionLiteral_Exact()
+    {
+        var huge = BigInteger.Pow(10, 31); // exceeds System.Decimal
+        var batch = Decimal128Column("amt", 12, 2, 1, 2); // just a 2-row batch to size the output
+        var result = Eval.EvaluateExpression(
+            Ex.Lit(LiteralValue.HighPrecisionDecimalOf(huge, 0)), batch, new Decimal128Type(38, 0));
+
+        var arr = Assert.IsType<Decimal128Array>(result);
+        Assert.Equal(huge, Unscaled(arr, 0));
+        Assert.Equal(huge, Unscaled(arr, 1));
+    }
+
+    [Fact]
+    public void EvaluateExpression_TargetTimestamp_MaterializesColumn()
+    {
+        var t0 = new DateTimeOffset(2024, 1, 15, 10, 30, 0, TimeSpan.Zero);
+        var t1 = new DateTimeOffset(2024, 6, 20, 14, 45, 30, TimeSpan.Zero);
+        var batch = TimestampColumn("ts", t0, t1, null);
+        var result = Eval.EvaluateExpression(
+            Ex.Ref("ts"), batch, new TimestampType(TimeUnit.Microsecond, "UTC"));
+
+        var arr = Assert.IsType<TimestampArray>(result);
+        Assert.Equal(t0, arr.GetTimestamp(0));
+        Assert.Equal(t1, arr.GetTimestamp(1));
+        Assert.True(arr.IsNull(2));
+    }
+
+    [Fact]
+    public void EvaluateExpression_TargetDate_MaterializesColumn()
+    {
+        var batch = Date32Column("d", new DateTime(2021, 1, 1), new DateTime(2021, 12, 31), null);
+        var result = Eval.EvaluateExpression(Ex.Ref("d"), batch, Date32Type.Default);
+
+        var arr = Assert.IsType<Date32Array>(result);
+        Assert.Equal(new DateTime(2021, 1, 1), arr.GetDateTime(0)!.Value.Date);
+        Assert.Equal(new DateTime(2021, 12, 31), arr.GetDateTime(1)!.Value.Date);
+        Assert.True(arr.IsNull(2));
+    }
 }
