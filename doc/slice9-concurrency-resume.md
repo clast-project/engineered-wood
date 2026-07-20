@@ -133,13 +133,20 @@ Design facts worth keeping:
    - ~~extend `ArrowRowEvaluator` to date/decimal/timestamp columns~~ **DONE (`119242e`).** Added
      Date32/Date64/Timestamp + Decimal32/64/128/256 cases (mapped to the same `LiteralValue` kinds the stats
      decoder uses — `DateTimeOffset`/`Decimal`/`HighPrecisionDecimal`), plus `LiteralValue` cross-type
-     comparison for Decimal↔HighPrecisionDecimal, integer↔decimal, and DateOnly↔DateTimeOffset. Stats-path
-     check: date/decimal are not pruned (date stats are emitted as a number the decoder rejects; decimal
-     stats are not collected) — both SAFE (never wrongly prune); timestamp DOES prune and round-trips.
+     comparison for Decimal↔HighPrecisionDecimal, integer↔decimal, and DateOnly↔DateTimeOffset.
      **Gotcha found:** the Delta/parquet reader NARROWS a decimal column to the smallest
      `Decimal{32,64,128,256}Array` that fits its precision, so all four array widths must be handled (a
      `decimal(12,2)` reads back as `Decimal64Array`). Tests: `ArrowRowEvaluatorTests` +5, `LiteralValueTests`
      +4, `ExpressionPredicateTests` +3 (incl. an end-to-end timestamp concurrentAppend-precision case).
+   - **stats-pruning gaps for these types (measured, then fixed/pending):** timestamp stats always
+     round-tripped and pruned. Date stats were emitted as a raw day-number the decoder rejects → no
+     pruning (SAFE); **fixed (pending commit):** `StatsCollector` now emits date bounds as Spark's
+     `"yyyy-MM-dd"` strings (verified by a tier-3 test that Spark skips a file on a date predicate). Decimal
+     stats are still not collected → no decimal pruning (SAFE); **decimal stats emission is the next piece**
+     — emit min/max as JSON numbers (measured: Spark writes even 38-digit decimals as raw numbers), exact
+     via unscaled `BigInteger`, `Utf8JsonWriter.WriteRawValue` for high-precision. Checkpoint is safe
+     (the `stats` JSON string is preserved on read; the `stats_parsed` decimal→double approx is unused by
+     EW's pruner — a separate pre-existing quirk).
    - rebasing partition/dynamic overwrite now has the predicate machinery it needed, but still needs the
      overwrite read-set expressed as a partition predicate.
 4. **Layer 3 — row-level concurrency.** The Databricks extension. Largest remaining piece; needs
