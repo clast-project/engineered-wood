@@ -102,12 +102,18 @@ internal static class ConflictChecker
     /// <paramref name="reads"/> has no predicates (a blind append or whole-table read).</param>
     /// <param name="isolation">This transaction's isolation level.</param>
     /// <param name="concurrent">The commits in <c>(readVersion, latestVersion]</c>, ascending.</param>
+    /// <param name="rowLevelResolvedPaths">Paths whose concurrent remove/re-add has been reconciled at
+    /// row granularity by deletion-vector union (Databricks row-level concurrency) before this check.
+    /// A concurrent <c>RemoveFile</c> or <c>AddFile</c> of such a path is ignored here: the delete's DV
+    /// was rebased onto the concurrent one, so it neither conflicts (delete/delete, concurrentDeleteRead)
+    /// nor counts as a foreign add (concurrentAppend). May be null when no row-level resolution ran.</param>
     public static ConflictResult Check(
         ReadSet reads,
         ISet<string> plannedRemovePaths,
         DeltaFilePruner? pruner,
         IsolationLevel isolation,
-        IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent)
+        IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent,
+        ISet<string>? rowLevelResolvedPaths = null)
     {
         foreach (var (version, actions) in concurrent)
         {
@@ -132,24 +138,38 @@ internal static class ConflictChecker
             {
                 switch (action)
                 {
-                    // 3 — delete/delete. A removed file is removed whatever its dataChange flag.
-                    case RemoveFile remove when plannedRemovePaths.Contains(remove.Path):
-                        return new ConflictResult(ConflictType.ConcurrentDeleteDelete, version,
-                            $"Concurrent commit {version} already removed '{remove.Path}', "
-                            + "which this transaction also removes.");
+                    case RemoveFile remove:
+                        // A file whose concurrent remove was reconciled at row granularity (DV union) is
+                        // no longer a conflict source: this transaction's delete rebased its own DV onto it.
+                        if (rowLevelResolvedPaths is not null && rowLevelResolvedPaths.Contains(remove.Path))
+                            break;
 
-                    // 4 — concurrentDeleteRead. Only data-changing removes invalidate a read.
-                    case RemoveFile remove when remove.DataChange && WasRead(reads, remove.Path):
-                        return new ConflictResult(ConflictType.ConcurrentDeleteRead, version,
-                            $"Concurrent commit {version} removed '{remove.Path}', "
-                            + "which this transaction read.");
+                        // 3 — delete/delete. A removed file is removed whatever its dataChange flag.
+                        if (plannedRemovePaths.Contains(remove.Path))
+                            return new ConflictResult(ConflictType.ConcurrentDeleteDelete, version,
+                                $"Concurrent commit {version} already removed '{remove.Path}', "
+                                + "which this transaction also removes.");
 
-                    // 5 — concurrentAppend. Only data-changing adds, and only when the isolation level
-                    // says a concurrent append of this shape is visible to us.
-                    case AddFile add when examineAdds && add.DataChange && Matches(reads, pruner, add):
-                        return new ConflictResult(ConflictType.ConcurrentAppend, version,
-                            $"Concurrent commit {version} added '{add.Path}', "
-                            + "which matches this transaction's read predicates.");
+                        // 4 — concurrentDeleteRead. Only data-changing removes invalidate a read.
+                        if (remove.DataChange && WasRead(reads, remove.Path))
+                            return new ConflictResult(ConflictType.ConcurrentDeleteRead, version,
+                                $"Concurrent commit {version} removed '{remove.Path}', "
+                                + "which this transaction read.");
+                        break;
+
+                    case AddFile add:
+                        // The re-add of a row-level-resolved file (the concurrent delete's own AddFile with
+                        // its new DV) is not a foreign append — the union already accounts for it.
+                        if (rowLevelResolvedPaths is not null && rowLevelResolvedPaths.Contains(add.Path))
+                            break;
+
+                        // 5 — concurrentAppend. Only data-changing adds, and only when the isolation level
+                        // says a concurrent append of this shape is visible to us.
+                        if (examineAdds && add.DataChange && Matches(reads, pruner, add))
+                            return new ConflictResult(ConflictType.ConcurrentAppend, version,
+                                $"Concurrent commit {version} added '{add.Path}', "
+                                + "which matches this transaction's read predicates.");
+                        break;
                 }
             }
         }

@@ -270,11 +270,13 @@ public class VariantTests : IDisposable
     public async Task Delete_OnVariantTable_PreservesTheExtensionType()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema());
+        await using var table = await DeltaTable.CreateAsync(
+            fs, VariantSchema(), enableDeletionVectors: true);
         await table.WriteAsync([VariantBatch(True, False, Int8Val)]);
 
-        // Copy-on-write DELETE filters every column through TakeRows; without an extension arm the
-        // variant column threw and the whole DML path was unusable.
+        // A partial DELETE soft-deletes via a deletion vector, filtering every column through TakeRows for
+        // the DV/CDC row extraction; without an extension arm the variant column threw and the whole DML
+        // path was unusable.
         await table.DeleteAsync(batch =>
         {
             var ids = (Int64Array)batch.Column(0);

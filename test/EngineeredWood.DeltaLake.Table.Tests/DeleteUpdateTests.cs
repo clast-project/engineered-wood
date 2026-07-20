@@ -32,7 +32,7 @@ public class DeleteUpdateTests : IDisposable
             .Field(new Field("value", StringType.Default, true))
             .Build();
 
-        var table = await DeltaTable.CreateAsync(fs, schema);
+        var table = await DeltaTable.CreateAsync(fs, schema, enableDeletionVectors: true);
 
         var ids = new Int64Array.Builder()
             .Append(1).Append(2).Append(3).Append(4).Append(5).Build();

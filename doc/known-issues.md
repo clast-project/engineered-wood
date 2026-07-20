@@ -379,9 +379,11 @@ fields still never emitted: `readVersion`, `isolationLevel`,
 `SetClusteringColumnsAsync` upgrade the protocol as needed via
 `UpgradeProtocolForFeatures` / `UpgradeProtocolForWriterFeatures`, and
 `CreateAsync` declares schema-driven features (`timestampNtz`,
-`identityColumns`, `columnMapping`) up front. There is still no general
+`identityColumns`, `columnMapping`) up front, and `enableDeletionVectors:
+true` declares `deletionVectors` at creation. There is still no general
 public API for enabling `deletionVectors` / `rowTracking` / `typeWidening` /
-`inCommitTimestamp` on an existing table.
+`inCommitTimestamp` on an EXISTING table (only `deletionVectors` can be
+declared, and only at create time).
 
 **Exactly-once transactional writes.** `SetTransaction` actions are
 read, written, and reconciled in snapshots, but `DeltaTable` has no
@@ -416,6 +418,29 @@ deleting a live deletion vector would silently resurrect every row it
 masked. EngineeredWood never writes `p` vectors.
 
 ### Correctness / interop issues
+
+**Deletion vectors are opt-in; DELETE fails on a partial match when they are
+off.** `DeltaTable.CreateAsync(..., enableDeletionVectors: true)` sets the
+`delta.enableDeletionVectors` property and declares the `deletionVectors`
+reader+writer feature (reader 3 / writer 7). Only then does a partial DELETE
+soft-delete rows with a deletion vector. With DVs disabled, a DELETE may only
+remove WHOLE files (a clean file/partition boundary — a metadata-only remove
+needing no DV); a predicate that would soft-delete part of a file throws
+`InvalidOperationException` rather than write a vector a foreign reader would
+not apply. There is still **no way to enable DVs on an EXISTING table** (no
+`ALTER TABLE`-style property update / protocol upgrade), and **no
+copy-on-write DELETE** to rewrite files when DVs are off — the two "for now"
+gaps behind the fail-fast. Earlier EW always wrote a DV without declaring the
+feature, so a conformant foreign reader silently returned the deleted rows;
+that data-loss gap is closed.
+
+_Reader-side reality (measured):_ delta-rs 1.6.2's reader does not support the
+`deletionVectors` feature, so it REFUSES an EW DV table (`DeltaProtocolError:
+... not yet supported`) rather than mis-reading it — the safe reaction, pinned
+by `DeltaRsInteropTests.EwUnionedDeletionVector_EwApplies_DeltaRsSafelyRefusesUnsupportedFeature`.
+Spark 4.0 does support DV reads; `SparkInteropTests.EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow`
+is where the read-back of an EW deletion vector (including a row-level union)
+is actually validated.
 
 **Binary partition values are unsupported.**
 `Partitioning/PartitionUtils.GetStringValue` throws

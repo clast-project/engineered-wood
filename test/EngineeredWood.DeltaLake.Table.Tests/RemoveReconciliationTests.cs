@@ -41,13 +41,14 @@ public class RemoveReconciliationTests : IDisposable
         return new RecordBatch(schema, [b.Build()], ids.Length);
     }
 
-    // DeleteAsync always marks rows with a deletion vector rather than rewriting the file, so the AddFile
-    // survives the delete carrying a DV — exactly the shape that exposes an unqualified remove.
+    // A partial DeleteAsync marks rows with a deletion vector rather than rewriting the file, so the AddFile
+    // survives the delete carrying a DV — exactly the shape that exposes an unqualified remove. That needs
+    // deletion vectors enabled on the table.
     private static async Task<DeltaTable> CreateDvTableAsync(string dir)
     {
         var fs = new LocalTableFileSystem(dir);
         var options = new DeltaTableOptions { CheckpointInterval = 0 };
-        return await DeltaTable.CreateAsync(fs, Schema(), options);
+        return await DeltaTable.CreateAsync(fs, Schema(), options, enableDeletionVectors: true);
     }
 
     private static async Task<List<long>> ReadIdsAsync(DeltaTable table)

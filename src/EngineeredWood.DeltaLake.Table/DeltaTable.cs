@@ -127,6 +127,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? partitionColumns = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         IReadOnlyList<string>? clusteringColumns = null,
+        bool enableDeletionVectors = false,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -181,6 +182,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             };
         }
 
+        // Deletion vectors are opt-in: set the table property so the DELETE path knows it may soft-delete
+        // rows with a DV, and declare the reader+writer feature below so foreign readers apply them.
+        if (enableDeletionVectors)
+        {
+            configuration ??= new Dictionary<string, string>();
+            configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
+        }
+
         // The legacy protocol versions this table would carry if NO table feature forced it into
         // table-features mode. Captured before any feature escalates the versions below, because
         // switching to reader 3 / writer 7 means every capability the legacy versions IMPLIED must be
@@ -206,6 +215,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             readerFeatures.Add(feature);
             writerFeatures.Add(feature);
+        }
+
+        // Deletion vectors — an opt-in reader+writer feature (reader 3 / writer 7). Declaring it is what
+        // makes a conformant foreign reader APPLY the DVs a DELETE writes; without it they are silently
+        // ignored (a reader returns rows the table considers deleted). The DELETE path refuses to write a DV
+        // unless this feature is enabled — see ComputeDeleteActionsAsync.
+        if (enableDeletionVectors)
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
+            writerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -1062,10 +1083,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Predicates = transaction.ReadPredicates,
         };
 
+        // Pure DV-delete edits are eligible for row-level DELETE/DELETE reconciliation. Withheld under row
+        // tracking: a rebased delete's AddFile would carry the concurrent file's baseRowId, which is fine
+        // for the survivors, but row-tracking rebase safety is handled uniformly by rebaseSafe:false until
+        // the copy-on-write remap (Layer 3 sub-problem B) lands.
         return CommitOccAsync(
             baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
             transaction.IsolationLevel, transaction.Operation, rebaseSafe: !rowTracking,
-            cancellationToken);
+            cancellationToken,
+            rowLevelDeletes: rowTracking ? null : transaction.DvEdits);
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -1093,7 +1119,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IsolationLevel isolationLevel,
         string operation,
         bool rebaseSafe,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null)
     {
         ThrowIfDisposed();
 
@@ -1101,13 +1128,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return baseSnapshot.Version; // nothing staged — no commit
 
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
+        bool rowLevel = rowLevelDeletes is { Count: > 0 };
+
+        // The actions actually written this attempt. Starts as the actions computed against the base
+        // snapshot; a row-level rebase replaces it with deletion-vector-union actions computed against the
+        // latest snapshot. Always derived from the original `dataActions`, never from a prior rebase, so
+        // each retry rebases the STABLE row edits onto whatever the newest snapshot holds.
+        var currentActions = dataActions;
 
         long attemptVersion = baseSnapshot.Version + 1;
         const int maxAttempts = 100;
         for (int attempt = 0; ; attempt++)
         {
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                dataActions, baseSnapshot.Metadata.Configuration, operation);
+                currentActions, baseSnapshot.Metadata.Configuration, operation);
             try
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
@@ -1118,7 +1152,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
             {
-                long latest = await _log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
+                // Row-level DELETE/DELETE reconciliation needs the concurrent files' current deletion
+                // vectors, so build the latest snapshot; the append/update paths only need the version.
+                long latest;
+                Snapshot.Snapshot? latestSnapshot = null;
+                if (rowLevel)
+                {
+                    latestSnapshot = await SnapshotBuilder.UpdateAsync(
+                        baseSnapshot, _log, cancellationToken).ConfigureAwait(false);
+                    latest = latestSnapshot.Version;
+                }
+                else
+                {
+                    latest = await _log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
+                }
 
                 var concurrent = new List<(long, IReadOnlyList<DeltaAction>)>();
                 for (long v = baseSnapshot.Version + 1; v <= latest; v++)
@@ -1127,8 +1174,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false)));
                 }
 
+                // Row-level resolution runs BEFORE the checker so its verdict can ignore the reconciled
+                // files: rebase each staged delete's deletion vector onto the file's current one (union the
+                // rows). A null result is a genuine conflict — the same row was deleted concurrently, or the
+                // file was rewritten away (compaction/update, out of scope for pure DV resolution).
+                ISet<string>? resolvedPaths = null;
+                if (rowLevel)
+                {
+                    var resolution = await ResolveRowLevelDeletesAsync(
+                        latestSnapshot!, dataActions, rowLevelDeletes!, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (resolution is null)
+                        throw new DeltaConflictException(
+                            "A concurrent commit deleted a row this delete also removed, or rewrote a file "
+                            + "it targeted; the delete conflicts at row level and must be retried.");
+
+                    currentActions = resolution.Value.Actions;
+                    resolvedPaths = resolution.Value.ResolvedPaths;
+                }
+
                 var verdict = Concurrency.ConflictChecker.Check(
-                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent);
+                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                     throw new DeltaConflictException(verdict.Message!);
 
@@ -1142,6 +1208,92 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
         }
+    }
+
+    /// <summary>
+    /// Row-level DELETE/DELETE reconciliation (Databricks row-level concurrency): rebase a losing delete's
+    /// deletion vectors onto the winner's so two concurrent deletes of DISJOINT rows of the same file both
+    /// land, instead of the second aborting at file granularity. For each file this delete touched, rebuild
+    /// its <see cref="RemoveFile"/>/<see cref="AddFile"/> pair against the file's CURRENT state in
+    /// <paramref name="latestSnapshot"/>, unioning the rows this delete removed into the file's current
+    /// deletion vector. Every other staged action (CDC files, a co-staged append) is preserved verbatim.
+    ///
+    /// <para>Returns <c>null</c> — a genuine conflict that must abort — when a row this delete removed was
+    /// ALSO removed by the concurrent commit (same-row conflict), or when a targeted file is no longer
+    /// active (it was rewritten by a concurrent compaction or UPDATE — a file-level, not row-level, change
+    /// that copy-on-write rewrites would need row-id remapping to survive; out of scope here).</para>
+    /// </summary>
+    private async ValueTask<(List<DeltaAction> Actions, ISet<string> ResolvedPaths)?>
+        ResolveRowLevelDeletesAsync(
+            Snapshot.Snapshot latestSnapshot,
+            IReadOnlyList<DeltaAction> originalActions,
+            IReadOnlyList<DeleteDvEdit> dvEdits,
+            CancellationToken cancellationToken)
+    {
+        // A valid table has at most one active file per path (a DV update removes the old reconciliation
+        // key and adds a new one with the same path), so path is a sufficient lookup key here.
+        var activeByPath = new Dictionary<string, AddFile>(StringComparer.Ordinal);
+        foreach (var file in latestSnapshot.ActiveFiles.Values)
+            activeByPath[file.Path] = file;
+
+        var editedPaths = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var edit in dvEdits)
+            editedPaths.Add(edit.Path);
+
+        // Keep everything except this delete's own remove/add of an edited file — those get rebuilt below.
+        var result = new List<DeltaAction>();
+        foreach (var action in originalActions)
+        {
+            if (action is RemoveFile remove && editedPaths.Contains(remove.Path))
+                continue;
+            if (action is AddFile add && editedPaths.Contains(add.Path))
+                continue;
+            result.Add(action);
+        }
+
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+
+        foreach (var edit in dvEdits)
+        {
+            if (!activeByPath.TryGetValue(edit.Path, out var latestAdd))
+                return null; // the file was rewritten/compacted away — file-level, out of scope
+
+            var concurrentDeleted = latestAdd.DeletionVector is not null
+                ? await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false)
+                : new HashSet<long>();
+
+            // If any row this delete removed is already deleted in the file's current DV, the same row was
+            // deleted concurrently — a real row-level conflict.
+            foreach (long row in edit.NewlyDeletedRows)
+            {
+                if (concurrentDeleted.Contains(row))
+                    return null;
+            }
+
+            var union = new HashSet<long>(concurrentDeleted);
+            foreach (long row in edit.NewlyDeletedRows)
+                union.Add(row);
+
+            var unionDv = await dvWriter.CreateAsync(union, union.Count, cancellationToken)
+                .ConfigureAwait(false);
+
+            result.Add(new RemoveFile
+            {
+                Path = latestAdd.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = latestAdd.DeletionVector,
+            });
+
+            result.Add(latestAdd with
+            {
+                DeletionVector = unionDv,
+                DataChange = true,
+            });
+        }
+
+        return (result, editedPaths);
     }
 
     #endregion
@@ -1205,11 +1357,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return (rowsDeleted, version);
     }
 
-    /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, and the row
-    /// count — everything a commit needs, but without committing. Shared by the auto-committing
-    /// <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
+    /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
+    /// by the auto-committing <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/>
+    /// path.</summary>
     internal sealed record DeleteActions(
-        IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted);
+        IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted,
+        IReadOnlyList<DeleteDvEdit> DvEdits);
+
+    /// <summary>
+    /// The rows one DELETE newly marked deleted in one file, by absolute row position. Deletion vectors
+    /// mark rows in place — they never move a surviving row — so these positions stay valid even after a
+    /// concurrent DV-delete of the same file. That stability is what lets row-level concurrency rebase a
+    /// losing delete's deletion vector onto the winner's (union the two) instead of aborting: see
+    /// <see cref="ResolveRowLevelDeletesAsync"/>.
+    /// </summary>
+    internal sealed record DeleteDvEdit(string Path, IReadOnlyList<long> NewlyDeletedRows);
 
     /// <summary>
     /// Computes the actions for a DELETE against <paramref name="snapshot"/> WITHOUT committing. The
@@ -1229,8 +1392,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+        var dvEdits = new List<DeleteDvEdit>();
         long totalDeleted = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        // Deletion vectors are opt-in. When disabled, a DELETE may only remove WHOLE files (a clean
+        // file/partition boundary); a partial match that would need a soft-delete throws below.
+        bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns);
@@ -1296,8 +1464,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             totalDeleted += newDeletedIndices.Count;
 
-            var newDv = await dvWriter.CreateAsync(
-                allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+            // Whole-file delete: every physical row is now gone, so the file can be dropped outright — a
+            // metadata-only remove needing no deletion vector, valid even when DVs are not enabled. When a
+            // file is only PARTIALLY matched a soft-delete is unavoidable, which requires DVs; without them
+            // enabled the delete is rejected rather than writing a vector a foreign reader would ignore.
+            bool wholeFile = allDeleted.Count == rowOffset;
+
+            if (!wholeFile && !deletionVectorsEnabled)
+            {
+                throw new InvalidOperationException(
+                    "DELETE would soft-delete part of a data file, which requires deletion vectors. Create "
+                    + "the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or restrict "
+                    + "the predicate so it removes whole files/partitions (which needs no deletion vector).");
+            }
 
             actions.Add(new RemoveFile
             {
@@ -1308,11 +1487,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             });
             removedPaths.Add(addFile.Path);
 
-            actions.Add(addFile with
+            if (!wholeFile)
             {
-                DeletionVector = newDv,
-                DataChange = true,
-            });
+                var newDv = await dvWriter.CreateAsync(
+                    allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+
+                actions.Add(addFile with
+                {
+                    DeletionVector = newDv,
+                    DataChange = true,
+                });
+
+                // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
+                // of the same file can be reconciled row-by-row rather than aborting the whole file. A
+                // whole-file remove has no surviving rows to reconcile, so it records no edit (a concurrent
+                // delete of that file is a genuine file-level conflict).
+                dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+            }
 
             // Write CDC file for deleted rows
             if (cdfEnabled)
@@ -1328,7 +1519,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        return new DeleteActions(actions, removedPaths, totalDeleted);
+        return new DeleteActions(actions, removedPaths, totalDeleted, dvEdits);
     }
 
     /// <summary>

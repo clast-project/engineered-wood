@@ -81,7 +81,7 @@ public class AutoCommitConcurrencyTests : IDisposable
     [Fact]
     public async Task TwoHandles_DisjointDeletes_SecondRebasesAndLands()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(5)]); // one file
             await setup.WriteAsync([Batch(7)]); // a second file
@@ -105,14 +105,16 @@ public class AutoCommitConcurrencyTests : IDisposable
     }
 
     /// <summary>
-    /// Two independent handles delete rows in the SAME file. The stale second committer's read (that
-    /// file) was removed by the first — a delete/delete conflict — so the auto-committer aborts with a
-    /// <see cref="DeltaConflictException"/> rather than corrupt or silently drop the loser's intent.
+    /// Two independent handles delete the SAME row of the same file. Row-level concurrency lets a stale
+    /// delete rebase its deletion vector onto a concurrent one when the rows are disjoint, but here they
+    /// overlap — the row B removes was already removed by A — so the auto-committer aborts with a
+    /// <see cref="DeltaConflictException"/> rather than double-delete. (Disjoint rows of the same file both
+    /// landing is covered by <see cref="RowLevelConcurrencyTests"/>.)
     /// </summary>
     [Fact]
-    public async Task TwoHandles_SameFileDeletes_SecondAborts()
+    public async Task TwoHandles_SameRowDeletes_SecondAborts()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(5, 7)]); // both rows in ONE file
         }
@@ -125,8 +127,8 @@ public class AutoCommitConcurrencyTests : IDisposable
         Assert.Equal(baseVersion + 1, vA);
 
         var ex = await Assert.ThrowsAsync<DeltaConflictException>(
-            async () => await tableB.DeleteAsync(IdEquals(7)));
-        Assert.Contains("removed", ex.Message, StringComparison.OrdinalIgnoreCase);
+            async () => await tableB.DeleteAsync(IdEquals(5))); // the same row A just removed
+        Assert.Contains("row level", ex.Message, StringComparison.OrdinalIgnoreCase);
 
         // Only A's delete landed; the aborted delete left the table uncorrupted.
         Assert.Equal([7L], await ReadIdsFresh());
@@ -140,7 +142,7 @@ public class AutoCommitConcurrencyTests : IDisposable
     [Fact]
     public async Task TwoHandles_ConcurrentAppends_BothLand()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(1)]);
         }
@@ -166,7 +168,7 @@ public class AutoCommitConcurrencyTests : IDisposable
     [Fact]
     public async Task Append_RebasesPastConcurrentDelete()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(1)]); // one file
             await setup.WriteAsync([Batch(2)]); // another file
@@ -194,7 +196,7 @@ public class AutoCommitConcurrencyTests : IDisposable
     [Fact]
     public async Task Append_AbortsOnConcurrentSchemaChange()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(1)]);
         }
@@ -216,7 +218,7 @@ public class AutoCommitConcurrencyTests : IDisposable
     [Fact]
     public async Task FullOverwrite_ThrowsOnConcurrentAppend()
     {
-        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
         {
             await setup.WriteAsync([Batch(1)]);
         }

@@ -44,6 +44,10 @@ public sealed class DeltaTransaction
     // They become the transaction's ReadSet.Predicates so a concurrent add matching one is a
     // concurrentAppend conflict. Left empty by the functional-predicate and append-only paths.
     private readonly List<Expressions.Predicate> _readPredicates = [];
+    // Per-file row-level edits from staged DELETEs (the rows each removed, by absolute position). They let
+    // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
+    // (row-level concurrency) instead of aborting. Only DELETEs contribute; appends and updates do not.
+    private readonly List<DeltaTable.DeleteDvEdit> _dvEdits = [];
     private bool _committed;
 
     internal DeltaTransaction(
@@ -67,6 +71,8 @@ public sealed class DeltaTransaction
     internal ISet<string> RemovedPaths => _removedPaths;
 
     internal IReadOnlyList<Expressions.Predicate> ReadPredicates => _readPredicates;
+
+    internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
 
     internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
 
@@ -121,6 +127,7 @@ public sealed class DeltaTransaction
         _dataActions.AddRange(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
+        _dvEdits.AddRange(plan.DvEdits);
         _operations.Add("DELETE");
 
         return plan.TotalDeleted;
@@ -145,6 +152,7 @@ public sealed class DeltaTransaction
         _dataActions.AddRange(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
+        _dvEdits.AddRange(plan.DvEdits);
         _readPredicates.Add(predicate);
         _operations.Add("DELETE");
 

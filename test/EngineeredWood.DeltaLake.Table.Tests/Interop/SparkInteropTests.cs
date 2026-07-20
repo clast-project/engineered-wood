@@ -158,6 +158,54 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([(1L, "us"), (2L, "eu"), (3L, "apac")], RowsFromJson(result));
     }
 
+    /// <summary>
+    /// <para>The Databricks row-level-concurrency artifact — a UNIONED deletion vector from two concurrent
+    /// EW deletes of disjoint rows of the SAME file (slice 9 Layer 3 sub-problem A) — read by a DV-capable
+    /// engine. Two EW handles delete the first and last of three rows in one file; the loser rebases its DV
+    /// onto the winner's, so the file ends up carrying DV {0, 2}. Spark must apply that union and return
+    /// only the middle row.</para>
+    ///
+    /// <para>This is the cross-engine half tier 1 cannot cover: deltalake 1.6.2's reader does not support
+    /// deletion vectors and refuses the table (its counterpart pins that safe refusal). Spark 4.0 does
+    /// support them, so this is where the claim "the resulting DV is spec-legal and reads correctly" is
+    /// actually measured — the union masks exactly the two deleted positions, not all-or-nothing.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema, enableDeletionVectors: true))
+        {
+            await setup.WriteAsync([IdRegionBatch([5, 7, 9], ["us", "eu", "us"])]); // one file, rows 0/1/2
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        var (_, vA) = await tableA.DeleteAsync(DeleteId(5)); // pos 0
+        var (_, vB) = await tableB.DeleteAsync(DeleteId(9)); // pos 2 — stale, collides, DV-union rebase
+        Assert.True(vB > vA);
+
+        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal([(7L, "eu")], await ReadAllViaEw(reader)); // EW applies the union
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal(1, result.GetProperty("row_count").GetInt32());
+        Assert.Equal([(7L, "eu")], RowsFromJson(result)); // Spark applies it too
+    }
+
+    /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
+    private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>
+    {
+        var ids = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < ids.Length; i++)
+            mask.Append(ids.GetValue(i) == target);
+        return mask.Build();
+    };
+
     /// <summary>The reference implementation writes, EW reads.</summary>
     [Fact]
     public async Task SparkWritten_SimpleTable_EwReadsSameRows()

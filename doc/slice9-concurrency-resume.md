@@ -34,8 +34,11 @@ data corruption.
 - **Layer 2 — full ConflictChecker parity**: the verdict rules. Landed as the checker in step 1.
 - **Layer 3 — row-level concurrency** (Databricks extension): two deletes on the *same file* touching
   *disjoint rows* both land, instead of the second aborting. Needs DV re-union (`resolveAgainst:`) and
-  remap-across-rewrite by stable row id. **Not started.** OSS Spark and delta-rs also conflict at file
-  granularity here, so the current file-level abort is *correct*, just not maximally permissive.
+  remap-across-rewrite by stable row id. OSS Spark and delta-rs also conflict at file granularity here, so
+  the pre-existing file-level abort is *correct*, just not maximally permissive.
+  **Sub-problem (A) — DELETE/DELETE deletion-vector union — DONE (see "What landed", step 6).**
+  Sub-problem (B) — rewrite-preservation (remap through a concurrent compaction/UPDATE by stable row id) —
+  **not started.**
 
 The buffered multi-statement surface (`Compute*` schema ALTERs, identity chaining,
 `ReconcileBatchToFields`, `ReadRowsByRowIds`) is **not needed for OCC correctness** and is deferred.
@@ -49,6 +52,7 @@ The buffered multi-statement surface (`Compute*` schema ALTERs, identity chainin
 | 3 | `7964d07` | Auto-committers routed through the OCC loop: `DeleteAsync` and the blind-append `WriteAsync` now rebase-retry instead of throwing on any collision. OCC loop generalised to `CommitOccAsync`; `AutoCommitConcurrencyTests` (6) + a rebased-commit tier-3 Spark test. |
 | 4 | `3bfb9fb` | Appends + updates stageable on `DeltaTransaction` (`WriteAsync`/`UpdateAsync`), closing limitation 1. Extracted `ComputeWriteActionsAsync` (shared by `WriteCoreAsync` + txn append) and `ComputeUpdateActionsAsync` (shared by `UpdateAsync` + txn update); auto-committer `UpdateAsync` now also rebase-retries via `CommitOccAsync`. Operation-label tracking on the txn; `ValidateWritable(snapshot, isAppend)` shared gate. `DeltaTransactionTests` +5. |
 | 5 | `5a8445f` | Analyzable-predicate `DeleteAsync`/`UpdateAsync` overloads (`Expressions.Predicate`), closing limitation 3. The predicate becomes the operation's `ReadSet.Predicates`, so concurrentAppend is now precise (a concurrent add matching it conflicts, per isolation level); files that can't match are pruned from the read. `EngineeredWood.Expressions.Arrow` project ref added for the `ArrowRowEvaluator` row mask. `ExpressionPredicateTests` (6). |
+| 6 | *(pending commit)* | **Layer 3 sub-problem (A) — DELETE/DELETE deletion-vector union.** Two concurrent deletes of *disjoint rows of the same file* now BOTH land instead of the second aborting; same-row deletes still conflict. `ComputeDeleteActionsAsync` records per-file newly-deleted row positions (`DeleteDvEdit`); `CommitOccAsync` grew a `rowLevelDeletes` param and `ResolveRowLevelDeletesAsync`, which on a delete/delete collision rebases each staged delete's DV onto the file's *current* DV (union) rather than throwing — returning null (→ abort) only on same-row overlap or a rewritten-away file. `ConflictChecker.Check` gained `rowLevelResolvedPaths` (skips the reconciled file's concurrent remove/re-add). Withheld under row tracking (`rowLevelDeletes: null`, still `rebaseSafe:false`). `RowLevelConcurrencyTests` (4) + a delta-rs interop test; the two former same-file-abort tests (`TwoTransactions_SameFile_SecondAborts`, `TwoHandles_SameFileDeletes_SecondAborts`) were repurposed to same-*row* (they now correctly both-land at disjoint rows). **Found (measured):** EW writes DVs but never declares the `deletionVectors` protocol feature, so delta-rs ignores *all* EW deletion vectors — pre-existing, orthogonal, recorded in `known-issues.md`. |
 
 Entry points:
 
@@ -157,12 +161,29 @@ Design facts worth keeping:
      approx is unused by EW's pruner — a separate pre-existing quirk).
    - rebasing partition/dynamic overwrite now has the predicate machinery it needed, but still needs the
      overwrite read-set expressed as a partition predicate.
-4. **Layer 3 — row-level concurrency.** The Databricks extension; the largest remaining piece. See the
-   dedicated starting brief below (**"Layer 3 — starting brief"**) — read that first before touching it.
+4. **Layer 3 — row-level concurrency.** Sub-problem (A) DONE (step 6). Sub-problem (B) — rewrite-preservation
+   (remap a delete through a concurrent compaction/UPDATE by stable row id) is the remaining piece; see the
+   dedicated starting brief below (**"Layer 3 — starting brief"**), read that first before touching it.
 
 The parked ledger is `test/EngineeredWood.DeltaLake.Table.Tests/PendingCoverageTests.cs`. The 7
-`LogicalRebase` stubs are retired (now live in `ConflictCheckerTests` + `DeltaTransactionTests`); the
-`RowLevelConcurrency`, `BufferedTxn`, `SetSchema`, and `CommitDataFiles` stubs remain.
+`LogicalRebase` stubs are retired (now live in `ConflictCheckerTests` + `DeltaTransactionTests`); the 3
+row-level (A) stubs are retired (now live in `RowLevelConcurrencyTests`); the remaining `RowLevelConcurrency`
+stubs (the (B) cases + `BufferedFlow_…`), `BufferedTxn`, `SetSchema`, and `CommitDataFiles` stubs remain.
+
+**Deletion-vector protocol declaration — FIXED (opt-in), and the interop reality measured.** The gap (A)'s
+interop test surfaced — EW wrote DVs without declaring the `deletionVectors` reader feature, so a conformant
+reader silently returned the deleted rows — is closed. Deletion vectors are now **opt-in**:
+`CreateAsync(..., enableDeletionVectors: true)` sets `delta.enableDeletionVectors` and declares the
+reader+writer feature (new `DeletionVectorConfig`). A partial DELETE soft-deletes with a DV only when
+enabled; with DVs off it removes WHOLE files (metadata-only, no DV) and **throws** on a partial match rather
+than write a non-conformant vector. Deliberate "for now" gaps (per the user): no enable-on-existing-table,
+no copy-on-write DELETE. **Measured, not assumed:** declaring the feature flipped delta-rs 1.6.2 from
+silently-wrong to a **safe refusal** — its reader does not support `deletionVectors` and rejects the table
+(`DeltaProtocolError: ... not yet supported`). So the delta-rs test now pins that safe refusal
+(`EwUnionedDeletionVector_EwApplies_DeltaRsSafelyRefusesUnsupportedFeature`), and the actual cross-engine
+read of the union DV is validated on Spark 4.0 (`SparkInteropTests.EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow`,
+tier 3). Brief's cross-engine claim (a) thus holds on a DV-capable engine (Spark); delta-rs will validate it
+once it gains DV read support.
 
 ## Layer 3 — starting brief (read first for row-level concurrency)
 
@@ -182,17 +203,21 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
 
 **Two sub-problems, very different difficulty — do (A) first:**
 
-- **(A) DELETE/DELETE disjoint rows → deletion-vector union (tractable, no row-tracking needed).** DELETE is
-  DV-based and does **not** rewrite the file, so row positions are stable. Two concurrent deletes compute
-  `DV1`/`DV2` against the same base file. tx1 commits `RemoveFile(path) + AddFile(path, DV1)`; on rebase tx2
-  currently collides (its planned `RemoveFile(path)` matches tx1's, and the base entry it removed is gone).
-  Row-level resolution: on rebase, re-stage tx2 as `RemoveFile(path, DV1) + AddFile(path, DV1 ∪ DV2)`. If the
-  DVs are **disjoint** → both land; if they **overlap** (same row) → that is the genuine row-level conflict.
-  This is the `ComputeDeletionVectorActionsAsync(resolveAgainst:)` API the parked tests name — `resolveAgainst`
-  = rebase this delete's DV onto the concurrent snapshot's DV for that file. Lives in `CommitOccAsync`'s
-  catch/retry (`DeltaTable.cs`): instead of throwing on a delete/delete verdict, resolve and retry. Unblocks
-  `ConcurrentDeletes_SameFile_DisjointRows_BothLand`, `ConcurrentDeletes_SameRow_RowLevelConflict`,
-  `WithoutRowLevelRetry_VersionConflictSurfaces`.
+- **(A) DELETE/DELETE disjoint rows → deletion-vector union (tractable, no row-tracking needed). DONE.**
+  DELETE is DV-based and does **not** rewrite the file, so row positions are stable. Two concurrent deletes
+  compute `DV1`/`DV2` against the same base file. tx1 commits `RemoveFile(path) + AddFile(path, DV1)`; on
+  rebase tx2 collides (its planned `RemoveFile(path)` matches tx1's, and the base entry it removed is gone).
+  Implemented as: `CommitOccAsync` takes `rowLevelDeletes` (the per-file newly-deleted positions recorded by
+  `ComputeDeleteActionsAsync` as `DeleteDvEdit`), and on any collision calls `ResolveRowLevelDeletesAsync`,
+  which re-stages each edited file as `RemoveFile(path, currentDV) + AddFile(path, currentDV ∪ ourRows)`
+  against the *latest* snapshot. Disjoint → both land; overlap (same row) → returns null → abort; file
+  rewritten away → returns null → abort (that is (B)'s territory). `ConflictChecker.Check` gained
+  `rowLevelResolvedPaths` so the reconciled file's concurrent remove/re-add no longer counts as a conflict.
+  (This filled the role the parked tests' `ComputeDeletionVectorActionsAsync(resolveAgainst:)` named, under a
+  different shape — a resolver on the commit loop, not a public compute method.) Lives in `DeltaTable.cs`.
+  **Now-live tests** (in `RowLevelConcurrencyTests`, not the parked file): `ConcurrentDeletes_SameFile_DisjointRows_BothLand`,
+  `ConcurrentDeletes_SameRow_RowLevelConflict`, `WithoutRowLevelRetry_VersionConflictSurfaces` (a
+  rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
 - **(B) Rewrite-preservation (UPDATE, compaction remap) — the harder prerequisite. VERIFIED on master:**
   `ComputeUpdateActionsAsync` rewrites the file and builds `new AddFile { Path, PartitionValues, Size,
@@ -206,18 +231,21 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   row-tracking transaction rebase safely — it directly retires **limitation 2** (`rebaseSafe: false` for
   row tracking).
 
-**The 7 acceptance tests** (all `[Fact(Skip = RowLevelConcurrency)]` in `PendingCoverageTests.cs`):
+**The 7 acceptance tests.** Three are LIVE (in `RowLevelConcurrencyTests`, un-parked): the (A) set —
 `ConcurrentDeletes_SameFile_DisjointRows_BothLand`, `ConcurrentDeletes_SameRow_RowLevelConflict`,
+`WithoutRowLevelRetry_VersionConflictSurfaces`. Four remain `[Fact(Skip = RowLevelConcurrency)]` in
+`PendingCoverageTests.cs`, all needing (B) or the buffered seam:
 `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
-`DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`, `WithoutRowLevelRetry_VersionConflictSurfaces`,
+`DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`,
 `BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete`.
 
-**Entry points:** `Concurrency/ConflictChecker.cs` (delete/delete verdict → must split same-file-disjoint-DV
-from same-row); `DeltaTable.CommitOccAsync` (the catch/retry loop — where DV-union resolution + retry hooks
-in); `ComputeDeleteActionsAsync` (DV creation via `DeletionVectorWriter`, ~line 1180) and its DELETE
-`addFile with { DeletionVector = newDv }` (preserves baseRowId — DELETE is fine); `ComputeUpdateActionsAsync`
-(the bare-AddFile rewrite — the (B) gap); `DeletionVectors/DeletionVectorReader`+`Writer` (for DV read/union);
-`RowTracking.RowTrackingWriter` (`AddRowIdColumn`/`StripRowIdColumn`).
+**Entry points.** For (A) as built: `DeltaTable.ResolveRowLevelDeletesAsync` (the DV-union resolver — where
+same-file-disjoint-DV is split from same-row, and where a rewritten-away file falls out to abort — this is
+the natural hook to extend for (B)); `DeltaTable.CommitOccAsync` (`rowLevelDeletes` param + the catch/retry
+that calls the resolver before the checker); `ComputeDeleteActionsAsync` (records `DeleteDvEdit` per file);
+`Concurrency/ConflictChecker.cs` (`rowLevelResolvedPaths` skips a reconciled file). For (B):
+`ComputeUpdateActionsAsync` (the bare-AddFile rewrite that drops baseRowId — the gap); `RowTracking.RowTrackingWriter`
+(`AddRowIdColumn`/`StripRowIdColumn`); `DeletionVectors/DeletionVectorReader`+`Writer` (DV read/union).
 
 ## Measure, don't assume
 

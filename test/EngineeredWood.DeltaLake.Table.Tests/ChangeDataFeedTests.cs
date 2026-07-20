@@ -36,9 +36,10 @@ public class ChangeDataFeedTests : IDisposable
         {
             new ProtocolAction
             {
-                MinReaderVersion = 1,
+                MinReaderVersion = 3,
                 MinWriterVersion = 7,
-                WriterFeatures = ["changeDataFeed"],
+                ReaderFeatures = ["deletionVectors"],
+                WriterFeatures = ["changeDataFeed", "deletionVectors"],
             },
             new MetadataAction
             {
@@ -49,6 +50,7 @@ public class ChangeDataFeedTests : IDisposable
                 Configuration = new Dictionary<string, string>
                 {
                     { CdfConfig.EnableKey, "true" },
+                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
                 },
             },
         });

@@ -196,7 +196,8 @@ public class CodecSeamTests : IDisposable
             DataFileReader = reader,
         };
 
-        await using var table = await DeltaTable.CreateAsync(fs, Schema(), options);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, Schema(), options, enableDeletionVectors: true);
         await table.WriteAsync([Rows(table.ArrowSchema, (1, "a"), (2, "b"), (3, "c"))]);
 
         await table.DeleteAsync(batch =>

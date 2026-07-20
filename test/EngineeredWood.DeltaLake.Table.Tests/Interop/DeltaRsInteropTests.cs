@@ -314,6 +314,71 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal([(1L, "us"), (3L, "us")], RowsFromJson(result));
     }
 
+    // ── Row-level concurrency — slice 9 Layer 3 sub-problem A (DELETE/DELETE deletion-vector union). ──
+
+    /// <summary>
+    /// <para>Two concurrent EW deletes of DISJOINT rows of the same file both land by rebasing the loser's
+    /// deletion vector onto the winner's — producing a <b>unioned</b> DV that no single EW operation wrote
+    /// (the Databricks row-level-concurrency extension; OSS Spark/delta-rs conflict at file granularity, so
+    /// neither would demonstrate both-land). EW applies that union exactly: it reads back only the surviving
+    /// middle row.</para>
+    ///
+    /// <para>The table opts into deletion vectors at creation, so its protocol declares the
+    /// <c>deletionVectors</c> reader feature. That declaration is the correctness fix: it changes a foreign
+    /// reader's behavior from <i>silently returning the deleted rows</i> (data loss — what happened before
+    /// EW declared the feature) to a <b>safe refusal</b>. Measured against delta-rs 1.6.2, whose reader does
+    /// not yet support deletion vectors: it rejects the table outright rather than mis-read it. That is the
+    /// spec-correct reaction of a reader that cannot apply DVs, and the same shape as
+    /// <see cref="EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3"/>. <b>Validating that
+    /// a DV-capable engine reads the union correctly needs tier 3</b> (see
+    /// <c>SparkInteropTests.EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow</c>).</para>
+    /// </summary>
+    [Fact]
+    public async Task EwUnionedDeletionVector_EwApplies_DeltaRsSafelyRefusesUnsupportedFeature()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema, enableDeletionVectors: true))
+        {
+            // One file, three rows at known positions 0/1/2.
+            await setup.WriteAsync([IdRegionBatch([5, 7, 9], ["us", "eu", "us"])]);
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        // A deletes row 5 (pos 0); B, still on the base snapshot, deletes the disjoint row 9 (pos 2). B
+        // collides, rebases its DV onto A's, and the file's DV becomes {0, 2}.
+        var (_, vA) = await tableA.DeleteAsync(IdEqualsRegion(5));
+        var (_, vB) = await tableB.DeleteAsync(IdEqualsRegion(9));
+        Assert.True(vB > vA);
+
+        // EW resolves the union: only the middle row 7 survives.
+        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal([(7L, "eu")], await ReadAllViaEw(reader));
+
+        // The protocol declares the deletionVectors reader feature.
+        var described = DeltaRs.Invoke("describe", new { path = _tempDir });
+        Assert.Contains("deletionVectors",
+            described.GetProperty("reader_features").EnumerateArray().Select(f => f.GetString()));
+
+        // delta-rs 1.6.2 does not support DV reads, so it REFUSES the table (safe) rather than returning the
+        // masked rows. If a future delta-rs gains DV support this flips to a clean read of [(7, "eu")].
+        var rejected = DeltaRs.InvokeRaw("read", new { path = _tempDir });
+        Assert.False(rejected.GetProperty("ok").GetBoolean());
+        Assert.Contains("deletionVectors", rejected.GetProperty("error").GetString()!);
+    }
+
+    private static Func<RecordBatch, BooleanArray> IdEqualsRegion(long target) => batch =>
+    {
+        var id = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < id.Length; i++)
+            mask.Append(id.GetValue(i) == target);
+        return mask.Build();
+    };
+
     // ── Protocol / writer features — slices 5 (`c1b1474`, `70d2384`) and 6 (`aa3f0e2`). ──
 
     /// <summary>

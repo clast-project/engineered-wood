@@ -26,8 +26,9 @@ public class PendingCoverageTests
         "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
 
     private const string RowLevelConcurrency =
-        "Blocked: needs row-level concurrency (ComputeDeletionVectorActionsAsync(resolveAgainst:) + the " +
-        "row-level conflict/retry path) — PR #4 slice 9.";
+        "Blocked: needs row-level concurrency sub-problem B — a copy-on-write rewrite (UPDATE/compaction) " +
+        "that carries surviving rows' baseRowId through, plus remap-by-row-id on rebase. Sub-problem A " +
+        "(DELETE/DELETE deletion-vector union) landed in RowLevelConcurrencyTests — PR #4 slice 9.";
 
     private const string SetSchema = "Blocked: needs DeltaTable.SetSchemaAsync — PR #4 slice 8 leftover.";
 
@@ -102,15 +103,18 @@ public class PendingCoverageTests
     // a transaction, and row-level (same-file disjoint-row) concurrency, are still parked below.
 
     // ── Row-level concurrency — pr-4 RowLevelConcurrencyTests ──
-
-    /// <summary>Two concurrent deletes touching DISJOINT rows of the same file must BOTH land (the point
-    /// of row-level concurrency: file-level conflict detection would reject the second).</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void ConcurrentDeletes_SameFile_DisjointRows_BothLand() { }
-
-    /// <summary>Two concurrent deletes of the SAME row must conflict.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void ConcurrentDeletes_SameRow_RowLevelConflict() { }
+    //
+    // UN-PARKED (sub-problem A — DELETE/DELETE deletion-vector union): the three cases a DV-only rebase
+    // covers — two disjoint-row deletes of the same file both landing, two same-row deletes conflicting,
+    // and a non-reconcilable conflict (a rewritten-away file) still surfacing — are now live in
+    // RowLevelConcurrencyTests, against the row-level resolution DeltaTable.CommitOccAsync gained. DV
+    // positions are stable across a concurrent DV-delete, so no row tracking is needed for this half.
+    //
+    // STILL PARKED (sub-problem B — rewrite-preservation): the cases below need a copy-on-write rewrite
+    // (UPDATE / compaction) to carry each surviving row's baseRowId through so a concurrent delete can be
+    // remapped onto the rewritten file by stable row id. ComputeUpdateActionsAsync currently builds a bare
+    // AddFile (no BaseRowId) and strips the row-id column, so these remain blocked on that work — which is
+    // also what would retire the row-tracking rebaseSafe:false limitation.
 
     /// <summary>A concurrent UPDATE and DELETE on disjoint rows must both land.</summary>
     [Fact(Skip = RowLevelConcurrency)]
@@ -124,11 +128,6 @@ public class PendingCoverageTests
     /// <summary>...but if the row was also concurrently deleted, that is a genuine row-level conflict.</summary>
     [Fact(Skip = RowLevelConcurrency)]
     public void DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict() { }
-
-    /// <summary>Without the row-level retry the plain version conflict must still surface — the retry is
-    /// an addition, not a silencer.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void WithoutRowLevelRetry_VersionConflictSurfaces() { }
 
     /// <summary>The buffered flow composes: Compute* → rebase → commit, against a concurrent delete.</summary>
     [Fact(Skip = RowLevelConcurrency)]

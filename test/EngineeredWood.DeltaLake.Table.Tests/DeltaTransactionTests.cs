@@ -73,7 +73,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task TwoTransactions_DisjointFiles_BothCommit()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
 
         // Two separate appends => two files: id 5 in one, id 7 in the other.
         await table.WriteAsync([Batch(5)]);
@@ -99,14 +99,16 @@ public class DeltaTransactionTests : IDisposable
     }
 
     /// <summary>
-    /// Two transactions delete rows in the SAME file. The second commit's read (that file) was
-    /// invalidated by the first — a delete/delete conflict — so it aborts. The user's canonical example.
+    /// Two transactions delete the SAME row of the same file. Under row-level concurrency a delete rebases
+    /// its deletion vector onto a concurrent one when the rows are disjoint, but here they overlap — the
+    /// row tx1 removes was already removed by tx2 — so tx1 aborts rather than double-delete. (Disjoint rows
+    /// of the same file both landing is covered by <see cref="RowLevelConcurrencyTests"/>.)
     /// </summary>
     [Fact]
-    public async Task TwoTransactions_SameFile_SecondAborts()
+    public async Task TwoTransactions_SameRow_SecondAborts()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
 
         // A single file holding both rows.
         await table.WriteAsync([Batch(5, 7)]);
@@ -119,10 +121,10 @@ public class DeltaTransactionTests : IDisposable
         long v2 = await tx2.CommitAsync();
         Assert.Equal(baseVersion + 1, v2);
 
-        await tx1.DeleteAsync(IdEquals(5));
+        await tx1.DeleteAsync(IdEquals(7)); // the same row tx2 just removed
         var ex = await Assert.ThrowsAsync<DeltaConflictException>(
             async () => await tx1.CommitAsync());
-        Assert.Contains("removed", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("row level", ex.Message, StringComparison.OrdinalIgnoreCase);
 
         // Only tx2's delete took effect; the table is not corrupted by the aborted transaction.
         Assert.Equal([5L], await ReadIds(table));
@@ -136,7 +138,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task Transaction_NoConcurrency_CommitsAtNextVersion()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 2, 3)]);
         long baseVersion = table.CurrentSnapshot.Version;
 
@@ -153,7 +155,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task Transaction_ReusedAfterCommit_Throws()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1)]);
 
         var tx = table.StartTransaction();
@@ -175,7 +177,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task TwoTransactions_ConcurrentAppends_BothCommit()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1)]);
         long baseVersion = table.CurrentSnapshot.Version;
 
@@ -201,7 +203,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task Transaction_Append_RebasesPastConcurrentDelete()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1)]); // file 1
         await table.WriteAsync([Batch(2)]); // file 2
 
@@ -226,7 +228,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task Transaction_DeleteAndAppend_CommitAtomically()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 2)]);
         long baseVersion = table.CurrentSnapshot.Version;
 
@@ -249,7 +251,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task TwoTransactions_DisjointUpdates_BothCommit()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema, enableDeletionVectors: true);
         await table.WriteAsync([IdValueBatch([5], [50])]);  // file 1
         await table.WriteAsync([IdValueBatch([7], [70])]);  // file 2
 
@@ -276,7 +278,7 @@ public class DeltaTransactionTests : IDisposable
     public async Task TwoTransactions_SameFileUpdate_SecondAborts()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema, enableDeletionVectors: true);
         await table.WriteAsync([IdValueBatch([5, 7], [50, 70])]); // one file
 
         var tx1 = table.StartTransaction();

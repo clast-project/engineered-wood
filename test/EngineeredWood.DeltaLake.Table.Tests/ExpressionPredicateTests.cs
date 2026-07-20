@@ -83,7 +83,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task DeleteByPredicate_RemovesMatchingRows()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1, 2, 3], ["us", "eu", "us"])]);
 
         var (deleted, _) = await table.DeleteAsync(Ex.Equal("region", "us"));
@@ -97,7 +97,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task UpdateByPredicate_UpdatesMatchingRows()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1, 2, 3], ["us", "eu", "us"])]);
 
         var (updated, _) = await table.UpdateAsync(Ex.Equal("region", "us"), SetRegion("xx"));
@@ -117,7 +117,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task Serializable_ConcurrentAppendMatchingPredicate_Aborts()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1, 2], ["us", "eu"])]);
 
         var tx = table.StartTransaction(IsolationLevel.Serializable);
@@ -141,7 +141,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task WriteSerializable_ConcurrentBlindAppendMatchingPredicate_Lands()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1, 2], ["us", "eu"])]);
 
         var tx = table.StartTransaction(); // WriteSerializable (default)
@@ -166,7 +166,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task Serializable_ConcurrentAppendDisjointPredicate_Lands()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1, 2], ["us", "eu"])]);
 
         var tx = table.StartTransaction(IsolationLevel.Serializable);
@@ -189,7 +189,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task TwoTransactions_DisjointDeletePredicates_BothCommit()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch([1], ["us"])]); // file 1
         await table.WriteAsync([Batch([2], ["eu"])]); // file 2
 
@@ -253,7 +253,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task DeleteByDecimalPredicate_EndToEnd()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema, enableDeletionVectors: true);
         await table.WriteAsync([AmountBatch([1, 2, 3], [12.34m, 56.78m, 5.00m])]);
 
         var (deleted, _) = await table.DeleteAsync(Ex.GreaterThan("amt", 20m));
@@ -273,7 +273,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task Serializable_ConcurrentDecimalAppendDisjoint_Lands()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema, enableDeletionVectors: true);
         await table.WriteAsync([AmountBatch([1], [100.00m])]);
 
         var tx = table.StartTransaction(IsolationLevel.Serializable);
@@ -319,7 +319,7 @@ public class ExpressionPredicateTests : IDisposable
         var batch = new RecordBatch(schema, [ids, new Decimal128Array(data)], 1);
 
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await using var table = await DeltaTable.CreateAsync(fs, schema, enableDeletionVectors: true);
         await table.WriteAsync([batch]);
 
         var seen = new List<long>();
@@ -351,7 +351,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task DeleteByDatePredicate_EndToEnd()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema, enableDeletionVectors: true);
         await table.WriteAsync([DateBatch(
             [1, 2, 3],
             [new DateTime(2021, 1, 1), new DateTime(2021, 6, 1), new DateTime(2021, 12, 31)])]);
@@ -375,7 +375,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task Serializable_ConcurrentDateAppendDisjoint_Lands()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema, enableDeletionVectors: true);
         await table.WriteAsync([DateBatch([1], [new DateTime(2021, 6, 15)])]);
 
         var tx = table.StartTransaction(IsolationLevel.Serializable);
@@ -416,7 +416,7 @@ public class ExpressionPredicateTests : IDisposable
     public async Task Serializable_ConcurrentTimestampAppendDisjoint_Lands()
     {
         var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdTsSchema);
+        await using var table = await DeltaTable.CreateAsync(fs, IdTsSchema, enableDeletionVectors: true);
         await table.WriteAsync([TsBatch([1], [new DateTimeOffset(2024, 6, 15, 0, 0, 0, TimeSpan.Zero)])]);
 
         var tx = table.StartTransaction(IsolationLevel.Serializable);
