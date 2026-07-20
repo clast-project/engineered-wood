@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Threading;
 using Apache.Arrow;
 
@@ -17,7 +18,12 @@ namespace EngineeredWood.DeltaLake.Table;
 /// codec seam: the Delta layer owns the <c>_delta_log</c> protocol, the host owns the parquet bytes in BOTH
 /// directions (which is what makes copy-on-write rewrites and compaction preserve codec-specific column
 /// representations the built-in reader is blind to, e.g. the parquet VARIANT logical-type annotation).
+///
+/// <para><b>Experimental</b> (shares diagnostic <c>EWDELTA0001</c> with <see cref="IDataFileWriter"/>): the
+/// codec seam has no in-tree implementation and an unsettled contract, and may change or be removed. See
+/// <c>doc/codec-seam-investigation.md</c>.</para>
 /// </summary>
+[Experimental("EWDELTA0001")]
 public interface IDataFileReader
 {
     /// <summary>

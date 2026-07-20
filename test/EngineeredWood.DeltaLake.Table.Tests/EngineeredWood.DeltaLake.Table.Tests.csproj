@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- CodecSeamTests deliberately implements/exercises the experimental codec seam (EWDELTA0001). -->
+    <NoWarn>$(NoWarn);EWDELTA0001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

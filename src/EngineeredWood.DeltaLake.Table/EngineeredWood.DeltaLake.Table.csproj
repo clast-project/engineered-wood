@@ -6,6 +6,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- PolySharp generates [Experimental] (a runtime-supported attribute) for the netstandard2.0 build. -->
+    <PolySharpIncludeRuntimeSupportedAttributes>true</PolySharpIncludeRuntimeSupportedAttributes>
+    <!-- The codec seam (IDataFileReader/Writer) is [Experimental("EWDELTA0001")]. Suppress the diagnostic
+         for EW's OWN internal plumbing, which necessarily references it (the options properties, the write/
+         rewrite/compaction call sites). NoWarn is scoped to THIS compilation only, so external consumers of
+         the library still get the experimental opt-in signal. -->
+    <NoWarn>$(NoWarn);EWDELTA0001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

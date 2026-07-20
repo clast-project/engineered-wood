@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Diagnostics.CodeAnalysis;
 using EngineeredWood.Parquet;
 
 namespace EngineeredWood.DeltaLake.Table;
@@ -54,13 +55,17 @@ public sealed record DeltaTableOptions
     /// <summary>Optional pluggable writer for data-file bytes. When set, the table delegates parquet file
     /// production to it (e.g. a host's native parquet writer) instead of the built-in <c>ParquetFileWriter</c>;
     /// all other write logic (partitioning, row tracking, stats, the <c>add</c> action, the commit) is unchanged.
-    /// Default: null (use the built-in writer).</summary>
+    /// Default: null (use the built-in writer). <b>Experimental</b> (<c>EWDELTA0001</c>) — the codec seam's
+    /// contract is not settled; see <see cref="IDataFileWriter"/>.</summary>
+    [Experimental("EWDELTA0001")]
     public IDataFileWriter? DataFileWriter { get; init; }
 
     /// <summary>Optional pluggable reader for data-file bytes — the read-side counterpart of
     /// <see cref="DataFileWriter"/>. When set, the table decodes each data file through it (raw physical
     /// batches in file order; see <see cref="IDataFileReader"/>) instead of the built-in
     /// <c>ParquetFileReader</c>; all processing above the decode (column-mapping rename, DV filtering,
-    /// backfill, partition re-add) is unchanged. Default: null (use the built-in reader).</summary>
+    /// backfill, partition re-add) is unchanged. Default: null (use the built-in reader). <b>Experimental</b>
+    /// (<c>EWDELTA0001</c>) — see <see cref="IDataFileReader"/>.</summary>
+    [Experimental("EWDELTA0001")]
     public IDataFileReader? DataFileReader { get; init; }
 }
