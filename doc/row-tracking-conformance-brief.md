@@ -1,9 +1,15 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
-**Status: deferred, and read-only on master.** Any data-changing write to a `delta.enableRowTracking=true`
-table is refused on master (`DeltaTable.RejectRowTrackingWrite`). This document captures everything learned
-while making that call, so a future session can land a correct writer without re-deriving it. It is also the
-**prerequisite for Layer 3 (B)** (row-level concurrency across rewrites) — see `doc/slice9-concurrency-resume.md`.
+**Status: Milestone 1 LANDED (2026-07-20) — appends are spec-conformant and writable; copy-on-write
+rewrites remain refused.** `CreateAsync(..., enableRowTracking: true)` now generates + stores the two
+materialized-column-name properties and declares `rowTracking` + `domainMetadata` (writer 7); an APPEND
+assigns `baseRowId`/`defaultRowCommitVersion` and writes NO materialized column (a row's id is
+`baseRowId + position`); `RejectRowTrackingWrite` now fires only for a rewrite (`!isAppend`) + compaction.
+**MEASURED:** `SparkInteropTests.EwAppended_RowTracking_SparkReadsBaseRowIdPositionIds` — Spark 4.0.1 reads
+`_metadata.row_id` = 0,1,2 across two EW-appended files (baseRowId + position), and recognizes the writer
+feature. Remaining below = Milestone 2+ (rewrite preservation) and Layer 3 (B). This document captures
+everything learned so a future session can finish without re-deriving it; it is the **prerequisite for
+Layer 3 (B)** (row-level concurrency across rewrites) — see `doc/slice9-concurrency-resume.md`.
 
 **IMPORTANT (corrected 2026-07-20): this is PORT + VALIDATE, not greenfield.** The `pr-4` branch (local:
 `git show pr-4:…`) **already implements** row-tracking-through-rewrite and both row-level-concurrency
@@ -151,16 +157,16 @@ emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_
 
 ## Gap analysis (current → conformant)
 
-| # | Gap | Fix |
-|---|---|---|
-| 1 | Writes a hardcoded non-spec `__delta_row_id` column, even for default-id files that need none | Stop writing it for fresh appends; rely on `baseRowId` + position. Only ever write a **materialized** column, under its metadata-declared name, when ids are non-derivable (rewrites). |
-| 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; stamp field IDs under column mapping. |
-| 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. |
-| 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Preserve row **order**, keep all rows, propagate `baseRowId`/`defaultRowCommitVersion` (see "cheap path"). |
-| 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). |
-| 6 | No `CreateAsync` enablement | Add `enableRowTracking: true` → set property + declare `rowTracking` + `domainMetadata` writer features + seed materialized-column-name metadata. |
-| 7 | No interop coverage | Tier-3 Spark tests both directions (EW writes → Spark reads ids; Spark writes → EW reads/preserves ids). |
-| 8 | The write gate | Remove `RejectRowTrackingWrite` once the above hold. |
+| # | Gap | Fix | Status |
+|---|---|---|---|
+| 1 | Writes a hardcoded non-spec `__delta_row_id` column, even for default-id files that need none | Stop writing it for fresh appends; rely on `baseRowId` + position. Only ever write a **materialized** column, under its metadata-declared name, when ids are non-derivable (rewrites). | **DONE (append)** — `ComputeWriteActionsAsync` no longer adds the column on append. The rewrite (materialized) half is Milestone 2. |
+| 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; stamp field IDs under column mapping. | **DONE (names)** — `RowTrackingConfig.GenerateMaterializedColumnNames()` + the two keys, stored by `CreateAsync`. Field-IDs-under-column-mapping deferred to when the columns are actually written (M2). |
+| 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. | deferred (M4, optional) |
+| 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Preserve row **order**, keep all rows, propagate `baseRowId`/`defaultRowCommitVersion` (see "cheap path"). | Milestone 2 |
+| 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). | Milestone 2 |
+| 6 | No `CreateAsync` enablement | Add `enableRowTracking: true` → set property + declare `rowTracking` + `domainMetadata` writer features + seed materialized-column-name metadata. | **DONE** — `CreateAsync(..., enableRowTracking: true)`. |
+| 7 | No interop coverage | Tier-3 Spark tests both directions (EW writes → Spark reads ids; Spark writes → EW reads/preserves ids). | **DONE (append direction)** — `EwAppended_RowTracking_SparkReadsBaseRowIdPositionIds` (Spark reads EW-appended ids). Rewrite direction + Spark→EW preservation are Milestone 2. |
+| 8 | The write gate | Remove `RejectRowTrackingWrite` once the above hold. | **partially relaxed** — now `!isAppend` only; appends pass, rewrites + compaction still refused. Full removal is Milestone 2+. |
 
 ## Implementation plan (ordered) — port pr-4, then validate
 

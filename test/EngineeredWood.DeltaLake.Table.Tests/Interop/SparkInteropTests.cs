@@ -196,6 +196,41 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([(7L, "eu")], RowsFromJson(result)); // Spark applies it too
     }
 
+    /// <summary>
+    /// <para>EW appends to a row-tracking table (<c>delta.enableRowTracking=true</c>); the reference engine
+    /// reads back each row's stable id via Delta's <c>_metadata.row_id</c> generated column. Two appends
+    /// (2 rows then 1) span two files, so the ids come from BOTH files' <c>add.baseRowId</c> plus physical
+    /// position — 0,1 in the first file, 2 in the second — with no materialized column on disk.</para>
+    ///
+    /// <para>This is the cross-engine claim that matters for Milestone 1: EW's freshly-appended
+    /// <c>baseRowId</c> / <c>defaultRowCommitVersion</c> are spec-correct, so a conformant reader derives the
+    /// intended stable ids. A round-trip through EW alone cannot prove it — EW does not itself expose row ids
+    /// yet, and it would agree with its own (possibly wrong) convention. Spark computing 0,1,2 with no gaps or
+    /// duplicates is the actual measurement.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwAppended_RowTracking_SparkReadsBaseRowIdPositionIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdRegionBatch([10, 20], ["us", "eu"])]);   // file 0: row ids 0, 1
+            await table.WriteAsync([IdRegionBatch([30], ["apac"])]);           // file 1: row id 2
+        }
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+
+        var rowIds = result.GetProperty("row_ids").EnumerateArray().Select(e => e.GetInt64()).ToList();
+        Assert.Equal([0L, 1L, 2L], rowIds); // contiguous, unique -> baseRowId + position across both files
+
+        // Spark must actually recognize the writer feature to expose the metadata column.
+        var features = result.GetProperty("detail").GetProperty("table_features")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Contains("rowTracking", features);
+    }
+
     /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
     private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>
     {

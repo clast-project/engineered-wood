@@ -36,6 +36,33 @@ public static class RowTrackingConfig
     public const string DomainName = "delta.rowTracking";
 
     /// <summary>
+    /// Table-property key naming the hidden physical column that MATERIALIZES row IDs (spec:
+    /// <c>delta.rowTracking.materializedRowIdColumnName</c>). A conformant reader consults this to find the
+    /// per-row row-id column that overrides <c>baseRowId + position</c> for rows moved by a rewrite. The name
+    /// is fixed at table creation and never changes.
+    /// </summary>
+    public const string MaterializedRowIdColumnNameKey = "delta.rowTracking.materializedRowIdColumnName";
+
+    /// <summary>
+    /// Table-property key naming the hidden physical column that MATERIALIZES row commit versions (spec:
+    /// <c>delta.rowTracking.materializedRowCommitVersionColumnName</c>). The commit-version counterpart of
+    /// <see cref="MaterializedRowIdColumnNameKey"/>.
+    /// </summary>
+    public const string MaterializedRowCommitVersionColumnNameKey =
+        "delta.rowTracking.materializedRowCommitVersionColumnName";
+
+    /// <summary>
+    /// Generates the two spec-required hidden physical column names for a table that is enabling row tracking.
+    /// The names are UUID-suffixed so they can never collide with a user column; they are FIXED at enablement,
+    /// stored in table metadata under <see cref="MaterializedRowIdColumnNameKey"/> /
+    /// <see cref="MaterializedRowCommitVersionColumnNameKey"/>, and honored by every reader/writer thereafter.
+    /// Fresh appends never write these columns (a row's id is <c>baseRowId + position</c>); they carry
+    /// materialized values only for rows relocated by a copy-on-write rewrite.
+    /// </summary>
+    public static (string RowIdColumnName, string RowCommitVersionColumnName) GenerateMaterializedColumnNames() =>
+        ($"_row_id_{Guid.NewGuid():N}", $"_row_commit_version_{Guid.NewGuid():N}");
+
+    /// <summary>
     /// Builds the <c>delta.rowTracking</c> domainMetadata action recording the new high-water mark. The
     /// domain stores the HIGHEST ASSIGNED row id (spec), while <paramref name="nextAvailableRowId"/> is
     /// engineered-wood's internal "next id to assign".

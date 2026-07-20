@@ -12,11 +12,11 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// Row tracking (<c>delta.enableRowTracking=true</c>) is READ-ONLY in this library for now: EngineeredWood
-/// cannot yet maintain stable row IDs through appends and copy-on-write rewrites, so a data-changing write
-/// to a row-tracking table is refused rather than silently corrupting it (a spec-conformant writer — the
-/// deferred Layer 3 (B) work — would lift this). These tests pin the refusal and that reads / non-tracking
-/// writes are unaffected.
+/// Row tracking (<c>delta.enableRowTracking=true</c>) supports APPENDS: a freshly-appended file's rows derive
+/// their stable ids from <c>add.baseRowId + position</c>, which EngineeredWood assigns and records correctly.
+/// A copy-on-write REWRITE (UPDATE / DELETE / OVERWRITE / compaction) is still refused, because it must carry
+/// each surviving row's ORIGINAL id in a materialized column — the deferred Layer 3 (B) work. These tests pin
+/// the stored enablement metadata, the append behavior, and the rewrite refusal.
 /// </summary>
 public class RowTrackingTests : IDisposable
 {
@@ -34,64 +34,129 @@ public class RowTrackingTests : IDisposable
             Directory.Delete(_tempDir, recursive: true);
     }
 
-    private async Task<DeltaTable> CreateRowTrackingTable()
+    private static Apache.Arrow.Schema Schema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("value", StringType.Default, true))
+        .Build();
+
+    private Task<DeltaTable> CreateRowTrackingTable() =>
+        DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), Schema, enableRowTracking: true).AsTask();
+
+    private static RecordBatch Rows(params (long Id, string? Value)[] rows)
     {
-        var fs = new LocalTableFileSystem(_tempDir);
-        var log = new TransactionLog(fs);
-
-        await log.WriteCommitAsync(0, new List<DeltaAction>
+        var ids = new Int64Array.Builder();
+        var values = new StringArray.Builder();
+        foreach (var (id, value) in rows)
         {
-            new ProtocolAction
-            {
-                MinReaderVersion = 1,
-                MinWriterVersion = 7,
-                WriterFeatures = ["rowTracking"],
-            },
-            new MetadataAction
-            {
-                Id = "rt-table",
-                Format = Format.Parquet,
-                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"value","type":"string","nullable":true,"metadata":{}}]}""",
-                PartitionColumns = [],
-                Configuration = new Dictionary<string, string>
-                {
-                    { RowTrackingConfig.EnableKey, "true" },
-                },
-            },
-        });
-
-        return await DeltaTable.OpenAsync(fs);
+            ids.Append(id);
+            values.Append(value);
+        }
+        return new RecordBatch(Schema, [ids.Build(), values.Build()], rows.Length);
     }
 
-    private RecordBatch OneRow(Apache.Arrow.Schema schema) => new(
-        schema,
-        [new Int64Array.Builder().Append(1).Build(),
-         new StringArray.Builder().Append("a").Build()], 1);
-
     [Fact]
-    public async Task Write_RejectedOnRowTrackingTable()
+    public async Task CreateAsync_StoresRowTrackingMetadataAndFeatures()
     {
         await using var table = await CreateRowTrackingTable();
 
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(
-            async () => await table.WriteAsync([OneRow(table.ArrowSchema)]));
-        Assert.Contains("row-tracking", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var config = table.CurrentSnapshot.Metadata.Configuration!;
+        Assert.Equal("true", config[RowTrackingConfig.EnableKey]);
+
+        // The two hidden materialized-column names are fixed at enablement and must be present, non-empty,
+        // and distinct (a reader consults them to find the per-row id/version columns a rewrite will write).
+        string rowIdCol = config[RowTrackingConfig.MaterializedRowIdColumnNameKey];
+        string rowCommitVersionCol = config[RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey];
+        Assert.False(string.IsNullOrEmpty(rowIdCol));
+        Assert.False(string.IsNullOrEmpty(rowCommitVersionCol));
+        Assert.NotEqual(rowIdCol, rowCommitVersionCol);
+
+        // rowTracking is a writer-only feature (writer 7) depending on domainMetadata; the reader is untouched.
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal(7, protocol.MinWriterVersion);
+        Assert.Contains("rowTracking", protocol.WriterFeatures!);
+        Assert.Contains("domainMetadata", protocol.WriterFeatures!);
+        Assert.True(protocol.ReaderFeatures is null || !protocol.ReaderFeatures.Contains("rowTracking"));
+    }
+
+    [Fact]
+    public async Task Append_AssignsBaseRowIdAndDefaultCommitVersion()
+    {
+        await using var table = await CreateRowTrackingTable();
+
+        await table.WriteAsync([Rows((10, "a"), (20, "b"), (30, "c"))]);
+
+        var addFile = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        Assert.Equal(0L, addFile.BaseRowId);
+        Assert.Equal(1L, addFile.DefaultRowCommitVersion); // create = v0, first append = v1
+
+        // The domain high-water mark records the HIGHEST ASSIGNED id (3 rows: ids 0,1,2 -> highest 2).
+        Assert.Equal(2L, RowTrackingConfig.TryReadHighWaterMark(table.GetDomainMetadata()));
+    }
+
+    [Fact]
+    public async Task Append_WritesNoMaterializedRowIdColumn()
+    {
+        await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((10, "a"), (20, "b"))]);
+
+        // A fresh append must NOT add a hidden physical column: a row's id is baseRowId + position. Reading
+        // back yields exactly the user schema — no stray _row_id_* / __delta_row_id column leaks through.
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var names = batch.Schema.FieldsList.Select(f => f.Name).ToArray();
+            Assert.Equal(["id", "value"], names);
+        }
+    }
+
+    [Fact]
+    public async Task SecondAppend_ContinuesRowIdsFromHighWaterMark()
+    {
+        await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((10, "a"), (20, "b"))]);  // ids 0,1 -> next 2
+        await table.WriteAsync([Rows((30, "c"))]);              // id 2   -> next 3
+
+        var second = table.CurrentSnapshot.ActiveFiles.Values
+            .OrderByDescending(f => f.BaseRowId ?? -1).First();
+        Assert.Equal(2L, second.BaseRowId);
+        Assert.Equal(2L, second.DefaultRowCommitVersion); // second append = v2
+        Assert.Equal(2L, RowTrackingConfig.TryReadHighWaterMark(table.GetDomainMetadata()));
+    }
+
+    [Fact]
+    public async Task Append_RoundTripsData()
+    {
+        await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((10, "a"), (20, "b"), (30, null))]);
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var read = new List<(long, string?)>();
+        await foreach (var batch in reopened.ReadAllAsync())
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var values = (StringArray)batch.Column("value");
+            for (int i = 0; i < batch.Length; i++)
+                read.Add((ids.GetValue(i)!.Value, values.GetString(i)));
+        }
+        read.Sort();
+        Assert.Equal([(10L, "a"), (20L, "b"), (30L, null)], read);
     }
 
     [Fact]
     public async Task Delete_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((1, "a"))]);
 
-        // The write-precondition gate fires before any file is read, so an empty table is enough.
-        await Assert.ThrowsAsync<NotSupportedException>(
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(
             async () => await table.DeleteAsync(_ => new BooleanArray.Builder().Build()));
+        Assert.Contains("row-tracking", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
     public async Task Update_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((1, "a"))]);
 
         await Assert.ThrowsAsync<NotSupportedException>(
             async () => await table.UpdateAsync(
@@ -99,9 +164,21 @@ public class RowTrackingTests : IDisposable
     }
 
     [Fact]
+    public async Task Overwrite_RejectedOnRowTrackingTable()
+    {
+        await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((1, "a"))]);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.WriteAsync([Rows((2, "b"))], DeltaWriteMode.Overwrite));
+    }
+
+    [Fact]
     public async Task Compaction_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
+        await table.WriteAsync([Rows((1, "a"))]);
+        await table.WriteAsync([Rows((2, "b"))]);
 
         await Assert.ThrowsAsync<NotSupportedException>(
             async () => await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));

@@ -128,6 +128,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         IReadOnlyList<string>? clusteringColumns = null,
         bool enableDeletionVectors = false,
+        bool enableRowTracking = false,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -190,6 +191,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
         }
 
+        // Row tracking is opt-in: set the property and store the two spec-required hidden column names now
+        // (they are fixed at enablement — a reader consults them to find the materialized id/version columns
+        // an eventual rewrite writes). Fresh appends need neither column: a row's id is baseRowId + position.
+        // The rowTracking + domainMetadata writer features are declared below.
+        if (enableRowTracking)
+        {
+            configuration ??= new Dictionary<string, string>();
+            configuration[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
+            var (rowIdCol, rowCommitVersionCol) =
+                DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
+            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
+            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
+                rowCommitVersionCol;
+        }
+
         // The legacy protocol versions this table would carry if NO table feature forced it into
         // table-features mode. Captured before any feature escalates the versions below, because
         // switching to reader 3 / writer 7 means every capability the legacy versions IMPLIED must be
@@ -227,6 +243,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             readerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
             writerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
+        }
+
+        // Row tracking — a WRITER-only feature ('rowTracking', writer 7) that depends on the 'domainMetadata'
+        // writer feature (the row-id high-water mark rides the delta.rowTracking system domain). Readers see
+        // ordinary data plus optional add.baseRowId metadata, so the reader version is untouched. The append
+        // path assigns baseRowId + defaultRowCommitVersion and advances the HWM domain; copy-on-write rewrites
+        // remain refused until materialization lands (see RejectRowTrackingWrite).
+        if (enableRowTracking)
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("rowTracking");
+            if (!writerFeatures.Contains("domainMetadata"))
+                writerFeatures.Add("domainMetadata");
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -1974,27 +2003,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     internal void ValidateWritable(Snapshot.Snapshot snapshot, bool isAppend)
     {
         ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
-        RejectRowTrackingWrite(snapshot);
+        // Appends to a row-tracking table are spec-conformant (baseRowId + position; no rewrite of existing
+        // rows), so only a data-CHANGING rewrite (update / delete / overwrite) is refused — those must
+        // preserve existing rows' ids through a copy-on-write rewrite, which is not yet implemented.
+        if (!isAppend)
+            RejectRowTrackingWrite(snapshot);
         HonorWriterFeatures(snapshot, isAppend);
     }
 
     /// <summary>
-    /// Row tracking (<c>delta.enableRowTracking=true</c>) is READ-ONLY in this library: a data-changing
-    /// write is refused rather than silently producing a broken table. EngineeredWood cannot yet maintain
-    /// stable row IDs the way the protocol requires — it assigns <c>baseRowId</c> on write but DROPS it on
-    /// any copy-on-write rewrite (UPDATE / compaction) and materializes a non-spec internal column — so a
-    /// write would corrupt the row-id invariants a conformant engine (Spark, Databricks) relies on. Reading
-    /// a row-tracking table is fully supported (<c>baseRowId</c> is log metadata that does not affect the
-    /// data). Lifting this gate is the deferred Layer 3 (B) work; see <c>doc/slice9-concurrency-resume.md</c>.
+    /// A copy-on-write REWRITE of a row-tracking table (<c>delta.enableRowTracking=true</c>) is refused
+    /// rather than silently producing a broken table. APPENDS are supported — a freshly-appended file's rows
+    /// derive their stable ids from <c>baseRowId + position</c>, which EngineeredWood assigns correctly. But
+    /// an UPDATE / DELETE / OVERWRITE that rewrites existing rows must carry each surviving row's ORIGINAL id
+    /// in a materialized column; EngineeredWood does not do this yet, so such a write would corrupt the
+    /// row-id invariants a conformant engine (Spark, Databricks) relies on. Reading a row-tracking table is
+    /// fully supported. Lifting this gate is the deferred Layer 3 (B) work; see
+    /// <c>doc/slice9-concurrency-resume.md</c>.
     /// </summary>
     private static void RejectRowTrackingWrite(Snapshot.Snapshot snapshot)
     {
         if (DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
         {
             throw new NotSupportedException(
-                "Writing to a row-tracking table (delta.enableRowTracking=true) is not supported: "
-                + "EngineeredWood cannot yet maintain stable row IDs through appends and rewrites without "
-                + "corrupting them. Reading such a table is supported; a spec-conformant writer is planned.");
+                "Rewriting a row-tracking table (delta.enableRowTracking=true) is not supported: "
+                + "EngineeredWood cannot yet preserve stable row IDs through a copy-on-write rewrite "
+                + "(UPDATE / DELETE / OVERWRITE / compaction) without corrupting them. Appending to and "
+                + "reading such a table is supported; a spec-conformant rewrite path is planned.");
         }
     }
 
@@ -2286,12 +2321,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // (field ids already stamped recursively above; IcebergCompat-appended partition columns are
                 // physical-named by AppendPartitionColumns and carry no mapping ids of their own)
 
-                // Assign row IDs if row tracking is enabled
+                // Assign row IDs if row tracking is enabled. A freshly-appended file needs ONLY
+                // add.baseRowId + add.defaultRowCommitVersion (set on the AddFile below): a row's stable id is
+                // baseRowId + its physical position, and its commit version is the file's default. NO
+                // materialized column is written — that is reserved for rows RELOCATED by a copy-on-write
+                // rewrite (deferred). Materializing one here produced a non-spec physical column a foreign
+                // reader would surface as a stray column.
                 long fileBaseRowId = nextRowId;
                 if (rowTrackingEnabled)
                 {
-                    physicalBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(
-                        physicalBatch, fileBaseRowId);
                     nextRowId += dataBatch.Length;
                 }
 

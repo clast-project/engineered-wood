@@ -221,6 +221,12 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
 
 - **(B) Rewrite-preservation (UPDATE, compaction remap) — DEFERRED behind a write fail-fast (2026-07-20).**
   **The full brief is `doc/row-tracking-conformance-brief.md` — read that when building (B).**
+  **UPDATE (2026-07-20): row-tracking Milestone 1 LANDED — appends are now writable + spec-conformant.**
+  `CreateAsync(..., enableRowTracking: true)` generates/stores the two `materialized*ColumnName` properties
+  and declares `rowTracking`+`domainMetadata`; appends assign `baseRowId`/`defaultRowCommitVersion` with NO
+  materialized column; `RejectRowTrackingWrite` now fires only for `!isAppend` + compaction. Spark 4.0.1
+  reads the appended ids correctly (`SparkInteropTests.EwAppended_RowTracking_SparkReadsBaseRowIdPositionIds`).
+  (B) itself — the copy-on-write rewrite preservation — is still deferred; the write fail-fast still guards it.
   **CORRECTION (2026-07-20): this is a PORT + VALIDATE, not greenfield.** The `pr-4` branch ALREADY implements
   row-tracking-through-rewrite (the `RowTrackingWriter` materialization overloads, the `materializeIds` UPDATE/
   DELETE/compaction paths keyed off `delta.rowTracking.materializedRowIdColumnName`, and the remap —

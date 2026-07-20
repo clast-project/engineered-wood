@@ -132,6 +132,28 @@ def cmd_read(args):
     }
 
 
+def cmd_read_row_ids(args):
+    """Read an EW row-tracking table via Delta's generated row-tracking metadata columns.
+
+    Row tracking surfaces each row's stable id / commit version through the _metadata.row_id and
+    _metadata.row_commit_version generated columns. For a freshly-appended file (which carries NO
+    materialized column) a conformant reader computes row_id = add.baseRowId + physical position; reading
+    them here is how EW's add.baseRowId is validated as spec-correct cross-engine, not merely round-tripped.
+    """
+    spark = _spark()
+    id_col = args.get("id_col", "id")
+    df = (spark.read.format("delta").load(_uri(args["path"]))
+          .selectExpr(id_col,
+                      "_metadata.row_id AS row_id",
+                      "_metadata.row_commit_version AS row_commit_version"))
+    rows = [r.asDict(recursive=True) for r in df.collect()]
+    return {
+        "rows": sorted(rows, key=lambda r: (r["row_id"] is None, r["row_id"])),
+        "row_ids": sorted(r["row_id"] for r in rows),
+        "detail": _detail(spark, args["path"]),
+    }
+
+
 def cmd_write(args):
     """Write a table WITH Spark, for the reference -> EW direction.
 
@@ -260,6 +282,7 @@ def cmd_write_variant(args):
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
+    "read_row_ids": cmd_read_row_ids,
     "read_variant": cmd_read_variant,
     "write_variant": cmd_write_variant,
     "write": cmd_write,
