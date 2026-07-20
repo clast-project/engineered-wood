@@ -140,13 +140,14 @@ Design facts worth keeping:
      +4, `ExpressionPredicateTests` +3 (incl. an end-to-end timestamp concurrentAppend-precision case).
    - **stats-pruning gaps for these types (measured, then fixed/pending):** timestamp stats always
      round-tripped and pruned. Date stats were emitted as a raw day-number the decoder rejects → no
-     pruning (SAFE); **fixed (pending commit):** `StatsCollector` now emits date bounds as Spark's
-     `"yyyy-MM-dd"` strings (verified by a tier-3 test that Spark skips a file on a date predicate). Decimal
-     stats are still not collected → no decimal pruning (SAFE); **decimal stats emission is the next piece**
-     — emit min/max as JSON numbers (measured: Spark writes even 38-digit decimals as raw numbers), exact
-     via unscaled `BigInteger`, `Utf8JsonWriter.WriteRawValue` for high-precision. Checkpoint is safe
-     (the `stats` JSON string is preserved on read; the `stats_parsed` decimal→double approx is unused by
-     EW's pruner — a separate pre-existing quirk).
+     pruning (SAFE); **fixed (`18c2de8`):** `StatsCollector` now emits date bounds as Spark's `"yyyy-MM-dd"`
+     strings (verified by a tier-3 test that Spark skips a file on a date predicate). Decimal was likewise
+     not collected → no decimal pruning; **fixed (pending commit):** decimal min/max now emitted as JSON
+     numbers — Decimal32/64 via `System.Decimal`, Decimal128/256 via exact unscaled `BigInteger` +
+     `Utf8JsonWriter.WriteRawValue` so high-precision (measured: Spark writes even 38-digit decimals as raw
+     numbers) survives. Tier-3 test confirms Spark prunes on EW decimal stats. Both stats fixes are now
+     complete. Checkpoint is safe (the `stats` JSON string is preserved on read; the `stats_parsed`
+     decimal→double approx is unused by EW's pruner — a separate pre-existing quirk).
    - rebasing partition/dynamic overwrite now has the predicate machinery it needed, but still needs the
      overwrite read-set expressed as a partition predicate.
 4. **Layer 3 — row-level concurrency.** The Databricks extension. Largest remaining piece; needs
