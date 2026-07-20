@@ -1712,7 +1712,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (_options.DataFileWriter is { } rewriteWriter)
             {
                 fileSize = await rewriteWriter.WriteAsync(
-                    writeBatches, newFileName, cancellationToken).ConfigureAwait(false);
+                    writeBatches.ToAsyncEnumerable(), newFileName, cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -2332,7 +2332,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // Delegate the parquet bytes to the host writer; it places the file at the location the
                     // table filesystem maps `fileName` to and returns its byte size.
                     fileSize = await dataFileWriter.WriteAsync(
-                        [writeBatch], fileName, cancellationToken).ConfigureAwait(false);
+                        new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 else
                 {

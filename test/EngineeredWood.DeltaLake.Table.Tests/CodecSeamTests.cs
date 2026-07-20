@@ -39,16 +39,20 @@ public class CodecSeamTests : IDisposable
         public List<int> BatchCounts { get; } = [];
 
         public async ValueTask<long> WriteAsync(
-            IReadOnlyList<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
         {
             Written.Add(relativePath);
-            BatchCounts.Add(batches.Count);
 
             await using var file = await fs.CreateAsync(relativePath, cancellationToken: cancellationToken);
             await using var writer = new ParquetFileWriter(file, ownsFile: false);
-            foreach (var b in batches)
+            int count = 0;
+            await foreach (var b in batches.WithCancellation(cancellationToken))
+            {
                 await writer.WriteRowGroupAsync(b, cancellationToken);
+                count++;
+            }
             await writer.DisposeAsync();
+            BatchCounts.Add(count); // count as we stream — no materialized list to .Count
             return file.Position;
         }
     }

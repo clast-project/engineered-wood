@@ -20,9 +20,12 @@ public interface IDataFileWriter
 {
     /// <summary>Writes <paramref name="batches"/> as a single parquet file at <paramref name="relativePath"/>
     /// (relative to the table root, including any partition subdirectory), and returns the written file's byte
-    /// size (stored on the <c>add</c> action). A fresh write passes one batch; a copy-on-write rewrite passes the
-    /// surviving batches of one source file. The implementation is responsible for placing the bytes at the
+    /// size (stored on the <c>add</c> action). The batches are <b>streamed</b> — a fresh write yields one batch,
+    /// a copy-on-write rewrite yields the surviving batches of one source file — so an implementation may consume
+    /// them incrementally (e.g. a streaming DuckDB <c>COPY</c>) instead of holding the whole file in memory; one
+    /// that wants a materialized list can collect them itself. This is symmetric with the streaming
+    /// <see cref="IDataFileReader.ReadAsync"/>. The implementation is responsible for placing the bytes at the
     /// location the table's filesystem maps <paramref name="relativePath"/> to.</summary>
-    ValueTask<long> WriteAsync(IReadOnlyList<RecordBatch> batches, string relativePath,
+    ValueTask<long> WriteAsync(IAsyncEnumerable<RecordBatch> batches, string relativePath,
                                CancellationToken cancellationToken);
 }

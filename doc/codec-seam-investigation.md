@@ -80,9 +80,13 @@ limitation.
 
 What genuinely does not fit is the `IReadOnlyList<RecordBatch>` contract:
 
-- **Materialization.** `WriteAsync` takes a realized batch list — the whole file in memory, one call
-  per file. Downstream's `RunCopyPartitioned` (streaming `COPY … PARTITION_BY … APPEND true`, bounded
-  memory, many files from one pass) is therefore **not** on the interface.
+- **Materialization.** ~~`WriteAsync` takes a realized batch list — the whole file in memory.~~ **Half
+  fixed (2026-07-20):** `WriteAsync` now takes `IAsyncEnumerable<RecordBatch>` (symmetric with the
+  streaming `IDataFileReader.ReadAsync`), so a host may consume a file's batches incrementally instead of
+  the interface forcing the whole file into memory; EW passes a lazy enumerable (a rewrite still collects
+  survivors internally for `StatsCollector`, but that is EW's business, not the contract's). What remains
+  is the **one-call-per-file** shape: downstream's `RunCopyPartitioned` (streaming `COPY … PARTITION_BY …
+  APPEND true`, bounded memory, *many files from one pass*) is still **not** expressible on the interface.
 - **The C-ABI crossing itself.** `RunCopySql` (clustered OPTIMIZE) runs the per-file read, the global
   `ORDER BY` (DuckDB's spilling sort) and the write inside a *single* host query so data never crosses
   into C#. `IDataFileRewriter` is the same instinct. Any batch-in/batch-out contract forecloses

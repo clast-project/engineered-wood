@@ -309,7 +309,8 @@ internal static class CompactionExecutor
                 {
                     // Keep the host codec's output quality (bloom filters, stats, footer) through an OPTIMIZE
                     // instead of reverting to the built-in writer for compacted files.
-                    fileSize = await dataFileWriter.WriteAsync(currentBatches, fileName, cancellationToken)
+                    fileSize = await dataFileWriter.WriteAsync(
+                        currentBatches.ToAsyncEnumerable(), fileName, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
