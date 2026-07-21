@@ -53,8 +53,15 @@ internal static class ValueWidener
             if (targetByName.TryGetValue(f.Name, out var targetType)
                 && !TypesMatch(f.DataType, targetType))
             {
-                columns[i] = WidenArray(batch.Column(i), targetType);
-                fields.Add(new Field(f.Name, targetType, f.IsNullable, f.Metadata));
+                var widened = WidenArray(batch.Column(i), targetType);
+                columns[i] = widened;
+                // Relabel with the target type ONLY when the array was actually converted: WidenArray
+                // passes an unsupported pair through unchanged (e.g. a host-transport variant blob vs
+                // the canonical extension type), and labeling untouched data with the target type lies
+                // about its representation — a downstream schema export then mis-describes the column.
+                fields.Add(ReferenceEquals(widened, batch.Column(i))
+                    ? f
+                    : new Field(f.Name, targetType, f.IsNullable, f.Metadata));
             }
             else
             {
