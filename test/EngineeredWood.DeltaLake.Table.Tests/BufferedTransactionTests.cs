@@ -206,4 +206,21 @@ public class BufferedTransactionTests : IDisposable
         // both deletes composed: id 2 (this transaction) and id 7 (the racer) are gone
         Assert.Equal(new long[] { 1, 3, 4, 5, 6, 8, 9, 10 }, await ReadIdsFreshAsync());
     }
+
+    /// <summary>A Delta application transaction (the <c>txn</c> action): an idempotent producer commits its
+    /// application-level version ATOMICALLY with the data via a fused commit; the snapshot exposes the
+    /// high-water mark. Un-parked from PendingCoverageTests.</summary>
+    [Fact]
+    public async Task AppTransactionAction_RoundTrips()
+    {
+        await using var table = await CreateTableAsync();
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await table.CommitDataFilesAsync([], DeltaWriteMode.Append,
+            extraActions: [new TransactionId { AppId = "producer-1", Version = 42, LastUpdated = nowMs }],
+            expectedVersion: table.CurrentSnapshot.Version, operation: "WRITE");
+
+        await using var check = await OpenAsync();
+        Assert.True(check.CurrentSnapshot.AppTransactions.TryGetValue("producer-1", out var txn));
+        Assert.Equal(42, txn!.Version);
+    }
 }

@@ -4,16 +4,15 @@
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <para><b>Coverage that Christoph Mettler's PR #4 has and master does not — parked, not lost.</b></para>
+/// <para><b>Ledger of coverage that Christoph Mettler's PR #4 had and master did not — now FULLY RETIRED.</b></para>
 ///
-/// <para>Every test here pins a behaviour the PR demonstrated (in several cases a real bug it found), but
-/// whose implementation has not been landed on master yet. They are <c>Skip</c>ped rather than failing so
-/// that a red suite still means a real regression; each Skip reason names the exact API that must exist
-/// before it can be un-skipped. When that work lands, grep this file — the bodies are described precisely
-/// enough to write directly from the comment, and the originals are in
-/// <c>pr-4:test/EngineeredWood.DeltaLake.Table.Tests/</c>.</para>
+/// <para>Every case this file once parked (as a <c>Skip</c>ped stub naming the API it needed) has landed and
+/// been un-parked into a real suite; the comments below map each former stub to its live home. Kept as the
+/// audit trail of where PR #4's transaction-era coverage went — the buffered-transaction seam (slice 9), the
+/// ConflictChecker/logical-rebase verdicts, row-level concurrency, SetSchemaAsync, and the clustering rewrite
+/// shape. The originals are in <c>pr-4:test/EngineeredWood.DeltaLake.Table.Tests/</c>.</para>
 ///
-/// <para>Deliberately NOT parked here: tests master already covers under different names (the clustering
+/// <para>Deliberately never parked here: tests master already covers under different names (the clustering
 /// suite, partitioned compaction, the overwrite modes, nested-stats pruning, timestamp resolution,
 /// appendOnly enforcement), and <c>DecimalReadTests.Int32Decimal_ReadsAsDecimal128</c> /
 /// <c>Int64Decimal_ReadsAsDecimal128</c>, which master intentionally diverges from — the widening is an
@@ -21,10 +20,6 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// </summary>
 public class PendingCoverageTests
 {
-    private const string BufferedTxn =
-        "Blocked: needs the buffered-transaction seam (WriteDataFilesAsync / CommitDataFilesAsync / the " +
-        "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
-
     // ── Buffered (multi-statement) transactions — pr-4 BufferedTransactionTests ──
     //
     // UN-PARKED (FusedCommit_AlterInsertDelete_IsOneAtomicVersion + ReadRowsByRowIds_AtVersion_ExactReadBack):
@@ -38,10 +33,9 @@ public class PendingCoverageTests
     //
     // UN-PARKED (ExpectedVersion_ConcurrentWriter_ConflictAborts): the CommitDataFilesAsync(expectedVersion:)
     // conflict-abort is live in ExternalDataFileCommitTests, against the Milestone-A external-commit seam.
-
-    /// <summary>A txn (application transaction id) action must round-trip through a fused commit.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void AppTransactionAction_RoundTrips() { }
+    //
+    // UN-PARKED (AppTransactionAction_RoundTrips): a `txn` action fused into a CommitDataFilesAsync commit
+    // round-trips through the snapshot's AppTransactions map — live in BufferedTransactionTests.
 
     // ── Identity columns across buffered statements — pr-4 IdentityTransactionSeamsTests ──
     //
