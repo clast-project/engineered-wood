@@ -5,6 +5,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
 
@@ -18,17 +19,28 @@ namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 internal static class CdfWriter
 {
     /// <summary>
-    /// Writes a CDC file for a set of changed rows and returns the <see cref="CdcFile"/> action.
+    /// Writes a CDC file for a set of changed rows (given in the table's LOGICAL shape) and returns the
+    /// <see cref="CdcFile"/> action. Under column mapping the row bytes are renamed to PHYSICAL names + parquet
+    /// field ids first, so the <c>_change_data</c> file follows the table's data-file layout exactly (a
+    /// spec reader — Spark's <c>table_changes</c>, delta-kernel — resolves the feed through the same mapping).
+    /// The synthetic <c>_change_type</c> column is added AFTER the rename, so it stays an unmapped, plainly-named
+    /// column. Partition columns are NOT stored in the file bytes (data-file convention) — they ride on the
+    /// returned action's <paramref name="partitionValues"/> and the reader re-materializes them.
     /// </summary>
     public static async ValueTask<CdcFile> WriteAsync(
         ITableFileSystem fs,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
         RecordBatch rows,
         string changeType,
         IReadOnlyDictionary<string, string> partitionValues,
         ParquetWriteOptions? parquetOptions,
         CancellationToken cancellationToken)
     {
-        // Add _change_type column
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        if (mappingMode != ColumnMappingMode.None)
+            rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
+
+        // Add _change_type column (unmapped — added after the physical rename)
         var batchWithChangeType = AddChangeTypeColumn(rows, changeType);
 
         string fileName = $"{CdfConfig.ChangeDataDir}/{Guid.NewGuid():N}.parquet";

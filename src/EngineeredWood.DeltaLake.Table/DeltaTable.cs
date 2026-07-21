@@ -2477,7 +2477,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var deletedBatch in deletedRowBatches)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -2779,7 +2779,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var pre in preimages)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -2787,7 +2787,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var post in postimages)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                        _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -2901,9 +2901,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        var snapshot = CurrentSnapshot;
         return ChangeDataFeed.CdfReader.ReadChangesAsync(
-            _fs, _log, startVersion, endVersion,
-            _dataFileReadOptions, cancellationToken);
+            _fs, _log, startVersion, endVersion, _dataFileReadOptions,
+            snapshot.ArrowSchema, snapshot.Schema,
+            ColumnMapping.GetMode(snapshot.Metadata.Configuration),
+            snapshot.Metadata.PartitionColumns,
+            cancellationToken);
     }
 
     /// <summary>
@@ -2919,11 +2923,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// have Change Data Feed enabled — a CDC file on a non-CDF table would be dead weight no reader consults.
     /// </summary>
     /// <remarks>
-    /// Follows engineered-wood's CDF on-disk convention exactly (the same one the auto DELETE/UPDATE paths write
-    /// and <see cref="ReadChangesAsync"/> reads back): the row bytes are written verbatim, so on a column-mapping
-    /// table they carry LOGICAL names, not physical — matching this reader. That round-trips within
-    /// engineered-wood but is not the Spark physical-name CDC layout; cross-engine CDF on a column-mapping table
-    /// is a standing limitation of the CDF subsystem, not specific to this helper.
+    /// Follows engineered-wood's spec-conformant CDF on-disk layout (the same one the auto DELETE/UPDATE paths
+    /// write and <see cref="ReadChangesAsync"/> reads back): on a column-mapping table the row bytes are stored
+    /// under PHYSICAL names + parquet field ids, exactly like data files, so Spark's <c>table_changes</c> and
+    /// delta-kernel resolve the feed correctly; <see cref="ReadChangesAsync"/> maps them back to logical and
+    /// re-materializes the partition columns.
     /// </remarks>
     public async ValueTask<CdcFile> WriteChangeDataFileAsync(
         RecordBatch rows, string changeType,
@@ -2951,7 +2955,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return await ChangeDataFeed.CdfWriter.WriteAsync(
-            _fs, rows, changeType,
+            _fs, CurrentSnapshot, rows, changeType,
             partitionValues ?? EmptyPartitionValues,
             _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
     }
@@ -4354,7 +4358,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     if (delRows.Count > 0)
                     {
                         var cdc = await ChangeDataFeed.CdfWriter.WriteAsync(
-                            _fs, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                            _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                             addFile.PartitionValues, _options.ParquetWriteOptions,
                             cancellationToken).ConfigureAwait(false);
                         actions.Add(cdc);

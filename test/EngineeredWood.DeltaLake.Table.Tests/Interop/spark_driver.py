@@ -244,6 +244,30 @@ def cmd_scan(args):
     }
 
 
+def cmd_read_changes(args):
+    """Read an EW table's Change Data Feed via Spark's readChangeFeed.
+
+    On a column-mapping table the _change_data files (and the data files a no-cdc version infers
+    inserts/deletes from) are stored in the PHYSICAL layout -- physical names + field ids, partition
+    columns absent. Spark resolves them through the table's column mapping and re-materializes the
+    partition columns, so the columns it reports back are the LOGICAL names + partition columns +
+    _change_type / _commit_version / _commit_timestamp. That is the cross-engine proof that EW writes
+    CDF in the spec layout, not merely that it round-trips through its own reader.
+    """
+    spark = _spark()
+    df = (spark.read.format("delta")
+          .option("readChangeFeed", "true")
+          .option("startingVersion", args["start"])
+          .option("endingVersion", args["end"])
+          .load(_uri(args["path"])))
+    rows = [r.asDict(recursive=True) for r in df.collect()]
+    return {
+        "columns": list(df.columns),
+        "rows": rows,
+        "detail": _detail(spark, args["path"]),
+    }
+
+
 def cmd_read_variant(args):
     """Read an EW-written variant table; report each row's variant as canonical JSON via to_json(v).
 
@@ -283,6 +307,7 @@ COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
     "read_row_ids": cmd_read_row_ids,
+    "read_changes": cmd_read_changes,
     "read_variant": cmd_read_variant,
     "write_variant": cmd_write_variant,
     "write": cmd_write,

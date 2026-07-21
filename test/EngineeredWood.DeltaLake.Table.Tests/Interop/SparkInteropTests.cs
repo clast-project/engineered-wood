@@ -5,6 +5,9 @@ using System.Numerics;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
@@ -1043,5 +1046,114 @@ public class SparkInteropTests : IDisposable
             structType, ids.Length, [scoreArray, labelBuilder.Build()], ArrowBuffer.Empty, nullCount: 0);
 
         return new RecordBatch(NestedSchema, [idArray, payload], ids.Length);
+    }
+
+    // ── Change Data Feed on a column-mapping, partitioned table ──
+
+    private static Apache.Arrow.Schema IdValueRegionSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("value", StringType.Default, true))
+        .Field(new Field("region", StringType.Default, true))
+        .Build();
+
+    private static RecordBatch IdValueRegionBatch(long[] ids, string[] values, string[] regions)
+    {
+        var idArray = new Int64Array.Builder().AppendRange(ids).Build();
+        var valueBuilder = new StringArray.Builder();
+        foreach (string v in values) valueBuilder.Append(v);
+        var regionBuilder = new StringArray.Builder();
+        foreach (string r in regions) regionBuilder.Append(r);
+        return new RecordBatch(IdValueRegionSchema, [idArray, valueBuilder.Build(), regionBuilder.Build()], ids.Length);
+    }
+
+    // Creates a Name-mode column-mapping table partitioned by region with CDF enabled (CreateAsync has no CDF
+    // switch, so the property is patched into the generated, correctly-mapped metadata as a follow-up commit).
+    private async Task<DeltaTable> CreateMappedPartitionedCdfTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long next;
+        MetadataAction meta;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdValueRegionSchema, partitionColumns: ["region"], columnMappingMode: ColumnMappingMode.Name))
+        {
+            meta = created.CurrentSnapshot.Metadata;
+            next = created.CurrentSnapshot.Version + 1;
+        }
+        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[CdfConfig.EnableKey] = "true";
+        await new TransactionLog(fs).WriteCommitAsync(
+            next, new List<DeltaAction> { meta with { Configuration = cfg } });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    /// <summary>
+    /// <para>The cross-engine proof for the CDF write layout: EW writes a Change Data Feed on a
+    /// COLUMN-MAPPING, PARTITIONED table (INSERT inferred from the AddFile, then an UPDATE that writes
+    /// <c>_change_data</c> files), and Spark reads it back via <c>readChangeFeed</c>.</para>
+    ///
+    /// <para>The <c>_change_data</c> files (and the data files the insert is inferred from) are stored in the
+    /// PHYSICAL layout — physical <c>col-&lt;guid&gt;</c> names + parquet field ids, partition column absent.
+    /// Spark resolves them through the table's column mapping and re-materializes the partition column, so it
+    /// reports the LOGICAL names (<c>id</c>/<c>value</c>/<c>region</c>) with the right partition value and change
+    /// types. If EW wrote the feed with logical names (the old behavior), Spark would fail to resolve the
+    /// physical layout or surface the wrong columns — an EW-only round-trip could never catch that.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_ChangeDataFeed_MappedPartitioned_SparkReadsLogicalNamesAndPartition()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long insertVersion, updateVersion;
+        await using (var table = await CreateMappedPartitionedCdfTableAsync())
+        {
+            insertVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdValueRegionBatch([1, 2], ["a", "b"], ["emea", "emea"])]);
+            updateVersion = table.CurrentSnapshot.Version + 1;
+
+            // UPDATE id=1's value → "z": a copy-on-write rewrite that emits update_preimage/postimage cdc files.
+            await table.UpdateAsync(
+                b =>
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 1);
+                    return mask.Build();
+                },
+                b =>
+                {
+                    int vIdx = b.Schema.GetFieldIndex("value");
+                    var cols = new IArrowArray[b.ColumnCount];
+                    for (int i = 0; i < b.ColumnCount; i++)
+                        cols[i] = i == vIdx ? new StringArray.Builder().Append("z").Build() : b.Column(i);
+                    return new RecordBatch(b.Schema, cols, b.Length);
+                });
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = insertVersion, end = updateVersion });
+
+        // Spark resolved the physical layout to the table's LOGICAL columns + the partition column.
+        var columns = result.GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        Assert.Contains("id", columns);
+        Assert.Contains("value", columns);
+        Assert.Contains("region", columns);
+        Assert.Contains("_change_type", columns);
+        Assert.DoesNotContain(columns, c => c!.StartsWith("col-", StringComparison.Ordinal));
+
+        // Gather (change_type, id, value, region) tuples.
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Ct: r.GetProperty("_change_type").GetString(),
+                Id: r.GetProperty("id").GetInt64(),
+                Value: r.GetProperty("value").GetString(),
+                Region: r.GetProperty("region").GetString()))
+            .ToList();
+
+        // Every row carries the re-materialized partition value.
+        Assert.All(rows, t => Assert.Equal("emea", t.Region));
+        // The two inserts, the pre-image (old value "a") and the post-image (new value "z") for id=1.
+        Assert.Contains(rows, t => t.Ct == "insert" && t.Id == 2 && t.Value == "b");
+        Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 1 && t.Value == "a");
+        Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
 }
