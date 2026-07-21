@@ -4627,9 +4627,133 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// commit version advances to this commit; untouched rows keep theirs). CDF / IcebergCompat not yet supported
     /// on this path. Returns the committed version (or the current version if nothing matched).
     /// </summary>
-    public async ValueTask<long> UpdateByRowIdsAsync(
+    public ValueTask<long> UpdateByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
         Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
+        CancellationToken cancellationToken = default)
+        => UpdateByRowIdsCoreAsync(rowIds, (ordinal, batches, _) => rewriteFile(ordinal, batches),
+                                   cancellationToken);
+
+    /// <summary>
+    /// Copy-on-write UPDATE by TRANSIENT rowid, with each source row's rowid ALSO handed to the rewriter — so a
+    /// host that computed the new values keyed by rowid (e.g. a DuckDB join against the Delta table, producing
+    /// <c>rowid → new SET values</c>) substitutes them by an O(1) lookup instead of re-matching on row content.
+    /// <paramref name="rewriteFile"/> receives <c>(fileOrdinal, sourceBatches, rowIdsPerBatch)</c> where
+    /// <c>rowIdsPerBatch[b][i]</c> is the transient rowid of row <c>i</c> of source batch <c>b</c> (same encoding
+    /// as <paramref name="rowIds"/>); it returns the modified batches (one per source batch, identical row
+    /// counts). Everything else matches the delegate overload above.
+    /// </summary>
+    public ValueTask<long> UpdateByRowIdsAsync(
+        IReadOnlyCollection<long> rowIds,
+        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
+        CancellationToken cancellationToken = default)
+        => UpdateByRowIdsCoreAsync(rowIds, rewriteFile, cancellationToken);
+
+    /// <summary>
+    /// Copy-on-write UPDATE by TRANSIENT rowid from a batch of new values — the convenience form for the
+    /// "update from a host-side join" scenario, so the caller supplies no substitution code at all.
+    /// <paramref name="updates"/> carries one row per rowid to change: a rowid column (named
+    /// <paramref name="rowIdColumn"/>, default <see cref="DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn"/>
+    /// — what <see cref="ReadAllWithRowIdsAsync"/> emits) plus one column per SET column, named by its LOGICAL
+    /// table-column name and typed to match. For every source row whose rowid appears in <paramref name="updates"/>,
+    /// each SET column's value is replaced with the corresponding value from <paramref name="updates"/> (type-
+    /// agnostic, via concat + take — no per-type code); all other columns and rows pass through. Duplicate rowids
+    /// in <paramref name="updates"/> are a caller error (last one wins). Returns the committed version (or the
+    /// current version if nothing matched).
+    /// </summary>
+    public ValueTask<long> UpdateByRowIdsAsync(
+        RecordBatch updates,
+        string? rowIdColumn = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (updates is null)
+            throw new ArgumentNullException(nameof(updates));
+        rowIdColumn ??= DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn;
+
+        int ridIdx = updates.Schema.GetFieldIndex(rowIdColumn);
+        if (ridIdx < 0)
+            throw new ArgumentException(
+                $"updates has no rowid column '{rowIdColumn}'.", nameof(updates));
+        if (updates.Column(ridIdx) is not Int64Array ridArray)
+            throw new ArgumentException(
+                $"updates rowid column '{rowIdColumn}' must be Int64.", nameof(updates));
+
+        // rowid → its row index in `updates`, and the SET columns (everything except the rowid column).
+        var updIndexByRowId = new Dictionary<long, int>(updates.Length);
+        for (int i = 0; i < updates.Length; i++)
+            if (!ridArray.IsNull(i))
+                updIndexByRowId[ridArray.GetValue(i)!.Value] = i;
+
+        var setColumns = new List<(string Name, IArrowArray Values)>();
+        for (int c = 0; c < updates.ColumnCount; c++)
+            if (c != ridIdx)
+                setColumns.Add((updates.Schema.FieldsList[c].Name, updates.Column(c)));
+
+        var rowIds = updIndexByRowId.Keys.ToArray();
+        return UpdateByRowIdsCoreAsync(
+            rowIds,
+            (ordinal, sourceBatches, rowIdsPerBatch) =>
+                ApplyRowIdKeyedUpdates(sourceBatches, rowIdsPerBatch, updIndexByRowId, setColumns),
+            cancellationToken);
+    }
+
+    // Substitutes the SET columns' values at every source row whose rowid is in `updIndexByRowId`, pulling the
+    // new value from `setColumns` at the mapped index. Type-agnostic: per SET column, concatenate
+    // [source column, updates column] and TAKE — source row i takes index i, an updated row takes
+    // (sourceLen + updIndex). Untouched columns/rows pass through by reference.
+    private static IReadOnlyList<RecordBatch> ApplyRowIdKeyedUpdates(
+        IReadOnlyList<RecordBatch> sourceBatches,
+        IReadOnlyList<Int64Array> rowIdsPerBatch,
+        IReadOnlyDictionary<long, int> updIndexByRowId,
+        IReadOnlyList<(string Name, IArrowArray Values)> setColumns)
+    {
+        var result = new List<RecordBatch>(sourceBatches.Count);
+        for (int b = 0; b < sourceBatches.Count; b++)
+        {
+            var src = sourceBatches[b];
+            var rids = rowIdsPerBatch[b];
+
+            // take indices: normally i (from the source half); an updated row → src.Length + updIndex.
+            List<int>? take = null;
+            for (int i = 0; i < src.Length; i++)
+            {
+                if (!rids.IsNull(i) && updIndexByRowId.TryGetValue(rids.GetValue(i)!.Value, out int updIdx))
+                {
+                    take ??= BuildIdentity(src.Length);
+                    take[i] = src.Length + updIdx;
+                }
+            }
+            if (take is null) { result.Add(src); continue; } // no target row in this batch — untouched
+
+            var columns = new IArrowArray[src.ColumnCount];
+            for (int c = 0; c < src.ColumnCount; c++)
+            {
+                string name = src.Schema.FieldsList[c].Name;
+                var setCol = setColumns.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.Ordinal));
+                if (setCol.Values is null)
+                {
+                    columns[c] = src.Column(c); // not a SET column — unchanged
+                    continue;
+                }
+                var combined = ArrowArrayConcatenator.Concatenate(new[] { src.Column(c), setCol.Values });
+                columns[c] = DeletionVectors.DeletionVectorFilter.TakeRowsPublic(combined, take);
+            }
+            result.Add(new RecordBatch(src.Schema, columns, src.Length));
+        }
+        return result;
+    }
+
+    private static List<int> BuildIdentity(int n)
+    {
+        var list = new List<int>(n);
+        for (int i = 0; i < n; i++) list.Add(i);
+        return list;
+    }
+
+    private async ValueTask<long> UpdateByRowIdsCoreAsync(
+        IReadOnlyCollection<long> rowIds,
+        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -4676,8 +4800,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (userBatches.Count == 0)
                 continue;
 
+            // Per-batch transient rowids (row-aligned), so the rewriter can key its new values by rowid.
+            var rowIdsPerBatch = new List<Int64Array>(userBatches.Count);
+            for (int bi = 0; bi < userBatches.Count; bi++)
+            {
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                var ridb = new Int64Array.Builder();
+                for (int i = 0; i < userBatches[bi].Length; i++)
+                {
+                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i;
+                    ridb.Append(((long)ordinal << RowIdPositionBits) | abs);
+                }
+                rowIdsPerBatch.Add(ridb.Build());
+            }
+
             // The caller rebuilds each batch's rows with the SET columns modified on the matched positions.
-            var rewritten = rewriteFile(ordinal, userBatches);
+            var rewritten = rewriteFile(ordinal, userBatches, rowIdsPerBatch);
             if (rewritten.Count != userBatches.Count)
                 throw new InvalidOperationException(
                     "UpdateByRowIdsAsync: rewriteFile must return one batch per source batch.");

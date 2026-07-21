@@ -273,4 +273,108 @@ public class RowIdDmlTests : IDisposable
         long version = await table.UpdateByRowIdsAsync([], AddToIds(1, 1));
         Assert.Equal(before, version);
     }
+
+    // ── update-from-a-host-join: the rowid-keyed overloads (no content-matching) ──
+
+    private static Apache.Arrow.Schema IdScoreSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("score", Int64Type.Default, true))
+        .Build();
+
+    private static RecordBatch IdScoreBatch(params (long Id, long Score)[] rows)
+    {
+        var id = new Int64Array.Builder();
+        var score = new Int64Array.Builder();
+        foreach (var (i, s) in rows) { id.Append(i); score.Append(s); }
+        return new RecordBatch(IdScoreSchema, [id.Build(), score.Build()], rows.Length);
+    }
+
+    private async Task<Dictionary<long, long>> ReadIdScoresFresh()
+    {
+        await using var reader = await OpenAsync();
+        var map = new Dictionary<long, long>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var id = (Int64Array)batch.Column("id");
+            var score = (Int64Array)batch.Column("score");
+            for (int i = 0; i < batch.Length; i++)
+                map[id.GetValue(i)!.Value] = score.GetValue(i)!.Value;
+        }
+        return map;
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_ValuesBatch_KeyedByRowId_AppliesJoinResult()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
+        await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30), (4, 40), (5, 50))]);
+
+        // Simulate a DuckDB join result: the rowids to change + their new SET values, as one batch.
+        long rid2 = (await RowIdsOf(table, 2)).Single();
+        long rid4 = (await RowIdsOf(table, 4)).Single();
+        var updates = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                .Field(new Field("score", Int64Type.Default, true))
+                .Build(),
+            [
+                new Int64Array.Builder().Append(rid2).Append(rid4).Build(),
+                new Int64Array.Builder().Append(999).Append(888).Build(),
+            ], 2);
+
+        long version = await table.UpdateByRowIdsAsync(updates);
+        Assert.Equal(2, version);
+
+        var scores = await ReadIdScoresFresh();
+        Assert.Equal(999, scores[2]); // targeted rows take the new score
+        Assert.Equal(888, scores[4]);
+        Assert.Equal(10, scores[1]);  // everything else untouched (incl. the un-updated `id` column)
+        Assert.Equal(30, scores[3]);
+        Assert.Equal(50, scores[5]);
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_RowIdExposedDelegate_KeysNewValuesByRowId()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
+        await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30))]);
+
+        long rid2 = (await RowIdsOf(table, 2)).Single();
+        var newScoreByRowId = new Dictionary<long, long> { [rid2] = 777 };
+
+        await table.UpdateByRowIdsAsync(
+            newScoreByRowId.Keys.ToArray(),
+            (long ordinal, IReadOnlyList<RecordBatch> batches, IReadOnlyList<Int64Array> rids) =>
+            {
+                var outp = new List<RecordBatch>(batches.Count);
+                for (int b = 0; b < batches.Count; b++)
+                {
+                    var src = batches[b];
+                    var score = (Int64Array)src.Column("score");
+                    var nb = new Int64Array.Builder();
+                    for (int i = 0; i < src.Length; i++)
+                        nb.Append(newScoreByRowId.TryGetValue(rids[b].GetValue(i)!.Value, out long v)
+                            ? v : score.GetValue(i)!.Value);
+                    outp.Add(new RecordBatch(src.Schema, [src.Column("id"), nb.Build()], src.Length));
+                }
+                return outp;
+            });
+
+        var scores = await ReadIdScoresFresh();
+        Assert.Equal(777, scores[2]);
+        Assert.Equal(10, scores[1]);
+        Assert.Equal(30, scores[3]);
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_ValuesBatch_MissingRowIdColumn_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
+        await table.WriteAsync([IdScoreBatch((1, 10))]);
+
+        var bad = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("score", Int64Type.Default, true)).Build(),
+            [new Int64Array.Builder().Append(1).Build()], 1);
+        await Assert.ThrowsAsync<ArgumentException>(() => table.UpdateByRowIdsAsync(bad).AsTask());
+    }
 }
