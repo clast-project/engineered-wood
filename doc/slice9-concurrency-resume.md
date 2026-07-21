@@ -219,7 +219,22 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   `ConcurrentDeletes_SameRow_RowLevelConflict`, `WithoutRowLevelRetry_VersionConflictSurfaces` (a
   rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
-- **(B) Rewrite-preservation (UPDATE, compaction remap) — DEFERRED behind a write fail-fast (2026-07-20).**
+- **(B) Rewrite-preservation (UPDATE, compaction remap).**
+  **The full brief is `doc/row-tracking-conformance-brief.md` — read that first.**
+  **UPDATE (2026-07-20): row-tracking Milestone 2 LANDED (uncommitted) — the copy-on-write REWRITE now
+  PRESERVES ids.** A rewrite (UPDATE / OVERWRITE / compaction) materializes each moved row's original id +
+  commit version into the declared hidden columns; the read path strips them and can surface resolved
+  ids/versions via out-params (so a second rewrite preserves a first rewrite's ids). MEASURED against Spark 4.0.1
+  (`SparkInteropTests.EwUpdated_/EwCompacted_RowTracking_SparkReadsPreservedIds` read the original 0,1,2 back
+  through the rewrite) + delta-rs (no column leak). The write gate now refuses a rewrite only when the declared
+  materialized names are absent. **What REMAINS for row-level concurrency (the actual Layer 3 (B) payload):**
+  the id-based *remap across a rewrite* — `ReadAllWithRowIdsAsync` (stable id = `(fileOrdinal<<40)|absPos`) +
+  `RemapRowsAcrossRewriteAsync` inside the OCC retry, using a row's commit version as the concurrent-modification
+  discriminator, and relaxing `rebaseSafe:false` for row-tracking deletes (retires limitation 2). Port from pr-4
+  (`RebaseDvDmlActionsAsync`). Materialization (M2) is the prerequisite that is now done; the remap is next.
+  Below is the ORIGINAL deferral note, kept for context.
+
+  **(originally, 2026-07-20) Rewrite-preservation — DEFERRED behind a write fail-fast.**
   **The full brief is `doc/row-tracking-conformance-brief.md` — read that when building (B).**
   **UPDATE (2026-07-20): row-tracking Milestone 1 LANDED — appends are now writable + spec-conformant.**
   `CreateAsync(..., enableRowTracking: true)` generates/stores the two `materialized*ColumnName` properties

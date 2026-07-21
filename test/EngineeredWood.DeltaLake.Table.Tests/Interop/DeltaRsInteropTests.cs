@@ -95,6 +95,45 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
     }
 
+    /// <summary>
+    /// EW writes a row-tracking table and then UPDATEs it — a copy-on-write rewrite that writes the hidden
+    /// materialized row-id / commit-version columns into the data file. A conformant reader (delta-rs) reads
+    /// the table by its Delta SCHEMA, so those hidden physical columns must NOT surface: delta-rs sees exactly
+    /// the user rows/columns, with the updated value applied. (Row tracking is a writer-only feature, so
+    /// delta-rs reads the table without needing to understand it.)
+    /// </summary>
+    [Fact]
+    public async Task EwUpdated_RowTracking_DeltaRsReadsUserColumnsOnly()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]);
+        await table.UpdateAsync(
+            b =>
+            {
+                var region = (StringArray)b.Column("region");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < region.Length; i++)
+                    mask.Append(region.GetString(i) == "eu");
+                return mask.Build();
+            },
+            b =>
+            {
+                var region = new StringArray.Builder();
+                for (int i = 0; i < b.Length; i++)
+                    region.Append("EU");
+                return new RecordBatch(IdRegionSchema, [b.Column("id"), region.Build()], b.Length);
+            });
+
+        var result = DeltaRs.Invoke("read", new { path = _tempDir });
+
+        Assert.Equal(3, result.GetProperty("row_count").GetInt32());
+        // delta-rs returns only the two user columns (id, region) — the hidden materialized columns do not leak.
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+    }
+
     /// <summary>delta-rs writes, EW reads. The reverse direction is what catches EW's reader
     /// quietly accepting only the dialect EW's own writer emits.</summary>
     [Fact]

@@ -63,6 +63,24 @@ public static class RowTrackingConfig
         ($"_row_id_{Guid.NewGuid():N}", $"_row_commit_version_{Guid.NewGuid():N}");
 
     /// <summary>
+    /// Returns the two hidden materialized physical column names stored at enablement, or <c>(null, null)</c>
+    /// when row tracking is off / the names are absent. A rewrite (UPDATE / compaction) writes each relocated
+    /// row's original id + commit version into these columns, and the read path strips them; both are keyed by
+    /// the physical name (spec: <see cref="MaterializedRowIdColumnNameKey"/> /
+    /// <see cref="MaterializedRowCommitVersionColumnNameKey"/>).
+    /// </summary>
+    public static (string? RowIdColumnName, string? RowCommitVersionColumnName) TryGetMaterializedColumnNames(
+        IReadOnlyDictionary<string, string>? configuration)
+    {
+        if (configuration is null)
+            return (null, null);
+        configuration.TryGetValue(MaterializedRowIdColumnNameKey, out string? rowId);
+        configuration.TryGetValue(MaterializedRowCommitVersionColumnNameKey, out string? rowCommitVersion);
+        return (string.IsNullOrEmpty(rowId) ? null : rowId,
+                string.IsNullOrEmpty(rowCommitVersion) ? null : rowCommitVersion);
+    }
+
+    /// <summary>
     /// Builds the <c>delta.rowTracking</c> domainMetadata action recording the new high-water mark. The
     /// domain stores the HIGHEST ASSIGNED row id (spec), while <paramref name="nextAvailableRowId"/> is
     /// engineered-wood's internal "next id to assign".

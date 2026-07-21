@@ -231,6 +231,84 @@ public class SparkInteropTests : IDisposable
         Assert.Contains("rowTracking", features);
     }
 
+    /// <summary>
+    /// <para>Milestone 2: a copy-on-write UPDATE on a row-tracking table must PRESERVE each surviving row's
+    /// stable id by materializing it into the declared hidden column. EW appends ids 0,1,2, then updates the
+    /// middle row (region eu → EU) — which rewrites the whole file and REORDERS rows (the matched row moves to
+    /// physical position 0). Spark reads each row's <c>_metadata.row_id</c>.</para>
+    ///
+    /// <para>This is the measurement that distinguishes correct materialization from the fallback: if EW wrote
+    /// the materialized column under the wrong physical name (or not at all), Spark would fall back to the new
+    /// file's <c>baseRowId + position</c> and read a DIFFERENT, reordered id set. Reading the ORIGINAL ids back
+    /// (id 10→0, 20→1, 30→2) proves the materialized column is present, correctly named, and correctly valued.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwUpdated_RowTracking_SparkReadsPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]); // ids 0,1,2
+
+            // UPDATE the eu row (id 20) → region "EU": a copy-on-write rewrite of the single file.
+            await table.UpdateAsync(
+                b =>
+                {
+                    var region = (StringArray)b.Column("region");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < region.Length; i++)
+                        mask.Append(region.GetString(i) == "eu");
+                    return mask.Build();
+                },
+                b =>
+                {
+                    var region = new StringArray.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        region.Append("EU");
+                    return new RecordBatch(IdRegionSchema, [b.Column("id"), region.Build()], b.Length);
+                });
+        }
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]); // the UPDATED row keeps its original id through the rewrite
+        Assert.Equal(2L, idToRowId[30]);
+    }
+
+    /// <summary>
+    /// Milestone 2: compaction (OPTIMIZE) must preserve each row's stable id. EW writes three single-row files
+    /// (ids 0,1,2), compacts them into one, and Spark reads each row's <c>_metadata.row_id</c>. Because rows
+    /// from several source files mix into one compacted file, a single <c>baseRowId</c> cannot represent them —
+    /// the compacted file MUST carry the materialized id column. Reading 10→0, 20→1, 30→2 proves it does.
+    /// </summary>
+    [Fact]
+    public async Task EwCompacted_RowTracking_SparkReadsPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdRegionBatch([10], ["us"])]);   // id 0
+            await table.WriteAsync([IdRegionBatch([20], ["eu"])]);   // id 1
+            await table.WriteAsync([IdRegionBatch([30], ["apac"])]); // id 2
+            await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        }
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]);
+        Assert.Equal(2L, idToRowId[30]);
+    }
+
     /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
     private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>
     {

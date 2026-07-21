@@ -110,13 +110,21 @@ internal static class CompactionExecutor
         bool rowTrackingEnabled = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+
+        // Row tracking through compaction: rows from several source files mix into one compacted file, so the
+        // compacted add's single baseRowId / defaultRowCommitVersion cannot represent them all. Materialize each
+        // surviving row's ORIGINAL id + commit version (from the source's own materialized column, else its
+        // baseRowId + physical position / defaultRowCommitVersion) into the declared hidden columns.
+        var (matRowIdName, matRowVerName) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        bool materialize = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         bool anyAdds = false;
 
         foreach (var group in groups)
         {
             (bool compacted, nextRowId) = await CompactGroupAsync(
                 fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
-                dvReader, actions, now, rowTrackingEnabled, nextRowId,
+                dvReader, actions, now, rowTrackingEnabled, nextRowId, materialize, matRowIdName, matRowVerName,
                 dataFileWriter, dataFileReader, cancellationToken).ConfigureAwait(false);
             anyAdds |= compacted;
         }
@@ -162,6 +170,9 @@ internal static class CompactionExecutor
         long now,
         bool rowTrackingEnabled,
         long nextRowId,
+        bool materialize,
+        string? matRowIdName,
+        string? matRowVerName,
         IDataFileWriter? dataFileWriter,
         IDataFileReader? dataFileReader,
         CancellationToken cancellationToken)
@@ -170,11 +181,15 @@ internal static class CompactionExecutor
         // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
         // compacting the raw parquet would RESURRECT every deleted row.
         var allBatches = new List<RecordBatch>();
+        var batchIds = materialize ? new List<Int64Array>() : null;   // aligned 1:1 with allBatches
+        var batchVers = materialize ? new List<Int64Array>() : null;  // aligned 1:1 with allBatches
         foreach (var addFile in group)
         {
             var deletedRows = addFile.DeletionVector is not null
                 ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
                 : null;
+            long baseId = addFile.BaseRowId ?? 0;
+            long commitVer = addFile.DefaultRowCommitVersion ?? 0;
 
             // Pluggable read half: raw physical batches in file order (positions drive the DV exclusion
             // below) — the same contract as the built-in reader.
@@ -200,15 +215,47 @@ internal static class CompactionExecutor
             long batchStartRow = 0;
             await foreach (var batch in rawBatches.ConfigureAwait(false))
             {
-                var liveBatch = batch;
+                // Strip the hidden materialized row-tracking columns (declared physical names) before widening
+                // and column mapping, which expect only user columns. Capture the source's own materialized
+                // ids/versions (present when the source was itself a rewrite output).
+                var (userBatch, srcMatIds, srcMatVers) = materialize
+                    ? RowTracking.RowTrackingWriter.StripMaterializedColumns(batch, matRowIdName, matRowVerName)
+                    : (batch, null, null);
+                long physicalRows = batch.Length;
+
+                // Build the survivor id/version arrays in the SAME order DeletionVectorFilter keeps (ascending
+                // physical index, skipping DV-deleted rows) so they stay aligned with the filtered batch.
+                Int64Array? survivorIds = null, survivorVers = null;
+                if (materialize)
+                {
+                    var idb = new Int64Array.Builder();
+                    var vrb = new Int64Array.Builder();
+                    for (int i = 0; i < physicalRows; i++)
+                    {
+                        if (deletedRows is not null && deletedRows.Contains(batchStartRow + i))
+                            continue;
+                        long id = srcMatIds is not null && !srcMatIds.IsNull(i)
+                            ? srcMatIds.GetValue(i)!.Value
+                            : baseId + batchStartRow + i;
+                        long ver = srcMatVers is not null && !srcMatVers.IsNull(i)
+                            ? srcMatVers.GetValue(i)!.Value
+                            : commitVer;
+                        idb.Append(id);
+                        vrb.Append(ver);
+                    }
+                    survivorIds = idb.Build();
+                    survivorVers = vrb.Build();
+                }
+
+                var liveBatch = userBatch;
                 if (deletedRows is not null)
                 {
                     liveBatch = DeletionVectors.DeletionVectorFilter.Filter(
                         liveBatch, deletedRows, batchStartRow);
-                    batchStartRow += batch.Length;
-                    if (liveBatch.Length == 0)
-                        continue; // every row in this batch was deleted
                 }
+                batchStartRow += physicalRows;
+                if (liveBatch.Length == 0)
+                    continue; // every row in this batch was deleted
 
                 // Widen values from old files to match current schema
                 var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
@@ -229,6 +276,11 @@ internal static class CompactionExecutor
                     outBatch = ColumnMappingRecursive.ToPhysical(outBatch, snapshot.Schema, mappingMode);
                 }
                 allBatches.Add(outBatch);
+                if (materialize)
+                {
+                    batchIds!.Add(survivorIds!);
+                    batchVers!.Add(survivorVers!);
+                }
             }
             }
             finally
@@ -290,12 +342,20 @@ internal static class CompactionExecutor
 
         int batchIdx = 0;
         long currentRowCount = 0;
-        var currentBatches = new List<RecordBatch>();
+        var currentBatches = new List<RecordBatch>();   // USER columns only (stats collected over these)
+        var currentWrite = new List<RecordBatch>();     // what gets written (== currentBatches unless materialize)
 
         while (batchIdx < allBatches.Count)
         {
-            currentBatches.Add(allBatches[batchIdx]);
-            currentRowCount += allBatches[batchIdx].Length;
+            var addBatch = allBatches[batchIdx];
+            currentBatches.Add(addBatch);
+            // When materializing, append the ORIGINAL id + commit-version columns to the WRITTEN batch (the
+            // internal columns must not appear in Delta stats, which cover the user columns only).
+            currentWrite.Add(materialize
+                ? RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+                    addBatch, batchIds![batchIdx], batchVers![batchIdx], matRowIdName!, matRowVerName!)
+                : addBatch);
+            currentRowCount += addBatch.Length;
             batchIdx++;
 
             if (currentRowCount >= rowsPerFile || batchIdx == allBatches.Count)
@@ -310,7 +370,7 @@ internal static class CompactionExecutor
                     // Keep the host codec's output quality (bloom filters, stats, footer) through an OPTIMIZE
                     // instead of reverting to the built-in writer for compacted files.
                     fileSize = await dataFileWriter.WriteAsync(
-                        currentBatches.ToAsyncEnumerable(), fileName, cancellationToken)
+                        currentWrite.ToAsyncEnumerable(), fileName, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
@@ -319,7 +379,7 @@ internal static class CompactionExecutor
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         outFile, ownsFile: false, parquetOptions);
-                    foreach (var batch in currentBatches)
+                    foreach (var batch in currentWrite)
                     {
                         await writer.WriteRowGroupAsync(batch, cancellationToken)
                             .ConfigureAwait(false);
@@ -346,6 +406,7 @@ internal static class CompactionExecutor
                 });
 
                 currentBatches.Clear();
+                currentWrite.Clear();
                 currentRowCount = 0;
             }
         }

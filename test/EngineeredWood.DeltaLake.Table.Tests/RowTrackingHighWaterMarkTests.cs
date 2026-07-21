@@ -74,9 +74,10 @@ public class RowTrackingHighWaterMarkTests : IDisposable
         Assert.Null(RowTrackingConfig.TryReadHighWaterMark(new Dictionary<string, DomainMetadata>()));
     }
 
-    // EngineeredWood does not WRITE row-tracking tables (that is refused — see RowTrackingTests), but it
-    // must still READ one a foreign engine wrote and reconcile the high-water mark correctly. So the state
-    // here is seeded directly into the log rather than via WriteAsync.
+    // This test exercises the READ-side high-water-mark reconciliation for a table a FOREIGN engine wrote
+    // (files whose highest-id member later leaves the active set), so the state is seeded directly into the
+    // log rather than via WriteAsync. (EngineeredWood now also writes row-tracking appends + rewrites itself —
+    // see RowTrackingTests.)
     private static AddFile SeedFile(string path, long baseRowId, int rows) => new()
     {
         Path = path,
