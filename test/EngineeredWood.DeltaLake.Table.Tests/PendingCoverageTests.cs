@@ -25,8 +25,6 @@ public class PendingCoverageTests
         "Blocked: needs the buffered-transaction seam (WriteDataFilesAsync / CommitDataFilesAsync / the " +
         "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
 
-    private const string SetSchema = "Blocked: needs DeltaTable.SetSchemaAsync — PR #4 slice 8 leftover.";
-
     // ── Buffered (multi-statement) transactions — pr-4 BufferedTransactionTests ──
 
     /// <summary>An ALTER + INSERT + DELETE buffered together must commit as ONE atomic Delta version —
@@ -34,11 +32,10 @@ public class PendingCoverageTests
     [Fact(Skip = BufferedTxn)]
     public void FusedCommit_AlterInsertDelete_IsOneAtomicVersion() { }
 
-    /// <summary>A second ComputeAddColumn must compose against the PENDING schema of the first (whose
-    /// maxColumnId it already bumped), not against the committed snapshot.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void ChainedComputes_SecondAddComposesOnPendingSchema() { }
-
+    // UN-PARKED (ChainedComputes_SecondAddComposesOnPendingSchema + ReconcileBatchToFields_BackfillsPendingColumn):
+    // the compute-only schema-ALTER family (ComputeAddColumn chaining on a pending base) and the public
+    // ReconcileBatchToFields overlay are live in BufferedSchemaSeamTests.
+    //
     // UN-PARKED (ExpectedVersion_ConcurrentWriter_ConflictAborts): the CommitDataFilesAsync(expectedVersion:)
     // conflict-abort is live in ExternalDataFileCommitTests, against the Milestone-A external-commit seam.
 
@@ -46,11 +43,6 @@ public class PendingCoverageTests
     /// mechanism an UPDATE post-image is built from.</summary>
     [Fact(Skip = BufferedTxn)]
     public void ReadRowsByRowIds_AtVersion_ExactReadBack() { }
-
-    /// <summary>The public ReconcileBatchToFields export must let a host overlay a PENDING schema onto
-    /// committed reads (backfilling a column the buffered transaction has added but not yet committed).</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void ReconcileBatchToFields_BackfillsPendingColumn() { }
 
     /// <summary>A txn (application transaction id) action must round-trip through a fused commit.</summary>
     [Fact(Skip = BufferedTxn)]
@@ -115,15 +107,9 @@ public class PendingCoverageTests
     public void BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete() { }
 
     // ── SetSchemaAsync — pr-4 SchemaWriteModesTests ──
-
-    /// <summary>SetSchemaAsync must adopt an incoming schema as a metadata-only commit, computing the
-    /// drops and adds relative to the current one.</summary>
-    [Fact(Skip = SetSchema)]
-    public void SetSchema_AdoptsIncomingSchema_DropAndAdd() { }
-
-    /// <summary>A logically identical schema must be a no-op (no commit written).</summary>
-    [Fact(Skip = SetSchema)]
-    public void SetSchema_LogicallyIdentical_IsNoOp() { }
+    //
+    // UN-PARKED: SetSchemaAsync (adopt an incoming schema as a metadata-only drop/add commit, with a logical
+    // no-op compare) is live in BufferedSchemaSeamTests.
 
     // ── Clustering rewrite-commit shape — pr-4 ClusteredTableTests ──
     //

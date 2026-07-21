@@ -474,6 +474,292 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             protocolUpgrade).ConfigureAwait(false);
     }
 
+    // ── Buffered-transaction schema seam ───────────────────────────────────────────────────────────────
+    //
+    // The Compute* family is the COMPUTE-ONLY counterpart of the schema ALTERs: each builds the metaData
+    // (+ optional protocol upgrade) actions WITHOUT committing, so a buffered multi-statement transaction can
+    // fuse a schema change with its data changes into ONE atomic commit (via CommitDataFilesAsync' extraActions).
+    // Chained ALTERs pass the previous change's baseMetadata/baseProtocol so the second composes on the first's
+    // PENDING schema — the fused commit then carries only the final metaData (a commit must not carry two).
+
+    /// <summary>The deferred (compute-only) form of a schema change, for a buffered multi-statement transaction:
+    /// <see cref="Actions"/> = the optional protocol upgrade + the new <c>metaData</c> action, to be fused into
+    /// ONE commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>; <see cref="Metadata"/> /
+    /// <see cref="ProtocolUpgrade"/> are the pending base for a CHAINED next change; <see cref="NewSchema"/> is
+    /// the parsed new Delta schema (drives the caller's read overlays and schema-overridden writes).</summary>
+    public readonly record struct DeferredSchemaChange(
+        IReadOnlyList<DeltaAction> Actions,
+        MetadataAction Metadata,
+        ProtocolAction? ProtocolUpgrade,
+        StructType NewSchema);
+
+    /// <summary>
+    /// The compute-only counterpart of <see cref="AddColumnAsync"/>: builds the metaData (+ protocol upgrade)
+    /// actions for appending a nullable column WITHOUT committing. For CHAINED adds in one transaction pass the
+    /// previous change's <paramref name="baseMetadata"/> / <paramref name="baseProtocol"/> so the second column
+    /// composes on the first's pending schema/protocol. Pure computation, no IO.
+    /// </summary>
+    public DeferredSchemaChange ComputeAddColumn(
+        Field newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        if (!newColumn.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var config = baseMeta.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, newColumn.Name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
+        }
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema([newColumn], null)).Fields[0];
+
+        StructType newSchema;
+        var newConfig = config;
+        if (mappingMode == ColumnMappingMode.None)
+        {
+            newSchema = new StructType { Fields = new List<StructField>(baseSchema.Fields) { newDeltaField } };
+        }
+        else
+        {
+            // Fresh column id + physical name, recursively, continuing past the base's maxColumnId (the base
+            // may itself be a pending change that already bumped it).
+            var (mappedField, lastId) = AssignMappedField(baseSchema, config, newDeltaField);
+            newSchema = new StructType { Fields = new List<StructField>(baseSchema.Fields) { mappedField } };
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        var protocolUpgrade = UpgradeProtocolForFeatures(
+            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = newConfig,
+        };
+        var actions = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actions.Add(protocolUpgrade);
+        actions.Add(metadata);
+        return new DeferredSchemaChange(actions, metadata, protocolUpgrade, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="RenameColumnAsync"/> — for a buffered transaction.
+    /// Requires column mapping (checked against the base config). The renamed field keeps its column id +
+    /// physical name; a renamed PARTITION column also updates <c>metaData.partitionColumns</c>. No protocol
+    /// change.</summary>
+    public DeferredSchemaChange ComputeRenameColumn(
+        string oldName, string newName, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+
+        StructField? target = null;
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newName}' already exists.");
+            if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                target = f;
+        }
+        if (target is null)
+            throw new InvalidOperationException($"Column '{oldName}' does not exist.");
+
+        var newFields = new List<StructField>(baseSchema.Fields.Count);
+        foreach (var f in baseSchema.Fields)
+        {
+            newFields.Add(ReferenceEquals(f, target)
+                ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
+                : f);
+        }
+        var newSchema = new StructType { Fields = newFields };
+
+        var newPartitionColumns = baseMeta.PartitionColumns;
+        if (newPartitionColumns.Contains(oldName))
+        {
+            newPartitionColumns = newPartitionColumns
+                .Select(pc => string.Equals(pc, oldName, StringComparison.Ordinal) ? newName : pc)
+                .ToList();
+        }
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            PartitionColumns = newPartitionColumns,
+        };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="DropColumnAsync"/> — for a buffered transaction.
+    /// Requires column mapping; partition columns and the last column are rejected. No protocol change.</summary>
+    public DeferredSchemaChange ComputeDropColumn(string name, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+        foreach (var pc in baseMeta.PartitionColumns)
+        {
+            if (string.Equals(pc, name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Cannot drop partition column '{name}'.");
+        }
+
+        var newFields = new List<StructField>(baseSchema.Fields.Count);
+        bool found = false;
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+            newFields.Add(f);
+        }
+        if (!found)
+            throw new InvalidOperationException($"Column '{name}' does not exist.");
+        if (newFields.Count == 0)
+            throw new InvalidOperationException("Cannot drop the table's only column.");
+        var newSchema = new StructType { Fields = newFields };
+
+        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>Reconciles a logically-named batch to <paramref name="expectedFields"/> — the public form of the
+    /// read path's recursive schema-evolution reconcile: expected columns/struct members the batch lacks
+    /// backfill as typed NULLs, extra ones drop, struct children recurse. A buffered transaction uses it to
+    /// overlay its PENDING (uncommitted-ALTER) schema onto committed reads ("read your own schema").</summary>
+    public static RecordBatch ReconcileBatchToFields(RecordBatch batch, IReadOnlyList<Field> expectedFields)
+        => SchemaEvolution.BackfillMissingColumns(batch, expectedFields);
+
+    /// <summary>
+    /// Replaces the table's schema wholesale with <paramref name="newSchema"/> as a metadata-only commit (a new
+    /// <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync"/> this can add,
+    /// drop, or retype columns — the "schema overwrite" primitive a CREATE OR REPLACE uses (adopt exactly the
+    /// incoming schema). Callers align the data (typically a paired <c>Overwrite</c> write that removes the
+    /// old-schema files). On a column-mapping table fresh field ids are assigned (continuing past the current
+    /// maxColumnId so ids are never reused across history). Returns the new version; a no-op (returns the current
+    /// version) if the schema is already logically identical.
+    /// </summary>
+    public async ValueTask<long> SetSchemaAsync(
+        Apache.Arrow.Schema newSchema, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var config = snapshot.Metadata.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        var newDeltaSchema = SchemaConverter.FromArrowSchema(newSchema);
+        var newConfig = config;
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            // A column-mapping table's SchemaString always differs (ids/physical names the incoming Arrow schema
+            // lacks), so compare the LOGICAL shape (names + types, ids stripped recursively) to no-op when nothing
+            // actually changed — e.g. a fresh CTAS that just created the table with the right schema+mapping.
+            if (string.Equals(LogicalSchemaString(snapshot.Schema),
+                              LogicalSchemaString(newDeltaSchema), StringComparison.Ordinal))
+            {
+                return snapshot.Version;
+            }
+            // Full-replace adopts an arbitrary new schema, so assign FRESH field ids + physical names (continuing
+            // from the current maxColumnId so ids are never reused) and bump maxColumnId. Sound for a REPLACE
+            // because the old data files are removed by the paired Overwrite.
+            int startId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
+            if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
+                && int.TryParse(maxStr, out var cfgMax))
+            {
+                startId = Math.Max(startId, cfgMax);
+            }
+            var (mapped, newMax) = ColumnMapping.AssignColumnMapping(newDeltaSchema, startId);
+            newDeltaSchema = mapped;
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = newMax.ToString();
+            newConfig = cfg;
+        }
+
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newDeltaSchema);
+        if (string.Equals(newSchemaString, snapshot.Metadata.SchemaString, StringComparison.Ordinal))
+        {
+            return snapshot.Version; // identical schema — nothing to commit
+        }
+
+        var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
+            "CHANGE COLUMNS",
+            cancellationToken,
+            protocolUpgrade).ConfigureAwait(false);
+    }
+
+    // The schema's LOGICAL signature — field names + types + nullability, with column-mapping metadata (ids /
+    // physical names) stripped RECURSIVELY — so two schemas that differ only in assigned ids compare equal. Used
+    // to no-op SetSchema on a column-mapping table when the logical shape is unchanged.
+    private static string LogicalSchemaString(StructType schema)
+        => DeltaSchemaSerializer.Serialize(StripMetadata(schema));
+
+    private static StructType StripMetadata(StructType schema)
+    {
+        var stripped = new List<StructField>(schema.Fields.Count);
+        foreach (var f in schema.Fields)
+            stripped.Add(new StructField
+            {
+                Name = f.Name, Type = StripMetadata(f.Type), Nullable = f.Nullable, Metadata = null,
+            });
+        return new StructType { Fields = stripped };
+    }
+
+    private static DeltaDataType StripMetadata(DeltaDataType type) => type switch
+    {
+        StructType st => StripMetadata(st),
+        ArrayType at => new ArrayType { ElementType = StripMetadata(at.ElementType), ContainsNull = at.ContainsNull },
+        MapType mt => new MapType
+        {
+            KeyType = StripMetadata(mt.KeyType), ValueType = StripMetadata(mt.ValueType),
+            ValueContainsNull = mt.ValueContainsNull,
+        },
+        _ => type,
+    };
+
     /// <summary>
     /// Renames a column as a metadata-only commit (a new <c>metaData</c> action changing only the field's
     /// logical name; NO data files are rewritten). ONLY supported on a <b>column-mapping</b> table: the field
