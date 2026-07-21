@@ -2869,6 +2869,393 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return committedVersion;
     }
 
+    // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
+    //
+    // WriteDataFilesAsync writes append-shaped data files WITHOUT committing (invisible orphans until
+    // referenced); CommitDataFilesAsync commits those files — optionally FUSED with a caller's extraActions
+    // (DML deletion-vector remove/add pairs, a schema metaData change) — into ONE atomic Delta version. The
+    // pair lets a host (or a multi-statement transaction) build a commit incrementally, then flush it atomically.
+
+    /// <summary>True when the table declares IcebergCompat (requires engineered-wood's committing write path).</summary>
+    public bool IsIcebergCompat =>
+        Schema.IcebergCompat.GetVersion(CurrentSnapshot.Metadata.Configuration)
+        != Schema.IcebergCompatVersion.None;
+
+    /// <summary>True when any column carries identity metadata (its values need write-time generation).</summary>
+    public bool HasIdentityColumns
+    {
+        get
+        {
+            foreach (var f in CurrentSnapshot.Schema.Fields)
+            {
+                if (IdentityColumn.GetConfig(f) is not null)
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when <see cref="CommitDataFilesAsync"/> is usable for this table — i.e. an external writer can
+    /// produce the data files without engineered-wood's per-row processing. Column-mapping tables (both modes)
+    /// are supported, with a caller contract: the external writer must write the files under the PHYSICAL column
+    /// names and stamp each column's parquet <c>field_id</c>, and any per-file stats it supplies must be keyed by
+    /// the physical names. Identity columns and IcebergCompat are NOT supported (they need write-time per-row
+    /// processing). A caller checks this BEFORE writing files externally so it can fall back to the batch path
+    /// without leaving an orphan. (Partitioning is a separate check — inspect
+    /// <c>CurrentSnapshot.Metadata.PartitionColumns</c>.)
+    /// </summary>
+    public bool SupportsExternalDataFileCommit
+    {
+        get
+        {
+            if (IsIcebergCompat)
+                return false;
+            foreach (var f in CurrentSnapshot.Schema.Fields)
+            {
+                if (IdentityColumn.GetConfig(f) is not null)
+                    return false;
+            }
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Writes <paramref name="batches"/> to append-shaped parquet data files WITHOUT committing, returning the
+    /// descriptors to hand to <see cref="CommitDataFilesAsync"/>. Partition split, recursive column-mapping
+    /// physical rename + field-id stamping, the variant logical-type policy, the <see cref="IDataFileWriter"/>
+    /// seam and per-file stats all apply; row-tracking <c>baseRowId</c> is NOT materialized into the files (the
+    /// commit assigns it, exactly like the streaming writer). Identity columns and IcebergCompat need write-time
+    /// per-row processing tied to the commit — callers must check <see cref="SupportsExternalDataFileCommit"/>
+    /// first (or pass <paramref name="identityValuesPreGenerated"/> for a table whose identity values were
+    /// generated up front via <c>GenerateIdentityValues</c>). The written files are invisible orphans until
+    /// committed (rollback = never reference them; vacuum cleans).
+    /// </summary>
+    /// <param name="schemaOverride">A buffered transaction's PENDING (ALTERed) schema — the batches carry columns
+    /// the committed snapshot doesn't know yet; the pending schema (whose added columns already carry their
+    /// column-mapping ids / physical names) drives the physical rename + stats keying, and the paired commit
+    /// includes the matching metaData action.</param>
+    public async ValueTask<IReadOnlyList<WrittenDataFile>> WriteDataFilesAsync(
+        IReadOnlyList<RecordBatch> batches,
+        CancellationToken cancellationToken = default,
+        Schema.StructType? schemaOverride = null,
+        bool identityValuesPreGenerated = false)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (IsIcebergCompat)
+            throw new NotSupportedException(
+                "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");
+        if (HasIdentityColumns && !identityValuesPreGenerated)
+            throw new NotSupportedException(
+                "WriteDataFilesAsync: table has identity columns — generate their values first "
+                + "(GenerateIdentityValues) and pass identityValuesPreGenerated, or use the committing write path.");
+
+        var snapshot = CurrentSnapshot;
+        var writeSchema = schemaOverride ?? snapshot.Schema;
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
+        var files = new List<WrittenDataFile>();
+
+        foreach (var batch in batches)
+        {
+            if (batch.Length == 0)
+                continue;
+
+            var partitions = Partitioning.PartitionUtils.SplitByPartition(batch, partitionColumns);
+            foreach (var (partValues, dataBatch) in partitions)
+            {
+                if (dataBatch.Length == 0)
+                    continue;
+
+                // Rename logical columns to physical names + stamp field ids at every nesting level.
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+
+                // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
+                var trackedPartValues = partValues;
+                if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+                {
+                    trackedPartValues = new Dictionary<string, string>(partValues.Count);
+                    foreach (var kv in partValues)
+                    {
+                        trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                    }
+                }
+
+                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
+                string fileName = string.IsNullOrEmpty(partDir)
+                    ? $"{Guid.NewGuid():N}.parquet"
+                    : $"{partDir}/{Guid.NewGuid():N}.parquet";
+
+                // Same variant logical-type policy as the committing write path (Spark 4.0.x tables drop the
+                // annotation; the read path recovers the type from the Delta schema).
+                var writeBatch = _options.EmitVariantLogicalType
+                    ? physicalBatch
+                    : VariantColumnCoercion.StripAnnotation(physicalBatch);
+
+                long fileSize;
+                if (_options.DataFileWriter is { } dataFileWriter)
+                {
+                    fileSize = await dataFileWriter.WriteAsync(
+                        new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await using var file = await _fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    await using var writer = new ParquetFileWriter(
+                        file, ownsFile: false, _options.ParquetWriteOptions);
+                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
+                    await writer.DisposeAsync().ConfigureAwait(false);
+                    fileSize = file.Position;
+                }
+
+                // Stats keyed PHYSICAL at every level, matching the streaming writer + spec readers.
+                string? stats = _options.CollectStats
+                    ? CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode))
+                    : null;
+
+                files.Add(new WrittenDataFile(
+                    fileName, fileSize, dataBatch.Length,
+                    trackedPartValues.Count > 0 ? trackedPartValues : null, stats));
+            }
+        }
+
+        return files;
+    }
+
+    /// <summary>
+    /// Commits externally-written <paramref name="files"/> to the Delta log — optionally FUSED with
+    /// <paramref name="extraActions"/> (a buffered transaction's deletion-vector remove/add pairs, or a schema
+    /// metaData change) — as ONE atomic version. Append-shaped by default (<paramref name="mode"/>
+    /// <see cref="DeltaWriteMode.Append"/>); a full <see cref="DeltaWriteMode.Overwrite"/> removes every active
+    /// file, and <paramref name="dynamicPartitionOverwrite"/> removes only the active files in partitions the
+    /// written files touch. Row-tracking <c>baseRowId</c> / <c>defaultRowCommitVersion</c> + the high-water-mark
+    /// domain are assigned here.
+    /// </summary>
+    /// <param name="expectedVersion">When set, the commit ABORTS (first-committer-wins) if the table has moved off
+    /// this version — the caller's snapshot-coupled <paramref name="extraActions"/> (deletion-vector ordinals /
+    /// positions computed against it) would be invalidated by a concurrent commit. When null, an append rebases
+    /// past a non-conflicting concurrent commit (bounded retry), reusing the already-written files as-is.</param>
+    /// <param name="dataChange">False for a REWRITE commit (compaction / clustering OPTIMIZE): removes and adds
+    /// carry <c>dataChange=false</c> — CDF readers exclude the commit, concurrent readers' dataChange checks
+    /// ignore it, and (per the spec) it is legal on an <c>appendOnly</c> table.</param>
+    /// <param name="clusteringProvider">Stamped as <c>add.clusteringProvider</c> on every add — a clustering
+    /// OPTIMIZE tags its clustered output files.</param>
+    /// <param name="deletedPositionsByFileIndex">Rows of a not-yet-committed file (by index into
+    /// <paramref name="files"/>) that a buffered transaction deleted AFTER inserting them (same-transaction DML):
+    /// the add is born with an inline deletion vector, so the rows never appear in any committed version.</param>
+    public async ValueTask<long> CommitDataFilesAsync(
+        IReadOnlyList<WrittenDataFile> files,
+        DeltaWriteMode mode = DeltaWriteMode.Append,
+        bool dynamicPartitionOverwrite = false,
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<DeltaAction>? extraActions = null,
+        long? expectedVersion = null,
+        string operation = "WRITE",
+        bool identityValuesPreGenerated = false,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
+        bool dataChange = true,
+        string? clusteringProvider = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
+        // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
+        // non-append. A dataChange=false rewrite (compaction) is append-LEGAL: appendOnly forbids removing
+        // ROWS, not reorganizing files.
+        bool appendShaped = (mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
+                             extraActions is not { Count: > 0 }) || !dataChange;
+        HonorWriterFeatures(CurrentSnapshot, appendShaped);
+
+        if (dynamicPartitionOverwrite)
+        {
+            if (mode != DeltaWriteMode.Append)
+                throw new DeltaFormatException(
+                    "Dynamic partition overwrite is append-shaped (a full Overwrite already removes everything).");
+            if (CurrentSnapshot.Metadata.PartitionColumns.Count == 0)
+                throw new DeltaFormatException(
+                    "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
+        }
+
+        // Reject configurations that require write-time per-row processing the external writer did not do (the
+        // caller should have checked SupportsExternalDataFileCommit first). Only relevant when data FILES are
+        // being committed — a deletion-vector-only or metadata-only fused flush (extraActions, no files) involves
+        // no write-time processing.
+        var cfg = CurrentSnapshot.Metadata.Configuration;
+        if (files.Count > 0 && !SupportsExternalDataFileCommit
+            && !(identityValuesPreGenerated && !IsIcebergCompat))
+            throw new NotSupportedException(
+                "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
+                + "these require engineered-wood's own writer.");
+
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg);
+
+        for (int attempt = 1; ; attempt++)
+        {
+            var snapshot = CurrentSnapshot;
+            // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
+            // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —
+            // conflict-ABORT instead of the append retry (first-committer-wins snapshot isolation).
+            if (expectedVersion is { } expected && snapshot.Version != expected)
+            {
+                throw new DeltaConflictException(
+                    $"Transaction conflict: the table moved from version {expected} to {snapshot.Version} "
+                    + "while the transaction was open — the buffered changes were rolled back; retry the "
+                    + "transaction.");
+            }
+            var actions = new List<DeltaAction>();
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            // Overwrite: remove every currently-active file (full replace; STATIC partition-scoped overwrite is
+            // not handled here — the caller keeps replace_where on the batch path). DYNAMIC partition overwrite:
+            // remove only the active files whose partition matches one of the written files' partitions.
+            if (mode == DeltaWriteMode.Overwrite)
+            {
+                foreach (var existingFile in snapshot.ActiveFiles.Values)
+                {
+                    actions.Add(new RemoveFile
+                    {
+                        Path = existingFile.Path,
+                        DeletionTimestamp = now,
+                        DataChange = dataChange,
+                        ExtendedFileMetadata = true,
+                        PartitionValues = existingFile.PartitionValues,
+                        Size = existingFile.Size,
+                        DeletionVector = existingFile.DeletionVector,
+                    });
+                }
+            }
+            else if (dynamicPartitionOverwrite)
+            {
+                var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
+                    snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+                var touched = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var f in files)
+                {
+                    if (f.PartitionValues is { Count: > 0 } pv)
+                        touched.Add(CanonicalPartitionKey(pv, logicalToPhysical));
+                }
+                foreach (var existingFile in snapshot.ActiveFiles.Values)
+                {
+                    if (!touched.Contains(CanonicalPartitionKey(existingFile.PartitionValues, logicalToPhysical)))
+                        continue;
+                    actions.Add(new RemoveFile
+                    {
+                        Path = existingFile.Path,
+                        DeletionTimestamp = now,
+                        DataChange = true,
+                        ExtendedFileMetadata = true,
+                        PartitionValues = existingFile.PartitionValues,
+                        Size = existingFile.Size,
+                        DeletionVector = existingFile.DeletionVector,
+                    });
+                }
+            }
+
+            long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+            long newVersion = snapshot.Version + 1;
+            for (int fi = 0; fi < files.Count; fi++)
+            {
+                var f = files[fi];
+                // deletedPositionsByFileIndex: rows of THIS not-yet-committed file that a buffered transaction
+                // deleted after inserting them (same-transaction DML) — the add is born with an inline deletion
+                // vector, so the rows never appear in any committed version. Stats stay physical-row stats,
+                // marked tightBounds=false per the spec (loose supersets).
+                DeletionVector? dv = null;
+                string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+                if (deletedPositionsByFileIndex is not null
+                    && deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
+                    && deletedPositions.Count > 0)
+                {
+                    var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+                    dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count,
+                        cancellationToken).ConfigureAwait(false);
+                    stats = StatsWithLooseBounds(stats);
+                }
+                long fileBaseRowId = nextRowId;
+                actions.Add(new AddFile
+                {
+                    Path = DeltaPath.Encode(f.RelativePath),
+                    PartitionValues = f.PartitionValues ?? new Dictionary<string, string>(),
+                    Size = f.SizeBytes,
+                    ModificationTime = now,
+                    DataChange = dataChange,
+                    // numRecords is REQUIRED (row-tracking high-water mark = baseRowId + numRecords); a caller
+                    // with full stats passes StatsJson, else we emit the minimal numRecords-only stats.
+                    Stats = stats,
+                    BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
+                    DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                    DeletionVector = dv,
+                    ClusteringProvider = clusteringProvider,
+                    Tags = f.Tags,
+                });
+                if (rowTrackingEnabled)
+                    nextRowId += f.NumRecords;
+            }
+
+            if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            {
+                actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+            }
+
+            // A buffered transaction's deletion-vector remove/add pairs (or a schema metaData change) join the
+            // SAME commit (atomic DML + append flush).
+            if (extraActions is { Count: > 0 })
+                actions.AddRange(extraActions);
+
+            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(actions, cfg, operation);
+            try
+            {
+                await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
+            }
+            catch (DeltaConflictException) when (attempt < 16 && expectedVersion is null)
+            {
+                // A concurrent writer took our version — refresh the snapshot (recomputes the Overwrite removes +
+                // the row-tracking high-water mark) and retry. The already-written data files are reused as-is.
+                _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+            if (_options.CheckpointInterval > 0 && newVersion % _options.CheckpointInterval == 0)
+                await _checkpointWriter.WriteCheckpointAsync(_currentSnapshot, cancellationToken).ConfigureAwait(false);
+            return newVersion;
+        }
+    }
+
+    /// <summary>Rewrites a stats JSON object with <c>tightBounds=false</c> — an add that carries an inline
+    /// deletion vector has fewer live rows than its physical min/max bounds cover, so the bounds are loose
+    /// supersets per the spec.</summary>
+    private static string? StatsWithLooseBounds(string? stats)
+    {
+        if (string.IsNullOrEmpty(stats))
+            return stats;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(stats!);
+            using var stream = new MemoryStream();
+            using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                writer.WriteBoolean("tightBounds", false);
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!prop.NameEquals("tightBounds"))
+                        prop.WriteTo(writer);
+                }
+                writer.WriteEndObject();
+            }
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return stats;
+        }
+    }
+
     /// <summary>
     /// Writes a stream of RecordBatch data as a new commit.
     /// </summary>

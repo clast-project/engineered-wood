@@ -27,10 +27,6 @@ public class PendingCoverageTests
 
     private const string SetSchema = "Blocked: needs DeltaTable.SetSchemaAsync — PR #4 slice 8 leftover.";
 
-    private const string CommitDataFiles =
-        "Blocked: needs CommitDataFilesAsync(dataChange:, clusteringProvider:) — PR #4 slice 10, itself " +
-        "gated on the buffered-transaction seam (slice 9).";
-
     // ── Buffered (multi-statement) transactions — pr-4 BufferedTransactionTests ──
 
     /// <summary>An ALTER + INSERT + DELETE buffered together must commit as ONE atomic Delta version —
@@ -43,10 +39,8 @@ public class PendingCoverageTests
     [Fact(Skip = BufferedTxn)]
     public void ChainedComputes_SecondAddComposesOnPendingSchema() { }
 
-    /// <summary>CommitDataFilesAsync(expectedVersion:) must turn the append OCC retry into a conflict
-    /// ABORT — first-committer-wins snapshot isolation for snapshot-coupled actions.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void ExpectedVersion_ConcurrentWriter_ConflictAborts() { }
+    // UN-PARKED (ExpectedVersion_ConcurrentWriter_ConflictAborts): the CommitDataFilesAsync(expectedVersion:)
+    // conflict-abort is live in ExternalDataFileCommitTests, against the Milestone-A external-commit seam.
 
     /// <summary>ReadRowsByRowIdsAsync(atVersion:) must read back exactly the addressed rows — the
     /// mechanism an UPDATE post-image is built from.</summary>
@@ -132,10 +126,9 @@ public class PendingCoverageTests
     public void SetSchema_LogicallyIdentical_IsNoOp() { }
 
     // ── Clustering rewrite-commit shape — pr-4 ClusteredTableTests ──
-
-    /// <summary>A clustering OPTIMIZE commits Overwrite-shaped with dataChange=false on BOTH removes and
-    /// adds (so CDF readers exclude it, and appendOnly still permits it — it removes files, not rows) and
-    /// stamps add.clusteringProvider = "liquid".</summary>
-    [Fact(Skip = CommitDataFiles)]
-    public void CommitDataFiles_RewriteShape_DataChangeFalseAndClusteringProvider() { }
+    //
+    // UN-PARKED: the Overwrite-shaped rewrite commit (dataChange=false on BOTH removes and adds, so CDF readers
+    // exclude it and appendOnly still permits it — it removes files, not rows; add.clusteringProvider stamped)
+    // is live in ExternalDataFileCommitTests.CommitDataFiles_RewriteShape_DataChangeFalseAndClusteringProvider,
+    // against the Milestone-A CommitDataFilesAsync(dataChange:, clusteringProvider:) surface.
 }
