@@ -147,4 +147,63 @@ public class BufferedTransactionTests : IDisposable
         ids.Sort();
         Assert.Equal(new long[] { 2, 4 }, ids);
     }
+
+    private static Func<RecordBatch, BooleanArray> IdEquals(long target) => batch =>
+    {
+        var id = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < id.Length; i++)
+            mask.Append(id.GetValue(i) == target);
+        return mask.Build();
+    };
+
+    private async Task<List<long>> ReadIdsFreshAsync()
+    {
+        await using var reader = await OpenAsync();
+        var ids = new List<long>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var col = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                ids.Add(col.GetValue(i)!.Value);
+        }
+        ids.Sort();
+        return ids;
+    }
+
+    /// <summary>The buffered consumer shape: DML positions are captured against a PINNED snapshot; a concurrent
+    /// DV delete lands while the "transaction" is open; at COMMIT the actions rebase onto the latest snapshot
+    /// (DV union), pass CheckLogicalRebaseAsync, and land in one commit — both deletes compose (disjoint rows).
+    /// Un-parked from PendingCoverageTests.</summary>
+    [Fact]
+    public async Task BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([BuildBatch(1, 10)]); // v1: ids 1..10, one file
+        var pinned = table.CurrentSnapshot;
+
+        // positions of id=2 in the pinned snapshot (single file → ordinal 0, position = id - 1)
+        var positions = new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } };
+        var (actions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+        Assert.Equal(1, rowsDeleted);
+
+        // a concurrent writer DV-deletes id=7 (position 6) on the SAME file while the transaction is open
+        await using (var racer = await OpenAsync())
+        {
+            await racer.DeleteAsync(IdEquals(7));
+        }
+
+        // rebase the pinned-resolved actions onto the latest snapshot, validate, commit
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            actions, positions, pinned, committer.CurrentSnapshot);
+        await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true);
+        await committer.CommitDataFilesAsync(
+            System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+            extraActions: rebased, expectedVersion: committer.CurrentSnapshot.Version, operation: "DELETE");
+
+        // both deletes composed: id 2 (this transaction) and id 7 (the racer) are gone
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 8, 9, 10 }, await ReadIdsFreshAsync());
+    }
 }

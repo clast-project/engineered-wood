@@ -77,13 +77,10 @@ public class PendingCoverageTests
     // against DeltaTable.RemapRowLevelDeletesAsync. This also retired the row-tracking rebaseSafe:false
     // limitation for DELETE-only transactions.
     //
-    // STILL PARKED (the buffered-transaction seam): the case below drives the explicit Compute* → rebase →
-    // commit surface (ComputeDeletionVectorActionsAsync / RebaseDvDmlActionsAsync / CheckLogicalRebaseAsync /
-    // CommitDataFilesAsync), which is the deferred multi-statement seam, not row-level concurrency itself.
-
-    /// <summary>The buffered flow composes: Compute* → rebase → commit, against a concurrent delete.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete() { }
+    // UN-PARKED (BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete): the explicit
+    // Compute* → rebase → commit surface (ComputeDeletionVectorActionsAsync / RebaseDvDmlActionsAsync /
+    // CheckLogicalRebaseAsync / CommitDataFilesAsync — a DV DELETE resolved against a pinned snapshot, rebased
+    // by DV union onto a concurrent delete, both composing) is live in BufferedTransactionTests.
 
     // ── SetSchemaAsync — pr-4 SchemaWriteModesTests ──
     //
