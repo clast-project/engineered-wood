@@ -11,9 +11,11 @@ pushdown, see [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
 For the forward-looking encryption design, see
 [`encryption-design.md`](encryption-design.md).
 
-> **Last verified against the code: 2026-07-19.** The Parquet and Delta
-> sections were re-checked claim by claim on that date; roughly a dozen
-> entries described gaps that had since been closed. If you are relying on
+> **Last verified against the code: 2026-07-21.** The Delta section was
+> re-checked claim by claim on that date (row tracking, the buffered-transaction
+> seam, nested-field ALTER, row-id DML, predicate DELETE/UPDATE, variant, and
+> CDF column-mapping had all landed since the prior pass); the Parquet section
+> was last re-checked 2026-07-19. If you are relying on
 > an entry here, confirm it against the code before acting on it — this file
 > records absences, and absences are exactly what nothing fails when they
 > stop being true. The Delta entries additionally have external coverage now
@@ -288,7 +290,6 @@ features appear in the Delta protocol but are absent from
 | Feature | Role | Impact |
 |---|---|---|
 | `allowColumnDefaults` / `columnDefaults` | Writer | Column default values on write not supported. |
-| `variantType` | Reader-Writer | Variant column type not supported AT THE DELTA LAYER. Note the Parquet layer does support VARIANT via the opt-in `arrow.parquet.variant` extension; the gap is Delta-side plumbing, not the codec. |
 | `collations` | Writer | String collations not supported. |
 | `catalogOwned` / `catalogOwned-preview` | Reader-Writer | Catalog-owned contracts not supported on either side. |
 | `coordinatedCommits` / `managedCommits` | Writer | No commit-coordinator client; plain rename-based commits only. |
@@ -327,29 +328,23 @@ Note the domain stores PHYSICAL column names, because OSS Delta
 `EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
 `DESCRIBE DETAIL` resolves the declaration back to the logical names.
 
-**Row tracking (`delta.enableRowTracking=true`) is READ-ONLY.** A
-data-changing write to a row-tracking table is refused with
-`NotSupportedException` (`DeltaTable.RejectRowTrackingWrite`, gating
-`ValidateWritable` and `CompactAsync`) rather than silently corrupting it.
-The write path could assign a `baseRowId` on append but DROPS it on any
-copy-on-write rewrite (UPDATE / compaction) and materializes a non-spec
-internal `__delta_row_id` column, so a write would violate the stable-row-id
-invariants a conformant engine (Spark, Databricks) relies on. Reading a
-row-tracking table is fully supported — `baseRowId` is log metadata that does
-not affect the data, and the `delta.rowTracking` high-water mark is
-reconciled on read (`RowTracking/RowTrackingConfig.cs`). A spec-conformant
-writer (materialized-column naming via metadata, id preservation through
-rewrites, tier-3 Spark validation) is the deferred **Layer 3 (B)** work; it
-is also the prerequisite for row-tracking optimistic-concurrency rebase (the
-`rebaseSafe: false` limitation). Full future-implementation brief:
-`doc/row-tracking-conformance-brief.md`. There is also no `CreateAsync` surface to
-ENABLE row tracking — the only way to reach a row-tracking table is opening
-one a foreign engine created.
-
-**`rowTracking` read-side classification.** `rowTracking` is a
-reader-writer feature in the spec but is listed only in
-`SupportedWriterFeatures`, so a table carrying it in `readerFeatures` is
-still rejected by `ValidateReadSupport`.
+**Row tracking (`delta.enableRowTracking=true`) — one residual limitation.**
+Row tracking is otherwise fully supported: `CreateAsync(enableRowTracking: true)`
+enables it (generating the materialized column-name properties + declaring the
+`rowTracking`/`domainMetadata` writer features), appends are spec-conformant
+(`baseRowId` + position), and a copy-on-write rewrite (UPDATE / OVERWRITE /
+DELETE / compaction) PRESERVES each surviving row's stable id by materializing
+its original id + commit version into the declared hidden columns. Optimistic
+concurrency rebases under row tracking (append/update re-derive `baseRowId` from
+the advanced high-water mark; a losing DELETE remaps by stable row id across a
+concurrent rewrite). All of this is measured cross-engine on Spark 4.0
+(`SparkInteropTests` — Spark reads the preserved / rebased ids via
+`_metadata.row_id`). The one residual: `DeltaTable.RejectRowTrackingWrite`
+refuses a copy-on-write REWRITE of a row-tracking table that does NOT declare
+its materialized column-name properties (a spec-invalid shape EW never creates,
+but a foreign engine could) — without those names EW cannot preserve ids through
+the rewrite. Appending to and reading such a table is still allowed. Background:
+`doc/row-tracking-conformance-brief.md`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single
@@ -396,28 +391,37 @@ fields still never emitted: `readVersion`, `isolationLevel`,
 `SetClusteringColumnsAsync` upgrade the protocol as needed via
 `UpgradeProtocolForFeatures` / `UpgradeProtocolForWriterFeatures`, and
 `CreateAsync` declares schema-driven features (`timestampNtz`,
-`identityColumns`, `columnMapping`) up front, and `enableDeletionVectors:
-true` declares `deletionVectors` at creation. There is still no general
-public API for enabling `deletionVectors` / `rowTracking` / `typeWidening` /
-`inCommitTimestamp` on an EXISTING table (only `deletionVectors` can be
-declared, and only at create time).
+`identityColumns`, `columnMapping`) up front, and its `enableDeletionVectors:
+true` / `enableRowTracking: true` switches declare `deletionVectors` /
+`rowTracking` at creation. There is still no general public API for enabling
+`deletionVectors` / `rowTracking` / `typeWidening` / `inCommitTimestamp` on an
+EXISTING table — these can only be declared at create time.
 
-**Exactly-once transactional writes.** `SetTransaction` actions are
-read, written, and reconciled in snapshots, but `DeltaTable` has no
-`WriteWithTxnAsync(appId, version, ...)` overload — streaming writers
-cannot use `(appId, version)` for exactly-once idempotency.
+**Exactly-once transactional writes — no convenience overload.** The
+primitives are all public: the `TransactionId` (`txn`) action is reconciled onto
+`Snapshot.AppTransactions` (readable for the last committed version per `appId`),
+and a `TransactionId` can be fused into a commit via `CommitDataFilesAsync`'
+`extraActions`. What is missing is a dedicated `WriteWithTxnAsync(appId, version,
+…)` overload that packages the idempotency check + `txn` action for a streaming
+writer, so today the caller must wire those primitives together by hand.
 
-**High-level DML.** No MERGE, no UPDATE-by-predicate beyond the
-existing `UpdateAsync`, no DELETE-by-predicate beyond `DeleteAsync`, no
-RESTORE (committing a time-travel state as the current version), no
-CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no
-raw incremental-by-version-range read outside of CDF.
+**High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
+overload and an analyzable-`Expressions.Predicate` overload (the predicate form
+feeds file pruning + concurrency read-set analysis); `DeleteByRowIdsAsync` /
+`UpdateByRowIdsAsync` do copy-on-write DML keyed by transient row id. Still
+missing: MERGE, RESTORE (committing a time-travel state as the current version),
+and CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw
+incremental-by-version-range read outside of CDF.
 
-**Schema evolution API — partial.** `AddColumnAsync`, `RenameColumnAsync`
-and `DropColumnAsync` exist as metadata-only commits. Still missing:
-`SetSchemaAsync` (adopt a whole incoming schema), column reorder,
-nullability change, and adding a column to a nested struct. Column mapping
-mode is fixed at `CreateAsync`.
+**Schema evolution API — partial.** Metadata-only commits exist for top-level
+ADD / RENAME / DROP COLUMN (`AddColumnAsync` / `RenameColumnAsync` /
+`DropColumnAsync`) and the nested-struct-field analogs (`AddFieldAsync` /
+`RenameFieldAsync` / `DropFieldAsync`) — each of those six also has a
+compute-only `Compute*` counterpart that a buffered transaction fuses with data
+changes — plus whole-schema adoption (`SetSchemaAsync`, the CREATE-OR-REPLACE
+building block, which commits directly). Still missing: column reorder and
+nullability change (drop/add NOT NULL). Column mapping mode is fixed at
+`CreateAsync`.
 
 **Vacuum does not collect expired change-data-feed files.** `_change_data/`
 is excluded from the sweep because CDF files are referenced by `cdc`
@@ -445,11 +449,13 @@ remove WHOLE files (a clean file/partition boundary — a metadata-only remove
 needing no DV); a predicate that would soft-delete part of a file throws
 `InvalidOperationException` rather than write a vector a foreign reader would
 not apply. There is still **no way to enable DVs on an EXISTING table** (no
-`ALTER TABLE`-style property update / protocol upgrade), and **no
-copy-on-write DELETE** to rewrite files when DVs are off — the two "for now"
-gaps behind the fail-fast. Earlier EW always wrote a DV without declaring the
-feature, so a conformant foreign reader silently returned the deleted rows;
-that data-loss gap is closed.
+`ALTER TABLE`-style property update / protocol upgrade), and the predicate
+`DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
+removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
+exist, keyed by transient row id — `DeleteByRowIdsAsync` / `UpdateByRowIdsAsync`
+— which rewrites the affected files with no DV; it requires row tracking.)
+Earlier EW always wrote a DV without declaring the feature, so a conformant
+foreign reader silently returned the deleted rows; that data-loss gap is closed.
 
 _Reader-side reality (measured):_ delta-rs 1.6.2's reader does not support the
 `deletionVectors` feature, so it REFUSES an EW DV table (`DeltaProtocolError:
