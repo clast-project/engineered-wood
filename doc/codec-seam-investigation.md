@@ -341,3 +341,10 @@ Either framing keeps the §5.3–6 codec obligations, and either can ship withou
 1 permanently, Framing 2 until join/MERGE DML is actually wanted. What should NOT happen is keeping the
 rewriter as-is while *assuming* Framing 1: that is the abstraction-level mismatch with no owning story, which
 is the state this section exists to flag.
+
+**Update (2026-07-21).** master now serves the Framing-1 "update from a host-side join" case directly, without
+the rewriter: `ReadAllWithRowIdsAsync` → host join → `UpdateByRowIdsAsync(updates)` (a rowid-keyed value batch;
+type-agnostic substitution via concat + take). So the deciding case in this section has a concrete API on the
+codec side. The pr-4 → master reconciliation this implies (drop `IDataFileRewriter`, keep the codec
+reader/writer, move the transform to the row-id DML) is written up for the PR #4 author in
+[`pr4-to-master-migration.md`](pr4-to-master-migration.md).
