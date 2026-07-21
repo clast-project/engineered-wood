@@ -1096,11 +1096,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var baseSnapshot = transaction.BaseSnapshot;
 
-        // A rebased add would need its baseRowId recomputed against the advanced high-water mark, which
-        // is not implemented yet. A row-tracking transaction may still commit if it wins the FIRST
-        // attempt (no rebase); on any rebase it aborts rather than write a wrong baseRowId.
         bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
+
+        // A rebased append/update needs its new file's baseRowId recomputed against the advanced high-water
+        // mark, which is not implemented — so under row tracking such a transaction still aborts rather than
+        // rebase (limitation 2). A DELETE, by contrast, only edits deletion vectors on EXISTING files (its
+        // re-add keeps that file's own baseRowId) and — when a file was concurrently rewritten — remaps its
+        // rows by STABLE ROW ID onto the new files (Layer 3 B), which likewise keep their baseRowId. So a
+        // DELETE-only transaction is rebase-safe and row-level-resolvable even under row tracking.
+        bool deleteOnly = transaction.Operation == "DELETE";
+        bool rebaseSafe = !rowTracking || deleteOnly;
 
         // Files = what a staged delete/update rewrote (concurrentDeleteRead). Predicates = the analyzable
         // read predicates staged on this transaction (empty for functional-predicate or append-only work);
@@ -1112,15 +1118,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Predicates = transaction.ReadPredicates,
         };
 
-        // Pure DV-delete edits are eligible for row-level DELETE/DELETE reconciliation. Withheld under row
-        // tracking: a rebased delete's AddFile would carry the concurrent file's baseRowId, which is fine
-        // for the survivors, but row-tracking rebase safety is handled uniformly by rebaseSafe:false until
-        // the copy-on-write remap (Layer 3 sub-problem B) lands.
+        // Row-level DELETE/DELETE reconciliation (DV union, or remap across a concurrent rewrite) engages only
+        // when the transaction is a rebase-safe delete; a mixed or non-delete transaction under row tracking
+        // aborts before reaching it.
         return CommitOccAsync(
             baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
-            transaction.IsolationLevel, transaction.Operation, rebaseSafe: !rowTracking,
+            transaction.IsolationLevel, transaction.Operation, rebaseSafe,
             cancellationToken,
-            rowLevelDeletes: rowTracking ? null : transaction.DvEdits);
+            rowLevelDeletes: rebaseSafe ? transaction.DvEdits : null);
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -1211,12 +1216,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (rowLevel)
                 {
                     var resolution = await ResolveRowLevelDeletesAsync(
-                        latestSnapshot!, dataActions, rowLevelDeletes!, cancellationToken)
+                        baseSnapshot, latestSnapshot!, dataActions, rowLevelDeletes!, cancellationToken)
                         .ConfigureAwait(false);
                     if (resolution is null)
                         throw new DeltaConflictException(
                             "A concurrent commit deleted a row this delete also removed, or rewrote a file "
-                            + "it targeted; the delete conflicts at row level and must be retried.");
+                            + "it targeted such that a row cannot be remapped; the delete conflicts at row "
+                            + "level and must be retried.");
 
                     currentActions = resolution.Value.Actions;
                     resolvedPaths = resolution.Value.ResolvedPaths;
@@ -1240,20 +1246,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Row-level DELETE/DELETE reconciliation (Databricks row-level concurrency): rebase a losing delete's
-    /// deletion vectors onto the winner's so two concurrent deletes of DISJOINT rows of the same file both
-    /// land, instead of the second aborting at file granularity. For each file this delete touched, rebuild
-    /// its <see cref="RemoveFile"/>/<see cref="AddFile"/> pair against the file's CURRENT state in
-    /// <paramref name="latestSnapshot"/>, unioning the rows this delete removed into the file's current
-    /// deletion vector. Every other staged action (CDC files, a co-staged append) is preserved verbatim.
+    /// Row-level DELETE/DELETE reconciliation (Databricks row-level concurrency, and beyond): rebase a losing
+    /// delete onto the winner so two writers touching DISJOINT rows of the same data both land, instead of the
+    /// second aborting at file granularity. Each file this delete touched is reconciled by one of two
+    /// mechanisms, chosen by whether the file survived the concurrent commits:
+    /// <list type="bullet">
+    /// <item><b>DV union</b> — the file is still active in <paramref name="latestSnapshot"/>: rebuild its
+    /// <see cref="RemoveFile"/>/<see cref="AddFile"/> pair against the file's CURRENT state, unioning the rows
+    /// this delete removed into the file's current deletion vector (DV positions are stable across a
+    /// concurrent DV-delete, so no row tracking is needed).</item>
+    /// <item><b>Remap across a rewrite</b> (<see cref="RemapRowLevelDeletesAsync"/>) — the file was rewritten
+    /// away by a concurrent compaction/UPDATE: relocate the deleted rows by STABLE ROW ID onto the new files
+    /// (requires row tracking). Beyond Databricks, whose row-level concurrency still conflicts with a rewrite.</item>
+    /// </list>
+    /// Every other staged action (CDC files, a co-staged append) is preserved verbatim.
     ///
-    /// <para>Returns <c>null</c> — a genuine conflict that must abort — when a row this delete removed was
-    /// ALSO removed by the concurrent commit (same-row conflict), or when a targeted file is no longer
-    /// active (it was rewritten by a concurrent compaction or UPDATE — a file-level, not row-level, change
-    /// that copy-on-write rewrites would need row-id remapping to survive; out of scope here).</para>
+    /// <para>Returns <c>null</c> — a genuine conflict that must abort — when a row this delete removed was ALSO
+    /// removed/updated by a concurrent commit (same-row conflict), or when a rewritten-away file's rows cannot
+    /// be remapped (no row tracking, or a target row was concurrently deleted so its stable id is gone).</para>
     /// </summary>
     private async ValueTask<(List<DeltaAction> Actions, ISet<string> ResolvedPaths)?>
         ResolveRowLevelDeletesAsync(
+            Snapshot.Snapshot baseSnapshot,
             Snapshot.Snapshot latestSnapshot,
             IReadOnlyList<DeltaAction> originalActions,
             IReadOnlyList<DeleteDvEdit> dvEdits,
@@ -1269,6 +1283,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var edit in dvEdits)
             editedPaths.Add(edit.Path);
 
+        // Split this delete's edits: files still active reconcile by DV union; files rewritten away need the
+        // stable-row-id remap (Layer 3 B), which requires row tracking. Without it a rewritten-away file is a
+        // genuine, unresolvable conflict (the strict pre-existing behavior).
+        var unionEdits = new List<DeleteDvEdit>();
+        var remapEdits = new List<DeleteDvEdit>();
+        foreach (var edit in dvEdits)
+            (activeByPath.ContainsKey(edit.Path) ? unionEdits : remapEdits).Add(edit);
+
+        if (remapEdits.Count > 0
+            && !DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(latestSnapshot.Metadata.Configuration))
+        {
+            return null; // rewritten away, no stable ids to remap by
+        }
+
+        // Paths whose concurrent remove/re-add the checker must ignore: the source files we reconcile (both
+        // union and remap), plus — added inside the remap — the NEW files it re-touches.
+        var resolvedPaths = new HashSet<string>(editedPaths, StringComparer.Ordinal);
+
         // Keep everything except this delete's own remove/add of an edited file — those get rebuilt below.
         var result = new List<DeltaAction>();
         foreach (var action in originalActions)
@@ -1282,10 +1314,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
 
-        foreach (var edit in dvEdits)
+        foreach (var edit in unionEdits)
         {
-            if (!activeByPath.TryGetValue(edit.Path, out var latestAdd))
-                return null; // the file was rewritten/compacted away — file-level, out of scope
+            var latestAdd = activeByPath[edit.Path];
 
             var concurrentDeleted = latestAdd.DeletionVector is not null
                 ? await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken)
@@ -1322,7 +1353,173 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             });
         }
 
-        return (result, editedPaths);
+        if (remapEdits.Count > 0)
+        {
+            var remapped = await RemapRowLevelDeletesAsync(
+                baseSnapshot, latestSnapshot, remapEdits, resolvedPaths, cancellationToken)
+                .ConfigureAwait(false);
+            if (remapped is null)
+                return null;
+            result.AddRange(remapped);
+        }
+
+        return (result, resolvedPaths);
+    }
+
+    /// <summary>
+    /// Layer 3 (B): relocate a losing DELETE's row intents ACROSS a concurrent rewrite (compaction /
+    /// copy-on-write UPDATE) by STABLE ROW ID, so a delete whose target file was rewritten away still lands
+    /// instead of aborting. Requires row tracking — the rows are followed by their stable id, not position.
+    ///
+    /// <list type="number">
+    /// <item>Resolve each target row's stable id + ORIGINAL commit version from the tombstoned source file
+    /// (read at <paramref name="baseSnapshot"/>, where those rows still live un-deleted — the parquet
+    /// survives until VACUUM). The target rows are identified by their absolute in-file positions
+    /// (<see cref="DeleteDvEdit.NewlyDeletedRows"/>).</item>
+    /// <item>Locate those stable ids in the NEW files (active in <paramref name="latestSnapshot"/> but not in
+    /// the base) — compaction-shaped files (<c>dataChange=false</c>) first, early-exit once all are found. The
+    /// row's commit version is the concurrent-modification discriminator: a relocated-untouched row keeps its
+    /// ORIGINAL version (compaction and a CoW pass-through both materialize it) ⇒ remap; a concurrently
+    /// UPDATED row carries the rewrite's version ⇒ conflict; an id found nowhere was concurrently DELETED (a
+    /// DV-deleted relocated row is filtered from the scan) ⇒ conflict.</item>
+    /// <item>The found positions become <c>remove</c>/<c>add</c> deletion-vector pairs on the new files.</item>
+    /// </list>
+    /// Returns <c>null</c> on any row-level conflict (concurrent update/delete of a target row, or an
+    /// unresolvable id). Adds each new file it re-touches to <paramref name="resolvedPaths"/> so the checker
+    /// ignores that file's concurrent add.
+    /// </summary>
+    private async ValueTask<List<DeltaAction>?> RemapRowLevelDeletesAsync(
+        Snapshot.Snapshot baseSnapshot,
+        Snapshot.Snapshot latestSnapshot,
+        IReadOnlyList<DeleteDvEdit> remapEdits,
+        HashSet<string> resolvedPaths,
+        CancellationToken cancellationToken)
+    {
+        var baseByPath = new Dictionary<string, AddFile>(StringComparer.Ordinal);
+        foreach (var file in baseSnapshot.ActiveFiles.Values)
+            baseByPath[file.Path] = file;
+
+        // 1. Resolve the target rows' stable ids + original commit versions from the tombstoned sources.
+        var targetVersions = new Dictionary<long, long>(); // stable row id -> original commit version
+        foreach (var edit in remapEdits)
+        {
+            if (!baseByPath.TryGetValue(edit.Path, out var sourceAdd))
+                return null; // the delete's source file is not in the base snapshot — cannot resolve
+
+            var wantPositions = new HashSet<long>(edit.NewlyDeletedRows);
+            var ids = new List<Int64Array?>();
+            var vers = new List<Int64Array?>();
+            var positions = new List<Int64Array?>();
+            await foreach (var _ in ReadFileAsync(
+                sourceAdd, null, baseSnapshot, cancellationToken, ids, vers, positions).ConfigureAwait(false))
+            {
+                // Only the row-aligned out-params matter here; the emitted user batches are discarded.
+            }
+
+            int resolved = 0;
+            for (int bi = 0; bi < positions.Count; bi++)
+            {
+                var pA = positions[bi];
+                var idA = bi < ids.Count ? ids[bi] : null;
+                var vA = bi < vers.Count ? vers[bi] : null;
+                if (pA is null)
+                    continue;
+                for (int i = 0; i < pA.Length; i++)
+                {
+                    long pos = pA.GetValue(i)!.Value;
+                    if (!wantPositions.Contains(pos))
+                        continue;
+                    if (idA is null || idA.IsNull(i) || vA is null || vA.IsNull(i))
+                        return null; // a target row has no stable id/version to remap by
+                    targetVersions[idA.GetValue(i)!.Value] = vA.GetValue(i)!.Value;
+                    resolved++;
+                }
+            }
+            if (resolved != wantPositions.Count)
+                return null; // some target rows could not be resolved
+        }
+
+        // 2. Locate the stable ids in the NEW files (active in latest, absent from base). A row concurrently
+        //    DV-deleted in latest is filtered out on read, so it never appears here → falls to the not-found
+        //    conflict below.
+        var remaining = new HashSet<long>(targetVersions.Keys);
+        var assignments = new Dictionary<string, (AddFile File, HashSet<long> Positions)>(StringComparer.Ordinal);
+        var candidates = latestSnapshot.ActiveFiles.Values
+            .Where(f => !baseByPath.ContainsKey(f.Path))
+            .OrderBy(f => f.DataChange) // false (compaction) first
+            .ToList();
+
+        foreach (var cand in candidates)
+        {
+            if (remaining.Count == 0)
+                break;
+
+            var ids = new List<Int64Array?>();
+            var vers = new List<Int64Array?>();
+            var positions = new List<Int64Array?>();
+            await foreach (var _ in ReadFileAsync(
+                cand, null, latestSnapshot, cancellationToken, ids, vers, positions).ConfigureAwait(false))
+            {
+            }
+
+            for (int bi = 0; bi < positions.Count; bi++)
+            {
+                var pA = positions[bi];
+                var idA = bi < ids.Count ? ids[bi] : null;
+                var vA = bi < vers.Count ? vers[bi] : null;
+                if (pA is null || idA is null)
+                    continue; // no resolvable ids in this batch — a fresh append can't hold our rows
+                for (int i = 0; i < pA.Length; i++)
+                {
+                    if (idA.IsNull(i))
+                        continue;
+                    long stable = idA.GetValue(i)!.Value;
+                    if (!remaining.Contains(stable))
+                        continue;
+                    long newVer = vA is not null && !vA.IsNull(i) ? vA.GetValue(i)!.Value : long.MaxValue;
+                    if (newVer != targetVersions[stable])
+                        return null; // the row was concurrently updated (its commit version advanced)
+                    if (!assignments.TryGetValue(cand.Path, out var slot))
+                        assignments[cand.Path] = slot = (cand, new HashSet<long>());
+                    slot.Positions.Add(pA.GetValue(i)!.Value);
+                    remaining.Remove(stable);
+                }
+            }
+        }
+        if (remaining.Count > 0)
+            return null; // some rows were not found after the rewrite — concurrently deleted
+
+        // 3. Build remove/add deletion-vector pairs on the new files.
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var result = new List<DeltaAction>(assignments.Count * 2);
+        foreach (var kv in assignments)
+        {
+            var (cand, positions) = kv.Value;
+            resolvedPaths.Add(cand.Path); // checker: this new file's concurrent add is reconciled, not foreign
+
+            var deleted = cand.DeletionVector is not null
+                ? new HashSet<long>(await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
+                : new HashSet<long>();
+            foreach (long p in positions)
+                deleted.Add(p);
+            var newDv = await dvWriter.CreateAsync(deleted, deleted.Count, cancellationToken)
+                .ConfigureAwait(false);
+
+            result.Add(new RemoveFile
+            {
+                Path = cand.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = cand.DeletionVector,
+            });
+            result.Add(cand with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+            });
+        }
+        return result;
     }
 
     #endregion
@@ -2704,13 +2901,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot snapshot,
         [EnumeratorCancellation] CancellationToken cancellationToken,
         List<Int64Array?>? strippedRowIdsOut = null,
-        List<Int64Array?>? strippedVersionsOut = null)
+        List<Int64Array?>? strippedVersionsOut = null,
+        List<Int64Array?>? strippedAbsPositionsOut = null)
     {
         // strippedRowIdsOut/strippedVersionsOut: when non-null, each EMITTED batch appends its per-row RESOLVED
         // row id / commit version (materialized value where present, else add.baseRowId + absolute position /
         // add.defaultRowCommitVersion; null when underivable). A copy-on-write rewrite (UPDATE) uses these so a
-        // moved row keeps its ORIGINAL id. The hidden materialized columns are always stripped from the emitted
-        // user batches regardless (a foreign reader must never see them).
+        // moved row keeps its ORIGINAL id. strippedAbsPositionsOut adds the surviving row's ABSOLUTE in-file
+        // position (parquet row index, DV-inclusive) — the row-level remap (Layer 3 B) uses it to correlate a
+        // delete's target positions with stable row ids and to place the rebased deletion vector. The hidden
+        // materialized columns are always stripped from the emitted user batches regardless (a foreign reader
+        // must never see them).
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         bool hasPartitions = partitionColumns.Count > 0 &&
             addFile.PartitionValues.Count > 0;
@@ -2767,7 +2968,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await foreach (var processed in ProcessFileBatchesAsync(
                 seamBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
                 logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows, partitionColumns,
-                hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut).ConfigureAwait(false))
+                hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
+                strippedAbsPositionsOut).ConfigureAwait(false))
             {
                 yield return processed;
             }
@@ -2845,7 +3047,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await foreach (var processed in ProcessFileBatchesAsync(
             builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
             logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
-            hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut).ConfigureAwait(false))
+            hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
+            strippedAbsPositionsOut).ConfigureAwait(false))
         {
             yield return processed;
         }
@@ -2875,7 +3078,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool hasPartitions,
         [EnumeratorCancellation] CancellationToken cancellationToken,
         List<Int64Array?>? strippedRowIdsOut = null,
-        List<Int64Array?>? strippedVersionsOut = null)
+        List<Int64Array?>? strippedVersionsOut = null,
+        List<Int64Array?>? strippedAbsPositionsOut = null)
     {
         long batchStartRow = 0;
 
@@ -2885,7 +3089,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool hasMaterialized = matRowIdName is not null || matRowVerName is not null;
-        bool wantRowIds = strippedRowIdsOut is not null || strippedVersionsOut is not null;
+        bool wantRowIds = strippedRowIdsOut is not null || strippedVersionsOut is not null
+            || strippedAbsPositionsOut is not null;
 
         await foreach (var batch in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -2990,6 +3195,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 var idb = new Int64Array.Builder();
                 var vrb = new Int64Array.Builder();
+                var pb = new Int64Array.Builder();
                 foreach (int i in survivorSrc!)
                 {
                     long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
@@ -2999,9 +3205,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
                     long? ver = mv ?? addFile.DefaultRowCommitVersion;
                     if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+
+                    pb.Append(thisBatchStart + i); // absolute in-file position (DV-inclusive), for the remap
                 }
                 strippedRowIdsOut?.Add(idb.Build());
                 strippedVersionsOut?.Add(vrb.Build());
+                strippedAbsPositionsOut?.Add(pb.Build());
             }
 
             yield return cleanResult;

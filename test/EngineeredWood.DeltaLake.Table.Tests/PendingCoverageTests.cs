@@ -25,11 +25,6 @@ public class PendingCoverageTests
         "Blocked: needs the buffered-transaction seam (WriteDataFilesAsync / CommitDataFilesAsync / the " +
         "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
 
-    private const string RowLevelConcurrency =
-        "Blocked: needs row-level concurrency sub-problem B — a copy-on-write rewrite (UPDATE/compaction) " +
-        "that carries surviving rows' baseRowId through, plus remap-by-row-id on rebase. Sub-problem A " +
-        "(DELETE/DELETE deletion-vector union) landed in RowLevelConcurrencyTests — PR #4 slice 9.";
-
     private const string SetSchema = "Blocked: needs DeltaTable.SetSchemaAsync — PR #4 slice 8 leftover.";
 
     private const string CommitDataFiles =
@@ -104,33 +99,25 @@ public class PendingCoverageTests
 
     // ── Row-level concurrency — pr-4 RowLevelConcurrencyTests ──
     //
-    // UN-PARKED (sub-problem A — DELETE/DELETE deletion-vector union): the three cases a DV-only rebase
-    // covers — two disjoint-row deletes of the same file both landing, two same-row deletes conflicting,
-    // and a non-reconcilable conflict (a rewritten-away file) still surfacing — are now live in
-    // RowLevelConcurrencyTests, against the row-level resolution DeltaTable.CommitOccAsync gained. DV
-    // positions are stable across a concurrent DV-delete, so no row tracking is needed for this half.
+    // UN-PARKED (sub-problem A — DELETE/DELETE deletion-vector union): two disjoint-row deletes of the same
+    // file both landing, two same-row deletes conflicting, and a non-reconcilable conflict still surfacing
+    // are live in RowLevelConcurrencyTests. DV positions are stable across a concurrent DV-delete, so no row
+    // tracking is needed for that half.
     //
-    // STILL PARKED (sub-problem B — rewrite-preservation): the cases below need a copy-on-write rewrite
-    // (UPDATE / compaction) to carry each surviving row's baseRowId through so a concurrent delete can be
-    // remapped onto the rewritten file by stable row id. ComputeUpdateActionsAsync currently builds a bare
-    // AddFile (no BaseRowId) and strips the row-id column, so these remain blocked on that work — which is
-    // also what would retire the row-tracking rebaseSafe:false limitation.
-
-    /// <summary>A concurrent UPDATE and DELETE on disjoint rows must both land.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void ConcurrentUpdateAndDelete_DisjointRows_BothLand() { }
-
-    /// <summary>A delete whose target file was concurrently COMPACTED must be remapped onto the
-    /// compacted file rather than failing.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void DeleteThroughConcurrentCompaction_Remapped() { }
-
-    /// <summary>...but if the row was also concurrently deleted, that is a genuine row-level conflict.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
-    public void DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict() { }
+    // UN-PARKED (sub-problem B — remap across a rewrite): a delete whose target file was concurrently
+    // COMPACTED or UPDATE-rewritten is now relocated by STABLE ROW ID onto the new file (requires row
+    // tracking), and a target row concurrently deleted/updated is a row-level conflict — all live in
+    // RowLevelConcurrencyTests (ConcurrentUpdateAndDelete_DisjointRows_BothLand,
+    // DeleteThroughConcurrentCompaction_Remapped, DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict),
+    // against DeltaTable.RemapRowLevelDeletesAsync. This also retired the row-tracking rebaseSafe:false
+    // limitation for DELETE-only transactions.
+    //
+    // STILL PARKED (the buffered-transaction seam): the case below drives the explicit Compute* → rebase →
+    // commit surface (ComputeDeletionVectorActionsAsync / RebaseDvDmlActionsAsync / CheckLogicalRebaseAsync /
+    // CommitDataFilesAsync), which is the deferred multi-statement seam, not row-level concurrency itself.
 
     /// <summary>The buffered flow composes: Compute* → rebase → commit, against a concurrent delete.</summary>
-    [Fact(Skip = RowLevelConcurrency)]
+    [Fact(Skip = BufferedTxn)]
     public void BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete() { }
 
     // ── SetSchemaAsync — pr-4 SchemaWriteModesTests ──

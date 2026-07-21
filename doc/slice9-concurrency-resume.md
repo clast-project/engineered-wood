@@ -52,6 +52,7 @@ The buffered multi-statement surface (`Compute*` schema ALTERs, identity chainin
 | 3 | `7964d07` | Auto-committers routed through the OCC loop: `DeleteAsync` and the blind-append `WriteAsync` now rebase-retry instead of throwing on any collision. OCC loop generalised to `CommitOccAsync`; `AutoCommitConcurrencyTests` (6) + a rebased-commit tier-3 Spark test. |
 | 4 | `3bfb9fb` | Appends + updates stageable on `DeltaTransaction` (`WriteAsync`/`UpdateAsync`), closing limitation 1. Extracted `ComputeWriteActionsAsync` (shared by `WriteCoreAsync` + txn append) and `ComputeUpdateActionsAsync` (shared by `UpdateAsync` + txn update); auto-committer `UpdateAsync` now also rebase-retries via `CommitOccAsync`. Operation-label tracking on the txn; `ValidateWritable(snapshot, isAppend)` shared gate. `DeltaTransactionTests` +5. |
 | 5 | `5a8445f` | Analyzable-predicate `DeleteAsync`/`UpdateAsync` overloads (`Expressions.Predicate`), closing limitation 3. The predicate becomes the operation's `ReadSet.Predicates`, so concurrentAppend is now precise (a concurrent add matching it conflicts, per isolation level); files that can't match are pruned from the read. `EngineeredWood.Expressions.Arrow` project ref added for the `ArrowRowEvaluator` row mask. `ExpressionPredicateTests` (6). |
+| 7 | *(pending commit, 2026-07-20)* | **Layer 3 sub-problem (B) — remap a losing DELETE across a concurrent REWRITE (row-tracking Milestone 3).** A DELETE whose target file was concurrently COMPACTED or UPDATE-rewritten is now relocated by STABLE ROW ID onto the new file(s) instead of aborting, and its commit version is the concurrent-modification discriminator (untouched-relocated both-lands; concurrently updated/deleted row → row-level conflict). `ReadFileAsync`/`ProcessFileBatchesAsync` gained a third out-param `strippedAbsPositionsOut` (absolute in-file position per surviving row) so the remap can correlate a delete's target positions with the M2 resolved stable ids/versions. `ResolveRowLevelDeletesAsync` (now takes `baseSnapshot`) SPLITS a delete's edits into still-active (DV union, path (A)) vs rewritten-away (new `RemapRowLevelDeletesAsync`): phase 1 resolves target stable ids+versions from the tombstoned source read at base, phase 2 finds them in the new files (compaction `dataChange=false` first, early-exit; a DV-deleted relocated row is filtered → not found → conflict), phase 3 builds remove/add DV pairs on the new files (added to `rowLevelResolvedPaths` so the checker ignores their concurrent add). `CommitTransactionAsync` relaxed: a DELETE-only transaction (`Operation=="DELETE"`) is now `rebaseSafe` and row-level-resolvable EVEN under row tracking (its rebase only re-adds existing files, keeping their baseRowId) — **retires limitation 2 for deletes**; appends/updates under RT still abort (fresh baseRowId). Un-parked the 3 (B) tests into `RowLevelConcurrencyTests` (`ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`, `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`). **MEASURED (not assumed):** new tier-3 test `SparkInteropTests.EwDeleteRemappedThroughCompaction_SparkReadsSurvivorsWithPreservedIds` — Spark 4.0.1 reads the remapped result (DV on the compacted materialized-id file), returns the survivors with ORIGINAL ids and omits exactly the remapped-away row. Full matrix green: 310 non-interop (net10 + net472), 21 Spark + 12 delta-rs interop. |
 | 6 | *(pending commit)* | **Layer 3 sub-problem (A) — DELETE/DELETE deletion-vector union.** Two concurrent deletes of *disjoint rows of the same file* now BOTH land instead of the second aborting; same-row deletes still conflict. `ComputeDeleteActionsAsync` records per-file newly-deleted row positions (`DeleteDvEdit`); `CommitOccAsync` grew a `rowLevelDeletes` param and `ResolveRowLevelDeletesAsync`, which on a delete/delete collision rebases each staged delete's DV onto the file's *current* DV (union) rather than throwing — returning null (→ abort) only on same-row overlap or a rewritten-away file. `ConflictChecker.Check` gained `rowLevelResolvedPaths` (skips the reconciled file's concurrent remove/re-add). Withheld under row tracking (`rowLevelDeletes: null`, still `rebaseSafe:false`). `RowLevelConcurrencyTests` (4) + a delta-rs interop test; the two former same-file-abort tests (`TwoTransactions_SameFile_SecondAborts`, `TwoHandles_SameFileDeletes_SecondAborts`) were repurposed to same-*row* (they now correctly both-land at disjoint rows). **Found (measured):** EW writes DVs but never declares the `deletionVectors` protocol feature, so delta-rs ignores *all* EW deletion vectors — pre-existing, orthogonal, recorded in `known-issues.md`. |
 
 Entry points:
@@ -98,9 +99,13 @@ Design facts worth keeping:
    `WriteAsync` calls `ComputeWriteActionsAsync` with `Append` only). A transactional append is blind
    (reads empty → equivalent to `ReadSet.Blind`); an update reads the files it rewrites, exactly like a
    delete.
-2. **Row-tracking tables abort on rebase.** A rebased add's `baseRowId` would need recomputing against
-   the advanced high-water mark. They still commit on an uncontended first attempt; on any rebase they
-   abort with a clear message. Fail-safe.
+2. ~~**Row-tracking tables abort on rebase.**~~ **CLOSED FOR DELETES (step 7 / Milestone 3).** A DELETE-only
+   transaction now rebase-retries under row tracking — its rebase only re-adds EXISTING files (DV union, path
+   (A)) or remaps rows onto concurrently-rewritten files by stable id (path (B)), both keeping the file's own
+   `baseRowId`, so no recomputation is needed. Still open for **appends/updates under row tracking**: a fresh
+   add's `baseRowId` would need recomputing against the advanced high-water mark, so an append/update (or any
+   non-delete transaction) under RT still aborts on rebase (fail-safe) — see pr-4's post-image re-derivation in
+   `RebaseDvDmlActionsAsync` for the eventual port.
 3. ~~**concurrentAppend is inert for DELETE.**~~ **CLOSED (step 5).** `DeleteAsync`/`UpdateAsync` now have
    `Expressions.Predicate` overloads (functional overloads unchanged). The analyzable predicate is
    evaluated to a row mask via `ArrowRowEvaluator` (new `EngineeredWood.Expressions.Arrow` project ref),
@@ -161,9 +166,13 @@ Design facts worth keeping:
      approx is unused by EW's pruner — a separate pre-existing quirk).
    - rebasing partition/dynamic overwrite now has the predicate machinery it needed, but still needs the
      overwrite read-set expressed as a partition predicate.
-4. **Layer 3 — row-level concurrency.** Sub-problem (A) DONE (step 6). Sub-problem (B) — rewrite-preservation
-   (remap a delete through a concurrent compaction/UPDATE by stable row id) is the remaining piece; see the
-   dedicated starting brief below (**"Layer 3 — starting brief"**), read that first before touching it.
+4. **Layer 3 — row-level concurrency.** Sub-problem (A) DONE (step 6). Sub-problem (B) — remap a DELETE
+   through a concurrent compaction/UPDATE by stable row id — **DONE (step 7 / Milestone 3)**, measured on
+   Spark. Remaining Layer-3 tail (deferred, needs pr-4's `RebaseDvDmlActionsAsync` post-image path): rebasing
+   a losing UPDATE/append under row tracking (re-derive the post-image add's `baseRowId` from the advanced
+   high-water mark) — the other half of limitation 2. The only still-parked row-level test,
+   `BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete`, needs the buffered-transaction seam
+   (Compute*/CommitDataFiles), not row-level concurrency.
 
 The parked ledger is `test/EngineeredWood.DeltaLake.Table.Tests/PendingCoverageTests.cs`. The 7
 `LogicalRebase` stubs are retired (now live in `ConflictCheckerTests` + `DeltaTransactionTests`); the 3
@@ -219,7 +228,17 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   `ConcurrentDeletes_SameRow_RowLevelConflict`, `WithoutRowLevelRetry_VersionConflictSurfaces` (a
   rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
-- **(B) Rewrite-preservation (UPDATE, compaction remap).**
+- **(B) Rewrite-preservation (UPDATE, compaction remap). DONE (2026-07-20, step 7 / Milestone 3).** A losing
+  DELETE whose target file was concurrently compacted/UPDATE-rewritten is remapped by stable row id onto the
+  new file (`DeltaTable.RemapRowLevelDeletesAsync`, called from `ResolveRowLevelDeletesAsync` when a file is
+  rewritten away); the row's commit version discriminates concurrent modification; MEASURED on Spark 4.0.1.
+  Adapted from pr-4's `RemapRowsAcrossRewriteAsync` but onto master's cleaner M2 read path — the resolved
+  stable id/version come straight from `ReadFileAsync`'s out-params (no transient `(fileOrdinal<<40)|pos`
+  column needed; a third out-param `strippedAbsPositionsOut` supplies the absolute position). The remaining
+  pr-4 payload NOT ported: rebasing a losing UPDATE/append's post-image add (`RebaseDvDmlActionsAsync`'s
+  baseRowId re-derivation) — the other half of limitation 2. Original deferral notes kept below for context.
+
+  **(originally, 2026-07-20) Rewrite-preservation (UPDATE, compaction remap).**
   **The full brief is `doc/row-tracking-conformance-brief.md` — read that first.**
   **UPDATE (2026-07-20): row-tracking Milestone 2 LANDED (uncommitted) — the copy-on-write REWRITE now
   PRESERVES ids.** A rewrite (UPDATE / OVERWRITE / compaction) materializes each moved row's original id +
@@ -270,13 +289,15 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`. Closing (B) also retires **limitation 2**
   (`rebaseSafe: false` for row tracking).
 
-**The 7 acceptance tests.** Three are LIVE (in `RowLevelConcurrencyTests`, un-parked): the (A) set —
+**The 7 acceptance tests.** SIX are now LIVE in `RowLevelConcurrencyTests` (master-idiomatic, via the public
+`DeleteAsync`/`UpdateAsync`/`CompactAsync` API + racing handles): the (A) set —
 `ConcurrentDeletes_SameFile_DisjointRows_BothLand`, `ConcurrentDeletes_SameRow_RowLevelConflict`,
-`WithoutRowLevelRetry_VersionConflictSurfaces`. Four remain `[Fact(Skip = RowLevelConcurrency)]` in
-`PendingCoverageTests.cs`, all needing (B) or the buffered seam:
+`WithoutRowLevelRetry_VersionConflictSurfaces` — plus the (B) set (step 7) —
 `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
-`DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`,
-`BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete`.
+`DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`. Only
+`BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete` remains parked (now
+`[Fact(Skip = BufferedTxn)]` — it needs the buffered-transaction seam, not row-level concurrency). The
+`RowLevelConcurrency` skip-reason const was retired.
 
 **Entry points.** For (A) as built: `DeltaTable.ResolveRowLevelDeletesAsync` (the DV-union resolver — where
 same-file-disjoint-DV is split from same-row, and where a rewritten-away file falls out to abort — this is

@@ -1,6 +1,18 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
-**Status: Milestone 2 LANDED (2026-07-20, uncommitted) — a copy-on-write rewrite (UPDATE / OVERWRITE /
+**Status: Milestone 3 LANDED (2026-07-20, pending commit) — row-level concurrency across a rewrite (Layer 3 B).**
+A losing DELETE whose target file was concurrently compacted/UPDATE-rewritten is remapped by STABLE ROW ID onto
+the new file(s) instead of aborting, and a DELETE-only transaction is now rebase-safe under row tracking
+(retires limitation 2 for deletes). New: `RemapRowLevelDeletesAsync` (adapted from pr-4's
+`RemapRowsAcrossRewriteAsync`, onto master's M2 read-out-params + a new `strippedAbsPositionsOut`),
+`ResolveRowLevelDeletesAsync` splits DV-union vs remap. MEASURED on Spark 4.0.1
+(`SparkInteropTests.EwDeleteRemappedThroughCompaction_SparkReadsSurvivorsWithPreservedIds`: Spark reads the
+remapped result — DV on the compacted materialized-id file — returns survivors with original ids, omits the
+remapped-away row). NOT ported: rebasing a losing UPDATE/append's post-image add (pr-4's
+`RebaseDvDmlActionsAsync` baseRowId re-derivation) — the other half of limitation 2. Full matrix green (310
+non-interop, 21 Spark, 12 delta-rs). See `doc/slice9-concurrency-resume.md` step 7.
+
+**Status: Milestone 2 LANDED (2026-07-20) — a copy-on-write rewrite (UPDATE / OVERWRITE /
 compaction) now PRESERVES stable row ids by materializing each moved row's original id + commit version into
 the declared hidden columns, MEASURED against Spark 4.0.1.** `RowTrackingWriter` grew the materialization
 overloads (`AddRowIdColumn(batch, Int64Array, name)`, `AddRowIdAndCommitVersionColumns(..., rowIdName,
@@ -214,9 +226,13 @@ validation) that pr-4 lacks.
 
 ## Relationship to Layer 3 (B) — row-level concurrency across rewrites
 
-**pr-4 already implements this** (`RemapRowsAcrossRewriteAsync` inside `RebaseDvDmlActionsAsync`); the port is
-onto master's `CommitOccAsync` / `ResolveRowLevelDeletesAsync` (Layer 3 (A), which == pr-4's "v1" DV
-re-union). What pr-4's "v2" adds on top:
+**DONE for the DELETE side (2026-07-20, Milestone 3):** `DeltaTable.RemapRowLevelDeletesAsync` on master (a
+port of pr-4's `RemapRowsAcrossRewriteAsync`, adapted onto master's M2 read-out-params rather than pr-4's
+transient rowid column), called from `ResolveRowLevelDeletesAsync` when a delete's file was rewritten away. A
+DELETE-only transaction is rebase-safe under RT (`CommitTransactionAsync`). What is NOT done: rebasing a losing
+UPDATE/append (pr-4's `RebaseDvDmlActionsAsync` re-derives the post-image add's baseRowId from the advanced
+high-water mark — the other half of limitation 2). The original brief below describes pr-4's "v2" mechanics the
+DELETE remap implements:
 
 - **Record row IDs, not just positions.** Master's `DeleteDvEdit` records absolute positions (stable across a
   DV swap — that is what makes (A) work). (B) also needs the **row IDs** so a rewrite that relocates rows can

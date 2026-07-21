@@ -309,6 +309,53 @@ public class SparkInteropTests : IDisposable
         Assert.Equal(2L, idToRowId[30]);
     }
 
+    /// <summary>
+    /// <para>Layer 3 sub-problem (B), cross-engine: a stale EW DELETE remapped across a concurrent EW
+    /// COMPACTION. One handle compacts two files into one (materialized ids preserved); a second, stale handle
+    /// then deletes a row whose original file is gone — EW relocates it by STABLE ROW ID and soft-deletes it
+    /// with a deletion vector on the compacted file. Spark 4.0 (DV- and row-tracking-capable) must return the
+    /// surviving rows with their ORIGINAL ids and omit exactly the remapped-away row.</para>
+    ///
+    /// <para>This is the measurement the remap's on-disk result demands: the artifact is a deletion vector on a
+    /// materialized-id file, and only a conformant reader proves the vector masks the row the remap chose by
+    /// stable id (not a position that shifted under the compaction) while every other row keeps its id. A
+    /// round-trip through EW alone would agree with its own convention; Spark computing 10→0, 30→2, 40→3, 50→4
+    /// with id 20 absent is the actual cross-engine confirmation.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwDeleteRemappedThroughCompaction_SparkReadsSurvivorsWithPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var setup = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, enableDeletionVectors: true, enableRowTracking: true))
+        {
+            await setup.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]); // file 0: ids 0,1,2
+            await setup.WriteAsync([IdRegionBatch([40, 50], ["us", "eu"])]);             // file 1: ids 3,4
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        // A compacts both files into one; B (stale) deletes id 20, whose source file is now gone — the row is
+        // remapped by stable id onto the compacted file.
+        await tableA.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        var (deleted, _) = await tableB.DeleteAsync(DeleteId(20));
+        Assert.Equal(1, deleted);
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+        Assert.False(idToRowId.ContainsKey(20)); // the remapped delete removed exactly id 20
+        Assert.Equal(new long[] { 10, 30, 40, 50 }, idToRowId.Keys.OrderBy(k => k).ToArray());
+        Assert.Equal(0L, idToRowId[10]); // every survivor keeps its original id through the compaction
+        Assert.Equal(2L, idToRowId[30]);
+        Assert.Equal(3L, idToRowId[40]);
+        Assert.Equal(4L, idToRowId[50]);
+    }
+
     /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
     private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>
     {
