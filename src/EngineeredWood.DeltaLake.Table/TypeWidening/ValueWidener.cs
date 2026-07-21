@@ -22,12 +22,20 @@ internal static class ValueWidener
     public static RecordBatch WidenBatch(
         RecordBatch batch, Apache.Arrow.Schema targetSchema)
     {
-        bool needsWidening = false;
+        // Match target fields BY NAME, never by position: a schema-EVOLVED file's column set differs from
+        // the current schema (a column ADDed after the file was written is absent; a DROPped one is still
+        // present), so positional pairing relabels one column's data as another's — silent corruption.
+        // Columns without a same-named target field pass through unchanged (schema-evolution reconcile
+        // downstream adds/drops columns); this method only WIDENS values.
+        var targetByName = new Dictionary<string, IArrowType>(StringComparer.Ordinal);
+        foreach (var f in targetSchema.FieldsList)
+            targetByName[f.Name] = f.DataType;
 
-        for (int i = 0; i < batch.ColumnCount && i < targetSchema.FieldsList.Count; i++)
+        bool needsWidening = false;
+        for (int i = 0; i < batch.ColumnCount; i++)
         {
-            if (!TypesMatch(batch.Schema.FieldsList[i].DataType,
-                            targetSchema.FieldsList[i].DataType))
+            if (targetByName.TryGetValue(batch.Schema.FieldsList[i].Name, out var t)
+                && !TypesMatch(batch.Schema.FieldsList[i].DataType, t))
             {
                 needsWidening = true;
                 break;
@@ -37,27 +45,25 @@ internal static class ValueWidener
         if (!needsWidening)
             return batch;
 
-        var columns = new IArrowArray[targetSchema.FieldsList.Count];
-
-        for (int i = 0; i < targetSchema.FieldsList.Count; i++)
+        var fields = new List<Field>(batch.ColumnCount);
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
         {
-            if (i < batch.ColumnCount)
+            var f = batch.Schema.FieldsList[i];
+            if (targetByName.TryGetValue(f.Name, out var targetType)
+                && !TypesMatch(f.DataType, targetType))
             {
-                var sourceType = batch.Schema.FieldsList[i].DataType;
-                var targetType = targetSchema.FieldsList[i].DataType;
-
-                columns[i] = TypesMatch(sourceType, targetType)
-                    ? batch.Column(i)
-                    : WidenArray(batch.Column(i), targetType);
+                columns[i] = WidenArray(batch.Column(i), targetType);
+                fields.Add(new Field(f.Name, targetType, f.IsNullable, f.Metadata));
             }
             else
             {
-                // Missing column — fill with nulls
-                columns[i] = BuildNullArray(targetSchema.FieldsList[i].DataType, batch.Length);
+                columns[i] = batch.Column(i);
+                fields.Add(f);
             }
         }
 
-        return new RecordBatch(targetSchema, columns, batch.Length);
+        return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
     }
 
     /// <summary>

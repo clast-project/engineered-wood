@@ -78,7 +78,13 @@ public static class ColumnMappingRecursive
             {
                 changed = true;
                 fields.Add(renamed);
-                arrays.Add(Rebuild(batch.Column(i).Data, renamed.DataType));
+                // Rebuild the ARRAY only when its type tree actually changed (nested renames live in the
+                // type). A rename that touched only the field's NAME/metadata reuses the array verbatim —
+                // the batch schema carries the name, and re-materializing through ArrowArrayFactory would
+                // reject reader-produced layouts whose buffer count differs from the canonical shape.
+                arrays.Add(ReferenceEquals(renamed.DataType, f.DataType)
+                    ? batch.Column(i)
+                    : Rebuild(batch.Column(i).Data, renamed.DataType));
             }
         }
 
