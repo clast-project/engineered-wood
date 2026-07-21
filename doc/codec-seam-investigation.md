@@ -1,8 +1,11 @@
 # The codec seam (`IDataFileWriter` / `IDataFileReader` / `IDataFileRewriter`) — investigation
 
-**Status: research complete, decision open (2026-07-19).** Written to record the findings behind the
-"seam question" in `doc/upstream-landing-notes.md`, whose recorded rationale turned out to be wrong.
-Nothing here has been acted on; `doc/upstream-landing-notes.md` still carries the superseded version.
+**Status: research complete, seam decision still open (last touched 2026-07-21).** Written to record the
+findings behind the "seam question" in `doc/upstream-landing-notes.md`, whose recorded rationale turned out
+to be wrong. The SEAM decision (keep `IDataFileRewriter` / codec-only / drop — §6–7) has not been acted on;
+`doc/upstream-landing-notes.md` still carries the superseded version. Note that Delta-layer VARIANT support
+has since landed on master (independently of the seam), which closes the feature gap §5.1 described — see the
+dated UPDATE there; §5.1's original reasoning is preserved for the record but is superseded on master.
 
 ## Sources
 
@@ -158,6 +161,32 @@ positions, row ids and commit versions are preserved for free, with no materiali
    `SchemaConverter`, the `variantType` table feature in `ProtocolVersions` and `RequiredSchemaFeatures`,
    and shredded read/write — i.e. PR #4's `VariantTransport` slice. Only *then* does the registry default
    on the Delta read path become a live question.
+
+   **UPDATE (2026-07-21) — the feature gap above is now CLOSED, and the schema-rejection premise no longer
+   holds.** Delta-layer variant support landed on master after this section was written (independently of the
+   seam decision). Concretely, everything the paragraph above listed as "what remains" now exists:
+   - `SchemaConverter` maps `"variant"` in **both** directions and no longer throws: read
+     `"variant" => VariantType.Default` (`SchemaConverter.cs:106`), write
+     `VariantType => new PrimitiveType { TypeName = "variant" }` (`:145`). The cited
+     `..._IsRejected_NotSilentlyMappedToStruct` tests were accordingly replaced with
+     `VariantDeltaType_MapsToTheArrowVariantExtension` / `VariantArrowType_MapsBackToTheDeltaVariantTypeName`
+     / `VariantRoundTrips_ThroughBothConvertersAndTheSerializer` — of the opposite polarity, but they KEEP
+     the `VariantType`-is-not-`StructType`-derived assertion, so the latent-hazard watch this section called
+     out survives.
+   - `variantType` is in `SupportedReaderFeatures` / `SupportedWriterFeatures`, and `RequiredSchemaFeatures`
+     fires the protocol upgrade when a variant column appears.
+   - The "registry default becomes a live question" worry is resolved by construction: the Delta read path
+     ALWAYS registers the variant extension into its read options (`DeltaTable.WithVariantExtension`), so a
+     caller's null-`ExtensionRegistry` default never reaches the parquet reader on a Delta table.
+
+   That also retires the retracted §5.1 bug's underpinning: it was declared *unreachable because variant was
+   rejected*, but variant is now *reached and handled* rather than rejected. Preservation through the rewrite
+   paths this section worried about is now pinned directly — `Compaction_OfVariantTable_PreservesValues` and
+   `Delete_OnVariantTable_PreservesTheExtensionType` (plus `VariantInteropTests` cross-validating on Spark /
+   delta-rs); `DeltaTableOptions.EmitVariantLogicalType` controls whether the annotation is emitted on write
+   (`VariantColumnCoercion.StripAnnotation` when off). So on master this whole item is historical: no defect,
+   no remaining feature gap. The seam decision in §6–7 is unaffected — variant was always a passenger (§1),
+   not the seam's reason to exist.
 
    **But the investigation it prompted did find a real one, at the Parquet layer — see 1a.**
 
