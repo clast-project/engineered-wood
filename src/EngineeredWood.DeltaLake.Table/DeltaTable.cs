@@ -3207,6 +3207,87 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Generates identity-column values for a buffered transaction's eagerly-written appends: the configs seed
+    /// from the CURRENT snapshot's schema, overridden by <paramref name="chainedHighWaterMarks"/> (the
+    /// transaction's pending marks from earlier statements, so values CHAIN across statements without a commit
+    /// in between). Returns the processed batches + the new per-column high-water marks; the caller fuses them
+    /// into its commit via <see cref="BuildIdentityMetadataAction"/>. Concurrency: a concurrent identity-consuming
+    /// commit necessarily carries a metaData action (the HWM lives in schema metadata), so the caller's
+    /// expectedVersion abort fires — values baked here never land on a moved HWM.
+    /// </summary>
+    public (IReadOnlyList<RecordBatch> Batches, IReadOnlyDictionary<string, long> HighWaterMarks)
+        GenerateIdentityValues(IReadOnlyList<RecordBatch> batches,
+                               IReadOnlyDictionary<string, long>? chainedHighWaterMarks = null)
+    {
+        ThrowIfDisposed();
+        return GenerateIdentityValuesForSchema(CurrentSnapshot.Schema, batches, chainedHighWaterMarks);
+    }
+
+    /// <summary>
+    /// The schema-seeded form of <see cref="GenerateIdentityValues"/> — for a table that does NOT exist yet (a
+    /// buffered CREATE: the identity configs come from the parked schema's <c>delta.identity.*</c> field
+    /// metadata, values chain across the transaction's statements, and the flush bakes the final marks into
+    /// commit-0's schema). No concurrency concern: nobody can consume ids from a table never committed.
+    /// </summary>
+    public static (IReadOnlyList<RecordBatch> Batches, IReadOnlyDictionary<string, long> HighWaterMarks)
+        GenerateIdentityValuesForSchema(StructType schema, IReadOnlyList<RecordBatch> batches,
+                                        IReadOnlyDictionary<string, long>? chainedHighWaterMarks = null)
+    {
+        var configs = new Dictionary<string, IdentityColumnConfig>();
+        foreach (var f in schema.Fields)
+        {
+            if (IdentityColumn.GetConfig(f) is { } cfg)
+            {
+                configs[f.Name] = chainedHighWaterMarks is not null
+                                  && chainedHighWaterMarks.TryGetValue(f.Name, out var h)
+                    ? cfg with { HighWaterMark = h }
+                    : cfg;
+            }
+        }
+        if (configs.Count == 0)
+        {
+            return (batches, new Dictionary<string, long>());
+        }
+        var outBatches = new List<RecordBatch>(batches.Count);
+        foreach (var b in batches)
+        {
+            var (processed, _) = IdentityColumns.IdentityColumnWriter.ProcessBatch(b, schema, ref configs);
+            outBatches.Add(processed);
+        }
+        var marks = new Dictionary<string, long>();
+        foreach (var kv in configs)
+        {
+            if (kv.Value.HighWaterMark is { } hwm)
+                marks[kv.Key] = hwm;
+        }
+        return (outBatches, marks);
+    }
+
+    /// <summary>
+    /// Builds the metaData action carrying updated identity high-water marks, based on
+    /// <paramref name="baseMetadata"/> (default: the current snapshot's — a buffered ALTER's pending metadata
+    /// composes so one commit never carries two metaData actions).
+    /// </summary>
+    public MetadataAction BuildIdentityMetadataAction(
+        IReadOnlyDictionary<string, long> highWaterMarks, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        var meta = baseMetadata ?? CurrentSnapshot.Metadata;
+        var schema = baseMetadata is null
+            ? CurrentSnapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var fields = new List<StructField>(schema.Fields.Count);
+        foreach (var f in schema.Fields)
+        {
+            fields.Add(highWaterMarks.TryGetValue(f.Name, out var hwm)
+                ? IdentityColumn.UpdateHighWaterMark(f, hwm)
+                : f);
+        }
+        var updated = new StructType { Fields = fields };
+        return meta with { SchemaString = DeltaSchemaSerializer.Serialize(updated) };
+    }
+
+    /// <summary>
     /// Writes <paramref name="batches"/> to append-shaped parquet data files WITHOUT committing, returning the
     /// descriptors to hand to <see cref="CommitDataFilesAsync"/>. Partition split, recursive column-mapping
     /// physical rename + field-id stamping, the variant logical-type policy, the <see cref="IDataFileWriter"/>

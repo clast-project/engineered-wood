@@ -49,26 +49,10 @@ public class PendingCoverageTests
     public void AppTransactionAction_RoundTrips() { }
 
     // ── Identity columns across buffered statements — pr-4 IdentityTransactionSeamsTests ──
-
-    /// <summary>GenerateIdentityValues must chain across statements in one transaction: the second
-    /// statement continues the first's high-water mark rather than restarting from the snapshot.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void GenerateIdentityValues_ChainsAcrossStatements() { }
-
-    /// <summary>The fused commit must carry exactly ONE metaData action with the persisted identity
-    /// high-water mark (two conflicting metaData actions in a commit is invalid).</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void FusedIdentityCommit_OneMetadataAction_HwmPersists() { }
-
-    /// <summary>The schema-seeded pending-CREATE form must generate identity values before any table
-    /// exists.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void GenerateIdentityValuesForSchema_PendingCreate_ChainsWithoutATable() { }
-
-    /// <summary>WriteDataFilesAsync must REJECT an identity table unless the caller flags that it
-    /// pre-generated the values — silently writing un-valued identity rows would corrupt the contract.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void WriteDataFiles_WithoutPreGeneratedFlag_RejectsIdentityTable() { }
+    //
+    // UN-PARKED: the identity seam (GenerateIdentityValues chaining, GenerateIdentityValuesForSchema for a
+    // pending CREATE, BuildIdentityMetadataAction folding the final marks into one metaData, and the
+    // WriteDataFilesAsync pre-generated-flag guard) is live in IdentityTransactionSeamsTests.
 
     // ── Logical rebase / ConflictChecker parity — pr-4 LogicalRebaseTests ──
     //
