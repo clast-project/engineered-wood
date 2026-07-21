@@ -184,10 +184,17 @@ Design facts worth keeping:
    `OrderedActiveFiles`/`RowIdPositionBits`; **M-D2 `ce44d26`** `RebaseDvDmlActionsAsync` +
    `CheckLogicalRebaseAsync` + `MetadataEquals`/`ProtocolEquals`; **M-D3 `3729835`** the `txn` round-trip (no new
    code — master already reconciled `TransactionId`). **MEASURED (`22e79b2`):** Spark 4.0.1 reads a fused
-   ALTER+INSERT+DELETE as one atomic version; delta-rs 1.6.2 reads the DV-free fused ALTER+INSERT. **Deferred
-   (no parked test, follow-ups):** nested `ComputeAddField/DropField` (master lacks `TransformStructAt`/`PathText`);
-   the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync` conflicts when a modified file was
-   concurrently rewritten (the AUTO commit path already remaps by stable id).
+   ALTER+INSERT+DELETE as one atomic version; delta-rs 1.6.2 reads the DV-free fused ALTER+INSERT. **Gap 1 —
+   nested-field ALTER. DONE (2026-07-21).** Ported from `pr-4`: the auto-commit `AddFieldAsync` /
+   `RenameFieldAsync` / `DropFieldAsync` (metadata-only, nested analogs of the top-level column ALTERs) AND the
+   compute-only buffered halves `ComputeAddField` / `ComputeRenameField` / `ComputeDropField`, sharing the
+   `TransformStructAt` / `PathText` helpers (master's recursive read reconcile in `SchemaEvolution.cs` already
+   handled the read side). `AddField` uses master's recursive `AssignMappedField` so struct/array/map descendants
+   each get ids (dropped pr-4's inconsistent struct rejection — matches `AddColumnAsync`); rename/drop require
+   column mapping and refuse to empty a struct. 12 tests in `NestedFieldEvolutionTests` (two-level add, chained
+   compute-adds distinct ids, mapped rename/drop reconcile old files, guards); full non-interop suite green (358).
+   **Deferred (no parked test, follow-up):** the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync`
+   conflicts when a modified file was concurrently rewritten (the AUTO commit path already remaps by stable id).
 
 Remaining slice-9 tail (unrelated to row tracking OR the buffered seam): the overwrite-family rebase
 (partition-predicate read-set) and M4 read-side `_metadata.row_id`.

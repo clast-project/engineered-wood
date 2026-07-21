@@ -659,6 +659,178 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
     }
 
+    /// <summary>The compute-only counterpart of <see cref="AddFieldAsync"/> (nested ADD) — for a buffered
+    /// transaction. <paramref name="containerPath"/> names the CONTAINING struct (every segment must resolve to
+    /// a struct). For CHAINED changes pass the previous change's <paramref name="baseMetadata"/> /
+    /// <paramref name="baseProtocol"/> so this composes on the pending schema/protocol. Under column mapping the
+    /// new field gets fresh recursive ids continuing past the base's <c>maxColumnId</c>; it may carry a protocol
+    /// upgrade for a schema-driven feature (timestampNtz / variantType). Pure computation, no IO.</summary>
+    public DeferredSchemaChange ComputeAddField(
+        IReadOnlyList<string> containerPath, Field newField,
+        MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (containerPath.Count == 0)
+            throw new ArgumentException(
+                "containerPath must name the containing struct column.", nameof(containerPath));
+        if (!newField.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have "
+                + "no value for a new field.");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var config = baseMeta.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema([newField], null)).Fields[0];
+
+        var newConfig = config;
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            // Fresh recursive ids + physical names, continuing past the base's maxColumnId (the base may itself
+            // be a pending change that already bumped it) — struct/array/map descendants each get their own id.
+            var (mappedField, lastId) = AssignMappedField(baseSchema, config, newDeltaField);
+            newDeltaField = mappedField;
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        var addedField = newDeltaField;
+        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        {
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
+            }
+            return new List<StructField>(fields) { addedField };
+        });
+
+        var protocolUpgrade = UpgradeProtocolForFeatures(
+            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = newConfig,
+        };
+        var actions = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actions.Add(protocolUpgrade);
+        actions.Add(metadata);
+        return new DeferredSchemaChange(actions, metadata, protocolUpgrade, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="RenameFieldAsync"/> (nested RENAME) — for a buffered
+    /// transaction. <paramref name="fieldPath"/> is the FULL path of the field (length ≥ 2). Requires column
+    /// mapping (the field keeps its id + physical name). No protocol change.</summary>
+    public DeferredSchemaChange ComputeRenameField(
+        IReadOnlyList<string> fieldPath, string newName, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException(
+                "fieldPath must name a NESTED field (use ComputeRenameColumn for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string oldName = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        {
+            StructField? target = null;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{newName}' already exists.");
+                if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                    target = f;
+            }
+            if (target is null)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            var result = new List<StructField>(fields.Count);
+            foreach (var f in fields)
+            {
+                result.Add(ReferenceEquals(f, target)
+                    ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
+                    : f);
+            }
+            return result;
+        });
+
+        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="DropFieldAsync"/> (nested DROP) — for a buffered
+    /// transaction. <paramref name="fieldPath"/> is the FULL path (length ≥ 2). Requires column mapping; the
+    /// containing struct must not become empty; the retired id is never reused. No protocol change.</summary>
+    public DeferredSchemaChange ComputeDropField(
+        IReadOnlyList<string> fieldPath, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException(
+                "fieldPath must name a NESTED field (use ComputeDropColumn for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string name = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        {
+            var result = new List<StructField>(fields.Count);
+            bool found = false;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+                result.Add(f);
+            }
+            if (!found)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            if (result.Count == 0)
+                throw new InvalidOperationException(
+                    $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
+            return result;
+        });
+
+        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
     /// <summary>Reconciles a logically-named batch to <paramref name="expectedFields"/> — the public form of the
     /// read path's recursive schema-evolution reconcile: expected columns/struct members the batch lacks
     /// backfill as typed NULLs, extra ones drop, struct children recurse. A buffered transaction uses it to
@@ -868,6 +1040,182 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             throw new InvalidOperationException("Cannot drop the table's only column.");
 
         string newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = newFields });
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString },
+            "DROP COLUMNS",
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Adds a nullable field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="AddColumnAsync"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
+    /// column first, e.g. <c>["s", "inner"]</c> adds a member to <c>s.inner</c>); every segment must resolve to
+    /// a STRUCT. Old files lack the member — the read path reconciles it to a typed NULL child. On a
+    /// column-mapping table the new field is assigned a fresh column id + physical name RECURSIVELY (a
+    /// struct/array/map-typed member arrives with ids on every descendant) and <c>maxColumnId</c> is bumped. A
+    /// type needing a schema-driven feature (timestampNtz / variantType) upgrades the protocol in the same
+    /// commit. Returns the new version.
+    /// </summary>
+    public async ValueTask<long> AddFieldAsync(
+        IReadOnlyList<string> containerPath, Field newField, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (containerPath.Count == 0)
+            throw new ArgumentException(
+                "containerPath must name the containing struct column.", nameof(containerPath));
+        if (!newField.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have "
+                + "no value for a new field.");
+
+        var snapshot = CurrentSnapshot;
+        var config = snapshot.Metadata.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema([newField], null)).Fields[0];
+
+        var newConfig = config;
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            // Recursive id + physical-name assignment (the create-time assigner) — a struct/array/map-typed
+            // field gets ids on every descendant, exactly like at create; maxColumnId advances past them.
+            var (mappedField, lastId) = AssignMappedField(snapshot.Schema, config, newDeltaField);
+            newDeltaField = mappedField;
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        var addedField = newDeltaField;
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
+            }
+            return new List<StructField>(fields) { addedField };
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
+
+        var protocolUpgrade =
+            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
+            "ADD COLUMNS",
+            cancellationToken,
+            protocolUpgrade).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Renames a field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="RenameColumnAsync"/>. <paramref name="fieldPath"/> is the FULL path of the field (length ≥ 2;
+    /// use <see cref="RenameColumnAsync"/> for a top-level column). Requires column mapping — the field keeps
+    /// its column id + physical name, so old files keep resolving under the new logical name. Returns the new
+    /// version.
+    /// </summary>
+    public async ValueTask<long> RenameFieldAsync(
+        IReadOnlyList<string> fieldPath, string newName, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException(
+                "fieldPath must name a NESTED field (use RenameColumnAsync for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string oldName = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            StructField? target = null;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{newName}' already exists.");
+                if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                    target = f;
+            }
+            if (target is null)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            var result = new List<StructField>(fields.Count);
+            foreach (var f in fields)
+            {
+                result.Add(ReferenceEquals(f, target)
+                    ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
+                    : f);
+            }
+            return result;
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
+
+        return await CommitMetadataOnlyAsync(
+            snapshot,
+            snapshot.Metadata with { SchemaString = newSchemaString },
+            "RENAME COLUMN",
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drops a field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="DropColumnAsync"/>. <paramref name="fieldPath"/> is the FULL path (length ≥ 2; use
+    /// <see cref="DropColumnAsync"/> for a top-level column). Requires column mapping; the containing struct
+    /// must not become empty; the retired column id is never reused (maxColumnId is not decremented). Old files
+    /// still carry the physical column — readers reconcile it away. Returns the new version.
+    /// </summary>
+    public async ValueTask<long> DropFieldAsync(
+        IReadOnlyList<string> fieldPath, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException(
+                "fieldPath must name a NESTED field (use DropColumnAsync for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string name = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            var result = new List<StructField>(fields.Count);
+            bool found = false;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+                result.Add(f);
+            }
+            if (!found)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            if (result.Count == 0)
+                throw new InvalidOperationException(
+                    $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
+            return result;
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
 
         return await CommitMetadataOnlyAsync(
             snapshot,
@@ -1144,6 +1492,45 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             new StructType { Fields = [field] }, maxId);
         return (assigned.Fields[0], lastId);
     }
+
+    // Rebuilds the schema with the struct at `containerPath` transformed via `transform` on its field list
+    // (every non-terminal segment must resolve to a struct field). Fields outside the path are untouched.
+    private static StructType TransformStructAt(
+        StructType current, IReadOnlyList<string> containerPath, int depth,
+        Func<IReadOnlyList<StructField>, List<StructField>> transform)
+    {
+        if (depth == containerPath.Count)
+            return new StructType { Fields = transform(current.Fields) };
+
+        string segment = containerPath[depth];
+        var newFields = new List<StructField>(current.Fields.Count);
+        bool found = false;
+        foreach (var f in current.Fields)
+        {
+            if (!found && string.Equals(f.Name, segment, StringComparison.Ordinal))
+            {
+                found = true;
+                if (f.Type is not StructType st)
+                    throw new InvalidOperationException(
+                        $"'{PathText(containerPath.Take(depth + 1).ToList())}' is not a STRUCT column.");
+                var newSt = TransformStructAt(st, containerPath, depth + 1, transform);
+                newFields.Add(new StructField
+                {
+                    Name = f.Name, Type = newSt, Nullable = f.Nullable, Metadata = f.Metadata,
+                });
+            }
+            else
+            {
+                newFields.Add(f);
+            }
+        }
+        if (!found)
+            throw new InvalidOperationException(
+                $"Column '{PathText(containerPath.Take(depth + 1).ToList())}' does not exist.");
+        return new StructType { Fields = newFields };
+    }
+
+    private static string PathText(IReadOnlyList<string> path) => string.Join(".", path);
 
     #endregion
 
