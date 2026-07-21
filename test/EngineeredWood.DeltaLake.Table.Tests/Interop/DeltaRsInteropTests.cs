@@ -78,6 +78,63 @@ public class DeltaRsInteropTests : IDisposable
 
     // ── Baselines. Nothing below these is meaningful if these two fail. ──
 
+    /// <summary>
+    /// The buffered-transaction seam's fused metaData + add commit, read by a conformant reader (delta-rs
+    /// cannot read deletion vectors, so this covers the DV-free half — a schema ALTER + an eagerly-written
+    /// INSERT fused into ONE commit via ComputeAddColumn + WriteDataFilesAsync + CommitDataFilesAsync).
+    /// delta-rs must read the single schema-evolved commit: the new column NULL-backfilled on the old file,
+    /// valued on the new file. A mis-shaped fused commit (a stray second metaData, an add referencing a schema
+    /// the reader doesn't have) would surface here as wrong columns or a read failure.
+    /// </summary>
+    [Fact]
+    public async Task EwFusedAlterInsert_DeltaRsReadsSchemaEvolvedCommit()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var baseSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("value", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), baseSchema);
+        await table.WriteAsync([new RecordBatch(baseSchema,
+        [
+            new Int64Array.Builder().Append(1).Append(2).Append(3).Build(),
+            new StringArray.Builder().Append("v1").Append("v2").Append("v3").Build(),
+        ], 3)]);
+        var pinned = table.CurrentSnapshot;
+
+        // ALTER ADD COLUMN extra INT + INSERT (4, 5) under the pending schema, fused into ONE commit
+        var change = table.ComputeAddColumn(new Field("extra", Int32Type.Default, true));
+        var widened = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("value", StringType.Default, true))
+            .Field(new Field("extra", Int32Type.Default, true))
+            .Build();
+        var files = await table.WriteDataFilesAsync([new RecordBatch(widened,
+        [
+            new Int64Array.Builder().Append(4).Append(5).Build(),
+            new StringArray.Builder().Append("v4").Append("v5").Build(),
+            new Int32Array.Builder().Append(40).Append(50).Build(),
+        ], 2)], schemaOverride: change.NewSchema);
+        await table.CommitDataFilesAsync(files, DeltaWriteMode.Append,
+            extraActions: change.Actions, expectedVersion: pinned.Version, operation: "TRANSACTION");
+
+        var result = DeltaRs.Invoke("read", new { path = _tempDir });
+        Assert.Equal(5, result.GetProperty("row_count").GetInt32());
+        var seen = new Dictionary<long, int?>();
+        foreach (var row in result.GetProperty("rows").EnumerateArray())
+        {
+            long id = row.GetProperty("id").GetInt64();
+            var extraProp = row.GetProperty("extra");
+            seen[id] = extraProp.ValueKind == JsonValueKind.Null ? null : extraProp.GetInt32();
+        }
+        Assert.Equal(new long[] { 1, 2, 3, 4, 5 }, seen.Keys.OrderBy(k => k).ToArray());
+        Assert.Null(seen[1]); // old file: new column backfilled NULL
+        Assert.Null(seen[3]);
+        Assert.Equal(40, seen[4]); // new file: valued
+        Assert.Equal(50, seen[5]);
+    }
+
     /// <summary>EW writes, delta-rs reads: the same rows, the same schema.</summary>
     [Fact]
     public async Task EwWritten_SimpleTable_DeltaRsReadsSameRows()

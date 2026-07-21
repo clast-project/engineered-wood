@@ -159,6 +159,83 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// <para>The BUFFERED-TRANSACTION flagship (slice 9 buffered seam): a schema ALTER (ADD COLUMN), an
+    /// eagerly-written INSERT under the pending schema, and a deletion-vector DELETE are fused into ONE atomic
+    /// Delta version via <c>ComputeAddColumn</c> + <c>WriteDataFilesAsync</c> +
+    /// <c>ComputeDeletionVectorActionsAsync</c> + <c>CommitDataFilesAsync(extraActions:)</c>. The reference
+    /// implementation must read the single commit correctly: the new column NULL-backfilled on the old files,
+    /// valued on the new file, and the DV-deleted row gone.</para>
+    ///
+    /// <para>This is the cross-engine claim the seam rests on — that a fused metaData + add + DV-remove commit
+    /// is a spec-legal ordinary version, not something only EW can interpret. A round-trip through EW alone
+    /// could not catch a mis-shaped commit (a stray second metaData, an add referencing the pending schema
+    /// Spark doesn't know, a DV a foreign reader ignores). Spark 4.0 supports deletion vectors, so the deleted
+    /// row being absent here proves the fused DV lands for a foreign reader too.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwFusedAlterInsertDelete_SparkReadsOneAtomicVersion()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var baseSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("value", StringType.Default, true))
+            .Build();
+
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), baseSchema, enableDeletionVectors: true);
+        await table.WriteAsync([new RecordBatch(baseSchema,
+        [
+            new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Append(5).Build(),
+            new StringArray.Builder().Append("v1").Append("v2").Append("v3").Append("v4").Append("v5").Build(),
+        ], 5)]);
+        var pinned = table.CurrentSnapshot; // v1: ids 1..5, one file
+
+        // ALTER ADD COLUMN extra INT — computed, not committed
+        var change = table.ComputeAddColumn(new Field("extra", Int32Type.Default, true));
+
+        // INSERT (6, 7) under the pending schema — file written now, add deferred
+        var widened = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("value", StringType.Default, true))
+            .Field(new Field("extra", Int32Type.Default, true))
+            .Build();
+        var files = await table.WriteDataFilesAsync([new RecordBatch(widened,
+        [
+            new Int64Array.Builder().Append(6).Append(7).Build(),
+            new StringArray.Builder().Append("v6").Append("v7").Build(),
+            new Int32Array.Builder().Append(60).Append(70).Build(),
+        ], 2)], schemaOverride: change.NewSchema);
+
+        // DELETE WHERE id = 2 — position 1 of ordinal 0 in the pinned snapshot
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(
+            new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } }, resolveAgainst: pinned);
+
+        var extra = new List<DeltaLake.Actions.DeltaAction>();
+        extra.AddRange(change.Actions);
+        extra.AddRange(dvActions);
+        long committed = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append,
+            extraActions: extra, expectedVersion: pinned.Version, operation: "TRANSACTION");
+        Assert.Equal(pinned.Version + 1, committed); // ONE version past the pin
+
+        // Spark reads the fused commit: id 2 gone, extra NULL-backfilled on old rows, valued on new rows.
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal(6, result.GetProperty("row_count").GetInt32());
+        var seen = new Dictionary<long, int?>();
+        foreach (var row in result.GetProperty("rows").EnumerateArray())
+        {
+            long id = row.GetProperty("id").GetInt64();
+            var extraProp = row.GetProperty("extra");
+            seen[id] = extraProp.ValueKind == JsonValueKind.Null ? null : extraProp.GetInt32();
+        }
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7 }, seen.Keys.OrderBy(k => k).ToArray());
+        Assert.Null(seen[1]);
+        Assert.Null(seen[5]);
+        Assert.Equal(60, seen[6]);
+        Assert.Equal(70, seen[7]);
+    }
+
+    /// <summary>
     /// <para>The Databricks row-level-concurrency artifact — a UNIONED deletion vector from two concurrent
     /// EW deletes of disjoint rows of the SAME file (slice 9 Layer 3 sub-problem A) — read by a DV-capable
     /// engine. Two EW handles delete the first and last of three rows in one file; the loser rebases its DV
