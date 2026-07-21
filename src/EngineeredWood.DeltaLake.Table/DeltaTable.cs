@@ -2794,7 +2794,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 foreach (var batch in writeBatches)
                 {
-                    await writer.WriteRowGroupAsync(batch, cancellationToken)
+                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for
+                    // canonical), then the annotation policy (see the committing write path).
+                    var codecBatch = VariantTransport.ToVariantArrays(batch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -3652,18 +3657,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (_options.DataFileWriter is { } dataFileWriter)
                 {
                     // Delegate the parquet bytes to the host writer; it places the file at the location the
-                    // table filesystem maps `fileName` to and returns its byte size.
+                    // table filesystem maps `fileName` to and returns its byte size. A transport-blob variant
+                    // column passes through UNCONVERTED — a host that speaks the transport form encodes it
+                    // itself (its writer produced the marker in the first place).
                     fileSize = await dataFileWriter.WriteAsync(
                         new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
                 {
+                    // The built-in codec takes VariantArray columns: convert any transport-marked blob
+                    // column first (marker-keyed no-op for canonical input), then re-apply the annotation
+                    // policy (the pre-branch StripAnnotation ran before the conversion existed to strip).
+                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
                         .ConfigureAwait(false);
 
                     // DisposeAsync writes the Parquet footer before we read Position
@@ -4073,11 +4086,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 else
                 {
+                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
+                    // then the annotation policy (see the committing write path).
+                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
                     await writer.DisposeAsync().ConfigureAwait(false);
                     fileSize = file.Position;
                 }
@@ -4773,7 +4791,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await using var writer = new Parquet.ParquetFileWriter(
                 file, ownsFile: false, _options.ParquetWriteOptions);
             foreach (var batch in writeBatches)
-                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            {
+                // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
+                // then the annotation policy (see the committing write path).
+                var codecBatch = VariantTransport.ToVariantArrays(batch);
+                if (!_options.EmitVariantLogicalType)
+                    codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
+                await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
+            }
             await writer.DisposeAsync().ConfigureAwait(false);
             fileSize = file.Position;
         }
@@ -5918,7 +5943,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // file (Spark 4.0.x, a spec-minimal writer, or our own output under
             // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
             // not wrap. Without this the column would silently read as a struct rather than a variant.
-            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
+            // Under VariantTransportBlob the host boundary speaks the LEAF-binary transport instead —
+            // convert every layout (VariantArray incl. shredded, bare struct, seam-delivered blob) to the
+            // marker-tagged blob; otherwise coerce to the canonical VariantArray.
+            cleanResult = _options.VariantTransportBlob
+                ? VariantTransport.ToTransportBlobs(cleanResult, snapshot.Schema)
+                : VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion

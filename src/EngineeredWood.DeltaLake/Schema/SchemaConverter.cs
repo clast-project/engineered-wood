@@ -15,6 +15,26 @@ namespace EngineeredWood.DeltaLake.Schema;
 /// </summary>
 public static class SchemaConverter
 {
+    /// <summary>
+    /// The variant TRANSPORT marker: an Arrow field-metadata extension name discriminating a BINARY
+    /// column that carries ONE self-delimiting variant value per row — the parquet-variant metadata
+    /// bytes immediately followed by the value bytes (the metadata header sizes itself, so the halves
+    /// split without a length prefix). Embedding hosts whose Arrow boundary cannot carry the canonical
+    /// <c>arrow.parquet.variant</c> extension (struct storage) exchange variant values in this LEAF-binary
+    /// form instead; <see cref="FromArrowSchema"/> accepts it unconditionally (marker-keyed), and
+    /// <c>DeltaTableOptions.VariantTransportBlob</c> selects it for the read direction.
+    /// </summary>
+    public const string VariantTransportExtensionName = "fabricator.variant";
+
+    private const string ArrowExtensionNameKey = "ARROW:extension:name";
+
+    /// <summary>True when the Arrow field carries the variant transport marker
+    /// (see <see cref="VariantTransportExtensionName"/>).</summary>
+    public static bool IsVariantTransportField(Field field) =>
+        field.Metadata is { } md
+        && md.TryGetValue(ArrowExtensionNameKey, out var ext)
+        && string.Equals(ext, VariantTransportExtensionName, StringComparison.Ordinal);
+
     private static readonly Regex s_decimalPattern = new(
         @"^decimal\((\d+),(\d+)\)$", RegexOptions.Compiled);
 
@@ -113,12 +133,18 @@ public static class SchemaConverter
         new()
         {
             Name = field.Name,
-            Type = FromArrowType(field.DataType),
+            // The variant TRANSPORT marker (field metadata) wins over the storage type: without it a plain
+            // binary stays an ordinary binary — the marker is the only discriminator (the transport is a
+            // LEAF binary, so the type alone cannot carry the distinction).
+            Type = IsVariantTransportField(field)
+                ? new PrimitiveType { TypeName = "variant" }
+                : FromArrowType(field.DataType),
             Nullable = field.IsNullable,
             // Preserve per-field metadata (comments, delta.columnMapping.id/physicalName, invariants, ...) —
             // dropping it silently loses column-mapping identities on any Arrow -> Delta round-trip. Writer
-            // internals (the parquet codec's "PARQUET:*" keys, e.g. PARQUET:field_id) are transport hints, not
-            // Delta schema metadata — those are filtered out.
+            // internals (the parquet codec's "PARQUET:*" keys, e.g. PARQUET:field_id) and Arrow transport
+            // markers ("ARROW:extension:*", e.g. the variant transport discriminator) are transport hints,
+            // not Delta schema metadata — those are filtered out.
             Metadata = FilterArrowMetadata(field.Metadata),
         };
 
@@ -130,6 +156,8 @@ public static class SchemaConverter
         foreach (var kv in metadata)
         {
             if (kv.Key.StartsWith("PARQUET:", StringComparison.Ordinal))
+                continue;
+            if (kv.Key.StartsWith("ARROW:extension:", StringComparison.Ordinal))
                 continue;
             (result ??= new Dictionary<string, string>())[kv.Key] = kv.Value;
         }
@@ -171,6 +199,16 @@ public static class SchemaConverter
         {
             Fields = s.Fields.Select(f => FromArrowField(f)).ToList(),
         },
+        // A variant transport marker on a list/map INNER field would be lost through the type-level
+        // conversion below (silently degrading the element to plain binary) — reject the placement
+        // instead. Struct-nested variant maps fine (struct children go through FromArrowField, which
+        // sees the marker).
+        ListType lv when IsVariantTransportField(lv.ValueField) =>
+            throw new DeltaLake.DeltaFormatException(
+                "variant is not supported as a list element (only top-level or struct-nested columns)."),
+        ArrowMapType mv when IsVariantTransportField(mv.KeyField) || IsVariantTransportField(mv.ValueField) =>
+            throw new DeltaLake.DeltaFormatException(
+                "variant is not supported as a map key/value (only top-level or struct-nested columns)."),
         ListType l => new ArrayType
         {
             ElementType = FromArrowType(l.ValueDataType),

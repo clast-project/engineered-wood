@@ -52,6 +52,21 @@ public sealed record DeltaTableOptions
     /// </summary>
     public bool EmitVariantLogicalType { get; init; } = true;
 
+    /// <summary>
+    /// Whether the read pipeline presents each <c>variant</c> column in its TRANSPORT form: one
+    /// self-delimiting BINARY per row (the parquet-variant metadata bytes immediately followed by the
+    /// value bytes), tagged with the <see cref="Schema.SchemaConverter.VariantTransportExtensionName"/>
+    /// field-metadata marker — instead of the canonical <c>arrow.parquet.variant</c>
+    /// <see cref="Apache.Arrow.VariantArray"/>. Default: <see langword="false"/> (canonical).
+    /// <para>For embedding hosts whose Arrow boundary cannot carry an extension type over struct storage
+    /// (the transport is a LEAF binary, safe to cross any C-data boundary). The WRITE side accepts the
+    /// transport form unconditionally — marker-keyed, a no-op for canonical input — so only the read
+    /// direction needs selecting. A pluggable <see cref="DataFileReader"/> that already delivers the
+    /// transport form (a host decoding variant itself) passes through unchanged. See
+    /// <see cref="VariantTransport"/>.</para>
+    /// </summary>
+    public bool VariantTransportBlob { get; init; }
+
     /// <summary>Optional pluggable writer for data-file bytes. When set, the table delegates parquet file
     /// production to it (e.g. a host's native parquet writer) instead of the built-in <c>ParquetFileWriter</c>;
     /// all other write logic (partitioning, row tracking, stats, the <c>add</c> action, the commit) is unchanged.
