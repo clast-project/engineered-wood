@@ -11,8 +11,13 @@ namespace EngineeredWood.DeltaLake.Table;
 /// Evaluates a <see cref="Predicate"/> against a Delta <see cref="AddFile"/>
 /// using both partition values and per-file column statistics. Skips files
 /// that the evaluator proves cannot contain matching rows.
+///
+/// <para>Public so a host that assembles its own file list (e.g. an <see cref="IDataFileReader"/>-style
+/// native scan that reads the active set through its own parquet reader) can apply the SAME
+/// superset-safe prune verdict the library's read paths use — a pruned file is provably matchless,
+/// an unresolvable reference keeps the file.</para>
 /// </summary>
-internal sealed class DeltaFilePruner
+public sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
 

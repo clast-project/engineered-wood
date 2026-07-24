@@ -129,6 +129,17 @@ internal static class ColumnChunkWriter
         // these check defLevels[i] == 0 for null, which only works when maxDefLevel <= 1.
         int[]? valueDefLevels = NormalizeDefLevels(defLevels, maxDefLevel);
 
+        // NARROW integer arrays (1-/2-byte Arrow buffers: Int8/UInt8/Int16/UInt16) write as the 4-byte
+        // Int32 PHYSICAL type, but the value extraction below (dictionary, PLAIN, the V2 encoders, stats)
+        // reinterprets the raw value buffer AT THE PHYSICAL WIDTH — reading a 1-byte buffer as int packs
+        // four values per element: SILENT corruption when the Arrow buffer's 64-byte padding hides the
+        // overrun, an out-of-range exception when it does not. Widen ONCE here so every downstream
+        // consumer sees an aligned buffer (same single-chokepoint shape as the FLBA byte reversal below).
+        if (physicalType == PhysicalType.Int32)
+        {
+            array = WidenNarrowIntArray(array);
+        }
+
         // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
         // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
         if (physicalType == PhysicalType.FixedLenByteArray &&
@@ -1376,6 +1387,65 @@ internal static class ColumnChunkWriter
         for (int i = 0; i < defLevels.Length; i++)
             normalized[i] = defLevels[i] >= maxDefLevel ? 1 : 0;
         return normalized;
+    }
+
+    /// <summary>
+    /// Widens a 1-/2-byte integer array (Int8/UInt8/Int16/UInt16 — Arrow types whose Parquet physical
+    /// type is the 4-byte Int32) to a position-identical <see cref="Int32Array"/>, so the width-naive
+    /// buffer reinterpretation in the encoders reads correct values. Sign- vs zero-extension follows the
+    /// source type. Any other array (already 4-byte, or a non-integer) passes through unchanged.
+    /// </summary>
+    private static IArrowArray WidenNarrowIntArray(IArrowArray array)
+    {
+        switch (array)
+        {
+            case Int8Array a:
+            {
+                var b = new Int32Array.Builder();
+                b.Reserve(a.Length);
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetValue(i)!.Value);
+                }
+                return b.Build();
+            }
+            case UInt8Array a:
+            {
+                var b = new Int32Array.Builder();
+                b.Reserve(a.Length);
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetValue(i)!.Value);
+                }
+                return b.Build();
+            }
+            case Int16Array a:
+            {
+                var b = new Int32Array.Builder();
+                b.Reserve(a.Length);
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetValue(i)!.Value);
+                }
+                return b.Build();
+            }
+            case UInt16Array a:
+            {
+                var b = new Int32Array.Builder();
+                b.Reserve(a.Length);
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetValue(i)!.Value);
+                }
+                return b.Build();
+            }
+            default:
+                return array;
+        }
     }
 
     /// <summary>

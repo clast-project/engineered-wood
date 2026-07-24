@@ -36,19 +36,31 @@ internal static class SchemaEvolution
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
         foreach (var f in expectedFields)
         {
-            schemaBuilder.Field(f);
             IArrowArray reconciled;
             if (present.TryGetValue(f.Name, out int idx))
             {
                 var column = batch.Column(idx);
                 reconciled = ReconcileColumn(column, f.DataType, batch.Length);
-                if (!ReferenceEquals(reconciled, column))
+                if (ReferenceEquals(reconciled, column))
+                {
+                    // Pass-through column: keep the SOURCE field. Relabeling present data with the
+                    // expected field can lie about its representation — e.g. a host-transport variant
+                    // blob (marker-tagged BINARY) labeled as the canonical extension type, which a
+                    // downstream schema export then mis-describes. Same relabeling class ValueWidener
+                    // avoids; the names match by construction.
+                    schemaBuilder.Field(batch.Schema.FieldsList[idx]);
+                }
+                else
+                {
                     changed = true;
+                    schemaBuilder.Field(f); // rebuilt to the expected structure — the expected label is right
+                }
             }
             else
             {
                 reconciled = MakeNullArray(f.DataType, batch.Length);
                 changed = true;
+                schemaBuilder.Field(f);
             }
             arrays.Add(reconciled);
         }

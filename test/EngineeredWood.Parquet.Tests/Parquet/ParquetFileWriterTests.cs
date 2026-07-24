@@ -1814,6 +1814,68 @@ public class ParquetFileWriterTests : IDisposable
         return new RecordBatch(schema, [array], array.Length);
     }
 
+    // --- Narrow integer columns (1-/2-byte Arrow buffers over the 4-byte Int32 physical type) ---
+    // The value extraction used to reinterpret the raw Arrow buffer AT THE PHYSICAL WIDTH, packing four
+    // int8 values into each int read — silent corruption whenever the buffer's 64-byte padding hid the
+    // overrun, an out-of-range exception when it did not. WriteColumnCore now widens narrow arrays once.
+
+    [Theory]
+    [InlineData(true)]   // dictionary path (DictionaryEncoder.TryEncodeFixed)
+    [InlineData(false)]  // plain/V2 path (EncodeFixedValues)
+    public async Task NarrowIntColumns_RoundTrip(bool dictionaryEnabled)
+    {
+        var path = TempPath($"narrow_ints_dict_{dictionaryEnabled}.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("i8", Int8Type.Default, nullable: true))
+            .Field(new Field("u8", UInt8Type.Default, nullable: true))
+            .Field(new Field("i16", Int16Type.Default, nullable: true))
+            .Field(new Field("u16", UInt16Type.Default, nullable: true))
+            .Build();
+
+        var i8 = new Int8Array.Builder();
+        i8.Append(-1); i8.Append(2); i8.AppendNull(); i8.Append(sbyte.MinValue); i8.Append(sbyte.MaxValue);
+        var u8 = new UInt8Array.Builder();
+        u8.Append(1); u8.Append(2); u8.AppendNull(); u8.Append(byte.MinValue); u8.Append(byte.MaxValue);
+        var i16 = new Int16Array.Builder();
+        i16.Append(-300); i16.Append(300); i16.AppendNull(); i16.Append(short.MinValue); i16.Append(short.MaxValue);
+        var u16 = new UInt16Array.Builder();
+        u16.Append(1); u16.Append(300); u16.AppendNull(); u16.Append(ushort.MinValue); u16.Append(ushort.MaxValue);
+
+        var batch = new RecordBatch(schema, [i8.Build(), u8.Build(), i16.Build(), u16.Build()], 5);
+
+        await WriteAndVerify(path, batch, readBatch =>
+        {
+            var r8 = Assert.IsType<Int8Array>(readBatch.Column(0));
+            Assert.Equal((sbyte)-1, r8.GetValue(0));
+            Assert.Equal((sbyte)2, r8.GetValue(1));
+            Assert.True(r8.IsNull(2));
+            Assert.Equal(sbyte.MinValue, r8.GetValue(3));
+            Assert.Equal(sbyte.MaxValue, r8.GetValue(4));
+
+            var ru8 = Assert.IsType<UInt8Array>(readBatch.Column(1));
+            Assert.Equal((byte)1, ru8.GetValue(0));
+            Assert.True(ru8.IsNull(2));
+            Assert.Equal(byte.MaxValue, ru8.GetValue(4));
+
+            var r16 = Assert.IsType<Int16Array>(readBatch.Column(2));
+            Assert.Equal((short)-300, r16.GetValue(0));
+            Assert.Equal((short)300, r16.GetValue(1));
+            Assert.True(r16.IsNull(2));
+            Assert.Equal(short.MinValue, r16.GetValue(3));
+            Assert.Equal(short.MaxValue, r16.GetValue(4));
+
+            var ru16 = Assert.IsType<UInt16Array>(readBatch.Column(3));
+            Assert.Equal((ushort)300, ru16.GetValue(1));
+            Assert.True(ru16.IsNull(2));
+            Assert.Equal(ushort.MaxValue, ru16.GetValue(4));
+        }, new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = dictionaryEnabled,
+        });
+    }
+
     private async Task WriteAndVerify(
         string path, RecordBatch batch, Action<RecordBatch> verify,
         ParquetWriteOptions? options = null)

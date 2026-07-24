@@ -223,4 +223,120 @@ public class BufferedTransactionTests : IDisposable
         Assert.True(check.CurrentSnapshot.AppTransactions.TryGetValue("producer-1", out var txn));
         Assert.Equal(42, txn!.Version);
     }
+
+    // ── buffered DML through a concurrent REWRITE: the Layer 3 (B) remap on the buffered surface ──
+    //
+    // A buffered transaction's DV pairs were computed against the PINNED snapshot; a concurrent compaction /
+    // copy-on-write rewrite makes the touched file vanish from the latest active set. RebaseDvDmlActionsAsync
+    // now relocates those rows by STABLE ROW ID onto the new files (RemapRowLevelDeletesAsync — the same
+    // machinery the autocommit path uses) instead of aborting; a row concurrently modified is still a
+    // row-level conflict, and a table without row tracking keeps the clean rewrite conflict.
+
+    private async Task<DeltaTable> CreateRowTrackedTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var table = await DeltaTable.CreateAsync(fs, BuildSchema(),
+            enableDeletionVectors: true, enableRowTracking: true);
+        await table.WriteAsync([BuildBatch(1, 10)]); // v1: ids 1..10, ONE file (ordinal 0)
+        return table;
+    }
+
+    private async Task<List<long>> ReadIdsFreshAsync2()
+    {
+        await using var reader = await OpenAsync();
+        var ids = new List<long>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var col = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                ids.Add(col.GetValue(i)!.Value);
+        }
+        ids.Sort();
+        return ids;
+    }
+
+    /// <summary>The buffered DELETE composes THROUGH a concurrent compaction: the pinned-resolved DV pair's
+    /// file was rewritten away; the rebase remaps the deleted row by stable id onto the compacted file and the
+    /// fused commit lands — no abort, no retry.</summary>
+    [Fact]
+    public async Task BufferedFlow_DvDml_RemapsAcrossConcurrentCompaction()
+    {
+        await using var table = await CreateRowTrackedTableAsync();
+        var pinned = table.CurrentSnapshot;
+
+        // "DELETE WHERE id = 2" — position 1 of ordinal 0 in the pinned snapshot
+        var positions = new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } };
+        var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(
+            positions, resolveAgainst: pinned);
+        Assert.Equal(1, rowsDeleted);
+
+        // the racer appends a second file and COMPACTS — the pinned file is rewritten away
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([BuildBatch(11, 2)]);
+            await racer.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        }
+
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            dvActions, positions, pinned, committer.CurrentSnapshot);
+        await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true);
+        await committer.CommitDataFilesAsync(
+            System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+            extraActions: rebased, expectedVersion: committer.CurrentSnapshot.Version, operation: "DELETE");
+
+        // the delete landed on the COMPACTED file: id 2 gone, the racer's rows kept
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, await ReadIdsFreshAsync2());
+    }
+
+    /// <summary>...but a row ALSO modified by the concurrent writer stays a row-level conflict: the racer
+    /// compacts AND deletes the same row, so the remap finds its stable id gone (DV-hidden) and aborts.</summary>
+    [Fact]
+    public async Task BufferedFlow_RemapThroughRewrite_RowConcurrentlyDeleted_Conflicts()
+    {
+        await using var table = await CreateRowTrackedTableAsync();
+        var pinned = table.CurrentSnapshot;
+
+        var positions = new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([BuildBatch(11, 2)]);
+            await racer.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+            await racer.DeleteAsync(IdEquals(2)); // the same row this transaction deletes
+        }
+
+        await using var committer = await OpenAsync();
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.RebaseDvDmlActionsAsync(dvActions, positions, pinned, committer.CurrentSnapshot));
+        Assert.Contains("row-level conflict", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // deleted exactly once (by the racer)
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, await ReadIdsFreshAsync2());
+    }
+
+    /// <summary>Without row tracking there are no stable ids to follow — a rewritten-away touched file keeps
+    /// the clean rewrite/compaction conflict.</summary>
+    [Fact]
+    public async Task BufferedFlow_RewriteWithoutRowTracking_Conflicts()
+    {
+        await using var table = await CreateTableAsync(); // DV only, NO row tracking
+        var pinned = table.CurrentSnapshot;
+
+        var positions = new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([BuildBatch(6, 2)]);
+            await racer.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        }
+
+        await using var committer = await OpenAsync();
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.RebaseDvDmlActionsAsync(dvActions, positions, pinned, committer.CurrentSnapshot));
+        Assert.Contains("rewrite/compaction", ex.Message);
+        Assert.Contains("row tracking", ex.Message);
+    }
 }

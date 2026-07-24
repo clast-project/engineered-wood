@@ -119,6 +119,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ColumnMappingMode.Id"/>, the protocol is upgraded to
     /// Reader v2 / Writer v5 and column mapping metadata is assigned.
     /// </param>
+    /// <param name="configuration">Caller-supplied table properties merged into the create-time
+    /// <c>metaData.configuration</c> (e.g. <c>delta.isolationLevel</c>, custom TBLPROPERTIES). The
+    /// <c>delta.enable*</c> keys in it enable their feature exactly like the boolean parameters
+    /// (deletion vectors, row tracking, and additionally <c>delta.enableInCommitTimestamps</c> /
+    /// <c>delta.enableChangeDataFeed</c> — each declared in the protocol). Internally-derived keys
+    /// (column mapping) override; caller-supplied row-tracking materialized column names win.</param>
+    /// <param name="preAssignedSchema">A caller-supplied Delta schema whose column-mapping ids +
+    /// physical names were assigned BEFORE this create (data files referencing them already exist —
+    /// e.g. an eagerly-streamed buffered-transaction CTAS); the create adopts it instead of
+    /// re-assigning (physical names are random GUIDs, so re-assignment would orphan those files).</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public static async ValueTask<DeltaTable> CreateAsync(
         ITableFileSystem fileSystem,
@@ -129,6 +139,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? clusteringColumns = null,
         bool enableDeletionVectors = false,
         bool enableRowTracking = false,
+        IReadOnlyDictionary<string, string>? configuration = null,
+        Schema.StructType? preAssignedSchema = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -152,22 +164,43 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (latestVersion >= 0)
             throw new InvalidOperationException("Delta table already exists.");
 
-        // Convert Arrow schema to Delta schema
-        var deltaSchema = SchemaConverter.FromArrowSchema(schema);
+        // Convert Arrow schema to Delta schema. `preAssignedSchema` = a caller-supplied Delta schema whose
+        // column-mapping ids + physical names were assigned BEFORE this create (data files referencing them
+        // were already written — e.g. an eagerly-streamed buffered-transaction CTAS); physical names are
+        // random GUIDs, so a re-assignment here would orphan those files.
+        var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
 
-        // Set protocol versions based on column mapping mode
+        // Set protocol versions based on column mapping mode. Start the table properties from any
+        // caller-supplied `configuration` (e.g. delta.isolationLevel, custom TBLPROPERTIES) — the
+        // internally-derived keys below compose with (and for the mapping keys, override) it. The
+        // delta.enable* keys in it also count as enablement, symmetric with the boolean parameters.
         int minReaderVersion = 1;
         int minWriterVersion = 2;
-        Dictionary<string, string>? configuration = null;
+        Dictionary<string, string>? config = null;
+        if (configuration is { Count: > 0 })
+        {
+            config = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var kv in configuration)
+                config[kv.Key] = kv.Value;
+        }
+        bool dvEnabled = enableDeletionVectors || DeletionVectors.DeletionVectorConfig.IsEnabled(config);
+        bool rowTrackingOn = enableRowTracking || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(config);
 
         if (columnMappingMode != ColumnMappingMode.None)
         {
             minReaderVersion = 2;
             minWriterVersion = 5;
 
-            // Assign column mapping IDs and physical names
-            var (mappedSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
-            deltaSchema = mappedSchema;
+            // Assign column mapping IDs and physical names (a pre-assigned schema keeps its own).
+            int maxId;
+            if (preAssignedSchema is not null)
+            {
+                maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
+            }
+            else
+            {
+                (deltaSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
+            }
 
             string modeStr = columnMappingMode switch
             {
@@ -176,34 +209,41 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 _ => "none",
             };
 
-            configuration = new Dictionary<string, string>
-            {
-                [ColumnMapping.ModeKey] = modeStr,
-                [ColumnMapping.MaxColumnIdKey] = maxId.ToString(),
-            };
+            config ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            config[ColumnMapping.ModeKey] = modeStr;
+            config[ColumnMapping.MaxColumnIdKey] = maxId.ToString();
         }
 
         // Deletion vectors are opt-in: set the table property so the DELETE path knows it may soft-delete
         // rows with a DV, and declare the reader+writer feature below so foreign readers apply them.
-        if (enableDeletionVectors)
+        if (dvEnabled)
         {
-            configuration ??= new Dictionary<string, string>();
-            configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
+            config ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            config[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
         }
 
         // Row tracking is opt-in: set the property and store the two spec-required hidden column names now
         // (they are fixed at enablement — a reader consults them to find the materialized id/version columns
         // an eventual rewrite writes). Fresh appends need neither column: a row's id is baseRowId + position.
+        // Caller-supplied column names (in `configuration`) win; only absent ones are generated.
         // The rowTracking + domainMetadata writer features are declared below.
-        if (enableRowTracking)
+        if (rowTrackingOn)
         {
-            configuration ??= new Dictionary<string, string>();
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
-            var (rowIdCol, rowCommitVersionCol) =
-                DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
-                rowCommitVersionCol;
+            config ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            config[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
+            if (!config.ContainsKey(DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey)
+                || !config.ContainsKey(
+                    DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey))
+            {
+                var (rowIdCol, rowCommitVersionCol) =
+                    DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
+                if (!config.ContainsKey(DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey))
+                    config[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
+                if (!config.ContainsKey(
+                        DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey))
+                    config[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
+                        rowCommitVersionCol;
+            }
         }
 
         // The legacy protocol versions this table would carry if NO table feature forced it into
@@ -237,7 +277,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // makes a conformant foreign reader APPLY the DVs a DELETE writes; without it they are silently
         // ignored (a reader returns rows the table considers deleted). The DELETE path refuses to write a DV
         // unless this feature is enabled — see ComputeDeleteActionsAsync.
-        if (enableDeletionVectors)
+        if (dvEnabled)
         {
             minReaderVersion = 3;
             minWriterVersion = 7;
@@ -250,12 +290,32 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // ordinary data plus optional add.baseRowId metadata, so the reader version is untouched. The append
         // path assigns baseRowId + defaultRowCommitVersion and advances the HWM domain; a copy-on-write rewrite
         // (UPDATE / OVERWRITE / compaction) materializes each moved row's original id + commit version.
-        if (enableRowTracking)
+        if (rowTrackingOn)
         {
             minWriterVersion = 7;
             writerFeatures.Add("rowTracking");
             if (!writerFeatures.Contains("domainMetadata"))
                 writerFeatures.Add("domainMetadata");
+        }
+
+        // In-commit timestamps (caller-enabled via 'delta.enableInCommitTimestamps') — a WRITER-only
+        // feature ('inCommitTimestamp'; readers read normally). Enabled at creation (version 0), so no
+        // inCommitTimestampEnablementVersion/Timestamp properties are required — every commit carries the
+        // field (EnsureCommitInfo writes it).
+        if (config is not null && config.TryGetValue("delta.enableInCommitTimestamps", out var ict)
+            && string.Equals(ict, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("inCommitTimestamp");
+        }
+
+        // Change data feed (caller-enabled via 'delta.enableChangeDataFeed') — a WRITER-only feature
+        // ('changeDataFeed'; readers read data normally, the change feed is opt-in via the reader). The
+        // DML paths then write _change_data files so table_changes / ReadChangesAsync return a correct feed.
+        if (DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(config))
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("changeDataFeed");
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -342,7 +402,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Format = Format.Parquet,
                 SchemaString = schemaString,
                 PartitionColumns = partitionColumns ?? [],
-                Configuration = configuration,
+                Configuration = config,
                 CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             },
         };
@@ -355,7 +415,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
         // the history (and resolvable by timestamp time travel) rather than being the one silent version.
         var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, configuration, "CREATE TABLE");
+            actions, config, "CREATE TABLE");
         await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
 
         var snapshot = await SnapshotBuilder.BuildAsync(
@@ -374,6 +434,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaTableOptions? options = null,
         IReadOnlyList<string>? partitionColumns = null,
         IReadOnlyList<string>? clusteringColumns = null,
+        ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
+        IReadOnlyDictionary<string, string>? configuration = null,
+        Schema.StructType? preAssignedSchema = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -387,7 +450,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
 
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
+            columnMappingMode: columnMappingMode,
             clusteringColumns: clusteringColumns,
+            configuration: configuration,
+            preAssignedSchema: preAssignedSchema,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
@@ -2728,7 +2794,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 foreach (var batch in writeBatches)
                 {
-                    await writer.WriteRowGroupAsync(batch, cancellationToken)
+                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for
+                    // canonical), then the annotation policy (see the committing write path).
+                    var codecBatch = VariantTransport.ToVariantArrays(batch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -2962,6 +3033,51 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     private static readonly IReadOnlyDictionary<string, string> EmptyPartitionValues =
         new Dictionary<string, string>();
+
+    /// <summary>
+    /// The partition-aware convenience over <see cref="WriteChangeDataFileAsync"/>: splits
+    /// <paramref name="rows"/> (logical user columns, partition columns INCLUDED) by partition per the
+    /// data-file convention — each partition's rows land in their own <c>_change_data</c> file with the
+    /// partition columns excluded from the bytes and the file's <c>partitionValues</c> physical-keyed —
+    /// and returns one <see cref="CdcFile"/> per written file. On an unpartitioned table this is exactly
+    /// one <see cref="WriteChangeDataFileAsync"/> call. Callers holding a statement's change rows as one
+    /// batch (a DELETE's matched rows, an UPDATE's pre/post-images) need no partition-splitting code.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<CdcFile>> WriteChangeDataFilesAsync(
+        RecordBatch rows, string changeType, CancellationToken cancellationToken = default)
+    {
+        var snapshot = CurrentSnapshot;
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        if (partitionColumns is not { Count: > 0 })
+        {
+            return new[]
+            {
+                await WriteChangeDataFileAsync(rows, changeType, null, cancellationToken)
+                    .ConfigureAwait(false),
+            };
+        }
+
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+        var files = new List<CdcFile>();
+        foreach (var (partValues, dataBatch) in Partitioning.PartitionUtils.SplitByPartition(
+                     rows, partitionColumns))
+        {
+            if (dataBatch.Length == 0)
+                continue;
+            IReadOnlyDictionary<string, string> keyed = partValues;
+            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            {
+                var k = new Dictionary<string, string>(partValues.Count);
+                foreach (var kv in partValues)
+                    k[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                keyed = k;
+            }
+            files.Add(await WriteChangeDataFileAsync(dataBatch, changeType, keyed, cancellationToken)
+                .ConfigureAwait(false));
+        }
+        return files;
+    }
 
     /// <summary>
     /// Creates a log compaction file for a range of commits.
@@ -3541,18 +3657,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (_options.DataFileWriter is { } dataFileWriter)
                 {
                     // Delegate the parquet bytes to the host writer; it places the file at the location the
-                    // table filesystem maps `fileName` to and returns its byte size.
+                    // table filesystem maps `fileName` to and returns its byte size. A transport-blob variant
+                    // column passes through UNCONVERTED — a host that speaks the transport form encodes it
+                    // itself (its writer produced the marker in the first place).
                     fileSize = await dataFileWriter.WriteAsync(
                         new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
                 {
+                    // The built-in codec takes VariantArray columns: convert any transport-marked blob
+                    // column first (marker-keyed no-op for canonical input), then re-apply the annotation
+                    // policy (the pre-branch StripAnnotation ran before the conversion existed to strip).
+                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
                         .ConfigureAwait(false);
 
                     // DisposeAsync writes the Parquet footer before we read Position
@@ -3851,7 +3975,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<RecordBatch> batches,
         CancellationToken cancellationToken = default,
         Schema.StructType? schemaOverride = null,
-        bool identityValuesPreGenerated = false)
+        bool identityValuesPreGenerated = false,
+        IReadOnlyList<long>? materializedRowIds = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -3870,19 +3995,65 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
         var files = new List<WrittenDataFile>();
 
+        // materializedRowIds: the rows' ORIGINAL stable row ids, flat + aligned with the batches' rows
+        // (e.g. UPDATE post-images on a row-tracking table — the declared materialized row-id column
+        // overrides baseRowId + position for a spec reader, preserving identity across the update; the
+        // row's commit version correctly advances via the new add's defaultRowCommitVersion). The table
+        // must DECLARE the materialized column name. Partitioned tables work: the id column is attached
+        // BEFORE the partition split so each row keeps its id through the regrouping.
+        string? matRowIdName = null;
+        if (materializedRowIds is not null)
+        {
+            (matRowIdName, _) = DeltaLake.RowTracking.RowTrackingConfig
+                .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+            if (matRowIdName is null)
+                throw new InvalidOperationException(
+                    "WriteDataFilesAsync: materializedRowIds requires the table to declare "
+                    + "'delta.rowTracking.materializedRowIdColumnName'.");
+        }
+        int matOffset = 0;
+
         foreach (var batch in batches)
         {
             if (batch.Length == 0)
                 continue;
 
-            var partitions = Partitioning.PartitionUtils.SplitByPartition(batch, partitionColumns);
-            foreach (var (partValues, dataBatch) in partitions)
+            var work = batch;
+            if (materializedRowIds is not null)
             {
-                if (dataBatch.Length == 0)
+                var idb = new Int64Array.Builder();
+                for (int r = 0; r < batch.Length; r++)
+                    idb.Append(materializedRowIds[matOffset + r]);
+                matOffset += batch.Length;
+                work = RowTracking.RowTrackingWriter.AddRowIdColumn(
+                    batch, idb.Build(), matRowIdName!, nullable: true);
+            }
+
+            var partitions = Partitioning.PartitionUtils.SplitByPartition(work, partitionColumns);
+            foreach (var (partValues, splitBatch) in partitions)
+            {
+                if (splitBatch.Length == 0)
                     continue;
+
+                // The id column (when attached) is NOT part of the table schema: convert AROUND it —
+                // strip, physical-rename the user columns, re-append — and keep it out of the stats.
+                var dataBatch = splitBatch;
+                Int64Array? splitIds = null;
+                if (materializedRowIds is not null)
+                {
+                    var (clean, ids, _) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                        splitBatch, matRowIdName, null);
+                    dataBatch = clean;
+                    splitIds = ids;
+                }
 
                 // Rename logical columns to physical names + stamp field ids at every nesting level.
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+                if (splitIds is not null)
+                {
+                    physicalBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(
+                        physicalBatch, splitIds, matRowIdName!, nullable: true);
+                }
 
                 // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
                 var trackedPartValues = partValues;
@@ -3915,11 +4086,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 else
                 {
+                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
+                    // then the annotation policy (see the committing write path).
+                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
+                    if (!_options.EmitVariantLogicalType)
+                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
+                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
                     await writer.DisposeAsync().ConfigureAwait(false);
                     fileSize = file.Position;
                 }
@@ -4410,6 +4586,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
+        // Change Data Feed: the deleted rows' CONTENT is in hand during the rewrite read — capture it into
+        // _change_data file(s) fused into the same commit (a commit carrying any cdc action is read
+        // cdc-only, so the survivors' rewritten add never mis-reports as inserts).
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        var cdcBatches = cdfEnabled ? new List<RecordBatch>() : null;
         long newVersion = snapshot.Version + 1;
         long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
 
@@ -4440,15 +4621,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 bi++;
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
                 var keepRows = new List<int>();
+                var delRows = cdfEnabled ? new List<int>() : null;
                 for (int i = 0; i < batch.Length; i++)
                 {
                     long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
                         ? absPos.GetValue(i)!.Value : i;
                     if (targets.Contains(abs))
+                    {
                         deletedHere++;
+                        delRows?.Add(i);
+                    }
                     else
+                    {
                         keepRows.Add(i);
+                    }
                 }
+                if (delRows is { Count: > 0 })
+                    cdcBatches!.Add(TakeRowsFromBatch(batch, delRows));
                 if (keepRows.Count == 0)
                     continue;
 
@@ -4490,6 +4679,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (actions.Count == 0)
             return (0, snapshot.Version);
 
+        if (cdcBatches is { Count: > 0 })
+        {
+            foreach (var cb in cdcBatches)
+            {
+                actions.AddRange(await WriteChangeDataFilesAsync(cb, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                    cancellationToken).ConfigureAwait(false));
+            }
+        }
+
         if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
@@ -4520,15 +4718,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return positionsByFile;
     }
 
-    // The corners the copy-on-write row-id DML path does not yet cover (each needs write-time work tied to the
-    // commit that the position-addressed rewrite skips). CDF callers use the DV path; IcebergCompat needs the
-    // committing writer.
+    // The corner the copy-on-write row-id DML path does not cover: IcebergCompat needs the committing
+    // writer. (Change Data Feed is supported — the rewrite has the changed rows in hand and captures them
+    // into _change_data files fused into the same commit.)
     private void RejectCopyOnWriteRowIdUnsupported(Snapshot.Snapshot snapshot, string op)
     {
-        if (DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration))
-            throw new NotSupportedException(
-                $"{op} by row id does not yet support Change Data Feed — use DeleteByRowIdsViaVectorsAsync "
-                + "(deletion-vector DELETE emits the change feed) or the predicate-based UpdateAsync.");
         if (IsIcebergCompat)
             throw new NotSupportedException($"{op} by row id is not supported on IcebergCompat tables.");
     }
@@ -4597,7 +4791,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await using var writer = new Parquet.ParquetFileWriter(
                 file, ownsFile: false, _options.ParquetWriteOptions);
             foreach (var batch in writeBatches)
-                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            {
+                // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
+                // then the annotation policy (see the committing write path).
+                var codecBatch = VariantTransport.ToVariantArrays(batch);
+                if (!_options.EmitVariantLogicalType)
+                    codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
+                await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
+            }
             await writer.DisposeAsync().ConfigureAwait(false);
             fileSize = file.Position;
         }
@@ -4774,6 +4975,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
+        // Change Data Feed: the matched rows' pre-images (source values) and post-images (rewritten values)
+        // are in hand during the rewrite — capture both into _change_data files fused into the same commit.
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        var preCdc = cdfEnabled ? new List<RecordBatch>() : null;
+        var postCdc = cdfEnabled ? new List<RecordBatch>() : null;
         long newVersion = snapshot.Version + 1;
         long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
 
@@ -4836,13 +5042,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
                 Int64Array.Builder? idb = materializeIds ? new Int64Array.Builder() : null;
                 Int64Array.Builder? vdb = materializeIds ? new Int64Array.Builder() : null;
+                var matchedRows = cdfEnabled ? new List<int>() : null;
                 for (int i = 0; i < src.Length; i++)
                 {
                     long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
                         ? absPos.GetValue(i)!.Value : i;
                     bool updated = targets.Contains(abs);
                     if (updated)
+                    {
                         updatedHere++;
+                        matchedRows?.Add(i);
+                    }
                     if (materializeIds)
                     {
                         long? id = batchIds is not null && !batchIds.IsNull(i) ? batchIds.GetValue(i) : null;
@@ -4852,6 +5062,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                             : (batchVers is not null && !batchVers.IsNull(i) ? batchVers.GetValue(i) : (long?)null);
                         if (ver is { } vv) vdb!.Append(vv); else vdb!.AppendNull();
                     }
+                }
+                if (matchedRows is { Count: > 0 })
+                {
+                    preCdc!.Add(TakeRowsFromBatch(src, matchedRows));
+                    postCdc!.Add(TakeRowsFromBatch(rewritten[bi], matchedRows));
                 }
                 outTracking?.Add(materializeIds ? (idb!.Build(), vdb!.Build()) : ((Int64Array, Int64Array)?)null);
             }
@@ -4875,6 +5090,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         if (actions.Count == 0)
             return snapshot.Version;
+
+        if (preCdc is { Count: > 0 })
+        {
+            foreach (var cb in preCdc)
+            {
+                actions.AddRange(await WriteChangeDataFilesAsync(
+                    cb, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, cancellationToken).ConfigureAwait(false));
+            }
+            foreach (var cb in postCdc!)
+            {
+                actions.AddRange(await WriteChangeDataFilesAsync(
+                    cb, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, cancellationToken).ConfigureAwait(false));
+            }
+        }
 
         if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
@@ -4903,6 +5132,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyCollection<long> rowIds,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
+        List<Int64Array>? rowIdsOut = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -4961,10 +5191,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     for (int k = 0; k < rows.Count; k++)
                     {
                         int i = rows[k];
-                        ids[k] = matI is not null && !matI.IsNull(i) ? matI.GetValue(i) : null;
-                        vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
+                        // The row's ORIGINAL stable id/commit version: the source file's materialized value
+                        // where present (a rewritten/compacted source) else the spec derivation —
+                        // baseRowId + absolute position / the file's defaultRowCommitVersion. NULL only
+                        // when the source predates row tracking (no baseRowId to derive from).
+                        ids[k] = matI is not null && !matI.IsNull(i)
+                            ? matI.GetValue(i)
+                            : addFile.BaseRowId is { } baseId && !absPos.IsNull(i)
+                                ? baseId + absPos.GetValue(i)!.Value
+                                : null;
+                        vers[k] = matV is not null && !matV.IsNull(i)
+                            ? matV.GetValue(i)
+                            : addFile.DefaultRowCommitVersion;
                     }
                     sourceRowTrackingOut.Add((ids, vers));
+                }
+                // rowIdsOut: one row-aligned array per yielded batch carrying each row's TRANSIENT rowid
+                // ((ordinal << RowIdPositionBits) | absolutePosition, the encoding the caller requested by) —
+                // the correlation key a caller needs to pair each returned row with its requested rowid
+                // (emission order alone cannot key a lookup). Appended BEFORE the batch is yielded.
+                if (rowIdsOut is not null)
+                {
+                    var ridb = new Int64Array.Builder();
+                    foreach (int i in rows)
+                        ridb.Append(((long)kvp.Key << RowIdPositionBits) | absPos.GetValue(i)!.Value);
+                    rowIdsOut.Add(ridb.Build());
                 }
                 yield return TakeRowsFromBatch(batch, rows);
             }
@@ -4974,16 +5225,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// ROW-LEVEL rebase for the buffered surface: re-targets a DV DML action set computed against
     /// <paramref name="from"/> onto <paramref name="to"/> when a concurrent writer swapped a touched file's
-    /// deletion vector. Per <c>remove</c>+<c>add</c> DV pair (matched by path): the path must still be ACTIVE
-    /// in <paramref name="to"/> (a concurrent rewrite/compaction of the file is a conflict here — the auto
-    /// commit path remaps by stable id, the explicit buffered remap is a follow-up); THIS transaction's
-    /// newly-deleted positions (<paramref name="newPositionsByOrdinal"/>, keyed by <paramref name="from"/>'s
-    /// path-sorted ordinals) must be DISJOINT from the concurrent deletions (an intersection = the same row
-    /// deleted/updated by both ⇒ row-level conflict); disjoint ⇒ the pair re-issues against the CURRENT state
-    /// (<c>remove</c>(path, current DV) + <c>add</c>(path, current DV ∪ ours)). Post-image adds (paths not in
-    /// <paramref name="from"/>) get row-tracking <c>baseRowId</c>/<c>defaultRowCommitVersion</c> re-derived from
-    /// <paramref name="to"/>, and the high-water-mark domain rebuilt. Metadata/protocol changes between the
-    /// snapshots throw. The caller re-runs commitInfo assembly after the rebase.
+    /// deletion vector. Per <c>remove</c>+<c>add</c> DV pair (matched by path): a path still ACTIVE in
+    /// <paramref name="to"/> re-unions — THIS transaction's newly-deleted positions
+    /// (<paramref name="newPositionsByOrdinal"/>, keyed by <paramref name="from"/>'s path-sorted ordinals)
+    /// must be DISJOINT from the concurrent deletions (an intersection = the same row deleted/updated by both
+    /// ⇒ row-level conflict); disjoint ⇒ the pair re-issues against the CURRENT state (<c>remove</c>(path,
+    /// current DV) + <c>add</c>(path, current DV ∪ ours)). A path REWRITTEN AWAY by a concurrent compaction /
+    /// copy-on-write UPDATE has its rows relocated by STABLE ROW ID onto the new files instead — the same
+    /// Layer 3 (B) remap the autocommit path uses (<see cref="RemapRowLevelDeletesAsync"/>; the row's commit
+    /// version discriminates relocated-untouched from concurrently-modified). Requires row tracking; without
+    /// it a rewritten-away touched file is a conflict. Post-image adds (paths not in <paramref name="from"/>)
+    /// get row-tracking <c>baseRowId</c>/<c>defaultRowCommitVersion</c> re-derived from <paramref name="to"/>,
+    /// and the high-water-mark domain rebuilt. Metadata/protocol changes between the snapshots throw. The
+    /// caller re-runs commitInfo assembly after the rebase.
     /// </summary>
     public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
@@ -5029,6 +5283,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var rebased = new List<DeltaAction>(actions.Count);
 
+        // Touched files REWRITTEN AWAY concurrently (compaction / copy-on-write UPDATE): their DV pairs
+        // cannot re-union — the rows are relocated by STABLE ROW ID onto the new files instead (the same
+        // Layer 3 (B) remap the autocommit path uses). Requires row tracking to follow the rows.
+        List<DeleteDvEdit>? remapEdits = null;
+        foreach (var kvp in oursByPath)
+        {
+            if (toByPath.ContainsKey(kvp.Key))
+                continue;
+            if (!rowTrackingEnabled)
+            {
+                throw new DeltaConflictException(
+                    $"concurrent rewrite/compaction of file '{kvp.Key}' this transaction modifies — "
+                    + "cannot rebase the buffered transaction (row tracking is disabled, so its rows "
+                    + "cannot be remapped by stable id); retry it");
+            }
+            (remapEdits ??= new List<DeleteDvEdit>()).Add(
+                new DeleteDvEdit(kvp.Key, kvp.Value as IReadOnlyList<long> ?? kvp.Value.ToList()));
+        }
+
         foreach (var action in actions)
         {
             switch (action)
@@ -5037,21 +5310,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     if (!toByPath.TryGetValue(remove.Path, out var current))
                     {
-                        // The file was REWRITTEN (compaction / copy-on-write) concurrently. The auto commit
-                        // path remaps the rows by stable id; the explicit buffered remap-across-rewrite is a
-                        // follow-up, so conflict here.
-                        throw new DeltaConflictException(
-                            $"concurrent rewrite/compaction of file '{remove.Path}' this transaction modifies — "
-                            + "cannot rebase the buffered transaction; retry it");
+                        // Rewritten away concurrently — this DV pair is replaced by the stable-id remap
+                        // appended after the loop (remapEdits collected above).
+                        break;
                     }
                     rebased.Add(remove with { DeletionVector = current.DeletionVector });
                     break;
                 }
                 case AddFile add when oursByPath.TryGetValue(add.Path, out var ours):
                 {
+                    if (!toByPath.TryGetValue(add.Path, out var current))
+                    {
+                        // Rewritten away — handled by the remap (paired with the skipped remove above).
+                        break;
+                    }
                     // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
                     // row-level disjointness check against the concurrent deletions.
-                    var current = toByPath[add.Path]; // present — the paired remove above would have thrown
                     var currentDeleted = current.DeletionVector is not null
                         ? new HashSet<long>(await _dvReader.ReadAsync(current.DeletionVector, cancellationToken)
                             .ConfigureAwait(false))
@@ -5109,6 +5383,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     rebased.Add(action);
                     break;
             }
+        }
+        if (remapEdits is not null)
+        {
+            // Layer 3 (B): relocate the rewritten-away files' rows by stable id onto the new files. The
+            // re-adds keep the new files' own baseRowId (they are DV pairs, not post-images) — no HWM impact.
+            var resolvedPaths = new HashSet<string>(StringComparer.Ordinal); // checker bookkeeping, unused here
+            var remapped = await RemapRowLevelDeletesAsync(from, to, remapEdits, resolvedPaths, cancellationToken)
+                .ConfigureAwait(false);
+            if (remapped is null)
+            {
+                throw new DeltaConflictException(
+                    "row-level conflict remapping across a concurrent rewrite/compaction: a row this "
+                    + "transaction deletes/updates was concurrently deleted or updated, or its stable id "
+                    + "could not be resolved — retry the transaction");
+            }
+            rebased.AddRange(remapped);
         }
         if (rowTrackingEnabled && anyPostImage)
         {
@@ -5527,6 +5817,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
         }
 
+        // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written before it lacks the
+        // new column — requesting that column from the parquet reader throws. Intersect the projection
+        // with the file's actual top-level columns; the downstream BackfillMissingColumns reconstitutes
+        // the absent ones as typed NULL, exactly like the unprojected path. When NO requested column
+        // exists in this file (a projection of only later-added columns), read one existing column so the
+        // batches still carry the row counts the backfill needs (the projection step drops the extra).
+        if (fileColumns is not null && fileColumns.Count > 0)
+        {
+            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var filePresent = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var child in parquetSchema.Root.Children)
+                filePresent.Add(child.Name);
+            if (fileColumns.Any(c => !filePresent.Contains(c)))
+            {
+                var kept = fileColumns.Where(filePresent.Contains).ToList();
+                if (kept.Count == 0 && parquetSchema.Root.Children.Count > 0)
+                    kept.Add(parquetSchema.Root.Children[0].Name);
+                fileColumns = kept;
+            }
+        }
+
         var builtinBatches = reader.ReadAllAsync(
             columnNames: fileColumns, cancellationToken: cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
@@ -5671,7 +5982,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // file (Spark 4.0.x, a spec-minimal writer, or our own output under
             // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
             // not wrap. Without this the column would silently read as a struct rather than a variant.
-            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
+            // Under VariantTransportBlob the host boundary speaks the LEAF-binary transport instead —
+            // convert every layout (VariantArray incl. shredded, bare struct, seam-delivered blob) to the
+            // marker-tagged blob; otherwise coerce to the canonical VariantArray.
+            cleanResult = _options.VariantTransportBlob
+                ? VariantTransport.ToTransportBlobs(cleanResult, snapshot.Schema)
+                : VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion

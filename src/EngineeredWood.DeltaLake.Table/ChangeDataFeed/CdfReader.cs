@@ -98,11 +98,15 @@ internal static class CdfReader
                 var removes = actions.OfType<RemoveFile>()
                     .Where(r => r.DataChange).ToList();
 
-                // Removed files → "delete" rows
+                // Removed files → "delete" rows. The removed file's DELETION VECTOR must be honored:
+                // rows it already marked deleted were reported as deletes when the DV committed —
+                // re-reporting them here (e.g. on a partition overwrite of a DV-carrying file) would
+                // double-count. Same for adds: DV-deleted rows of an added file are not live inserts.
                 foreach (var remove in removes)
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, remove.Path, remove.PartitionValues, CdfConfig.Delete, version,
+                        fs, remove.Path, remove.PartitionValues, remove.DeletionVector,
+                        CdfConfig.Delete, version,
                         commitTimestamp, readOptions, ctx, cancellationToken)
                         .ConfigureAwait(false))
                     {
@@ -114,7 +118,8 @@ internal static class CdfReader
                 foreach (var add in adds)
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, add.Path, add.PartitionValues, CdfConfig.Insert, version,
+                        fs, add.Path, add.PartitionValues, add.DeletionVector,
+                        CdfConfig.Insert, version,
                         commitTimestamp, readOptions, ctx, cancellationToken)
                         .ConfigureAwait(false))
                     {
@@ -159,6 +164,7 @@ internal static class CdfReader
         ITableFileSystem fs,
         string path,
         IReadOnlyDictionary<string, string>? partitionValues,
+        Actions.DeletionVector? deletionVector,
         string changeType,
         long commitVersion,
         long? commitTimestamp,
@@ -173,13 +179,37 @@ internal static class CdfReader
         if (!await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
             yield break;
 
+        // The action's deletion vector: those rows are NOT part of this change (they were reported when
+        // the DV committed).
+        HashSet<long>? dvRows = null;
+        if (deletionVector is not null)
+        {
+            dvRows = await new DeletionVectors.DeletionVectorReader(fs)
+                .ReadAsync(deletionVector, cancellationToken).ConfigureAwait(false);
+        }
+
         await using var file = await fs.OpenReadAsync(diskPath, cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
-        await foreach (var batch in reader.ReadAllAsync(
+        long batchStartRow = 0;
+        await foreach (var rawBatch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
+            var batch = rawBatch;
+            if (dvRows is not null)
+            {
+                var filtered = DeletionVectors.DeletionVectorFilter.Filter(batch, dvRows, batchStartRow);
+                batchStartRow += batch.Length;
+                if (filtered.Length == 0)
+                    continue;
+                batch = filtered;
+            }
+            else
+            {
+                batchStartRow += batch.Length;
+            }
+
             // Strip a _change_type column if the data file happens to carry one (defensive), map physical → logical
             // + re-materialize partition columns, then add the constant _change_type for this add/remove.
             var cleanBatch = StripChangeTypeColumn(batch);

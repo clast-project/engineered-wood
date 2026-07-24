@@ -185,7 +185,7 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_Throws()
+    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_CapturesChangeFeed()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var log = new EngineeredWood.DeltaLake.Log.TransactionLog(fs);
@@ -209,8 +209,27 @@ public class RowIdDmlTests : IDisposable
         await using var table = await DeltaTable.OpenAsync(fs);
         await table.WriteAsync([Batch(1, 3)]);
         var ids = await RowIdsOf(table, 2);
-        await Assert.ThrowsAsync<NotSupportedException>(async () =>
-            await table.DeleteByRowIdsAsync(ids));
+
+        // The copy-on-write DELETE captures the deleted rows' content into a _change_data file fused into
+        // the same commit (the rewrite has them in hand) — the feed for that version is EXACTLY one
+        // 'delete' row carrying id=2 (no inferred survivor noise: a commit with a cdc action is read
+        // cdc-only).
+        var (deleted, version) = await table.DeleteByRowIdsAsync(ids);
+        Assert.Equal(1, deleted);
+
+        var changeRows = new List<(string ChangeType, long Id)>();
+        await foreach (var b in table.ReadChangesAsync(version, version))
+        {
+            int typeIdx = b.Schema.GetFieldIndex("_change_type");
+            int idIdx = b.Schema.GetFieldIndex("id");
+            var types = (Apache.Arrow.StringArray)b.Column(typeIdx);
+            var idsCol = (Apache.Arrow.Int64Array)b.Column(idIdx);
+            for (int i = 0; i < b.Length; i++)
+                changeRows.Add((types.GetString(i), idsCol.GetValue(i)!.Value));
+        }
+        var change = Assert.Single(changeRows);
+        Assert.Equal("delete", change.ChangeType);
+        Assert.Equal(2, change.Id);
     }
 
     // ── copy-on-write UPDATE by row id ──
