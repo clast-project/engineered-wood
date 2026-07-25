@@ -189,15 +189,13 @@ and the chunk is then read again. That +19% is the reason the option is opt-in.
 
 ## Known limitations of the prototype
 
-1. **The batched/paged read path is not wired up — and cannot be, yet.** The fast path is applied
-   only by the whole-row-group entry points (`ReadRowGroupAsync` and the parallel/incremental
-   variants). Wiring it into the multi-batch path (`ParquetReadOptions.BatchSize` /
-   `MaxBatchByteSize`) is blocked by a **pre-existing, unrelated bug**: that path does not correctly
-   handle nested (list/struct/map) columns at all. It decodes whole pages and then slices the
-   resulting array by row count, which is wrong for a list leaf (whose array length is the element
-   count, not the row count) — reading any list column with `BatchSize` set throws
-   `IndexOutOfRangeException` today, fast path or not. Fixing the batched path for nested columns is
-   a separate correctness task; the fast path should be extended there only once it works generally.
+1. **The batched/paged read path decodes nested row groups whole.** The fast path now applies on the
+   multi-batch path (`ParquetReadOptions.BatchSize` / `MaxBatchByteSize`) as well as the
+   whole-row-group entry points — when a row group contains nested columns the reader decodes and
+   assembles it once (running the fast path) and yields row-sliced views. The remaining limitation is
+   memory, not correctness: per-page subsetting is not implemented for nested columns, so the full
+   row group is decoded up front rather than page by page. (Flat-only row groups still use per-page
+   subsetting.)
 2. **Late-breaking columns are read twice.** See "Scope and fallback".
 3. **Only `maxRepetitionLevel == 1`.** A fixed-length list nested inside another list is not
    detected, though the same reasoning would extend to it.

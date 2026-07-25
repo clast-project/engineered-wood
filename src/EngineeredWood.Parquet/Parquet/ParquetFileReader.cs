@@ -297,7 +297,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             yield break;
         }
 
-        // Multi-batch path: build page maps, then read only the pages needed per batch.
+        if (ctx.HasNestedColumns)
+        {
+            // Per-page subsetting slices each column's decoded array by row, which is only valid for
+            // flat columns: a list/map leaf array is indexed by element, not row, and its records may
+            // straddle both page and cross-column boundaries. Rather than reconstruct records from
+            // partial pages, decode the whole row group once, assemble it (which also runs the
+            // fixed-list fast path), then yield row-sliced views — Arrow's ArrayData.Slice adjusts
+            // offsets and validity correctly for nested types. The trade-off is that the full row
+            // group is decoded up front; true per-page subsetting for nested columns is future work.
+            await foreach (var b in ReadNestedRowGroupInBatchesAsync(
+                ctx, batchSize, maxBytes, cancellationToken).ConfigureAwait(false))
+            {
+                yield return b;
+            }
+            yield break;
+        }
+
+        // Multi-batch path (flat columns): build page maps, then read only the pages needed per batch.
         //
         // Phase 1: Read each column chunk to scan page headers and build page maps.
         //          The full column buffers are released after scanning.
@@ -397,6 +414,79 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
             rowsEmitted += actualBatchRows;
         }
+    }
+
+    /// <summary>
+    /// Batches a row group that contains nested columns by decoding it once and yielding row-sliced
+    /// views. Batch sizing honours <paramref name="batchSize"/> and <paramref name="maxBytes"/> the
+    /// same way the flat path does; only the decode strategy differs (whole chunk vs per-page).
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ReadNestedRowGroupInBatchesAsync(
+        RowGroupContext ctx,
+        int? batchSize,
+        long? maxBytes,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
+        // Decode and assemble the entire row group once. The assembled arrays own their buffers, so
+        // the file buffers (and page maps, kept only for byte-budget sizing) can be released before
+        // any batch is yielded.
+        RecordBatch full;
+        ColumnPageMap[] pageMaps = new ColumnPageMap[ctx.Count];
+
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var results = new ColumnResult[ctx.Count];
+            Parallel.For(0, ctx.Count, i =>
+            {
+                pageMaps[i] = PageMapBuilder.Build(
+                    buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                results[i] = ColumnChunkReader.ReadColumn(
+                    buffers[i].Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                    ctx.HasNestedColumns,
+                    _options.PageChecksumValidation,
+                    _options.FixedListFastPath);
+            });
+            full = AssembleRecordBatch(ctx, results);
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+
+        int rowsEmitted = 0;
+        while (rowsEmitted < ctx.RowCount)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            int actualBatchRows = ComputeBatchRowCount(
+                pageMaps, rowsEmitted, ctx.RowCount, batchSize, maxBytes);
+
+            yield return SliceRecordBatch(full, rowsEmitted, actualBatchRows);
+            rowsEmitted += actualBatchRows;
+        }
+    }
+
+    /// <summary>
+    /// Returns a row-range view of <paramref name="batch"/> covering
+    /// <c>[offset, offset + length)</c>. Each column is sliced via <see cref="ArrayData.Slice"/>,
+    /// which is zero-copy and offset-correct for nested (list/struct/map) arrays.
+    /// </summary>
+    private static RecordBatch SliceRecordBatch(RecordBatch batch, int offset, int length)
+    {
+        if (offset == 0 && length == batch.Length)
+            return batch;
+
+        // Apache.Arrow's factory (not EW's leaf-only Data.ArrowArrayFactory) reconstructs every
+        // type, including struct/list/map, from sliced ArrayData.
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
+            columns[i] = Apache.Arrow.ArrowArrayFactory.BuildArray(batch.Column(i).Data.Slice(offset, length));
+
+        return new RecordBatch(batch.Schema, columns, length);
     }
 
     /// <summary>
