@@ -182,6 +182,29 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, ByteArrayEncoding>? ColumnEncodings { get; init; }
 
     /// <summary>
+    /// Prototype. When <see langword="true"/>, consecutive bit-packed groups in RLE/bit-packed
+    /// hybrid streams — definition levels, repetition levels, and dictionary indices — are batched
+    /// into a single literal run (up to 63 groups) instead of emitting a run header for every
+    /// 8 values. Default: <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The output stays fully spec-conformant either way; multi-group literal runs are what
+    /// parquet-mr and arrow already emit, and every reader handles them. Batching shrinks
+    /// bit-packed-heavy streams (most visibly V2 repetition levels, which are stored uncompressed)
+    /// and gives decoders a contiguous block instead of header-interleaved single bytes.</para>
+    /// <para>Prototype flag: this changes the bytes of every file written, so it is opt-in until the
+    /// size and decode-speed trade-off has been measured across representative data.</para>
+    /// </remarks>
+    public bool BatchBitPackedRuns { get; init; }
+
+    /// <summary>
+    /// Number of bit-packed groups to batch per literal run, derived from
+    /// <see cref="BatchBitPackedRuns"/>.
+    /// </summary>
+    internal int MaxLiteralGroups =>
+        BatchBitPackedRuns ? Data.RleBitPackedEncoder.MaxLiteralGroups : 1;
+
+    /// <summary>
     /// Application identifier written to the file footer's <c>created_by</c> field.
     /// </summary>
     public string CreatedBy { get; init; } = "EngineeredWood";

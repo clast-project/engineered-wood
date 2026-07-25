@@ -23,4 +23,5 @@ BenchmarkSwitcher.FromTypes([
     typeof(FixedListReadBenchmarks),
     typeof(FixedListFallbackBenchmarks),
     typeof(FixedListDetectorBenchmarks),
+    typeof(BatchedRunsReadBenchmarks),
 ]).Run(args);

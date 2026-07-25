@@ -232,8 +232,9 @@ internal static class ColumnChunkWriter
         if (valuesPerPage < 1) valuesPerPage = 1;
 
         // Reusable encoder for def/rep levels across pages
-        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel)) : null;
-        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel)) : null;
+        int maxLiteralGroups = options.MaxLiteralGroups;
+        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
+        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
 
         int offset = 0;
         while (offset < rowCount)
@@ -324,9 +325,10 @@ internal static class ColumnChunkWriter
         int valuesPerPage = Math.Max(1, options.DataPageSize / bytesPerIndex);
 
         // Reusable encoders across pages
-        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel)) : null;
-        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel)) : null;
-        var indexEncoder = new RleBitPackedEncoder(bitWidth);
+        int maxLiteralGroups = options.MaxLiteralGroups;
+        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
+        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
+        var indexEncoder = new RleBitPackedEncoder(bitWidth, maxLiteralGroups: options.MaxLiteralGroups);
 
         int offset = 0;
         int indexOffset = 0;
@@ -870,7 +872,7 @@ internal static class ColumnChunkWriter
         encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding);
         return physicalType switch
         {
-            PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels),
+            PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels, options.MaxLiteralGroups),
             PhysicalType.Int32 => EncodeDeltaInt32ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Int64 => EncodeDeltaInt64ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Float when useAlp => EncodeAlpSingleToBuffer(array, offset, numValues, nonNullCount, defLevels),
@@ -934,7 +936,8 @@ internal static class ColumnChunkWriter
 
 
     private static int EncodeBooleanValuesRleToBuffer(
-        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
+        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
+        int maxLiteralGroups)
     {
         var boolArray = (BooleanArray)array;
         var values = new int[nonNullCount];
@@ -945,7 +948,7 @@ internal static class ColumnChunkWriter
                 values[idx++] = boolArray.GetValue(offset + i) == true ? 1 : 0;
         }
 
-        var encoder = new RleBitPackedEncoder(1);
+        var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: maxLiteralGroups);
         encoder.Encode(values);
 
         // 4-byte LE length prefix + RLE data

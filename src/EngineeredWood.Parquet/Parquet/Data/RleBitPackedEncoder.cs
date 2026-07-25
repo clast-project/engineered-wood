@@ -10,13 +10,36 @@ namespace EngineeredWood.Parquet.Data;
 /// </summary>
 internal sealed class RleBitPackedEncoder
 {
+    /// <summary>
+    /// Largest number of bit-packed groups a single literal run may carry. 63 keeps the run header a
+    /// one-byte varint (<c>(63 &lt;&lt; 1) | 1 == 127</c>), which is also parquet-mr's limit.
+    /// </summary>
+    public const int MaxLiteralGroups = 63;
+
     private readonly int _bitWidth;
+    private readonly int _maxLiteralValues;
     private byte[] _buffer;
     private int _position;
 
-    public RleBitPackedEncoder(int bitWidth, int initialCapacity = 256)
+    // Literal values awaiting a flush. Only whole groups of 8 may be emitted mid-stream, so a
+    // partial group stays here until either the stream ends (where zero padding is safe) or
+    // enough values arrive to complete it.
+    private int[]? _pending;
+    private int _pendingCount;
+
+    /// <param name="maxLiteralGroups">
+    /// How many bit-packed groups may be batched into one literal run. The default of 1 emits a run
+    /// header for every 8 values; raising it amortises that header across more values, shrinking
+    /// bit-packed-heavy streams and giving decoders a contiguous block to scan.
+    /// </param>
+    public RleBitPackedEncoder(int bitWidth, int initialCapacity = 256, int maxLiteralGroups = 1)
     {
+        if (maxLiteralGroups is < 1 or > MaxLiteralGroups)
+            throw new ArgumentOutOfRangeException(nameof(maxLiteralGroups), maxLiteralGroups,
+                $"Must be between 1 and {MaxLiteralGroups}.");
+
         _bitWidth = bitWidth;
+        _maxLiteralValues = maxLiteralGroups * 8;
         _buffer = new byte[initialCapacity];
     }
 
@@ -42,8 +65,8 @@ internal sealed class RleBitPackedEncoder
         if (_bitWidth == 0)
             return; // all values are 0, nothing to encode
 
-        Span<int> pending = stackalloc int[8];
-        int pendingCount = 0;
+        _pending ??= new int[_maxLiteralValues];
+        _pendingCount = 0;
 
         int i = 0;
         while (i < values.Length)
@@ -56,43 +79,54 @@ internal sealed class RleBitPackedEncoder
 
             int runLength = i - runStart;
 
-            if (runLength >= 8 && pendingCount == 0)
+            if (runLength >= 8 && _pendingCount == 0)
             {
                 // Pure RLE run, no pending values to flush first
                 WriteRleRun(value, runLength);
                 continue;
             }
 
-            // Add run values to pending buffer, flushing complete groups of 8
+            // Add run values to pending, emitting whole groups of 8 as they become available
             int runPos = 0;
             while (runPos < runLength)
             {
-                pending[pendingCount++] = value;
+                _pending[_pendingCount++] = value;
                 runPos++;
 
-                if (pendingCount == 8)
+                if ((_pendingCount & 7) != 0)
+                    continue; // mid-group: nothing can be emitted yet
+
+                int remaining = runLength - runPos;
+                if (remaining >= 8)
                 {
-                    int remaining = runLength - runPos;
-                    if (remaining >= 8)
-                    {
-                        // Flush the complete group, then RLE the rest of this run
-                        WriteBitPackedGroup(pending);
-                        pendingCount = 0;
-                        WriteRleRun(value, remaining);
-                        runPos = runLength;
-                    }
-                    else
-                    {
-                        WriteBitPackedGroup(pending);
-                        pendingCount = 0;
-                    }
+                    // The rest of this run is cheaper as RLE; flush the literals accumulated so far
+                    // (a whole number of groups) as a single run, then switch.
+                    FlushLiterals();
+                    WriteRleRun(value, remaining);
+                    runPos = runLength;
+                }
+                else if (_pendingCount == _maxLiteralValues)
+                {
+                    FlushLiterals();
                 }
             }
         }
 
         // Emit remaining values as a final partial group (padding is safe at end of stream)
-        if (pendingCount > 0)
-            WriteBitPackedGroup(pending.Slice(0, pendingCount));
+        FlushLiterals();
+    }
+
+    /// <summary>
+    /// Emits all buffered literals as one bit-packed run. Callers must only invoke this at a group
+    /// boundary, except for the final flush at end of stream where zero padding is harmless.
+    /// </summary>
+    private void FlushLiterals()
+    {
+        if (_pendingCount == 0)
+            return;
+
+        WriteBitPackedGroup(_pending.AsSpan(0, _pendingCount));
+        _pendingCount = 0;
     }
 
     private void WriteRleRun(int value, int count)
