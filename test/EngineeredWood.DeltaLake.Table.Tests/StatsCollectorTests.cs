@@ -209,4 +209,143 @@ public class StatsCollectorTests
         Assert.Equal("2019-01-01", doc.RootElement.GetProperty("minValues").GetProperty("d").GetString());
         Assert.Equal("2021-03-03", doc.RootElement.GetProperty("maxValues").GetProperty("d").GetString());
     }
+
+    // ── String stat truncation ────────────────────────────────────────────────────────────────────
+    //
+    // Delta stats over 32 characters are truncated, and the protocol has no marker recording that.
+    // Correctness therefore rests entirely on the truncated values remaining VALID BOUNDS: min at or
+    // below every value in the file, max at or above. A bound that violates that skips files holding
+    // matching rows — silent data loss, in every engine that reads the table.
+
+    /// <summary>The substitution Utf8JsonWriter emits for a lone surrogate (U+FFFD).</summary>
+    private const char ReplacementChar = (char)0xFFFD;
+
+    /// <summary>Unsigned byte-wise UTF-8 comparison — the order Delta string stats are defined in.</summary>
+    private static int Utf8Compare(string a, string b)
+    {
+        byte[] x = System.Text.Encoding.UTF8.GetBytes(a), y = System.Text.Encoding.UTF8.GetBytes(b);
+        int n = Math.Min(x.Length, y.Length);
+        for (int i = 0; i < n; i++)
+            if (x[i] != y[i]) return x[i].CompareTo(y[i]);
+        return x.Length.CompareTo(y.Length);
+    }
+
+    private static (string? Min, string? Max) CollectStringBounds(params string[] values)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", StringType.Default, true))
+            .Build();
+
+        var builder = new StringArray.Builder();
+        foreach (string v in values) builder.Append(v);
+        var batch = new RecordBatch(schema, [builder.Build()], values.Length);
+
+        string? stats = StatsCollector.Collect(batch);
+        Assert.NotNull(stats);
+
+        var root = JsonDocument.Parse(stats).RootElement;
+        // A max that cannot be raised to a valid upper bound is omitted rather than written wrong.
+        string? min = root.GetProperty("minValues").TryGetProperty("s", out var mn) ? mn.GetString() : null;
+        string? max = root.GetProperty("maxValues").TryGetProperty("s", out var mx) ? mx.GetString() : null;
+        return (min, max);
+    }
+
+    [Fact]
+    public void Collect_LongString_TruncatesToBounds()
+    {
+        string value = new string('a', 40) + "z";
+        var (min, max) = CollectStringBounds(value);
+
+        Assert.NotNull(min);
+        Assert.NotNull(max);
+        Assert.True(min!.Length <= 32);
+        Assert.True(max!.Length <= 32);
+        Assert.True(Utf8Compare(min, value) <= 0, "min must not exceed the value");
+        Assert.True(Utf8Compare(max, value) >= 0, "max must not fall below the value");
+    }
+
+    [Fact]
+    public void Collect_LongString_MinDoesNotSplitSurrogatePair()
+    {
+        // The pair straddles the 32-char cut (high half at index 31), so a naive Substring(0, 32)
+        // orphans it. Utf8JsonWriter then rewrites the orphan to U+FFFD, which sorts ABOVE the
+        // supplementary character it replaced — a min GREATER than the value it must sit below.
+        string value = new string('a', 31) + char.ConvertFromUtf32(0x1F600) + new string('b', 20);
+        Assert.True(char.IsHighSurrogate(value[31]));
+
+        var (min, _) = CollectStringBounds(value);
+
+        Assert.NotNull(min);
+        Assert.DoesNotContain(ReplacementChar, min!);
+        Assert.True(Utf8Compare(min!, value) <= 0, "min must not exceed the value");
+    }
+
+    [Fact]
+    public void Collect_LongString_MaxDoesNotOrphanHighSurrogate()
+    {
+        // U+103FF encodes as D800 DFFF. With the LOW half at index 31, incrementing it yields
+        // U+E000 — outside the surrogate range, so the increment guard alone lets the cut through
+        // and strands the high half at index 30. The resulting U+FFFD sorts BELOW the character it
+        // replaced, leaving a max SMALLER than a value in the file.
+        string value = new string('a', 30) + char.ConvertFromUtf32(0x103FF) + new string('b', 20);
+        Assert.True(char.IsHighSurrogate(value[30]));
+        Assert.True(char.IsLowSurrogate(value[31]));
+
+        var (_, max) = CollectStringBounds(value);
+
+        Assert.NotNull(max);
+        Assert.DoesNotContain(ReplacementChar, max!);
+        Assert.True(Utf8Compare(max!, value) >= 0, "max must not fall below the value");
+    }
+
+    /// <summary>
+    /// The bound invariant itself, over strings built to land a supplementary character on every
+    /// offset near the truncation boundary — the family both fixes above are instances of.
+    /// </summary>
+    [Fact]
+    public void Collect_LongStrings_BoundsAlwaysEncloseValues()
+    {
+        int[] interesting = [0x1F600, 0x103FF, 0x10000, 0x10FFFF, 0xFFFF, 0xFFFD, 0xE000];
+        var failures = new List<string>();
+
+        foreach (int cp in interesting)
+        {
+            for (int offset = 25; offset <= 35; offset++)
+            {
+                string value = new string('a', offset) + char.ConvertFromUtf32(cp) + new string('b', 20);
+                var (min, max) = CollectStringBounds(value);
+
+                if (min is null || Utf8Compare(min, value) > 0)
+                    failures.Add($"min U+{cp:X} @{offset}: {(min is null ? "missing" : "exceeds value")}");
+                // A null max is legal: an unraisable bound is omitted rather than written wrong.
+                if (max is not null && Utf8Compare(max, value) < 0)
+                    failures.Add($"max U+{cp:X} @{offset}: below value");
+            }
+        }
+
+        Assert.Empty(failures);
+    }
+
+    [Fact]
+    public void Collect_LongStrings_BoundsEncloseEveryValueInTheFile()
+    {
+        string[] values =
+        [
+            new string('a', 40),
+            new string('a', 31) + char.ConvertFromUtf32(0x1F600) + new string('b', 20),
+            new string('a', 30) + char.ConvertFromUtf32(0x103FF) + new string('b', 20),
+            new string('m', 35),
+            "short",
+        ];
+
+        var (min, max) = CollectStringBounds(values);
+        Assert.NotNull(min);
+
+        foreach (string v in values)
+        {
+            Assert.True(Utf8Compare(min!, v) <= 0, $"min exceeds {v.Length}-char value");
+            if (max is not null)
+                Assert.True(Utf8Compare(max, v) >= 0, $"max below {v.Length}-char value");
+        }
+    }
 }

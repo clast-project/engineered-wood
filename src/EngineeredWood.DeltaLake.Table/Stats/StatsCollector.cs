@@ -203,7 +203,7 @@ internal static class StatsCollector
             }
             if (value is string str && str.Length > StringStatMaxLength)
             {
-                value = isMax ? (object?)TruncateMaxString(str) : str.Substring(0, StringStatMaxLength);
+                value = isMax ? (object?)TruncateMaxString(str) : TruncateMinString(str);
             }
             if (value is not null)
             {
@@ -237,6 +237,22 @@ internal static class StatsCollector
     private const int StringStatMaxLength = 32;
 
     /// <summary>
+    /// Truncates a min-side string stat to a lower bound of at most <see cref="StringStatMaxLength"/>
+    /// characters. A prefix always sorts at or below the full string, so the only requirement is that
+    /// the cut land on a code point boundary: splitting a surrogate pair orphans its high half, and
+    /// <see cref="Utf8JsonWriter"/> silently rewrites a lone surrogate to U+FFFD — which sorts ABOVE
+    /// the supplementary character it replaced, turning the bound into one GREATER than a value in the
+    /// file. Backing off by one char keeps a valid (merely looser) lower bound.
+    /// </summary>
+    private static string TruncateMinString(string value)
+    {
+        int length = StringStatMaxLength;
+        if (char.IsHighSurrogate(value[length - 1]))
+            length--;
+        return value.Substring(0, length);
+    }
+
+    /// <summary>
     /// Truncates a max-side string stat to an upper bound of at most <see cref="StringStatMaxLength"/>
     /// characters: the prefix with its last incrementable char bumped by one (skipping chars whose
     /// increment would create a lone surrogate). Returns null when no char can be incremented — the
@@ -248,6 +264,13 @@ internal static class StatsCollector
         {
             char c = value[i];
             if (c == char.MaxValue)
+                continue;
+            // Replacing a LOW surrogate orphans the high half that precedes it. The increment guard
+            // below does not catch this: U+DFFF + 1 is U+E000, which is outside the surrogate range,
+            // so the cut would look legal while leaving invalid UTF-16 behind. The JSON writer then
+            // rewrites the orphan to U+FFFD, which sorts BELOW the supplementary character it
+            // replaced — no longer an upper bound. Step back to the char before the pair instead.
+            if (char.IsLowSurrogate(c))
                 continue;
             char next = (char)(c + 1);
             if (next is >= '\ud800' and <= '\udfff')
