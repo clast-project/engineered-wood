@@ -319,8 +319,10 @@ public static class StatisticsEvaluator
         string mn = min.AsString;
         string mx = max.AsString;
 
-        // If max is strictly less than prefix and exact: AlwaysFalse.
-        if (maxExact && string.CompareOrdinal(mx, p) < 0)
+        // If max is strictly less than prefix and exact: AlwaysFalse. Ordered over code points
+        // to match the UTF-8 byte order the bounds were written in (see StringOrdering); the
+        // StartsWith checks below are prefix tests, which are order-independent.
+        if (maxExact && StringOrdering.Compare(mx, p) < 0)
             return FilterResult.AlwaysFalse;
 
         // If min sorts strictly after the prefix range: AlwaysFalse.

@@ -328,7 +328,9 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
                 Kind.Float => _inline.Float.CompareTo(other._inline.Float),
                 Kind.Double => _inline.Double.CompareTo(other._inline.Double),
                 Kind.Decimal => ((decimal)_ref!).CompareTo((decimal)other._ref!),
-                Kind.String => string.CompareOrdinal((string?)_ref, (string?)other._ref),
+                // Code point (== UTF-8 byte) order, NOT UTF-16 code-unit order — every format's
+                // string stats are ordered over UTF-8 bytes. See StringOrdering.
+                Kind.String => StringOrdering.Compare((string?)_ref, (string?)other._ref),
                 Kind.Binary => BinaryCompare((byte[]?)_ref, (byte[]?)other._ref),
                 Kind.Guid => ((Guid)_ref!).CompareTo((Guid)other._ref!),
                 Kind.DateTimeOffset => AsDateTimeOffset.CompareTo(other.AsDateTimeOffset),
