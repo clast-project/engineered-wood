@@ -50,7 +50,7 @@ public class RleBitPackedEncoderBatchingTests
 
         // Pure long run: must stay RLE regardless of batching.
         var longRun = new int[4096];
-        Array.Fill(longRun, 5);
+        for (int i = 0; i < longRun.Length; i++) longRun[i] = 5;
         data.Add("long-run", 3, longRun);
 
         // Runs straddling the RLE threshold (7, 8, 9 identical values).
