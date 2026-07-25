@@ -486,21 +486,29 @@ internal static class StatsCollector
         if (min.HasValue)
         {
             var tsType = (Apache.Arrow.Types.TimestampType)array.Data.DataType;
-            string minStr = FormatTimestamp(min.Value, tsType);
-            string maxStr = FormatTimestamp(max!.Value, tsType);
+            string minStr = FormatTimestamp(min.Value, tsType, isMax: false);
+            string maxStr = FormatTimestamp(max!.Value, tsType, isMax: true);
             MergeStringMinMax(name, minStr, maxStr, minValues, maxValues);
         }
     }
 
-    private static string FormatTimestamp(long value, Apache.Arrow.Types.TimestampType tsType)
+    private static string FormatTimestamp(
+        long value, Apache.Arrow.Types.TimestampType tsType, bool isMax)
     {
-        // Convert to microseconds
+        // Convert to microseconds. Second/millisecond sources scale up exactly, but a NANOSECOND
+        // source has precision the microsecond ISO-8601 form below cannot carry, so it must round
+        // OUTWARD — min down, max up — to stay a valid bound. Plain integer division truncates
+        // toward ZERO, which rounds the max down for positive timestamps and the min up for negative
+        // ones; either way the bound excludes a value actually present in the file, and the file is
+        // skipped for a predicate that matches it.
         long micros = tsType.Unit switch
         {
             Apache.Arrow.Types.TimeUnit.Second => value * 1_000_000,
             Apache.Arrow.Types.TimeUnit.Millisecond => value * 1_000,
             Apache.Arrow.Types.TimeUnit.Microsecond => value,
-            Apache.Arrow.Types.TimeUnit.Nanosecond => value / 1_000,
+            Apache.Arrow.Types.TimeUnit.Nanosecond => isMax
+                ? DivCeil(value, 1_000)
+                : DivFloor(value, 1_000),
             _ => value,
         };
 
@@ -511,6 +519,14 @@ internal static class StatsCollector
             ? dto.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'")
             : dto.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff");
     }
+
+    /// <summary>Integer division rounding toward negative infinity. <paramref name="divisor"/> must be positive.</summary>
+    private static long DivFloor(long value, long divisor) =>
+        value / divisor - (value % divisor < 0 ? 1 : 0);
+
+    /// <summary>Integer division rounding toward positive infinity. <paramref name="divisor"/> must be positive.</summary>
+    private static long DivCeil(long value, long divisor) =>
+        value / divisor + (value % divisor > 0 ? 1 : 0);
 
     private static void CollectDateMinMax(
         string name, Date32Array array,

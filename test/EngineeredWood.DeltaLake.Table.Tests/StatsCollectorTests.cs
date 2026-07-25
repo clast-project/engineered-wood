@@ -210,6 +210,109 @@ public class StatsCollectorTests
         Assert.Equal("2021-03-03", doc.RootElement.GetProperty("maxValues").GetProperty("d").GetString());
     }
 
+    // ── Timestamp bound rounding ──────────────────────────────────────────────────────────────────
+    //
+    // Delta stats carry timestamps as microsecond ISO-8601 strings, so a nanosecond column's
+    // sub-microsecond digits cannot be represented. Dropping them is only safe if the bounds round
+    // OUTWARD; truncating toward zero (plain integer division) moves the max down for positive
+    // timestamps and the min up for negative ones, excluding a value that is in the file.
+
+    // DateTimeOffset.UnixEpoch does not exist on net472.
+    private static readonly DateTimeOffset UnixEpoch =
+        new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    private static RecordBatch TimestampBatch(TimeUnit unit, string? timezone, params long[] values)
+    {
+        var type = new TimestampType(unit, timezone);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("ts", type, true)).Build();
+
+        var buffer = new ArrowBuffer.Builder<long>();
+        foreach (long v in values) buffer.Append(v);
+        var validity = new ArrowBuffer.BitmapBuilder();
+        for (int i = 0; i < values.Length; i++) validity.Append(true);
+
+        var data = new ArrayData(type, values.Length, 0, 0, [validity.Build(), buffer.Build()]);
+        return new RecordBatch(schema, [new TimestampArray(data)], values.Length);
+    }
+
+    private static (DateTimeOffset Min, DateTimeOffset Max) CollectTimestampBounds(
+        TimeUnit unit, params long[] values)
+    {
+        string? stats = StatsCollector.Collect(TimestampBatch(unit, "UTC", values));
+        Assert.NotNull(stats);
+
+        var root = JsonDocument.Parse(stats).RootElement;
+        return (
+            DateTimeOffset.Parse(root.GetProperty("minValues").GetProperty("ts").GetString()!,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal),
+            DateTimeOffset.Parse(root.GetProperty("maxValues").GetProperty("ts").GetString()!,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal));
+    }
+
+    private static DateTimeOffset FromNanos(long nanos) =>
+        UnixEpoch.AddTicks(nanos / 100);
+
+    [Fact]
+    public void Collect_NanosecondTimestamps_MaxRoundsUp()
+    {
+        // 1_000_000_123ns carries 123ns past the microsecond the ISO form can express. Truncating
+        // toward zero yields a max of exactly 1.000000s — BELOW the value in the file.
+        var (min, max) = CollectTimestampBounds(TimeUnit.Nanosecond, 1_000_000_123L, 500_000_001L);
+
+        Assert.True(min <= FromNanos(500_000_001L), "min must not exceed the smallest value");
+        Assert.True(max >= FromNanos(1_000_000_123L), "max must not fall below the largest value");
+    }
+
+    [Fact]
+    public void Collect_NegativeNanosecondTimestamps_MinRoundsDown()
+    {
+        // Pre-1970 values are negative, and integer division truncates TOWARD ZERO — so the error
+        // flips to the min side: -10500ns becomes -10us, ABOVE the value in the file.
+        var (min, max) = CollectTimestampBounds(TimeUnit.Nanosecond, -1_500L, -10_500L);
+
+        Assert.True(min <= FromNanos(-10_500L), "min must not exceed the smallest value");
+        Assert.True(max >= FromNanos(-1_500L), "max must not fall below the largest value");
+    }
+
+    [Theory]
+    [InlineData(TimeUnit.Second, 1L, 90L)]
+    [InlineData(TimeUnit.Millisecond, -5_000L, 1_234L)]
+    [InlineData(TimeUnit.Microsecond, -1_500L, 1_000_000_123L)]
+    public void Collect_ExactTimestampUnits_BoundsAreTight(TimeUnit unit, long lo, long hi)
+    {
+        // Second/millisecond/microsecond sources scale exactly, so rounding must not loosen them.
+        long perUnitTicks = unit switch
+        {
+            TimeUnit.Second => TimeSpan.TicksPerSecond,
+            TimeUnit.Millisecond => TimeSpan.TicksPerMillisecond,
+            _ => 10L,
+        };
+        var (min, max) = CollectTimestampBounds(unit, hi, lo);
+
+        Assert.Equal(UnixEpoch.AddTicks(lo * perUnitTicks), min);
+        Assert.Equal(UnixEpoch.AddTicks(hi * perUnitTicks), max);
+    }
+
+    [Fact]
+    public void Collect_NanosecondTimestamps_BoundsEncloseEveryValue()
+    {
+        long[] values =
+        [
+            -10_500L, -1_500L, -1_000L, 0L, 1L, 999L, 1_000L,
+            500_000_001L, 1_000_000_123L, 1_699_999_999_999_999_999L,
+        ];
+
+        var (min, max) = CollectTimestampBounds(TimeUnit.Nanosecond, values);
+
+        foreach (long v in values)
+        {
+            Assert.True(min <= FromNanos(v), $"min exceeds {v}ns");
+            Assert.True(max >= FromNanos(v), $"max below {v}ns");
+        }
+    }
+
     // ── String stat truncation ────────────────────────────────────────────────────────────────────
     //
     // Delta stats over 32 characters are truncated, and the protocol has no marker recording that.
