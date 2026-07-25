@@ -9,16 +9,17 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// Delta's timestamp and timestamp_ntz are microsecond precision. A nanosecond Arrow column has
-/// digits neither the Delta schema nor its ISO-8601 file statistics can carry, and nothing in the
-/// write path narrows the unit -- the value would reach Parquet as a nanosecond column under a
-/// schema advertising microseconds, with bounds that had to drop the remainder. Rejecting at write
-/// keeps that decision with the caller instead of silently altering their data.
+/// Two Arrow timestamp units have no faithful encoding here, and nothing in the write path narrows
+/// the unit. NANOSECOND exceeds the microsecond precision of Delta timestamps and of the ISO-8601
+/// file statistics, so its low digits would be dropped. SECOND has no Parquet unit at all, so the
+/// writer annotates the column MICROS and leaves the values untouched — they read back a million
+/// times too small. Rejecting at write keeps the choice with the caller rather than silently
+/// altering their data.
 /// </summary>
-public class NanosecondTimestampRejectionTests : IDisposable
+public class TimestampUnitRejectionTests : IDisposable
 {
     private readonly string _tempDir = Path.Combine(
-        Path.GetTempPath(), "ew-ns-reject-" + Guid.NewGuid().ToString("N"));
+        Path.GetTempPath(), "ew-ts-unit-reject-" + Guid.NewGuid().ToString("N"));
 
     public void Dispose()
     {
@@ -129,21 +130,53 @@ public class NanosecondTimestampRejectionTests : IDisposable
     }
 
     [Theory]
-    [InlineData(TimeUnit.Microsecond)]
-    [InlineData(TimeUnit.Millisecond)]
-    [InlineData(TimeUnit.Second)]
-    public async Task Write_NonNanosecondUnits_StillAccepted(TimeUnit unit)
+    [InlineData(TimeUnit.Microsecond, 1_700_000_000_000_000L)]
+    [InlineData(TimeUnit.Millisecond, 1_700_000_000_000L)]
+    public async Task Write_SupportedUnits_RoundTripValuesExactly(TimeUnit unit, long raw)
     {
-        // Only nanoseconds lose data. The other units scale up exactly and must keep working.
+        // Microsecond and millisecond both have a Parquet unit that carries them exactly, so their
+        // VALUES must survive — asserting only the row count would have missed the second-unit bug,
+        // where every value came back a million times too small.
         var fs = new LocalTableFileSystem(_tempDir);
         var schema = SchemaWith(unit);
         await using var table = await DeltaTable.CreateAsync(fs, schema);
 
-        await table.WriteAsync([BatchWith(schema, unit, "UTC", 1L, 2L, 3L)]);
+        await table.WriteAsync([BatchWith(schema, unit, "UTC", raw)]);
 
-        long rows = 0;
+        var expected = new DateTimeOffset(2023, 11, 14, 22, 13, 20, TimeSpan.Zero);
+        var read = new List<DateTimeOffset>();
         await foreach (var b in table.ReadAllAsync())
-            rows += b.Length;
-        Assert.Equal(3, rows);
+        {
+            var arr = (TimestampArray)b.Column(1);
+            for (int i = 0; i < arr.Length; i++)
+                read.Add(arr.GetTimestamp(i)!.Value);
+        }
+
+        Assert.Equal(expected, Assert.Single(read));
+    }
+
+    [Fact]
+    public async Task CreateAsync_SecondTimestamp_Rejected()
+    {
+        // Parquet has no second-precision timestamp unit: the writer annotates the column MICROS and
+        // leaves the values alone, so 1700000000s reads back as 1970-01-01T00:28:20Z.
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await DeltaTable.CreateAsync(fs, SchemaWith(TimeUnit.Second)));
+
+        Assert.Contains("second", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WriteAsync_SecondBatchIntoMicrosecondTable_Rejected()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, SchemaWith(TimeUnit.Microsecond));
+
+        var secondSchema = SchemaWith(TimeUnit.Second);
+        var batch = BatchWith(secondSchema, TimeUnit.Second, "UTC", 1_700_000_000L);
+
+        await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.WriteAsync([batch]));
     }
 }

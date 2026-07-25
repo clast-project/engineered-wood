@@ -368,6 +368,32 @@ table metadata but not acted on by the runtime: `delta.logRetentionDuration`,
 property; the .NET option `DeltaTableOptions.CheckpointInterval` does
 work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
 
+**Timestamp units are refused rather than converted.** `SchemaConverter`
+rejects two Arrow timestamp units at write, and the incoming batches are
+checked again in `ComputeWriteActionsAsync` / `WriteDataFilesAsync` because a
+write into an existing table converts no schema:
+
+- `Nanosecond` — Delta timestamps are microsecond precision, and the ISO-8601
+  stats strings stop at microseconds, so the low digits would be lost.
+- `Second` — Parquet's `TimestampType` has only MILLIS/MICROS/NANOS. There is
+  no second unit to map to, and `ArrowToSchemaConverter.MapTimeUnit` falls
+  through to MICROS, leaving the raw seconds under a microsecond annotation.
+  Measured before the rejection landed: `1700000000` (2023-11-14) round-tripped
+  as `1970-01-01T00:28:20Z`.
+
+TODO: convert instead of refusing. Both are losslessly representable in
+microseconds — seconds and milliseconds scale up exactly, and nanoseconds could
+take an explicit rounding option — so the write path could narrow the array to
+`TimeUnit.Microsecond` and accept all four units. That needs a value-converting
+pass over the batch (and its partition values) rather than a schema check, so it
+is deliberately deferred; refusing is the cheap, safe interim. `Millisecond`
+already round-trips exactly and is unaffected.
+
+Note the underlying `MapTimeUnit` fallback is a **Parquet-writer** bug, not a
+Delta one: writing a `Timestamp(Second)` column through `ParquetFileWriter`
+directly still mislabels it, with no error. Fixing that is a separate change
+with its own compatibility surface.
+
 **Stats collection gaps.**
 
 - `tightBounds` is never written.

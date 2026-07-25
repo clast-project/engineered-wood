@@ -592,13 +592,18 @@ internal static class PartitionUtils
         long micros = ts.GetValue(row)!.Value;
         var tsType = (TimestampType)ts.Data.DataType;
 
+        // Reached only from partition splitting of a batch being WRITTEN, and the write path already
+        // refuses the units with no faithful encoding (SchemaConverter.ThrowIfUnsupportedTimestampUnit).
+        // Throw rather than convert if one arrives anyway: a partition value is an exact identity, not a
+        // bound, so rounding it produces a value that will not round-trip — and the nanosecond arm used to
+        // do exactly that silently. Same rule as GetStringValue's unsupported-type arm above.
         long asMicros = tsType.Unit switch
         {
-            TimeUnit.Second => micros * 1_000_000,
             TimeUnit.Millisecond => micros * 1_000,
             TimeUnit.Microsecond => micros,
-            TimeUnit.Nanosecond => micros / 1_000,
-            _ => micros,
+            _ => throw new NotSupportedException(
+                $"Timestamp partition columns with {tsType.Unit} precision are not supported; "
+                + "cast the column to TimeUnit.Microsecond before writing."),
         };
 
         var dto = DateTimeOffset.FromUnixTimeMilliseconds(asMicros / 1_000)
