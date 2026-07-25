@@ -15,7 +15,17 @@ namespace EngineeredWood.Parquet.Data;
 /// <summary>
 /// Result of reading a single column chunk: the Arrow array and optionally the raw definition/repetition levels.
 /// </summary>
-internal readonly record struct ColumnResult(IArrowArray Array, int[]? DefinitionLevels, int[]? RepetitionLevels);
+/// <param name="FixedListLength">
+/// When greater than zero, the column chunk was proven by <see cref="FixedListDetector"/> to hold
+/// fully-defined lists of exactly this many elements, and <paramref name="DefinitionLevels"/> /
+/// <paramref name="RepetitionLevels"/> were never materialised. The assembler derives offsets
+/// arithmetically instead of scanning levels.
+/// </param>
+internal readonly record struct ColumnResult(
+    IArrowArray Array,
+    int[]? DefinitionLevels,
+    int[]? RepetitionLevels,
+    int FixedListLength = 0);
 
 /// <summary>
 /// Reads a single column chunk's pages and produces an Arrow array.
@@ -40,8 +50,17 @@ internal static class ColumnChunkReader
         int rowCount,
         Field arrowField,
         bool preserveDefLevels = false,
-        bool validateCrc = false)
+        bool validateCrc = false,
+        bool fixedListFastPath = false)
     {
+        if (fixedListFastPath && IsFixedListCandidate(column))
+        {
+            var fast = TryReadFixedListColumn(
+                data, column, columnMeta, rowCount, arrowField, validateCrc);
+            if (fast is not null)
+                return fast.Value;
+        }
+
         bool isRepeated = column.MaxRepetitionLevel > 0;
         int capacity = isRepeated ? checked((int)columnMeta.NumValues) : rowCount;
         var byteArrayOutput = arrowField.DataType switch
@@ -152,6 +171,252 @@ internal static class ColumnChunkReader
         }
 
         return new ColumnResult(array, defLevels, repLevels);
+    }
+
+    /// <summary>
+    /// Whether a column is even eligible for the fixed-length list fast path: exactly one level of
+    /// repetition (a single list), which is the shape embeddings and coordinate vectors take.
+    /// </summary>
+    private static bool IsFixedListCandidate(ColumnDescriptor column) =>
+        column.MaxRepetitionLevel == 1 && column.MaxDefinitionLevel is > 0 and <= 255;
+
+    /// <summary>
+    /// Reads a column chunk on the assumption that it holds fully-defined fixed-length lists,
+    /// verifying that assumption page by page against the encoded level streams.
+    /// </summary>
+    /// <returns>
+    /// The decoded column with <see cref="ColumnResult.FixedListLength"/> set, or
+    /// <see langword="null"/> if any page disproves the assumption — in which case the caller
+    /// re-reads the chunk down the general path.
+    /// </returns>
+    /// <remarks>
+    /// Detection runs before any values are decoded for a page, so the common rejection (a column
+    /// whose very first page has ragged lists or nulls) costs only the probe. A column that turns
+    /// ragged part-way through pays for the pages already decoded, which is why detection is keyed
+    /// on the whole chunk agreeing rather than switching mid-stream.
+    /// </remarks>
+    private static ColumnResult? TryReadFixedListColumn(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        int rowCount,
+        Field arrowField,
+        bool validateCrc)
+    {
+        int numValues = checked((int)columnMeta.NumValues);
+        var byteArrayOutput = arrowField.DataType switch
+        {
+            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
+            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
+            _ => ByteArrayOutputKind.Default,
+        };
+
+        // maxDefLevel/maxRepLevel are declared as 0: no level arrays are rented or filled, and the
+        // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
+        using var state = new ColumnBuildState(
+            column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput);
+
+        DictionaryDecoder? dictionary = null;
+        int listLength = 0;
+        int pos = 0;
+        long valuesRead = 0;
+
+        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        {
+            PageHeader pageHeader;
+            int headerSize;
+            try
+            {
+                pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out headerSize);
+            }
+            catch (ParquetFormatException)
+            {
+                return null; // let the general path produce the diagnostic
+            }
+
+            pos += headerSize;
+            var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
+            pos += pageHeader.CompressedPageSize;
+
+            if (validateCrc && pageHeader.Crc.HasValue)
+            {
+                uint expected = unchecked((uint)pageHeader.Crc.Value);
+                if (ComputeCrc32C(pageData) != expected)
+                    return null;
+            }
+
+            switch (pageHeader.Type)
+            {
+                case PageType.DictionaryPage:
+                    dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    break;
+
+                case PageType.DataPage:
+                    if (!TryReadFixedListPageV1(
+                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            ref listLength, valuesRead))
+                        return null;
+                    valuesRead += pageHeader.DataPageHeader!.NumValues;
+                    break;
+
+                case PageType.DataPageV2:
+                    if (!TryReadFixedListPageV2(
+                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            ref listLength, valuesRead))
+                        return null;
+                    valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
+                    break;
+
+                default:
+                    break;
+            }
+        }
+
+        if (valuesRead != columnMeta.NumValues || listLength <= 0)
+            return null;
+
+        // The list count must line up with the row count exactly; anything else means the levels
+        // were telling a story the arithmetic offsets would not reproduce.
+        if ((long)rowCount * listLength != columnMeta.NumValues)
+            return null;
+
+        var array = ArrowArrayBuilder.BuildDense(state, arrowField, numValues);
+        return new ColumnResult(array, DefinitionLevels: null, RepetitionLevels: null, listLength);
+    }
+
+    private static bool TryReadFixedListPageV1(
+        PageHeader header,
+        ReadOnlySpan<byte> compressedData,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        DictionaryDecoder? dictionary,
+        ColumnBuildState state,
+        ref int listLength,
+        long startIndex)
+    {
+        var dataHeader = header.DataPageHeader;
+        if (dataHeader is null)
+            return false;
+
+        // The deprecated BIT_PACKED level encoding has no run structure to walk.
+        if (dataHeader.RepetitionLevelEncoding != Encoding.Rle ||
+            dataHeader.DefinitionLevelEncoding != Encoding.Rle)
+            return false;
+
+        int numValues = dataHeader.NumValues;
+
+        ReadOnlySpan<byte> pageData;
+        byte[]? decompressedBuffer = null;
+        if (columnMeta.Codec == CompressionCodec.Uncompressed)
+        {
+            pageData = compressedData;
+        }
+        else
+        {
+            int size = header.UncompressedPageSize;
+            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
+            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+            pageData = decompressedBuffer.AsSpan(0, size);
+        }
+
+        try
+        {
+            if (!TrySliceV1Levels(pageData, out var repEncoded, out int afterRep))
+                return false;
+            if (!TrySliceV1Levels(pageData.Slice(afterRep), out var defEncoded, out int afterDef))
+                return false;
+
+            if (!FixedListDetector.TryDetectPage(
+                    repEncoded, defEncoded, column.MaxDefinitionLevel, numValues,
+                    ref listLength, startIndex))
+                return false;
+
+            var valueData = pageData.Slice(afterRep + afterDef);
+            DecodeValues(valueData, dataHeader.Encoding, column, dictionary, numValues, state);
+            return true;
+        }
+        finally
+        {
+            if (decompressedBuffer != null)
+                ArrayPool<byte>.Shared.Return(decompressedBuffer);
+        }
+    }
+
+    private static bool TryReadFixedListPageV2(
+        PageHeader header,
+        ReadOnlySpan<byte> rawData,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        DictionaryDecoder? dictionary,
+        ColumnBuildState state,
+        ref int listLength,
+        long startIndex)
+    {
+        var v2Header = header.DataPageHeaderV2;
+        if (v2Header is null || v2Header.NumNulls > 0)
+            return false;
+
+        int numValues = v2Header.NumValues;
+        int repLen = v2Header.RepetitionLevelsByteLength;
+        int defLen = v2Header.DefinitionLevelsByteLength;
+        if (repLen <= 0 || defLen <= 0 || repLen + defLen > rawData.Length)
+            return false;
+
+        if (!FixedListDetector.TryDetectPage(
+                rawData.Slice(0, repLen), rawData.Slice(repLen, defLen),
+                column.MaxDefinitionLevel, numValues, ref listLength, startIndex))
+            return false;
+
+        var valuesCompressed = rawData.Slice(repLen + defLen);
+        if (valuesCompressed.IsEmpty)
+            return false;
+
+        ReadOnlySpan<byte> valueData;
+        byte[]? decompressedBuffer = null;
+        if (!v2Header.IsCompressed || columnMeta.Codec == CompressionCodec.Uncompressed)
+        {
+            valueData = valuesCompressed;
+        }
+        else
+        {
+            int uncompressedValuesSize = header.UncompressedPageSize - repLen - defLen;
+            decompressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedValuesSize);
+            Decompressor.Decompress(columnMeta.Codec, valuesCompressed, decompressedBuffer);
+            valueData = decompressedBuffer.AsSpan(0, uncompressedValuesSize);
+        }
+
+        try
+        {
+            DecodeValues(valueData, v2Header.Encoding, column, dictionary, numValues, state);
+            return true;
+        }
+        finally
+        {
+            if (decompressedBuffer != null)
+                ArrayPool<byte>.Shared.Return(decompressedBuffer);
+        }
+    }
+
+    /// <summary>
+    /// Slices one 4-byte-length-prefixed V1 level section, returning the encoded bytes and the
+    /// total consumed length (prefix included).
+    /// </summary>
+    private static bool TrySliceV1Levels(
+        ReadOnlySpan<byte> pageData, out ReadOnlySpan<byte> levels, out int consumed)
+    {
+        levels = default;
+        consumed = 0;
+
+        if (pageData.Length < 4)
+            return false;
+
+        int encodedLength = BinaryPrimitives.ReadInt32LittleEndian(pageData);
+        if (encodedLength < 0 || 4 + encodedLength > pageData.Length)
+            return false;
+
+        levels = pageData.Slice(4, encodedLength);
+        consumed = 4 + encodedLength;
+        return true;
     }
 
     /// <summary>

@@ -25,6 +25,11 @@ internal static class NestedAssembler
     /// <param name="leafDefLevels">Raw definition levels per leaf (null for required leaves).</param>
     /// <param name="leafRepLevels">Raw repetition levels per leaf (null for non-repeated leaves).</param>
     /// <param name="rowCount">Number of rows in the row group.</param>
+    /// <param name="leafFixedListLengths">
+    /// Optional per-leaf fixed list lengths from <see cref="FixedListDetector"/>. A non-zero entry
+    /// means that leaf's levels were proven to describe fully-defined lists of that exact length
+    /// and were therefore never materialised; the list offsets are derived arithmetically.
+    /// </param>
     /// <param name="extensionRegistry">
     /// Optional Arrow extension registry. When supplied and the registry knows
     /// <c>arrow.parquet.variant</c>, top-level groups annotated with the
@@ -39,6 +44,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int rowCount,
         ExtensionTypeRegistry? extensionRegistry = null)
     {
@@ -48,7 +54,7 @@ internal static class NestedAssembler
         for (int i = 0; i < root.Children.Count; i++)
         {
             var child = root.Children[i];
-            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, rowCount, ref leafIndex);
+            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,rowCount, ref leafIndex);
             result[i] = WrapTopLevelExtension(array, child, extensionRegistry);
         }
 
@@ -78,6 +84,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int parentCount,
         ref int leafIndex)
     {
@@ -85,17 +92,17 @@ internal static class NestedAssembler
         {
             // Bare repeated primitive: leaf with Repeated → wrap in list
             if (node.Element.RepetitionType == FieldRepetitionType.Repeated)
-                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, parentCount, ref leafIndex);
+                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
 
             return leafArrays[leafIndex++];
         }
 
         if (ArrowSchemaConverter.IsListNode(node))
-            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, parentCount, ref leafIndex);
+            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
         if (ArrowSchemaConverter.IsMapNode(node))
-            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, parentCount, ref leafIndex);
+            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
 
-        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, parentCount, ref leafIndex);
+        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
     }
 
     private static IArrowArray AssembleStruct(
@@ -103,6 +110,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int parentCount,
         ref int leafIndex)
     {
@@ -110,7 +118,7 @@ internal static class NestedAssembler
 
         var childArrays = new IArrowArray[node.Children.Count];
         for (int i = 0; i < node.Children.Count; i++)
-            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, parentCount, ref leafIndex);
+            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
 
         int lastLeafIndex = leafIndex;
 
@@ -155,6 +163,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int parentCount,
         ref int leafIndex)
     {
@@ -171,8 +180,12 @@ internal static class NestedAssembler
         int parentDefLevel = node.Parent != null ? ComputeAccumulatedDefLevel(node.Parent) : 0;
         int repThreshold = ComputeAccumulatedRepLevel(node);
 
-        var (offsets, bitmap, nullCount, _) = BuildOffsetsAndBitmap(
-            repLevels, defLevels, parentDefLevel, nodeDefLevel, parentCount, numValues, repThreshold);
+        int fixedLength = FixedLengthFor(leafFixedLengths, li, repLevels, repThreshold);
+
+        var (offsets, bitmap, nullCount, _) = fixedLength > 0
+            ? (BuildFixedOffsets(parentCount, fixedLength), (byte[]?)null, 0, parentCount * fixedLength)
+            : BuildOffsetsAndBitmap(
+                repLevels, defLevels, parentDefLevel, nodeDefLevel, parentCount, numValues, repThreshold);
 
         // Filter out phantom entries from the element array
         elementArray = FilterElementArray(elementArray, defLevels, nodeDefLevel);
@@ -192,6 +205,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int parentCount,
         ref int leafIndex)
     {
@@ -211,9 +225,14 @@ internal static class NestedAssembler
 
         int numValues = repLevels?.Length ?? 0;
 
-        // Build offsets FIRST to determine elementCount for inner assembly
-        var (offsets, bitmap, nullCount, elementCount) = BuildOffsetsAndBitmap(
-            repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
+        int fixedLength = FixedLengthFor(leafFixedLengths, firstLeafIndex, repLevels, repThreshold);
+
+        // Build offsets FIRST to determine elementCount for inner assembly.
+        // A detected fixed length makes that arithmetic: offsets[i] = i * n, no nulls, no scan.
+        var (offsets, bitmap, nullCount, elementCount) = fixedLength > 0
+            ? (BuildFixedOffsets(parentCount, fixedLength), (byte[]?)null, 0, parentCount * fixedLength)
+            : BuildOffsetsAndBitmap(
+                repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty list markers) before inner recursive assembly
         var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
@@ -238,13 +257,13 @@ internal static class NestedAssembler
         else if (ArrowSchemaConverter.IsListNode(repeatedChild))
         {
             // Nested list: repeated child is itself a LIST → recurse with elementCount
-            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
             elementField = NodeToField(repeatedChild);
         }
         else if (ArrowSchemaConverter.IsMapNode(repeatedChild))
         {
             // Nested map: repeated child is itself a MAP → recurse with elementCount
-            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
             elementField = NodeToField(repeatedChild);
         }
         else if (repeatedChild.Children.Count == 1)
@@ -255,16 +274,16 @@ internal static class NestedAssembler
             if (ArrowSchemaConverter.IsListNode(elementNode))
             {
                 // Element is itself a LIST → recurse with elementCount
-                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
             }
             else if (ArrowSchemaConverter.IsMapNode(elementNode))
             {
                 // Element is itself a MAP → recurse with elementCount
-                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
             }
             else
             {
-                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
             }
             elementField = NodeToField(elementNode);
         }
@@ -273,7 +292,7 @@ internal static class NestedAssembler
             // 3-level with multiple children → struct element
             var structChildArrays = new IArrowArray[repeatedChild.Children.Count];
             for (int i = 0; i < repeatedChild.Children.Count; i++)
-                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
 
             var structChildFields = BuildChildFields(repeatedChild);
             var structType = new StructType(structChildFields);
@@ -296,6 +315,7 @@ internal static class NestedAssembler
         IArrowArray[] leafArrays,
         int[]?[] leafDefLevels,
         int[]?[] leafRepLevels,
+        int[]? leafFixedLengths,
         int parentCount,
         ref int leafIndex)
     {
@@ -325,13 +345,13 @@ internal static class NestedAssembler
 
         // Assemble key and value arrays with elementCount as parentCount
         var keyNode = keyValueGroup.Children[0];
-        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
 
         IArrowArray? valueArray = null;
         if (keyValueGroup.Children.Count > 1)
         {
             var valueNode = keyValueGroup.Children[1];
-            valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, elementCount, ref leafIndex);
+            valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
         }
 
         // Filter out phantom entries from key and value arrays
@@ -444,6 +464,36 @@ internal static class NestedAssembler
             offsets[i] = elementOffset;
 
         return (offsets, bitmap, nullCount, elementOffset);
+    }
+
+    /// <summary>
+    /// Returns the detected fixed list length for a leaf, or 0 if the fast path does not apply here.
+    /// </summary>
+    /// <remarks>
+    /// The detector only fires for <c>maxRepetitionLevel == 1</c>, so it can only describe the list
+    /// level whose accumulated repetition level is 1; and it only fires when the reader skipped
+    /// materialising levels, so a leaf that still carries repetition levels is not on the fast path.
+    /// </remarks>
+    private static int FixedLengthFor(int[]? leafFixedLengths, int leafIndex, int[]? repLevels, int repThreshold)
+    {
+        if (leafFixedLengths is null || repLevels is not null || repThreshold != 1)
+            return 0;
+        if ((uint)leafIndex >= (uint)leafFixedLengths.Length)
+            return 0;
+        return leafFixedLengths[leafIndex];
+    }
+
+    /// <summary>
+    /// Builds list offsets for <paramref name="parentCount"/> lists of exactly
+    /// <paramref name="fixedLength"/> elements each.
+    /// </summary>
+    private static int[] BuildFixedOffsets(int parentCount, int fixedLength)
+    {
+        var offsets = new int[parentCount + 1];
+        int offset = 0;
+        for (int i = 0; i <= parentCount; i++, offset += fixedLength)
+            offsets[i] = offset;
+        return offsets;
     }
 
     /// <summary>

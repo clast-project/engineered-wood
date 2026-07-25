@@ -128,6 +128,24 @@ public sealed record ParquetReadOptions
     public bool PageChecksumValidation { get; init; }
 
     /// <summary>
+    /// When <see langword="true"/>, the reader probes the encoded definition and repetition level
+    /// streams of single-level list columns for the fixed-length, fully-defined shape that vector
+    /// data (embeddings, coordinates, fixed feature rows) takes. On a match, the levels are never
+    /// decoded or materialised and the list offsets are computed arithmetically.
+    /// Default: <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The probe is cheap — it walks RLE/bit-packed runs, not values — but a column that is only
+    /// ragged part-way through a chunk is read twice, so this stays opt-in.
+    /// Results are identical either way; only the decode cost changes.</para>
+    /// <para>Prototype. The option is read-only and output-equivalent — it never changes the bytes on
+    /// disk or the Arrow data produced — so it is safe to enable, but its shape may still change: it
+    /// currently applies file-wide (no per-column control) and only on the whole-row-group read
+    /// entry points, not the batched <see cref="BatchSize"/> / <see cref="MaxBatchByteSize"/> path.</para>
+    /// </remarks>
+    public bool FixedListFastPath { get; init; }
+
+    /// <summary>
     /// Optional registry of Arrow extension types. When supplied, columns whose
     /// Parquet logical type matches a registered extension are materialised as
     /// the corresponding <see cref="Apache.Arrow.ExtensionArray"/> rather than

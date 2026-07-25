@@ -148,7 +148,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     buffers[i].Memory.Span, ctx.Columns[i],
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
-                    _options.PageChecksumValidation);
+                    _options.PageChecksumValidation,
+                    _options.FixedListFastPath);
             });
 
             return AssembleRecordBatch(ctx, results);
@@ -283,7 +284,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         buffers[i].Memory.Span, ctx.Columns[i],
                         ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                         ctx.HasNestedColumns,
-                    _options.PageChecksumValidation);
+                        _options.PageChecksumValidation,
+                        _options.FixedListFastPath);
                 });
                 yield return AssembleRecordBatch(ctx, results);
             }
@@ -368,7 +370,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         startPage, endPage,
                         ctx.LeafArrowFields[i],
                         ctx.HasNestedColumns,
-                    _options.PageChecksumValidation);
+                        _options.PageChecksumValidation);
 
                     int skipRows = batchStartRow - pageStartRow;
                     if (skipRows > 0 || fullResult.Array.Length > actualBatchRows)
@@ -495,7 +497,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             results[i] = ColumnChunkReader.ReadColumn(
                 buffer.Memory.Span, ctx.Columns[i],
                 ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
-                ctx.HasNestedColumns);
+                ctx.HasNestedColumns,
+                validateCrc: _options.PageChecksumValidation,
+                fixedListFastPath: _options.FixedListFastPath);
         }
 
         return AssembleRecordBatch(ctx, results);
@@ -525,7 +529,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     buffers[i].Memory.Span, ctx.Columns[i],
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
-                    _options.PageChecksumValidation);
+                    _options.PageChecksumValidation,
+                    _options.FixedListFastPath);
             });
 
             return AssembleRecordBatch(ctx, results);
@@ -568,7 +573,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     buffer.Memory.Span, ctx.Columns[i],
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
-                    _options.PageChecksumValidation);
+                    _options.PageChecksumValidation,
+                    _options.FixedListFastPath);
             }).ConfigureAwait(false);
 #else
         for (int i = 0; i < ctx.Count; i++)
@@ -580,7 +586,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             results[i] = ColumnChunkReader.ReadColumn(
                 buffer.Memory.Span, ctx.Columns[i],
                 ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
-                ctx.HasNestedColumns);
+                ctx.HasNestedColumns,
+                validateCrc: _options.PageChecksumValidation,
+                fixedListFastPath: _options.FixedListFastPath);
         }
 #endif
 
@@ -690,15 +698,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var leafArrays = new IArrowArray[results.Length];
         var leafDefLevels = new int[]?[results.Length];
         var leafRepLevels = new int[]?[results.Length];
+        int[]? leafFixedLengths = null;
         for (int i = 0; i < results.Length; i++)
         {
             leafArrays[i] = results[i].Array;
             leafDefLevels[i] = results[i].DefinitionLevels;
             leafRepLevels[i] = results[i].RepetitionLevels;
+            if (results[i].FixedListLength > 0)
+                (leafFixedLengths ??= new int[results.Length])[i] = results[i].FixedListLength;
         }
 
         var topLevelArrays = NestedAssembler.Assemble(
-            ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, ctx.RowCount,
+            ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths, ctx.RowCount,
             _options.ExtensionRegistry);
 
         // NestedAssembler wraps only top-level variant columns; wrap variants nested inside a

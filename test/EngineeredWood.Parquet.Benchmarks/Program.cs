@@ -20,4 +20,7 @@ BenchmarkSwitcher.FromTypes([
     typeof(ByteStreamSplitBenchmarks),
     typeof(EncodingReadBenchmarks),
     typeof(PrimitivesBenchmarks),
+    typeof(FixedListReadBenchmarks),
+    typeof(FixedListFallbackBenchmarks),
+    typeof(FixedListDetectorBenchmarks),
 ]).Run(args);
