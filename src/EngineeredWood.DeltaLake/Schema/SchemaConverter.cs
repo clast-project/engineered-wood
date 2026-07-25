@@ -136,6 +136,48 @@ public static class SchemaConverter
         return result;
     }
 
+    internal const string NanosecondTimestampMessage =
+        "Delta timestamps are microsecond precision, so a nanosecond Arrow timestamp cannot be written "
+        + "without discarding its sub-microsecond digits. Cast the column to TimeUnit.Microsecond before "
+        + "writing, choosing for yourself how it should round.";
+
+    /// <summary>
+    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, is a nanosecond Arrow
+    /// timestamp. <see cref="FromArrowSchema"/> already rejects those when a schema is converted, which
+    /// covers table creation and schema evolution — but a write into an EXISTING table converts nothing,
+    /// so the same rule has to be enforced against the incoming batches directly. Without this a
+    /// nanosecond column reaches Parquet under a schema advertising microseconds.
+    /// </summary>
+    internal static void ThrowIfNanosecondTimestamp(Apache.Arrow.Schema schema)
+    {
+        foreach (var field in schema.FieldsList)
+            ThrowIfNanosecondTimestamp(field.DataType, field.Name);
+    }
+
+    private static void ThrowIfNanosecondTimestamp(IArrowType type, string path)
+    {
+        switch (type)
+        {
+            case TimestampType { Unit: Apache.Arrow.Types.TimeUnit.Nanosecond }:
+                throw new DeltaLake.DeltaFormatException(
+                    $"Column '{path}': {NanosecondTimestampMessage}");
+
+            case ArrowStructType s:
+                foreach (var f in s.Fields)
+                    ThrowIfNanosecondTimestamp(f.DataType, path + "." + f.Name);
+                break;
+
+            case ListType l:
+                ThrowIfNanosecondTimestamp(l.ValueDataType, path + ".element");
+                break;
+
+            case ArrowMapType m:
+                ThrowIfNanosecondTimestamp(m.KeyField.DataType, path + ".key");
+                ThrowIfNanosecondTimestamp(m.ValueField.DataType, path + ".value");
+                break;
+        }
+    }
+
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {
         // MUST precede the struct arm: VariantType is an ExtensionType (not a StructType), so it
@@ -163,6 +205,15 @@ public static class SchemaConverter
         BinaryType or LargeBinaryType or BinaryViewType or FixedSizeBinaryType =>
             new PrimitiveType { TypeName = "binary" },
         Date32Type or Date64Type => new PrimitiveType { TypeName = "date" },
+
+        // MUST precede the timestamp arms below. Delta's timestamp and timestamp_ntz are MICROSECOND
+        // precision, and nothing downstream narrows the Arrow unit: the value would reach Parquet as a
+        // nanosecond column while the Delta schema advertised microseconds, and its file statistics --
+        // ISO-8601 strings that stop at microseconds -- would have to drop the sub-microsecond digits.
+        // Converting here instead would silently alter the caller's data, so require an explicit cast.
+        TimestampType ts when ts.Unit == Apache.Arrow.Types.TimeUnit.Nanosecond =>
+            throw new DeltaLake.DeltaFormatException(NanosecondTimestampMessage),
+
         TimestampType ts when ts.Timezone is not null =>
             new PrimitiveType { TypeName = "timestamp" },
         TimestampType => new PrimitiveType { TypeName = "timestamp_ntz" },
