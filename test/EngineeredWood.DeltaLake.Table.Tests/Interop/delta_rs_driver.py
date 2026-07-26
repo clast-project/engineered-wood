@@ -199,6 +199,45 @@ def cmd_write(args):
     return {"written": tbl.num_rows, "columns": names}
 
 
+def cmd_read_epoch_micros(args):
+    """Read a table and report column `col` as exact microseconds since the Unix epoch.
+
+    Used for timestamp PARTITION columns, whose value delta-rs reconstructs by parsing the string in
+    `add.partitionValues` -- so this is the oracle for how EW formatted that string.
+
+    Integers rather than rendered datetimes: a formatted comparison can agree while the underlying
+    instant is wrong (a truncating format hides exactly the sub-second digits at issue here), and
+    Python's datetime is microsecond-resolution, which is precisely Delta's timestamp precision.
+    """
+    import datetime
+    from deltalake import DeltaTable
+
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+    def micros(v):
+        if v is None:
+            return None
+        # A timestamp_ntz comes back naive; it is already UTC-normalized, so label it rather than convert.
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=datetime.timezone.utc)
+        d = v - epoch
+        return d.days * 86_400_000_000 + d.seconds * 1_000_000 + d.microseconds
+
+    dt = DeltaTable(args["path"])
+    tbl = dt.to_pyarrow_table()
+    col = tbl.column(args["col"]).to_pylist()
+    ids = tbl.column(args.get("id_col", "id")).to_pylist()
+    rows = [{"id": i, "micros": micros(v)} for i, v in zip(ids, col)]
+    rows.sort(key=lambda r: (r["id"] is None, r["id"]))
+    return {
+        "version": dt.version(),
+        "row_count": tbl.num_rows,
+        "type": str(tbl.schema.field(args["col"]).type),
+        "partition_columns": list(dt.metadata().partition_columns),
+        "rows": rows,
+    }
+
+
 def cmd_read_variant(args):
     """Read a table EW wrote whose column `col` is a VARIANT, reporting the raw variant bytes.
 
@@ -231,6 +270,7 @@ def cmd_read_variant(args):
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
+    "read_epoch_micros": cmd_read_epoch_micros,
     "read_variant": cmd_read_variant,
     "describe": cmd_describe,
     "checkpoint_only_read": cmd_checkpoint_only_read,

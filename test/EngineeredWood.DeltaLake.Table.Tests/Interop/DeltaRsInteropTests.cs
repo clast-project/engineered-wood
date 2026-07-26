@@ -462,6 +462,154 @@ public class DeltaRsInteropTests : IDisposable
         return new RecordBatch(IdRegionSchema, [newIds.Build(), batch.Column("region")], batch.Length);
     };
 
+    // ── Timestamp fidelity on the partitioned write path — ArrowCompute consolidation (`04eaac4`). ──
+
+    /// <summary>
+    /// <para>Writing to a PARTITIONED table splits the batch by partition value, which gathers rows out of
+    /// every non-partition column. That gather used to round each <c>TimestampArray</c> value through
+    /// <c>DateTimeOffset.FromUnixTimeMilliseconds(stored / 1000)</c> — hardcoding an interpretation of the
+    /// column's unit — so a partitioned write of any table with a timestamp <b>data</b> column silently
+    /// corrupted it. Measured against the old arm: microsecond <c>1700000000000123</c> became
+    /// <c>1700000000000000</c> (sub-millisecond digits dropped) and millisecond <c>1700000000123</c> became
+    /// <c>1700000000</c> (a thousand times too small).</para>
+    ///
+    /// <para>Only an external reader can settle this. EW's own reader agrees with EW's own writer either way,
+    /// so the round-trip tests that existed passed throughout; the values were wrong <i>on disk</i>. delta-rs
+    /// decodes the parquet independently, and the driver reports exact microseconds since the epoch rather
+    /// than a formatted datetime — a rendered comparison can agree while the instant is wrong, since the
+    /// truncating format hides precisely the digits at issue.</para>
+    ///
+    /// <para>The rows are laid out so <c>us</c> gathers non-contiguous rows 0 and 2 while <c>eu</c> gathers
+    /// row 1 plus a NULL at row 3: a gather that mixed up row order or lost the validity bitmap fails here
+    /// too, not just one that mis-scales the unit.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(TimeUnit.Microsecond)]
+    [InlineData(TimeUnit.Millisecond)]
+    public async Task EwWritten_PartitionedTableWithTimestampDataColumn_DeltaRsReadsExactMicroseconds(
+        TimeUnit unit)
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        // Deliberately not whole multiples of the next coarser unit — 123 microseconds is exactly what a
+        // millisecond-resolution round-trip destroys.
+        long[] raw = unit == TimeUnit.Microsecond
+            ? [1_700_000_000_000_123L, 1_700_000_000_000_456L, 1_700_000_000_000_789L, 0L]
+            : [1_700_000_000_123L, 1_700_000_000_456L, 1_700_000_000_789L, 0L];
+        long scale = unit == TimeUnit.Microsecond ? 1 : 1_000;
+
+        var tsType = new TimestampType(unit, "UTC");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringType.Default, false))
+            .Field(new Field("ts", tsType, true))
+            .Build();
+
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < raw.Length; i++) ids.Append(i);
+
+        var regions = new StringArray.Builder();
+        foreach (string r in new[] { "us", "eu", "us", "eu" }) regions.Append(r);
+
+        var values = new ArrowBuffer.Builder<long>(raw.Length);
+        foreach (long v in raw) values.Append(v);
+        // Row 3 is NULL, so the gather has to carry validity across the split as well as the values.
+        var validity = new ArrowBuffer.BitmapBuilder(raw.Length);
+        validity.Append(true).Append(true).Append(true).Append(false);
+        var ts = new TimestampArray(new ArrayData(
+            tsType, raw.Length, nullCount: 1, offset: 0, [validity.Build(), values.Build()]));
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema, partitionColumns: ["region"]);
+        await table.WriteAsync(
+            [new RecordBatch(schema, [ids.Build(), regions.Build(), ts], raw.Length)]);
+
+        var result = DeltaRs.Invoke("read_epoch_micros", new { path = _tempDir, col = "ts" });
+
+        Assert.Equal(["region"], result.GetProperty("partition_columns")
+            .EnumerateArray().Select(p => p.GetString()!).ToArray());
+
+        var byId = new Dictionary<long, long?>();
+        foreach (var row in result.GetProperty("rows").EnumerateArray())
+        {
+            var micros = row.GetProperty("micros");
+            byId[row.GetProperty("id").GetInt64()] =
+                micros.ValueKind == JsonValueKind.Null ? null : micros.GetInt64();
+        }
+
+        Assert.Equal(raw[0] * scale, byId[0]);
+        Assert.Equal(raw[1] * scale, byId[1]);
+        Assert.Equal(raw[2] * scale, byId[2]);
+        Assert.Null(byId[3]);
+    }
+
+    /// <summary>
+    /// The other side of the same coin: a timestamp column used as the PARTITION column itself, whose value
+    /// is not stored in the parquet at all but formatted into a string in <c>add.partitionValues</c> (and the
+    /// directory name) and parsed back by the reader. Nothing covered this path before — so both halves of
+    /// the encoding are pinned here: the exact spec string EW emits, and the instant delta-rs recovers from it.
+    ///
+    /// <para>Spark's convention, which delta-rs follows, is <c>yyyy-MM-dd HH:mm:ss[.ffffff]</c> with the
+    /// fraction omitted when zero — both forms appear below, and the millisecond case must be widened to six
+    /// fractional digits rather than emitted as its stored value.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(TimeUnit.Microsecond, "UTC")]
+    [InlineData(TimeUnit.Millisecond, "UTC")]
+    [InlineData(TimeUnit.Microsecond, null)] // timestamp_ntz
+    public async Task EwWritten_TimestampPartitionColumn_DeltaRsRecoversExactInstant(
+        TimeUnit unit, string? timezone)
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        // One value with a sub-second fraction, one landing exactly on the second.
+        long[] raw = unit == TimeUnit.Microsecond
+            ? [1_700_000_000_000_123L, 1_700_000_000_000_000L]
+            : [1_700_000_000_123L, 1_700_000_000_000L];
+        long scale = unit == TimeUnit.Microsecond ? 1 : 1_000;
+
+        var tsType = new TimestampType(unit, timezone);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("ts", tsType, true))
+            .Build();
+
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < raw.Length; i++) ids.Append(i);
+        var values = new ArrowBuffer.Builder<long>(raw.Length);
+        foreach (long v in raw) values.Append(v);
+        var ts = new TimestampArray(new ArrayData(
+            tsType, raw.Length, nullCount: 0, offset: 0, [ArrowBuffer.Empty, values.Build()]));
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema, partitionColumns: ["ts"]);
+        await table.WriteAsync([new RecordBatch(schema, [ids.Build(), ts], raw.Length)]);
+
+        // Half one: the literal strings EW wrote into the log, pinned as ground truth.
+        var partitionValues = DeltaRs.Invoke("raw_log", new { path = _tempDir })
+            .GetProperty("actions").EnumerateArray()
+            .Select(a => a.GetProperty("action"))
+            .Where(a => a.TryGetProperty("add", out _))
+            .Select(a => a.GetProperty("add").GetProperty("partitionValues").GetProperty("ts").GetString()!)
+            .ToList();
+
+        string fraction = unit == TimeUnit.Microsecond ? ".000123" : ".123000";
+        Assert.Equal(
+            ["2023-11-14 22:13:20", "2023-11-14 22:13:20" + fraction],
+            partitionValues.OrderBy(v => v, StringComparer.Ordinal).ToArray());
+
+        // Half two: delta-rs parses those strings back to the exact instants.
+        var result = DeltaRs.Invoke("read_epoch_micros", new { path = _tempDir, col = "ts" });
+        Assert.Equal(["ts"], result.GetProperty("partition_columns")
+            .EnumerateArray().Select(p => p.GetString()!).ToArray());
+
+        var byId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("micros").GetInt64());
+
+        Assert.Equal(raw[0] * scale, byId[0]);
+        Assert.Equal(raw[1] * scale, byId[1]);
+    }
+
     // ── Row-level concurrency — slice 9 Layer 3 sub-problem A (DELETE/DELETE deletion-vector union). ──
 
     /// <summary>
