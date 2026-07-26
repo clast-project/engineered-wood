@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 
 namespace EngineeredWood.DeltaLake.Table;
 
@@ -47,7 +48,7 @@ internal static class SchemaEvolution
             }
             else
             {
-                reconciled = MakeNullArray(f.DataType, batch.Length);
+                reconciled = ArrowCompute.MakeNullArray(f.DataType, batch.Length);
                 changed = true;
             }
             arrays.Add(reconciled);
@@ -94,7 +95,7 @@ internal static class SchemaEvolution
             }
             else
             {
-                reconciled = MakeNullArray(expectedChild.DataType, physicalLength);
+                reconciled = ArrowCompute.MakeNullArray(expectedChild.DataType, physicalLength);
                 changed = true;
             }
             children.Add(reconciled);
@@ -106,89 +107,4 @@ internal static class SchemaEvolution
             expectedStruct, sa.Length, children, sa.NullBitmapBuffer, sa.NullCount, sa.Data.Offset);
     }
 
-    /// <summary>Builds an all-NULL array of the given Arrow type and length (for schema-evolution backfill).</summary>
-    /// <summary>Builds an all-null array of <paramref name="type"/>. Shared with
-    /// <see cref="TypeWidening.ValueWidener"/> so both backfill paths agree on the typed-NULL shape
-    /// (and neither silently substitutes a string column).</summary>
-    internal static IArrowArray MakeNullArrayPublic(IArrowType type, int length) =>
-        MakeNullArray(type, length);
-
-    private static IArrowArray MakeNullArray(IArrowType type, int length)
-    {
-        switch (type)
-        {
-            // MUST precede the StructType case: an extension over a struct storage type (VARIANT)
-            // would otherwise backfill as a bare storage struct, dropping the annotation and
-            // producing a batch whose column type contradicts the schema it is backfilled into.
-            case ExtensionType ext:
-                return ext.CreateArray(MakeNullArray(ext.StorageType, length));
-            case BooleanType:
-            { var b = new BooleanArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Int8Type:
-            { var b = new Int8Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Int16Type:
-            { var b = new Int16Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Int32Type:
-            { var b = new Int32Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Int64Type:
-            { var b = new Int64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case UInt8Type:
-            { var b = new UInt8Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case UInt16Type:
-            { var b = new UInt16Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case UInt32Type:
-            { var b = new UInt32Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case UInt64Type:
-            { var b = new UInt64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case FloatType:
-            { var b = new FloatArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case DoubleType:
-            { var b = new DoubleArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Decimal128Type dec:
-            { var b = new Decimal128Array.Builder(dec); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Date32Type:
-            { var b = new Date32Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case TimestampType ts:
-            { var b = new TimestampArray.Builder(ts); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case BinaryType:
-            { var b = new BinaryArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Decimal256Type dec:
-            { var b = new Decimal256Array.Builder(dec); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Date64Type:
-            { var b = new Date64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Time32Type t32:
-            { var b = new Time32Array.Builder(t32); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Time64Type t64:
-            { var b = new Time64Array.Builder(t64); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            case Apache.Arrow.Types.StructType st:
-            {
-                // An all-null struct: zeroed validity + typed all-null children (children length == the
-                // struct's own length; the caller passes the PHYSICAL length when backfilling a child).
-                var children = new List<IArrowArray>(st.Fields.Count);
-                foreach (var f in st.Fields)
-                    children.Add(MakeNullArray(f.DataType, length));
-                return new StructArray(st, length, children, AllNullBitmap(length), nullCount: length);
-            }
-            case ListType lt:
-            {
-                // An all-null list: zeroed validity + all-zero offsets over an empty values child.
-                var offsets = new ArrowBuffer.Builder<int>(length + 1);
-                for (int i = 0; i <= length; i++) offsets.Append(0);
-                return new ListArray(lt, length, offsets.Build(), MakeNullArray(lt.ValueDataType, 0),
-                                     AllNullBitmap(length), nullCount: length);
-            }
-            case StringType:
-            { var b = new StringArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-            default:
-                throw new NotSupportedException(
-                    $"Schema-evolution backfill has no NULL-array builder for Arrow type '{type.Name}'.");
-        }
-    }
-
-    private static ArrowBuffer AllNullBitmap(int length)
-    {
-        var bitmap = new ArrowBuffer.Builder<byte>((length + 7) / 8);
-        for (int i = 0; i < (length + 7) / 8; i++) bitmap.Append(0);
-        return bitmap.Build();
-    }
 }

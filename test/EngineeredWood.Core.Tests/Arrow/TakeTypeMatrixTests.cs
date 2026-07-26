@@ -17,64 +17,29 @@ namespace EngineeredWood.Core.Tests.Arrow;
 public class TakeTypeMatrixTests
 {
     /// <summary>
-    /// Every fixed-width type the gather claims to support. Named rather than passed as instances so the
-    /// theory cases stay individually runnable from a test runner.
+    /// Every fixed-width type the gather claims to support, from the shared width table in
+    /// <see cref="FixedWidthCases"/>.
     /// </summary>
     public static TheoryData<string> FixedWidthTypes
     {
         get
         {
-            TheoryData<string> cases =
-            [
-                "int8", "uint8",
-                "int16", "uint16",
-                "int32", "uint32", "float", "date32", "time32",
-                "int64", "uint64", "double", "date64", "time64",
-                "timestamp_us_utc", "timestamp_ms_naive", "duration_ns",
-                "decimal32", "decimal64", "decimal128", "decimal256",
-                "fsb7",
-            ];
-#if NET6_0_OR_GREATER
-            // Apache.Arrow's ArrowArrayFactory throws "Half-float arrays are not supported by this target
-            // framework" on netstandard2.0, so no HalfFloatArray can exist there to gather from. The width
-            // entry stays unconditional in ArrowCompute because it keys off HalfFloatType, which does exist on
-            // every target — only the array class is missing.
-            cases.Add("halffloat");
+            var cases = new TheoryData<string>();
+            foreach (string name in FixedWidthCases.All)
+            {
+                // Apache.Arrow's ArrowArrayFactory throws "Half-float arrays are not supported by this target
+                // framework" on netstandard2.0, so no HalfFloatArray can exist there to gather FROM — there is
+                // no input to construct, which is why this is a skip here rather than an expected throw.
+#if !NET6_0_OR_GREATER
+                if (name == "halffloat") continue;
 #endif
+                cases.Add(name);
+            }
             return cases;
         }
     }
 
-    private static (IArrowType Type, int Width) Resolve(string name) => name switch
-    {
-        "int8" => (Int8Type.Default, 1),
-        "uint8" => (UInt8Type.Default, 1),
-        "int16" => (Int16Type.Default, 2),
-        "uint16" => (UInt16Type.Default, 2),
-        "halffloat" => (HalfFloatType.Default, 2),
-        "int32" => (Int32Type.Default, 4),
-        "uint32" => (UInt32Type.Default, 4),
-        "float" => (FloatType.Default, 4),
-        "date32" => (Date32Type.Default, 4),
-        "time32" => (new Time32Type(TimeUnit.Millisecond), 4),
-        "int64" => (Int64Type.Default, 8),
-        "uint64" => (UInt64Type.Default, 8),
-        "double" => (DoubleType.Default, 8),
-        "date64" => (Date64Type.Default, 8),
-        "time64" => (new Time64Type(TimeUnit.Microsecond), 8),
-        "timestamp_us_utc" => (new TimestampType(TimeUnit.Microsecond, "UTC"), 8),
-        "timestamp_ms_naive" => (new TimestampType(TimeUnit.Millisecond, (string?)null), 8),
-        // DurationType exposes only static per-unit instances, no public constructor.
-        "duration_ns" => (DurationType.Nanosecond, 8),
-        "decimal32" => (new Decimal32Type(9, 2), 4),
-        "decimal64" => (new Decimal64Type(18, 4), 8),
-        "decimal128" => (new Decimal128Type(38, 10), 16),
-        "decimal256" => (new Decimal256Type(76, 20), 32),
-        // A width that is neither a power of two nor a multiple of one, to catch slot arithmetic that
-        // happens to work only for aligned widths.
-        "fsb7" => (new FixedSizeBinaryType(7), 7),
-        _ => throw new ArgumentOutOfRangeException(nameof(name), name, "unknown case"),
-    };
+    private static (IArrowType Type, int Width) Resolve(string name) => FixedWidthCases.Resolve(name);
 
     /// <summary>Distinct, non-zero bytes so a mis-slotted copy cannot coincidentally match.</summary>
     private static byte[] Pattern(int rows, int width)

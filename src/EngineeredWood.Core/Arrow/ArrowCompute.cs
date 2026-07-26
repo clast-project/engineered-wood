@@ -115,6 +115,142 @@ public static class ArrowCompute
 #endif
 
     /// <summary>
+    /// Builds an all-NULL array of <paramref name="type"/> and <paramref name="length"/> — every row null,
+    /// with the type reproduced exactly, including the parameters a typed builder for a narrower type would
+    /// discard (timestamp unit and timezone, decimal precision and scale, list and struct child types).
+    ///
+    /// <para>Used to backfill a column that is absent from a data file but present in the schema it must be
+    /// read under. The type fidelity is the point: a null column built as the wrong Arrow type contradicts
+    /// the schema of the batch it lands in, which is a silent mismatch rather than a failure.</para>
+    ///
+    /// <para>Nested types recurse — a struct's children are all-null arrays of the same length, and a list's
+    /// offsets are all zero over an empty child, so every row is a null rather than an empty list.</para>
+    /// </summary>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="type"/> is one this cannot construct. Never substitute another type for it: that is
+    /// the silent schema mismatch above.
+    /// </exception>
+    public static IArrowArray MakeNullArray(IArrowType type, int length)
+    {
+        switch (type)
+        {
+            // Extension types first, for the same reason as in Take: an extension over a struct or primitive
+            // storage type (VARIANT) would otherwise be built as its bare storage and land in a batch whose
+            // schema still declares the extension.
+            case ExtensionType ext:
+                return ext.CreateArray(MakeNullArray(ext.StorageType, length));
+
+            // A null array is all-null by construction and carries no buffers to fill.
+            case NullType:
+                return new NullArray(length);
+
+#if !NET6_0_OR_GREATER
+            // Apache.Arrow cannot construct a HalfFloatArray on netstandard2.0 at all — BuildArray throws
+            // "Half-float arrays are not supported by this target framework". Take needs no such guard
+            // because a target that cannot represent the array cannot hand one over to be gathered; this
+            // method is reached from a SCHEMA, so a caller genuinely can ask for the impossible. Say why
+            // rather than surfacing Arrow's message from inside a backfill.
+            case HalfFloatType:
+                throw new NotSupportedException(
+                    "An all-null HalfFloat column cannot be built on this target framework, because "
+                    + "Apache.Arrow cannot construct a HalfFloatArray here at all. Use net6.0 or later.");
+#endif
+
+            case BooleanType:
+                // The values bitmap is zeroed alongside the validity bitmap. Every value bit is unset, so a
+                // consumer that reads values without consulting validity sees false rather than garbage.
+                return BuildNull(type, length, new[] { AllNullBitmap(length), Zeros(BitmapBytes(length)) });
+
+            case StringType or BinaryType:
+                return BuildNull(type, length, new[]
+                {
+                    AllNullBitmap(length), Zeros((length + 1) * sizeof(int)), ArrowBuffer.Empty,
+                });
+
+            // Kept distinct from the 32-bit arm so a Large* column is built as Large*: narrowing it would
+            // contradict the schema, the same trap TakeVarBinary64 exists to avoid.
+            case LargeStringType or LargeBinaryType:
+                return BuildNull(type, length, new[]
+                {
+                    AllNullBitmap(length), Zeros((length + 1) * sizeof(long)), ArrowBuffer.Empty,
+                });
+
+            // All-zero offsets make every row a zero-length slice of an empty child — which, combined with
+            // the cleared validity bit, reads as NULL rather than as an empty list.
+            case ListType lt:
+                return BuildNull(
+                    type, length,
+                    new[] { AllNullBitmap(length), Zeros((length + 1) * sizeof(int)) },
+                    new[] { MakeNullArray(lt.ValueDataType, 0).Data });
+
+            case LargeListType llt:
+                return BuildNull(
+                    type, length,
+                    new[] { AllNullBitmap(length), Zeros((length + 1) * sizeof(long)) },
+                    new[] { MakeNullArray(llt.ValueDataType, 0).Data });
+
+            // A fixed-size list has no offsets buffer: the child occupies length * ListSize slots whether or
+            // not the parent rows are null, so the child has to be sized accordingly rather than left empty.
+            case FixedSizeListType flt:
+                return BuildNull(
+                    type, length,
+                    new[] { AllNullBitmap(length) },
+                    new[] { MakeNullArray(flt.ValueDataType, length * flt.ListSize).Data });
+
+            // A map is a list of key/value entry structs, so it takes the list layout with an empty child.
+            // Apache.Arrow models MapType as unrelated to ListType, so arm order between them is irrelevant
+            // (pinned by DeltaLake's MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant).
+            case MapType mt:
+                return BuildNull(
+                    type, length,
+                    new[] { AllNullBitmap(length), Zeros((length + 1) * sizeof(int)) },
+                    new[] { MakeNullArray(mt.KeyValueType, 0).Data });
+
+            // Children are parallel to the parent's rows, so each is an all-null array of the same length.
+            case StructType st:
+            {
+                var children = new ArrayData[st.Fields.Count];
+                for (int i = 0; i < children.Length; i++)
+                    children[i] = MakeNullArray(st.Fields[i].DataType, length).Data;
+
+                return BuildNull(type, length, new[] { AllNullBitmap(length) }, children);
+            }
+
+            default:
+            {
+                // Every fixed-width type — ints, floats, Date/Time/Timestamp/Duration/Interval,
+                // Decimal32/64/128/256 and FixedSizeBinary — is a zeroed value buffer of the right size.
+                // The source type is reused verbatim, so its unit/timezone/precision/scale ride along.
+                int? width = FixedWidthBytes(type);
+                if (width is int byteWidth)
+                {
+                    return BuildNull(
+                        type, length, new[] { AllNullBitmap(length), Zeros(length * byteWidth) });
+                }
+
+                throw new NotSupportedException(
+                    $"ArrowCompute cannot build an all-null column of type {type.TypeId}.");
+            }
+        }
+    }
+
+    private static IArrowArray BuildNull(
+        IArrowType type, int length, ArrowBuffer[] buffers, ArrayData[]? children = null) =>
+        ArrowArrayFactory.BuildArray(new ArrayData(
+            type, length, nullCount: length, offset: 0, buffers, children));
+
+    /// <summary>
+    /// A validity bitmap with every bit cleared — the all-null case. This is the inverse of the no-null
+    /// shape <see cref="ValidityWriter"/> produces (<see cref="ArrowBuffer.Empty"/> with a zero null count),
+    /// and unlike that one it must actually be allocated: an absent bitmap means all-valid.
+    /// </summary>
+    private static ArrowBuffer AllNullBitmap(int length) => Zeros(BitmapBytes(length));
+
+    /// <summary>A zero-filled buffer; <c>new byte[]</c> is already zeroed, so there is nothing to fill.</summary>
+    private static ArrowBuffer Zeros(int byteCount) =>
+        byteCount == 0 ? ArrowBuffer.Empty : new ArrowBuffer(new byte[byteCount]);
+
+    /// <summary>
     /// Byte width of a fixed-width Arrow type, or null for variable-width and nested types.
     /// Boolean is deliberately absent — it is bit-packed, not one byte per value.
     /// </summary>

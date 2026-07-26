@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Schema;
 
 namespace EngineeredWood.DeltaLake.Table.TypeWidening;
@@ -52,8 +53,12 @@ internal static class ValueWidener
             }
             else
             {
-                // Missing column — fill with nulls
-                columns[i] = BuildNullArray(targetSchema.FieldsList[i].DataType, batch.Length);
+                // Missing column — fill with nulls of the TARGET type. This used to fall back to a
+                // StringArray for anything it had no per-type builder for, so a null Timestamp or Decimal
+                // column came back typed String: an array contradicting the schema it was placed into,
+                // silently, rather than a failure.
+                columns[i] = ArrowCompute.MakeNullArray(
+                    targetSchema.FieldsList[i].DataType, batch.Length);
             }
         }
 
@@ -418,44 +423,6 @@ internal static class ValueWidener
             _ => true,
         };
     }
-
-    private static IArrowArray BuildNullArray(IArrowType type, int length)
-    {
-        return type switch
-        {
-            Int64Type => BuildNullInt64(length),
-            Int32Type => BuildNullInt32(length),
-            Int16Type => BuildNullInt16(length),
-            Int8Type => BuildNullInt8(length),
-            DoubleType => BuildNullDouble(length),
-            FloatType => BuildNullFloat(length),
-            BooleanType => BuildNullBoolean(length),
-            // An extension column (VARIANT) must keep its type: the string fallback below would put a
-            // StringArray into a batch declaring the extension type — a silent schema/array mismatch
-            // rather than a failure. Delegate to the schema-evolution builder, which handles the
-            // storage type and re-wraps.
-            ExtensionType ext => ext.CreateArray(
-                SchemaEvolution.MakeNullArrayPublic(ext.StorageType, length)),
-            _ => BuildNullString(length),
-        };
-    }
-
-    private static Int64Array BuildNullInt64(int length)
-    { var b = new Int64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int32Array BuildNullInt32(int length)
-    { var b = new Int32Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int16Array BuildNullInt16(int length)
-    { var b = new Int16Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int8Array BuildNullInt8(int length)
-    { var b = new Int8Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static DoubleArray BuildNullDouble(int length)
-    { var b = new DoubleArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static FloatArray BuildNullFloat(int length)
-    { var b = new FloatArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static BooleanArray BuildNullBoolean(int length)
-    { var b = new BooleanArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static StringArray BuildNullString(int length)
-    { var b = new StringArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
 
     #endregion
 }
