@@ -321,6 +321,22 @@ internal static class ArrowToSchemaConverter
         Apache.Arrow.Types.TimeUnit.Millisecond => Metadata.TimeUnit.Millis,
         Apache.Arrow.Types.TimeUnit.Microsecond => Metadata.TimeUnit.Micros,
         Apache.Arrow.Types.TimeUnit.Nanosecond => Metadata.TimeUnit.Nanos,
-        _ => Metadata.TimeUnit.Micros,
+
+        // Parquet's TIMESTAMP and TIME annotations have only MILLIS, MICROS and NANOS — there is no
+        // SECOND unit to map onto. The former `_ => Micros` fallback did not rescale the values, it
+        // just relabelled them, and both ways that plays out are silent:
+        //
+        //   Timestamp(Second) holding 1700000000 (2023-11-14T22:13:20Z) was written as INT64 annotated
+        //   TIMESTAMP(MICROS) and read back as 1970-01-01T00:28:20Z — every value a million times small.
+        //
+        //   Time32(Second) was written as INT32 annotated TIME(MICROS), which is not a legal pairing
+        //   (micros requires INT64); the resulting file cannot be read back at all.
+        //
+        // Refuse rather than corrupt. Rescaling to microseconds instead is tracked in
+        // doc/known-issues.md — it needs a value-converting pass, not a schema decision.
+        _ => throw new NotSupportedException(
+            $"Parquet timestamps and times have no {unit}-precision unit (only milliseconds, "
+            + "microseconds and nanoseconds). Cast the column to a supported unit before writing; "
+            + "TimeUnit.Microsecond preserves every value exactly."),
     };
 }

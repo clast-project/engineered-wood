@@ -389,10 +389,15 @@ pass over the batch (and its partition values) rather than a schema check, so it
 is deliberately deferred; refusing is the cheap, safe interim. `Millisecond`
 already round-trips exactly and is unaffected.
 
-Note the underlying `MapTimeUnit` fallback is a **Parquet-writer** bug, not a
-Delta one: writing a `Timestamp(Second)` column through `ParquetFileWriter`
-directly still mislabels it, with no error. Fixing that is a separate change
-with its own compatibility surface.
+The underlying cause was a **Parquet-writer** bug rather than a Delta one, and
+is now fixed there too: `ArrowToSchemaConverter.MapTimeUnit` fell through to
+MICROS for any unmapped unit, relabelling values instead of rescaling them. It
+throws instead, which covers nested columns for free since `MapArrowType` is
+reached per leaf while building the schema tree. That also closed a second,
+worse case — `Time32(Second)` was written as INT32 annotated TIME(MICROS), an
+illegal pairing (micros requires INT64) whose file could not be read back at
+all. `Timestamp(Nanosecond)` stays valid at the Parquet level; NANOS is a real
+Parquet unit, and only Delta cannot carry it.
 
 **Stats collection gaps.**
 
