@@ -7,89 +7,52 @@ using EngineeredWood.Avro.Encoding;
 namespace EngineeredWood.Avro.Data;
 
 /// <summary>Reads int from writer, appends as long to reader builder.</summary>
-internal sealed class PromotingIntToLongBuilder : IColumnBuilder
+internal sealed class PromotingIntToLongBuilder : FixedWidthBuilder<long>
 {
-    private Apache.Arrow.Int64Array.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override long ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
 }
 
 /// <summary>Reads int from writer, appends as float to reader builder.</summary>
-internal sealed class PromotingIntToFloatBuilder : IColumnBuilder
+internal sealed class PromotingIntToFloatBuilder : FixedWidthBuilder<float>
 {
-    private Apache.Arrow.FloatArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override float ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
 }
 
 /// <summary>Reads int from writer, appends as double to reader builder.</summary>
-internal sealed class PromotingIntToDoubleBuilder : IColumnBuilder
+internal sealed class PromotingIntToDoubleBuilder : FixedWidthBuilder<double>
 {
-    private Apache.Arrow.DoubleArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override double ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
 }
 
 /// <summary>Reads long from writer, appends as float to reader builder.</summary>
-internal sealed class PromotingLongToFloatBuilder : IColumnBuilder
+internal sealed class PromotingLongToFloatBuilder : FixedWidthBuilder<float>
 {
-    private Apache.Arrow.FloatArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override float ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
 }
 
 /// <summary>Reads long from writer, appends as double to reader builder.</summary>
-internal sealed class PromotingLongToDoubleBuilder : IColumnBuilder
+internal sealed class PromotingLongToDoubleBuilder : FixedWidthBuilder<double>
 {
-    private Apache.Arrow.DoubleArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override double ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
 }
 
 /// <summary>Reads float from writer, appends as double to reader builder.</summary>
-internal sealed class PromotingFloatToDoubleBuilder : IColumnBuilder
+internal sealed class PromotingFloatToDoubleBuilder : FixedWidthBuilder<double>
 {
-    private Apache.Arrow.DoubleArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadFloat());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override double ReadValue(ref AvroBinaryReader reader) => reader.ReadFloat();
 }
 
+// String↔bytes promotion is a no-op at the byte level (Avro string is UTF-8 bytes on the
+// wire); only the target Arrow type differs, which VarLengthBuilder.Build takes from the field.
+
 /// <summary>Reads string from writer, appends as bytes to reader builder.</summary>
-internal sealed class PromotingStringToBytesBuilder : IColumnBuilder
+internal sealed class PromotingStringToBytesBuilder : VarLengthBuilder
 {
-    private Apache.Arrow.BinaryArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadStringBytes());
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override ReadOnlySpan<byte> ReadRaw(ref AvroBinaryReader reader) => reader.ReadStringBytes();
 }
 
 /// <summary>Reads bytes from writer, appends as string to reader builder.</summary>
-internal sealed class PromotingBytesToStringBuilder : IColumnBuilder
+internal sealed class PromotingBytesToStringBuilder : VarLengthBuilder
 {
-    private Apache.Arrow.StringArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader)
-    {
-        var bytes = reader.ReadBytes();
-#if NETSTANDARD2_0
-        _builder.Append(System.Text.Encoding.UTF8.GetString(bytes.ToArray()));
-#else
-        _builder.Append(System.Text.Encoding.UTF8.GetString(bytes));
-#endif
-    }
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override ReadOnlySpan<byte> ReadRaw(ref AvroBinaryReader reader) => reader.ReadBytes();
 }

@@ -8,6 +8,7 @@ using Apache.Arrow;
 using Apache.Arrow.Arrays;
 using Apache.Arrow.Scalars;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Avro.Encoding;
 using EngineeredWood.Avro.Schema;
 
@@ -48,6 +49,7 @@ internal sealed class RecordBatchAssembler
         var reader = new AvroBinaryReader(data);
         var effectiveSchema = _resolution?.ArrowSchema ?? _arrowSchema;
         ResetBuilders();
+        ReserveBuilders(maxRows);
 
         int rowCount = 0;
         for (int i = 0; i < maxRows && !reader.IsEmpty; i++)
@@ -69,6 +71,7 @@ internal sealed class RecordBatchAssembler
         var reader = new AvroBinaryReader(data);
         var effectiveSchema = _resolution?.ArrowSchema ?? _arrowSchema;
         ResetBuilders();
+        ReserveBuilders(objectCount);
 
         for (int i = 0; i < objectCount; i++)
             DecodeRecordDispatch(ref reader, _builders);
@@ -81,6 +84,17 @@ internal sealed class RecordBatchAssembler
     {
         for (int i = 0; i < _builders.Length; i++)
             _builders[i].Reset();
+    }
+
+    /// <summary>
+    /// Preallocates exactly-sized buffers for the known row count of the next batch,
+    /// so scalar columns fill without growth reallocations. Container builders treat
+    /// the count as a hint for their own validity/offsets.
+    /// </summary>
+    private void ReserveBuilders(int rowCount)
+    {
+        for (int i = 0; i < _builders.Length; i++)
+            _builders[i].Reserve(rowCount);
     }
 
     private void DecodeRecordDispatch(ref AvroBinaryReader reader, IColumnBuilder[] builders)
@@ -400,6 +414,12 @@ internal interface IColumnBuilder
     IArrowArray Build(Field field);
     /// <summary>Resets accumulated state so the builder can be reused for the next batch.</summary>
     void Reset();
+    /// <summary>
+    /// Hints the row count of the next batch so buffers can be preallocated. For fixed-width
+    /// scalar columns this is exact (one value per row); container builders treat it as a hint.
+    /// Callers must invoke <see cref="Reset"/> first. Default implementations may ignore it.
+    /// </summary>
+    void Reserve(int rowCount);
 }
 
 /// <summary>Wraps a non-nullable builder to handle ["null", T] unions.</summary>
@@ -430,70 +450,284 @@ internal sealed class NullableBuilder : IColumnBuilder
     public void AppendNull() => _inner.AppendNull();
     public IArrowArray Build(Field field) => _inner.Build(field);
     public void Reset() => _inner.Reset();
+    public void Reserve(int rowCount) => _inner.Reserve(rowCount);
 }
 
 // ─── Validity bitmap accumulator ───
 
 /// <summary>
-/// Compact validity bitmap that stores 1 bit per value instead of 8 bytes (List&lt;bool&gt;).
-/// Tracks null count inline to avoid a second pass.
+/// Accumulates an Arrow validity bitmap in native memory, one bit per value. The bitmap is
+/// allocated lazily on the first null (back-filling the prior all-valid entries), so a
+/// non-nullable column — the common case — never allocates or touches a validity buffer.
+/// Ownership of the bitmap transfers to a zero-copy <see cref="ArrowBuffer"/> at
+/// <see cref="BuildBitmap"/> (called only when <see cref="NullCount"/> &gt; 0); the tracker
+/// then holds no buffer until the next <see cref="Reserve"/>, so a built batch's bitmap is
+/// never mutated by a later batch. Used as a mutable in-place field — never copy it by value.
 /// </summary>
 internal struct ValidityTracker
 {
-    private byte[] _bitmap;
+    private NativeBuffer<byte>? _bitmap;   // null until the first null is appended
+    private int _capacityBytes;
+    private int _reserveBits;              // capacity hint from Reserve
     private int _count;
     private int _nullCount;
 
-    public ValidityTracker() : this(64) { }
-
-    public ValidityTracker(int initialCapacity)
-    {
-        _bitmap = new byte[(initialCapacity + 7) / 8];
-        _count = 0;
-        _nullCount = 0;
-    }
+    public ValidityTracker() { }
 
     public int Count => _count;
     public int NullCount => _nullCount;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void AppendValid()
+    /// <summary>Records the expected row count; defers bitmap allocation until a null appears.</summary>
+    public void Reserve(int rowCount)
     {
-        int byteIndex = _count / 8;
-        if (byteIndex >= _bitmap.Length)
-            Grow();
-        _bitmap[byteIndex] |= (byte)(1 << (_count % 8));
-        _count++;
+        _bitmap?.Dispose();
+        _bitmap = null;
+        _capacityBytes = 0;
+        _reserveBits = rowCount;
+        _count = 0;
+        _nullCount = 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void AppendValid()
+    {
+        if (_bitmap != null)
+            SetValidBit(_count);
+        _count++;
+    }
+
     public void AppendNull()
     {
-        int byteIndex = _count / 8;
-        if (byteIndex >= _bitmap.Length)
-            Grow();
-        // bit is already 0
+        if (_bitmap == null)
+            AllocateAndBackfill();
+        else
+            EnsureByte(_count >> 3);
+        // bit stays 0
         _count++;
         _nullCount++;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetValidBit(int index)
+    {
+        int byteIndex = index >> 3;
+        if (byteIndex >= _capacityBytes)
+            EnsureByte(byteIndex);
+        _bitmap!.ByteSpan[byteIndex] |= (byte)(1 << (index & 7));
+    }
+
+    /// <summary>First null: allocate the bitmap and mark all prior <see cref="_count"/> entries valid.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void AllocateAndBackfill()
+    {
+        _capacityBytes = Math.Max(1, (Math.Max(_reserveBits, _count + 1) + 7) / 8);
+        _bitmap = new NativeBuffer<byte>(_capacityBytes, zeroFill: true);
+        var span = _bitmap.ByteSpan;
+        int fullBytes = _count >> 3;
+        for (int i = 0; i < fullBytes; i++)
+            span[i] = 0xFF;
+        int rem = _count & 7;
+        if (rem != 0)
+            span[fullBytes] = (byte)((1 << rem) - 1);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void EnsureByte(int byteIndex)
+    {
+        if (byteIndex < _capacityBytes)
+            return;
+        int oldBytes = _capacityBytes;
+        _bitmap!.Grow(byteIndex + 1);
+        // NativeBuffer.Grow does not zero new bytes; validity needs zeros for unset (null) bits.
+        _bitmap.ByteSpan.Slice(oldBytes).Clear();
+        _capacityBytes = _bitmap.Length;
+    }
+
+    /// <summary>Transfers bitmap ownership to an <see cref="ArrowBuffer"/>. Only valid when NullCount &gt; 0.</summary>
+    public ArrowBuffer BuildBitmap()
+    {
+        var buf = _bitmap!;
+        _bitmap = null;
+        _capacityBytes = 0;
+        return buf.Build();
+    }
+
+    /// <summary>Discards any un-built bitmap so the next batch starts fresh.</summary>
+    public void Reset()
+    {
+        _bitmap?.Dispose();
+        _bitmap = null;
+        _capacityBytes = 0;
+        _reserveBits = 0;
+        _count = 0;
+        _nullCount = 0;
+    }
+}
+
+/// <summary>
+/// Accumulates Arrow list/map offsets (int32, count+1 running byte/element offsets) in native
+/// memory, transferring ownership to a zero-copy <see cref="ArrowBuffer"/> at <see cref="Build"/>.
+/// Used as a mutable in-place field — never copy it by value.
+/// </summary>
+internal struct OffsetsAccumulator
+{
+    private NativeBuffer<int>? _offsets;
+    private int _cap;        // element capacity of _offsets
+    private int _count;      // number of appended elements (offsets holds _count+1 entries)
+    private int _running;    // current running total
+
+    public OffsetsAccumulator() { }
+
+    public int Count => _count;
+
+    public void Reserve(int rowCount)
+    {
+        _offsets?.Dispose();
+        _cap = Math.Max(1, rowCount) + 1;
+        _offsets = new NativeBuffer<int>(_cap, zeroFill: false);
+        _offsets.Span[0] = 0;
+        _count = 0;
+        _running = 0;
+    }
+
+    /// <summary>Appends one parent element whose child span advanced by <paramref name="length"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Append(int length)
+    {
+        EnsureSlot();
+        _running += length;
+        _count++;
+        _offsets!.Span[_count] = _running;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureSlot()
+    {
+        if (_offsets != null && _count + 1 < _cap)
+            return;
+        Grow();
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void Grow()
     {
-        int newSize = Math.Max(_bitmap.Length * 2, 8);
-        var newBitmap = new byte[newSize];
-        _bitmap.CopyTo(newBitmap, 0);
-        _bitmap = newBitmap;
+        if (_offsets == null)
+        {
+            _cap = 64;
+            _offsets = new NativeBuffer<int>(_cap, zeroFill: false);
+            _offsets.Span[0] = 0;
+            return;
+        }
+        _offsets.Grow(_count + 2);
+        _cap = _offsets.Length;
     }
 
-    public ArrowBuffer BuildBitmap() => new(_bitmap.AsMemory(0, (_count + 7) / 8));
+    public ArrowBuffer Build()
+    {
+        var buf = _offsets!;
+        _offsets = null;
+        _cap = 0;
+        return buf.Build();
+    }
 
-    /// <summary>Resets count and null count, retaining the allocated bitmap.</summary>
     public void Reset()
     {
-        _bitmap.AsSpan(0, (_count + 7) / 8).Clear();
+        _offsets?.Dispose();
+        _offsets = null;
+        _cap = 0;
         _count = 0;
-        _nullCount = 0;
+        _running = 0;
+    }
+}
+
+/// <summary>
+/// Base for fixed-width scalar columns. Accumulates values into a native buffer sized to the
+/// batch row count (via <see cref="Reserve"/>), then transfers that buffer to Arrow zero-copy
+/// at <see cref="Build"/>. Ownership moves to the built <see cref="RecordBatch"/> — the builder
+/// holds no buffer afterwards — so a built batch is safe to retain while later batches decode.
+/// When there are no nulls the validity buffer is elided.
+/// </summary>
+internal abstract class FixedWidthBuilder<T> : IColumnBuilder
+    where T : unmanaged
+{
+    private NativeBuffer<T>? _values;
+    private int _capacity;
+    private int _count;
+    private ValidityTracker _validity = new();
+
+    protected abstract T ReadValue(ref AvroBinaryReader reader);
+
+    public void Append(ref AvroBinaryReader reader)
+    {
+        T value = ReadValue(ref reader);
+        if (_count >= _capacity)
+            Grow();
+        _values!.Span[_count] = value;
+        _count++;
+        _validity.AppendValid();
+    }
+
+    public void AppendNull()
+    {
+        if (_count >= _capacity)
+            Grow();
+        _values!.Span[_count] = default;
+        _count++;
+        _validity.AppendNull();
+    }
+
+    /// <summary>Appends a known, non-null value (schema-resolution default path).</summary>
+    protected void AppendValueDirect(T value)
+    {
+        if (_count >= _capacity)
+            Grow();
+        _values!.Span[_count] = value;
+        _count++;
+        _validity.AppendValid();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _values?.Dispose();
+        _capacity = Math.Max(1, rowCount);
+        // zeroFill:false — every slot up to _count is written (values or default for nulls).
+        _values = new NativeBuffer<T>(_capacity, zeroFill: false);
+        _validity.Reserve(rowCount);
+        _count = 0;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow()
+    {
+        if (_values == null)
+        {
+            _capacity = 64;
+            _values = new NativeBuffer<T>(_capacity, zeroFill: false);
+            return;
+        }
+        _values.Grow(_count + 1);
+        _capacity = _values.Length;
+    }
+
+    public IArrowArray Build(Field field)
+    {
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
+        int count = _count;
+        int nullCount = _validity.NullCount;
+        var values = _values!.Build();
+        _values = null;
+        _capacity = 0;
+        var data = new ArrayData(field.DataType, count, nullCount, 0, [validity, values]);
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    public void Reset()
+    {
+        _values?.Dispose();
+        _values = null;
+        _capacity = 0;
+        _count = 0;
+        _validity.Reset();
     }
 }
 
@@ -506,76 +740,261 @@ internal sealed class NullBuilder : IColumnBuilder
     public void AppendNull() => _count++;
     public IArrowArray Build(Field field) => new NullArray(_count);
     public void Reset() => _count = 0;
+    public void Reserve(int rowCount) { }
 }
 
+/// <summary>
+/// Arrow <see cref="BooleanArray"/> stores values bit-packed. Values are accumulated into a
+/// native value bitmap (one bit per row, set when true) alongside a validity bitmap — the same
+/// native-bit-packing pattern the ORC and Parquet readers use — so the column never touches the
+/// managed heap. Both buffers transfer ownership to Arrow zero-copy at <see cref="Build"/>.
+/// </summary>
 internal sealed class BooleanBuilder : IColumnBuilder
 {
-    private Apache.Arrow.BooleanArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadBoolean());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(bool value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    private NativeBuffer<byte>? _values;   // 1 bit per value; bit set when the value is true
+    private int _capacityBytes;
+    private int _count;
+    private ValidityTracker _validity = new();
+
+    public void Append(ref AvroBinaryReader reader) => AppendBool(reader.ReadBoolean());
+    public void AppendDefault(bool value) => AppendBool(value);
+
+    public void AppendNull()
+    {
+        int byteIndex = _count >> 3;
+        if (byteIndex >= _capacityBytes)
+            Grow(byteIndex);
+        // value bit stays 0 (buffer is zero-filled)
+        _count++;
+        _validity.AppendNull();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void AppendBool(bool value)
+    {
+        int byteIndex = _count >> 3;
+        if (byteIndex >= _capacityBytes)
+            Grow(byteIndex);
+        if (value)
+            _values!.ByteSpan[byteIndex] |= (byte)(1 << (_count & 7));
+        _count++;
+        _validity.AppendValid();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _values?.Dispose();
+        _capacityBytes = Math.Max(1, (rowCount + 7) / 8);
+        _values = new NativeBuffer<byte>(_capacityBytes, zeroFill: true);
+        _count = 0;
+        _validity.Reserve(rowCount);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow(int byteIndex)
+    {
+        if (_values == null)
+        {
+            _capacityBytes = Math.Max(8, byteIndex + 1);
+            _values = new NativeBuffer<byte>(_capacityBytes, zeroFill: true);
+            return;
+        }
+        int oldBytes = _capacityBytes;
+        _values.Grow(byteIndex + 1);
+        // NativeBuffer.Grow does not zero new bytes; false/unset value bits need zeros.
+        _values.ByteSpan.Slice(oldBytes).Clear();
+        _capacityBytes = _values.Length;
+    }
+
+    public IArrowArray Build(Field field)
+    {
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
+        int count = _count;
+        int nullCount = _validity.NullCount;
+        var values = _values!.Build();
+        _values = null;
+        _capacityBytes = 0;
+        var data = new ArrayData(field.DataType, count, nullCount, 0, [validity, values]);
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    public void Reset()
+    {
+        _values?.Dispose();
+        _values = null;
+        _capacityBytes = 0;
+        _count = 0;
+        _validity.Reset();
+    }
 }
 
-internal sealed class Int32Builder : IColumnBuilder
+internal sealed class Int32Builder : FixedWidthBuilder<int>
 {
-    private Apache.Arrow.Int32Array.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(int value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override int ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
+    public void AppendDefault(int value) => AppendValueDirect(value);
 }
 
-internal sealed class Int64Builder : IColumnBuilder
+internal sealed class Int64Builder : FixedWidthBuilder<long>
 {
-    private Apache.Arrow.Int64Array.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(long value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override long ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
+    public void AppendDefault(long value) => AppendValueDirect(value);
 }
 
-internal sealed class FloatBuilder : IColumnBuilder
+internal sealed class FloatBuilder : FixedWidthBuilder<float>
 {
-    private Apache.Arrow.FloatArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadFloat());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(float value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override float ReadValue(ref AvroBinaryReader reader) => reader.ReadFloat();
+    public void AppendDefault(float value) => AppendValueDirect(value);
 }
 
-internal sealed class DoubleBuilder : IColumnBuilder
+internal sealed class DoubleBuilder : FixedWidthBuilder<double>
 {
-    private Apache.Arrow.DoubleArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadDouble());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(double value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override double ReadValue(ref AvroBinaryReader reader) => reader.ReadDouble();
+    public void AppendDefault(double value) => AppendValueDirect(value);
 }
 
-internal sealed class BinaryBuilder : IColumnBuilder
+/// <summary>
+/// Base for variable-length columns (Arrow string/binary layout: validity, int32 offsets,
+/// data bytes). Raw element bytes are copied straight from the wire into a native data buffer
+/// — no intermediate <c>string</c> or <c>byte[]</c> per value — and both offset and data
+/// buffers transfer ownership to Arrow zero-copy at <see cref="Build"/>. Validity is elided
+/// when there are no nulls; the built batch is safe to retain while later batches decode.
+/// </summary>
+internal abstract class VarLengthBuilder : IColumnBuilder
 {
-    private Apache.Arrow.BinaryArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadBytes());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(byte[] value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    private NativeBuffer<int>? _offsets;   // count+1 running byte offsets, offsets[0] = 0
+    private int _offsetCap;                // element capacity of _offsets (i.e. offsets.Length)
+    private NativeBuffer<byte>? _data;
+    private int _dataCap;
+    private int _dataLen;
+    private int _count;
+    private ValidityTracker _validity = new();
+
+    /// <summary>Returns the raw element bytes from the wire (valid until the next read).</summary>
+    protected abstract ReadOnlySpan<byte> ReadRaw(ref AvroBinaryReader reader);
+
+    public void Append(ref AvroBinaryReader reader) => AppendRawValid(ReadRaw(ref reader));
+
+    public void AppendNull()
+    {
+        EnsureOffsetSlot();
+        _count++;
+        _offsets!.Span[_count] = _dataLen;   // repeat last offset -> empty slot
+        _validity.AppendNull();
+    }
+
+    /// <summary>Appends one non-null element from raw bytes (also the schema-default path).</summary>
+    protected void AppendRawValid(ReadOnlySpan<byte> bytes)
+    {
+        EnsureOffsetSlot();
+        if (bytes.Length > 0)
+        {
+            EnsureDataCapacity(bytes.Length);
+            bytes.CopyTo(_data!.ByteSpan.Slice(_dataLen));
+            _dataLen += bytes.Length;
+        }
+        _count++;
+        _offsets!.Span[_count] = _dataLen;
+        _validity.AppendValid();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _offsets?.Dispose();
+        _data?.Dispose();
+        _offsetCap = Math.Max(1, rowCount) + 1;
+        _offsets = new NativeBuffer<int>(_offsetCap, zeroFill: false);
+        _offsets.Span[0] = 0;
+        // Estimate ~8 bytes/element; grows on demand.
+        _dataCap = Math.Max(256, Math.Max(1, rowCount) * 8);
+        _data = new NativeBuffer<byte>(_dataCap, zeroFill: false);
+        _dataLen = 0;
+        _count = 0;
+        _validity.Reserve(rowCount);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureOffsetSlot()
+    {
+        if (_offsets != null && _count + 1 < _offsetCap)
+            return;
+        GrowOffsets();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GrowOffsets()
+    {
+        if (_offsets == null)
+        {
+            _offsetCap = 64;
+            _offsets = new NativeBuffer<int>(_offsetCap, zeroFill: false);
+            _offsets.Span[0] = 0;
+            return;
+        }
+        _offsets.Grow(_count + 2);
+        _offsetCap = _offsets.Length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureDataCapacity(int extra)
+    {
+        if (_data != null && _dataLen + extra <= _dataCap)
+            return;
+        GrowData(extra);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GrowData(int extra)
+    {
+        if (_data == null)
+        {
+            _dataCap = Math.Max(256, extra);
+            _data = new NativeBuffer<byte>(_dataCap, zeroFill: false);
+            return;
+        }
+        _data.Grow(_dataLen + extra);
+        _dataCap = _data.Length;
+    }
+
+    public IArrowArray Build(Field field)
+    {
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
+        int count = _count;
+        int nullCount = _validity.NullCount;
+        var offsets = _offsets!.Build();
+        var data = _data!.Build();
+        _offsets = null;
+        _data = null;
+        _offsetCap = 0;
+        _dataCap = 0;
+        var arrayData = new ArrayData(field.DataType, count, nullCount, 0, [validity, offsets, data]);
+        return ArrowArrayFactory.BuildArray(arrayData);
+    }
+
+    public void Reset()
+    {
+        _offsets?.Dispose();
+        _data?.Dispose();
+        _offsets = null;
+        _data = null;
+        _offsetCap = 0;
+        _dataCap = 0;
+        _dataLen = 0;
+        _count = 0;
+        _validity.Reset();
+    }
 }
 
-internal sealed class StringBuilder : IColumnBuilder
+internal sealed class BinaryBuilder : VarLengthBuilder
 {
-    private Apache.Arrow.StringArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadString());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(string value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
+    protected override ReadOnlySpan<byte> ReadRaw(ref AvroBinaryReader reader) => reader.ReadBytes();
+    public void AppendDefault(byte[] value) => AppendRawValid(value);
+}
+
+internal sealed class StringBuilder : VarLengthBuilder
+{
+    protected override ReadOnlySpan<byte> ReadRaw(ref AvroBinaryReader reader) => reader.ReadStringBytes();
+    public void AppendDefault(string value)
+        => AppendRawValid(System.Text.Encoding.UTF8.GetBytes(value));
 }
 
 /// <summary>
@@ -593,61 +1012,35 @@ internal sealed class GuidBuilder : IColumnBuilder
     public void AppendDefault(string value) => _builder.Append(Guid.Parse(value));
     public IArrowArray Build(Field field) => _builder.Build(allocator: null);
     public void Reset() => _builder = new();
+    public void Reserve(int rowCount) => _builder.Reserve(rowCount);
 }
 
 // ─── Logical type builders ───
 
-internal sealed class Date32Builder : IColumnBuilder
+// Avro's date logical type is an int count of days since the epoch — exactly the
+// Date32 value-buffer layout — so we store the raw int with no DateOnly round-trip.
+internal sealed class Date32Builder : FixedWidthBuilder<int>
 {
-#if NET6_0_OR_GREATER
-    private static readonly DateOnly Epoch = new(1970, 1, 1);
-    private Apache.Arrow.Date32Array.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader)
-        => _builder.Append(Epoch.AddDays(reader.ReadInt()));
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(int daysSinceEpoch) => _builder.Append(Epoch.AddDays(daysSinceEpoch));
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
-#else
-    private static readonly DateTime Epoch = new DateTime(1970, 1, 1);
-    private Apache.Arrow.Date32Array.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader)
-        => _builder.Append(Epoch.AddDays(reader.ReadInt()));
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(int daysSinceEpoch) => _builder.Append(Epoch.AddDays(daysSinceEpoch));
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
-#endif
+    protected override int ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
+    public void AppendDefault(int daysSinceEpoch) => AppendValueDirect(daysSinceEpoch);
 }
 
-internal sealed class Time32MillisBuilder : IColumnBuilder
+internal sealed class Time32MillisBuilder : FixedWidthBuilder<int>
 {
-    private Apache.Arrow.Time32Array.Builder _builder = new(new Time32Type(TimeUnit.Millisecond));
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(int value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new(new Time32Type(TimeUnit.Millisecond));
+    protected override int ReadValue(ref AvroBinaryReader reader) => reader.ReadInt();
+    public void AppendDefault(int value) => AppendValueDirect(value);
 }
 
-internal sealed class Time64MicrosBuilder : IColumnBuilder
+internal sealed class Time64MicrosBuilder : FixedWidthBuilder<long>
 {
-    private Apache.Arrow.Time64Array.Builder _builder = new(new Time64Type(TimeUnit.Microsecond));
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(long value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new(new Time64Type(TimeUnit.Microsecond));
+    protected override long ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
+    public void AppendDefault(long value) => AppendValueDirect(value);
 }
 
-internal sealed class Time64NanosBuilder : IColumnBuilder
+internal sealed class Time64NanosBuilder : FixedWidthBuilder<long>
 {
-    private Apache.Arrow.Time64Array.Builder _builder = new(new Time64Type(TimeUnit.Nanosecond));
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(long value) => _builder.Append(value);
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new(new Time64Type(TimeUnit.Nanosecond));
+    protected override long ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
+    public void AppendDefault(long value) => AppendValueDirect(value);
 }
 
 /// <summary>
@@ -671,62 +1064,50 @@ internal sealed class DurationBuilder : IColumnBuilder
     public void AppendNull() => _builder.AppendNull();
     public IArrowArray Build(Field field) => _builder.Build();
     public void Reset() => _builder = new();
+    public void Reserve(int rowCount) { }
 }
 
-internal sealed class TimestampBuilder : IColumnBuilder
+// Avro timestamp logical types read a single int64 (millis/micros/nanos since epoch),
+// which is exactly the Timestamp value-buffer layout. DataType comes from the field.
+internal sealed class TimestampBuilder : FixedWidthBuilder<long>
 {
-    private byte[] _buffer = new byte[64];
-    private int _count;
-    private ValidityTracker _validity = new();
-
-    public void Append(ref AvroBinaryReader reader) { AppendValue(reader.ReadLong()); _validity.AppendValid(); }
-    public void AppendNull() { AppendValue(0); _validity.AppendNull(); }
-    public void AppendDefault(long value) { AppendValue(value); _validity.AppendValid(); }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void AppendValue(long value)
-    {
-        int offset = _count * 8;
-        if (offset + 8 > _buffer.Length)
-            System.Array.Resize(ref _buffer, _buffer.Length * 2);
-        BinaryPrimitives.WriteInt64LittleEndian(_buffer.AsSpan(offset), value);
-        _count++;
-    }
-
-    public IArrowArray Build(Field field)
-    {
-        var data = new ArrayData(field.DataType, _count, _validity.NullCount,
-            0, [_validity.BuildBitmap(), new ArrowBuffer(_buffer.AsMemory(0, _count * 8))]);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    public void Reset() { _count = 0; _validity.Reset(); }
+    protected override long ReadValue(ref AvroBinaryReader reader) => reader.ReadLong();
+    public void AppendDefault(long value) => AppendValueDirect(value);
 }
 
 // ─── Complex type builders ───
 
 internal sealed class EnumBuilder : IColumnBuilder
 {
+    // Dictionary indices are int32 — accumulate them through the native-backed Int32 builder.
+    private static readonly Field IndexField = new("indices", Int32Type.Default, nullable: true);
     private readonly IReadOnlyList<string> _symbols;
-    private Int32Array.Builder _indexBuilder = new();
+    private readonly Int32Builder _indexBuilder = new();
+    private StringArray? _dictionary;   // immutable — built once, shared across batches
 
     public EnumBuilder(IReadOnlyList<string> symbols) => _symbols = symbols;
 
-    public void Append(ref AvroBinaryReader reader) => _indexBuilder.Append(reader.ReadInt());
+    public void Append(ref AvroBinaryReader reader) => _indexBuilder.Append(ref reader);
     public void AppendNull() => _indexBuilder.AppendNull();
-    public void AppendDefault(int index) => _indexBuilder.Append(index);
+    public void AppendDefault(int index) => _indexBuilder.AppendDefault(index);
 
     public IArrowArray Build(Field field)
+        => new DictionaryArray((DictionaryType)field.DataType,
+            _indexBuilder.Build(IndexField), BuildDictionary(_symbols, ref _dictionary));
+
+    public void Reset() => _indexBuilder.Reset();
+    public void Reserve(int rowCount) => _indexBuilder.Reserve(rowCount);
+
+    /// <summary>Builds the immutable symbol dictionary once and caches it for reuse across batches.</summary>
+    internal static StringArray BuildDictionary(IReadOnlyList<string> symbols, ref StringArray? cache)
     {
-        var dictBuilder = new StringArray.Builder();
-        foreach (var sym in _symbols)
-            dictBuilder.Append(sym);
-
-        return new DictionaryArray((DictionaryType)field.DataType,
-            _indexBuilder.Build(), dictBuilder.Build());
+        if (cache != null)
+            return cache;
+        var b = new StringArray.Builder();
+        foreach (var sym in symbols)
+            b.Append(sym);
+        return cache = b.Build();
     }
-
-    public void Reset() => _indexBuilder = new();
 }
 
 /// <summary>
@@ -735,9 +1116,11 @@ internal sealed class EnumBuilder : IColumnBuilder
 /// </summary>
 internal sealed class RemappingEnumBuilder : IColumnBuilder
 {
+    private static readonly Field IndexField = new("indices", Int32Type.Default, nullable: true);
     private readonly IReadOnlyList<string> _readerSymbols;
     private readonly int[] _writerToReaderIndex;
-    private Int32Array.Builder _indexBuilder = new();
+    private readonly Int32Builder _indexBuilder = new();
+    private StringArray? _dictionary;   // immutable — built once, shared across batches
 
     public RemappingEnumBuilder(AvroEnumSchema writerSchema, AvroEnumSchema readerSchema)
     {
@@ -780,81 +1163,132 @@ internal sealed class RemappingEnumBuilder : IColumnBuilder
     public void Append(ref AvroBinaryReader reader)
     {
         int writerIndex = reader.ReadInt();
-        _indexBuilder.Append(_writerToReaderIndex[writerIndex]);
+        _indexBuilder.AppendDefault(_writerToReaderIndex[writerIndex]);
     }
 
     public void AppendNull() => _indexBuilder.AppendNull();
 
     /// <summary>Appends a default using a reader symbol index.</summary>
-    public void AppendDefault(int readerIndex) => _indexBuilder.Append(readerIndex);
+    public void AppendDefault(int readerIndex) => _indexBuilder.AppendDefault(readerIndex);
 
     public IArrowArray Build(Field field)
-    {
-        var dictBuilder = new StringArray.Builder();
-        foreach (var sym in _readerSymbols)
-            dictBuilder.Append(sym);
+        => new DictionaryArray((DictionaryType)field.DataType,
+            _indexBuilder.Build(IndexField), EnumBuilder.BuildDictionary(_readerSymbols, ref _dictionary));
 
-        return new DictionaryArray((DictionaryType)field.DataType,
-            _indexBuilder.Build(), dictBuilder.Build());
-    }
-
-    public void Reset() => _indexBuilder = new();
+    public void Reset() => _indexBuilder.Reset();
+    public void Reserve(int rowCount) => _indexBuilder.Reserve(rowCount);
 }
 
-internal sealed class FixedBuilder : IColumnBuilder
+/// <summary>
+/// Base for columns whose value buffer holds a fixed number of bytes per row (fixed-size
+/// binary, decimal). Accumulates into a native buffer sized to the batch row count and
+/// transfers ownership to Arrow zero-copy at <see cref="Build"/>, so a built batch is safe to
+/// retain while later batches decode. Validity is elided when there are no nulls.
+/// </summary>
+internal abstract class ByteBlobBuilder : IColumnBuilder
 {
-    private readonly int _size;
-    private byte[] _values;
+    private readonly int _elemBytes;
+    private NativeBuffer<byte>? _values;
+    private int _capacityElems;
     private int _count;
     private ValidityTracker _validity = new();
 
-    public FixedBuilder(int size)
-    {
-        _size = size;
-        _values = new byte[size * 64];
-    }
+    protected ByteBlobBuilder(int elemBytes) => _elemBytes = elemBytes;
 
-    public void Append(ref AvroBinaryReader reader)
-    {
-        EnsureCapacity();
-        reader.ReadFixed(_size).CopyTo(_values.AsSpan(_count * _size));
-        _count++;
-        _validity.AppendValid();
-    }
+    /// <summary>Writes exactly <c>elemBytes</c> bytes for one element into <paramref name="dest"/>.</summary>
+    protected abstract void WriteElement(ref AvroBinaryReader reader, Span<byte> dest);
+
+    /// <summary>The Arrow value type for this column.</summary>
+    protected abstract IArrowType ValueType(Field field);
+
+    public void Append(ref AvroBinaryReader reader) => WriteElement(ref reader, NextValidSlot());
 
     public void AppendNull()
     {
-        EnsureCapacity();
-        _values.AsSpan(_count * _size, _size).Clear();
+        EnsureSlot();
+        _values!.ByteSpan.Slice(_count * _elemBytes, _elemBytes).Clear();
         _count++;
         _validity.AppendNull();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void EnsureCapacity()
+    /// <summary>Reserves the next slot, marks it valid, and returns it for the caller to fill.</summary>
+    protected Span<byte> NextValidSlot()
     {
-        int required = (_count + 1) * _size;
-        if (required <= _values.Length) return;
-        var newValues = new byte[Math.Max(_values.Length * 2, required)];
-        _values.AsSpan(0, _count * _size).CopyTo(newValues);
-        _values = newValues;
+        EnsureSlot();
+        var dest = _values!.ByteSpan.Slice(_count * _elemBytes, _elemBytes);
+        _count++;
+        _validity.AppendValid();
+        return dest;
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _values?.Dispose();
+        _capacityElems = Math.Max(1, rowCount);
+        _values = new NativeBuffer<byte>(_capacityElems * _elemBytes, zeroFill: false);
+        _validity.Reserve(rowCount);
+        _count = 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureSlot()
+    {
+        if (_count < _capacityElems)
+            return;
+        Grow();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow()
+    {
+        if (_values == null)
+        {
+            _capacityElems = 64;
+            _values = new NativeBuffer<byte>(_capacityElems * _elemBytes, zeroFill: false);
+            return;
+        }
+        _values.Grow((_count + 1) * _elemBytes);
+        _capacityElems = _values.Length / _elemBytes;
     }
 
     public IArrowArray Build(Field field)
     {
-        var dataType = field.DataType as FixedSizeBinaryType ?? new FixedSizeBinaryType(_size);
-        var data = new ArrayData(dataType, _count, _validity.NullCount,
-            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * _size))]);
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
+        int count = _count;
+        int nullCount = _validity.NullCount;
+        var values = _values!.Build();
+        _values = null;
+        _capacityElems = 0;
+        var data = new ArrayData(ValueType(field), count, nullCount, 0, [validity, values]);
         return ArrowArrayFactory.BuildArray(data);
     }
 
-    public void Reset() { _count = 0; _validity.Reset(); }
+    public void Reset()
+    {
+        _values?.Dispose();
+        _values = null;
+        _capacityElems = 0;
+        _count = 0;
+        _validity.Reset();
+    }
+}
+
+internal sealed class FixedBuilder : ByteBlobBuilder
+{
+    private readonly int _size;
+    public FixedBuilder(int size) : base(size) => _size = size;
+
+    protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
+        => reader.ReadFixed(_size).CopyTo(dest);
+
+    protected override IArrowType ValueType(Field field)
+        => field.DataType as FixedSizeBinaryType ?? new FixedSizeBinaryType(_size);
 }
 
 internal sealed class ArrayBuilder : IColumnBuilder
 {
     private readonly IColumnBuilder _itemBuilder;
-    private readonly List<int> _offsets = new() { 0 };
+    private OffsetsAccumulator _offsets = new();
     private ValidityTracker _validity = new();
 
     public ArrayBuilder(IColumnBuilder itemBuilder) => _itemBuilder = itemBuilder;
@@ -877,13 +1311,13 @@ internal sealed class ArrayBuilder : IColumnBuilder
                 count++;
             }
         }
-        _offsets.Add(_offsets[^1] + count);
+        _offsets.Append(count);
         _validity.AppendValid();
     }
 
     public void AppendNull()
     {
-        _offsets.Add(_offsets[^1]);
+        _offsets.Append(0);
         _validity.AppendNull();
     }
 
@@ -891,33 +1325,32 @@ internal sealed class ArrayBuilder : IColumnBuilder
     {
         var listType = (ListType)field.DataType;
         var values = _itemBuilder.Build(listType.ValueField);
-        return BuildListArray(listType, values, _offsets, _validity);
+
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
+        return new ListArray(listType, _validity.Count,
+            _offsets.Build(), values, validity, _validity.NullCount);
     }
 
     public void Reset()
     {
         _itemBuilder.Reset();
-        _offsets.Clear();
-        _offsets.Add(0);
+        _offsets.Reset();
         _validity.Reset();
     }
 
-    internal static ListArray BuildListArray(
-        ListType listType, IArrowArray values, List<int> offsets, ValidityTracker validity)
+    public void Reserve(int rowCount)
     {
-        var offsetBuffer = new ArrowBuffer.Builder<int>();
-        foreach (var o in offsets) offsetBuffer.Append(o);
-
-        return new ListArray(listType, validity.Count,
-            offsetBuffer.Build(), values, validity.BuildBitmap(), validity.NullCount);
+        _validity.Reserve(rowCount);
+        _offsets.Reserve(rowCount);
+        _itemBuilder.Reserve(rowCount);
     }
 }
 
 internal sealed class MapBuilder : IColumnBuilder
 {
     private readonly IColumnBuilder _valueBuilder;
-    private StringArray.Builder _keyBuilder = new();
-    private readonly List<int> _offsets = new() { 0 };
+    private readonly StringBuilder _keyBuilder = new();
+    private OffsetsAccumulator _offsets = new();
     private ValidityTracker _validity = new();
 
     public MapBuilder(IColumnBuilder valueBuilder) => _valueBuilder = valueBuilder;
@@ -936,25 +1369,25 @@ internal sealed class MapBuilder : IColumnBuilder
             }
             for (long i = 0; i < blockCount; i++)
             {
-                _keyBuilder.Append(reader.ReadString());
+                _keyBuilder.Append(ref reader);   // map keys are Avro strings, read first
                 _valueBuilder.Append(ref reader);
                 count++;
             }
         }
-        _offsets.Add(_offsets[^1] + count);
+        _offsets.Append(count);
         _validity.AppendValid();
     }
 
     public void AppendNull()
     {
-        _offsets.Add(_offsets[^1]);
+        _offsets.Append(0);
         _validity.AppendNull();
     }
 
     public IArrowArray Build(Field field)
     {
         var mapType = (MapType)field.DataType;
-        var keys = _keyBuilder.Build();
+        var keys = _keyBuilder.Build(mapType.KeyField);
         var values = _valueBuilder.Build(mapType.ValueField);
 
         var structFields = new List<Field> { mapType.KeyField, mapType.ValueField };
@@ -962,20 +1395,25 @@ internal sealed class MapBuilder : IColumnBuilder
         var entries = new StructArray(structType, keys.Length,
             new IArrowArray[] { keys, values }, ArrowBuffer.Empty);
 
-        var offsetBuffer = new ArrowBuffer.Builder<int>();
-        foreach (var o in _offsets) offsetBuffer.Append(o);
-
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
         return new MapArray(mapType, _validity.Count,
-            offsetBuffer.Build(), entries, _validity.BuildBitmap(), _validity.NullCount);
+            _offsets.Build(), entries, validity, _validity.NullCount);
     }
 
     public void Reset()
     {
         _valueBuilder.Reset();
-        _keyBuilder = new();
-        _offsets.Clear();
-        _offsets.Add(0);
+        _keyBuilder.Reset();
+        _offsets.Reset();
         _validity.Reset();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _validity.Reserve(rowCount);
+        _keyBuilder.Reserve(rowCount);
+        _offsets.Reserve(rowCount);
+        _valueBuilder.Reserve(rowCount);
     }
 }
 
@@ -1008,8 +1446,9 @@ internal sealed class StructBuilder : IColumnBuilder
         for (int i = 0; i < _children.Count; i++)
             childArrays[i] = _children[i].builder.Build(structType.Fields[i]);
 
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
         return new StructArray(structType, _validity.Count,
-            childArrays, _validity.BuildBitmap(), _validity.NullCount);
+            childArrays, validity, _validity.NullCount);
     }
 
     public void Reset()
@@ -1017,6 +1456,13 @@ internal sealed class StructBuilder : IColumnBuilder
         foreach (var (_, builder) in _children)
             builder.Reset();
         _validity.Reset();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        _validity.Reserve(rowCount);
+        foreach (var (_, builder) in _children)
+            builder.Reserve(rowCount);
     }
 }
 
@@ -1082,8 +1528,9 @@ internal sealed class ResolvingStructBuilder : IColumnBuilder
         for (int i = 0; i < _readerBuilders.Length; i++)
             childArrays[i] = _readerBuilders[i].Build(structType.Fields[i]);
 
+        var validity = _validity.NullCount > 0 ? _validity.BuildBitmap() : ArrowBuffer.Empty;
         return new StructArray(structType, _validity.Count,
-            childArrays, _validity.BuildBitmap(), _validity.NullCount);
+            childArrays, validity, _validity.NullCount);
     }
 
     public void Reset()
@@ -1092,136 +1539,61 @@ internal sealed class ResolvingStructBuilder : IColumnBuilder
             builder.Reset();
         _validity.Reset();
     }
+
+    public void Reserve(int rowCount)
+    {
+        _validity.Reserve(rowCount);
+        foreach (var builder in _readerBuilders)
+            builder.Reserve(rowCount);
+    }
 }
 
 // ─── Decimal builders ───
 
 /// <summary>Reads Avro fixed-size bytes and converts to Arrow Decimal128 (big-endian → little-endian).</summary>
-internal sealed class DecimalFixedBuilder : IColumnBuilder
+internal sealed class DecimalFixedBuilder : ByteBlobBuilder
 {
     private readonly int _size;
     private readonly int _precision;
     private readonly int _scale;
-    private byte[] _values;
-    private int _count;
-    private ValidityTracker _validity = new();
 
-    public DecimalFixedBuilder(int size, int precision, int scale)
+    public DecimalFixedBuilder(int size, int precision, int scale) : base(16)
     {
         _size = size;
         _precision = precision;
         _scale = scale;
-        _values = new byte[16 * 64];
     }
 
-    public void Append(ref AvroBinaryReader reader)
-    {
-        EnsureCapacity();
-        var bytes = reader.ReadFixed(_size);
-        DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes, _values.AsSpan(_count * 16));
-        _count++;
-        _validity.AppendValid();
-    }
+    protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
+        => DecimalArrayHelper.BigEndianToDecimal128Bytes(reader.ReadFixed(_size), dest);
 
-    public void AppendNull()
-    {
-        EnsureCapacity();
-        _values.AsSpan(_count * 16, 16).Clear();
-        _count++;
-        _validity.AppendNull();
-    }
+    protected override IArrowType ValueType(Field field) => new Decimal128Type(_precision, _scale);
 
     /// <summary>Appends a default value from big-endian Avro bytes.</summary>
     public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)
-    {
-        EnsureCapacity();
-        DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, _values.AsSpan(_count * 16));
-        _count++;
-        _validity.AppendValid();
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void EnsureCapacity()
-    {
-        int required = (_count + 1) * 16;
-        if (required <= _values.Length) return;
-        var newValues = new byte[Math.Max(_values.Length * 2, required)];
-        _values.AsSpan(0, _count * 16).CopyTo(newValues);
-        _values = newValues;
-    }
-
-    public IArrowArray Build(Field field)
-    {
-        var dataType = new Decimal128Type(_precision, _scale);
-        var data = new ArrayData(dataType, _count, _validity.NullCount,
-            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * 16))]);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    public void Reset() { _count = 0; _validity.Reset(); }
+        => DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, NextValidSlot());
 }
 
 /// <summary>Reads Avro variable-length bytes and converts to Arrow Decimal128 (big-endian → little-endian).</summary>
-internal sealed class DecimalBytesBuilder : IColumnBuilder
+internal sealed class DecimalBytesBuilder : ByteBlobBuilder
 {
     private readonly int _precision;
     private readonly int _scale;
-    private byte[] _values;
-    private int _count;
-    private ValidityTracker _validity = new();
 
-    public DecimalBytesBuilder(int precision, int scale)
+    public DecimalBytesBuilder(int precision, int scale) : base(16)
     {
         _precision = precision;
         _scale = scale;
-        _values = new byte[16 * 64];
     }
 
-    public void Append(ref AvroBinaryReader reader)
-    {
-        EnsureCapacity();
-        var bytes = reader.ReadBytes();
-        DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes, _values.AsSpan(_count * 16));
-        _count++;
-        _validity.AppendValid();
-    }
+    protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
+        => DecimalArrayHelper.BigEndianToDecimal128Bytes(reader.ReadBytes(), dest);
 
-    public void AppendNull()
-    {
-        EnsureCapacity();
-        _values.AsSpan(_count * 16, 16).Clear();
-        _count++;
-        _validity.AppendNull();
-    }
+    protected override IArrowType ValueType(Field field) => new Decimal128Type(_precision, _scale);
 
     /// <summary>Appends a default value from big-endian Avro bytes.</summary>
     public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)
-    {
-        EnsureCapacity();
-        DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, _values.AsSpan(_count * 16));
-        _count++;
-        _validity.AppendValid();
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void EnsureCapacity()
-    {
-        int required = (_count + 1) * 16;
-        if (required <= _values.Length) return;
-        var newValues = new byte[Math.Max(_values.Length * 2, required)];
-        _values.AsSpan(0, _count * 16).CopyTo(newValues);
-        _values = newValues;
-    }
-
-    public IArrowArray Build(Field field)
-    {
-        var dataType = new Decimal128Type(_precision, _scale);
-        var data = new ArrayData(dataType, _count, _validity.NullCount,
-            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * 16))]);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    public void Reset() { _count = 0; _validity.Reset(); }
+        => DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, NextValidSlot());
 }
 
 internal static class DecimalArrayHelper
@@ -1242,15 +1614,6 @@ internal static class DecimalArrayHelper
         var result = new byte[16];
         BigEndianToDecimal128Bytes(bigEndian, result);
         return result;
-    }
-
-    public static IArrowArray BuildDecimal128Array(
-        Field field, byte[] values, int count, ValidityTracker validity, int precision, int scale)
-    {
-        var dataType = new Decimal128Type(precision, scale);
-        var data = new ArrayData(dataType, count, validity.NullCount,
-            0, [validity.BuildBitmap(), new ArrowBuffer(values.AsMemory(0, count * 16))]);
-        return ArrowArrayFactory.BuildArray(data);
     }
 }
 
@@ -1310,5 +1673,13 @@ internal sealed class DenseUnionBuilder : IColumnBuilder
         System.Array.Clear(_branchCounts, 0, _branchCounts.Length);
         foreach (var builder in _branchBuilders)
             builder.Reset();
+    }
+
+    public void Reserve(int rowCount)
+    {
+        // Branch cardinalities are unknown up front; forward the row count as a hint so
+        // each branch's value buffer starts at a reasonable size.
+        foreach (var builder in _branchBuilders)
+            builder.Reserve(rowCount);
     }
 }
