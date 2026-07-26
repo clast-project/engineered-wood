@@ -266,135 +266,159 @@ internal static class PartitionUtils
     /// Used to materialize partition columns on read. A null <paramref name="value"/>, the
     /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel (some writers put it into
     /// <c>partitionValues</c>), or an empty string for a non-string type all decode as SQL NULL.
+    ///
+    /// <para>The value is decoded ONCE into its raw Arrow encoding and then tiled across the column, rather
+    /// than appended per row through a typed builder. Besides being the read path's hottest loop — it runs
+    /// per partition column, per batch, per file of every partitioned scan — that is what makes it lossless:
+    /// a builder round-trips each value through its .NET surface type, which for <c>decimal</c> silently
+    /// rounds away anything past ~28 significant digits.</para>
     /// </summary>
     private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
     {
-        var inv = System.Globalization.CultureInfo.InvariantCulture;
         bool isNull = value is null
             || value == "__HIVE_DEFAULT_PARTITION__"
             || (value.Length == 0 && type is not StringType);
 
+        if (isNull)
+            return ArrowCompute.MakeNullArray(type, length);
+
+        // The two shapes are inverses and each gets its own path: an all-null column needs an allocated,
+        // all-zero validity bitmap, while a constant column needs no validity buffer at all.
+        return ArrowCompute.Repeat(type, EncodePartitionValue(type, value!), length);
+    }
+
+    /// <summary>
+    /// Decodes one partition value string into the raw little-endian Arrow encoding of a single value slot
+    /// (or, for a string column, the UTF-8 bytes).
+    /// </summary>
+    private static byte[] EncodePartitionValue(IArrowType type, string value)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+
         switch (type)
         {
             case StringType:
-            {
-                var builder = new StringArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(value);
-                }
-                return builder.Build();
-            }
+                return System.Text.Encoding.UTF8.GetBytes(value);
+
             case Int64Type:
-            {
-                long v = isNull ? 0 : long.Parse(value!, inv);
-                var builder = new Int64Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(long.Parse(value, inv)));
             case Int32Type:
-            {
-                int v = isNull ? 0 : int.Parse(value!, inv);
-                var builder = new Int32Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(int.Parse(value, inv)));
             case Int16Type:
-            {
-                short v = isNull ? (short)0 : short.Parse(value!, inv);
-                var builder = new Int16Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(short.Parse(value, inv)));
             case Int8Type:
-            {
-                sbyte v = isNull ? (sbyte)0 : sbyte.Parse(value!, inv);
-                var builder = new Int8Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return [unchecked((byte)sbyte.Parse(value, inv))];
+
             case DoubleType:
-            {
-                double v = isNull ? 0 : double.Parse(value!, inv);
-                var builder = new DoubleArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(double.Parse(value, inv)));
             case FloatType:
-            {
-                float v = isNull ? 0 : float.Parse(value!, inv);
-                var builder = new FloatArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(float.Parse(value, inv)));
+
+            case BooleanType:
+                return [bool.Parse(value) ? (byte)1 : (byte)0];
+
             case Decimal128Type decType:
-            {
-                decimal v = isNull ? 0m : decimal.Parse(value!, System.Globalization.NumberStyles.Number, inv);
-                var builder = new Decimal128Array.Builder(decType);
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return EncodeDecimal128(decType, value);
+
             case Date32Type:
             {
-                // "yyyy-MM-dd"
-                var dt = isNull ? default : DateTime.Parse(value!, inv,
-                    System.Globalization.DateTimeStyles.None);
-                var builder = new Date32Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(dt);
-                }
-                return builder.Build();
+                // "yyyy-MM-dd", stored as a day count from the epoch.
+                var dt = DateTime.Parse(value, inv, System.Globalization.DateTimeStyles.None);
+                int days = (dt.Date - new DateTime(1970, 1, 1)).Days;
+                return Le(BitConverter.GetBytes(days));
             }
-            case BooleanType:
-            {
-                bool v = !isNull && bool.Parse(value!);
-                var builder = new BooleanArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+
             case TimestampType tsType:
             {
                 // "yyyy-MM-dd HH:mm:ss[.ffffff]" — no zone suffix; timestamps are stored UTC-normalized.
-                var dto = isNull ? default : DateTimeOffset.Parse(value!, inv,
+                var dto = DateTimeOffset.Parse(value, inv,
                     System.Globalization.DateTimeStyles.AssumeUniversal);
-                var builder = new TimestampArray.Builder(tsType);
-                for (int i = 0; i < length; i++)
+                long micros = (dto.UtcTicks - EpochUtcTicks) / TicksPerMicrosecond;
+
+                // The inverse of FormatTimestampPartitionValue, and it accepts exactly the units that one
+                // emits. Anything else would need the stored value scaled by a factor that discards digits,
+                // and a partition value is an exact identity rather than a bound.
+                long stored = tsType.Unit switch
                 {
-                    if (isNull) builder.AppendNull(); else builder.Append(dto);
-                }
-                return builder.Build();
+                    TimeUnit.Microsecond => micros,
+                    TimeUnit.Millisecond => micros / 1_000,
+                    _ => throw new NotSupportedException(
+                        $"Timestamp partition columns with {tsType.Unit} precision are not supported; "
+                        + "the column must be millisecond or microsecond precision."),
+                };
+                return Le(BitConverter.GetBytes(stored));
             }
+
             default:
                 // Falling back to a string column would mismatch the table schema downstream — throw.
                 throw new NotSupportedException(
                     $"Partition columns of Arrow type {type.TypeId} are not supported on read.");
         }
     }
+
+    private const long TicksPerMicrosecond = 10L;
+    private static readonly long EpochUtcTicks =
+        new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
+    /// <summary>
+    /// Arrow value buffers are little-endian; <see cref="BitConverter"/> follows the host, so flip on a
+    /// big-endian one rather than writing the wrong bytes there.
+    /// </summary>
+    private static byte[] Le(byte[] hostOrder)
+    {
+        // Qualified: `Array` alone is ambiguous here, since Apache.Arrow declares one too.
+        if (!BitConverter.IsLittleEndian)
+            System.Array.Reverse(hostOrder);
+        return hostOrder;
+    }
+
+    /// <summary>
+    /// Encodes a decimal partition value as Decimal128's 16-byte little-endian two's complement.
+    ///
+    /// <para>Parsed through <see cref="DeltaLake.Schema.DecimalText"/> rather than
+    /// <see cref="decimal"/>: <c>decimal.Parse</c> silently rounds a value carrying more than ~28
+    /// significant digits and throws on anything wider still, and Delta's <c>decimal(38,s)</c> range is
+    /// wider than that in both directions. Measured before the change: a <c>decimal(38,10)</c> partition
+    /// value of <c>1234567890123456789012345678.1234567890</c> materialized as
+    /// <c>1234567890123456789012345678.1000000000</c> for every row of the partition, and a
+    /// <c>decimal(38,0)</c> value above <see cref="decimal.MaxValue"/> failed the read outright.</para>
+    /// </summary>
+    private static byte[] EncodeDecimal128(Decimal128Type decType, string value)
+    {
+        if (!DeltaLake.Schema.DecimalText.TryParse(value, out var unscaled, out int scale))
+        {
+            throw new FormatException(
+                $"Partition value '{value}' is not a valid decimal for a "
+                + $"decimal({decType.Precision},{decType.Scale}) column.");
+        }
+
+        if (!DeltaLake.Schema.DecimalText.TryRescale(unscaled, scale, decType.Scale, out var scaled))
+        {
+            throw new FormatException(
+                $"Partition value '{value}' carries more fractional digits than its column's scale of "
+                + $"{decType.Scale} can hold, so restating it would change the value.");
+        }
+
+        var bytes = new byte[16];
+        // Sign-extend first, so a negative value's high bytes are 0xFF rather than 0x00.
+        if (scaled.Sign < 0)
+            bytes.AsSpan().Fill(0xFF);
+
+#if NET6_0_OR_GREATER
+        if (!scaled.TryWriteBytes(bytes, out _, isUnsigned: false, isBigEndian: false))
+            throw new OverflowException(DecimalRangeMessage(value, decType));
+#else
+        var le = scaled.ToByteArray(); // little-endian, signed, minimal representation
+        if (le.Length > 16)
+            throw new OverflowException(DecimalRangeMessage(value, decType));
+        le.CopyTo(bytes, 0);
+#endif
+        return bytes;
+    }
+
+    private static string DecimalRangeMessage(string value, Decimal128Type decType) =>
+        $"Partition value '{value}' does not fit a decimal({decType.Precision},{decType.Scale}) column's "
+        + "128-bit storage.";
 
     private static string FormatTimestampPartitionValue(TimestampArray ts, int row)
     {

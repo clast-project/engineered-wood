@@ -159,59 +159,14 @@ internal static class DeltaLiteralDecoder
     /// <summary>
     /// Parses a decimal number's text (from a stats JSON number or a partition string) into a
     /// <see cref="LiteralValue"/> WITHOUT loss of precision: the exact digits become an unscaled
-    /// <see cref="BigInteger"/> at the value's own scale, materialized as a <c>System.Decimal</c> only when
-    /// that representation is exact, otherwise as a high-precision decimal. Accepts an optional sign,
-    /// fractional part, and exponent (e.g. <c>1.23e4</c>).
+    /// <see cref="BigInteger"/> at the value's own scale (see <see cref="DecimalText"/> for why never through
+    /// <see cref="decimal"/>), materialized as a <c>System.Decimal</c> only when that representation is
+    /// exact, otherwise as a high-precision decimal.
     /// </summary>
-    private static LiteralValue? ParseDecimalText(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return null;
-
-        string s = text!.Trim();
-
-        int e = s.IndexOfAny(ExponentChars);
-        int exponent = 0;
-        string mantissa = s;
-        if (e >= 0)
-        {
-            mantissa = s.Substring(0, e);
-            if (!int.TryParse(s.Substring(e + 1), NumberStyles.AllowLeadingSign,
-                    CultureInfo.InvariantCulture, out exponent))
-                return null;
-        }
-
-        bool negative = false;
-        if (mantissa.Length > 0 && (mantissa[0] == '-' || mantissa[0] == '+'))
-        {
-            negative = mantissa[0] == '-';
-            mantissa = mantissa.Substring(1);
-        }
-
-        int dot = mantissa.IndexOf('.');
-        int fractionalDigits = dot < 0 ? 0 : mantissa.Length - dot - 1;
-        string digits = dot < 0 ? mantissa : mantissa.Substring(0, dot) + mantissa.Substring(dot + 1);
-
-        if (digits.Length == 0
-            || !BigInteger.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var unscaled))
-            return null;
-
-        if (negative)
-            unscaled = -unscaled;
-
-        // value = unscaled * 10^(exponent - fractionalDigits); a negative resulting scale is absorbed into
-        // the integer so the stored scale is always >= 0.
-        int scale = fractionalDigits - exponent;
-        if (scale < 0)
-        {
-            unscaled *= BigInteger.Pow(10, -scale);
-            scale = 0;
-        }
-
-        return MakeDecimalLiteral(unscaled, scale);
-    }
-
-    private static readonly char[] ExponentChars = { 'e', 'E' };
+    private static LiteralValue? ParseDecimalText(string? text) =>
+        DecimalText.TryParse(text, out var unscaled, out int scale)
+            ? (LiteralValue?)MakeDecimalLiteral(unscaled, scale)
+            : null;
 
     // The largest magnitude a System.Decimal can hold (96-bit unscaled integer).
     private static readonly BigInteger Decimal96Max = (BigInteger.One << 96) - 1;

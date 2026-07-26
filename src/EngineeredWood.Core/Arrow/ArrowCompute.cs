@@ -234,6 +234,152 @@ public static class ArrowCompute
         }
     }
 
+    /// <summary>
+    /// Builds an array of <paramref name="length"/> rows all holding the same non-null value, given that
+    /// value's raw Arrow encoding. The inverse of <see cref="MakeNullArray"/>: no validity buffer is
+    /// allocated and the null count is zero, which is what lets Arrow skip the per-element validity check
+    /// downstream.
+    ///
+    /// <para>Taking raw bytes rather than a .NET value is what keeps this lossless. A constant built through
+    /// a typed builder round-trips through the builder's surface type — a decimal wider than
+    /// <see cref="decimal"/>'s 28 digits cannot survive that, and a timestamp is re-derived from a
+    /// <see cref="DateTimeOffset"/> — whereas these bytes are stored verbatim and the type is reused as
+    /// given, so unit, timezone, precision and scale all ride along.</para>
+    /// </summary>
+    /// <param name="value">
+    /// The value's Arrow encoding: for a fixed-width type, exactly one value slot, little-endian (so
+    /// <c>FixedWidthBytes(type)</c> bytes); for String/Binary and their Large twins, the encoded bytes, of
+    /// any length; for Boolean, a single byte, zero for false and non-zero for true.
+    /// </param>
+    /// <exception cref="ArgumentException"><paramref name="value"/> is not the width the type requires.</exception>
+    /// <exception cref="NotSupportedException">The type is one this cannot build a constant of.</exception>
+    public static IArrowArray Repeat(IArrowType type, ReadOnlySpan<byte> value, int length)
+    {
+        switch (type)
+        {
+            // Extension types first, matching Take and MakeNullArray: the constant is built as the storage
+            // type and re-wrapped, so the annotation survives.
+            case ExtensionType ext:
+                return ext.CreateArray(Repeat(ext.StorageType, value, length));
+
+            case BooleanType:
+            {
+                if (value.Length != 1)
+                {
+                    throw new ArgumentException(
+                        $"A Boolean constant needs exactly 1 byte, got {value.Length}.", nameof(value));
+                }
+
+                // Bit-packed, so a true constant is an all-ones bitmap. Bits past `length` are padding and
+                // are never read, so setting them costs nothing and keeps this a single Fill.
+                var bits = new byte[BitmapBytes(length)];
+                if (value[0] != 0)
+                    bits.AsSpan().Fill(0xFF);
+
+                return new BooleanArray(new ArrayData(
+                    BooleanType.Default, length, nullCount: 0, offset: 0,
+                    new[] { ArrowBuffer.Empty, new ArrowBuffer(bits) }));
+            }
+
+            case StringType or BinaryType:
+                return RepeatVarBinary(type, value, length, largeOffsets: false);
+
+            case LargeStringType or LargeBinaryType:
+                return RepeatVarBinary(type, value, length, largeOffsets: true);
+
+            default:
+            {
+                int? width = FixedWidthBytes(type);
+                if (width is int byteWidth)
+                {
+                    if (value.Length != byteWidth)
+                    {
+                        throw new ArgumentException(
+                            $"A constant of type {type.TypeId} needs exactly {byteWidth} bytes, "
+                            + $"got {value.Length}.", nameof(value));
+                    }
+
+                    var values = new byte[length * byteWidth];
+                    FillRepeating(values, value);
+
+                    return ArrowArrayFactory.BuildArray(new ArrayData(
+                        type, length, nullCount: 0, offset: 0,
+                        new[] { ArrowBuffer.Empty, new ArrowBuffer(values) }));
+                }
+
+                throw new NotSupportedException(
+                    $"ArrowCompute cannot build a constant column of type {type.TypeId}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The variable-width constant: the value bytes repeated, over offsets that are simply
+    /// <c>i * value.Length</c> — no scan of the values is needed to derive them.
+    /// </summary>
+    private static IArrowArray RepeatVarBinary(
+        IArrowType type, ReadOnlySpan<byte> value, int length, bool largeOffsets)
+    {
+        long total = (long)length * value.Length;
+        if (total > int.MaxValue)
+        {
+            throw new ArgumentException(
+                $"A constant of {value.Length} bytes repeated {length} times needs {total} bytes, which "
+                + "overflows a single Arrow buffer.", nameof(value));
+        }
+
+        var values = new byte[total];
+        FillRepeating(values, value);
+
+        byte[] offsetBytes;
+        if (largeOffsets)
+        {
+            var offsets = new long[length + 1];
+            for (int i = 0; i <= length; i++)
+                offsets[i] = (long)i * value.Length;
+            offsetBytes = new byte[(length + 1) * sizeof(long)];
+            MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+        }
+        else
+        {
+            var offsets = new int[length + 1];
+            for (int i = 0; i <= length; i++)
+                offsets[i] = i * value.Length;
+            offsetBytes = new byte[(length + 1) * sizeof(int)];
+            MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+        }
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, length, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(offsetBytes), new ArrowBuffer(values) }));
+    }
+
+    /// <summary>
+    /// Tiles <paramref name="pattern"/> across <paramref name="destination"/> by repeatedly doubling the
+    /// filled prefix, so a long run costs a handful of large block copies instead of one copy per repetition.
+    /// </summary>
+    private static void FillRepeating(Span<byte> destination, ReadOnlySpan<byte> pattern)
+    {
+        // Also covers a zero-length value: the destination is then empty too.
+        if (destination.IsEmpty)
+            return;
+
+        if (pattern.Length == 1)
+        {
+            destination.Fill(pattern[0]);
+            return;
+        }
+
+        pattern.CopyTo(destination);
+        int filled = pattern.Length;
+        while (filled < destination.Length)
+        {
+            int n = Math.Min(filled, destination.Length - filled);
+            destination.Slice(0, n).CopyTo(destination.Slice(filled, n));
+            filled += n;
+        }
+    }
+
     private static IArrowArray BuildNull(
         IArrowType type, int length, ArrowBuffer[] buffers, ArrayData[]? children = null) =>
         ArrowArrayFactory.BuildArray(new ArrayData(
