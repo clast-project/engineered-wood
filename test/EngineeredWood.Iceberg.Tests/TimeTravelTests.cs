@@ -84,14 +84,46 @@ public class TimeTravelTests : IDisposable
         Assert.Throws<ArgumentException>(() => TimeTravel.AtSnapshot(metadata, 999));
     }
 
+    /// <summary>
+    /// Restamps the snapshots with the given millisecond offsets, in creation order.
+    /// The three appends above are stamped from the wall clock, so on a fast machine —
+    /// or on .NET Framework, whose clock resolves to ~15 ms — two of them can land on
+    /// the same millisecond. Fixing the timestamps makes the assertions here about
+    /// <see cref="TimeTravel"/>'s semantics rather than about commit latency.
+    /// </summary>
+    private static TableMetadata Restamp(TableMetadata metadata, params long[] offsetsMs)
+    {
+        var baseTs = metadata.Snapshots[0].TimestampMs;
+        var restamped = metadata.Snapshots
+            .Select((s, i) => s with { TimestampMs = baseTs + offsetsMs[i] })
+            .ToList();
+        return metadata with { Snapshots = restamped };
+    }
+
     [Fact]
     public async Task AsOfTimestamp_ReturnsLatestSnapshotBeforeTime()
     {
         long snap2 = 0;
-        var metadata = await CreateTableWithSnapshotsAsync(onSnap2: id => snap2 = id);
+        var metadata = Restamp(
+            await CreateTableWithSnapshotsAsync(onSnap2: id => snap2 = id), 0, 1000, 2000);
 
         var snap2Ts = metadata.Snapshots.First(s => s.SnapshotId == snap2).TimestampMs;
         var atTime = TimeTravel.AsOfTimestamp(metadata, snap2Ts);
+
+        Assert.Equal(snap2, atTime.CurrentSnapshotId);
+    }
+
+    [Fact]
+    public async Task AsOfTimestamp_SnapshotsSharingATimestamp_ReturnsTheNewest()
+    {
+        long snap2 = 0;
+        var metadata = await CreateTableWithSnapshotsAsync(onSnap2: id => snap2 = id);
+
+        // Collapse snap1 and snap2 onto one millisecond and leave snap3 strictly later.
+        var collapsed = Restamp(metadata, 0, 0, 1000);
+        var sharedTs = collapsed.Snapshots[0].TimestampMs;
+
+        var atTime = TimeTravel.AsOfTimestamp(collapsed, sharedTs);
 
         Assert.Equal(snap2, atTime.CurrentSnapshotId);
     }

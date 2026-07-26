@@ -63,8 +63,12 @@ public sealed class ExpireSnapshots
         // Retain last N snapshots by timestamp
         if (_retainLast is not null)
         {
+            // Sequence number breaks ties: snapshots committed within one clock tick
+            // share a timestamp, and ordering by timestamp alone would retain the
+            // oldest of such a group instead of the newest.
             foreach (var snap in allSnapshots
                 .OrderByDescending(s => s.TimestampMs)
+                .ThenByDescending(s => s.SequenceNumber)
                 .Take(_retainLast.Value))
             {
                 retained.Add(snap.SnapshotId);

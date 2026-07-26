@@ -24,9 +24,13 @@ public static class TimeTravel
     /// </summary>
     public static TableMetadata AsOfTimestamp(TableMetadata metadata, long timestampMs)
     {
+        // Snapshots committed within one clock tick share a timestamp, so order by
+        // sequence number as well: it is monotonic per commit and is what makes
+        // "latest at or before" pick the newest of a tie rather than the oldest.
         var snapshot = metadata.Snapshots
             .Where(s => s.TimestampMs <= timestampMs)
             .OrderByDescending(s => s.TimestampMs)
+            .ThenByDescending(s => s.SequenceNumber)
             .FirstOrDefault()
             ?? throw new ArgumentException(
                 $"No snapshot found at or before timestamp: {timestampMs}");

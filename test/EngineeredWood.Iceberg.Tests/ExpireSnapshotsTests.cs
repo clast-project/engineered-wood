@@ -97,6 +97,7 @@ public class ExpireSnapshotsTests : IDisposable
     public async Task RetainLast_KeepsNNewestSnapshots()
     {
         var metadata = await CreateTableWithSnapshotsAsync(5);
+        var newest = metadata.Snapshots.Skip(3).Select(s => s.SnapshotId).ToArray();
 
         var result = await new ExpireSnapshots()
             .ExpireOlderThan(long.MaxValue) // Expire everything...
@@ -104,7 +105,31 @@ public class ExpireSnapshotsTests : IDisposable
             .ApplyAsync(metadata, _fs);
 
         Assert.Equal(2, result.Metadata.Snapshots.Count);
+        Assert.Equal(newest, result.Metadata.Snapshots.Select(s => s.SnapshotId));
         Assert.Equal(metadata.CurrentSnapshotId, result.Metadata.CurrentSnapshotId);
+    }
+
+    [Fact]
+    public async Task RetainLast_SnapshotsSharingATimestamp_KeepsTheNewest()
+    {
+        var metadata = await CreateTableWithSnapshotsAsync(5);
+
+        // Five appends can outrun the clock, so pin them all to one millisecond:
+        // retention must then fall back to commit order, not list order.
+        var ts = metadata.Snapshots[0].TimestampMs;
+        metadata = metadata with
+        {
+            Snapshots = metadata.Snapshots.Select(s => s with { TimestampMs = ts }).ToList(),
+        };
+        var newest = metadata.Snapshots.Skip(3).Select(s => s.SnapshotId).ToArray();
+
+        var result = await new ExpireSnapshots()
+            .ExpireOlderThan(long.MaxValue)
+            .RetainLast(2)
+            .ApplyAsync(metadata, _fs);
+
+        Assert.Equal(2, result.Metadata.Snapshots.Count);
+        Assert.Equal(newest, result.Metadata.Snapshots.Select(s => s.SnapshotId));
     }
 
     [Fact]
