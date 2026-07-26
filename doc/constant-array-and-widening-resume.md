@@ -1,184 +1,105 @@
-# Resuming the constant-array and value-widening builder cleanups (tiers 2 and 3)
+# Arrow-builder audit — outcome
 
-Handoff for the two remaining items from the Arrow-builder audit whose first item landed as
-`ArrowCompute` (commits `04eaac4` and `9fd512b` on master). Read this first: it records what already
-landed and why, the line numbers as they stand *after* that landing, and several facts that were
-established by measurement or by reading Apache.Arrow's actual behaviour rather than reasoned from
-first principles.
+**Status: complete.** This file was the handoff for tiers 2 and 3 of the Arrow-builder audit (tier 1 landed
+as `ArrowCompute.Take` in `04eaac4` / `9fd512b`). Everything it planned has landed; what follows is the
+record, including the one item deliberately not done and why. Kept under its original name so the references
+to it from `cb919a8` and from the session memory still resolve.
 
-**These are two independently landable commits, deliberately written up together.** Both edit
-`src/EngineeredWood.DeltaLake.Table/TypeWidening/ValueWidener.cs` — tier 2 deletes its null-array
-helpers, tier 3 rewrites its widening methods, and `WidenBatch` calls into both. Doing them in
-separate sessions means reading and re-reasoning about that file twice, with adjacent edits.
+## What landed
 
-## What already landed, and the pattern to follow
-
-`src/EngineeredWood.Core/Arrow/ArrowCompute.cs` is a **public** static class in the
-`EngineeredWood.Arrow` namespace holding `Take` — a row gather built from raw Arrow buffers rather
-than through the typed `XArray.Builder` classes. It replaced four hand-rolled per-type gathers
-(752 lines deleted for 15) in `PartitionUtils`, `DeletionVectorFilter`, `RecordBatchRowFilter` and
-`NestedAssembler`.
-
-Both remaining tiers are the same move applied to a different operation, and should extend the same
-class. The argument for it is not primarily speed:
-
-> A builder round-trips every value through its .NET surface type, which is lossy for timestamps and
-> decimals, and the builder for a narrower type silently discards the source's type parameters (unit,
-> timezone, precision, scale).
-
-Tier 1 found four real defects hiding behind that, including silent data corruption on partitioned
-writes. Expect the same class of finding here rather than only allocation wins.
-
-`test/EngineeredWood.Core.Tests` exists now (287 tests, `net10.0;net8.0;net472`) and is the right home
-for tests of anything added to `ArrowCompute`. Its `Arrow/RawArrays.cs` helper builds arrays straight
-from buffers and is what you need to construct inputs the builders cannot express — a non-zero logical
-offset, an unknown null count, a value too wide for the .NET surface type.
-
-### Facts worth not re-deriving
-
-- **`ArrowBuffer.Empty` + `nullCount: 0` is the right shape for a column with no nulls.** It lets
-  Arrow skip the per-element validity check downstream. `ArrowCompute`'s private `ValidityWriter`
-  does this by allocating the bitmap only once a null actually appears.
-- **`ArrowArrayFactory.BuildArray` reconstructs extension-typed `ArrayData` correctly**, including as
-  a struct child. This was an open question in tier 1 and is now covered by a test. It matters here
-  because both `MakeNullArray` and `ValueWidener.BuildNullArray` special-case extension types.
-- **netstandard2.0 cannot construct a `HalfFloatArray` at all** — `ArrowArrayFactory.BuildArray`
-  throws `"Half-float arrays are not supported by this target framework"`. A type-complete null-array
-  factory has to account for that. `ArrowCompute` needs no `#if` because its width table keys off
-  `HalfFloatType` (present on every target); matching on the *array class* is what forces a guard.
-- **`Apache.Arrow.ExtensionArray` does not derive from `Apache.Arrow.Array`** and has no `Slice`.
-  `ExtensionType.CreateArray` is abstract and returns `ExtensionArray`, so every conforming extension
-  array *is* one.
-- **`DurationType` exposes only static per-unit instances**, no public constructor.
-- **`IntervalType` is deliberately absent from `ArrowCompute.FixedWidthBytes`.** No caller produces
-  interval columns and an unverified width truncates silently. `TakeTypeMatrixTests` pins the throw.
-
-## Tier 2 — row-at-a-time loops that build a constant
-
-Four sites loop `length` times appending a value that is known before the loop starts. All produce one
-of two buffer shapes, which are inverses of each other and want **one helper each** rather than one
-flag-driven helper:
-
-| Column | Validity buffer | `nullCount` |
+| Commit | Tier | Change |
 | --- | --- | --- |
-| constant, non-null | none (`ArrowBuffer.Empty`) | `0` |
-| all-null | all-zero bitmap | `length` |
+| `0d7149c` | step 1 | Cross-validated tier 1's timestamp fix against delta-rs |
+| `6409d2d` | 2b + 2c | `ArrowCompute.MakeNullArray` — the all-null factory |
+| `6407c20` | 2a | `ArrowCompute.Repeat` — the constant factory, plus two decimal fixes |
+| `a55e652` | 3 | `ArrowCompute.Widen` — widening by value-slot copy |
 
-### 2a. `PartitionUtils.BuildConstantArray` — line 270, 11 `case` arms
+`ArrowCompute` now holds four kernels — `Take`, `MakeNullArray`, `Repeat`, `Widen` — sharing one
+`FixedWidthBytes` width table, all producing offset-0 arrays and reusing the caller's `IArrowType` verbatim.
 
-`src/EngineeredWood.DeltaLake.Table/Partitioning/PartitionUtils.cs`, called from lines **131**
-(`AddPartitionColumns`) and **189** (`AppendPartitionColumns`).
+## Defects found
 
-> Line numbers moved: this was at 461 before tier 1 deleted 192 lines from the file.
+The audit's premise was that a builder round-trip hides correctness bugs, not just allocations. It held:
 
-**This is the hot one.** It runs on every batch of every file in a partitioned scan, once per
-partition column, appending the same parsed value `length` times through a builder. Replacement: parse
-once, then one `byte[length * width]` filled via `Span.Fill` for fixed-width types; for strings the
-value bytes are the pattern repeated and the offsets are just `i * len`, both computable without a
-loop over values.
+1. **`ValueWidener.BuildNullArray` typed columns wrong** (2c). Seven per-type arms behind
+   `_ => BuildNullString(length)`, so a missing Timestamp, Decimal, Date, Binary or struct column was
+   backfilled as a `StringArray` — an array contradicting the schema of the batch it was placed into, with
+   nothing raised. Same shape as the `DeletionVectorFilter.CreateEmptyArray` fallback tier 1 fixed.
 
-Because it is a read hot path, this is the item with the largest behavioural surface of the three, and
-worth benchmarking rather than assuming — `test/EngineeredWood.DeltaLake.Benchmarks` exists.
+2. **Partition decimals were silently rounded** (2a). `decimal.Parse` does not fail on excess precision — it
+   rounds and reports success. Measured: a `decimal(38,10)` partition value of
+   `1234567890123456789012345678.1234567890` materialised as `…678.1000000000` for every row of the
+   partition.
 
-### 2b. `SchemaEvolution.MakeNullArray` — line 116, 20 `AppendNull`-loop arms
+3. **Partition decimals wider than `System.Decimal` failed the read** (2a). A `decimal(38,0)` value above
+   `decimal.MaxValue` fits Decimal128's 128 bits and is legal Delta, but `decimal.Parse` threw
+   `OverflowException`. Measured on `99999999999999999999999999999999999999`.
 
-`src/EngineeredWood.DeltaLake.Table/SchemaEvolution.cs`. Called from lines **50** and **97**.
+Tier 3 was, as the handoff predicted, performance-only — `Date32 → Timestamp` starts from a day count, which
+carries no unit to misread and has no sub-day precision to lose.
 
-**This is the richest of the four and the consolidation should move toward its behaviour, not away
-from it.** It already handles extension types (line 124), structs (169) and lists (177) recursively,
-which `ValueWidener`'s copies do not. Two internal details:
+## The interop gap step 1 actually found
 
-- Line 175-176 builds list offsets with `new ArrowBuffer.Builder<int>(length + 1)` then appends `0`
-  in a loop — a zeroed `byte[]` wrapped in an `ArrowBuffer` needs neither.
-- Line 190-191 hand-rolls the all-zero validity bitmap but still loops `bitmap.Append(0)` per byte.
+Both tiers ran green (delta-rs 13, Spark 25) but **could not have caught tier 1's bug**: there was no
+timestamp coverage anywhere under `test/…/Interop`, and every partition column in the suite was the string
+`region`. `0d7149c` closes that from both sides — a partitioned table with a timestamp *data* column (the
+gather tier 1 fixed) and a timestamp *partition* column (`FormatTimestampPartitionValue`, which had no test
+of any kind). New driver command `read_epoch_micros` reports exact microseconds rather than a rendered
+datetime, because a truncating format hides precisely the digits at issue.
 
-**`MakeNullArrayPublic` at line 113 is the same smell as the `TakeRowsPublic` that tier 1 retired** —
-an `internal` one-line delegate to the `private MakeNullArray`, named after its accessibility,
-existing only so `ValueWidener.cs:438` can reach it across a class boundary. A shared factory on
-`ArrowCompute` retires it the same way. Note it is `internal`, not `public`, so unlike `TakeRowsPublic`
-there is no downstream `fabricator-extension` breakage to weigh.
+## Not done: tier 2d (`ArrowRowEvaluator`), and why
 
-### 2c. `ValueWidener.BuildNullArray` — line 422, plus 8 `BuildNull*` at 443-458
+The handoff listed this as "if it still seems worth it". It is not:
 
-`src/EngineeredWood.DeltaLake.Table/TypeWidening/ValueWidener.cs`. Called from `WidenBatch` line
-**56** for a column missing from the source file.
+- `MaterializeAsArray`'s seven per-type loops are **not** the constant-array pattern. They materialise
+  per-row *varying* values out of a `LiteralValue?[]`, and the data is already in .NET surface form by the
+  time it arrives, so there is no fidelity to recover — only a rewrite with real risk. The cases where
+  metadata *would* be lost (decimal, temporal) already build buffers directly in `BuildDecimalArray` /
+  `BuildTimestampArray`.
+- `BuildAllNullStrings` is a genuine `AppendNull` loop and would be a one-line call to the new factory — but
+  `EngineeredWood.Expressions.Arrow` does not reference `EngineeredWood.Core`, and `Core` is the base
+  library with no project references of its own. Adding that edge makes Snappier / ZstdSharp / K4os.LZ4
+  transitive dependencies of a lightweight expression-evaluation package, for four lines. Wrong trade.
+- `Constant` and `Repeat` fill `bool?[]` / `LiteralValue?[]` — managed arrays, not Arrow buffers.
+  `Array.Fill` is marginally tidier and is unavailable on netstandard2.0, which this project targets.
 
-These 8 are strictly redundant with 2b and should simply be **deleted**, not rewritten — the method
-already delegates to `SchemaEvolution.MakeNullArrayPublic` for the extension case (line 438), so it is
-half-migrated already. Its `_ => BuildNullString(length)` fallback (line 439) has the same
-wrong-type-for-the-schema problem tier 1 fixed in `DeletionVectorFilter.CreateEmptyArray`: a null
-Timestamp or Decimal column comes back typed as String.
+Revisit only if `Expressions.Arrow` gains a `Core` dependency for some other reason.
 
-### 2d. `ArrowRowEvaluator` — `src/EngineeredWood.Expressions.Arrow/ArrowRowEvaluator.cs`
+## Measurements
 
-Lowest priority; smaller and on a different path. `BuildAllNullStrings` (588) is an
-`AppendNull` loop; `Constant` (608) and `Repeat` (615) are `for` loops that are `Array.Fill`;
-`MaterializeAsArray` (472) dispatches to 7 per-type builder loops in the 405-470 region.
+Per-array construction, versus the builder loops replaced (`ConstantArrayBenchmarks`,
+`WideningBenchmarks`; ratios at a 1024-row batch, then 65536):
 
-## Tier 3 — `ValueWidener` integer and float widening
+| Operation | 1024 | 65536 |
+| --- | --- | --- |
+| Int64 constant | 20× | 3.4× |
+| String constant | 24× | 4.0× |
+| Timestamp constant | 30× | 4.0× |
+| All-null Int64 | 21× | 27× |
+| Int32 → Int64 widen | 20× | 5× |
+| Date32 → Timestamp widen | 31× | 8× |
 
-`src/EngineeredWood.DeltaLake.Table/TypeWidening/ValueWidener.cs`, three regions:
+Allocation roughly halves throughout, and the builders' repeated internal growth no longer provokes
+Gen1/Gen2 collections at 1024 rows. The fixed-width ratios compress at 65536 as the work becomes
+bandwidth-bound; all-null does not, because it never writes a value buffer.
 
-- **Integer Widening**, lines **103-171** — 6 methods: int8→16, int8→32, int8→64, int16→32, int16→64,
-  int32→64.
-- **Float Widening**, lines **173-219** — 4 methods: float→double, int8→double, int16→double,
-  int32→double.
-- **Date → Timestamp**, lines **221-241** — `WidenDate32ToTimestamp`.
+## Facts still worth not re-deriving
 
-All ten integer/float methods are the same shape: `for` over `source.Length`, `IsNull` probe,
-`b.Append(source.GetValue(i)!.Value)`. Each is a widening element copy: read the source value buffer
-as a span of the narrow type, write a span of the wide type.
+Carried forward from the original handoff, plus what this work added:
 
-**Scope note: the Decimal Widening region (lines 243-398) is already buffer-based** —
-`WidenDecimal128`, `WidenIntToDecimal` and `WidenLongToDecimal` build `resultBytes` with an
-`ArrowBuffer.BitmapBuilder`. Leave it alone. Tier 3 is only the three regions above.
-
-`WidenDate32ToTimestamp` (223) allocates an epoch `DateTime` and round-trips each value through
-`DateTimeOffset` per row for what is arithmetic on the stored `int` days. Deriving the target unit's
-multiplier once and multiplying is faster and avoids the round-trip.
-
-**This one is a performance item only — it is *not* the unit bug tier 1 found in
-`PartitionUtils.TakeRows`, and it was checked rather than assumed.** The difference is where the value
-starts: `TakeRows` read a raw stored `long` and hardcoded an interpretation of its unit, whereas this
-method starts from `days`, which carries no unit, and hands a `DateTimeOffset` (an absolute instant) to
-a builder that knows its own target unit and converts correctly. A date also has no sub-day precision
-to lose. Do not go looking for corruption here.
-
-### The validity-buffer subtlety
-
-Widening never changes nullness, so the source's validity buffer can be **shared by reference** —
-`ArrowBuffer` is a readonly struct over `ReadOnlyMemory`, so this is safe and means no bitmap rebuild
-at all.
-
-**But it is only valid when `source.Data.Offset == 0`.** The bitmap is indexed by *physical* slot, so
-reusing it requires the new array to carry the same offset — which in turn requires allocating
-`(offset + length)` wide slots rather than `length`. For a non-zero offset, either re-derive the
-bitmap for offset 0, or allocate the larger buffer and preserve the offset. Getting this wrong reads
-the wrong rows' null flags, silently. Tier 1's `Offset_ReadsCorrectValidityBits` in
-`TakeDimensionTests` is the template for testing it.
-
-## Suggested order
-
-1. **Run the interop tiers against what already landed, first.** Tier 1's timestamp fix changed the
-   bytes written for millisecond and microsecond timestamp columns in partitioned tables, and the
-   Spark / delta-rs tiers have *not* been run against it. They need `EW_REQUIRE_*` plus the local
-   `JAVA_HOME`/`HADOOP_HOME` toolchain — see `reference_spark_interop_toolchain`. If those surface
-   anything, better to know before layering more onto the same files.
-2. Tier 2b + 2c together — they are one consolidation, and 2c is a deletion.
-3. Tier 2a — separate commit, benchmark it, largest behavioural surface.
-4. Tier 3.
-5. Tier 2d if it still seems worth it.
-
-## Definition of done
-
-- New helpers live on `ArrowCompute` with XML docs (they are public API — Core is packaged, currently
-  `0.1.0`, and `src/Directory.Build.props` notes the public API is preliminary pre-1.0).
-- Direct tests in `test/EngineeredWood.Core.Tests`, using `RawArrays` for inputs, covering the type
-  matrix *and* the offset / all-null / no-null / unknown-null-count shapes.
-- Any behaviour change proven against the old code before deleting it. Tier 1's timestamp corruption
-  was confirmed by replicating the old arm and measuring it (microsecond `1700000000000123` →
-  `1700000000000000`; millisecond `1700000000123` → `1700000000`), not by reading it. A test that
-  passes against both implementations is worthless.
-- Full matrix green: Parquet 715, DeltaLake.Table 441, DeltaLake 210, Core.Tests 287/287/285, Lance
-  Table 94 — plus `net472` for anything touching a `#if NET6_0_OR_GREATER` path, since net472
-  consumes Core's netstandard2.0 build.
+- **`ArrowBuffer.Empty` + `nullCount: 0` is the no-null shape**, and an *allocated* all-zero bitmap with
+  `nullCount: length` is its inverse. An absent bitmap means all-valid, so it is not optional in the
+  all-null direction.
+- **A validity bitmap is indexed by PHYSICAL slot.** `Widen` shares the source's bitmap by reference when
+  `Data.Offset == 0` (`ArrowBuffer` is a readonly struct over `ReadOnlyMemory`) and re-derives it otherwise.
+  Verified load-bearing: removing the `Offset == 0` condition fails exactly the two offset tests and leaves
+  the other 23 passing — the shape of a bug that reaches production.
+- **A declared null count can be −1** (unknown) and must be counted, not trusted.
+- **netstandard2.0 cannot construct a `HalfFloatArray`.** For `Take` that is a non-issue (no input can
+  exist); for `MakeNullArray` it is reached from a *schema*, so it throws with an explanation instead.
+- **`Apache.Arrow.MapType` does not derive from `ListType`**, so arm order between them is free.
+- **`IntervalType` stays absent from `FixedWidthBytes`.** No caller produces interval columns, and an
+  unverified width truncates silently.
+- **`DeltaLiteralDecoder` and the partition materialiser now share `DecimalText`** for digit-exact decimal
+  parsing. They differ only in what they do with an unparseable value: pruning treats it as unknown,
+  materialising a column has to fail.
