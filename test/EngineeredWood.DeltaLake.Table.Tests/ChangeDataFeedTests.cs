@@ -320,6 +320,13 @@ public class ChangeDataFeedTests : IDisposable
     // whole commit is inferred: the remove carries the file's PRE-image DV (none here, so all five rows are
     // deletes) and the add carries the new DV, so only the four survivors are inserts. Net: id=2 deleted.
     // Without the add-side filter the survivors and the deleted row all re-insert, and the delete disappears.
+    //
+    // NOTE: this mode is EW-ONLY and has no reference oracle. Measured against Spark 4.0: asking for a change
+    // feed over a version where delta.enableChangeDataFeed was never set fails with DELTA_MISSING_CHANGE_DATA
+    // rather than inferring anything. EW deliberately answers instead (see ReadChanges_WithoutCdf_InfersChanges)
+    // — so these expectations are EW's own semantics, not a conformance claim. The remove side, which DOES have
+    // a Spark counterpart, is pinned cross-engine by
+    // SparkInteropTests.EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed.
     [Fact]
     public async Task ReadChanges_Inferred_DvDeleteWithoutCdf_ReportsNetDelete()
     {

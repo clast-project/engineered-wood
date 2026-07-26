@@ -1156,4 +1156,126 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 1 && t.Value == "a");
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
+
+    // ── CDF inference over a deletion-vector-carrying file ──
+
+    // Creates an unmapped table with BOTH deletion vectors and CDF. CreateAsync has no CDF switch, so the
+    // property and the writer feature are patched into the generated metadata/protocol as a follow-up commit.
+    private async Task<DeltaTable> CreateCdfDvTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long next;
+        MetadataAction meta;
+        ProtocolAction proto;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, enableDeletionVectors: true))
+        {
+            meta = created.CurrentSnapshot.Metadata;
+            proto = created.CurrentSnapshot.Protocol;
+            next = created.CurrentSnapshot.Version + 1;
+        }
+
+        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[CdfConfig.EnableKey] = "true";
+        var writerFeatures = (proto.WriterFeatures ?? []).ToList();
+        if (!writerFeatures.Contains("changeDataFeed"))
+            writerFeatures.Add("changeDataFeed");
+
+        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
+        {
+            proto with { WriterFeatures = writerFeatures },
+            meta with { Configuration = cfg },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    /// <summary>
+    /// <para>A commit that carries no <c>cdc</c> action is read by INFERENCE — the removed files' rows become
+    /// deletes, the added files' rows become inserts. When the removed file carries a DELETION VECTOR, the rows
+    /// it marks are NOT part of that change: they were reported as deletes when the DV itself committed. This
+    /// pins EW's inference against the reference implementation's.</para>
+    ///
+    /// <para>The scenario: append five rows, DV-delete <c>id=2</c> (a soft delete, so v3 writes a
+    /// <c>_change_data</c> file and reports that one delete), then OVERWRITE — which removes the DV-carrying
+    /// file and emits no cdc action, so v4 is inferred. Spark must report only the four SURVIVORS as deletes;
+    /// re-reporting <c>id=2</c> would count one row's deletion twice across the history.</para>
+    ///
+    /// <para>Spark is a true oracle here: it reads the on-disk log and data files, which are identical whether
+    /// or not EW's own reader honors the DV. Measured against Spark 4.0 — before the DV-aware inference fix EW
+    /// reported five deletes at v4 where Spark reported four.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long appendVersion, deleteVersion, overwriteVersion;
+        await using (var table = await CreateCdfDvTableAsync())
+        {
+            appendVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([1, 2, 3, 4, 5], ["emea", "emea", "emea", "emea", "emea"])]);
+
+            deleteVersion = table.CurrentSnapshot.Version + 1;
+            await table.DeleteAsync(b =>
+            {
+                var id = (Int64Array)b.Column("id");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 2);
+                return mask.Build();
+            });
+
+            // The scenario is only meaningful if the DELETE actually soft-deleted via a DV rather than
+            // rewriting the file — otherwise the removed file below carries nothing to double-count.
+            Assert.Contains(table.CurrentSnapshot.ActiveFiles.Values, a => a.DeletionVector is not null);
+
+            overwriteVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([9], ["emea"])], DeltaWriteMode.Overwrite);
+        }
+
+        // The inferred version, as each engine sees it.
+        var sparkInferred = SparkChanges(overwriteVersion, overwriteVersion);
+        var ewInferred = await EwChangesAsync(overwriteVersion, overwriteVersion);
+
+        // id=2 was already reported deleted at the DV commit; only the four survivors are deleted here.
+        var expected = new List<(string, long)>
+        {
+            ("delete", 1), ("delete", 3), ("delete", 4), ("delete", 5), ("insert", 9),
+        };
+        Assert.Equal(expected, sparkInferred);
+        Assert.Equal(expected, ewInferred);
+        Assert.Equal(sparkInferred, ewInferred);
+
+        // Across the whole history the deletion of id=2 is reported EXACTLY once — at the DV commit, not
+        // again at the overwrite. This is the property the double-count broke.
+        var sparkAll = SparkChanges(appendVersion, overwriteVersion);
+        var ewAll = await EwChangesAsync(appendVersion, overwriteVersion);
+        Assert.Equal(sparkAll, ewAll);
+        Assert.Single(sparkAll.Where(t => t is { Ct: "delete", Id: 2 }));
+    }
+
+    private List<(string Ct, long Id)> SparkChanges(long start, long end)
+    {
+        var result = Spark.Invoke("read_changes", new { path = _tempDir, start, end });
+        return result.GetProperty("rows").EnumerateArray()
+            .Select(r => (r.GetProperty(CdfConfig.ChangeTypeColumn).GetString()!,
+                          r.GetProperty("id").GetInt64()))
+            .OrderBy(t => t.Item1, StringComparer.Ordinal).ThenBy(t => t.Item2)
+            .ToList();
+    }
+
+    private async Task<List<(string Ct, long Id)>> EwChangesAsync(long start, long end)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+        var rows = new List<(string, long)>();
+        await foreach (var b in table.ReadChangesAsync(start, end))
+        {
+            var ids = (Int64Array)b.Column("id");
+            var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
+            for (int i = 0; i < b.Length; i++)
+                rows.Add((ct.GetString(i), ids.GetValue(i)!.Value));
+        }
+
+        return rows.OrderBy(t => t.Item1, StringComparer.Ordinal).ThenBy(t => t.Item2).ToList();
+    }
 }
