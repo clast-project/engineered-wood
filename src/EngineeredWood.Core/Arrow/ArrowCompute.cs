@@ -318,9 +318,11 @@ public static class ArrowCompute
     /// Widens a fixed-width column to a wider type, losslessly — a value-slot copy per row rather than a
     /// round-trip through either type's .NET surface representation.
     ///
-    /// <para>Supported: the integer ladder (Int8 → Int16 → Int32 → Int64), Int8/Int16/Int32 → Double,
-    /// Float → Double, and Date32 → Timestamp at any unit. Every one of those is exactly representable in
-    /// the target, which is what makes this a widening rather than a cast: nothing here can round.</para>
+    /// <para>Supported: the integer ladder (Int8 → Int16 → Int32 → Int64), an unsigned source into any
+    /// signed type that can hold its whole range (UInt8 → Int16, UInt16 → Int32, UInt32 → Int64, …),
+    /// Int8/Int16/Int32 → Double, Float → Double, and Date32 → Timestamp at any unit. Every one of those is
+    /// exactly representable in the target, which is what makes this a widening rather than a cast: nothing
+    /// here can round.</para>
     ///
     /// <para>Narrowing conversions are deliberately absent rather than throwing at runtime for some values
     /// and succeeding for others — an unlisted pair is a <see cref="NotSupportedException"/>.</para>
@@ -339,6 +341,18 @@ public static class ArrowCompute
 
             (Int32Type, Int64Type) => WidenSlots<int, long, Int32ToInt64>(source, targetType),
             (Int32Type, DoubleType) => WidenSlots<int, double, Int32ToDouble>(source, targetType),
+
+            // Unsigned sources are ZERO-extended into the next signed type that holds their whole range —
+            // every value stays positive, so the target's signed ordering agrees with the source's unsigned
+            // one. (An unsigned source into the SAME-width signed type would wrap, so those pairs are absent.)
+            (UInt8Type, Int16Type) => WidenSlots<byte, short, ByteToInt16>(source, targetType),
+            (UInt8Type, Int32Type) => WidenSlots<byte, int, ByteToInt32>(source, targetType),
+            (UInt8Type, Int64Type) => WidenSlots<byte, long, ByteToInt64>(source, targetType),
+
+            (UInt16Type, Int32Type) => WidenSlots<ushort, int, UInt16ToInt32>(source, targetType),
+            (UInt16Type, Int64Type) => WidenSlots<ushort, long, UInt16ToInt64>(source, targetType),
+
+            (UInt32Type, Int64Type) => WidenSlots<uint, long, UInt32ToInt64>(source, targetType),
 
             (FloatType, DoubleType) => WidenSlots<float, double, FloatToDouble>(source, targetType),
 
@@ -369,6 +383,12 @@ public static class ArrowCompute
     private readonly struct Int16ToDouble : IWideningOp<short, double> { public double Apply(short v) => v; }
     private readonly struct Int32ToInt64 : IWideningOp<int, long> { public long Apply(int v) => v; }
     private readonly struct Int32ToDouble : IWideningOp<int, double> { public double Apply(int v) => v; }
+    private readonly struct ByteToInt16 : IWideningOp<byte, short> { public short Apply(byte v) => v; }
+    private readonly struct ByteToInt32 : IWideningOp<byte, int> { public int Apply(byte v) => v; }
+    private readonly struct ByteToInt64 : IWideningOp<byte, long> { public long Apply(byte v) => v; }
+    private readonly struct UInt16ToInt32 : IWideningOp<ushort, int> { public int Apply(ushort v) => v; }
+    private readonly struct UInt16ToInt64 : IWideningOp<ushort, long> { public long Apply(ushort v) => v; }
+    private readonly struct UInt32ToInt64 : IWideningOp<uint, long> { public long Apply(uint v) => v; }
     private readonly struct FloatToDouble : IWideningOp<float, double> { public double Apply(float v) => v; }
 
     private static IArrowArray WidenSlots<TFrom, TTo, TOp>(IArrowArray source, IArrowType targetType)

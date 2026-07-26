@@ -136,6 +136,78 @@ public class ParquetFileWriterTests : IDisposable
         });
     }
 
+    // Int8/UInt8/Int16/UInt16 are all written as the 4-byte Int32 PHYSICAL type, but every downstream
+    // value extraction (dictionary encoder, PLAIN, the V2 encoders, statistics) reinterprets the Arrow
+    // value buffer AT THE PHYSICAL WIDTH — so a 1-byte buffer read as int packs four rows into one value,
+    // which the buffer's 64-byte padding hides instead of faulting. Pinned at the type boundaries, over
+    // both the dictionary and the plain path.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RoundTrip_NarrowIntegerColumns(bool dictionaryEnabled)
+    {
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = dictionaryEnabled,
+        };
+
+        async Task Check<TArray, T>(string name, IArrowType type, T?[] expected, IArrowArray array)
+            where TArray : IArrowArray, IReadOnlyList<T?>
+            where T : struct
+        {
+            await WriteAndVerify(
+                TempPath($"{name}_{dictionaryEnabled}.parquet"),
+                MakeBatch(new Field("v", type, nullable: true), array),
+                readBatch =>
+                {
+                    var col = Assert.IsType<TArray>(readBatch.Column(0));
+                    Assert.Equal(expected, col);
+                },
+                options);
+        }
+
+        var int8 = new sbyte?[] { 1, -2, sbyte.MinValue, sbyte.MaxValue, null, 0 };
+        var int8Builder = new Int8Array.Builder();
+        foreach (var v in int8) { if (v is null) int8Builder.AppendNull(); else int8Builder.Append(v.Value); }
+        await Check<Int8Array, sbyte>("int8", Int8Type.Default, int8, int8Builder.Build());
+
+        var uint8 = new byte?[] { 1, 200, byte.MaxValue, null, 0 };
+        var uint8Builder = new UInt8Array.Builder();
+        foreach (var v in uint8) { if (v is null) uint8Builder.AppendNull(); else uint8Builder.Append(v.Value); }
+        await Check<UInt8Array, byte>("uint8", UInt8Type.Default, uint8, uint8Builder.Build());
+
+        var int16 = new short?[] { 1, -2, short.MinValue, short.MaxValue, null, 0 };
+        var int16Builder = new Int16Array.Builder();
+        foreach (var v in int16) { if (v is null) int16Builder.AppendNull(); else int16Builder.Append(v.Value); }
+        await Check<Int16Array, short>("int16", Int16Type.Default, int16, int16Builder.Build());
+
+        var uint16 = new ushort?[] { 1, 40000, ushort.MaxValue, null, 0 };
+        var uint16Builder = new UInt16Array.Builder();
+        foreach (var v in uint16) { if (v is null) uint16Builder.AppendNull(); else uint16Builder.Append(v.Value); }
+        await Check<UInt16Array, ushort>("uint16", UInt16Type.Default, uint16, uint16Builder.Build());
+    }
+
+    // A required (no def levels) narrow column takes the direct buffer-copy path rather than the
+    // per-row extraction — the same width assumption, a different branch.
+    [Fact]
+    public async Task RoundTrip_NarrowIntegerColumn_Required()
+    {
+        string path = TempPath("int8_required.parquet");
+        var values = new sbyte[] { 1, 2, 3, 4, 5, sbyte.MinValue, sbyte.MaxValue };
+        var batch = MakeBatch(
+            new Field("v", Int8Type.Default, nullable: false),
+            new Int8Array.Builder().AppendRange(values).Build());
+
+        await WriteAndVerify(path, batch, readBatch =>
+        {
+            var col = Assert.IsType<Int8Array>(readBatch.Column(0));
+            Assert.Equal(values.Length, col.Length);
+            for (int i = 0; i < values.Length; i++)
+                Assert.Equal(values[i], col.GetValue(i));
+        });
+    }
+
     [Fact]
     public async Task RoundTrip_Int64Column()
     {
@@ -1138,6 +1210,32 @@ public class ParquetFileWriterTests : IDisposable
             Assert.Equal(2L, stats.NullCount);
             Assert.Equal(BitConverter.GetBytes(3), stats.MinValue);
             Assert.Equal(BitConverter.GetBytes(10), stats.MaxValue);
+        });
+    }
+
+    // Statistics read the same value buffer at the physical width, so a narrow column's min/max is
+    // corrupt in exactly the way the values are — and a wrong min/max prunes real rows away at read.
+    [Fact]
+    public async Task Statistics_Int8_MinMaxAtPhysicalWidth()
+    {
+        string path = TempPath("stats_int8.parquet");
+        var builder = new Int8Array.Builder();
+        builder.Append((sbyte)7);
+        builder.AppendNull();
+        builder.Append((sbyte)-3);
+        builder.Append((sbyte)9);
+
+        var batch = MakeBatch(
+            new Field("x", Int8Type.Default, nullable: true),
+            builder.Build());
+
+        await WriteAndVerifyStats(path, batch, stats =>
+        {
+            Assert.NotNull(stats);
+            Assert.Equal(1L, stats.NullCount);
+            // Int32 physical type → the bound is the 4-byte encoding of the logical value.
+            Assert.Equal(BitConverter.GetBytes(-3), stats.MinValue);
+            Assert.Equal(BitConverter.GetBytes(9), stats.MaxValue);
         });
     }
 

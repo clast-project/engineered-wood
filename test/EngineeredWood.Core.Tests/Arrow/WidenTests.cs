@@ -55,6 +55,56 @@ public class WidenTests
     }
 
     [Fact]
+    public void UnsignedToWiderSigned_ZeroExtends()
+    {
+        // The top-of-range values are the ones a widening that sign-extended would turn negative.
+        byte[] bytes = [0, 1, 200, byte.MaxValue];
+        var u8 = RawArrays.Fixed(UInt8Type.Default, bytes);
+
+        var u8To16 = Assert.IsType<Int16Array>(ArrowCompute.Widen(u8, Int16Type.Default));
+        var u8To32 = Assert.IsType<Int32Array>(ArrowCompute.Widen(u8, Int32Type.Default));
+        var u8To64 = Assert.IsType<Int64Array>(ArrowCompute.Widen(u8, Int64Type.Default));
+
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            Assert.Equal(bytes[i], u8To16.GetValue(i));
+            Assert.Equal(bytes[i], u8To32.GetValue(i));
+            Assert.Equal(bytes[i], u8To64.GetValue(i));
+        }
+
+        ushort[] ushorts = [0, 1, 40000, ushort.MaxValue];
+        var u16 = RawArrays.Fixed(UInt16Type.Default, ushorts);
+
+        var u16To32 = Assert.IsType<Int32Array>(ArrowCompute.Widen(u16, Int32Type.Default));
+        var u16To64 = Assert.IsType<Int64Array>(ArrowCompute.Widen(u16, Int64Type.Default));
+
+        for (int i = 0; i < ushorts.Length; i++)
+        {
+            Assert.Equal(ushorts[i], u16To32.GetValue(i));
+            Assert.Equal(ushorts[i], u16To64.GetValue(i));
+        }
+
+        uint[] uints = [0, 1, 3_000_000_000, uint.MaxValue];
+        var u32 = RawArrays.Fixed(UInt32Type.Default, uints);
+
+        var u32To64 = Assert.IsType<Int64Array>(ArrowCompute.Widen(u32, Int64Type.Default));
+
+        for (int i = 0; i < uints.Length; i++)
+            Assert.Equal(uints[i], u32To64.GetValue(i));
+    }
+
+    [Fact]
+    public void UnsignedToSameWidthSigned_IsRejected()
+    {
+        // Not a widening: the source's top half wraps negative. Absent rather than silently wrapping.
+        var u8 = RawArrays.Fixed(UInt8Type.Default, new byte[] { byte.MaxValue });
+        var u32 = RawArrays.Fixed(UInt32Type.Default, new uint[] { uint.MaxValue });
+
+        Assert.Throws<NotSupportedException>(() => ArrowCompute.Widen(u8, Int8Type.Default));
+        Assert.Throws<NotSupportedException>(() => ArrowCompute.Widen(u32, Int32Type.Default));
+    }
+
+    [Fact]
     public void Int32ToInt64_CopiesValuesIncludingTheExtremes()
     {
         int[] values = [0, -1, int.MaxValue, int.MinValue, 12345];

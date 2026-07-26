@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using Clast.BloomFilter;
+using EngineeredWood.Arrow;
 using EngineeredWood.Compression;
 using EngineeredWood.Parquet.BloomFilter;
 using EngineeredWood.Parquet.Metadata;
@@ -128,6 +129,19 @@ internal static class ColumnChunkWriter
         // Normalize def levels for value-encoding and dictionary methods:
         // these check defLevels[i] == 0 for null, which only works when maxDefLevel <= 1.
         int[]? valueDefLevels = NormalizeDefLevels(defLevels, maxDefLevel);
+
+        // Int8/UInt8/Int16/UInt16 are written as the 4-byte Int32 physical type, but every value extraction
+        // below (DictionaryEncoder, PLAIN, the V2 encoders, StatisticsCollector) reinterprets the raw Arrow
+        // value buffer AT THE PHYSICAL WIDTH — reading a 1-byte buffer as int packs four rows into each
+        // value: silent corruption when the buffer's 64-byte padding hides the overrun, an out-of-range
+        // read when it does not. Widen once here so every consumer downstream sees a 4-byte buffer, the
+        // same single-normalization shape as the FLBA byte reversal below.
+        if (physicalType == PhysicalType.Int32
+            && array.Data.DataType is Int8Type or UInt8Type or Int16Type or UInt16Type)
+        {
+            // Sign- vs zero-extension follows the source type; nulls and row positions are preserved.
+            array = ArrowCompute.Widen(array, Int32Type.Default);
+        }
 
         // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
         // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
