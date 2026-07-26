@@ -230,38 +230,60 @@ public class TakeExtensionTests
     }
 
     [Fact]
+    public void ExtensionOverListStorage_GathersThroughStorageAndKeepsAnnotation()
+    {
+        // A list is nested storage of a third shape — its child is reached through its offsets rather than
+        // being parallel to its rows, so it exercises a recursion path neither the primitive nor the struct
+        // extension case does.
+        var values = RawArrays.Fixed(Int32Type.Default, new[] { 1, 2, 3, 4, 5 });
+        var listType = new ListType(new Field("item", Int32Type.Default, true));
+        var list = RawArrays.List(listType, [0, 2, 2, 5], values);
+
+        var wrapperType = new WrapperType(listType);
+        var array = wrapperType.CreateArray(list);
+
+        var result = ArrowCompute.Take(array, (int[])[2, 0, 1]);
+
+        var ext = Assert.IsType<WrapperArray>(result);
+        Assert.Equal("test.wrapper", ((ExtensionType)ext.Data.DataType).Name);
+
+        var storage = Assert.IsType<ListArray>(ext.Storage);
+        Assert.Equal(3, storage.Length);
+        Assert.Equal(3, ((Int32Array)storage.GetSlicedValues(0)!).Length);   // source row 2 → [3,4,5]
+        Assert.Equal(2, ((Int32Array)storage.GetSlicedValues(1)!).Length);   // source row 0 → [1,2]
+        Assert.Equal(0, ((Int32Array)storage.GetSlicedValues(2)!).Length);   // source row 1 → []
+    }
+
+    [Fact]
     public void ExtensionOverUnsupportedStorage_Throws()
     {
         // An extension does not make an ungatherable storage type gatherable; it must still refuse rather
         // than hand back a wrong-length column.
-        var values = RawArrays.Fixed(Int32Type.Default, new[] { 1, 2, 3, 4 });
-        var offsets = new ArrowBuffer.Builder<int>(3);
-        offsets.Append(0).Append(2).Append(4);
-        var listType = new ListType(new Field("item", Int32Type.Default, true));
-        var list = new ListArray(new ArrayData(
-            listType, 2, 0, 0,
-            new[] { ArrowBuffer.Empty, offsets.Build() }, new[] { values.Data }));
+        var indices = new Int32Array.Builder().Append(0).Append(1).Build();
+        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
+        var dictType = new DictionaryType(Int32Type.Default, StringType.Default, ordered: false);
+        var dict = new DictionaryArray(dictType, indices, dictionary);
 
-        var listExtType = new ListExtType(listType);
-        var array = listExtType.CreateArray(list);
+        var array = new WrapperType(dictType).CreateArray(dict);
 
         Assert.Throws<NotSupportedException>(() => ArrowCompute.Take(array, (int[])[1, 0]));
     }
 
-    internal sealed class ListExtType : ExtensionType
+    /// <summary>An extension over whatever storage a test hands it, so one type covers both cases above.</summary>
+    internal sealed class WrapperType : ExtensionType
     {
-        public ListExtType(IArrowType storage) : base(storage) { }
+        public WrapperType(IArrowType storage) : base(storage) { }
 
-        public override string Name => "test.listext";
+        public override string Name => "test.wrapper";
 
         public override string ExtensionMetadata => string.Empty;
 
         public override ExtensionArray CreateArray(IArrowArray storage) =>
-            new ListExtArray(this, storage);
+            new WrapperArray(this, storage);
     }
 
-    internal sealed class ListExtArray : ExtensionArray
+    internal sealed class WrapperArray : ExtensionArray
     {
-        public ListExtArray(ListExtType type, IArrowArray storage) : base(type, storage) { }
+        public WrapperArray(WrapperType type, IArrowArray storage) : base(type, storage) { }
     }
 }

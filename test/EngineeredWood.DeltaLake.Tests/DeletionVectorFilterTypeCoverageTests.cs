@@ -136,20 +136,49 @@ public class DeletionVectorFilterTypeCoverageTests
         Assert.Equal(3, ((Int32Array)s.Fields[1]).GetValue(1));
     }
 
-    // The important part: an unsliceable type must THROW rather than come back unfiltered at the wrong length.
+    // A LIST column is filtered by re-deriving its offsets over a gathered child, so a delete against a table
+    // with a list column rewrites correctly rather than refusing. (It used to throw — a list was the type this
+    // filter could not handle at all.)
     [Fact]
-    public void Filter_UnsupportedType_Throws()
+    public void Filter_List_KeepsSurvivingRowsAndTheirElements()
     {
         var valueField = new Field("item", Int64Type.Default, true);
         var type = new ListType(valueField);
         var builder = new ListArray.Builder(valueField);
         var values = (Int64Array.Builder)builder.ValueBuilder;
+        // Rows of different lengths, so a filter that kept the child intact would misalign every later row.
         builder.Append(); values.Append(1);
-        builder.Append(); values.Append(2);
-        builder.Append(); values.Append(3);
+        builder.Append(); values.Append(2).Append(3);
+        builder.Append(); values.Append(4).Append(5).Append(6);
         var col = builder.Build();
 
-        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("l", type, true)).Build();
+        var result = Filter(new Field("l", type, true), col);
+
+        Assert.Equal(2, result.Length);
+        var list = Assert.IsType<ListArray>(result.Column(0));
+        Assert.Equal(2, list.Length);
+
+        var row0 = Assert.IsType<Int64Array>(list.GetSlicedValues(0));
+        Assert.Equal([1L], Enumerable.Range(0, row0.Length).Select(i => row0.GetValue(i)!.Value));
+
+        // Row 1 was deleted, so the survivor's elements must be [4,5,6] — not [2,3] shifted into its place.
+        var row1 = Assert.IsType<Int64Array>(list.GetSlicedValues(1));
+        Assert.Equal([4L, 5L, 6L], Enumerable.Range(0, row1.Length).Select(i => row1.GetValue(i)!.Value));
+
+        // The gathered child must hold only the surviving rows' elements.
+        Assert.Equal(4, ((Int64Array)list.Values).Length);
+    }
+
+    // The important part: an unsliceable type must THROW rather than come back unfiltered at the wrong length.
+    [Fact]
+    public void Filter_UnsupportedType_Throws()
+    {
+        var type = new DictionaryType(Int32Type.Default, StringType.Default, ordered: false);
+        var indices = new Int32Array.Builder().Append(0).Append(1).Append(0).Build();
+        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
+        var col = new DictionaryArray(type, indices, dictionary);
+
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("d", type, true)).Build();
         var batch = new RecordBatch(schema, [col], 3);
 
         Assert.Throws<NotSupportedException>(() =>

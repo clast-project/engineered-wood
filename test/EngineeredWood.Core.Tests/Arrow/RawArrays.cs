@@ -116,6 +116,59 @@ internal static class RawArrays
             new[] { Validity(physicalValid, physicalCount) }, childData));
     }
 
+    /// <summary>
+    /// A list-shaped array with 32-bit offsets — LIST or MAP, depending on <paramref name="type"/> — over a
+    /// pre-built child.
+    ///
+    /// <para><paramref name="physicalOffsets"/> is the raw offsets buffer: indexed by PHYSICAL slot, and
+    /// holding LOGICAL positions in <paramref name="child"/>, which is Arrow's own convention. The child is
+    /// NOT pre-shifted by <paramref name="offset"/> — a list reaches its child through the offsets, not by
+    /// being sliced with its parent.</para>
+    /// </summary>
+    public static IArrowArray List(
+        IArrowType type, int[] physicalOffsets, IArrowArray child,
+        bool[]? physicalValid = null, int offset = 0)
+    {
+        int physical = physicalOffsets.Length - 1;
+        var b = new ArrowBuffer.Builder<int>(physicalOffsets.Length);
+        foreach (int o in physicalOffsets) b.Append(o);
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, physical - offset, CountNulls(physicalValid, offset, physical), offset,
+            new[] { Validity(physicalValid, physical), b.Build() },
+            new[] { child.Data }));
+    }
+
+    /// <summary>The 64-bit-offset twin of <see cref="List"/>, for LargeList.</summary>
+    public static IArrowArray LargeList(
+        IArrowType type, long[] physicalOffsets, IArrowArray child,
+        bool[]? physicalValid = null, int offset = 0)
+    {
+        int physical = physicalOffsets.Length - 1;
+        var b = new ArrowBuffer.Builder<long>(physicalOffsets.Length);
+        foreach (long o in physicalOffsets) b.Append(o);
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, physical - offset, CountNulls(physicalValid, offset, physical), offset,
+            new[] { Validity(physicalValid, physical), b.Build() },
+            new[] { child.Data }));
+    }
+
+    /// <summary>
+    /// A fixed-size list over a pre-built child. There is no offsets buffer — the validity bitmap is the only
+    /// one — and the child must be exactly <c>physicalCount * type.ListSize</c> long whatever the validity says.
+    /// </summary>
+    public static IArrowArray FixedSizeList(
+        FixedSizeListType type, int physicalCount, IArrowArray child,
+        bool[]? physicalValid = null, int offset = 0)
+    {
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, physicalCount - offset,
+            CountNulls(physicalValid, offset, physicalCount), offset,
+            new[] { Validity(physicalValid, physicalCount) },
+            new[] { child.Data }));
+    }
+
     /// <summary>Raw value-slot bytes for one LOGICAL row of a fixed-width array.</summary>
     public static byte[] Slot(IArrowArray array, int logicalRow, int byteWidth) =>
         array.Data.Buffers[1].Span

@@ -225,9 +225,9 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// at 0. Only a caller that sliced its own data pays for the copy.</para>
     ///
     /// <para><c>Take</c> with the identity selection is the compaction: it applies the source's offset in
-    /// every one of its per-type gathers, so the result is a genuine copy of the rows the view designates. A
-    /// sliced LIST or MAP column raises <see cref="NotSupportedException"/> from there rather than being
-    /// written wrong — the one shape this cannot yet compact.</para>
+    /// every one of its per-type gathers, so the result is a genuine copy of the rows the view designates.
+    /// A type it cannot gather raises <see cref="NotSupportedException"/> from there rather than being
+    /// written wrong.</para>
     /// </summary>
     private static RecordBatch CompactSlicedColumns(RecordBatch batch)
     {
@@ -275,25 +275,32 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
     private static IArrowArray MaterializeSlice(IArrowArray array, int offset, int length)
     {
-        // Use Arrow's builder pattern to create a zero-offset copy of the slice
-        var sliced = ((Apache.Arrow.Array)array).Slice(offset, length);
-        var slicedData = sliced.Data;
-
-        if (slicedData.Offset == 0)
-            return sliced; // Already zero-offset (e.g., first slice)
-
-        // A STRUCT has no flat value buffer for the copy below to slice — its children are separate arrays,
-        // and they are not sliced along with the parent. Gather it instead: Take applies the source's offset
-        // in each per-type gather and recurses into the children, so a struct column no longer fails the
-        // auto-split outright. (LIST and MAP still fall through to the copy's explicit refusal — Take cannot
-        // gather them either, and the message there names the workaround.)
-        if (array is StructArray)
+        // A NESTED column is gathered rather than sliced, and — unlike the flat cases below — it is gathered
+        // even at offset zero.
+        //
+        // A nested column has no flat value buffer for CopyArray to slice: a struct's children are separate
+        // arrays that are not sliced along with their parent, and a list-shaped column reaches its child
+        // through its offsets buffer. But taking Arrow's zero-copy VIEW is not enough either, which is why
+        // the offset-zero shortcut below cannot cover this. A view narrows the PARENT's row range and leaves
+        // the children whole, so the first row group of a split list column still hands the leaf every row in
+        // the batch while the def levels describe only this group's — measured as an IndexOutOfRangeException
+        // out of StatisticsCollector. Take rebuilds the children down to exactly the selected rows, which is
+        // what the write path assumes throughout. (MapArray derives from ListArray, so a map is covered by
+        // the list pattern here.)
+        if (array is StructArray or ListArray or LargeListArray or FixedSizeListArray)
         {
             var indices = new int[length];
             for (int i = 0; i < length; i++)
                 indices[i] = offset + i;
             return EngineeredWood.Arrow.ArrowCompute.Take(array, indices);
         }
+
+        // Use Arrow's builder pattern to create a zero-offset copy of the slice
+        var sliced = ((Apache.Arrow.Array)array).Slice(offset, length);
+        var slicedData = sliced.Data;
+
+        if (slicedData.Offset == 0)
+            return sliced; // Already zero-offset (e.g., first slice)
 
         // For non-zero offset slices, create a compact copy.
         // The simplest approach: build new ArrayData with copied buffers.

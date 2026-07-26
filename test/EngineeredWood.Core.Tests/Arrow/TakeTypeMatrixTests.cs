@@ -287,17 +287,17 @@ public class TakeTypeMatrixTests
     [Fact]
     public void UnsupportedType_Throws()
     {
-        // List is genuinely not gatherable here. It must throw rather than pass the column through
-        // unfiltered — an unfiltered column has the wrong length for the batch it lands in.
-        var values = RawArrays.Fixed(Int32Type.Default, new[] { 1, 2, 3, 4 });
-        var offsets = new ArrowBuffer.Builder<int>(3);
-        offsets.Append(0).Append(2).Append(4);
-        var list = new ListArray(new ArrayData(
-            new ListType(new Field("item", Int32Type.Default, true)),
-            2, 0, 0, new[] { ArrowBuffer.Empty, offsets.Build() }, new[] { values.Data }));
+        // A dictionary-encoded column is genuinely not gatherable here. It must throw rather than pass the
+        // column through unfiltered — an unfiltered column has the wrong length for the batch it lands in.
+        var indices = new Int32Array.Builder().Append(0).Append(1).Append(0).Build();
+        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
+        var dict = new DictionaryArray(
+            new DictionaryType(Int32Type.Default, StringType.Default, ordered: false),
+            indices, dictionary);
 
-        var ex = Assert.Throws<NotSupportedException>(() => ArrowCompute.Take(list, (int[])[1, 0]));
-        Assert.Contains("List", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var ex = Assert.Throws<NotSupportedException>(() => ArrowCompute.Take(dict, (int[])[1, 0]));
+        Assert.Contains("ArrowCompute", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Dictionary", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

@@ -63,6 +63,28 @@ public static class ArrowCompute
             case StructArray a:
                 return TakeStruct(a, indices);
 
+            // A map IS a list of key/value entry structs, and Apache.Arrow models that literally: MapArray
+            // DERIVES FROM ListArray (measured), so `case ListArray` on its own would match maps too. The map
+            // arm is spelled out separately and FIRST so the derived type cannot be swallowed by the base one
+            // — and because they are ordered this way, the compiler enforces it: putting the list arm first
+            // makes this one unreachable and fails the build with CS8120 (measured). What both arms rely on
+            // is passing source.Data.DataType through, which is what keeps a map a map rather than the plain
+            // list its layout looks like. Note this is the ARRAY hierarchy only — the TYPES are unrelated
+            // (MapType is not a ListType), which DeltaLake's
+            // MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant pins for type-driven walks.
+            case MapArray a:
+                return TakeList32(a, indices);
+            case ListArray a:
+                return TakeList32(a, indices);
+
+            // Kept distinct from the 32-bit arm for the same reason as LargeString/LargeBinary: rebuilding a
+            // LargeList through the narrow path would contradict the schema and overflow past 2^31 children.
+            case LargeListArray a:
+                return TakeList64(a, indices);
+
+            case FixedSizeListArray a:
+                return TakeFixedSizeList(a, indices);
+
             default:
             {
                 // Every fixed-width type — signed/unsigned ints, floats, HalfFloat, Date/Time/Timestamp/
@@ -810,6 +832,182 @@ public static class ArrowCompute
             source.Data.DataType, count, validity.NullCount, offset: 0,
             new[] { validity.Build() }, children));
     }
+
+    /// <summary>
+    /// Gathers a LIST or MAP — the two that share the 32-bit-offset list layout — by turning each kept row's
+    /// offset range into the child positions it covers, then gathering the child by those positions.
+    ///
+    /// <para>A list's child is reached through the offsets buffer, NOT by being sliced alongside its parent
+    /// the way a struct's children are. That difference is the whole of this method: the offsets buffer is
+    /// indexed by the parent's PHYSICAL slot (so the parent's offset applies to it), while the values it
+    /// holds are LOGICAL positions in the child, with the child's own offset applying on top. Measured
+    /// against Apache.Arrow's own <c>GetSlicedValues</c>, which resolves them the same way — so handing those
+    /// positions straight to the recursive <see cref="Take(IArrowArray, ReadOnlySpan{int})"/> is correct, and
+    /// shifting them by the parent's offset (as the struct gather must) would read the wrong child rows.</para>
+    ///
+    /// <para>The source's DataType is reused verbatim, which is what keeps a MAP a map — including its
+    /// keysSorted flag and its entry field names — rather than the list its layout looks like.</para>
+    /// </summary>
+    private static IArrowArray TakeList32(IArrowArray source, ReadOnlySpan<int> indices)
+    {
+        int count = indices.Length;
+        ReadOnlySpan<int> srcOffsets = MemoryMarshal.Cast<byte, int>(source.Data.Buffers[1].Span);
+        int arrOffset = source.Data.Offset;
+
+        var newOffsets = new int[count + 1];
+        var validity = new ValidityWriter(count, source.NullCount);
+        bool probeNulls = validity.SourceHasNulls;
+
+        // First pass sizes the child selection and fills the offsets; a null contributes a zero-length slice,
+        // which still needs its offset written so the run stays monotonic.
+        int total = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int r = indices[i];
+            newOffsets[i] = total;
+
+            if (probeNulls && source.IsNull(r))
+            {
+                validity.SetNull(i);
+                continue;
+            }
+
+            int slot = arrOffset + r;
+            // Checked because duplicated indices can select more child rows than the source holds, and a
+            // wrapped total would size the child buffer wrong rather than fail.
+            total = checked(total + (srcOffsets[slot + 1] - srcOffsets[slot]));
+        }
+        newOffsets[count] = total;
+
+        var childIndices = new int[total];
+        int w = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int r = indices[i];
+            if (probeNulls && source.IsNull(r))
+                continue;
+
+            int slot = arrOffset + r;
+            int start = srcOffsets[slot];
+            int len = srcOffsets[slot + 1] - start;
+            for (int k = 0; k < len; k++)
+                childIndices[w++] = start + k;
+        }
+
+        var offsetBytes = new byte[(count + 1) * sizeof(int)];
+        MemoryMarshal.AsBytes(newOffsets.AsSpan()).CopyTo(offsetBytes);
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            source.Data.DataType, count, validity.NullCount, offset: 0,
+            new[] { validity.Build(), new ArrowBuffer(offsetBytes) },
+            new[] { TakeListChild(source, childIndices) }));
+    }
+
+    /// <summary>
+    /// The 64-bit-offset twin of <see cref="TakeList32"/>, for LargeList. The child positions themselves
+    /// still have to fit an <see cref="int"/> — an Arrow array cannot be longer than that — so the narrowing
+    /// is checked rather than assumed.
+    /// </summary>
+    private static IArrowArray TakeList64(IArrowArray source, ReadOnlySpan<int> indices)
+    {
+        int count = indices.Length;
+        ReadOnlySpan<long> srcOffsets = MemoryMarshal.Cast<byte, long>(source.Data.Buffers[1].Span);
+        int arrOffset = source.Data.Offset;
+
+        var newOffsets = new long[count + 1];
+        var validity = new ValidityWriter(count, source.NullCount);
+        bool probeNulls = validity.SourceHasNulls;
+
+        long total = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int r = indices[i];
+            newOffsets[i] = total;
+
+            if (probeNulls && source.IsNull(r))
+            {
+                validity.SetNull(i);
+                continue;
+            }
+
+            int slot = arrOffset + r;
+            total = checked(total + (srcOffsets[slot + 1] - srcOffsets[slot]));
+        }
+        newOffsets[count] = total;
+
+        var childIndices = new int[checked((int)total)];
+        int w = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int r = indices[i];
+            if (probeNulls && source.IsNull(r))
+                continue;
+
+            int slot = arrOffset + r;
+            int start = checked((int)srcOffsets[slot]);
+            int len = checked((int)(srcOffsets[slot + 1] - srcOffsets[slot]));
+            for (int k = 0; k < len; k++)
+                childIndices[w++] = start + k;
+        }
+
+        var offsetBytes = new byte[(count + 1) * sizeof(long)];
+        MemoryMarshal.AsBytes(newOffsets.AsSpan()).CopyTo(offsetBytes);
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            source.Data.DataType, count, validity.NullCount, offset: 0,
+            new[] { validity.Build(), new ArrowBuffer(offsetBytes) },
+            new[] { TakeListChild(source, childIndices) }));
+    }
+
+    /// <summary>
+    /// A fixed-size list carries no offsets buffer at all — its single buffer is the validity bitmap — so a
+    /// row's child positions are arithmetic: <c>ListSize</c> of them starting at
+    /// <c>(offset + row) * ListSize</c>, in the child's logical space.
+    ///
+    /// <para>A NULL row still owns its full <c>ListSize</c> of child slots, because Arrow requires the child
+    /// to be exactly <c>length * ListSize</c> long whatever the validity says. Its source slots are therefore
+    /// gathered like any other row rather than skipped: the values under a null are undefined either way, and
+    /// carrying the source's over keeps the length invariant without inventing data.</para>
+    /// </summary>
+    private static IArrowArray TakeFixedSizeList(FixedSizeListArray source, ReadOnlySpan<int> indices)
+    {
+        int count = indices.Length;
+        int listSize = ((FixedSizeListType)source.Data.DataType).ListSize;
+        int arrOffset = source.Data.Offset;
+
+        var childIndices = new int[checked(count * listSize)];
+        int w = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int start = checked((arrOffset + indices[i]) * listSize);
+            for (int k = 0; k < listSize; k++)
+                childIndices[w++] = start + k;
+        }
+
+        var validity = new ValidityWriter(count, source.NullCount);
+        if (validity.SourceHasNulls)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                if (source.IsNull(indices[i]))
+                    validity.SetNull(i);
+            }
+        }
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            source.Data.DataType, count, validity.NullCount, offset: 0,
+            new[] { validity.Build() },
+            new[] { TakeListChild(source, childIndices) }));
+    }
+
+    /// <summary>
+    /// Gathers the child rows a list-shaped array's parent gather selected. The child is rebuilt from its raw
+    /// <see cref="ArrayData"/> so the recursion re-enters <see cref="Take(IArrowArray, ReadOnlySpan{int})"/>
+    /// by array type — which is how a list of structs, a map's key/value entries, and a list of lists all
+    /// gather without a case of their own here.
+    /// </summary>
+    private static ArrayData TakeListChild(IArrowArray source, int[] childIndices) =>
+        Take(ArrowArrayFactory.BuildArray(source.Data.Children[0]), childIndices).Data;
 
     private static int BitmapBytes(int count) => (count + 7) / 8;
 

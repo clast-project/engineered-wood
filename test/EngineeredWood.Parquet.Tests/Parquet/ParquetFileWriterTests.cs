@@ -354,6 +354,172 @@ public class ParquetFileWriterTests : IDisposable
         Assert.Equal(Enumerable.Range(0, rows).Select(i => i * 100), seen);
     }
 
+    /// <summary>Rows 0..n of a list column as flat int arrays, for comparing what came back.</summary>
+    private static int[][] ListRows(ListArray list) =>
+        Enumerable.Range(0, list.Length)
+            .Select(i =>
+            {
+                var slice = (Int32Array)list.GetSlicedValues(i)!;
+                return Enumerable.Range(0, slice.Length).Select(j => slice.GetValue(j)!.Value).ToArray();
+            })
+            .ToArray();
+
+    private static ListArray BuildListColumn(int rows, ListType type)
+    {
+        // Row i is [i*10, i*10+1, ... ] of length (i % 3) + 1, so lengths vary and the offsets buffer is the
+        // only thing that says where a row's values start.
+        var values = new Int32Array.Builder();
+        var offsets = new int[rows + 1];
+        int total = 0;
+        for (int i = 0; i < rows; i++)
+        {
+            offsets[i] = total;
+            int len = (i % 3) + 1;
+            for (int k = 0; k < len; k++) values.Append(i * 10 + k);
+            total += len;
+        }
+        offsets[rows] = total;
+
+        var offsetBytes = new byte[offsets.Length * 4];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+        return new ListArray(
+            type, rows, new ArrowBuffer(offsetBytes), values.Build(), ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    private static MapArray BuildMapColumn(int rows, MapType type)
+    {
+        // Row i is {"k<i>": i * 100} — one entry each, so a mis-slotted gather shows up as the wrong key.
+        var keys = new StringArray.Builder();
+        var vals = new Int32Array.Builder();
+        var offsets = new int[rows + 1];
+        for (int i = 0; i < rows; i++)
+        {
+            offsets[i] = i;
+            keys.Append($"k{i}");
+            vals.Append(i * 100);
+        }
+        offsets[rows] = rows;
+
+        var offsetBytes = new byte[offsets.Length * 4];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+
+        var entries = new StructArray(
+            type.KeyValueType, rows, [keys.Build(), vals.Build()], ArrowBuffer.Empty, nullCount: 0);
+        return new MapArray(
+            type, rows, new ArrowBuffer(offsetBytes), entries, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    // A sliced LIST or MAP column used to be the one shape CompactSlicedColumns could not normalize —
+    // ArrowCompute.Take had no arm for it, so the write refused outright. A list reaches its child through
+    // its offsets buffer rather than by being sliced with its parent, so the parent's offset is what picks
+    // which offset PAIR a row uses; ignoring it writes rows 0..len where the caller meant N..N+len.
+    [Fact]
+    public async Task RoundTrip_SlicedListAndMapColumns_WriteTheSlicedRows()
+    {
+        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var slicedList = (ListArray)((Apache.Arrow.Array)BuildListColumn(10, listType)).Slice(3, 4);
+        Assert.NotEqual(0, slicedList.Data.Offset); // meaningless if the slice was materialized
+
+        await WriteAndVerify(
+            TempPath("sliced_list.parquet"),
+            MakeBatch(new Field("numbers", listType, nullable: false), slicedList),
+            readBatch =>
+            {
+                var list = Assert.IsType<ListArray>(readBatch.Column(0));
+                Assert.Equal(4, list.Length);
+                // Rows 3..6, whose lengths are 1, 2, 3, 1 — not rows 0..3.
+                Assert.Equal(
+                    [[30], [40, 41], [50, 51, 52], [60]],
+                    ListRows(list));
+            },
+            options);
+
+        var mapType = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true));
+        var slicedMap = (MapArray)((Apache.Arrow.Array)BuildMapColumn(10, mapType)).Slice(3, 4);
+        Assert.NotEqual(0, slicedMap.Data.Offset);
+
+        await WriteAndVerify(
+            TempPath("sliced_map.parquet"),
+            MakeBatch(new Field("m", mapType, nullable: false), slicedMap),
+            readBatch =>
+            {
+                var map = Assert.IsType<MapArray>(readBatch.Column(0));
+                Assert.Equal(4, map.Length);
+
+                var keys = Assert.IsType<StringArray>(map.Keys);
+                var vals = Assert.IsType<Int32Array>(map.Values);
+                Assert.Equal(
+                    ["k3", "k4", "k5", "k6"],
+                    Enumerable.Range(0, keys.Length).Select(i => keys.GetString(i)));
+                Assert.Equal(
+                    [300, 400, 500, 600],
+                    Enumerable.Range(0, vals.Length).Select(i => vals.GetValue(i)!.Value));
+            },
+            options);
+    }
+
+    // The other half of the same gap: auto-split slices the batch per row group, and a LIST or MAP column
+    // used to hit CopyArray's refusal ("Auto-split does not support column type list"), so ANY batch with a
+    // list or map column above RowGroupMaxRows could not be written at all. Each row group must now carry
+    // its own rows, in order.
+    [Fact]
+    public async Task RoundTrip_ListAndMapColumns_AutoSplitAcrossRowGroups()
+    {
+        const int rows = 10;
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var mapType = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true));
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("numbers", listType, nullable: false))
+            .Field(new Field("m", mapType, nullable: false))
+            .Build();
+
+        string path = TempPath("list_map_autosplit.parquet");
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 4, // forces 4 + 4 + 2
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(
+                schema, [BuildListColumn(rows, listType), BuildMapColumn(rows, mapType)], rows));
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(3, metadata.RowGroups.Count);
+        Assert.Equal(rows, metadata.NumRows);
+
+        // Read every group back in order — the rows must be the original sequence, not group 0 repeated.
+        var seenLists = new List<int[]>();
+        var seenKeys = new List<string>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var batch = await reader.ReadRowGroupAsync(g);
+            seenLists.AddRange(ListRows(Assert.IsType<ListArray>(batch.Column(0))));
+
+            var map = Assert.IsType<MapArray>(batch.Column(1));
+            var keys = Assert.IsType<StringArray>(map.Keys);
+            for (int i = 0; i < keys.Length; i++)
+                seenKeys.Add(keys.GetString(i));
+        }
+
+        var expectedLists = ListRows(BuildListColumn(rows, listType));
+        Assert.Equal(expectedLists, seenLists);
+        Assert.Equal(Enumerable.Range(0, rows).Select(i => $"k{i}"), seenKeys);
+    }
+
     [Fact]
     public async Task RoundTrip_Int64Column()
     {
