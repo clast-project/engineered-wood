@@ -141,6 +141,63 @@ public class ChangeDataFeedTests : IDisposable
         Assert.Contains(deleteChanges, c => c.Id == 2 && c.ChangeType == "delete");
     }
 
+    // A commit carrying no cdc action (an OVERWRITE writes none) is read by INFERENCE: the removed file's rows
+    // become deletes, the added file's rows become inserts. Rows a file's DELETION VECTOR already marked deleted
+    // are not live at that moment — they were reported as deletes when the DV committed — so materializing them
+    // again double-counts. Both directions are checked here: the removed file's DV must exclude rows from the
+    // inferred deletes, and the added file's DV must exclude rows from the inferred inserts.
+    [Fact]
+    public async Task ReadChanges_Inferred_HonorsDeletionVectors()
+    {
+        await using var table = await CreateCdfTable();
+        var schema = table.ArrowSchema;
+
+        // v1: five rows in one file.
+        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Append(5).Build();
+        var values = new StringArray.Builder()
+            .Append("a").Append("b").Append("c").Append("d").Append("e").Build();
+        await table.WriteAsync([new RecordBatch(schema, [ids, values], 5)]);
+
+        // v2: soft-delete id=2 through a deletion vector. This commit writes its own cdc file (CDF is on), so
+        // the delete of id=2 is reported exactly once, here.
+        await table.DeleteAsync(batch =>
+        {
+            var idCol = (Int64Array)batch.Column(0);
+            var builder = new BooleanArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                builder.Append(idCol.GetValue(i)!.Value == 2);
+            return builder.Build();
+        });
+
+        // v3: full overwrite — removes the DV-carrying file and adds a fresh one. The overwrite path emits no
+        // cdc action, so version 3 is the inference case.
+        var newIds = new Int64Array.Builder().Append(9).Build();
+        var newValues = new StringArray.Builder().Append("z").Build();
+        await table.WriteAsync(
+            [new RecordBatch(schema, [newIds, newValues], 1)], DeltaWriteMode.Overwrite);
+
+        var deleted = new List<long>();
+        var inserted = new List<long>();
+        await foreach (var b in table.ReadChangesAsync(3, 3))
+        {
+            var idCol = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
+            for (int i = 0; i < b.Length; i++)
+            {
+                long id = idCol.GetValue(i)!.Value;
+                switch (ct.GetString(i))
+                {
+                    case CdfConfig.Delete: deleted.Add(id); break;
+                    case CdfConfig.Insert: inserted.Add(id); break;
+                }
+            }
+        }
+
+        // id=2 was already reported deleted at version 2 — the overwrite must not report it a second time.
+        Assert.Equal([1L, 3L, 4L, 5L], deleted.Order().ToArray());
+        Assert.Equal([9L], inserted.ToArray());
+    }
+
     [Fact]
     public async Task Update_ProducesPreimageAndPostimage()
     {
@@ -257,6 +314,55 @@ public class ChangeDataFeedTests : IDisposable
         var ct = (StringArray)changes[0].Column(
             changes[0].Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
         Assert.Equal("insert", ct.GetString(0));
+    }
+
+    // The add side of the same rule, on a table where CDF is OFF so a DV delete produces no cdc file and the
+    // whole commit is inferred: the remove carries the file's PRE-image DV (none here, so all five rows are
+    // deletes) and the add carries the new DV, so only the four survivors are inserts. Net: id=2 deleted.
+    // Without the add-side filter the survivors and the deleted row all re-insert, and the delete disappears.
+    [Fact]
+    public async Task ReadChanges_Inferred_DvDeleteWithoutCdf_ReportsNetDelete()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, enableDeletionVectors: true);
+
+        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Append(5).Build();
+        await table.WriteAsync([new RecordBatch(schema, [ids], 5)]);
+
+        // v2: soft-delete id=2 via a deletion vector. CDF is off, so this commit carries no cdc action.
+        await table.DeleteAsync(batch =>
+        {
+            var idCol = (Int64Array)batch.Column(0);
+            var builder = new BooleanArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                builder.Append(idCol.GetValue(i)!.Value == 2);
+            return builder.Build();
+        });
+
+        var deleted = new List<long>();
+        var inserted = new List<long>();
+        await foreach (var b in table.ReadChangesAsync(2, 2))
+        {
+            var idCol = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
+            for (int i = 0; i < b.Length; i++)
+            {
+                long id = idCol.GetValue(i)!.Value;
+                switch (ct.GetString(i))
+                {
+                    case CdfConfig.Delete: deleted.Add(id); break;
+                    case CdfConfig.Insert: inserted.Add(id); break;
+                }
+            }
+        }
+
+        Assert.Equal([1L, 2L, 3L, 4L, 5L], deleted.Order().ToArray());
+        Assert.Equal([1L, 3L, 4L, 5L], inserted.Order().ToArray());
     }
 
     [Fact]

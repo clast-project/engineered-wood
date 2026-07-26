@@ -6,6 +6,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Table.Partitioning;
@@ -58,6 +59,9 @@ internal static class CdfReader
                 ? new Dictionary<string, string>()
                 : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode));
 
+        // Stateless over the file system — one instance serves every action in the range.
+        var dvReader = new DeletionVectorReader(fs);
+
         for (long version = startVersion; version <= endVersion; version++)
         {
             IReadOnlyList<DeltaAction> actions;
@@ -98,12 +102,18 @@ internal static class CdfReader
                 var removes = actions.OfType<RemoveFile>()
                     .Where(r => r.DataChange).ToList();
 
-                // Removed files → "delete" rows
+                // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
+                // marked deleted are not live at this version — they were reported as deletes when the DV
+                // itself committed, so materializing them again double-counts (e.g. an overwrite removing a
+                // file an earlier DV-delete had soft-deleted rows in). Same on the add side: a DV-carrying
+                // add's marked rows are not live inserts, which is also what makes a DV-delete visible at all
+                // under inference (remove reports the pre-image rows, add reports only the survivors).
                 foreach (var remove in removes)
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, remove.Path, remove.PartitionValues, CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, ctx, cancellationToken)
+                        fs, remove.Path, remove.PartitionValues, remove.DeletionVector,
+                        CdfConfig.Delete, version,
+                        commitTimestamp, readOptions, ctx, dvReader, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -114,8 +124,9 @@ internal static class CdfReader
                 foreach (var add in adds)
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, add.Path, add.PartitionValues, CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, ctx, cancellationToken)
+                        fs, add.Path, add.PartitionValues, add.DeletionVector,
+                        CdfConfig.Insert, version,
+                        commitTimestamp, readOptions, ctx, dvReader, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -159,11 +170,13 @@ internal static class CdfReader
         ITableFileSystem fs,
         string path,
         IReadOnlyDictionary<string, string>? partitionValues,
+        EngineeredWood.DeltaLake.Actions.DeletionVector? deletionVector,
         string changeType,
         long commitVersion,
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
+        DeletionVectorReader dvReader,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
@@ -173,13 +186,29 @@ internal static class CdfReader
         if (!await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
             yield break;
 
+        // Rows the action's DV marks deleted are not part of this change (see the call sites).
+        HashSet<long>? dvRows = deletionVector is null
+            ? null
+            : await dvReader.ReadAsync(deletionVector, cancellationToken).ConfigureAwait(false);
+
         await using var file = await fs.OpenReadAsync(diskPath, cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
-        await foreach (var batch in reader.ReadAllAsync(
+        // DV positions are absolute within the file, and batches arrive in file order.
+        long batchStartRow = 0;
+        await foreach (var rawBatch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
+            var batch = rawBatch;
+            if (dvRows is not null)
+            {
+                batch = DeletionVectorFilter.Filter(batch, dvRows, batchStartRow);
+                batchStartRow += rawBatch.Length;
+                if (batch.Length == 0)
+                    continue; // every row of this batch was already deleted
+            }
+
             // Strip a _change_type column if the data file happens to carry one (defensive), map physical → logical
             // + re-materialize partition columns, then add the constant _change_type for this add/remove.
             var cleanBatch = StripChangeTypeColumn(batch);
