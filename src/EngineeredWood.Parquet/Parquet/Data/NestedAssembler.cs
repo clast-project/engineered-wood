@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -629,219 +630,7 @@ internal static class NestedAssembler
         }
 
         // Use Arrow's Take operation equivalent — build a new array from selected indices
-        return TakeArray(denseArray, indices, elementCount);
-    }
-
-    /// <summary>
-    /// Creates a new array by selecting elements at the given indices from the source array.
-    /// </summary>
-    private static IArrowArray TakeArray(IArrowArray source, int[] indices, int count)
-    {
-        // For each array type, extract the selected elements
-        switch (source)
-        {
-            case Int8Array a:
-                return TakeFixedWidth<sbyte>(a, indices, count, a.Data.DataType);
-            case UInt8Array a:
-                return TakeFixedWidth<byte>(a, indices, count, a.Data.DataType);
-            case Int16Array a:
-                return TakeFixedWidth<short>(a, indices, count, a.Data.DataType);
-            case UInt16Array a:
-                return TakeFixedWidth<ushort>(a, indices, count, a.Data.DataType);
-            case Int32Array a:
-                return TakeFixedWidth<int>(a, indices, count, a.Data.DataType);
-            case UInt32Array a:
-                return TakeFixedWidth<uint>(a, indices, count, a.Data.DataType);
-            case Int64Array a:
-                return TakeFixedWidth<long>(a, indices, count, a.Data.DataType);
-            case UInt64Array a:
-                return TakeFixedWidth<ulong>(a, indices, count, a.Data.DataType);
-            case FloatArray a:
-                return TakeFixedWidth<float>(a, indices, count, a.Data.DataType);
-            case DoubleArray a:
-                return TakeFixedWidth<double>(a, indices, count, a.Data.DataType);
-#if NET6_0_OR_GREATER
-            case HalfFloatArray a:
-                return TakeFixedWidth<Half>(a, indices, count, a.Data.DataType);
-#endif
-            case Date32Array a:
-                return TakeFixedWidth<int>(a, indices, count, a.Data.DataType);
-            case TimestampArray a:
-                return TakeFixedWidth<long>(a, indices, count, a.Data.DataType);
-            case Time32Array a:
-                return TakeFixedWidth<int>(a, indices, count, a.Data.DataType);
-            case Time64Array a:
-                return TakeFixedWidth<long>(a, indices, count, a.Data.DataType);
-            case BooleanArray a:
-                return TakeBoolean(a, indices, count);
-            case StringArray a:
-                return TakeVarBinary(a, indices, count, Apache.Arrow.Types.StringType.Default);
-            case BinaryArray a:
-                return TakeVarBinary(a, indices, count, BinaryType.Default);
-            case Decimal32Array:
-                return TakeFixedBytes(source, indices, count, 4);
-            case Decimal64Array:
-                return TakeFixedBytes(source, indices, count, 8);
-            case Decimal128Array:
-                return TakeFixedBytes(source, indices, count, 16);
-            case Decimal256Array:
-                return TakeFixedBytes(source, indices, count, 32);
-            case FixedSizeBinaryArray fsb:
-                return TakeFixedBytes(source, indices, count, ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth);
-            case NullArray:
-                return new NullArray(count);
-            default:
-                throw new NotSupportedException(
-                    $"TakeArray not supported for {source.GetType().Name}");
-        }
-    }
-
-    private static IArrowArray TakeFixedWidth<T>(IArrowArray source, int[] indices, int count, IArrowType arrowType)
-        where T : struct
-    {
-        var values = new T[count];
-        var bitmapBytes = new byte[(count + 7) / 8];
-        int nullCount = 0;
-
-        for (int i = 0; i < count; i++)
-        {
-            int srcIdx = indices[i];
-            if (!source.IsNull(srcIdx))
-            {
-                // Read value from source array data
-                var srcSpan = source.Data.Buffers[1].Span;
-                int size = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
-                values[i] = MemoryMarshal.Read<T>(srcSpan.Slice(srcIdx * size, size));
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-
-        var valueBytes = new byte[count * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()];
-        MemoryMarshal.AsBytes(values.AsSpan()).CopyTo(valueBytes);
-
-        var buffers = nullCount > 0
-            ? new[] { new ArrowBuffer(bitmapBytes), new ArrowBuffer(valueBytes) }
-            : new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) };
-
-        var data = new ArrayData(arrowType, count, nullCount, offset: 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    private static IArrowArray TakeFixedBytes(IArrowArray source, int[] indices, int count, int byteWidth)
-    {
-        var valueBytes = new byte[count * byteWidth];
-        var bitmapBytes = new byte[(count + 7) / 8];
-        int nullCount = 0;
-        var srcSpan = source.Data.Buffers[1].Span;
-
-        for (int i = 0; i < count; i++)
-        {
-            int srcIdx = indices[i];
-            if (!source.IsNull(srcIdx))
-            {
-                srcSpan.Slice(srcIdx * byteWidth, byteWidth)
-                    .CopyTo(valueBytes.AsSpan(i * byteWidth, byteWidth));
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-
-        var buffers = nullCount > 0
-            ? new[] { new ArrowBuffer(bitmapBytes), new ArrowBuffer(valueBytes) }
-            : new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) };
-
-        var data = new ArrayData(source.Data.DataType, count, nullCount, offset: 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    private static IArrowArray TakeBoolean(BooleanArray source, int[] indices, int count)
-    {
-        var valueBits = new byte[(count + 7) / 8];
-        var bitmapBytes = new byte[(count + 7) / 8];
-        int nullCount = 0;
-
-        for (int i = 0; i < count; i++)
-        {
-            int srcIdx = indices[i];
-            if (!source.IsNull(srcIdx))
-            {
-                if (source.GetValue(srcIdx) == true)
-                    valueBits[i >> 3] |= (byte)(1 << (i & 7));
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-
-        var buffers = nullCount > 0
-            ? new[] { new ArrowBuffer(bitmapBytes), new ArrowBuffer(valueBits) }
-            : new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBits) };
-
-        return new BooleanArray(new ArrayData(BooleanType.Default, count, nullCount, 0, buffers));
-    }
-
-    private static IArrowArray TakeVarBinary(IArrowArray source, int[] indices, int count, IArrowType arrowType)
-    {
-        // Read source offsets and data
-        var srcOffsets = MemoryMarshal.Cast<byte, int>(source.Data.Buffers[1].Span);
-        var srcData = source.Data.Buffers[2].Span;
-
-        var bitmapBytes = new byte[(count + 7) / 8];
-        int nullCount = 0;
-
-        // First pass: compute total data size and new offsets
-        var newOffsets = new int[count + 1];
-        int totalDataLen = 0;
-        for (int i = 0; i < count; i++)
-        {
-            int srcIdx = indices[i] + source.Data.Offset;
-            newOffsets[i] = totalDataLen;
-            if (!source.IsNull(indices[i]))
-            {
-                int len = srcOffsets[srcIdx + 1] - srcOffsets[srcIdx];
-                totalDataLen += len;
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-        newOffsets[count] = totalDataLen;
-
-        // Second pass: copy data
-        var newData = new byte[totalDataLen];
-        int pos = 0;
-        for (int i = 0; i < count; i++)
-        {
-            int srcIdx = indices[i] + source.Data.Offset;
-            if (!source.IsNull(indices[i]))
-            {
-                int start = srcOffsets[srcIdx];
-                int len = srcOffsets[srcIdx + 1] - start;
-                srcData.Slice(start, len).CopyTo(newData.AsSpan(pos, len));
-                pos += len;
-            }
-        }
-
-        var offsetBytes = new byte[newOffsets.Length * sizeof(int)];
-        MemoryMarshal.AsBytes(newOffsets.AsSpan()).CopyTo(offsetBytes);
-
-        var buffers = nullCount > 0
-            ? new[] { new ArrowBuffer(bitmapBytes), new ArrowBuffer(offsetBytes), new ArrowBuffer(newData) }
-            : new[] { ArrowBuffer.Empty, new ArrowBuffer(offsetBytes), new ArrowBuffer(newData) };
-
-        var data = new ArrayData(arrowType, count, nullCount, 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
+        return ArrowCompute.Take(denseArray, indices.AsSpan(0, elementCount));
     }
 
     /// <summary>
@@ -916,7 +705,7 @@ internal static class NestedAssembler
         {
             leafDefLevels[i] = FilterLevelArray(leafDefLevels[i], keepIndices);
             leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
-            leafArrays[i] = TakeArray(leafArrays[i], keepIndices, keepIndices.Length);
+            leafArrays[i] = ArrowCompute.Take(leafArrays[i], keepIndices);
         }
     }
 

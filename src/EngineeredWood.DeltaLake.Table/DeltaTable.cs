@@ -3,6 +3,7 @@
 
 using System.Runtime.CompilerServices;
 using Apache.Arrow;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Checkpoint;
 using EngineeredWood.DeltaLake.DeletionVectors;
@@ -2878,14 +2879,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return true;
     }
 
-    private static RecordBatch TakeRowsFromBatch(RecordBatch batch, List<int> rows)
-    {
-        var columns = new IArrowArray[batch.ColumnCount];
-        for (int col = 0; col < batch.ColumnCount; col++)
-            columns[col] = DeletionVectors.DeletionVectorFilter.TakeRowsPublic(
-                batch.Column(col), rows);
-        return new RecordBatch(batch.Schema, columns, rows.Count);
-    }
+    private static RecordBatch TakeRowsFromBatch(RecordBatch batch, List<int> rows) =>
+        ArrowCompute.Take(batch, batch.Schema, rows);
 
     #endregion
 
@@ -4747,7 +4742,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     continue;
                 }
                 var combined = ArrowArrayConcatenator.Concatenate(new[] { src.Column(c), setCol.Values });
-                columns[c] = DeletionVectors.DeletionVectorFilter.TakeRowsPublic(combined, take);
+                columns[c] = ArrowCompute.Take(combined, take);
             }
             result.Add(new RecordBatch(src.Schema, columns, src.Length));
         }
