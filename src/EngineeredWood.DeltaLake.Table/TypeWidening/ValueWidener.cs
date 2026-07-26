@@ -70,27 +70,30 @@ internal static class ValueWidener
     /// </summary>
     public static IArrowArray WidenArray(IArrowArray source, IArrowType targetType)
     {
+        // The arms below are the POLICY — which widenings Delta permits — while ArrowCompute.Widen is the
+        // mechanism. They stay enumerated pair by pair rather than collapsed into coarser patterns, because a
+        // coarser pattern would also match narrowings (Int32Array to Int16Type) and claim they were legal.
         return (source, targetType) switch
         {
             // Integer widening: byte → short → int → long
-            (Int8Array a, Int16Type) => WidenInt8ToInt16(a),
-            (Int8Array a, Int32Type) => WidenInt8ToInt32(a),
-            (Int8Array a, Int64Type) => WidenInt8ToInt64(a),
-            (Int16Array a, Int32Type) => WidenInt16ToInt32(a),
-            (Int16Array a, Int64Type) => WidenInt16ToInt64(a),
-            (Int32Array a, Int64Type) => WidenInt32ToInt64(a),
+            (Int8Array, Int16Type) => ArrowCompute.Widen(source, targetType),
+            (Int8Array, Int32Type) => ArrowCompute.Widen(source, targetType),
+            (Int8Array, Int64Type) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, Int32Type) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, Int64Type) => ArrowCompute.Widen(source, targetType),
+            (Int32Array, Int64Type) => ArrowCompute.Widen(source, targetType),
 
             // Float → Double
-            (FloatArray a, DoubleType) => WidenFloatToDouble(a),
+            (FloatArray, DoubleType) => ArrowCompute.Widen(source, targetType),
 
             // Integer → Double
-            (Int8Array a, DoubleType) => WidenInt8ToDouble(a),
-            (Int16Array a, DoubleType) => WidenInt16ToDouble(a),
-            (Int32Array a, DoubleType) => WidenInt32ToDouble(a),
+            (Int8Array, DoubleType) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, DoubleType) => ArrowCompute.Widen(source, targetType),
+            (Int32Array, DoubleType) => ArrowCompute.Widen(source, targetType),
 
             // Date → Timestamp_ntz
-            (Date32Array a, TimestampType ts) when ts.Timezone is null =>
-                WidenDate32ToTimestamp(a, ts),
+            (Date32Array, TimestampType ts) when ts.Timezone is null =>
+                ArrowCompute.Widen(source, targetType),
 
             // Decimal widening (precision and/or scale change)
             (Decimal128Array a, Decimal128Type dt) => WidenDecimal128(a, dt),
@@ -104,146 +107,6 @@ internal static class ValueWidener
             _ => source, // No widening needed or unsupported
         };
     }
-
-    #region Integer Widening
-
-    private static Int16Array WidenInt8ToInt16(Int8Array source)
-    {
-        var b = new Int16Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int32Array WidenInt8ToInt32(Int8Array source)
-    {
-        var b = new Int32Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt8ToInt64(Int8Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int32Array WidenInt16ToInt32(Int16Array source)
-    {
-        var b = new Int32Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt16ToInt64(Int16Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt32ToInt64(Int32Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    #endregion
-
-    #region Float Widening
-
-    private static DoubleArray WidenFloatToDouble(FloatArray source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt8ToDouble(Int8Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt16ToDouble(Int16Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt32ToDouble(Int32Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    #endregion
-
-    #region Date → Timestamp Widening
-
-    private static TimestampArray WidenDate32ToTimestamp(Date32Array source, TimestampType tsType)
-    {
-        var b = new TimestampArray.Builder(tsType);
-        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i))
-                b.AppendNull();
-            else
-            {
-                int days = source.GetValue(i)!.Value;
-                b.Append(new DateTimeOffset(epoch.AddDays(days), TimeSpan.Zero));
-            }
-        }
-        return b.Build();
-    }
-
-    #endregion
 
     #region Decimal Widening
 

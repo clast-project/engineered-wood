@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -311,6 +312,170 @@ public static class ArrowCompute
                     $"ArrowCompute cannot build a constant column of type {type.TypeId}.");
             }
         }
+    }
+
+    /// <summary>
+    /// Widens a fixed-width column to a wider type, losslessly — a value-slot copy per row rather than a
+    /// round-trip through either type's .NET surface representation.
+    ///
+    /// <para>Supported: the integer ladder (Int8 → Int16 → Int32 → Int64), Int8/Int16/Int32 → Double,
+    /// Float → Double, and Date32 → Timestamp at any unit. Every one of those is exactly representable in
+    /// the target, which is what makes this a widening rather than a cast: nothing here can round.</para>
+    ///
+    /// <para>Narrowing conversions are deliberately absent rather than throwing at runtime for some values
+    /// and succeeding for others — an unlisted pair is a <see cref="NotSupportedException"/>.</para>
+    /// </summary>
+    public static IArrowArray Widen(IArrowArray source, IArrowType targetType) =>
+        (source.Data.DataType, targetType) switch
+        {
+            (Int8Type, Int16Type) => WidenSlots<sbyte, short, SByteToInt16>(source, targetType),
+            (Int8Type, Int32Type) => WidenSlots<sbyte, int, SByteToInt32>(source, targetType),
+            (Int8Type, Int64Type) => WidenSlots<sbyte, long, SByteToInt64>(source, targetType),
+            (Int8Type, DoubleType) => WidenSlots<sbyte, double, SByteToDouble>(source, targetType),
+
+            (Int16Type, Int32Type) => WidenSlots<short, int, Int16ToInt32>(source, targetType),
+            (Int16Type, Int64Type) => WidenSlots<short, long, Int16ToInt64>(source, targetType),
+            (Int16Type, DoubleType) => WidenSlots<short, double, Int16ToDouble>(source, targetType),
+
+            (Int32Type, Int64Type) => WidenSlots<int, long, Int32ToInt64>(source, targetType),
+            (Int32Type, DoubleType) => WidenSlots<int, double, Int32ToDouble>(source, targetType),
+
+            (FloatType, DoubleType) => WidenSlots<float, double, FloatToDouble>(source, targetType),
+
+            (Date32Type, TimestampType ts) => WidenDate32ToTimestamp(source, ts),
+
+            _ => throw new NotSupportedException(
+                $"ArrowCompute cannot widen a column of type {source.Data.DataType.TypeId} to "
+                + $"{targetType.TypeId}."),
+        };
+
+    /// <summary>
+    /// One value's widening conversion. Taken as a <c>struct</c> type parameter rather than a delegate so the
+    /// JIT specializes each instantiation and inlines <see cref="Apply"/>, instead of paying an indirect call
+    /// per element — which on a 64K-row batch is the difference between the copy and the dispatch dominating.
+    /// </summary>
+    private interface IWideningOp<TFrom, TTo>
+    {
+        TTo Apply(TFrom value);
+    }
+
+    // Each conversion is a C# implicit numeric conversion, i.e. guaranteed lossless by the language.
+    private readonly struct SByteToInt16 : IWideningOp<sbyte, short> { public short Apply(sbyte v) => v; }
+    private readonly struct SByteToInt32 : IWideningOp<sbyte, int> { public int Apply(sbyte v) => v; }
+    private readonly struct SByteToInt64 : IWideningOp<sbyte, long> { public long Apply(sbyte v) => v; }
+    private readonly struct SByteToDouble : IWideningOp<sbyte, double> { public double Apply(sbyte v) => v; }
+    private readonly struct Int16ToInt32 : IWideningOp<short, int> { public int Apply(short v) => v; }
+    private readonly struct Int16ToInt64 : IWideningOp<short, long> { public long Apply(short v) => v; }
+    private readonly struct Int16ToDouble : IWideningOp<short, double> { public double Apply(short v) => v; }
+    private readonly struct Int32ToInt64 : IWideningOp<int, long> { public long Apply(int v) => v; }
+    private readonly struct Int32ToDouble : IWideningOp<int, double> { public double Apply(int v) => v; }
+    private readonly struct FloatToDouble : IWideningOp<float, double> { public double Apply(float v) => v; }
+
+    private static IArrowArray WidenSlots<TFrom, TTo, TOp>(IArrowArray source, IArrowType targetType)
+        where TFrom : struct
+        where TTo : struct
+        where TOp : struct, IWideningOp<TFrom, TTo>
+    {
+        int length = source.Length;
+
+        // Slicing by the logical offset here is what lets the result carry offset 0 — see AlignedValidity
+        // for the matching half of that decision on the bitmap.
+        ReadOnlySpan<TFrom> src = MemoryMarshal
+            .Cast<byte, TFrom>(source.Data.Buffers[1].Span)
+            .Slice(source.Data.Offset, length);
+
+        var values = new byte[length * Unsafe.SizeOf<TTo>()];
+        Span<TTo> dst = MemoryMarshal.Cast<byte, TTo>(values.AsSpan());
+
+        var op = default(TOp);
+        for (int i = 0; i < length; i++)
+            dst[i] = op.Apply(src[i]);
+
+        return BuildWidened(source, targetType, values);
+    }
+
+    /// <summary>
+    /// Date32 holds a day count, so widening it to a timestamp is a multiplication by the target unit's
+    /// ticks-per-day — not a trip through <see cref="DateTimeOffset"/> per row. Unlike a raw stored timestamp,
+    /// a day count carries no unit of its own to misread, and a date has no sub-day precision to lose.
+    /// </summary>
+    private static IArrowArray WidenDate32ToTimestamp(IArrowArray source, TimestampType targetType)
+    {
+        long perDay = targetType.Unit switch
+        {
+            TimeUnit.Second => 86_400L,
+            TimeUnit.Millisecond => 86_400_000L,
+            TimeUnit.Microsecond => 86_400_000_000L,
+            TimeUnit.Nanosecond => 86_400_000_000_000L,
+            _ => throw new NotSupportedException(
+                $"ArrowCompute cannot widen Date32 to a timestamp with {targetType.Unit} precision."),
+        };
+
+        int length = source.Length;
+        ReadOnlySpan<int> days = MemoryMarshal
+            .Cast<byte, int>(source.Data.Buffers[1].Span)
+            .Slice(source.Data.Offset, length);
+
+        var values = new byte[length * sizeof(long)];
+        Span<long> dst = MemoryMarshal.Cast<byte, long>(values.AsSpan());
+
+        for (int i = 0; i < length; i++)
+        {
+            // Checked: a far-future date at nanosecond precision genuinely overflows (Int64 nanoseconds run
+            // out in 2262), and wrapping silently would be worse than failing.
+            dst[i] = checked(days[i] * perDay);
+        }
+
+        return BuildWidened(source, targetType, values);
+    }
+
+    private static IArrowArray BuildWidened(IArrowArray source, IArrowType targetType, byte[] values)
+    {
+        var (validity, nullCount) = AlignedValidity(source);
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            targetType, source.Length, nullCount, offset: 0,
+            new[] { validity, new ArrowBuffer(values) }));
+    }
+
+    /// <summary>
+    /// The source's validity, restated for an array whose logical row 0 is its physical slot 0.
+    ///
+    /// <para>Widening never changes which rows are null, so when the source already starts at offset 0 its
+    /// bitmap is returned <b>by reference</b> — <see cref="ArrowBuffer"/> is a readonly struct over
+    /// <see cref="ReadOnlyMemory{T}"/>, so that is safe and skips rebuilding it entirely.</para>
+    ///
+    /// <para>At a non-zero offset it must NOT be reused: a validity bitmap is indexed by PHYSICAL slot, so
+    /// sharing it while the values have been re-based to 0 would read every row's null flag from the wrong
+    /// bit — silently, and only for sliced arrays. The bitmap is re-derived instead. The same path handles a
+    /// declared-but-unknown null count, which has to be counted rather than trusted.</para>
+    /// </summary>
+    private static (ArrowBuffer Validity, int NullCount) AlignedValidity(IArrowArray source)
+    {
+        int declared = source.NullCount;
+
+        // No nulls: an absent bitmap means all-valid, which is also what lets Arrow skip the per-element check.
+        if (declared == 0 || source.Data.Buffers[0].Length == 0)
+            return (ArrowBuffer.Empty, 0);
+
+        if (source.Data.Offset == 0 && declared > 0)
+            return (source.Data.Buffers[0], declared);
+
+        int length = source.Length;
+        var bits = new byte[BitmapBytes(length)];
+        bits.AsSpan().Fill(0xFF);
+
+        int nulls = 0;
+        for (int i = 0; i < length; i++)
+        {
+            // IsNull applies the array's own offset, so i stays logical.
+            if (source.IsNull(i))
+            {
+                bits[i >> 3] &= (byte)~(1 << (i & 7));
+                nulls++;
+            }
+        }
+
+        return nulls == 0 ? (ArrowBuffer.Empty, 0) : (new ArrowBuffer(bits), nulls);
     }
 
     /// <summary>

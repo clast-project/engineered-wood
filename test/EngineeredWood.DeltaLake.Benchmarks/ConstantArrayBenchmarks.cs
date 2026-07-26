@@ -92,3 +92,72 @@ public class ConstantArrayBenchmarks
     public IArrowArray NullMake() =>
         ArrowCompute.MakeNullArray(Int64Type.Default, Length);
 }
+
+/// <summary>
+/// Type widening on the read path: a data file written before an ALTER COLUMN carries the narrower type, so
+/// every batch read from it is converted. The <c>Builder</c> methods replicate what <c>ValueWidener</c> did
+/// before the rewrite — probe <c>IsNull</c>, read through the nullable surface type, append.
+/// </summary>
+[MemoryDiagnoser]
+public class WideningBenchmarks
+{
+    [Params(1_024, 65_536)]
+    public int Length { get; set; }
+
+    private Int32Array _int32 = null!;
+    private Date32Array _date32 = null!;
+
+    private static readonly TimestampType NtzMicros = new(TimeUnit.Microsecond, (string?)null);
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var values = new ArrowBuffer.Builder<int>(Length);
+        for (int i = 0; i < Length; i++)
+            values.Append(i);
+        var buffer = values.Build();
+
+        _int32 = new Int32Array(new ArrayData(
+            Int32Type.Default, Length, nullCount: 0, offset: 0, [ArrowBuffer.Empty, buffer]));
+        _date32 = new Date32Array(new ArrayData(
+            Date32Type.Default, Length, nullCount: 0, offset: 0, [ArrowBuffer.Empty, buffer]));
+    }
+
+    [Benchmark(Baseline = true, Description = "Int32->Int64 via typed builder")]
+    public IArrowArray Int32ToInt64Builder()
+    {
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < _int32.Length; i++)
+        {
+            if (_int32.IsNull(i)) b.AppendNull();
+            else b.Append(_int32.GetValue(i)!.Value);
+        }
+        return b.Build();
+    }
+
+    [Benchmark(Description = "Int32->Int64 via ArrowCompute.Widen")]
+    public IArrowArray Int32ToInt64Widen() =>
+        ArrowCompute.Widen(_int32, Int64Type.Default);
+
+    /// <summary>
+    /// The date case is the one where the builder was not merely appending: it allocated an epoch
+    /// <see cref="DateTime"/> and round-tripped every row through <see cref="DateTimeOffset"/> to express
+    /// arithmetic on a stored day count.
+    /// </summary>
+    [Benchmark(Description = "Date32->Timestamp via typed builder")]
+    public IArrowArray Date32ToTimestampBuilder()
+    {
+        var b = new TimestampArray.Builder(NtzMicros);
+        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        for (int i = 0; i < _date32.Length; i++)
+        {
+            if (_date32.IsNull(i)) b.AppendNull();
+            else b.Append(new DateTimeOffset(epoch.AddDays(_date32.GetValue(i)!.Value), TimeSpan.Zero));
+        }
+        return b.Build();
+    }
+
+    [Benchmark(Description = "Date32->Timestamp via ArrowCompute.Widen")]
+    public IArrowArray Date32ToTimestampWiden() =>
+        ArrowCompute.Widen(_date32, NtzMicros);
+}
