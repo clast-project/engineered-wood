@@ -259,6 +259,14 @@ internal static class CompactionExecutor
 
                 // Widen values from old files to match current schema
                 var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
+
+                // Then reconcile the COLUMN SET. ADD/DROP COLUMN are metadata-only commits, so the files being
+                // compacted span vintages with different column sets (one predating an ADD lacks the column,
+                // one predating a DROP still carries it). Every batch must be reconciled to the current
+                // schema's (physical-named, partition-less) columns — absent ones typed all-NULL, dropped ones
+                // removed — because the parquet writer fixes the file's schema on its FIRST row group: a later
+                // batch of a different shape either fails the write or lands columns under the wrong names.
+                outBatch = SchemaEvolution.BackfillMissingColumns(outBatch, targetSchema.FieldsList);
                 if (mappingMode != ColumnMappingMode.None)
                 {
                     // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own

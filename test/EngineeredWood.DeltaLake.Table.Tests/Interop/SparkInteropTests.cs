@@ -1253,6 +1253,111 @@ public class SparkInteropTests : IDisposable
         Assert.Single(sparkAll.Where(t => t is { Ct: "delete", Id: 2 }));
     }
 
+    /// <summary>
+    /// <para>EW compacts a table whose live files span ADD/DROP/RENAME COLUMN vintages, and Spark reads the
+    /// result. ADD and DROP are metadata-only commits, so the files being merged carry DIFFERENT column sets;
+    /// compaction has to reconcile each to the current schema before they can share an output file, and pair
+    /// their columns BY NAME, since position no longer means the same thing across vintages.</para>
+    ///
+    /// <para>This is the case where being wrong is silent. A positional pairing lands one column's values
+    /// under another column's name; when the types happen to be compatible nothing raises, and the table
+    /// simply holds different data than it did before the OPTIMIZE. An EW-only round-trip cannot rule that
+    /// out — it would read its own mislabeled output back through the same mapping and agree with itself.
+    /// Spark resolves the compacted file through the table's column mapping independently, so it is the check
+    /// that the physical names, field ids and values still line up.</para>
+    ///
+    /// <para>Compaction is a pure reorganization (<c>dataChange: false</c>), so Spark must see exactly the
+    /// rows it saw before — asserted here against the same query run on both sides of the compaction.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCompacted_SchemaEvolvedMappedTable_SparkReadsSameRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        var v1Schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("amount", Int64Type.Default, true))
+            .Build();
+
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, v1Schema, columnMappingMode: ColumnMappingMode.Name))
+        {
+            // Vintage 1: (id, amount).
+            await table.WriteAsync([new RecordBatch(v1Schema,
+                [
+                    new Int64Array.Builder().AppendRange([1L, 2L]).Build(),
+                    new Int64Array.Builder().AppendRange([10L, 20L]).Build(),
+                ], 2)]);
+
+            await table.RenameColumnAsync("amount", "total");
+            await table.AddColumnAsync(new Field("note", StringType.Default, true));
+
+            // Vintage 2: (id, total, note) — renamed column plus one the first file has never heard of.
+            await table.WriteAsync([new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("id", Int64Type.Default, true))
+                    .Field(new Field("total", Int64Type.Default, true))
+                    .Field(new Field("note", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(3L).Build(),
+                    new Int64Array.Builder().Append(30L).Build(),
+                    new StringArray.Builder().Append("n3").Build(),
+                ], 1)]);
+
+            await table.DropColumnAsync("total");
+
+            // Vintage 3: (id, note) — and now the first two files carry a column the schema has dropped.
+            await table.WriteAsync([new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("id", Int64Type.Default, true))
+                    .Field(new Field("note", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(4L).Build(),
+                    new StringArray.Builder().Append("n4").Build(),
+                ], 1)]);
+
+            Assert.Equal(3, table.CurrentSnapshot.ActiveFiles.Count);
+        }
+
+        var before = SparkIdNoteRows();
+        Assert.Equal(
+            [(1L, null), (2L, null), (3L, "n3"), (4L, "n4")],
+            before);
+
+        await using (var table = await DeltaTable.OpenAsync(fs))
+        {
+            var version = await table.CompactAsync(
+                new CompactionOptions { MinFileSize = long.MaxValue, TargetFileSize = long.MaxValue });
+            Assert.NotNull(version);
+            Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        }
+
+        // The reference implementation reads the merged file: same rows, and the dropped column does not
+        // reappear in the schema it resolves.
+        Assert.Equal(before, SparkIdNoteRows());
+
+        var columns = Spark.Invoke("read", new { path = _tempDir })
+            .GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        Assert.Equal(["id", "note"], columns);
+    }
+
+    private List<(long Id, string? Note)> SparkIdNoteRows()
+    {
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                r.GetProperty("id").GetInt64(),
+                r.GetProperty("note").ValueKind == JsonValueKind.Null
+                    ? null
+                    : r.GetProperty("note").GetString()))
+            .ToList();
+        rows.Sort();
+        return rows;
+    }
+
     private List<(string Ct, long Id)> SparkChanges(long start, long end)
     {
         var result = Spark.Invoke("read_changes", new { path = _tempDir, start, end });

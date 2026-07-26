@@ -37,19 +37,31 @@ internal static class SchemaEvolution
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
         foreach (var f in expectedFields)
         {
-            schemaBuilder.Field(f);
             IArrowArray reconciled;
             if (present.TryGetValue(f.Name, out int idx))
             {
                 var column = batch.Column(idx);
                 reconciled = ReconcileColumn(column, f.DataType, batch.Length);
-                if (!ReferenceEquals(reconciled, column))
+                if (ReferenceEquals(reconciled, column))
+                {
+                    // Pass-through column: keep the SOURCE field. Stamping the expected field onto an array
+                    // that was not touched can describe it wrongly — the names match by construction, but the
+                    // expected TYPE may not be the one the array actually carries (a host-transport form, an
+                    // unconverted widening pair). A batch whose schema contradicts its arrays is the same
+                    // class of silent lie the positional pairing in ValueWidener told.
+                    schemaBuilder.Field(batch.Schema.FieldsList[idx]);
+                }
+                else
+                {
                     changed = true;
+                    schemaBuilder.Field(f); // rebuilt to the expected structure, so the expected label is right
+                }
             }
             else
             {
                 reconciled = ArrowCompute.MakeNullArray(f.DataType, batch.Length);
                 changed = true;
+                schemaBuilder.Field(f);
             }
             arrays.Add(reconciled);
         }

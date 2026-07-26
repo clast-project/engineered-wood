@@ -17,18 +17,30 @@ namespace EngineeredWood.DeltaLake.Table.TypeWidening;
 internal static class ValueWidener
 {
     /// <summary>
-    /// Widens a RecordBatch to match the target schema.
-    /// Columns whose types differ are converted; matching columns are passed through.
+    /// Widens a RecordBatch's values to the target schema's types, matching columns BY NAME. Columns whose
+    /// types differ are converted; every other column passes through untouched, keeping its own field.
+    ///
+    /// <para>This only WIDENS. Reconciling the batch's column SET to the current schema — backfilling a column
+    /// ADDed after the file was written, dropping one DROPped since — belongs to
+    /// <see cref="SchemaEvolution.BackfillMissingColumns"/>, which every caller runs afterwards.</para>
     /// </summary>
     public static RecordBatch WidenBatch(
         RecordBatch batch, Apache.Arrow.Schema targetSchema)
     {
-        bool needsWidening = false;
+        // BY NAME, never by position: a schema-EVOLVED file's column set differs from the current schema (a
+        // column ADDed after the file was written is absent from it, a DROPped one is still present), so
+        // pairing the two positionally lines one column's data up against another column's type — which
+        // either throws deep in an encoder or, when the types happen to be compatible, silently writes the
+        // values under the wrong name.
+        var targetByName = new Dictionary<string, IArrowType>(StringComparer.Ordinal);
+        foreach (var f in targetSchema.FieldsList)
+            targetByName[f.Name] = f.DataType;
 
-        for (int i = 0; i < batch.ColumnCount && i < targetSchema.FieldsList.Count; i++)
+        bool needsWidening = false;
+        for (int i = 0; i < batch.ColumnCount; i++)
         {
-            if (!TypesMatch(batch.Schema.FieldsList[i].DataType,
-                            targetSchema.FieldsList[i].DataType))
+            if (targetByName.TryGetValue(batch.Schema.FieldsList[i].Name, out var t)
+                && !TypesMatch(batch.Schema.FieldsList[i].DataType, t))
             {
                 needsWidening = true;
                 break;
@@ -38,31 +50,33 @@ internal static class ValueWidener
         if (!needsWidening)
             return batch;
 
-        var columns = new IArrowArray[targetSchema.FieldsList.Count];
-
-        for (int i = 0; i < targetSchema.FieldsList.Count; i++)
+        var fields = new List<Field>(batch.ColumnCount);
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
         {
-            if (i < batch.ColumnCount)
-            {
-                var sourceType = batch.Schema.FieldsList[i].DataType;
-                var targetType = targetSchema.FieldsList[i].DataType;
+            var f = batch.Schema.FieldsList[i];
+            var source = batch.Column(i);
 
-                columns[i] = TypesMatch(sourceType, targetType)
-                    ? batch.Column(i)
-                    : WidenArray(batch.Column(i), targetType);
+            if (targetByName.TryGetValue(f.Name, out var targetType)
+                && !TypesMatch(f.DataType, targetType))
+            {
+                var widened = WidenArray(source, targetType);
+                columns[i] = widened;
+                // Take the target's TYPE only when the array was actually converted: WidenArray returns the
+                // source unchanged for a pair it does not support, and relabeling untouched data with a type
+                // it does not have is the same lie the positional pairing told. The name is the batch's own.
+                fields.Add(ReferenceEquals(widened, source)
+                    ? f
+                    : new Field(f.Name, targetType, f.IsNullable, f.Metadata));
             }
             else
             {
-                // Missing column — fill with nulls of the TARGET type. This used to fall back to a
-                // StringArray for anything it had no per-type builder for, so a null Timestamp or Decimal
-                // column came back typed String: an array contradicting the schema it was placed into,
-                // silently, rather than a failure.
-                columns[i] = ArrowCompute.MakeNullArray(
-                    targetSchema.FieldsList[i].DataType, batch.Length);
+                columns[i] = source;
+                fields.Add(f);
             }
         }
 
-        return new RecordBatch(targetSchema, columns, batch.Length);
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, batch.Length);
     }
 
     /// <summary>

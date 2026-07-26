@@ -78,7 +78,13 @@ public static class ColumnMappingRecursive
             {
                 changed = true;
                 fields.Add(renamed);
-                arrays.Add(Rebuild(batch.Column(i).Data, renamed.DataType));
+                // A rename that leaves the TYPE TREE untouched (RenameType returns the same instance when it
+                // changes nothing) needs no new array — only the field's name/id moved. Re-materializing it
+                // through ArrowArrayFactory would revalidate a layout the reader already produced and reject
+                // the legal-but-non-canonical ones ("Buffer count <2> must be at exactly <3>").
+                arrays.Add(ReferenceEquals(renamed.DataType, f.DataType)
+                    ? batch.Column(i)
+                    : Rebuild(batch.Column(i).Data, renamed.DataType));
             }
         }
 
