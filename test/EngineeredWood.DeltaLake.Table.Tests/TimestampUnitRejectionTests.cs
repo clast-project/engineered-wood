@@ -120,11 +120,26 @@ public class TimestampUnitRejectionTests : IDisposable
         // because Apache.Arrow models the two as unrelated types. Were MapType ever to derive from
         // ListType, the list arm would swallow maps and skip their key/value types entirely — so pin
         // it, alongside the behaviour that actually matters.
+        //
+        // Asked as a TYPE-RELATIONSHIP question rather than `mapType is ListType`: the latter is folded
+        // to a constant by the compiler (an unrelated pair can never match, hence CS0184), so it emits no
+        // runtime check at all and only reports through the warning. IsAssignableFrom is evaluated against
+        // the Arrow assembly actually loaded, so it still answers if that assembly is ever swapped for one
+        // where the relationship differs.
         var nano = new TimestampType(TimeUnit.Nanosecond, "UTC");
         var mapType = new Apache.Arrow.Types.MapType(
             new Field("key", StringType.Default, false), new Field("value", nano, true));
 
-        Assert.False(mapType is ListType, "MapType deriving from ListType would break arm ordering");
+        Assert.False(
+            typeof(ListType).IsAssignableFrom(typeof(Apache.Arrow.Types.MapType)),
+            "MapType deriving from ListType would break arm ordering");
+
+        // Positive control for the mechanism above: a derivation Arrow genuinely has (StringArray extends
+        // BinaryArray — the relationship ArrowCompute's gather arms are ordered around). Without this, an
+        // IsAssignableFrom that silently stopped detecting derivation would leave the assertion vacuous.
+        Assert.True(
+            typeof(BinaryArray).IsAssignableFrom(typeof(StringArray)),
+            "sanity: IsAssignableFrom must detect a real derivation");
         Assert.Throws<DeltaFormatException>(
             () => EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(NestedSchema(mapType)));
     }

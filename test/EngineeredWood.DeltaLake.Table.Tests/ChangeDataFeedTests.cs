@@ -194,7 +194,7 @@ public class ChangeDataFeedTests : IDisposable
         }
 
         // id=2 was already reported deleted at version 2 — the overwrite must not report it a second time.
-        Assert.Equal([1L, 3L, 4L, 5L], deleted.Order().ToArray());
+        Assert.Equal([1L, 3L, 4L, 5L], deleted.OrderBy(x => x).ToArray());
         Assert.Equal([9L], inserted.ToArray());
     }
 
@@ -368,8 +368,8 @@ public class ChangeDataFeedTests : IDisposable
             }
         }
 
-        Assert.Equal([1L, 2L, 3L, 4L, 5L], deleted.Order().ToArray());
-        Assert.Equal([1L, 3L, 4L, 5L], inserted.Order().ToArray());
+        Assert.Equal([1L, 2L, 3L, 4L, 5L], deleted.OrderBy(x => x).ToArray());
+        Assert.Equal([1L, 3L, 4L, 5L], inserted.OrderBy(x => x).ToArray());
     }
 
     [Fact]
