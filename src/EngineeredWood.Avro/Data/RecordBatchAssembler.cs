@@ -1003,16 +1003,78 @@ internal sealed class StringBuilder : VarLengthBuilder
 /// Selected by <see cref="RecordBatchAssembler.CreateBuilderForType"/> when
 /// the target Arrow type is an <c>arrow.uuid</c> extension; falls back to
 /// <see cref="StringBuilder"/> when no registry is supplied.
+/// <para>
+/// The 16-byte storage uses RFC 4122 big-endian order, which is exactly the byte order of
+/// the canonical string's hex — so the wire bytes are parsed straight into the value slot,
+/// with no intermediate <see cref="string"/> or <see cref="Guid"/> per value. The value
+/// type is the <c>arrow.uuid</c> extension; <see cref="ArrowArrayFactory"/> builds the
+/// <see cref="FixedSizeBinaryArray"/> storage from the same buffers and wraps it as a
+/// <see cref="GuidArray"/>.
+/// </para>
 /// </summary>
-internal sealed class GuidBuilder : IColumnBuilder
+internal sealed class GuidBuilder : ByteBlobBuilder
 {
-    private Apache.Arrow.GuidArray.Builder _builder = new();
-    public void Append(ref AvroBinaryReader reader) => _builder.Append(Guid.Parse(reader.ReadString()));
-    public void AppendNull() => _builder.AppendNull();
-    public void AppendDefault(string value) => _builder.Append(Guid.Parse(value));
-    public IArrowArray Build(Field field) => _builder.Build(allocator: null);
-    public void Reset() => _builder = new();
-    public void Reserve(int rowCount) => _builder.Reserve(rowCount);
+    public GuidBuilder() : base(16) { }
+
+    protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
+        => UuidHex.Parse(reader.ReadStringBytes(), dest);
+
+    protected override IArrowType ValueType(Field field) => field.DataType;
+
+    /// <summary>Schema-default path: the default is a canonical UUID string.</summary>
+    public void AppendDefault(string value)
+        => GuidArray.GuidToRFC4122(Guid.Parse(value), NextValidSlot());
+}
+
+/// <summary>Parses an Avro <c>uuid</c> string into the 16-byte RFC 4122 big-endian layout.</summary>
+internal static class UuidHex
+{
+    /// <summary>
+    /// Parses UTF-8/ASCII UUID bytes into <paramref name="dest16"/>. Fast path for the canonical
+    /// 8-4-4-4-12 form; falls back to lenient <see cref="Guid.Parse(string)"/> for any other
+    /// accepted format (rare — valid Avro always emits the canonical form).
+    /// </summary>
+    public static void Parse(ReadOnlySpan<byte> ascii, Span<byte> dest16)
+    {
+        if (TryParseCanonical(ascii, dest16))
+            return;
+#if NETSTANDARD2_0
+        var s = System.Text.Encoding.UTF8.GetString(ascii.ToArray());
+#else
+        var s = System.Text.Encoding.UTF8.GetString(ascii);
+#endif
+        GuidArray.GuidToRFC4122(Guid.Parse(s), dest16);
+    }
+
+    private static bool TryParseCanonical(ReadOnlySpan<byte> ascii, Span<byte> dest16)
+    {
+        if (ascii.Length != 36
+            || ascii[8] != (byte)'-' || ascii[13] != (byte)'-'
+            || ascii[18] != (byte)'-' || ascii[23] != (byte)'-')
+            return false;
+
+        int di = 0;
+        for (int i = 0; i < 36;)
+        {
+            if (i == 8 || i == 13 || i == 18 || i == 23) { i++; continue; }
+            int hi = HexVal(ascii[i]);
+            int lo = HexVal(ascii[i + 1]);
+            if ((hi | lo) < 0)
+                return false;
+            dest16[di++] = (byte)((hi << 4) | lo);
+            i += 2;
+        }
+        return di == 16;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int HexVal(byte c)
+    {
+        if (c >= (byte)'0' && c <= (byte)'9') return c - '0';
+        if (c >= (byte)'a' && c <= (byte)'f') return c - 'a' + 10;
+        if (c >= (byte)'A' && c <= (byte)'F') return c - 'A' + 10;
+        return -1;
+    }
 }
 
 // ─── Logical type builders ───
@@ -1045,26 +1107,21 @@ internal sealed class Time64NanosBuilder : FixedWidthBuilder<long>
 
 /// <summary>
 /// Reads Avro duration (fixed 12 bytes: months u32 LE, days u32 LE, millis u32 LE)
-/// into Arrow MonthDayNanosecondIntervalArray (months, days, nanoseconds).
+/// into an Arrow MonthDayNanosecondIntervalArray (months, days, nanoseconds). The Arrow value
+/// buffer stores <see cref="MonthDayNanosecondInterval"/> structs directly (16 bytes each:
+/// months@0, days@4, nanoseconds@8), so the fixed-width native builder writes them straight in.
 /// </summary>
-internal sealed class DurationBuilder : IColumnBuilder
+internal sealed class DurationBuilder : FixedWidthBuilder<MonthDayNanosecondInterval>
 {
-    private MonthDayNanosecondIntervalArray.Builder _builder = new();
-
-    public void Append(ref AvroBinaryReader reader)
+    protected override MonthDayNanosecondInterval ReadValue(ref AvroBinaryReader reader)
     {
         var bytes = reader.ReadFixed(12);
         uint months = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
         uint days = BinaryPrimitives.ReadUInt32LittleEndian(bytes[4..]);
         uint millis = BinaryPrimitives.ReadUInt32LittleEndian(bytes[8..]);
-        _builder.Append(new MonthDayNanosecondInterval(
-            checked((int)months), checked((int)days), (long)millis * 1_000_000));
+        return new MonthDayNanosecondInterval(
+            checked((int)months), checked((int)days), (long)millis * 1_000_000);
     }
-
-    public void AppendNull() => _builder.AppendNull();
-    public IArrowArray Build(Field field) => _builder.Build();
-    public void Reset() => _builder = new();
-    public void Reserve(int rowCount) { }
 }
 
 // Avro timestamp logical types read a single int64 (millis/micros/nanos since epoch),

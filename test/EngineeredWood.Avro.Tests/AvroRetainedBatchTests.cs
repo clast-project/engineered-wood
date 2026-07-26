@@ -196,6 +196,41 @@ public class AvroRetainedBatchTests
     }
 
     [Fact]
+    public void RetainedBatches_GuidColumn_KeepTheirValues()
+    {
+        var guids = new Guid[100];
+        var builder = new GuidArray.Builder();
+        for (int i = 0; i < 100; i++)
+        {
+            guids[i] = Guid.NewGuid();
+            builder.Append(guids[i]);
+        }
+        var arr = builder.Build(allocator: null);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("g", arr.Data.DataType, false)).Build();
+        var data = Write(schema, new RecordBatch(schema, [arr], 100));
+
+        var registry = new ExtensionTypeRegistry();
+        registry.Register(GuidExtensionDefinition.Instance);
+
+        using var ms = new MemoryStream(data);
+        using var reader = new AvroReaderBuilder()
+            .WithBatchSize(30).WithExtensionRegistry(registry).Build(ms);
+        var batches = new List<RecordBatch>();
+        foreach (var b in reader) batches.Add(b);
+        Assert.Equal(4, batches.Count);
+
+        int row = 0;
+        foreach (var b in batches)
+        {
+            var ga = (GuidArray)b.Column(0);
+            for (int i = 0; i < b.Length; i++, row++)
+                Assert.Equal(guids[row], ga.GetGuid(i));
+        }
+        Assert.Equal(100, row);
+    }
+
+    [Fact]
     public void RetainedBatches_DecimalColumn_KeepTheirValues()
     {
         var type = new Decimal128Type(18, 2);
