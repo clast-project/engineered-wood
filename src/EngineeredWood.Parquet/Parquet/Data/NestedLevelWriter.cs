@@ -66,6 +66,9 @@ internal static class NestedLevelWriter
             parentDefLevels: null, parentRepLevels: null,
             parentCount: rowCount);
 
+        // The recursive walk reads raw spans off the caller's array and its children while building the
+        // leaf columns. Roots it for the duration; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
         return leaves;
     }
 

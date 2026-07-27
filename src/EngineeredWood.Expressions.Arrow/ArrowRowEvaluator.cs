@@ -657,8 +657,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         catch (OverflowException)
         {
             int scale = ((Decimal128Type)a.Data.DataType).Scale;
-            return LiteralValue.HighPrecisionDecimalOf(
+            // ToBigInteger is a call, and therefore a point at which `a` — whose last use is the span
+            // it is being handed — could otherwise be collected out from under that span.
+            // See doc/arrow-span-lifetime.md.
+            var literal = LiteralValue.HighPrecisionDecimalOf(
                 ToBigInteger(a.ValueBuffer.Span.Slice(index * 16, 16)), scale);
+            GC.KeepAlive(a);
+            return literal;
         }
     }
 
@@ -668,8 +673,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         catch (OverflowException)
         {
             int scale = ((Decimal256Type)a.Data.DataType).Scale;
-            return LiteralValue.HighPrecisionDecimalOf(
+            // See the Decimal128 overload above, and doc/arrow-span-lifetime.md.
+            var literal = LiteralValue.HighPrecisionDecimalOf(
                 ToBigInteger(a.ValueBuffer.Span.Slice(index * 32, 32)), scale);
+            GC.KeepAlive(a);
+            return literal;
         }
     }
 

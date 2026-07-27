@@ -275,6 +275,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
     private static IArrowArray MaterializeSlice(IArrowArray array, int offset, int length)
     {
+        // Roots the caller's array across the copy. The arms below read raw spans off its buffers, and a
+        // span is not a GC reference to what it points at; the many returns are why this is a wrapper
+        // rather than a trailing GC.KeepAlive. See doc/arrow-span-lifetime.md.
+        var sliced = MaterializeSliceCore(array, offset, length);
+        GC.KeepAlive(array);
+        return sliced;
+    }
+
+    private static IArrowArray MaterializeSliceCore(IArrowArray array, int offset, int length)
+    {
         // A NESTED column is gathered rather than sliced, and — unlike the flat cases below — it is gathered
         // even at offset zero.
         //

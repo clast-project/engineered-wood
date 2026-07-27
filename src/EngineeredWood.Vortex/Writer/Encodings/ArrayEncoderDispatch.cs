@@ -42,6 +42,14 @@ internal static class ArrayEncoderDispatch
     /// copying). Encoders consult fields like <c>IsStrictSorted</c> to decide
     /// profitability without re-scanning.</param>
     /// </summary>
+    /// <summary>
+    /// Roots the caller's array across the encode. Every encoder below reads raw spans off its buffers,
+    /// and a span is not a GC reference to what it points at — so for a caller-built array, whose buffers
+    /// are native memory freed by a finalizer, the array has to stay reachable until the last read. This
+    /// is the single way into the encoder family, so one root here covers all of them rather than each
+    /// encoder rooting separately. The many early returns in the body are why this is a wrapper rather
+    /// than a trailing GC.KeepAlive. See doc/arrow-span-lifetime.md.
+    /// </summary>
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
         int? statsTicket = null, bool compress = false,
@@ -49,6 +57,20 @@ internal static class ArrayEncoderDispatch
         bool preferVarBinView = false,
         bool preferPco = false,
         bool preferDateTimeParts = false)
+    {
+        int ticket = EmitCore(sb, array, idx, statsTicket, compress, stats,
+            preferVarBinView, preferPco, preferDateTimeParts);
+        GC.KeepAlive(array);
+        return ticket;
+    }
+
+    private static int EmitCore(
+        SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
+        int? statsTicket, bool compress,
+        ArrayStatsValues stats,
+        bool preferVarBinView,
+        bool preferPco,
+        bool preferDateTimeParts)
     {
         // Extension-typed columns (TimestampArray / Date32Array / Date64Array)
         // need to be wrapped in a vortex.ext ArrayNode whose single child is

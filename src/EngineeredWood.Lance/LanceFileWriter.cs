@@ -556,6 +556,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     {
         byte[] bytes = new byte[array.Length * bytesPerValue];
         array.Data.Buffers[1].Span.Slice(0, array.Length * bytesPerValue).CopyTo(bytes);
+        GC.KeepAlive(array);   // roots the source buffer across the copy; doc/arrow-span-lifetime.md
         return bytes;
     }
 
@@ -703,6 +704,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             if ((srcBuf[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0)
                 valueBytes[i >> 3] |= (byte)(1 << (i & 7));
         }
+        GC.KeepAlive(array);   // roots `srcBuf` across the row loop; doc/arrow-span-lifetime.md
         bool hasDef = array.NullCount > 0;
         byte[]? validity = hasDef ? ExtractValidityBitmap(array) : null;
         ushort[]? def = null;
@@ -806,7 +808,9 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // every primitive/variable-length Arrow array. Spec: LSB-first,
         // bit set = valid.
         var span = array.Data.Buffers[0].Span;
-        return span.IsEmpty ? null : span.ToArray();
+        var bitmap = span.IsEmpty ? null : span.ToArray();
+        GC.KeepAlive(array);   // roots the source buffer across the copy; doc/arrow-span-lifetime.md
+        return bitmap;
     }
 
     /// <summary>
@@ -1402,6 +1406,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int totalBytes = checked(rows * dim * innerBytes);
         var bytes = new byte[totalBytes];
         array.Values.Data.Buffers[1].Span.Slice(0, totalBytes).CopyTo(bytes);
+        GC.KeepAlive(array);   // roots the child's buffer across the copy; doc/arrow-span-lifetime.md
         var encoding = new CompressiveEncoding
         {
             FixedSizeList = new Proto.Encodings.V21.FixedSizeList
@@ -1435,6 +1440,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             if ((src[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0)
                 bytes[i >> 3] |= (byte)(1 << (i & 7));
         }
+        GC.KeepAlive(array);   // roots `src` across the row loop; doc/arrow-span-lifetime.md
         return (bytes, FlatEncoding(1), "bool");
     }
 
@@ -1474,6 +1480,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     {
         byte[] bytes = new byte[array.Length * bytesPerValue];
         array.Data.Buffers[1].Span.Slice(0, array.Length * bytesPerValue).CopyTo(bytes);
+        GC.KeepAlive(array);   // roots the source buffer across the copy; doc/arrow-span-lifetime.md
         return (bytes, FlatEncoding(bytesPerValue * 8), logicalType);
     }
 

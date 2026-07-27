@@ -47,6 +47,10 @@ internal static class BloomFilterArrowEncoder
                 AddFixedWidthValues(builder, array, typeLength);
                 break;
         }
+
+        // The value arms read raw spans off the array's buffers while adding a row at a time to the
+        // filter. Roots it for the duration; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
     }
 
     private static void AddBooleanValues(SplitBlockBloomFilterBuilder builder, BooleanArray array)

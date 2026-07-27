@@ -783,6 +783,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     EncodeFixedLenByteArray(array.Data.Buffers[1].Span, srcOffset, rowCount, fsb.ByteWidth);
                     break;
             }
+
+            // Each arm hands a raw span off the caller's buffers to an encoder that then loops over the
+            // rows, allocating. A span does not keep the array alive, so root it across the call.
+            // See doc/arrow-span-lifetime.md.
+            GC.KeepAlive(array);
         }
 
         // Generic fixed-width encoding via int key (handles Int8/16 widening to int)
@@ -937,6 +942,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 }
                 Indices!.Add(idx);
             }
+
+            // `data` is the only thing rooting the buffers the two spans above point into, and the loop
+            // allocates on every new distinct value. See doc/arrow-span-lifetime.md.
+            GC.KeepAlive(data);
         }
 
         private void EncodeFixedLenByteArray(ReadOnlySpan<byte> valueBuffer, int srcOffset, int rowCount, int byteWidth)

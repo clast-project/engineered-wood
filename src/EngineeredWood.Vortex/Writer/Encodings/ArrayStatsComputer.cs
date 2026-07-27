@@ -48,6 +48,9 @@ internal static class ArrayStatsComputer
         ComputeMinMax(array, ref values);
         ComputeSum(array, ref values);
 
+        // Every Compute* helper above scans the caller's array through raw spans off its buffers.
+        // Roots it for the duration; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
         return values;
     }
 

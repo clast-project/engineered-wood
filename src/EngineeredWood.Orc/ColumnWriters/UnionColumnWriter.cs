@@ -166,7 +166,11 @@ internal sealed class UnionColumnWriter : ColumnWriter
 
         var newData = new ArrayData(data.DataType, indices.Count, nullCount, 0,
             [validityBuffer, new ArrowBuffer(valueBytes)]);
-        return ArrowArrayFactory.BuildArray(newData);
+        var result = ArrowArrayFactory.BuildArray(newData);
+        // `data` roots the buffer srcSpan points into, across a gather that allocates.
+        // See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(data);
+        return result;
     }
 
     private static IArrowArray TakeVariableWidth(ArrayData data, List<int> indices,
@@ -195,7 +199,11 @@ internal sealed class UnionColumnWriter : ColumnWriter
             [validityBuffer,
              new ArrowBuffer(MemoryMarshal.AsBytes(newOffsets.AsSpan()).ToArray()),
              new ArrowBuffer(newDataStream.WrittenSpan.ToArray())]);
-        return ArrowArrayFactory.BuildArray(newData);
+        var result = ArrowArrayFactory.BuildArray(newData);
+        // `data` roots the buffers `offsets` and `srcData` point into, across a gather that allocates.
+        // See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(data);
+        return result;
     }
 
     private static IArrowArray TakeStruct(ArrayData data, List<int> indices,
@@ -240,7 +248,11 @@ internal sealed class UnionColumnWriter : ColumnWriter
         var newData = new ArrayData(data.DataType, indices.Count, nullCount, 0,
             [validityBuffer, new ArrowBuffer(MemoryMarshal.AsBytes(newOffsets.AsSpan()).ToArray())],
             [takenChild.Data]);
-        return ArrowArrayFactory.BuildArray(newData);
+        var result = ArrowArrayFactory.BuildArray(newData);
+        // `data` roots the buffer `offsets` points into, across a gather that allocates and recurses
+        // into the child. See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(data);
+        return result;
     }
 
     public override ColumnEncoding GetEncoding() => new() { Kind = ColumnEncoding.Types.Kind.Direct };

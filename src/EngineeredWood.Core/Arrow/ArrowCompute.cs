@@ -31,6 +31,18 @@ public static class ArrowCompute
     /// </summary>
     public static IArrowArray Take(IArrowArray source, ReadOnlySpan<int> indices)
     {
+        // Roots the caller's array across the gather. The Take* helpers below read raw spans off its
+        // buffers, and a span is not a GC reference to what it points at — so for a caller-built array,
+        // whose buffers are native memory freed by a finalizer, `source` has to stay reachable until the
+        // last read. The many returns in the body are why this is a wrapper rather than a trailing
+        // GC.KeepAlive. See doc/arrow-span-lifetime.md.
+        var taken = TakeCore(source, indices);
+        GC.KeepAlive(source);
+        return taken;
+    }
+
+    private static IArrowArray TakeCore(IArrowArray source, ReadOnlySpan<int> indices)
+    {
         switch (source)
         {
             // Extension arrays (VARIANT, GUID, ...) gather through their STORAGE and are re-wrapped, so the
@@ -362,7 +374,16 @@ public static class ArrowCompute
     /// <para>Narrowing conversions are deliberately absent rather than throwing at runtime for some values
     /// and succeeding for others — an unlisted pair is a <see cref="NotSupportedException"/>.</para>
     /// </summary>
-    public static IArrowArray Widen(IArrowArray source, IArrowType targetType) =>
+    public static IArrowArray Widen(IArrowArray source, IArrowType targetType)
+    {
+        // Roots the caller's array across the widen, for the reason given on Take.
+        // See doc/arrow-span-lifetime.md.
+        var widened = WidenCore(source, targetType);
+        GC.KeepAlive(source);
+        return widened;
+    }
+
+    private static IArrowArray WidenCore(IArrowArray source, IArrowType targetType) =>
         (source.Data.DataType, targetType) switch
         {
             (Int8Type, Int16Type) => WidenSlots<sbyte, short, SByteToInt16>(source, targetType),

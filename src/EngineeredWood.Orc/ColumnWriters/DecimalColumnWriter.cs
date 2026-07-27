@@ -71,7 +71,11 @@ internal sealed class DecimalColumnWriter : ColumnWriter
         // For precision <= 38, we read the low 8 bytes as the value
         // (high 8 bytes are sign extension for values that fit in a long)
         var bytes = array.ValueBuffer.Span.Slice(index * 16, 16);
-        return BinaryPrimitives.ReadInt64LittleEndian(bytes);
+        long value = BinaryPrimitives.ReadInt64LittleEndian(bytes);
+        // `array` has no use past the span it produced, and the read is a call. See
+        // doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
+        return value;
     }
 
     public override ColumnStatistics GetStatistics()

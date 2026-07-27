@@ -73,9 +73,18 @@ internal static class DictionaryEncoder
         // A run-end encoded column is dictionary-encoded from its RUNS. Everything below reads one value
         // slot per row, which such a column does not have.
         if (array is RunEndEncodedArray ree)
-            return TryEncodeRuns(ree, physicalType, typeLength, nonNullCount, options.DictionaryPageSizeLimit);
+        {
+            var runResult = TryEncodeRuns(ree, physicalType, typeLength, nonNullCount, options.DictionaryPageSizeLimit);
+            GC.KeepAlive(array);
+            return runResult;
+        }
 
-        return physicalType switch
+        // Every arm below reads raw spans off this array's buffers and then loops, allocating, for as long
+        // as the column is. `array` is not referenced again once an arm has taken its spans, and a span is
+        // not a GC reference to what it points at — so without the KeepAlive the array is collectable from
+        // that moment, and for a caller-built array that means its buffers are freed by a finalizer while
+        // the arms are still reading them. See doc/arrow-span-lifetime.md.
+        var result = physicalType switch
         {
             PhysicalType.Int32 => TryEncodeFixed<int>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
             PhysicalType.Int64 => TryEncodeFixed<long>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
@@ -85,6 +94,9 @@ internal static class DictionaryEncoder
             PhysicalType.FixedLenByteArray => TryEncodeFixedLenByteArray(array, defLevels, nonNullCount, typeLength, options.DictionaryPageSizeLimit),
             _ => null,
         };
+
+        GC.KeepAlive(array);
+        return result;
     }
 
     /// <summary>

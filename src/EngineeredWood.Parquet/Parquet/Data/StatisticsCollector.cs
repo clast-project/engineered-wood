@@ -55,7 +55,7 @@ internal static class StatisticsCollector
                 ? ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder)
                 : ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder);
 
-            return new Statistics
+            var fpStats = new Statistics
             {
                 NullCount = nullCount,
                 Min = fpMin,
@@ -66,6 +66,9 @@ internal static class StatisticsCollector
                 IsMaxValueExact = fpMax != null ? true : (bool?)null,
                 NanCount = nanCount,
             };
+
+            GC.KeepAlive(array);
+            return fpStats;
         }
 
         var (minBytes, maxBytes, minExact, maxExact) = physicalType switch
@@ -78,7 +81,7 @@ internal static class StatisticsCollector
             _ => (null, null, true, true),
         };
 
-        return new Statistics
+        var stats = new Statistics
         {
             NullCount = nullCount,
             Min = minBytes,
@@ -88,6 +91,11 @@ internal static class StatisticsCollector
             IsMinValueExact = minBytes != null ? minExact : null,
             IsMaxValueExact = maxBytes != null ? maxExact : null,
         };
+
+        // The min/max scans above read raw spans off the array's buffers, a full pass over the column.
+        // Roots it for the duration; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
+        return stats;
     }
 
     /// <summary>

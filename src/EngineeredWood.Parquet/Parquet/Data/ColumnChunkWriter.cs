@@ -266,6 +266,12 @@ internal static class ColumnChunkWriter
             };
         }
 
+        // Roots the caller's array across the whole column encode. Both WriteColumn overloads land here,
+        // and everything below this point — the dictionary encoder, the plain/V2 encoders, the statistics
+        // scan, the Bloom filter — reads raw spans off its buffers. A span does not keep the array alive,
+        // so without this the buffers of a caller-built array can be finalized mid-encode.
+        // See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
         return result;
     }
 

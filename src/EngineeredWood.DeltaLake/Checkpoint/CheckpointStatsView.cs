@@ -273,6 +273,10 @@ internal sealed class CheckpointStatsView
 #else
         var unscaled = new BigInteger(bytes.ToArray());
 #endif
+        // Today this array always comes from EngineeredWood's own reader, whose buffers are managed
+        // arrays and therefore rooted by the span itself. Rooting anyway keeps the method correct for
+        // any array it might be handed. See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
         if (scale == 0)
             return unscaled.ToString(CultureInfo.InvariantCulture);
 
