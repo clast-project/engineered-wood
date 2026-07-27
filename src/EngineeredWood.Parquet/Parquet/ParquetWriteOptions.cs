@@ -182,6 +182,27 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, ByteArrayEncoding>? ColumnEncodings { get; init; }
 
     /// <summary>
+    /// Per-column dictionary-encoding overrides, keyed by dotted column path. Columns not listed use
+    /// <see cref="DictionaryEnabled"/>.
+    ///
+    /// <para>For a producer that already knows a column's cardinality. Deciding a column is unsuitable
+    /// otherwise costs a full analysis pass that ends in nothing: the encoder hashes its way to a fifth of
+    /// the row count in distinct values before giving up, and the column is then read again and written
+    /// PLAIN. Measured on a 1M-row column of distinct strings, that attempt cost 17.5 MB and 13 ms and
+    /// produced a byte-identical file. Setting <see langword="false"/> for such a column skips it.</para>
+    ///
+    /// <para>A map rather than a list of exclusions, so it overrides in both directions: dictionary
+    /// encoding is on by default, and a column set <see langword="true"/> here is still analyzed when
+    /// <see cref="DictionaryEnabled"/> is <see langword="false"/> globally.</para>
+    ///
+    /// <para>This is a switch, not an assertion about the data — <see langword="true"/> means "analyze it",
+    /// not "it is low-cardinality". The cardinality threshold and
+    /// <see cref="DictionaryPageSizeLimit"/> still decide the outcome, so a column left on cannot produce
+    /// an oversized dictionary however it is annotated.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, bool>? ColumnDictionaryEnabled { get; init; }
+
+    /// <summary>
     /// Prototype. When <see langword="true"/>, consecutive bit-packed groups in RLE/bit-packed
     /// hybrid streams — definition levels, repetition levels, and dictionary indices — are batched
     /// into a single literal run (up to 63 groups) instead of emitting a run header for every
@@ -318,4 +339,13 @@ public sealed record ParquetWriteOptions
         ColumnEncodings != null && ColumnEncodings.TryGetValue(string.Join(".", pathInSchema), out var enc)
             ? enc
             : ByteArrayEncoding;
+
+    /// <summary>
+    /// Resolves whether a column is dictionary-analyzed at all, checking per-column overrides first.
+    /// </summary>
+    internal bool GetDictionaryEnabled(IReadOnlyList<string> pathInSchema) =>
+        ColumnDictionaryEnabled != null &&
+        ColumnDictionaryEnabled.TryGetValue(string.Join(".", pathInSchema), out bool enabled)
+            ? enabled
+            : DictionaryEnabled;
 }

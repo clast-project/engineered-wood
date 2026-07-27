@@ -130,7 +130,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     ? (float)s.DictionaryCount / s.NonNullCount
                     : 0;
 
-                if (_options.DictionaryEnabled && cardinality <= DictionaryEncoder.CardinalityThreshold)
+                // Per-column resolution, not the file-wide flag: an option that held for one writer and
+                // not the other would be worse than not having it.
+                if (_options.GetDictionaryEnabled(s.PathInSchema)
+                    && cardinality <= DictionaryEncoder.CardinalityThreshold)
                 {
                     dictResults[i] = new DictionaryEncoder.DictionaryResult
                     {

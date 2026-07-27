@@ -583,3 +583,27 @@ Three of the five constant-column sources deliberately stayed on `ArrowCompute.R
 ones (their batches go to callers, whose schema expectations are not ours to change) and IcebergCompat's
 partition materialization (it can flow to a caller-supplied `DataFileWriter`). Reasoning in full, plus the
 measurements and the gotchas: [`ree-constant-column-encoding.md`](ree-constant-column-encoding.md).
+
+### D. What a declined dictionary costs — per-column switch DONE, two changes deferred (2026-07-27)
+
+Fell out of the run-end-encoding work: the hash-table sizing that hid the REE saving is a general
+problem, not a run-arm one. Measured — a 1M-row column of distinct strings pays **17.5 MB and 13 ms** for
+a dictionary analysis that is discarded, producing a byte-identical file. Meanwhile a 1M-row column of
+twelve distinct values allocates the same 8.4 MB hash table as one with a million, because the table is
+sized from the cardinality CAP rather than from anything the column contains.
+
+`ParquetWriteOptions.ColumnDictionaryEnabled` landed: a per-column override (a map, so it works in both
+directions), honored by both writers. It saves the full 17.5 MB on a producer that names its id column.
+It only helps producers who KNOW, which is why the other two are worth doing:
+
+- **Grow `BytesHashTable` instead of pre-sizing it** — helps everyone, needs no API, and is the actual
+  memory-bounding fix (twenty string columns is ~168 MB of table live at once under `Parallel.For`,
+  independent of the data). Blocked on the table having no resize path: the generous pre-sizing is
+  load-bearing today, since `GetOrAdd` spins forever if it fills. **Do this next.**
+- **Incremental fallback (the parquet-cpp model)** — keeps the dictionary-encoded prefix instead of
+  discarding it. Deferred deliberately: on a uniformly high-cardinality column a mixed chunk makes the
+  file WORSE, and EW, unlike a streaming writer, has the whole column and can simply decide. Justify it on
+  regime-changing data, not on waste.
+
+Measurements, the parquet-cpp comparison, and three smaller things noticed and not addressed:
+[`dictionary-encoding-cost.md`](dictionary-encoding-cost.md).

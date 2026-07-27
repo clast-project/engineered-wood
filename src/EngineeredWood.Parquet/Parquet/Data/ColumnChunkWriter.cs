@@ -122,15 +122,21 @@ internal static class ColumnChunkWriter
         var columnCodec = options.GetCodec(pathInSchema);
         var columnLevel = options.GetCompressionLevel(pathInSchema);
         var columnByteArrayEncoding = options.GetByteArrayEncoding(pathInSchema);
+        bool columnDictionary = options.GetDictionaryEnabled(pathInSchema);
         if (columnCodec != options.Compression
             || columnLevel != options.CompressionLevel
-            || columnByteArrayEncoding != options.ByteArrayEncoding)
+            || columnByteArrayEncoding != options.ByteArrayEncoding
+            || columnDictionary != options.DictionaryEnabled)
         {
             options = options with
             {
                 Compression = columnCodec,
                 CompressionLevel = columnLevel,
                 ByteArrayEncoding = columnByteArrayEncoding,
+                // Folded into the per-column options rather than passed alongside them, so everything
+                // downstream — DictionaryEncoder above all — reads one resolved DictionaryEnabled and
+                // cannot consult the file-wide one by accident.
+                DictionaryEnabled = columnDictionary,
             };
         }
 
