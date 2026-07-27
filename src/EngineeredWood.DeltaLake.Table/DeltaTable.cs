@@ -122,9 +122,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </param>
     /// <param name="configuration">
     /// Table properties (<c>delta.*</c>) to record in the table's metadata, e.g.
-    /// <c>delta.checkpoint.writeStatsAsJson</c> or <c>delta.deletedFileRetentionDuration</c>. The
-    /// properties implied by the other arguments — column mapping, deletion vectors, row tracking —
-    /// are applied on top, so those arguments remain the source of truth for the features they enable.
+    /// <c>delta.checkpoint.writeStatsAsJson</c> or <c>delta.deletedFileRetentionDuration</c>.
+    /// <para>The <c>delta.enable*</c> / mode properties in it ENABLE their feature exactly like the
+    /// dedicated arguments do, and each is declared in the commit-0 protocol: column mapping
+    /// (<c>delta.columnMapping.mode</c>), deletion vectors, row tracking, in-commit timestamps
+    /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>) and
+    /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c>). Enablement is
+    /// one-directional — a property can turn a feature on, never off — so an argument and a property that
+    /// disagree resolve to the argument. Internally-derived keys (the column-mapping mode and max id)
+    /// overwrite caller-supplied ones; caller-supplied row-tracking materialized column names win.</para>
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public static async ValueTask<DeltaTable> CreateAsync(
@@ -177,7 +183,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 configurationBuilder[kvp.Key] = kvp.Value;
         }
 
-        if (columnMappingMode != ColumnMappingMode.None)
+        // A feature is enabled by EITHER its dedicated argument or its table property, symmetrically — a
+        // caller translating CREATE TABLE ... TBLPROPERTIES gets the same table as one passing the flags.
+        // Enablement is one-directional (a property turns a feature on, never off), so the argument stays
+        // the source of truth where the two disagree. Everything enabled here MUST also be declared in the
+        // protocol below: a delta.enable* property with no matching table feature is exactly what a strict
+        // reader rejects as DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH.
+        var mappingMode = columnMappingMode != ColumnMappingMode.None
+            ? columnMappingMode
+            : ColumnMapping.GetMode(configurationBuilder);
+        bool dvEnabled = enableDeletionVectors
+            || DeletionVectors.DeletionVectorConfig.IsEnabled(configurationBuilder);
+        bool rowTrackingEnabled = enableRowTracking
+            || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder);
+        bool inCommitTimestampsEnabled = Log.InCommitTimestamp.IsEnabled(configurationBuilder);
+        bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
+        var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
+
+        if (mappingMode != ColumnMappingMode.None)
         {
             minReaderVersion = 2;
             minWriterVersion = 5;
@@ -186,7 +209,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var (mappedSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
             deltaSchema = mappedSchema;
 
-            string modeStr = columnMappingMode switch
+            string modeStr = mappingMode switch
             {
                 ColumnMappingMode.Id => "id",
                 ColumnMappingMode.Name => "name",
@@ -200,7 +223,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         // Deletion vectors are opt-in: set the table property so the DELETE path knows it may soft-delete
         // rows with a DV, and declare the reader+writer feature below so foreign readers apply them.
-        if (enableDeletionVectors)
+        if (dvEnabled)
         {
             configurationBuilder ??= new Dictionary<string, string>();
             configurationBuilder[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
@@ -209,16 +232,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Row tracking is opt-in: set the property and store the two spec-required hidden column names now
         // (they are fixed at enablement — a reader consults them to find the materialized id/version columns
         // an eventual rewrite writes). Fresh appends need neither column: a row's id is baseRowId + position.
+        // Caller-supplied names (in `configuration`) WIN — a table being recreated, or one whose files were
+        // already written against known names, must keep them; only an absent name is generated.
         // The rowTracking + domainMetadata writer features are declared below.
-        if (enableRowTracking)
+        if (rowTrackingEnabled)
         {
             configurationBuilder ??= new Dictionary<string, string>();
             configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
-            var (rowIdCol, rowCommitVersionCol) =
-                DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
-            configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
-            configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
-                rowCommitVersionCol;
+            string rowIdKey = DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey;
+            string rowVersionKey =
+                DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey;
+            if (!configurationBuilder.ContainsKey(rowIdKey)
+                || !configurationBuilder.ContainsKey(rowVersionKey))
+            {
+                var (rowIdCol, rowCommitVersionCol) =
+                    DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
+                if (!configurationBuilder.ContainsKey(rowIdKey))
+                    configurationBuilder[rowIdKey] = rowIdCol;
+                if (!configurationBuilder.ContainsKey(rowVersionKey))
+                    configurationBuilder[rowVersionKey] = rowCommitVersionCol;
+            }
         }
 
         // The legacy protocol versions this table would carry if NO table feature forced it into
@@ -252,7 +285,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // makes a conformant foreign reader APPLY the DVs a DELETE writes; without it they are silently
         // ignored (a reader returns rows the table considers deleted). The DELETE path refuses to write a DV
         // unless this feature is enabled — see ComputeDeleteActionsAsync.
-        if (enableDeletionVectors)
+        if (dvEnabled)
         {
             minReaderVersion = 3;
             minWriterVersion = 7;
@@ -265,12 +298,50 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // ordinary data plus optional add.baseRowId metadata, so the reader version is untouched. The append
         // path assigns baseRowId + defaultRowCommitVersion and advances the HWM domain; a copy-on-write rewrite
         // (UPDATE / OVERWRITE / compaction) materializes each moved row's original id + commit version.
-        if (enableRowTracking)
+        if (rowTrackingEnabled)
         {
             minWriterVersion = 7;
             writerFeatures.Add("rowTracking");
             if (!writerFeatures.Contains("domainMetadata"))
                 writerFeatures.Add("domainMetadata");
+        }
+
+        // In-commit timestamps — a WRITER-only feature ('inCommitTimestamp'); readers read the table
+        // normally and only consult commitInfo.inCommitTimestamp instead of the file modification time.
+        // Because it is enabled AT CREATION (version 0), the spec requires NO
+        // delta.inCommitTimestampEnablementVersion / …Timestamp pair: those exist to mark where a
+        // mid-life enablement began, and here every commit in the table's history carries the field
+        // (EnsureCommitInfo writes it, including for this creation commit).
+        if (inCommitTimestampsEnabled)
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("inCommitTimestamp");
+        }
+
+        // Change data feed — a WRITER-only feature ('changeDataFeed'); readers read data normally and the
+        // change feed is a separate, opt-in read. Declaring it is what obliges every writer of this table
+        // (including foreign ones) to emit _change_data for row-level changes, which is what makes the feed
+        // COMPLETE — a feed with a silent gap is worse than no feed. The DML paths honor it from the table
+        // property; ReadChangesAsync / table_changes then return the recorded changes.
+        if (changeDataFeedEnabled)
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("changeDataFeed");
+        }
+
+        // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'icebergCompatV2'); readers see
+        // an ordinary Delta table. The constraints bind the WRITER (column mapping required, partition
+        // values materialized into the data files, numRecords in every stats blob; V1 additionally forbids
+        // deletion vectors and array/map columns) so that an external converter — UniForm — can generate
+        // Iceberg metadata over the very same parquet files. Declaring it is what tells a foreign writer it
+        // must honor them too; the full constraint set is validated against the finished commit-0 actions
+        // below. V2 wins if a caller somehow enables both (matching IcebergCompat.GetVersion).
+        if (icebergCompatVersion != IcebergCompatVersion.None)
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add(icebergCompatVersion == IcebergCompatVersion.V2
+                ? "icebergCompatV2"
+                : "icebergCompatV1");
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -304,7 +375,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // cosmetic, because writer v5's extra implied features only impose obligations on tables that
         // actually declare a constraint or generated column, and HonorWriterFeatures already fails
         // closed on those. See doc/upstream-landing-notes.md for the full measurement.
-        if (columnMappingMode != ColumnMappingMode.None &&
+        if (mappingMode != ColumnMappingMode.None &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
             minReaderVersion = 3;
@@ -342,29 +413,35 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         string schemaString = DeltaSchemaSerializer.Serialize(deltaSchema);
 
-        var actions = new List<DeltaAction>
+        var protocolAction = new ProtocolAction
         {
-            new ProtocolAction
-            {
-                MinReaderVersion = minReaderVersion,
-                MinWriterVersion = minWriterVersion,
-                ReaderFeatures = readerFeatures.Count > 0 ? readerFeatures : null,
-                WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
-            },
-            new MetadataAction
-            {
-                Id = Guid.NewGuid().ToString(),
-                Format = Format.Parquet,
-                SchemaString = schemaString,
-                PartitionColumns = partitionColumns ?? [],
-                Configuration = configurationBuilder,
-                CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            },
+            MinReaderVersion = minReaderVersion,
+            MinWriterVersion = minWriterVersion,
+            ReaderFeatures = readerFeatures.Count > 0 ? readerFeatures : null,
+            WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
         };
+
+        var metadataAction = new MetadataAction
+        {
+            Id = Guid.NewGuid().ToString(),
+            Format = Format.Parquet,
+            SchemaString = schemaString,
+            PartitionColumns = partitionColumns ?? [],
+            Configuration = configurationBuilder,
+            CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        };
+
+        // IcebergCompat's constraints are cross-cutting (configuration + schema + protocol), so they are
+        // checked once against the FINISHED commit-0 actions rather than piecemeal. A violating table must
+        // not be created at all: the alternative is a table that looks fine until UniForm tries to convert
+        // it, long after data has been written into it.
+        Schema.IcebergCompat.Validate(icebergCompatVersion, metadataAction, protocolAction);
+
+        var actions = new List<DeltaAction> { protocolAction, metadataAction };
 
         if (clusteringColumns is { Count: > 0 })
         {
-            actions.Add(BuildClusteringDomain(deltaSchema, clusteringColumns, columnMappingMode));
+            actions.Add(BuildClusteringDomain(deltaSchema, clusteringColumns, mappingMode));
         }
 
         // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
@@ -383,12 +460,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Opens an existing Delta table, or creates a new one if it doesn't exist.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="columnMappingMode"/> and <paramref name="configuration"/> apply only on the CREATE
+    /// path — an existing table keeps the mode and properties it was created with, because changing either
+    /// is a metadata commit (see <see cref="SetSchemaAsync"/>), not something an open should do silently.
+    /// </remarks>
     public static async ValueTask<DeltaTable> OpenOrCreateAsync(
         ITableFileSystem fileSystem,
         Apache.Arrow.Schema schema,
         DeltaTableOptions? options = null,
         IReadOnlyList<string>? partitionColumns = null,
         IReadOnlyList<string>? clusteringColumns = null,
+        ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
+        IReadOnlyDictionary<string, string>? configuration = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -402,7 +486,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
 
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
+            columnMappingMode: columnMappingMode,
             clusteringColumns: clusteringColumns,
+            configuration: configuration,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 

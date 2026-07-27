@@ -1269,23 +1269,12 @@ public class SparkInteropTests : IDisposable
 
     // Creates a Name-mode column-mapping table partitioned by region with CDF enabled (CreateAsync has no CDF
     // switch, so the property is patched into the generated, correctly-mapped metadata as a follow-up commit).
-    private async Task<DeltaTable> CreateMappedPartitionedCdfTableAsync()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        long next;
-        MetadataAction meta;
-        await using (var created = await DeltaTable.CreateAsync(
-            fs, IdValueRegionSchema, partitionColumns: ["region"], columnMappingMode: ColumnMappingMode.Name))
-        {
-            meta = created.CurrentSnapshot.Metadata;
-            next = created.CurrentSnapshot.Version + 1;
-        }
-        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
-        cfg[CdfConfig.EnableKey] = "true";
-        await new TransactionLog(fs).WriteCommitAsync(
-            next, new List<DeltaAction> { meta with { Configuration = cfg } });
-        return await DeltaTable.OpenAsync(fs);
-    }
+    private async Task<DeltaTable> CreateMappedPartitionedCdfTableAsync() =>
+        await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdValueRegionSchema,
+            partitionColumns: ["region"],
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
 
     /// <summary>
     /// <para>The cross-engine proof for the CDF write layout: EW writes a Change Data Feed on a
@@ -1358,39 +1347,12 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
 
-    // Creates an UNMAPPED table partitioned by region with CDF enabled (property + writer feature patched in,
-    // as CreateAsync has no CDF switch).
-    private async Task<DeltaTable> CreatePartitionedCdfTableAsync()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        long next;
-        MetadataAction meta;
-        ProtocolAction proto;
-        await using (var created = await DeltaTable.CreateAsync(
-            fs, IdValueRegionSchema, partitionColumns: ["region"]))
-        {
-            meta = created.CurrentSnapshot.Metadata;
-            proto = created.CurrentSnapshot.Protocol;
-            next = created.CurrentSnapshot.Version + 1;
-        }
-        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
-        cfg[CdfConfig.EnableKey] = "true";
-
-        // CDF needs writer support. A plain table is created on a LEGACY protocol (no feature lists), where the
-        // capability is implied by the version — bumping to 4 is the whole declaration. Naming the feature there
-        // instead would be rejected outright ("Mismatched minWriterVersion and writerFeatures"), since a feature
-        // list is only legal at writer 7.
-        var upgraded = proto.WriterFeatures is { Count: > 0 } features
-            ? proto with { WriterFeatures = features.Contains("changeDataFeed") ? features : [.. features, "changeDataFeed"] }
-            : proto with { MinWriterVersion = Math.Max(proto.MinWriterVersion, 4) };
-
-        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
-        {
-            upgraded,
-            meta with { Configuration = cfg },
-        });
-        return await DeltaTable.OpenAsync(fs);
-    }
+    // Creates an UNMAPPED table partitioned by region with CDF enabled at creation.
+    private async Task<DeltaTable> CreatePartitionedCdfTableAsync() =>
+        await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdValueRegionSchema,
+            partitionColumns: ["region"],
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
 
     /// <summary>Transient rowids (<c>_metadata.row_id</c>) of the rows whose <c>id</c> is listed.</summary>
     private static async Task<List<long>> RowIdsOfAsync(DeltaTable table, params long[] ids)
@@ -1487,35 +1449,12 @@ public class SparkInteropTests : IDisposable
 
     // ── CDF inference over a deletion-vector-carrying file ──
 
-    // Creates an unmapped table with BOTH deletion vectors and CDF. CreateAsync has no CDF switch, so the
-    // property and the writer feature are patched into the generated metadata/protocol as a follow-up commit.
-    private async Task<DeltaTable> CreateCdfDvTableAsync()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        long next;
-        MetadataAction meta;
-        ProtocolAction proto;
-        await using (var created = await DeltaTable.CreateAsync(
-            fs, IdRegionSchema, enableDeletionVectors: true))
-        {
-            meta = created.CurrentSnapshot.Metadata;
-            proto = created.CurrentSnapshot.Protocol;
-            next = created.CurrentSnapshot.Version + 1;
-        }
-
-        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
-        cfg[CdfConfig.EnableKey] = "true";
-        var writerFeatures = (proto.WriterFeatures ?? []).ToList();
-        if (!writerFeatures.Contains("changeDataFeed"))
-            writerFeatures.Add("changeDataFeed");
-
-        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
-        {
-            proto with { WriterFeatures = writerFeatures },
-            meta with { Configuration = cfg },
-        });
-        return await DeltaTable.OpenAsync(fs);
-    }
+    // Creates an unmapped table with BOTH deletion vectors and CDF enabled at creation.
+    private async Task<DeltaTable> CreateCdfDvTableAsync() =>
+        await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
 
     /// <summary>
     /// <para>A commit that carries no <c>cdc</c> action is read by INFERENCE — the removed files' rows become
@@ -1710,5 +1649,163 @@ public class SparkInteropTests : IDisposable
         }
 
         return rows.OrderBy(t => t.Item1, StringComparer.Ordinal).ThenBy(t => t.Item2).ToList();
+    }
+
+    // ── Create-time feature enablement ──
+    //
+    // `CreateAsync(configuration: …)` turns a `delta.enable*` property into a real feature: the property in
+    // the metadata AND the matching entry in the commit-0 protocol. Getting only the first half is precisely
+    // what a strict reader rejects (DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH: "enabled in metadata but not
+    // listed in protocol"), and nothing inside EngineeredWood notices — its own reader does not consult the
+    // feature lists. The reference implementation is the only oracle for that half, so each test below has
+    // Spark not merely READ the table but WRITE THROUGH it, which is where the protocol check actually runs.
+
+    /// <summary>
+    /// <para>In-commit timestamps: EW creates the table with <c>delta.enableInCommitTimestamps</c>, Spark
+    /// mutates it, and Spark stamps its OWN commit with an <c>inCommitTimestamp</c> that follows EW's.</para>
+    ///
+    /// <para>The timestamps are read RAW off disk rather than through
+    /// <see cref="Snapshot.Snapshot.InCommitTimestamp"/>, because <c>InCommitTimestamp.GetTimestamp</c> falls
+    /// back to commitInfo's informational <c>timestamp</c> field — so a snapshot value proves nothing about
+    /// whether the feature is live. The key's presence in the JSON does.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCreated_InCommitTimestampsProperty_SparkWritesThroughAndStampsItsOwnCommit()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long ewVersion;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            configuration: new Dictionary<string, string> { [InCommitTimestamp.EnableKey] = "true" }))
+        {
+            await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]);
+            ewVersion = table.CurrentSnapshot.Version;
+        }
+
+        var result = Spark.Invoke("sql", new
+        {
+            path = _tempDir,
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+        });
+
+        Assert.Contains("inCommitTimestamp", TableFeatures(result));
+
+        long ewStamp = CommitInfoOnDisk(ewVersion).GetProperty("inCommitTimestamp").GetInt64();
+        long sparkStamp = CommitInfoOnDisk(ewVersion + 1).GetProperty("inCommitTimestamp").GetInt64();
+        Assert.True(sparkStamp >= ewStamp, $"Spark's stamp {sparkStamp} must not precede EW's {ewStamp}");
+
+        // Commit 0 carries one too: enabling at CREATION is what makes the enablement-version/timestamp
+        // pair unnecessary, and that only holds if the creation commit itself is stamped.
+        Assert.True(CommitInfoOnDisk(0).TryGetProperty("inCommitTimestamp", out _));
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal([(1L, "us"), (3L, "us")], await ReadAllViaEw(reopened));
+    }
+
+    /// <summary>
+    /// IcebergCompat V1 / V2: the reference implementation resolves the declared feature and reads the
+    /// rows. Column mapping is a hard dependency of both, and at writer 7 it must be spelled out in BOTH
+    /// feature lists — if it were not, Spark would read the table as unmapped and fail to resolve the
+    /// physical <c>col-&lt;guid&gt;</c> column names in the data files.
+    /// </summary>
+    [Theory]
+    [InlineData(IcebergCompat.EnableV1Key, "icebergCompatV1")]
+    [InlineData(IcebergCompat.EnableV2Key, "icebergCompatV2")]
+    public async Task EwCreated_IcebergCompatProperty_SparkResolvesFeatureAndReadsRows(
+        string enableKey, string feature)
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { [enableKey] = "true" });
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]);
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+        var features = TableFeatures(result);
+        Assert.Contains(feature, features);
+        Assert.Contains("columnMapping", features);
+    }
+
+    /// <summary>
+    /// <para>Every property-enabled feature at once on one table — deletion vectors, row tracking,
+    /// in-commit timestamps, change data feed, column mapping — then Spark DELETEs through it.</para>
+    ///
+    /// <para>Spark's writer-side protocol check runs against the WHOLE declaration set, so this is the
+    /// test that fails if any one of them is enabled in metadata without being listed (or listed without
+    /// its dependency: <c>rowTracking</c> needs <c>domainMetadata</c>). EW then reads Spark's result,
+    /// and its own change feed for the version it wrote.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCreated_AllFeaturesViaProperties_SparkDeletesThroughItAndEwReadsBack()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long insertVersion;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string>
+            {
+                [EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey] = "true",
+                [EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true",
+                [InCommitTimestamp.EnableKey] = "true",
+                [CdfConfig.EnableKey] = "true",
+            }))
+        {
+            insertVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]);
+        }
+
+        var result = Spark.Invoke("sql", new
+        {
+            path = _tempDir,
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+        });
+
+        var features = TableFeatures(result);
+        Assert.All(
+            new[]
+            {
+                "deletionVectors", "rowTracking", "domainMetadata",
+                "inCommitTimestamp", "changeDataFeed", "columnMapping",
+            },
+            f => Assert.Contains(f, features));
+
+        var sparkRows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (r.GetProperty("id").GetInt64(), r.GetProperty("region").GetString()!))
+            .OrderBy(t => t.Item1).ToList();
+        Assert.Equal([(1L, "us"), (3L, "us")], sparkRows);
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal([(1L, "us"), (3L, "us")], await ReadAllViaEw(reopened));
+        Assert.Equal(
+            [("insert", 1L), ("insert", 2L), ("insert", 3L)],
+            await EwChangesAsync(insertVersion, insertVersion));
+    }
+
+    private static List<string?> TableFeatures(JsonElement result) =>
+        result.GetProperty("detail").GetProperty("table_features")
+            .EnumerateArray().Select(f => f.GetString()).ToList();
+
+    /// <summary>
+    /// The raw <c>commitInfo</c> action of one version, straight off disk. Needed wherever the question is
+    /// which KEYS a commit carries — every accessor in the library normalizes that away.
+    /// </summary>
+    private JsonElement CommitInfoOnDisk(long version)
+    {
+        string path = Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json");
+        foreach (string line in File.ReadAllLines(path))
+        {
+            using var doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("commitInfo", out var commitInfo))
+                return commitInfo.Clone();
+        }
+
+        throw new InvalidOperationException($"version {version} has no commitInfo action");
     }
 }

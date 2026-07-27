@@ -725,4 +725,51 @@ public class DeltaRsInteropTests : IDisposable
         Assert.False(rejected.GetProperty("ok").GetBoolean());
         Assert.Contains("minimum reader version", rejected.GetProperty("error").GetString()!);
     }
+
+    /// <summary>
+    /// <para>Create-time feature enablement: `delta.enable*` properties handed to <c>CreateAsync</c> must
+    /// land as BOTH the metadata property and the matching writer-feature declaration. A second engine is
+    /// the only thing that sees the pair as a pair — EW's own reader never consults the feature lists.</para>
+    ///
+    /// <para>All three features here are WRITER-only, which is what makes this a tier-1 test rather than a
+    /// tier-3 one: a reader that does not implement them must still read the table normally. If EW ever
+    /// escalated the READER version for one of them, delta-rs would refuse the table outright and this
+    /// would fail — which is the point. Deletion vectors are deliberately absent: they are a reader
+    /// feature, and delta-rs 1.6.2 correctly declines those (see the deletion-vector test above).</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCreated_WriterOnlyFeatureProperties_DeltaRsStillReadsAndSeesDeclarations()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            configuration: new Dictionary<string, string>
+            {
+                [EngineeredWood.DeltaLake.Log.InCommitTimestamp.EnableKey] = "true",
+                [EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey] = "true",
+                [EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true",
+            });
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]);
+
+        var described = DeltaRs.Invoke("describe", new { path = _tempDir });
+
+        var writerFeatures = described.GetProperty("writer_features").EnumerateArray()
+            .Select(f => f.GetString()).ToList();
+        Assert.All(
+            new[] { "inCommitTimestamp", "changeDataFeed", "rowTracking", "domainMetadata" },
+            f => Assert.Contains(f, writerFeatures));
+        // Writer-only means exactly that: the reader side stays untouched, so any engine can still read.
+        Assert.Empty(described.GetProperty("reader_features").EnumerateArray());
+        Assert.Equal(1, described.GetProperty("min_reader_version").GetInt32());
+
+        var configuration = described.GetProperty("configuration");
+        Assert.Equal("true", configuration
+            .GetProperty(EngineeredWood.DeltaLake.Log.InCommitTimestamp.EnableKey).GetString());
+        Assert.Equal("true", configuration
+            .GetProperty(EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey).GetString());
+
+        Assert.Equal(await ReadAllViaEw(table),
+            RowsFromJson(DeltaRs.Invoke("read", new { path = _tempDir })));
+    }
 }
