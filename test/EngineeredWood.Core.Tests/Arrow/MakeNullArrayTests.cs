@@ -381,6 +381,127 @@ public class MakeNullArrayTests
         Assert.Equal(0, offsets[0]);
     }
 
+    // ── Unions ──
+    //
+    // A union is the one type here with no validity bitmap: the Arrow spec puts its nulls in the child that
+    // each row's type id selects. So "all null" cannot be asserted by reading a parent bitmap — it has to be
+    // read the way a consumer would, by following each row's type id into its branch.
+
+    private static UnionType MakeUnionType(UnionMode mode, params int[] typeIds) =>
+        new(
+            [
+                new Field("i", Int32Type.Default, nullable: true),
+                new Field("s", StringType.Default, nullable: true),
+            ],
+            typeIds.Length > 0 ? typeIds : [0, 1],
+            mode);
+
+    [Fact]
+    public void DenseUnion_EveryRowReadsAsNullThroughItsSelectedBranch()
+    {
+        var type = MakeUnionType(UnionMode.Dense);
+
+        var result = Assert.IsType<DenseUnionArray>(ArrowCompute.MakeNullArray(type, 4));
+
+        Assert.Equal(4, result.Length);
+
+        // A dense union addresses its children through the offsets buffer, so only the selected branch
+        // carries rows; the other stays empty rather than being padded.
+        var selected = Assert.IsType<Int32Array>(result.Fields[0]);
+        Assert.Equal(4, selected.Length);
+        Assert.Equal(0, Assert.IsType<StringArray>(result.Fields[1]).Length);
+
+        for (int i = 0; i < result.Length; i++)
+        {
+            Assert.Equal(0, result.TypeIds[i]);
+            Assert.Equal(i, result.ValueOffsets[i]);
+            Assert.True(selected.IsNull(result.ValueOffsets[i]));
+        }
+    }
+
+    [Fact]
+    public void SparseUnion_EveryBranchIsParallelToTheParent()
+    {
+        var type = MakeUnionType(UnionMode.Sparse);
+
+        var result = Assert.IsType<SparseUnionArray>(ArrowCompute.MakeNullArray(type, 3));
+
+        Assert.Equal(3, result.Length);
+
+        // Sparse children are addressed by row position, so a short child would be read past its end.
+        var ints = Assert.IsType<Int32Array>(result.Fields[0]);
+        var strings = Assert.IsType<StringArray>(result.Fields[1]);
+        Assert.Equal(3, ints.Length);
+        Assert.Equal(3, strings.Length);
+
+        for (int i = 0; i < result.Length; i++)
+        {
+            Assert.Equal(0, result.TypeIds[i]);
+            Assert.True(ints.IsNull(i));
+            Assert.True(strings.IsNull(i));
+        }
+    }
+
+    [Fact]
+    public void Union_TypeIdWrittenIsTheOneTheTypeMapAssigns_NotTheBranchIndex()
+    {
+        // A union numbers its branches however it likes, and the type_ids buffer holds those numbers, not
+        // positions. Writing a bare 0 here would point every row at whichever branch happens to be numbered
+        // 0 — a different branch than the one actually carrying the nulls.
+        var type = MakeUnionType(UnionMode.Dense, 7, 9);
+
+        var result = Assert.IsType<DenseUnionArray>(ArrowCompute.MakeNullArray(type, 2));
+
+        for (int i = 0; i < result.Length; i++)
+            Assert.Equal(7, result.TypeIds[i]);
+    }
+
+    [Fact]
+    public void Union_ZeroLength_IsWellFormed()
+    {
+        // The case the ORC reader actually hits: a list<union> whose lists are all empty needs a
+        // zero-length child of the declared union type.
+        var type = MakeUnionType(UnionMode.Dense);
+
+        var result = Assert.IsType<DenseUnionArray>(ArrowCompute.MakeNullArray(type, 0));
+
+        Assert.Equal(0, result.Length);
+        Assert.Same(type, result.Data.DataType);
+        Assert.Equal(2, result.Fields.Count);
+        Assert.Equal(0, result.Fields[0].Length);
+        Assert.Equal(0, result.Fields[1].Length);
+    }
+
+    [Fact]
+    public void Union_NestedInsideAList_Recurses()
+    {
+        // The path that made this arm necessary: MakeNullArray recurses into a list's element type, so a
+        // union anywhere in a nested subtree is reached even when the caller never names one.
+        var elementType = MakeUnionType(UnionMode.Dense);
+        var listType = new ListType(new Field("item", elementType, nullable: true));
+
+        var result = Assert.IsType<ListArray>(ArrowCompute.MakeNullArray(listType, 3));
+
+        Assert.Equal(3, result.Length);
+        Assert.Equal(3, result.Data.NullCount);
+        Assert.IsType<DenseUnionArray>(result.Values);
+
+        for (int i = 0; i < result.Length; i++)
+            Assert.True(result.IsNull(i));
+    }
+
+    [Fact]
+    public void ApacheArrow_RefusesABranchlessUnionType_WhichIsWhyMakeNullUnionNeedsNoGuard()
+    {
+        // A union with no branches would have nowhere to put a null — no child means no validity anywhere
+        // in the array — so MakeNullUnion indexing branch 0 unconditionally rests on that type being
+        // impossible to construct. It is: Apache.Arrow rejects an empty field list outright (reporting it,
+        // oddly, as a null 'fields' argument). If a future Arrow version starts allowing it, this test
+        // fails and MakeNullUnion needs the guard that is deliberately absent today.
+        Assert.Throws<ArgumentNullException>(
+            () => new UnionType(new Field[0], new int[0], UnionMode.Dense));
+    }
+
     [Fact]
     public void UnsupportedType_ThrowsRatherThanSubstitutingAnotherType()
     {

@@ -147,7 +147,9 @@ public static class ArrowCompute
     /// the schema of the batch it lands in, which is a silent mismatch rather than a failure.</para>
     ///
     /// <para>Nested types recurse — a struct's children are all-null arrays of the same length, and a list's
-    /// offsets are all zero over an empty child, so every row is a null rather than an empty list.</para>
+    /// offsets are all zero over an empty child, so every row is a null rather than an empty list. A union
+    /// is the exception to "the parent bitmap carries the nulls": it has none, so its nulls are delegated to
+    /// the branch each row selects (see <see cref="MakeNullUnion"/>).</para>
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// <paramref name="type"/> is one this cannot construct. Never substitute another type for it: that is
@@ -238,6 +240,12 @@ public static class ArrowCompute
 
                 return BuildNull(type, length, new[] { AllNullBitmap(length) }, children);
             }
+
+            // A union is the one arm that cannot go through BuildNull: it has NO validity bitmap of its
+            // own. The Arrow spec puts a union's nulls in the CHILD that each row's type id selects, so
+            // "all null" here is a property of the children, not of a cleared parent bitmap.
+            case UnionType ut:
+                return MakeNullUnion(ut, length);
 
             default:
             {
@@ -588,6 +596,52 @@ public static class ArrowCompute
             destination.Slice(0, n).CopyTo(destination.Slice(filled, n));
             filled += n;
         }
+    }
+
+    /// <summary>
+    /// The all-null union. Every row selects the FIRST branch, and that branch's child is what actually
+    /// holds the nulls — a union has no validity bitmap of its own, so there is nowhere else to put them.
+    ///
+    /// <para>Dense and sparse differ in what that costs the other branches. A dense union's children have
+    /// independent lengths and are addressed through the offsets buffer, so only branch 0 is populated and
+    /// the rest stay empty. A sparse union's children are addressed by row position and so are all parallel
+    /// to the parent, which makes every one of them an all-null array of the full length.</para>
+    ///
+    /// <para>The type id written per row is the one the type map assigns branch 0, which is not necessarily
+    /// 0 — a union may number its branches however it likes.</para>
+    ///
+    /// <para>There is no guard for a branchless union, which would have nowhere to put a null: Apache.Arrow
+    /// refuses to construct that type in the first place (measured — its constructor rejects an empty field
+    /// list), so branch 0 always exists here. Pinned by
+    /// <c>ApacheArrow_RefusesABranchlessUnionType_WhichIsWhyMakeNullUnionNeedsNoGuard</c>.</para>
+    /// </summary>
+    private static IArrowArray MakeNullUnion(UnionType type, int length)
+    {
+        int branchCount = type.Fields.Count;
+        bool dense = type.Mode == UnionMode.Dense;
+
+        var children = new IArrowArray[branchCount];
+        for (int i = 0; i < branchCount; i++)
+            children[i] = MakeNullArray(type.Fields[i].DataType, dense && i != 0 ? 0 : length);
+
+        // Zeroed, then overwritten only when branch 0 is numbered something other than 0.
+        var typeIds = new byte[length];
+        if (type.TypeIds[0] != 0)
+            typeIds.AsSpan().Fill(checked((byte)type.TypeIds[0]));
+
+        if (!dense)
+            return new SparseUnionArray(type, length, children, new ArrowBuffer(typeIds));
+
+        // Branch 0 holds one null per row, in row order, so row i reads slot i of it.
+        var offsets = Uninitialized<int>(length);
+        for (int i = 0; i < length; i++)
+            offsets[i] = i;
+
+        var offsetBytes = Uninitialized<byte>(length * sizeof(int));
+        MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+
+        return new DenseUnionArray(
+            type, length, children, new ArrowBuffer(typeIds), new ArrowBuffer(offsetBytes));
     }
 
     private static IArrowArray BuildNull(

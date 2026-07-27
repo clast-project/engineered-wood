@@ -4221,4 +4221,118 @@ public class OrcWriterTests
         }
         finally { File.Delete(path); }
     }
+
+    [Fact]
+    public async Task RoundTrip_ListOfUnion_AllListsEmpty_SynthesizesTheUnionChild()
+    {
+        // A union under a container is the case that made MakeNullArray need a union arm at all: the
+        // element type here IS the union, so there is nothing exotic about the schema — no nested union
+        // required. With every list empty the reader has to invent a zero-length union child.
+        var path = GetTempPath();
+        try
+        {
+            var unionType = new UnionType(
+                [
+                    new Field("i", Int32Type.Default, nullable: true),
+                    new Field("s", StringType.Default, nullable: true),
+                ],
+                [0, 1],
+                UnionMode.Dense);
+            var listType = new ListType(new Field("item", unionType, nullable: true));
+            var schema = new Schema([new Field("vals", listType, nullable: true)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions
+            {
+                Compression = CompressionKind.None,
+            }))
+            {
+                var emptyUnion = new DenseUnionArray(
+                    unionType, 0,
+                    [new Int32Array.Builder().Build(), new StringArray.Builder().Build()],
+                    ArrowBuffer.Empty, ArrowBuffer.Empty);
+
+                var offsets = new ArrowBuffer.Builder<int>();
+                offsets.Append(0).Append(0).Append(0).Append(0);
+                var list = new ListArray(listType, 3, offsets.Build(), emptyUnion, ArrowBuffer.Empty, 0);
+
+                await writer.WriteBatchAsync(new RecordBatch(schema, [list], 3));
+            }
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var rowReader = reader.CreateRowReader();
+            await foreach (var batch in rowReader)
+            {
+                var col = (ListArray)batch.Column(0);
+                Assert.Equal(3, col.Length);
+
+                var elements = Assert.IsType<DenseUnionArray>(col.Values);
+                Assert.Equal(0, elements.Length);
+                Assert.IsType<Int32Array>(elements.Fields[0]);
+                Assert.IsType<StringArray>(elements.Fields[1]);
+
+                for (int i = 0; i < col.Length; i++)
+                    Assert.Equal(0, col.GetValueLength(i));
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public async Task RoundTrip_ListOfStructContainingUnion_AllListsEmpty_RecursesToTheUnion()
+    {
+        // The union is two levels down, so nothing at the list's own element type hints one is involved.
+        // MakeNullArray recurses through the struct to reach it, which is what makes the exposure wider
+        // than "schemas whose element type is a union".
+        var path = GetTempPath();
+        try
+        {
+            var unionType = new UnionType(
+                [
+                    new Field("i", Int32Type.Default, nullable: true),
+                    new Field("s", StringType.Default, nullable: true),
+                ],
+                [0, 1],
+                UnionMode.Dense);
+            var structType = new StructType(
+                [
+                    new Field("id", Int32Type.Default, nullable: true),
+                    new Field("u", unionType, nullable: true),
+                ]);
+            var listType = new ListType(new Field("item", structType, nullable: true));
+            var schema = new Schema([new Field("rows", listType, nullable: true)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions
+            {
+                Compression = CompressionKind.None,
+            }))
+            {
+                var emptyUnion = new DenseUnionArray(
+                    unionType, 0,
+                    [new Int32Array.Builder().Build(), new StringArray.Builder().Build()],
+                    ArrowBuffer.Empty, ArrowBuffer.Empty);
+                var emptyStruct = new StructArray(
+                    structType, 0, [new Int32Array.Builder().Build(), emptyUnion], ArrowBuffer.Empty, 0);
+
+                var offsets = new ArrowBuffer.Builder<int>();
+                offsets.Append(0).Append(0).Append(0);
+                var list = new ListArray(listType, 2, offsets.Build(), emptyStruct, ArrowBuffer.Empty, 0);
+
+                await writer.WriteBatchAsync(new RecordBatch(schema, [list], 2));
+            }
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var rowReader = reader.CreateRowReader();
+            await foreach (var batch in rowReader)
+            {
+                var col = (ListArray)batch.Column(0);
+                Assert.Equal(2, col.Length);
+
+                var entries = Assert.IsType<StructArray>(col.Values);
+                Assert.Equal(0, entries.Length);
+                Assert.IsType<Int32Array>(entries.Fields[0]);
+                Assert.IsType<DenseUnionArray>(entries.Fields[1]);
+            }
+        }
+        finally { File.Delete(path); }
+    }
 }
