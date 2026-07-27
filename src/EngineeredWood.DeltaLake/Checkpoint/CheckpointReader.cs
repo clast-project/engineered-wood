@@ -170,6 +170,11 @@ public sealed class CheckpointReader
         int protocolIdx = batch.Schema.GetFieldIndex("protocol");
         int domainMetadataIdx = batch.Schema.GetFieldIndex("domainMetadata");
 
+        // Located once per batch, then shared by every add row in it.
+        var statsView = addIdx >= 0
+            ? CheckpointStatsView.TryCreate((Apache.Arrow.StructArray)batch.Column(addIdx))
+            : null;
+
         for (int row = 0; row < batch.Length; row++)
         {
             // Detect which action type is present by checking a key inner field.
@@ -186,7 +191,7 @@ public sealed class CheckpointReader
             }
             else if (addIdx >= 0 && HasStructValue(batch, addIdx, "path", row))
             {
-                actions.Add(ExtractAdd(batch, addIdx, row));
+                actions.Add(ExtractAdd(batch, addIdx, row, statsView));
             }
             else if (removeIdx >= 0 && HasStructValue(batch, removeIdx, "path", row))
             {
@@ -203,7 +208,8 @@ public sealed class CheckpointReader
         }
     }
 
-    private static AddFile ExtractAdd(RecordBatch batch, int colIdx, int row)
+    private static AddFile ExtractAdd(
+        RecordBatch batch, int colIdx, int row, CheckpointStatsView? statsView = null)
     {
         var structArray = (Apache.Arrow.StructArray)batch.Column(colIdx);
 
@@ -256,6 +262,7 @@ public sealed class CheckpointReader
             ModificationTime = modTime,
             DataChange = dataChange,
             Stats = stats,
+            TypedStats = statsView is not null ? new ParsedStatsRef(statsView, row) : null,
             Tags = tags,
             DeletionVector = dv,
             BaseRowId = GetInt64Field(structArray, "baseRowId", row),

@@ -542,7 +542,16 @@ internal static class ActionSerializer
             writer.WriteNumber("size", add.Size);
             writer.WriteNumber("modificationTime", add.ModificationTime);
             writer.WriteBoolean("dataChange", add.DataChange);
-            if (add.Stats is not null) writer.WriteString("stats", add.Stats);
+            // GetStatsJson, not Stats: an add read from a checkpoint that carries only typed
+            // statistics has no string of its own, and dropping it here would lose the statistics
+            // from every commit that re-serialises the file.
+            // GetStatsJson, not Stats: an add read from a checkpoint that carries only typed
+            // statistics has no string of its own, and dropping it here would lose the statistics
+            // from every commit that re-serialises the file.
+            // GetStatsJson, not Stats: an add read from a checkpoint that carries only typed
+            // statistics has no string of its own, and dropping it here would lose the statistics
+            // from every commit that re-serialises the file.
+            if (add.GetStatsJson() is { } statsJson) writer.WriteString("stats", statsJson);
             if (add.Tags is not null) WriteStringDict(writer, "tags", add.Tags);
             if (add.DeletionVector is not null)
             {

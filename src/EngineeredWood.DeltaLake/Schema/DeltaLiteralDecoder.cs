@@ -133,6 +133,117 @@ internal static class DeltaLiteralDecoder
         catch (OverflowException) { return null; }
     }
 
+    /// <summary>
+    /// Decodes one value of a checkpoint's typed <c>stats_parsed</c> column — the same bound
+    /// <see cref="FromJson"/> would produce from the JSON copy, read straight from the Arrow array
+    /// instead of parsed from text.
+    /// </summary>
+    /// <remarks>
+    /// Dispatch is on the DELTA type name, not on the Arrow array type, so the literal's
+    /// <c>Kind</c> matches the JSON path exactly: a <c>short</c> bound becomes an Int32 literal
+    /// either way, and comparison semantics cannot drift between the two sources.
+    /// </remarks>
+    public static LiteralValue? FromArrow(Apache.Arrow.IArrowArray array, int row, string typeName)
+    {
+        if (array.IsNull(row))
+            return null;
+
+        try
+        {
+            switch (typeName)
+            {
+                case "long":
+                    return array is Apache.Arrow.Int64Array i64
+                        ? (LiteralValue?)LiteralValue.Of(i64.GetValue(row)!.Value) : null;
+                case "integer":
+                    return array is Apache.Arrow.Int32Array i32
+                        ? (LiteralValue?)LiteralValue.Of(i32.GetValue(row)!.Value) : null;
+                case "short":
+                    return array is Apache.Arrow.Int16Array i16
+                        ? (LiteralValue?)LiteralValue.Of((int)i16.GetValue(row)!.Value) : null;
+                case "byte":
+                    return array is Apache.Arrow.Int8Array i8
+                        ? (LiteralValue?)LiteralValue.Of((int)i8.GetValue(row)!.Value) : null;
+                case "float":
+                    return array is Apache.Arrow.FloatArray f32
+                        ? (LiteralValue?)LiteralValue.Of(f32.GetValue(row)!.Value) : null;
+                case "double":
+                    return array is Apache.Arrow.DoubleArray f64
+                        ? (LiteralValue?)LiteralValue.Of(f64.GetValue(row)!.Value) : null;
+                case "boolean":
+                    return array is Apache.Arrow.BooleanArray b
+                        ? (LiteralValue?)LiteralValue.Of(b.GetValue(row)!.Value) : null;
+                case "string":
+                    return array is Apache.Arrow.StringArray s
+                        ? (LiteralValue?)LiteralValue.Of(s.GetString(row)) : null;
+                case "date":
+                    // Date32 holds days since the Unix epoch; the JSON path yields a UTC DateTimeOffset.
+                    return array is Apache.Arrow.Date32Array d32
+                        ? (LiteralValue?)LiteralValue.Of(
+                            new DateTimeOffset(
+                                s_epoch.AddDays(d32.GetValue(row)!.Value), TimeSpan.Zero))
+                        : null;
+                case "timestamp":
+                case "timestamp_ntz":
+                    return array is Apache.Arrow.TimestampArray ts
+                        ? (LiteralValue?)LiteralValue.Of(
+                            new DateTimeOffset(
+                                s_epoch.AddTicks(ts.GetValue(row)!.Value * 10), TimeSpan.Zero))
+                        : null;
+                default:
+                    return typeName.StartsWith("decimal(", StringComparison.Ordinal)
+                        ? FromArrowDecimal(array, row)
+                        : null;
+            }
+        }
+        catch (ArgumentOutOfRangeException) { return null; }
+        catch (InvalidOperationException) { return null; }
+        catch (OverflowException) { return null; }
+    }
+
+    private static readonly DateTime s_epoch = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>
+    /// Decimal bounds keep their exact unscaled digits, as in <see cref="ParseDecimalText"/>: the
+    /// reader may narrow a decimal column to any of the four Arrow widths, and 128/256 can hold values
+    /// <c>System.Decimal</c> cannot.
+    /// </summary>
+    private static LiteralValue? FromArrowDecimal(Apache.Arrow.IArrowArray array, int row)
+    {
+        // Width and scale first: a Span cannot travel through a tuple or a switch expression.
+        int width, scale;
+        Apache.Arrow.ArrowBuffer buffer;
+        switch (array)
+        {
+            case Apache.Arrow.Decimal32Array d:
+                (width, scale, buffer) =
+                    (4, ((Apache.Arrow.Types.Decimal32Type)d.Data.DataType).Scale, d.ValueBuffer);
+                break;
+            case Apache.Arrow.Decimal64Array d:
+                (width, scale, buffer) =
+                    (8, ((Apache.Arrow.Types.Decimal64Type)d.Data.DataType).Scale, d.ValueBuffer);
+                break;
+            case Apache.Arrow.Decimal128Array d:
+                (width, scale, buffer) =
+                    (16, ((Apache.Arrow.Types.Decimal128Type)d.Data.DataType).Scale, d.ValueBuffer);
+                break;
+            case Apache.Arrow.Decimal256Array d:
+                (width, scale, buffer) =
+                    (32, ((Apache.Arrow.Types.Decimal256Type)d.Data.DataType).Scale, d.ValueBuffer);
+                break;
+            default:
+                return null;
+        }
+
+        var bytes = buffer.Span.Slice((row + array.Data.Offset) * width, width);
+#if NET6_0_OR_GREATER
+        var unscaled = new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+#else
+        var unscaled = new BigInteger(bytes.ToArray());
+#endif
+        return MakeDecimalLiteral(unscaled, scale);
+    }
+
     private static LiteralValue? ParseDate(string s) =>
         DateTimeOffset.TryParseExact(s, "yyyy-MM-dd",
             CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto)

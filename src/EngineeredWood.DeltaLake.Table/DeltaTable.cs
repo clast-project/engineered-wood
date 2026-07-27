@@ -1836,7 +1836,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (dataActions.Count == 0)
             return baseSnapshot.Version; // nothing staged — no commit
 
-        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
+        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
@@ -2254,7 +2255,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         BaseRowId = nextRowId,
                         DefaultRowCommitVersion = attemptVersion,
                     });
-                    nextRowId += ColumnStats.Parse(add.Stats)?.NumRecords ?? 0;
+                    nextRowId += add.GetNumRecords() ?? 0;
                     changed = true;
                     break;
 
@@ -2382,7 +2383,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -2585,7 +2587,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
 
         // ColumnMappingRecursive reads the physical names / field ids off the schema itself — no flat maps needed.
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -3012,7 +3015,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
         var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -3051,7 +3055,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken)
             .ConfigureAwait(false);
         var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -3139,7 +3144,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
         var ordered = OrderedActiveFiles(snapshot);
         for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
         {
@@ -4263,7 +4269,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.Stats),
+                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
             });
         }
 
@@ -4350,7 +4356,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.Stats),
+                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
             });
             removedPaths.Add(addFile.Path);
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
@@ -5093,7 +5099,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(current.Stats),
+                        Stats = StatsWithLooseBounds(current.GetStatsJson()),
                     });
                     break;
                 }
@@ -5103,7 +5109,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // committing onto — concurrent commits may have consumed row-id space.
                     if (rowTrackingEnabled && add.BaseRowId is not null)
                     {
-                        long rows = Actions.ColumnStats.Parse(add.Stats)?.NumRecords ?? 0;
+                        long rows = add.GetNumRecords() ?? 0;
                         rebased.Add(add with
                         {
                             BaseRowId = nextRowId,
@@ -5205,7 +5211,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             return;
         }
-        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
+        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
         bool ReadsMatch(AddFile file)
         {
             if (readWholeTable)

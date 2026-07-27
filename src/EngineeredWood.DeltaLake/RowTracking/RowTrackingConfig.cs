@@ -142,25 +142,11 @@ public static class RowTrackingConfig
     }
 
     /// <summary>
-    /// Estimates the row count for a file from its stats JSON.
-    /// Falls back to 0 if stats are not available.
+    /// Estimates the row count for a file from its statistics.
+    /// Falls back to 0 when neither copy carries one.
     /// </summary>
-    private static long EstimateRowCount(Actions.AddFile addFile)
-    {
-        if (addFile.Stats is null)
-            return 0;
-
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(addFile.Stats);
-            if (doc.RootElement.TryGetProperty("numRecords", out var nr))
-                return nr.GetInt64();
-        }
-        catch
-        {
-            // Stats are optional; if they can't be parsed, use 0
-        }
-
-        return 0;
-    }
+    private static long EstimateRowCount(Actions.AddFile addFile) =>
+        // Reads whichever copy of the statistics carries a row count: a checkpoint written with
+        // writeStatsAsJson=false has only the typed one, and taking 0 there would break row ids.
+        addFile.GetNumRecords() ?? 0;
 }

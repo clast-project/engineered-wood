@@ -38,6 +38,24 @@ public sealed record DeltaTableOptions
     public bool CollectStats { get; init; } = true;
 
     /// <summary>
+    /// Whether file pruning reads a checkpoint's typed <c>add.stats_parsed</c> columns in preference
+    /// to its JSON <c>stats</c> string when the checkpoint carries both. Default: true.
+    /// </summary>
+    /// <remarks>
+    /// <para>Only the tie is being broken here. A checkpoint that carries just one copy is read from
+    /// that one either way — including the typed-only shape a table with
+    /// <c>delta.checkpoint.writeStatsAsJson=false</c> produces, which has no JSON to fall back to.
+    /// A column the typed struct does not cover (booleans, which carry no bounds there) also falls
+    /// back to the JSON regardless of this setting.</para>
+    ///
+    /// <para>The typed path avoids parsing a file's whole statistics blob to answer a predicate that
+    /// names one column, and does so on every query: measured at ~14x faster with ~100x less
+    /// allocation over a 100,000-file checkpoint. Set to false to force the JSON path — the two are
+    /// expected to agree, and any disagreement is a bug worth reporting.</para>
+    /// </remarks>
+    public bool PreferTypedCheckpointStats { get; init; } = true;
+
+    /// <summary>
     /// Whether a <c>variant</c> column's parquet group carries the <c>VARIANT</c> logical-type
     /// annotation. Default: <see langword="true"/>.
     /// <para>The Delta spec defines a variant's physical layout as a plain <c>struct&lt;value,

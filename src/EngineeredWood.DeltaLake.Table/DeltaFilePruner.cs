@@ -16,7 +16,15 @@ internal sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
 
-    public DeltaFilePruner(StructType schema, IReadOnlyList<string> partitionColumns)
+    /// <param name="schema">The table schema, used to type each column's bounds.</param>
+    /// <param name="partitionColumns">Partition columns, whose values are constant per file.</param>
+    /// <param name="preferTypedStats">
+    /// Whether a checkpoint's typed <c>stats_parsed</c> columns win over its JSON <c>stats</c> string
+    /// when both are present — see <see cref="DeltaTableOptions.PreferTypedCheckpointStats"/>. A
+    /// checkpoint carrying only typed statistics is read from them either way.
+    /// </param>
+    public DeltaFilePruner(
+        StructType schema, IReadOnlyList<string> partitionColumns, bool preferTypedStats = true)
     {
         var typeMap = new Dictionary<string, string>(StringComparer.Ordinal);
         var logicalToPhysical = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -33,7 +41,8 @@ internal sealed class DeltaFilePruner
         }
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-        _accessor = new DeltaFileStatsAccessor(typeMap, partitionSet, logicalToPhysical);
+        _accessor = new DeltaFileStatsAccessor(
+            typeMap, partitionSet, logicalToPhysical, preferTypedStats);
     }
 
     private static void AddFields(
@@ -87,7 +96,10 @@ internal sealed class DeltaFilePruner
         if (filter is TruePredicate)
             return true;
 
-        var stats = new DeltaFileStats(addFile, ColumnStats.Parse(addFile.Stats));
+        // The JSON parse is LAZY: a file answered entirely from a checkpoint's typed columns never
+        // touches its statistics string, and one that falls back for a column pays for the parse only
+        // then. The blob covers every column; a predicate names one or two.
+        var stats = new DeltaFileStats(addFile);
         return StatisticsEvaluator.Evaluate(filter, stats, _accessor)
             != FilterResult.AlwaysFalse;
     }
@@ -100,14 +112,30 @@ internal sealed class DeltaFilePruner
 /// </summary>
 internal sealed class DeltaFileStats
 {
-    public DeltaFileStats(AddFile addFile, ColumnStats? columnStats)
-    {
-        AddFile = addFile;
-        ColumnStats = columnStats;
-    }
+    private ColumnStats? _columnStats;
+    private bool _parsed;
+
+    public DeltaFileStats(AddFile addFile) => AddFile = addFile;
 
     public AddFile AddFile { get; }
-    public ColumnStats? ColumnStats { get; }
+
+    /// <summary>
+    /// The JSON statistics, parsed on first use. Files whose bounds all come from a checkpoint's typed
+    /// columns never touch this, which is where the saving is: the blob covers every column, while a
+    /// predicate names one or two.
+    /// </summary>
+    public ColumnStats? ColumnStats
+    {
+        get
+        {
+            if (!_parsed)
+            {
+                _columnStats = Actions.ColumnStats.Parse(AddFile.Stats);
+                _parsed = true;
+            }
+            return _columnStats;
+        }
+    }
 }
 
 /// <summary>
@@ -122,16 +150,29 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private readonly IReadOnlyDictionary<string, string> _columnTypes;
     private readonly HashSet<string> _partitionColumns;
     private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
+    private readonly bool _preferTypedStats;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
         HashSet<string> partitionColumns,
-        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null,
+        bool preferTypedStats = true)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
         _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
+        _preferTypedStats = preferTypedStats;
     }
+
+    /// <summary>
+    /// The typed statistics to read this file from, or null to use the JSON copy. Typed statistics
+    /// win when preferred, and also when there is no JSON string to fall back to — a checkpoint
+    /// written with <c>writeStatsAsJson=false</c> has nothing else to offer.
+    /// </summary>
+    private Checkpoint.ParsedStatsRef? TypedFor(AddFile addFile) =>
+        addFile.TypedStats is { } typed && (_preferTypedStats || addFile.Stats is null)
+            ? typed
+            : null;
 
     // Looks up a per-file dictionary keyed by column name under the LOGICAL name first, then the PHYSICAL name
     // (column mapping: partitionValues/stats keys are physical per the Delta spec; older engineered-wood
@@ -164,14 +205,49 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             return null;
         }
 
+        if (TypedFor(stats.AddFile) is { } typed
+            && TryResolveTyped(typed, column, typed.View.HasNullCount, out string resolved))
+            return typed.View.GetNullCount(resolved, typed.Row);
+
         return TryGet(stats.ColumnStats?.NullCount, column, out long n) ? (long?)n : null;
     }
 
-    public long? GetValueCount(DeltaFileStats stats, string column) =>
-        stats.ColumnStats?.NumRecords > 0 ? stats.ColumnStats.NumRecords : null;
+    public long? GetValueCount(DeltaFileStats stats, string column)
+    {
+        if (TypedFor(stats.AddFile) is { } typed)
+        {
+            long? records = typed.View.GetNumRecords(typed.Row);
+            if (records is not null)
+                return records > 0 ? records : null;
+        }
+
+        return stats.ColumnStats?.NumRecords > 0 ? stats.ColumnStats.NumRecords : null;
+    }
 
     public bool IsMinExact(DeltaFileStats stats, string column) => true;
     public bool IsMaxExact(DeltaFileStats stats, string column) => true;
+
+    /// <summary>
+    /// True when the checkpoint's typed statistics cover this column, under its logical or physical
+    /// name. False sends the lookup to the JSON copy, which may carry bounds stats_parsed omits.
+    /// </summary>
+    private bool TryResolveTyped(
+        Checkpoint.ParsedStatsRef typed, string column,
+        Func<string, bool> covers, out string resolved)
+    {
+        if (covers(column))
+        {
+            resolved = column;
+            return true;
+        }
+        if (_logicalToPhysical.TryGetValue(column, out var physical) && covers(physical))
+        {
+            resolved = physical;
+            return true;
+        }
+        resolved = column;
+        return false;
+    }
 
     private LiteralValue? GetBound(DeltaFileStats stats, string column, bool isMin)
     {
@@ -184,6 +260,10 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
                 return null;
             return DeltaLiteralDecoder.FromPartitionString(partVal, typeName);
         }
+
+        if (TypedFor(stats.AddFile) is { } typed
+            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
+            return typed.View.GetBound(resolved, typed.Row, isMin, typeName);
 
         var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
         if (!TryGet(bounds, column, out var element))
