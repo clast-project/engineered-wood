@@ -71,8 +71,9 @@ internal sealed class ListColumnReader : ColumnReader
             }
             else
             {
-                var elementType = _schema.Children[0].ToArrowType();
-                elements = CreateEmptyArray(elementType);
+                // Zero-length, but it must still be the ELEMENT's type: the ListType below declares that
+                // type, and a child of any other type contradicts it silently rather than failing.
+                elements = ArrowCompute.MakeNullArray(_schema.Children[0].ToArrowType(), 0);
             }
 
             var validityBuffer = CreateValidityBuffer(present, batchSize);
@@ -84,16 +85,5 @@ internal sealed class ListColumnReader : ColumnReader
         {
             System.Buffers.ArrayPool<long>.Shared.Return(lengthPool);
         }
-    }
-
-    private static IArrowArray CreateEmptyArray(IArrowType type)
-    {
-        if (type is StringType)
-            return new StringArray.Builder().Build();
-        if (type is Int32Type)
-            return new Int32Array.Builder().Build();
-        if (type is Int64Type)
-            return new Int64Array.Builder().Build();
-        return new StringArray.Builder().Build();
     }
 }

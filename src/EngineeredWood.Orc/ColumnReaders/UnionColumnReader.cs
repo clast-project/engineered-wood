@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.InteropServices;
+using EngineeredWood.Arrow;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Orc.Encodings;
@@ -74,7 +75,9 @@ internal sealed class UnionColumnReader : ColumnReader
             if (childCounts[i] > 0)
                 childArrays[i] = _childReaders[i].ReadBatch(childCounts[i]);
             else
-                childArrays[i] = CreateEmptyArray(_schema.Children[i].ToArrowType());
+                // Zero-length, but typed: the union's field list below declares this branch's type, and a
+                // child of any other type contradicts it silently rather than failing.
+                childArrays[i] = ArrowCompute.MakeNullArray(_schema.Children[i].ToArrowType(), 0);
         }
 
         // Build offsets for dense union: maps each row to its index within the child array
@@ -108,22 +111,5 @@ internal sealed class UnionColumnReader : ColumnReader
         var offsetBuffer = new ArrowBuffer(MemoryMarshal.AsBytes(offsets.AsSpan()).ToArray());
 
         return new DenseUnionArray(unionType, batchSize, childArrays, typeIdBuffer, offsetBuffer);
-    }
-
-    private static IArrowArray CreateEmptyArray(IArrowType type)
-    {
-        return type switch
-        {
-            BooleanType => new BooleanArray.Builder().Build(),
-            Int8Type => new Int8Array.Builder().Build(),
-            Int16Type => new Int16Array.Builder().Build(),
-            Int32Type => new Int32Array.Builder().Build(),
-            Int64Type => new Int64Array.Builder().Build(),
-            FloatType => new FloatArray.Builder().Build(),
-            DoubleType => new DoubleArray.Builder().Build(),
-            StringType => new StringArray.Builder().Build(),
-            BinaryType => new BinaryArray.Builder().Build(),
-            _ => new StringArray.Builder().Build(), // fallback
-        };
     }
 }

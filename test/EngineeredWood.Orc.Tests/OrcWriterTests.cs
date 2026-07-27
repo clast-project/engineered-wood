@@ -4066,4 +4066,159 @@ public class OrcWriterTests
         }
         finally { File.Delete(path); }
     }
+
+    // ── Empty children of nested columns keep their declared type ──
+    //
+    // When a batch leaves a nested column's child empty — every list empty, every map empty, a union branch
+    // unused — the reader has no child data to read and must synthesize a zero-length array. The type of
+    // that array is not free: the ListType / MapType / UnionType built alongside it declares one, and any
+    // other type is a batch whose data contradicts its own schema. The readers used to reach for a
+    // StringArray whenever the type fell outside a short hardcoded list, so these three cases each produced
+    // a StringArray under a schema saying otherwise. They now build through ArrowCompute.MakeNullArray at
+    // length 0, which reproduces the declared type exactly. Each test below picks an element type OUTSIDE
+    // the old hardcoded list, so it fails against the previous code.
+
+    [Fact]
+    public async Task RoundTrip_ListOfDouble_AllListsEmpty_ElementChildKeepsItsType()
+    {
+        var path = GetTempPath();
+        try
+        {
+            var listType = new ListType(new Field("item", DoubleType.Default, nullable: true));
+            var schema = new Schema([new Field("vals", listType, nullable: true)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions
+            {
+                Compression = CompressionKind.None,
+            }))
+            {
+                // Three rows, every one an empty list — so the element stream carries nothing and the
+                // reader must invent the child array.
+                var builder = new ListArray.Builder(DoubleType.Default);
+                builder.Append();
+                builder.Append();
+                builder.Append();
+                await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 3));
+            }
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var rowReader = reader.CreateRowReader();
+            await foreach (var batch in rowReader)
+            {
+                var col = (ListArray)batch.Column(0);
+                Assert.Equal(3, col.Length);
+
+                // The declared element type is double, so the (empty) child must be a DoubleArray.
+                var elements = Assert.IsType<DoubleArray>(col.Values);
+                Assert.Equal(0, elements.Length);
+
+                for (int i = 0; i < col.Length; i++)
+                    Assert.Equal(0, col.GetValueLength(i));
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public async Task RoundTrip_MapWithDoubleValues_AllMapsEmpty_EntryChildrenKeepTheirTypes()
+    {
+        var path = GetTempPath();
+        try
+        {
+            var keyField = new Field("key", StringType.Default, nullable: false);
+            var valueField = new Field("value", DoubleType.Default, nullable: true);
+            var mapType = new MapType(keyField, valueField);
+            var schema = new Schema([new Field("m", mapType, nullable: true)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions
+            {
+                Compression = CompressionKind.None,
+            }))
+            {
+                // Two rows, both empty maps: no keys and no values are written.
+                var offsets = new ArrowBuffer.Builder<int>();
+                offsets.Append(0).Append(0).Append(0);
+
+                var entries = new StructArray(
+                    new StructType([keyField, valueField]), 0,
+                    [new StringArray.Builder().Build(), new DoubleArray.Builder().Build()],
+                    ArrowBuffer.Empty, 0);
+                var map = new MapArray(mapType, 2, offsets.Build(), entries, ArrowBuffer.Empty, 0);
+
+                await writer.WriteBatchAsync(new RecordBatch(schema, [map], 2));
+            }
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var rowReader = reader.CreateRowReader();
+            await foreach (var batch in rowReader)
+            {
+                var col = (MapArray)batch.Column(0);
+                Assert.Equal(2, col.Length);
+
+                // Keys and values are synthesized separately, so each has its own way to go wrong: the
+                // value child is what a blanket StringArray fallback got wrong here.
+                var entries = col.KeyValues;
+                Assert.Equal(0, entries.Length);
+                Assert.IsType<StringArray>(entries.Fields[0]);
+                Assert.IsType<DoubleArray>(entries.Fields[1]);
+
+                for (int i = 0; i < col.Length; i++)
+                    Assert.Equal(0, col.GetValueLength(i));
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public async Task RoundTrip_Union_UnusedDateBranch_KeepsItsType()
+    {
+        var path = GetTempPath();
+        try
+        {
+            var unionType = new UnionType(
+                [
+                    new Field("i", Int32Type.Default, nullable: true),
+                    new Field("d", Date32Type.Default, nullable: true),
+                ],
+                [0, 1],
+                UnionMode.Dense);
+            var schema = new Schema([new Field("u", unionType, nullable: false)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions
+            {
+                Compression = CompressionKind.None,
+            }))
+            {
+                // Every row takes the int branch, so the date branch reads back with zero rows.
+                var typeIds = new byte[] { 0, 0, 0 };
+                var offsets = new int[] { 0, 1, 2 };
+
+                var intChild = new Int32Array.Builder().AppendRange([10, 20, 30]).Build();
+                var dateChild = new Date32Array.Builder().Build();
+
+                var unionArr = new DenseUnionArray(
+                    unionType, 3, [intChild, dateChild],
+                    new ArrowBuffer(typeIds),
+                    new ArrowBuffer(System.Runtime.InteropServices.MemoryMarshal
+                        .AsBytes(offsets.AsSpan()).ToArray()));
+                await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 3));
+            }
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var rowReader = reader.CreateRowReader();
+            await foreach (var batch in rowReader)
+            {
+                var col = (DenseUnionArray)batch.Column(0);
+                Assert.Equal(3, col.Length);
+
+                var ints = Assert.IsType<Int32Array>(col.Fields[0]);
+                Assert.Equal([10, 20, 30], ints.Values.ToArray());
+
+                // The union declares branch 1 as date32, so its empty child must be a Date32Array.
+                var dates = Assert.IsType<Date32Array>(col.Fields[1]);
+                Assert.Equal(0, dates.Length);
+            }
+        }
+        finally { File.Delete(path); }
+    }
 }

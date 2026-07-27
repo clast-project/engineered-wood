@@ -75,8 +75,11 @@ internal sealed class MapColumnReader : ColumnReader
             }
             else
             {
-                keys = new StringArray.Builder().Build();
-                values = new StringArray.Builder().Build();
+                // Zero-length, but each must still carry its OWN type: the entry struct below declares the
+                // key and value types, and a child of any other type contradicts it silently rather than
+                // failing.
+                keys = ArrowCompute.MakeNullArray(_schema.Children[0].ToArrowType(), 0);
+                values = ArrowCompute.MakeNullArray(_schema.Children[1].ToArrowType(), 0);
             }
 
             var keyField = new Field("key", _schema.Children[0].ToArrowType(), false);
