@@ -571,7 +571,10 @@ not apply. There is still **no way to enable DVs on an EXISTING table** (no
 `DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
 removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
 exist, keyed by transient row id — `DeleteByRowIdsAsync` / `UpdateByRowIdsAsync`
-— which rewrites the affected files with no DV; it requires row tracking.)
+— which rewrites the affected files with no DV. It needs neither deletion
+vectors nor row tracking, preserves row-tracking ids when the table has them,
+and writes the Change Data Feed for exactly the rows it touched; only
+IcebergCompat tables are still refused on that path.)
 Earlier EW always wrote a DV without declaring the feature, so a conformant
 foreign reader silently returned the deleted rows; that data-loss gap is closed.
 

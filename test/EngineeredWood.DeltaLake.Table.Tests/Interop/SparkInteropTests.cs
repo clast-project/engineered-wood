@@ -1358,6 +1358,133 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
 
+    // Creates an UNMAPPED table partitioned by region with CDF enabled (property + writer feature patched in,
+    // as CreateAsync has no CDF switch).
+    private async Task<DeltaTable> CreatePartitionedCdfTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long next;
+        MetadataAction meta;
+        ProtocolAction proto;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdValueRegionSchema, partitionColumns: ["region"]))
+        {
+            meta = created.CurrentSnapshot.Metadata;
+            proto = created.CurrentSnapshot.Protocol;
+            next = created.CurrentSnapshot.Version + 1;
+        }
+        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[CdfConfig.EnableKey] = "true";
+
+        // CDF needs writer support. A plain table is created on a LEGACY protocol (no feature lists), where the
+        // capability is implied by the version — bumping to 4 is the whole declaration. Naming the feature there
+        // instead would be rejected outright ("Mismatched minWriterVersion and writerFeatures"), since a feature
+        // list is only legal at writer 7.
+        var upgraded = proto.WriterFeatures is { Count: > 0 } features
+            ? proto with { WriterFeatures = features.Contains("changeDataFeed") ? features : [.. features, "changeDataFeed"] }
+            : proto with { MinWriterVersion = Math.Max(proto.MinWriterVersion, 4) };
+
+        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
+        {
+            upgraded,
+            meta with { Configuration = cfg },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    /// <summary>Transient rowids (<c>_metadata.row_id</c>) of the rows whose <c>id</c> is listed.</summary>
+    private static async Task<List<long>> RowIdsOfAsync(DeltaTable table, params long[] ids)
+    {
+        var wanted = new HashSet<long>(ids);
+        var result = new List<long>();
+        await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+        {
+            var id = (Int64Array)b.Column("id");
+            var rid = (Int64Array)b.Column("_metadata.row_id");
+            for (int i = 0; i < b.Length; i++)
+                if (wanted.Contains(id.GetValue(i)!.Value))
+                    result.Add(rid.GetValue(i)!.Value);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// <para>The cross-engine proof for Change Data Feed on the COPY-ON-WRITE row-id DML paths
+    /// (<see cref="DeltaTable.UpdateByRowIdsAsync(RecordBatch, string?, CancellationToken)"/> and
+    /// <see cref="DeltaTable.DeleteByRowIdsAsync"/>). Both commit <c>remove</c>(old)+<c>add</c>(new) for each
+    /// rewritten file, so without change files the feed would be INFERRED — reporting every surviving row of
+    /// the file as deleted and re-inserted. Each path therefore writes <c>_change_data</c> files for exactly
+    /// the rows it touched, and a version carrying <c>cdc</c> actions is read cdc-only.</para>
+    ///
+    /// <para>The table is PARTITIONED so the change files' partition values are exercised end to end. Note what
+    /// this tier does and does not prove: Spark resolves a change file by NAME, so it reads the feed correctly
+    /// whether or not the partition column is in the file bytes (MEASURED — it passes with the writer's
+    /// partition-column strip disabled). The strict reader is EW's own, which re-materializes partition columns
+    /// POSITIONALLY; that half is pinned by <c>RowIdDmlTests</c>. What Spark alone can prove is that the cdc
+    /// actions make the rewrite commit read as three row-level changes instead of an inferred whole-file
+    /// delete + insert.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwRowIdDml_CopyOnWrite_ChangeDataFeed_SparkReadsPreImagePostImageAndDelete()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long updateVersion, deleteVersion;
+        await using (var table = await CreatePartitionedCdfTableAsync())
+        {
+            await table.WriteAsync([IdValueRegionBatch([1, 2, 3], ["a", "b", "c"], ["emea", "emea", "emea"])]);
+
+            // UPDATE id=2's value → "z" by transient rowid (copy-on-write rewrite of its file).
+            updateVersion = table.CurrentSnapshot.Version + 1;
+            long rid2 = (await RowIdsOfAsync(table, 2)).Single();
+            var updates = new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                    .Field(new Field("value", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(rid2).Build(),
+                    new StringArray.Builder().Append("z").Build(),
+                ], 1);
+            Assert.Equal(updateVersion, await table.UpdateByRowIdsAsync(updates));
+
+            // DELETE id=3 by transient rowid (copy-on-write again — no deletion vectors on this table).
+            deleteVersion = table.CurrentSnapshot.Version + 1;
+            var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOfAsync(table, 3));
+            Assert.Equal(1, deleted);
+            Assert.Equal(deleteVersion, version);
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = updateVersion, end = deleteVersion });
+
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Ct: r.GetProperty(CdfConfig.ChangeTypeColumn).GetString(),
+                Id: r.GetProperty("id").GetInt64(),
+                Value: r.GetProperty("value").GetString(),
+                Region: r.GetProperty("region").GetString()))
+            .OrderBy(t => t.Ct, StringComparer.Ordinal).ThenBy(t => t.Id)
+            .ToList();
+
+        // Exactly the touched rows: id=1 was rewritten by neither statement, and the delete's surviving rows
+        // are not re-inserted. Every row carries the re-materialized partition value.
+        Assert.Equal(
+            [
+                ("delete", 3L, "c", "emea"),
+                ("update_postimage", 2L, "z", "emea"),
+                ("update_preimage", 2L, "b", "emea"),
+            ],
+            rows);
+
+        // …and the table itself reads as the two survivors with the update applied.
+        var table_ = Spark.Invoke("read", new { path = _tempDir });
+        var data = table_.GetProperty("rows").EnumerateArray()
+            .Select(r => (Id: r.GetProperty("id").GetInt64(), Value: r.GetProperty("value").GetString()))
+            .OrderBy(t => t.Id).ToList();
+        Assert.Equal([(1L, "a"), (2L, "z")], data);
+    }
+
     // ── CDF inference over a deletion-vector-carrying file ──
 
     // Creates an unmapped table with BOTH deletion vectors and CDF. CreateAsync has no CDF switch, so the

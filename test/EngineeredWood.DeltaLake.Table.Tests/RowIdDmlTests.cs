@@ -184,35 +184,6 @@ public class RowIdDmlTests : IDisposable
         Assert.Equal(new long[] { 1, 3, 4, 5 }, await ReadIdsFresh());
     }
 
-    [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_Throws()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        var log = new EngineeredWood.DeltaLake.Log.TransactionLog(fs);
-        await log.WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
-        {
-            new EngineeredWood.DeltaLake.Actions.ProtocolAction
-            {
-                MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["changeDataFeed"],
-            },
-            new EngineeredWood.DeltaLake.Actions.MetadataAction
-            {
-                Id = "cdf", Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
-                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
-                PartitionColumns = [],
-                Configuration = new Dictionary<string, string>
-                {
-                    { EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey, "true" },
-                },
-            },
-        });
-        await using var table = await DeltaTable.OpenAsync(fs);
-        await table.WriteAsync([Batch(1, 3)]);
-        var ids = await RowIdsOf(table, 2);
-        await Assert.ThrowsAsync<NotSupportedException>(async () =>
-            await table.DeleteByRowIdsAsync(ids));
-    }
-
     // ── copy-on-write UPDATE by row id ──
 
     // A rewriteFile callback that adds `delta` to the id of the rows whose id is in `targetIds`.
@@ -378,7 +349,11 @@ public class RowIdDmlTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(() => table.UpdateByRowIdsAsync(bad).AsTask());
     }
 
-    // ── Change Data Feed on a row-id DELETE ──
+    // ── Change Data Feed on the row-id DML paths ──
+    //
+    // A copy-on-write DELETE/UPDATE commits remove(old)+add(new), so an INFERRED feed would report every
+    // surviving row of the rewritten file as deleted and re-inserted. Both paths therefore write change files
+    // for exactly the rows they touched, which makes the reader use them instead of inferring.
 
     private static Apache.Arrow.Schema RegionSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -447,6 +422,76 @@ public class RowIdDmlTests : IDisposable
         StringArray s => s.IsNull(i) ? "null" : s.GetString(i),
         _ => column.GetType().Name,
     };
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_FeedReportsOnlyTheDeletedRows()
+    {
+        await using var table = await CreateCdfTableAsync(IdSchema);
+        await table.WriteAsync([Batch(1, 4)]); // ids 1..4, one file
+
+        var ids = await RowIdsOf(table, 2);
+        var (deleted, version) = await table.DeleteByRowIdsAsync(ids);
+        Assert.Equal(1, deleted);
+
+        // Exactly one delete — the survivors 1, 3 and 4 were rewritten, not changed.
+        Assert.Equal(["delete|id=2"], await FeedRowsAsync(version, version));
+        Assert.Equal(new long[] { 1, 3, 4 }, await ReadIdsFresh());
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_CopyOnWrite_CdfTable_FeedReportsPreAndPostImages()
+    {
+        await using var table = await CreateCdfTableAsync(IdScoreSchema);
+        await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30))]);
+
+        long rid2 = (await RowIdsOf(table, 2)).Single();
+        var updates = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                .Field(new Field("score", Int64Type.Default, true))
+                .Build(),
+            [
+                new Int64Array.Builder().Append(rid2).Build(),
+                new Int64Array.Builder().Append(999).Build(),
+            ], 1);
+
+        long version = await table.UpdateByRowIdsAsync(updates);
+
+        Assert.Equal(
+            ["update_postimage|id=2|score=999", "update_preimage|id=2|score=20"],
+            await FeedRowsAsync(version, version));
+    }
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_PartitionedCdfTable_FeedKeepsEveryColumn()
+    {
+        // Partition columns live in the action's partitionValues, never in the change file's bytes — the reader
+        // re-materializes them POSITIONALLY, so a partition column written into the file would come back twice
+        // and push the columns after it out of the feed.
+        await using var table = await CreateCdfTableAsync(RegionSchema, partitionColumns: ["region"]);
+        await table.WriteAsync([RegionBatch(1, 3, "east")]);
+
+        var ids = await RowIdsOf(table, 2);
+        var (_, version) = await table.DeleteByRowIdsAsync(ids);
+
+        Assert.Equal(["delete|id=2|region=east|val=102"], await FeedRowsAsync(version, version));
+    }
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_WholeFileCdfTable_FeedReportsEveryRowOnce()
+    {
+        // Deleting every row of a file drops it outright — there is no add to pair with the remove, and the
+        // change files are the only record of which rows went away.
+        await using var table = await CreateCdfTableAsync(IdSchema);
+        await table.WriteAsync([Batch(1, 2)]); // file A
+        await table.WriteAsync([Batch(100, 2)]); // file B
+
+        var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOf(table, 1, 2));
+        Assert.Equal(2, deleted);
+
+        Assert.Equal(["delete|id=1", "delete|id=2"], await FeedRowsAsync(version, version));
+        Assert.Equal(new long[] { 100, 101 }, await ReadIdsFresh());
+    }
 
     [Fact]
     public async Task DeleteByRowIdsViaVectors_PartitionedCdfTable_FeedKeepsEveryColumn()
