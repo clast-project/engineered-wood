@@ -266,4 +266,107 @@ public class SchemaEvolutionTests : IDisposable
         Assert.Null(rows.Single(r => r.Id == 1).Score);   // pre-ADD file
         Assert.Equal(9.5, rows.Single(r => r.Id == 2).Score); // post-ADD file
     }
+
+    private static async Task<List<RecordBatch>> ReadProjectedAsync(
+        DeltaTable table, params string[] columns)
+    {
+        var list = new List<RecordBatch>();
+        await foreach (var b in table.ReadAllAsync(columns))
+            list.Add(b);
+        return list;
+    }
+
+    // A PROJECTED read of a column added after a file was written must behave exactly like the
+    // unprojected read of the same file: the column is absent from the bytes, so it backfills as NULL.
+    // Before this was reconciled, the projection went to the parquet reader verbatim and threw
+    // "Column 'score' was not found in the schema" — a projected read was strictly less capable than an
+    // unprojected one over the same data.
+    [Theory]
+    [InlineData(ColumnMappingMode.None)]
+    [InlineData(ColumnMappingMode.Name)]
+    [InlineData(ColumnMappingMode.Id)]
+    public async Task ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull(ColumnMappingMode mode)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = TwoColumnSchema();
+        var options = new DeltaTableOptions { CheckpointInterval = 0 };
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema, options, columnMappingMode: mode);
+        await table.WriteAsync([Rows(schema, (1, "a"), (2, "b"))]);
+        await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
+
+        // The added column ALONE — nothing the projection names exists in the file.
+        var onlyAdded = Assert.Single(await ReadProjectedAsync(table, "score"));
+        Assert.Equal(2, onlyAdded.Length);
+        var scores = (DoubleArray)onlyAdded.Column(onlyAdded.Schema.GetFieldIndex("score"));
+        Assert.True(scores.IsNull(0));
+        Assert.True(scores.IsNull(1));
+
+        // Mixed: one column the file has, one it does not.
+        var mixed = Assert.Single(await ReadProjectedAsync(table, "id", "score"));
+        Assert.Equal(2, mixed.Length);
+        Assert.Equal(1L, ((Int64Array)mixed.Column(mixed.Schema.GetFieldIndex("id"))).GetValue(0));
+        Assert.True(((DoubleArray)mixed.Column(mixed.Schema.GetFieldIndex("score"))).IsNull(0));
+
+        // Control: a projection of only pre-existing columns is unaffected.
+        var control = Assert.Single(await ReadProjectedAsync(table, "id"));
+        Assert.Equal(2, control.Length);
+        Assert.Equal(2L, ((Int64Array)control.Column(control.Schema.GetFieldIndex("id"))).GetValue(1));
+    }
+
+    // Mixed vintages under one projection: the reconciliation must be per FILE, not per table — the
+    // post-ADD file carries the column and must keep its values while the pre-ADD file backfills.
+    [Fact]
+    public async Task ProjectedRead_AcrossMixedVintageFiles_KeepsRealValuesAndBackfillsTheRest()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = TwoColumnSchema();
+        var options = new DeltaTableOptions { CheckpointInterval = 0 };
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, options, columnMappingMode: ColumnMappingMode.Name);
+        await table.WriteAsync([Rows(schema, (1, "old"))]);
+        await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
+        await table.WriteAsync(
+        [
+            new RecordBatch(table.ArrowSchema,
+            [
+                new Int64Array.Builder().Append(2).Build(),
+                new StringArray.Builder().Append("new").Build(),
+                new DoubleArray.Builder().Append(9.5).Build(),
+            ], 1),
+        ]);
+
+        var rows = new List<(long Id, double? Score)>();
+        foreach (var b in await ReadProjectedAsync(table, "id", "score"))
+        {
+            var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            var scores = (DoubleArray)b.Column(b.Schema.GetFieldIndex("score"));
+            for (int i = 0; i < b.Length; i++)
+                rows.Add((ids.GetValue(i)!.Value, scores.IsNull(i) ? null : scores.GetValue(i)));
+        }
+
+        Assert.Equal(2, rows.Count);
+        Assert.Null(rows.Single(r => r.Id == 1).Score);
+        Assert.Equal(9.5, rows.Single(r => r.Id == 2).Score);
+    }
+
+    // A DROPped column is gone from the current schema, so it is not projectable — but the files still
+    // carry it. Projecting the SURVIVING columns must not be disturbed by the leftover bytes.
+    [Fact]
+    public async Task ProjectedRead_AfterDropColumn_ReadsTheSurvivingColumn()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = TwoColumnSchema();
+        var options = new DeltaTableOptions { CheckpointInterval = 0 };
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, options, columnMappingMode: ColumnMappingMode.Name);
+        await table.WriteAsync([Rows(schema, (1, "a"), (2, "b"))]);
+        await table.DropColumnAsync("name");
+
+        var read = Assert.Single(await ReadProjectedAsync(table, "id"));
+        Assert.Equal(2, read.Length);
+        Assert.Equal(1L, ((Int64Array)read.Column(read.Schema.GetFieldIndex("id"))).GetValue(0));
+    }
 }

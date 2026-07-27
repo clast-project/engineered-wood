@@ -5719,6 +5719,32 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
         }
 
+        // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not
+        // contain the new column — asking the parquet reader for it throws ("Column 'x' was not found in
+        // the schema"). Intersect the projection with the file's ACTUAL top-level columns and let the
+        // BackfillMissingColumns step downstream reconstitute the absent ones as typed NULL, exactly as it
+        // already does for an UNPROJECTED read of the same file. Without this a projected read is strictly
+        // less capable than an unprojected one over identical data, which is the wrong way round.
+        //
+        // An empty result — a projection naming ONLY later-added columns — is deliberately left empty
+        // rather than padded with some column the file does happen to have: the reader takes its row count
+        // from the row group, not from the columns it returns, so the batches still carry the lengths the
+        // backfill needs, and padding would read bytes only to discard them. Pinned by
+        // SchemaEvolutionTests.ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull.
+        //
+        // Id mode never threw here (an unresolvable field id already drops out of ResolveFieldIds); it runs
+        // through the same reconciliation so one rule covers every mapping mode.
+        if (fileColumns is not null)
+        {
+            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var filePresent = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var child in parquetSchema.Root.Children)
+                filePresent.Add(child.Name);
+
+            if (fileColumns.Any(c => !filePresent.Contains(c)))
+                fileColumns = fileColumns.Where(filePresent.Contains).ToList();
+        }
+
         var builtinBatches = reader.ReadAllAsync(
             columnNames: fileColumns, cancellationToken: cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
