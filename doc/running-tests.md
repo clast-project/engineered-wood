@@ -70,8 +70,14 @@ standing between a spec divergence and shipping it.
 
 | Tier | Install | Tests | Reaches |
 |---|---|---|---|
-| 1 — delta-rs | `pip install deltalake` | 9 | Log/checkpoint replay, path encoding, per-file stats, filtered reads. Seconds to run. |
-| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 12 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival. ~25s to run. |
+| 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 19 | Log/checkpoint replay, path encoding, per-file stats, filtered reads. Seconds to run. |
+| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 36 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival. ~40s to run. |
+
+**The `[pyarrow]` extra is not optional.** `deltalake` 1.6 made pyarrow an extra,
+and the tier-1 driver reads through pyarrow — install the bare package and the
+tier does not skip, it FAILS, all 19 tests at once with
+`ImportError: Pyarrow is required, install deltalake[pyarrow]`. The availability
+probe only imports `deltalake`, which succeeds.
 
 Tier 2 (DuckDB) was evaluated and **dropped**: delta-rs embeds
 delta-kernel-rs, which is what DuckDB's delta extension is, so tier 1
