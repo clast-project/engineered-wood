@@ -2713,18 +2713,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
             long fileSize;
 
+            // The rows were READ, so they carry the partition columns the read path materializes — a data file
+            // never stores those (their values live in add.partitionValues). Drop them first, so the rewrite's
+            // layout AND its statistics match what the append path writes for the same rows.
+            var dataBatches = new List<RecordBatch>(outputBatches.Count);
+            foreach (var ob in outputBatches)
+            {
+                dataBatches.Add(Partitioning.PartitionUtils.RemovePartitionColumns(
+                    ob, snapshot.Metadata.PartitionColumns));
+            }
+
             // Physical names + parquet field ids at EVERY level (nested struct children included — the
             // top-level-only rename/stamp pair left them logical-named and id-less). When row tracking is on,
             // append the materialized id + commit-version columns (declared physical names) carrying each moved
             // row's ORIGINAL values. Prepared up front so both the built-in and pluggable writers see the same
             // batches.
-            var writeBatches = new List<RecordBatch>(outputBatches.Count);
-            for (int k = 0; k < outputBatches.Count; k++)
+            var writeBatches = new List<RecordBatch>(dataBatches.Count);
+            for (int k = 0; k < dataBatches.Count; k++)
             {
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(
-                    outputBatches[k], snapshot.Schema, mappingMode);
+                    dataBatches[k], snapshot.Schema, mappingMode);
                 // Drop the VARIANT annotation for a Spark 4.0.x-compatible table (bytes unchanged; the
-                // read path recovers the type from the schema). Stats use outputBatches, not these.
+                // read path recovers the type from the schema). Stats use dataBatches, not these.
                 if (!_options.EmitVariantLogicalType)
                     physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
                 if (materializeIds && outTracking![k] is { } trk)
@@ -2757,7 +2767,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileSize = file.Position;
             }
 
-            string? stats = Stats.StatsCollector.Collect(outputBatches);
+            string? stats = Stats.StatsCollector.Collect(dataBatches);
 
             // Remove old, add new
             actions.Add(new RemoveFile
@@ -4630,10 +4640,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string baseName = $"{Guid.NewGuid():N}.parquet";
         string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
 
-        var writeBatches = new List<RecordBatch>(outputBatches.Count);
-        for (int k = 0; k < outputBatches.Count; k++)
+        // Read rows carry the partition columns the read path materializes; a data file never stores them (the
+        // values live in add.partitionValues). Dropping them here keeps the rewrite's layout and statistics
+        // identical to what the append path produces for the same rows.
+        var dataBatches = new List<RecordBatch>(outputBatches.Count);
+        foreach (var ob in outputBatches)
         {
-            var physicalBatch = ColumnMappingRecursive.ToPhysical(outputBatches[k], snapshot.Schema, mappingMode);
+            dataBatches.Add(Partitioning.PartitionUtils.RemovePartitionColumns(
+                ob, snapshot.Metadata.PartitionColumns));
+        }
+
+        var writeBatches = new List<RecordBatch>(dataBatches.Count);
+        for (int k = 0; k < dataBatches.Count; k++)
+        {
+            var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode);
             if (!_options.EmitVariantLogicalType)
                 physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
             if (materializeIds && outTracking is not null && outTracking[k] is { } trk)
@@ -4669,7 +4689,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
-            Stats = Stats.StatsCollector.Collect(outputBatches),
+            Stats = Stats.StatsCollector.Collect(dataBatches),
             BaseRowId = rowTrackingEnabled ? baseRowId : null,
             DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
         };

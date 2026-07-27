@@ -78,6 +78,37 @@ internal static class PartitionUtils
     }
 
     /// <summary>
+    /// Drops the partition columns (matched by LOGICAL name) from a batch that already carries them — what the
+    /// READ path materializes and a data file must never store. <see cref="SplitByPartition"/> does this as part
+    /// of grouping fresh rows; this is the same removal for a batch whose partition values are already known,
+    /// i.e. a copy-on-write rewrite of one existing file. A no-op for an unpartitioned table and for a batch that
+    /// never carried them (rows read straight out of a data file).
+    /// </summary>
+    public static RecordBatch RemovePartitionColumns(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns)
+    {
+        if (partitionColumns.Count == 0)
+            return batch;
+
+        var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        var keep = new List<int>(batch.ColumnCount);
+        for (int i = 0; i < batch.ColumnCount; i++)
+            if (!partSet.Contains(batch.Schema.FieldsList[i].Name))
+                keep.Add(i);
+        if (keep.Count == batch.ColumnCount)
+            return batch;
+
+        var columns = new IArrowArray[keep.Count];
+        var schema = new Apache.Arrow.Schema.Builder();
+        for (int i = 0; i < keep.Count; i++)
+        {
+            columns[i] = batch.Column(keep[i]);
+            schema.Field(batch.Schema.FieldsList[keep[i]]);
+        }
+        return new RecordBatch(schema.Build(), columns, batch.Length);
+    }
+
+    /// <summary>
     /// Builds a directory path for partition values (e.g., "date=2024-01-01/region=us").
     /// Values are URI-encoded for safety.
     /// </summary>
