@@ -76,6 +76,28 @@ internal static class DictionaryEncoder
         int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
         int elementSize = Marshal.SizeOf<T>();
 
+        // The fixed-width twin of the constant probe in TryEncodeByteArray, and cheaper: every value slot is
+        // the same width, so "all rows equal" is exactly "the value buffer is periodic with period
+        // elementSize" — one vectorized compare that stops at the first differing byte.
+        //
+        // Byte equality is stricter than the Dictionary<T,int> below, which compares by value. That only
+        // ever costs a missed fast path (+0.0 and -0.0 are equal but differ in bytes, so such a column
+        // falls through to the loop), never a wrong answer: byte-identical values read back identical.
+        if (defLevels is null && rowCount > 0
+            && IsConstantFixedWidth(array.Data.Buffers[1].Span, rowCount, elementSize))
+        {
+            if (elementSize > pageSizeLimit)
+                return null;
+
+            var constPage = array.Data.Buffers[1].Span.Slice(0, elementSize).ToArray();
+            return new DictionaryResult
+            {
+                DictionaryPageData = constPage,
+                DictionaryCount = 1,
+                Indices = new int[nonNullCount],
+            };
+        }
+
         var dict = new Dictionary<T, int>();
         var indices = new int[nonNullCount];
         var valueBuffer = MemoryMarshal.Cast<byte, T>(array.Data.Buffers[1].Span);
@@ -125,6 +147,31 @@ internal static class DictionaryEncoder
         var data = array.Data;
         ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
         ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
+
+        // A column holding one value in every row is a common shape on the write path — a materialized
+        // partition value, a CDF _change_type, anything ArrowCompute.Repeat produced — and hashing every row
+        // to discover that it has one distinct value is what dominates encoding it. Recognising it up front
+        // replaces that with a length check and one comparison. The probe costs almost nothing when it
+        // fails: see TryDescribeConstantValue.
+        if (defLevels is null &&
+            TryDescribeConstantValue(arrowOffsets, arrowData, rowCount, out int constStart, out int constLen))
+        {
+            // The dictionary page has the same PLAIN shape as below, with one entry.
+            if (4 + constLen > pageSizeLimit)
+                return null;
+
+            var constPage = new byte[4 + constLen];
+            BinaryPrimitives.WriteInt32LittleEndian(constPage, constLen);
+            arrowData.Slice(constStart, constLen).CopyTo(constPage.AsSpan(4));
+
+            return new DictionaryResult
+            {
+                DictionaryPageData = constPage,
+                DictionaryCount = 1,
+                // Every row maps to entry 0, and a fresh int[] is already zeroed — nothing to write per row.
+                Indices = new int[nonNullCount],
+            };
+        }
 
         // Open-addressing hash table with linear probing
         var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
@@ -177,6 +224,69 @@ internal static class DictionaryEncoder
             DictionaryCount = uniqueEntries.Count,
             Indices = indices,
         };
+    }
+
+    /// <summary>
+    /// Whether a fixed-width value buffer holds <paramref name="rowCount"/> copies of one value — i.e. is
+    /// periodic with period <paramref name="elementSize"/>. A single-row column is trivially constant.
+    /// </summary>
+    private static bool IsConstantFixedWidth(ReadOnlySpan<byte> buffer, int rowCount, int elementSize)
+    {
+        var body = buffer.Slice(0, rowCount * elementSize);
+        return body.Length <= elementSize
+            || body.Slice(elementSize).SequenceEqual(body.Slice(0, body.Length - elementSize));
+    }
+
+    /// <summary>
+    /// Tests whether every row of a variable-width column holds the same bytes, reporting that value's span
+    /// when so. Callers must have established that the column has no nulls, since this reads every row.
+    ///
+    /// <para>The checks are ordered so that a column which is NOT constant — the common case, and the one
+    /// that must not pay for this — is rejected as early as possible:</para>
+    /// <list type="number">
+    ///   <item>Values of differing length make the total length disagree with <c>len * rowCount</c>. That is
+    ///   O(1) and rejects most real columns outright.</item>
+    ///   <item>Otherwise the value buffer must be <paramref name="rowCount"/> repetitions of one value, i.e.
+    ///   periodic with period <c>len</c>. Comparing it against itself shifted by one value settles that in a
+    ///   single vectorized compare that stops at the first differing byte — immediately, for a column whose
+    ///   rows differ at all early.</item>
+    ///   <item>Only a column that has passed both pays the offset walk, which is what actually proves each
+    ///   row is one whole value. It is needed: lengths <c>[2,1,3]</c> over <c>"aaaaaa"</c> satisfy both
+    ///   checks above while holding three DIFFERENT values.</item>
+    /// </list>
+    /// </summary>
+    private static bool TryDescribeConstantValue(
+        ReadOnlySpan<int> offsets, ReadOnlySpan<byte> data, int rowCount, out int start, out int length)
+    {
+        start = 0;
+        length = 0;
+        if (rowCount <= 0)
+            return false;
+
+        start = offsets[0];
+        length = offsets[1] - start;
+        int total = offsets[rowCount] - start;
+
+        // (1) Uniform length is necessary, and cheap to refute.
+        if ((long)length * rowCount != total)
+            return false;
+
+        // (2) Periodicity. An all-empty column (length 0) is constant and lands here with empty slices.
+        if (length > 0 && rowCount > 1)
+        {
+            var body = data.Slice(start, total);
+            if (!body.Slice(length).SequenceEqual(body.Slice(0, total - length)))
+                return false;
+        }
+
+        // (3) Every row is exactly one period into the buffer.
+        for (int i = 1; i < rowCount; i++)
+        {
+            if (offsets[i] - start != (long)i * length)
+                return false;
+        }
+
+        return true;
     }
 
     private static DictionaryResult? TryEncodeFixedLenByteArray(

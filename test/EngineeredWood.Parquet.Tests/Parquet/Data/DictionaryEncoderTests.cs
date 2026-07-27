@@ -158,6 +158,133 @@ public class DictionaryEncoderTests
         Assert.All(result.Value.Indices, idx => Assert.Equal(0, idx));
     }
 
+    // ── The constant-column fast path ──
+    //
+    // A column holding one value in every row skips the per-row hashing entirely: uniform value length is
+    // checked in O(1), then the value buffer is compared against itself shifted by one value. The result
+    // must be indistinguishable from what the hashing loop would have produced — one dictionary entry and an
+    // index of 0 for every row — because the encoding is what lands in the file.
+
+    private static StringArray Strings(params string[] values)
+    {
+        var b = new StringArray.Builder();
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    [Fact]
+    public void TryEncode_ConstantStringColumn_MatchesWhatHashingWouldProduce()
+    {
+        var array = Strings(Enumerable.Repeat("update_postimage", 64).ToArray());
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, null, 64, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.Value.DictionaryCount);
+        Assert.Equal(64, result.Value.Indices.Length);
+        Assert.All(result.Value.Indices, idx => Assert.Equal(0, idx));
+        // PLAIN dictionary page: 4-byte LE length prefix, then the value.
+        Assert.Equal(4 + 16, result.Value.DictionaryPageData.Length);
+        Assert.Equal("update_postimage",
+            System.Text.Encoding.UTF8.GetString(result.Value.DictionaryPageData, 4, 16));
+    }
+
+    [Fact]
+    public void TryEncode_VaryingLengthsOverRepeatingBytes_IsNotMistakenForConstant()
+    {
+        // The case the offset walk exists for. Lengths 2,1,3 over a run of 'a's hold THREE different values,
+        // yet the two cheap checks both pass: the lengths average out so uniform-length is not refuted, and
+        // the value buffer is trivially periodic in any period. Without the walk this encodes as one value
+        // repeated — a corrupt file rather than a failure.
+        //
+        // Repeated to 30 rows so the 3 distinct values stay under the cardinality threshold; at 3 rows
+        // TryEncode bails on cardinality before reaching any of this.
+        var pattern = new[] { "aa", "a", "aaa" };
+        var array = Strings(Enumerable.Range(0, 30).Select(i => pattern[i % 3]).ToArray());
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, null, 30, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Value.DictionaryCount);
+        Assert.Equal([0, 1, 2, 0, 1, 2], result.Value.Indices.Take(6));
+    }
+
+    [Fact]
+    public void TryEncode_SameLengthDifferentValues_IsNotMistakenForConstant()
+    {
+        // Uniform length, so the O(1) check cannot refute it; the periodicity compare is what does, at the
+        // first differing byte. Repeated to 40 rows to clear the cardinality threshold.
+        var pattern = new[] { "aaa", "bbb", "aaa", "ccc" };
+        var array = Strings(Enumerable.Range(0, 40).Select(i => pattern[i % 4]).ToArray());
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, null, 40, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Value.DictionaryCount);
+        Assert.Equal([0, 1, 0, 2], result.Value.Indices.Take(4));
+    }
+
+    [Fact]
+    public void TryEncode_AllEmptyStrings_IsConstant()
+    {
+        // Value length 0 — the buffer is empty, so periodicity is vacuous and only the offset walk speaks.
+        var array = Strings("", "", "");
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, null, 3, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.Value.DictionaryCount);
+        Assert.Equal(4, result.Value.DictionaryPageData.Length); // length prefix only
+        Assert.Equal([0, 0, 0], result.Value.Indices);
+    }
+
+    [Fact]
+    public void TryEncode_ConstantColumnWithNulls_FallsBackToHashing()
+    {
+        // The probe reads every row, so it is only valid with no nulls. With def levels present the column
+        // must still encode correctly — through the hashing loop, which skips null rows.
+        var array = Strings("x", "x", "x", "x");
+        int[] defLevels = [1, 0, 1, 1];
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, defLevels, 3, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.Value.DictionaryCount);
+        Assert.Equal(3, result.Value.Indices.Length); // one per NON-NULL row
+    }
+
+    [Fact]
+    public void TryEncode_ConstantFixedWidthColumn_MatchesWhatHashingWouldProduce()
+    {
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < 64; i++) b.Append(7L);
+
+        var result = DictionaryEncoder.TryEncode(
+            b.Build(), PhysicalType.Int64, 0, null, 64, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.Value.DictionaryCount);
+        Assert.Equal(8, result.Value.DictionaryPageData.Length);
+        Assert.Equal(7L, BitConverter.ToInt64(result.Value.DictionaryPageData, 0));
+        Assert.All(result.Value.Indices, idx => Assert.Equal(0, idx));
+    }
+
+    [Fact]
+    public void TryEncode_SingleRow_IsConstant()
+    {
+        var result = DictionaryEncoder.TryEncode(
+            Strings("only"), PhysicalType.ByteArray, 0, null, 1, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.Value.DictionaryCount);
+        Assert.Equal([0], result.Value.Indices);
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(2)]
