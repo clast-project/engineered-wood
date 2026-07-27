@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Schema;
 using DeltaStructType = EngineeredWood.DeltaLake.Schema.StructType;
 
@@ -137,15 +138,32 @@ internal static class IdentityColumnWriter
         return (resultBatch, updates);
     }
 
+    /// <summary>
+    /// Builds the generated column straight into its Arrow value buffer.
+    ///
+    /// <para>The sequence IS the buffer — one int64 per slot, no nulls — so there is nothing for a
+    /// <see cref="Int64Array.Builder"/> to decide. Going through one cost a second full-size allocation and
+    /// a per-element append (with its growth check) on top of the array the values were generated into,
+    /// which for a wide batch is two copies of a column that is pure arithmetic. The buffer is filled once,
+    /// in place, and handed to the array.</para>
+    ///
+    /// <para>An identity column is never null, so no validity bitmap is allocated — <see cref="ArrowBuffer.Empty"/>
+    /// with a zero null count is what lets Arrow skip the per-element validity check downstream.</para>
+    /// </summary>
     private static (Int64Array Array, long NewHighWaterMark) GenerateColumn(
         IdentityColumnConfig config, int count)
     {
-        var (values, newHwm) = IdentityColumn.GenerateValues(config, count);
+        if (count <= 0)
+            return (new Int64Array.Builder().Build(), IdentityColumn.GenerateInto(config, []));
 
-        var builder = new Int64Array.Builder();
-        foreach (long v in values)
-            builder.Append(v);
+        // zeroFill: false — GenerateInto writes every slot.
+        using var values = new NativeBuffer<long>(count, zeroFill: false);
+        long newHwm = IdentityColumn.GenerateInto(config, values.Span);
 
-        return (builder.Build(), newHwm);
+        var data = new ArrayData(
+            Int64Type.Default, count, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty, values.Build() });
+
+        return (new Int64Array(data), newHwm);
     }
 }

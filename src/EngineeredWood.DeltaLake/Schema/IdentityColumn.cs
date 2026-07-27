@@ -140,14 +140,27 @@ public static class IdentityColumn
         if (count <= 0)
             return ([], config.HighWaterMark ?? config.Start);
 
-        long start = NextValue(config);
         var values = new long[count];
+        return (values, GenerateInto(config, values));
+    }
 
-        for (int i = 0; i < count; i++)
-            values[i] = checked(start + (long)i * config.Step);
+    /// <summary>
+    /// Writes the sequence into <paramref name="destination"/> and returns the new high water mark, so a
+    /// caller that already owns the memory it wants the values in — an Arrow value buffer, say — is not
+    /// made to allocate a <see cref="long"/> array and copy out of it. One value per slot, so
+    /// <paramref name="destination"/>'s length is the count.
+    /// </summary>
+    public static long GenerateInto(IdentityColumnConfig config, Span<long> destination)
+    {
+        if (destination.Length == 0)
+            return config.HighWaterMark ?? config.Start;
 
-        long newHwm = values[count - 1];
-        return (values, newHwm);
+        long start = NextValue(config);
+
+        for (int i = 0; i < destination.Length; i++)
+            destination[i] = checked(start + (long)i * config.Step);
+
+        return destination[destination.Length - 1];
     }
 
     /// <summary>
