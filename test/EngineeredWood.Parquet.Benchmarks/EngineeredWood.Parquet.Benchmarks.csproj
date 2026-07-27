@@ -6,6 +6,14 @@
     <LangVersion>preview</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!--
+      CS8002: ParquetSharp is not strongly named, and this assembly is (see the
+      repository-root Directory.Build.props). It is a comparison baseline used only
+      by the benchmarks and is never shipped, and .NET Core does not enforce
+      strong-name references at run time, so the warning has nothing to say here.
+    -->
+    <NoWarn>$(NoWarn);CS8002</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

@@ -1,6 +1,14 @@
 <Project>
 
   <!--
+    MSBuild stops at the first Directory.Build.props it finds walking up from a
+    project, so the repository-root file (strong naming) has to be imported here
+    explicitly or test/ would never see it. Test and benchmark assemblies are named
+    as friends by the signed libraries under src/, so they must be signed as well.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <!--
     Test and benchmark projects are never published. Opting them out of packing
     here (one file for the whole test/ tree) means `dotnet pack` on the solution
     produces only the src/ libraries — no stray test/benchmark .nupkg files.

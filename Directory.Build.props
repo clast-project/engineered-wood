@@ -1,0 +1,32 @@
+<Project>
+
+  <!--
+    Strong naming.
+
+    The key is deliberately committed: a strong name provides assembly identity,
+    not security (the runtime does not validate the signature on .NET Core and
+    later), so there is nothing secret to protect. Clast.snk is the same key file
+    used across the clast-project repositories, so every EngineeredWood.* assembly
+    carries the same public key token as every Clast.* dependency: 0b0eddb1936076d9.
+
+    Signing is configured at the repository root rather than under src/ because a
+    signed assembly may only name friends that are themselves signed. The test and
+    benchmark projects appear in InternalsVisibleTo declarations throughout src/,
+    so they have to be signed too.
+  -->
+  <PropertyGroup>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)Clast.snk</AssemblyOriginatorKeyFile>
+
+    <!--
+      The full 2048-bit public key of Clast.snk. A signed assembly may only declare
+      friends that specify a public key (CS1726), and the SDK does not append one
+      by default. Setting PublicKey makes it stamp this key onto every
+      InternalsVisibleTo item that does not carry its own Key metadata
+      (Microsoft.NET.GenerateAssemblyInfo.targets), which keeps the ~60 declarations
+      across src/ free of a 500-character literal.
+    -->
+    <PublicKey>00240000048000001401000006020000002400005253413100080000010001000594feb31648818f936120bdb332c64d73cbfb85079c1d80e4cbc808b5df489e5145ec7adf075c12e8af5246451e3e72740b57c162225b80bfcb0b71762985a05e4b9cfc8197a88a5c957ee25d702ababe81192f61be33cbbb5c9fbc9a083561d740fb257ccb9b7af648b91d9742511e3f24edae52bb9a86263902c5e5c87cc81f9384cc45862a23151cf6a33090fc77066c8a108c035c40a6aa34316b70cc7593716fd5f79e6874ff3fa19715658c0eef13339382d58b4bcdfd241b0d305291c16ce0f562f4e3657ccc8759df805b544a4db986dfab63fe691a17d1f1ef2fffc0f186aff0b79f61d4dbc57e91f79b539b5211d8729891eb7e600fd1301bcaa8</PublicKey>
+  </PropertyGroup>
+
+</Project>

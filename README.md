@@ -2,11 +2,15 @@
 
 A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, and **Vortex** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
-> **Status — preliminary (0.1.0).** EngineeredWood is pre-1.0 and under active
-> development. The published NuGet packages are versioned `0.1.0`, and
+> **Status — preliminary (0.2.0).** EngineeredWood is pre-1.0 and under active
+> development. The published NuGet packages are versioned `0.2.0`, and
 > **every public API is subject to change — without notice and without a
 > deprecation cycle — until 1.0.0.** If you depend on a package, pin an exact
 > version. Feedback on the API surface is welcome while it's still malleable.
+>
+> 0.2.0 is the first strongly-named release. The unsigned 0.1.0 packages remain on
+> nuget.org, but assembly identity changed, so upgrading from 0.1.0 requires a
+> rebuild rather than a drop-in binary swap.
 
 ## Highlights
 
@@ -16,6 +20,7 @@ A .NET library for reading and writing columnar file formats — **Apache Parque
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
 - **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
+- **Strongly named.** Every assembly is signed with the shared clast-project key, public key token `0b0eddb1936076d9`, so the libraries can be referenced from strongly-named projects.
 
 ## Why
 

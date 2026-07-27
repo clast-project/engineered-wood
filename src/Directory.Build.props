@@ -1,6 +1,13 @@
 <Project>
 
   <!--
+    MSBuild stops at the first Directory.Build.props it finds walking up from a
+    project, so the repository-root file (strong naming) has to be imported here
+    explicitly or src/ would never see it.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <!--
     Validate AOT / trim compatibility for the net10.0 builds of every library
     under src/. Setting IsAotCompatible enables the trim, single-file, and AOT
     analyzers, which flag reflection / dynamic-codegen patterns that would not
@@ -25,12 +32,16 @@
     Applied to all src projects; the non-library TestTool opts out with
     <IsPackable>false</IsPackable> in its own csproj.
 
-    Version is 0.1.0 (preliminary). EngineeredWood is pre-1.0 and the public
+    Version is 0.2.0 (preliminary). EngineeredWood is pre-1.0 and the public
     API is explicitly unstable — the release notes and per-package descriptions
     say so, and consumers are told to pin an exact version.
+
+    0.2.0 is the first strongly-named release: 0.1.0 shipped unsigned, and adding
+    a strong name changes assembly identity, so it could not go out under the same
+    version. The Clast.* dependencies moved to 0.2.0 for the same reason.
   -->
   <PropertyGroup>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>clast-project</Authors>
     <Company>clast-project</Company>
     <Product>EngineeredWood</Product>
@@ -42,7 +53,7 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
     <PackageTags>arrow;parquet;orc;avro;lance;vortex;delta-lake;iceberg;columnar;analytics</PackageTags>
-    <PackageReleaseNotes>Preliminary 0.1.0 release. EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
+    <PackageReleaseNotes>Preliminary 0.2.0 release, and the first strongly-named one: every assembly is now signed with the shared clast-project key (public key token 0b0eddb1936076d9). EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
@@ -75,7 +86,7 @@
     ends with the same pre-1.0 caveat that appears in the release notes.
   -->
   <PropertyGroup>
-    <_PreRelease>Preliminary 0.1.0 — APIs may change before 1.0.0.</_PreRelease>
+    <_PreRelease>Preliminary 0.2.0 — APIs may change before 1.0.0.</_PreRelease>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Core'">Shared abstractions for EngineeredWood: offset-based (range-oriented) I/O, pure-managed compression (Snappy/Zstd/LZ4/Brotli), and Apache Arrow helpers. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Expressions'">Format-agnostic expression and predicate trees with a statistics evaluator, driving columnar predicate pushdown across EngineeredWood formats. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Expressions.Arrow'">Row-level evaluation of EngineeredWood expression trees against Apache Arrow RecordBatches, with full SQL three-valued null semantics. $(_PreRelease)</Description>
