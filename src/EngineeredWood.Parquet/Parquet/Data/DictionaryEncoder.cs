@@ -203,7 +203,7 @@ internal static class DictionaryEncoder
         }
 
         // Open-addressing hash table with linear probing
-        var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
+        var table = new BytesHashTable();
         var uniqueEntries = new List<byte[]>();
         var indices = new int[nonNullCount];
         int idx = 0;
@@ -295,13 +295,11 @@ internal static class DictionaryEncoder
 
         int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
 
-        // Sized from the RUN count, not the row count. The per-row arms have to size for the cardinality
-        // cap — a fifth of the rows — because that is all they know before they start hashing; here the
-        // runs are an exact upper bound on the distinct values, and one run cannot hold two of them. On a
-        // constant column of a million rows that is the difference between 16 slots and half a million
-        // (8 MB of table for a one-entry dictionary), which would have swallowed the whole saving.
+        // The runs are an EXACT upper bound on the distinct values — one run cannot hold two of them —
+        // where the per-row arms have nothing to go on and must grow into the right size. Passing it
+        // costs nothing and means a column whose bound is tight never rehashes at all.
         int distinctBound = Math.Min(maxCardinality, values.Length) + 1;
-        var table = new BytesHashTable(Math.Max(16, distinctBound * 2));
+        var table = new BytesHashTable(distinctBound);
         var uniqueEntries = new List<byte[]>();
         var runIndices = new List<int>();
         var runLengths = new List<int>();
@@ -497,7 +495,7 @@ internal static class DictionaryEncoder
 
         var valueBuffer = array.Data.Buffers[1].Span;
 
-        var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
+        var table = new BytesHashTable();
         var uniqueEntries = new List<byte[]>();
         var indices = new int[nonNullCount];
         int idx = 0;
@@ -545,23 +543,57 @@ internal static class DictionaryEncoder
     /// Open-addressing hash table with linear probing for byte sequences.
     /// More cache-friendly than Dictionary&lt;int, List&lt;...&gt;&gt; with collision chains.
     /// Uses FNV-1a for hashing.
+    ///
+    /// <para><b>Grows geometrically rather than being sized up front.</b> It used to be built from the
+    /// caller's cardinality CAP — a fifth of the row count — so a 1M-row string column allocated 8.4 MB of
+    /// table before hashing a single row, identically whether the column went on to hold twelve distinct
+    /// values or a million. That is per column and concurrent, since the writer runs columns under
+    /// <c>Parallel.For</c>: twenty string columns was ~168 MB of table live at once, independent of the
+    /// data. It now starts at 16 slots and doubles.</para>
+    ///
+    /// <para>The load factor ceiling stays at one half, which is exactly what the old sizing guaranteed
+    /// (<c>maxCardinality * 2</c> rounded up to a power of two, against at most <c>maxCardinality</c>
+    /// entries). Linear probing degrades sharply as a table fills, so holding the same ceiling keeps probe
+    /// lengths what they were rather than trading the memory for lookup cost. The worst case — a column
+    /// that really does reach the cap — ends at the same size it was allocated at before, having paid an
+    /// amortized two moves per entry to get there.</para>
     /// </summary>
     private sealed class BytesHashTable
     {
-        private readonly int[] _hashes;    // 0 = empty slot
-        private readonly byte[]?[] _keys;
-        private readonly int[] _values;
-        private readonly int _mask;
+        /// <summary>Smallest table. A column with a handful of distinct values never outgrows it.</summary>
+        private const int MinimumSize = 16;
 
-        public BytesHashTable(int capacity)
+        /// <summary>
+        /// Largest table. <c>_hashes.Length &lt;&lt; 1</c> overflows to negative past this, and a table
+        /// this size is 12 GB across the three arrays — long past where the column itself would have
+        /// exhausted memory.
+        /// </summary>
+        private const int MaximumSize = 1 << 30;
+
+        // Empty until the constructor's Allocate call, which every path goes through; the initializers
+        // are here only so the nullable analysis can see that they are never null.
+        private int[] _hashes = [];    // 0 = empty slot
+        private byte[]?[] _keys = [];
+        private int[] _values = [];
+        private int _mask;
+        private int _count;
+        private int _growAt;
+
+        /// <param name="expectedEntries">
+        /// An upper bound on the distinct values, for a caller that has one — the run-end encoded arm
+        /// does, since a run cannot hold two distinct values. Sizing to it means an exact bound never
+        /// rehashes. Zero (the default) starts at the minimum and grows, which is the right answer for a
+        /// caller that cannot know.
+        /// </param>
+        public BytesHashTable(int expectedEntries = 0)
         {
-            // Round up to next power of 2
-            int size = 1;
-            while (size < capacity) size <<= 1;
-            _hashes = new int[size];
-            _keys = new byte[]?[size];
-            _values = new int[size];
-            _mask = size - 1;
+            int size = MinimumSize;
+            // Two slots per entry, matching the load-factor ceiling below. Compared as long: a bound near
+            // int.MaxValue would otherwise double past the sign bit and spin here.
+            while (size < (long)expectedEntries * 2 && size < MaximumSize)
+                size <<= 1;
+
+            Allocate(size);
         }
 
         /// <summary>
@@ -583,6 +615,12 @@ internal static class DictionaryEncoder
                     _hashes[slot] = hash;
                     _keys[slot] = key.ToArray();
                     _values[slot] = nextIndex;
+
+                    // Grown AFTER the insert, so the slot this landed in does not have to survive the
+                    // rehash — nothing here returns a slot, only the caller's own index.
+                    if (++_count >= _growAt)
+                        Grow();
+
                     return nextIndex;
                 }
 
@@ -592,6 +630,54 @@ internal static class DictionaryEncoder
                 }
 
                 slot = (slot + 1) & _mask;
+            }
+        }
+
+        private void Allocate(int size)
+        {
+            _hashes = new int[size];
+            _keys = new byte[]?[size];
+            _values = new int[size];
+            _mask = size - 1;
+            _growAt = size / 2;
+        }
+
+        /// <summary>
+        /// Doubles the table and reinserts. The stored hash is reused rather than recomputed — it is the
+        /// full FNV-1a value with the low bit forced, so the wider mask selects the new slot directly and
+        /// no key is hashed twice.
+        /// </summary>
+        private void Grow()
+        {
+            var oldHashes = _hashes;
+            var oldKeys = _keys;
+            var oldValues = _values;
+
+            if (oldHashes.Length >= MaximumSize)
+            {
+                // Unreachable in practice — the caller declines at a fifth of the row count long before,
+                // and half a billion live keys would have exhausted memory first. Stated as a failure
+                // rather than left implicit: a table that cannot grow eventually fills, and a full
+                // open-addressed table makes GetOrAdd spin forever rather than return.
+                throw new InvalidOperationException(
+                    $"The dictionary hash table cannot grow past {MaximumSize} slots.");
+            }
+
+            Allocate(oldHashes.Length << 1);
+
+            for (int i = 0; i < oldHashes.Length; i++)
+            {
+                int hash = oldHashes[i];
+                if (hash == 0)
+                    continue;
+
+                int slot = hash & _mask;
+                while (_hashes[slot] != 0)
+                    slot = (slot + 1) & _mask;
+
+                _hashes[slot] = hash;
+                _keys[slot] = oldKeys[i];
+                _values[slot] = oldValues[i];
             }
         }
 

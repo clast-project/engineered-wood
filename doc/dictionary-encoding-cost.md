@@ -31,32 +31,62 @@ dictionaries generally: there the dictionary saves 3.5 MB of allocation and shri
 On a realistic two-column table (one low-cardinality, one all-distinct), naming the distinct column in
 `ColumnDictionaryEnabled` saves **17,450,424 B and 20.52 ms** per 1M rows and produces an identical file.
 
-## Deferred — A. Grow the hash table instead of pre-sizing it
+## Done — A. Grow the hash table instead of pre-sizing it
 
-`TryEncodeByteArray` and `TryEncodeFixedLenByteArray` open with:
+`TryEncodeByteArray` and `TryEncodeFixedLenByteArray` used to open with:
 
 ```csharp
 var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
 ```
 
-`maxCardinality` is 20% of the row count, so a 1M-row column sizes the table to 400,000 slots, which
-rounds to 524,288 and costs **8,388,608 bytes at 16 bytes a slot** — allocated before the first row is
-hashed, and identical whether the column holds twelve distinct values or a million. `TryEncodeFixed` does
-not have this problem, because `Dictionary<T,int>` grows geometrically; the penalty falls only on string
-and binary columns, which are the ones dictionary encoding usually serves best.
+`maxCardinality` is 20% of the row count, so a 1M-row column sized the table to 400,000 slots, which
+rounds to 524,288 and cost **8,388,608 bytes at 16 bytes a slot** — allocated before the first row was
+hashed, and identical whether the column held twelve distinct values or a million. `TryEncodeFixed` never
+had the problem, because `Dictionary<T,int>` grows geometrically; the penalty fell only on string, binary
+and FLBA columns.
 
-`WriteSingleRowGroupAsync` runs columns under `Parallel.For`, so twenty string columns is ~168 MB of hash
-table live simultaneously, independent of the data.
+`BytesHashTable` now starts at 16 slots and doubles, holding the same load-factor ceiling of one half that
+the old sizing guaranteed — so probe lengths are unchanged and only the memory moves. The run-end encoded
+arm still passes a hint, because the run count is an exact upper bound on distinct values and an exact
+bound never rehashes.
 
-The fix is geometric growth, and the catch is that it is a contract change rather than a tuning one:
-`BytesHashTable` has no resize path and no load-factor guard, so `GetOrAdd` spins forever if the table
-fills. The generous pre-sizing is currently load-bearing. Anything that shrinks it has to add growth and
-rehashing first. (The run-end-encoded arm sizes from the run count instead, which is an exact upper bound
-on distinct values — see `doc/ree-constant-column-encoding.md`. That trick does not generalize, because
-the per-row arms have no such bound before they start.)
+### Measured, A/B in one process
 
-This is the change that needs no API and no producer knowledge, and it helps the low-cardinality columns
-that currently over-pay. It is the one to do next.
+Same data, same build, only the sizing differs. Minimum of 5 after 2 warm-ups.
+
+| shape | pre-sized | grown | delta |
+| --- | --- | --- | --- |
+| 1M rows, 12 distinct | 15,579,256 B / 40.14 ms | 7,191,488 B / 39.38 ms | **−8,387,768 B (−54%)** |
+| 1M rows, 50,000 distinct | 28,124,320 B / 48.35 ms | 23,930,696 B / 49.29 ms | −4,193,624 B (−15%) |
+| 1M rows, all distinct | 36,588,312 B / 48.17 ms | 32,396,488 B / 47.29 ms | −4,191,824 B (−11%) |
+| 20 columns × 200k rows, 8 distinct | 67,343,496 B / 19.45 ms | 25,418,952 B / 21.37 ms | **−41,924,544 B (−62%)** |
+| FSB(4), 1M rows, 1,000 distinct | 15,666,488 B / 22.12 ms | 7,343,664 B / 20.06 ms | −8,322,824 B (−53%) |
+| FSB(4), 1M rows, 150,000 distinct | 33,773,248 B / 47.24 ms | 42,162,680 B / 51.11 ms | **+8,389,432 B (+25%)** |
+| FSB(4), 1M rows, 250,000 distinct | 42,477,008 B / 43.61 ms | 50,867,352 B / 46.27 ms | **+8,390,344 B (+20%)** |
+
+### The last two rows are a real regression, and it is bounded
+
+A doubling series sums to about one extra copy of the final table, so a column that grows all the way to
+the size it would have been pre-sized at pays roughly twice. That only happens when the **cardinality cap
+is the binding constraint** rather than `DictionaryPageSizeLimit`.
+
+For BYTE_ARRAY it never is. Fitting 200,000 entries inside a 1 MB dictionary page needs ~5 bytes each, and
+a BYTE_ARRAY entry carries a 4-byte length prefix — so the values would have to be ~1 byte, and there are
+not 200,000 distinct 1-byte values. The page limit always trips first, at a table far below the cap, which
+is why the all-distinct string row above still *improves* by 4.2 MB.
+
+It is reachable for narrow FIXED_LEN_BYTE_ARRAY columns, which have no length prefix: FSB(4) fits 262,144
+entries in the page limit, so the 200,000 cap binds. That is the shape in the last two rows. Accepted
+rather than mitigated, because:
+
+- those columns are being **discarded** anyway — the dictionary is declined and the column written PLAIN,
+  so it makes an already-wasteful path ~20% more wasteful, in exchange for halving the productive one;
+- `ColumnDictionaryEnabled` is the escape hatch for a producer that has such a column;
+- the alternatives all cost elsewhere. Growing by 4× would cut the series to ~⅓ of final but overshoot
+  every mid-sized column; jumping straight to the cap once the table gets large would re-introduce the
+  8.4 MB for every column that stops below it.
+
+Timings moved by ±4 ms with no consistent direction, on a shared machine — treat them as flat.
 
 ## Deferred — B. Incremental fallback, the parquet-cpp model
 
@@ -103,3 +133,8 @@ page-buffering: the sequence above is recalled, not verified against the source.
   per-column switch inherits that behaviour.
 - **`EncodingStrategyResolver.ShouldAttemptDictionary` has no callers.** It duplicates the check in
   `DictionaryEncoder.TryEncode` and would need the per-column resolution if it were ever wired up.
+- **Every distinct value is copied twice.** `BytesHashTable.GetOrAdd` stores its own `key.ToArray()` for
+  comparison, and the caller then does `uniqueEntries.Add(valueBytes.ToArray())` for the dictionary page —
+  two allocations per distinct value, in all three arms. Collapsing them needs `GetOrAdd` to be handed the
+  array the caller is going to keep, which is a call-site change in each arm rather than a change to the
+  table.

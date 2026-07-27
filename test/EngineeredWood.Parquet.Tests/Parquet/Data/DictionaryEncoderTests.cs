@@ -293,6 +293,108 @@ public class DictionaryEncoderTests
         Assert.Equal([0], Indices(result.Value));
     }
 
+    // ── Hash-table growth ──
+    //
+    // The table starts at 16 slots and doubles, where it used to be sized from the cardinality cap — a
+    // fifth of the row count — so a 1M-row string column allocated 8.4 MB before hashing a single row.
+    // Growth means rehashing, and a rehash that loses or misplaces an entry corrupts the dictionary
+    // rather than failing, so correctness across many doublings is pinned first.
+
+    /// <summary>Reads back the values of a PLAIN byte-array dictionary page, in index order.</summary>
+    private static List<string> DictionaryEntries(DictionaryEncoder.DictionaryResult result)
+    {
+        var entries = new List<string>(result.DictionaryCount);
+        var page = result.DictionaryPageData;
+        int pos = 0;
+
+        for (int i = 0; i < result.DictionaryCount; i++)
+        {
+            int length = BitConverter.ToInt32(page, pos);
+            pos += 4;
+            entries.Add(System.Text.Encoding.UTF8.GetString(page, pos, length));
+            pos += length;
+        }
+
+        return entries;
+    }
+
+    [Fact]
+    public void TryEncode_ManyDistinctValues_SurvivesRepeatedTableGrowth()
+    {
+        // 5,000 distinct values over 50,000 rows — 10% cardinality, so it stays under the threshold and
+        // the table doubles nine times on the way. Every row is then checked back through the dictionary
+        // it produced: a rehash that dropped an entry would show up as a wrong value here, not as an
+        // exception.
+        const int Distinct = 5_000;
+        const int Rows = 50_000;
+
+        var values = new string[Rows];
+        for (int i = 0; i < Rows; i++) values[i] = $"value-{i % Distinct:D5}";
+
+        var result = DictionaryEncoder.TryEncode(
+            Strings(values), PhysicalType.ByteArray, 0, null, Rows, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(Distinct, result.Value.DictionaryCount);
+
+        var entries = DictionaryEntries(result.Value);
+        var indices = Indices(result.Value);
+
+        Assert.Equal(Rows, indices.Length);
+        for (int i = 0; i < Rows; i++)
+            Assert.Equal(values[i], entries[indices[i]]);
+    }
+
+    [Fact]
+    public void TryEncode_ARepeatedValueAfterGrowth_StillFindsItsExistingEntry()
+    {
+        // The other way a rehash goes wrong: the entry survives but is no longer findable, so the value
+        // is added a second time. The count is what catches that — every value here recurs after the
+        // table has doubled well past where it was first seen.
+        // Six passes over 2,000 values keeps cardinality at 16.7%, under the threshold; the table has
+        // doubled to its final size long before the second pass begins.
+        var values = new string[12_000];
+        for (int i = 0; i < values.Length; i++) values[i] = $"v{i % 2_000:D4}";
+
+        var result = DictionaryEncoder.TryEncode(
+            Strings(values), PhysicalType.ByteArray, 0, null, values.Length, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(2_000, result.Value.DictionaryCount);
+
+        var indices = Indices(result.Value);
+        for (int i = 0; i < 2_000; i++)
+            Assert.Equal(indices[i], indices[2_000 + i]);
+    }
+
+#if NET6_0_OR_GREATER
+    [Fact]
+    public void TryEncode_LowCardinalityColumn_DoesNotAllocateForTheCardinalityCap()
+    {
+        // A 1M-row column of twelve distinct values used to allocate the same 8.4 MB table as one with a
+        // million, because the size came from the CAP rather than from anything the column held. What is
+        // left after growth is dominated by the per-row index array (4 MB), so the bound sits above that
+        // and below what the old sizing added on top.
+        //
+        // .NET Framework has no per-thread allocation counter, so the pin runs on the modern targets only.
+        var values = new string[1_000_000];
+        for (int i = 0; i < values.Length; i++) values[i] = $"kind-{i % 12}";
+        var array = Strings(values);
+
+        DictionaryEncoder.TryEncode(array, PhysicalType.ByteArray, 0, null, values.Length, DefaultOptions);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.ByteArray, 0, null, values.Length, DefaultOptions);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.NotNull(result);
+        Assert.Equal(12, result.Value.DictionaryCount);
+        Assert.True(allocated < 5 * 1024 * 1024,
+            $"Encoding a 1,000,000-row column of 12 distinct values allocated {allocated:N0} bytes.");
+    }
+#endif
+
     // ── The run-end encoded arm ──
     //
     // A run-encoded column is hashed once per RUN and its indices come out in run form, so both the work

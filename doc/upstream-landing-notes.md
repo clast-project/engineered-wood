@@ -596,10 +596,13 @@ sized from the cardinality CAP rather than from anything the column contains.
 directions), honored by both writers. It saves the full 17.5 MB on a producer that names its id column.
 It only helps producers who KNOW, which is why the other two are worth doing:
 
-- **Grow `BytesHashTable` instead of pre-sizing it** — helps everyone, needs no API, and is the actual
-  memory-bounding fix (twenty string columns is ~168 MB of table live at once under `Parallel.For`,
-  independent of the data). Blocked on the table having no resize path: the generous pre-sizing is
-  load-bearing today, since `GetOrAdd` spins forever if it fills. **Do this next.**
+- **Grow `BytesHashTable` instead of pre-sizing it** — DONE (2026-07-27). 16 slots, doubling, same
+  load-factor ceiling of one half, so probe lengths are unchanged and only the memory moves. Measured A/B
+  in one process: a 1M-row column of twelve distinct values drops **54%** (15,579,256 → 7,191,488 B) and
+  twenty low-cardinality string columns drop **62%** (67,343,496 → 25,418,952 B). One bounded regression,
+  accepted knowingly: a narrow FIXED_LEN_BYTE_ARRAY column that reaches the cardinality CAP rather than
+  the page-size limit pays the doubling series twice over (+8.4 MB), which is unreachable for BYTE_ARRAY
+  and lands only on columns whose dictionary is being discarded anyway.
 - **Incremental fallback (the parquet-cpp model)** — keeps the dictionary-encoded prefix instead of
   discarding it. Deferred deliberately: on a uniformly high-cardinality column a mixed chunk makes the
   file WORSE, and EW, unlike a streaming writer, has the whole column and can simply decide. Justify it on
