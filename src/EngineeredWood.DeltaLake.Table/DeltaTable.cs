@@ -2041,6 +2041,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = unionDv,
                 DataChange = true,
+                Stats = StatsWithLooseBounds(latestAdd.GetStatsJson()),
             });
         }
 
@@ -2208,6 +2209,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
+                Stats = StatsWithLooseBounds(cand.GetStatsJson()),
             });
         }
         return result;
@@ -2479,6 +2481,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     DeletionVector = newDv,
                     DataChange = true,
+                    Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
                 });
 
                 // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
@@ -4163,9 +4166,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
-    /// <summary>Rewrites a stats JSON object with <c>tightBounds=false</c> — an add that carries an inline
-    /// deletion vector has fewer live rows than its physical min/max bounds cover, so the bounds are loose
-    /// supersets per the spec.</summary>
+    /// <summary>
+    /// Rewrites a stats JSON object with <c>tightBounds=false</c>. Applied wherever a deletion vector is
+    /// ATTACHED: the file's min/max then describe rows the vector removed, so they are loose supersets
+    /// rather than values still present. Absent means <c>true</c> per the spec, so leaving it off asserts
+    /// bounds that the vector has just invalidated — harmless for skipping, which only needs a superset,
+    /// but wrong for a reader answering MIN/MAX/COUNT from statistics alone.
+    /// </summary>
+    /// <remarks>
+    /// Only the flag needs writing. Delta additionally rewrites <c>nullCount</c> into its tri-state wide
+    /// form, because its tight-state counts are LOGICAL; EW collects statistics over the physical rows
+    /// when the file is written and never recomputes them, so an all-null column's count already equals
+    /// the physical <c>numRecords</c> that the wide reading tests against.
+    /// </remarks>
     private static string? StatsWithLooseBounds(string? stats)
     {
         if (string.IsNullOrEmpty(stats))

@@ -272,4 +272,55 @@ public class DeletionVectorTests : IDisposable
         System.Array.Copy(data, result, data.Length);
         return result;
     }
+
+    /// <summary>
+    /// <para>Attaching a deletion vector makes the file's statistics WIDE: its min/max now describe rows
+    /// the vector removed, and per the spec a wide file's <c>nullCount</c> only carries meaning at 0 and
+    /// at <c>numRecords</c>. `tightBounds` is absent-means-true, so a file that keeps quiet after a
+    /// delete is asserting bounds the delete just invalidated.</para>
+    ///
+    /// <para>Skipping is unaffected either way — a superset bound still proves non-matches — but a
+    /// reader answering MIN/MAX/COUNT from statistics alone would get a wrong answer, which is exactly
+    /// what the flag exists to prevent.</para>
+    /// </summary>
+    [Fact]
+    public async Task DeleteWithDeletionVector_MarksBoundsWide()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, enableDeletionVectors: true);
+
+        var ids = new Int64Array.Builder()
+            .AppendRange(Enumerable.Range(0, 20).Select(v => (long)v)).Build();
+        await table.WriteAsync([new RecordBatch(schema, [ids], 20)]);
+
+        var before = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        Assert.NotNull(before.Stats);
+        using (var tight = System.Text.Json.JsonDocument.Parse(before.Stats!))
+        {
+            // A freshly written file has tight bounds; the flag may be absent, which means the same.
+            Assert.True(
+                !tight.RootElement.TryGetProperty("tightBounds", out var flag) || flag.GetBoolean());
+        }
+
+        await table.DeleteAsync(EngineeredWood.Expressions.Expressions.LessThan(
+            "id", EngineeredWood.Expressions.LiteralValue.Of(5L)));
+
+        var after = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        Assert.NotNull(after.DeletionVector);
+        Assert.NotNull(after.Stats);
+
+        using var wide = System.Text.Json.JsonDocument.Parse(after.Stats!);
+        Assert.False(wide.RootElement.GetProperty("tightBounds").GetBoolean());
+
+        // The bounds themselves stay put — they are still a valid superset, which is all skipping needs,
+        // and numRecords stays PHYSICAL as the spec requires of a file carrying a deletion vector.
+        Assert.Equal(0, wide.RootElement.GetProperty("minValues").GetProperty("id").GetInt64());
+        Assert.Equal(19, wide.RootElement.GetProperty("maxValues").GetProperty("id").GetInt64());
+        Assert.Equal(20, wide.RootElement.GetProperty("numRecords").GetInt64());
+    }
 }

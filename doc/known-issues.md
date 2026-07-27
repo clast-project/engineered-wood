@@ -401,7 +401,22 @@ Parquet unit, and only Delta cannot carry it.
 
 **Stats collection gaps.**
 
-- `tightBounds` is never written.
+- `tightBounds` is written only where it changes meaning: `StatsWithLooseBounds`
+  marks a file wide wherever a deletion vector is ATTACHED, since the min/max then
+  describe rows the vector removed. A freshly written file leaves the flag off,
+  which the spec reads as `true`. Only the flag is rewritten, not `nullCount`:
+  Delta's tight-state null counts are logical and have to be converted on the way
+  to wide, whereas EW collects over the physical rows and never recomputes, so an
+  all-null column's count already equals the physical `numRecords` the wide
+  reading tests against.
+
+  Worth knowing how little this buys on the read side: the spec says the bounds
+  are "sufficient information for data skipping" either way, and delta-spark's
+  `DataSkippingReader` never mentions the flag. It matters to a reader answering
+  `MIN`/`MAX`/`COUNT` from statistics alone, which EW does not do — the flag is
+  written for other engines' benefit, not our own. EW's pruner is safe against
+  wide statistics regardless: it only skips on the two `nullCount` states (0 and
+  `== numRecords`) that the spec preserves when bounds go wide.
 - `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
   are ignored; every eligible column gets stats.
 
