@@ -2833,26 +2833,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return new UpdateActions(actions, removedPaths, totalUpdated);
     }
 
-    // Builds an Int64 array holding src[idx[0]], src[idx[1]], … preserving nulls — used to reorder/subset a
-    // resolved row-id (or commit-version) array to match a rewritten batch's row order.
-    private static Int64Array TakeIds(Int64Array src, List<int> idx)
-    {
-        var b = new Int64Array.Builder();
-        foreach (int i in idx)
-        {
-            if (src.IsNull(i)) b.AppendNull();
-            else b.Append(src.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
+    // Reorders/subsets a resolved row-id (or commit-version) array to match a rewritten batch's row order.
+    // This is the take kernel with the type fixed, so it gathers value slots rather than round-tripping each
+    // row through Int64Array.Builder.
+    private static Int64Array TakeIds(Int64Array src, List<int> idx) =>
+        (Int64Array)ArrowCompute.Take(src, idx);
 
-    // Builds a constant Int64 array of length n (the commit version assigned to every matched/updated row).
-    private static Int64Array ConstInt64(long value, int n)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < n; i++) b.Append(value);
-        return b.Build();
-    }
+    // A constant Int64 column (the commit version assigned to every matched/updated row). Tiled by Repeat
+    // rather than appended per row, which also drops the validity buffer a builder allocates for a column
+    // that has no nulls to record.
+    private static Int64Array ConstInt64(long value, int n) =>
+        (Int64Array)ArrowCompute.Repeat(
+            Apache.Arrow.Types.Int64Type.Default, BitConverter.GetBytes(value), n);
 
     private static int CountTrue(BooleanArray mask)
     {
@@ -3173,7 +3165,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 bi++;
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var idb = new Int64Array.Builder();
+                var idb = new Int64Array.Builder().Reserve(batch.Length);
                 for (int i = 0; i < batch.Length; i++)
                 {
                     long absolute = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
@@ -4888,7 +4880,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             for (int bi = 0; bi < userBatches.Count; bi++)
             {
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var ridb = new Int64Array.Builder();
+                var ridb = new Int64Array.Builder().Reserve(userBatches[bi].Length);
                 for (int i = 0; i < userBatches[bi].Length; i++)
                 {
                     long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
@@ -4920,8 +4912,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
                 var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
                 var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
-                Int64Array.Builder? idb = materializeIds ? new Int64Array.Builder() : null;
-                Int64Array.Builder? vdb = materializeIds ? new Int64Array.Builder() : null;
+                Int64Array.Builder? idb = materializeIds ? new Int64Array.Builder().Reserve(src.Length) : null;
+                Int64Array.Builder? vdb = materializeIds ? new Int64Array.Builder().Reserve(src.Length) : null;
                 var matchedRows = cdfEnabled ? new List<int>() : null;
                 for (int i = 0; i < src.Length; i++)
                 {
@@ -5792,10 +5784,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // (null when the file carries neither — a pre-row-tracking source). The rewrite path preserves ids.
             if (wantRowIds)
             {
-                var idb = new Int64Array.Builder();
-                var vrb = new Int64Array.Builder();
-                var pb = new Int64Array.Builder();
-                foreach (int i in survivorSrc!)
+                var idb = new Int64Array.Builder().Reserve(survivorSrc!.Count);
+                var vrb = new Int64Array.Builder().Reserve(survivorSrc.Count);
+                var pb = new Int64Array.Builder().Reserve(survivorSrc.Count);
+                foreach (int i in survivorSrc)
                 {
                     long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
                     long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + thisBatchStart + i : (long?)null);

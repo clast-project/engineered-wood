@@ -228,8 +228,10 @@ internal static class CompactionExecutor
                 Int64Array? survivorIds = null, survivorVers = null;
                 if (materialize)
                 {
-                    var idb = new Int64Array.Builder();
-                    var vrb = new Int64Array.Builder();
+                    // physicalRows is an upper bound — DV-deleted rows are skipped below — so this reserves
+                    // once rather than growing, without over-trimming when nothing is deleted.
+                    var idb = new Int64Array.Builder().Reserve((int)physicalRows);
+                    var vrb = new Int64Array.Builder().Reserve((int)physicalRows);
                     for (int i = 0; i < physicalRows; i++)
                     {
                         if (deletedRows is not null && deletedRows.Contains(batchStartRow + i))

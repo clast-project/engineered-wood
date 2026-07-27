@@ -4,6 +4,7 @@
 using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.DeletionVectors;
@@ -240,17 +241,15 @@ internal static class CdfReader
     private static RecordBatch AddMetadataColumns(
         RecordBatch batch, long commitVersion, long? commitTimestamp)
     {
-        var versionBuilder = new Int64Array.Builder();
-        var timestampBuilder = new Int64Array.Builder();
-
-        for (int i = 0; i < batch.Length; i++)
-        {
-            versionBuilder.Append(commitVersion);
-            if (commitTimestamp.HasValue)
-                timestampBuilder.Append(commitTimestamp.Value);
-            else
-                timestampBuilder.AppendNull();
-        }
+        // Both added columns are constant down the whole batch — one commit contributes one version and one
+        // timestamp — so they are tiled rather than appended a row at a time. Repeat allocates no validity
+        // buffer, which is what lets Arrow skip the per-element validity check downstream; the absent
+        // timestamp is the one case that needs one, and every row of it is null rather than a sentinel.
+        var versionColumn = ArrowCompute.Repeat(
+            Int64Type.Default, BitConverter.GetBytes(commitVersion), batch.Length);
+        var timestampColumn = commitTimestamp is { } ts
+            ? ArrowCompute.Repeat(Int64Type.Default, BitConverter.GetBytes(ts), batch.Length)
+            : ArrowCompute.MakeNullArray(Int64Type.Default, batch.Length);
 
         var columns = new IArrowArray[batch.ColumnCount + 2];
         var fields = new List<Field>(batch.ColumnCount + 2);
@@ -261,10 +260,10 @@ internal static class CdfReader
             fields.Add(batch.Schema.FieldsList[i]);
         }
 
-        columns[batch.ColumnCount] = versionBuilder.Build();
+        columns[batch.ColumnCount] = versionColumn;
         fields.Add(new Field(CdfConfig.CommitVersionColumn, Int64Type.Default, false));
 
-        columns[batch.ColumnCount + 1] = timestampBuilder.Build();
+        columns[batch.ColumnCount + 1] = timestampColumn;
         fields.Add(new Field(CdfConfig.CommitTimestampColumn, Int64Type.Default, true));
 
         var schema = new Apache.Arrow.Schema.Builder();
