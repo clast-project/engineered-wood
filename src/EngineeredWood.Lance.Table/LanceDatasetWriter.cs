@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Expressions;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.IO;
@@ -828,11 +829,12 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// means no rows matched and the dataset is unchanged (current
     /// version returned).</para>
     ///
-    /// <para><b>Scope</b>: schemas of leaf columns only — primitives
-    /// (int / uint / float / double), strings, binary, bool, date, timestamp,
-    /// and decimal. Nested types (struct / list / FSL / map) in the schema
-    /// cause an <see cref="NotSupportedException"/> because the row-by-row take
-    /// helper only handles leaf shapes today.</para>
+    /// <para><b>Scope</b>: the rewrite gathers matching rows with
+    /// <see cref="ArrowCompute.Take"/>, so the shapes it can carry are that
+    /// kernel's — leaves, nested (struct / list / FSL / map), and extension types
+    /// alike. A column type neither it nor <see cref="LanceFileWriter"/> handles
+    /// raises <see cref="NotSupportedException"/> rather than being written
+    /// through unfiltered.</para>
     /// </summary>
     public static async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         string datasetPath, Predicate predicate,
@@ -935,9 +937,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 IArrowArray source = assignedArrays.TryGetValue(colIdx, out var assigned)
                     ? assigned
                     : arrays[colIdx];
-                IArrowArray taken = TakeRows(
-                    source, matching, arrowSchema.FieldsList[colIdx].DataType);
-                perColumnSlices[colIdx].Add(taken);
+                perColumnSlices[colIdx].Add(ArrowCompute.Take(source, matching));
             }
 
             perFragmentDeletes[fragment.Id] = matching;
@@ -1075,109 +1075,6 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Build a new array containing values from <paramref name="source"/>
-    /// at the given row indices, in order. Used by
-    /// <see cref="UpdateAsync"/> when assembling the rewrite-fragment from
-    /// matching rows. Currently handles primitive numeric types, Bool,
-    /// String, and Binary; nested types throw <see cref="NotSupportedException"/>.
-    /// </summary>
-    private static IArrowArray TakeRows(
-        IArrowArray source, IReadOnlyList<int> indices, IArrowType expectedType)
-    {
-        switch (source)
-        {
-            case Int8Array a: { var b = new Int8Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case UInt8Array a: { var b = new UInt8Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case Int16Array a: { var b = new Int16Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case UInt16Array a: { var b = new UInt16Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case Int32Array a: { var b = new Int32Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case UInt32Array a: { var b = new UInt32Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case Int64Array a: { var b = new Int64Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case UInt64Array a: { var b = new UInt64Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case FloatArray a: { var b = new FloatArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case DoubleArray a: { var b = new DoubleArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case BooleanArray a: { var b = new BooleanArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
-            case StringArray a: { var b = new StringArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetString(i)!); } return b.Build(); }
-            case BinaryArray a:
-            {
-                var b = new BinaryArray.Builder().Reserve(indices.Count);
-                foreach (int i in indices)
-                {
-                    if (a.IsNull(i)) b.AppendNull();
-                    else b.Append(a.GetBytes(i));
-                }
-                return b.Build();
-            }
-            case Date32Array a:
-            {
-                var b = new Date32Array.Builder().Reserve(indices.Count);
-                foreach (int i in indices)
-                {
-                    if (a.IsNull(i)) b.AppendNull();
-                    else b.Append(Epoch.AddDays(a.GetValue(i)!.Value));
-                }
-                return b.Build();
-            }
-            case Date64Array a:
-            {
-                var b = new Date64Array.Builder().Reserve(indices.Count);
-                foreach (int i in indices)
-                {
-                    if (a.IsNull(i)) b.AppendNull();
-                    else b.Append(Epoch.AddMilliseconds(a.GetValue(i)!.Value));
-                }
-                return b.Build();
-            }
-            case TimestampArray a:
-            {
-                var b = new TimestampArray.Builder((Apache.Arrow.Types.TimestampType)a.Data.DataType)
-                    .Reserve(indices.Count);
-                foreach (int i in indices)
-                {
-                    if (a.IsNull(i)) b.AppendNull();
-                    else b.Append(a.GetTimestamp(i)!.Value);
-                }
-                return b.Build();
-            }
-            case Decimal128Array a:
-                return TakeFixedWidth(a, a.ValueBuffer, indices, 16, d => new Decimal128Array(d));
-            case Decimal256Array a:
-                return TakeFixedWidth(a, a.ValueBuffer, indices, 32, d => new Decimal256Array(d));
-            default:
-                throw new NotSupportedException(
-                    $"UpdateAsync's row-take helper doesn't yet support column type " +
-                    $"'{expectedType}' (source array: {source.GetType().Name}). " +
-                    "Currently supported: Int / UInt / Float / Double / Bool / String / Binary / " +
-                    "Date32 / Date64 / Timestamp / Decimal128 / Decimal256.");
-        }
-    }
-
-    private static readonly DateTime Epoch = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-
-    // Slices a fixed-width (decimal) array by copying each selected value's raw bytes verbatim, so full
-    // precision is preserved regardless of the decimal's magnitude.
-    private static IArrowArray TakeFixedWidth(
-        Apache.Arrow.Array source, ArrowBuffer valueBuffer, IReadOnlyList<int> indices, int width,
-        Func<ArrayData, IArrowArray> create)
-    {
-        var bytes = new byte[indices.Count * width];
-        var validity = new ArrowBuffer.BitmapBuilder();
-        int nullCount = 0;
-        var src = valueBuffer.Span;
-        for (int k = 0; k < indices.Count; k++)
-        {
-            int i = indices[k];
-            if (source.IsNull(i)) { validity.Append(false); nullCount++; continue; }
-            validity.Append(true);
-            src.Slice(i * width, width).CopyTo(bytes.AsSpan(k * width, width));
-        }
-        var data = new ArrayData(
-            source.Data.DataType, indices.Count, nullCount, 0,
-            new[] { validity.Build(), new ArrowBuffer(bytes) });
-        return create(data);
-    }
-
-    /// <summary>
     /// Compacts fragments that carry a deletion file: reads the surviving
     /// rows from each, writes them into a single fresh fragment, and
     /// publishes a new manifest version that drops the source fragments
@@ -1192,8 +1089,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// <para>Old data and deletion files remain on disk so prior
     /// versions stay readable; <see cref="VacuumAsync"/> with
     /// <see cref="LanceVacuumOptions.RetainVersions"/> = 1 reclaims them.
-    /// Same scope limitation as <see cref="UpdateAsync"/> — leaf-typed
-    /// columns only.</para>
+    /// Survivors are gathered with <see cref="ArrowCompute.Take"/>, so the
+    /// same column-type scope as <see cref="UpdateAsync"/> applies.</para>
     /// </summary>
     public static async ValueTask<LanceCompactionResult> CompactAsync(
         string datasetPath, CancellationToken cancellationToken = default)
@@ -1269,10 +1166,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
             for (int colIdx = 0; colIdx < arrays.Length; colIdx++)
             {
-                IArrowArray taken = TakeRows(
-                    arrays[colIdx], survivors,
-                    arrowSchema.FieldsList[colIdx].DataType);
-                perColumnSlices[colIdx].Add(taken);
+                perColumnSlices[colIdx].Add(ArrowCompute.Take(arrays[colIdx], survivors));
             }
             totalRetained += survivors.Count;
         }

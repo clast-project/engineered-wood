@@ -2169,4 +2169,124 @@ public class LanceDatasetWriterTests
             if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
         }
     }
+
+    // ── Nested columns through the rewrite paths ──
+    //
+    // UpdateAsync and CompactAsync gather rows with ArrowCompute.Take, which handles nested shapes. The
+    // local row-take helper these replaced covered leaves only, so a struct column made either operation
+    // throw NotSupportedException no matter what the file writer could encode. These pin that a struct
+    // rides through both rewrites intact — including the null row, whose child slots must not shift.
+
+    private static StructArray MakeIdNameStruct(
+        (int? Id, string? Name)[] rows, params int[] nullRows)
+    {
+        var ids = new Int32Array.Builder();
+        var names = new StringArray.Builder();
+        foreach (var (id, name) in rows)
+        {
+            if (id is null) ids.AppendNull(); else ids.Append(id.Value);
+            if (name is null) names.AppendNull(); else names.Append(name);
+        }
+
+        var validity = new ArrowBuffer.BitmapBuilder();
+        for (int i = 0; i < rows.Length; i++) validity.Append(!nullRows.Contains(i));
+
+        var type = new StructType(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: true),
+            new Field("name", StringType.Default, nullable: true),
+        });
+        return new StructArray(new ArrayData(
+            type, rows.Length, nullRows.Length, 0,
+            new[] { validity.Build() },
+            new[] { ids.Build().Data, names.Build().Data }));
+    }
+
+    /// <summary>Reads the "rec" struct column as (id, name) per row, with null rows as (null, null).</summary>
+    private static async Task<List<(int? Id, string? Name)>> ReadIdNameStructAsync(LanceTable table)
+    {
+        var result = new List<(int? Id, string? Name)>();
+        await foreach (var batch in table.ReadAsync())
+        {
+            var rec = (StructArray)batch.Column(batch.Schema.GetFieldIndex("rec"));
+            var ids = (Int32Array)rec.Fields[0];
+            var names = (StringArray)rec.Fields[1];
+            for (int i = 0; i < batch.Length; i++)
+            {
+                result.Add(rec.IsNull(i)
+                    ? (null, null)
+                    : (ids.IsNull(i) ? null : ids.GetValue(i), names.GetString(i)));
+            }
+        }
+        return result;
+    }
+
+    [Fact]
+    public async Task Update_CarriesUnassignedStructColumn()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            var rec = MakeIdNameStruct(
+                [(10, "alpha"), (20, "beta"), (30, "gamma"), (40, "delta")], nullRows: 2);
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4 });
+                await ds.FileWriter.WriteColumnAsync("rec", rec);
+                await ds.FinishAsync();
+            }
+
+            // Rows 3 and 4 (x = 3, 4) are rewritten; 'rec' is unassigned, so it is gathered by Take.
+            var pred = Expressions.Expressions.GreaterThan("x", LiteralValue.Of(2));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["x"] = new LiteralExpression(LiteralValue.Of(99)),
+            };
+            var (rowsUpdated, _) = await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+            Assert.Equal(2L, rowsUpdated);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            // Survivors first (rows 0-1), then the rewritten fragment (rows 2-3, the second of which is
+            // the struct-null row).
+            Assert.Equal(
+                [(10, "alpha"), (20, "beta"), (null, null), (40, "delta")],
+                await ReadIdNameStructAsync(table));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_RetainsStructColumn()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            var rec = MakeIdNameStruct(
+                [(10, "alpha"), (20, "beta"), (30, "gamma"), (40, "delta"), (50, "epsilon")],
+                nullRows: 3);
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4, 5 });
+                await ds.FileWriter.WriteColumnAsync("rec", rec);
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 1, 2 } });
+
+            var result = await LanceDatasetWriter.CompactAsync(path);
+            Assert.Equal(3, result.RowsRetained);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(
+                [(10, "alpha"), (null, null), (50, "epsilon")],
+                await ReadIdNameStructAsync(table));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
 }
