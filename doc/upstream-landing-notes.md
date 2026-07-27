@@ -603,10 +603,14 @@ It only helps producers who KNOW, which is why the other two are worth doing:
   accepted knowingly: a narrow FIXED_LEN_BYTE_ARRAY column that reaches the cardinality CAP rather than
   the page-size limit pays the doubling series twice over (+8.4 MB), which is unreachable for BYTE_ARRAY
   and lands only on columns whose dictionary is being discarded anyway.
+- **One copy per distinct value, not two** — DONE (2026-07-27). The hash table stored its own copy of
+  each key and the caller stored another for the dictionary page; `GetOrAdd` now hands its copy back.
+  Worth 8-9% on any column with many distinct values, exactly one `byte[]` per distinct value, and
+  nothing on a low-cardinality one.
 - **Incremental fallback (the parquet-cpp model)** — keeps the dictionary-encoded prefix instead of
   discarding it. Deferred deliberately: on a uniformly high-cardinality column a mixed chunk makes the
   file WORSE, and EW, unlike a streaming writer, has the whole column and can simply decide. Justify it on
-  regime-changing data, not on waste.
+  regime-changing data, not on waste. **The only item left.**
 
 Measurements, the parquet-cpp comparison, and three smaller things noticed and not addressed:
 [`dictionary-encoding-cost.md`](dictionary-encoding-cost.md).

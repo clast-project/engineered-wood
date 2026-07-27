@@ -217,16 +217,15 @@ internal static class DictionaryEncoder
             int len = arrowOffsets[i + 1] - start;
             ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
 
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
 
-            if (dictIdx == uniqueEntries.Count)
+            if (inserted is not null)
             {
-                // New entry
+                // New entry — the table's copy becomes the dictionary's, rather than a second one.
                 if (uniqueEntries.Count >= maxCardinality)
                     return null;
 
-                var copy = valueBytes.ToArray();
-                uniqueEntries.Add(copy);
+                uniqueEntries.Add(inserted);
                 totalDictBytes += 4 + len;
 
                 if (totalDictBytes > pageSizeLimit)
@@ -314,14 +313,14 @@ internal static class DictionaryEncoder
             countedNonNull += run.Length;
 
             var valueBytes = RunValueBytes(values, run.PhysicalIndex, lengthPrefixed, slotWidth);
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
 
-            if (dictIdx == uniqueEntries.Count)
+            if (inserted is not null)
             {
                 if (uniqueEntries.Count >= maxCardinality)
                     return null;
 
-                uniqueEntries.Add(valueBytes.ToArray());
+                uniqueEntries.Add(inserted);
                 totalDictBytes += (lengthPrefixed ? 4 : 0) + valueBytes.Length;
 
                 if (totalDictBytes > pageSizeLimit)
@@ -505,15 +504,15 @@ internal static class DictionaryEncoder
             if (defLevels != null && defLevels[i] == 0) continue;
 
             ReadOnlySpan<byte> valueBytes = valueBuffer.Slice(i * typeLength, typeLength);
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
 
-            if (dictIdx == uniqueEntries.Count)
+            if (inserted is not null)
             {
-                // New entry
+                // New entry — the table's copy becomes the dictionary's, rather than a second one.
                 if (uniqueEntries.Count >= maxCardinality)
                     return null;
 
-                uniqueEntries.Add(valueBytes.ToArray());
+                uniqueEntries.Add(inserted);
 
                 if (uniqueEntries.Count * typeLength > pageSizeLimit)
                     return null;
@@ -600,7 +599,14 @@ internal static class DictionaryEncoder
         /// Returns the existing index for the key, or inserts <paramref name="nextIndex"/>
         /// and returns it if the key is new.
         /// </summary>
-        public int GetOrAdd(ReadOnlySpan<byte> key, int nextIndex)
+        /// <param name="inserted">
+        /// The copy of the key this table now holds, when the key was new; null when it was already
+        /// present. Callers keep their own copy of each distinct value for the dictionary page, and
+        /// handing them this one is what stops every distinct value being copied twice. It is the table's
+        /// comparison key, so a caller that mutated it would corrupt lookups — every caller here only ever
+        /// reads it, on the way into the dictionary page.
+        /// </param>
+        public int GetOrAdd(ReadOnlySpan<byte> key, int nextIndex, out byte[]? inserted)
         {
             uint h = Fnv1a(key);
             // Ensure hash is non-zero (0 = empty sentinel)
@@ -612,9 +618,11 @@ internal static class DictionaryEncoder
                 if (_hashes[slot] == 0)
                 {
                     // Empty slot — insert
+                    var copy = key.ToArray();
                     _hashes[slot] = hash;
-                    _keys[slot] = key.ToArray();
+                    _keys[slot] = copy;
                     _values[slot] = nextIndex;
+                    inserted = copy;
 
                     // Grown AFTER the insert, so the slot this landed in does not have to survive the
                     // rehash — nothing here returns a slot, only the caller's own index.
@@ -626,6 +634,7 @@ internal static class DictionaryEncoder
 
                 if (_hashes[slot] == hash && key.SequenceEqual(_keys[slot]))
                 {
+                    inserted = null;
                     return _values[slot];
                 }
 

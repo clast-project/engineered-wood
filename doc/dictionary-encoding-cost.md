@@ -88,7 +88,34 @@ rather than mitigated, because:
 
 Timings moved by ±4 ms with no consistent direction, on a shared machine — treat them as flat.
 
-## Deferred — B. Incremental fallback, the parquet-cpp model
+## Done — B. One copy per distinct value, not two
+
+`BytesHashTable.GetOrAdd` stored its own `key.ToArray()` to compare against, and the caller then did
+`uniqueEntries.Add(valueBytes.ToArray())` for the dictionary page — two allocations per distinct value, in
+all three arms. `GetOrAdd` now hands back the copy it made (`out byte[]? inserted`, null when the key was
+already present) and the caller keeps that one. The array is the table's comparison key, so a caller that
+mutated it would corrupt lookups; every caller only ever reads it, on the way into the dictionary page.
+
+The returned copy also replaces `dictIdx == uniqueEntries.Count` as the test for "this was new", which was
+the more subtle way to ask.
+
+| shape | two copies | one copy | delta |
+| --- | --- | --- | --- |
+| 1M rows, 12 distinct | 7,191,488 B | 7,191,008 B | −480 B |
+| 1M rows, 50,000 distinct | 23,930,696 B | 21,930,472 B | **−2,000,224 B (−8.4%)** |
+| 1M rows, all distinct | 32,396,488 B | 29,927,448 B | **−2,469,040 B (−7.6%)** |
+| FSB(16), 1M rows, 60,000 distinct | 25,170,672 B | 22,771,608 B | **−2,399,064 B (−9.5%)** |
+
+The saving is exactly one `byte[]` per distinct value and the measurements say so to the byte: 12 entries
+saved 480 B, 50,000 saved 2,000,224, and 60,000 FSB(16) entries saved 2,399,064 — all of them the entry
+count times 40, which is a 24-byte object header plus a payload padded to 8. That makes it worth roughly
+8-9% on any column with many distinct values and nothing at all on a low-cardinality one, since the saving
+scales with distinct values rather than rows.
+
+Timings across the two process runs are not comparable and were not used; the change removes an
+allocation and adds no work.
+
+## Deferred — C. Incremental fallback, the parquet-cpp model
 
 parquet-cpp accumulates its dictionary as values arrive and, when it outgrows
 `dictionary_pagesize_limit`, **falls back to PLAIN for the remainder of the column chunk**, keeping the
@@ -133,8 +160,3 @@ page-buffering: the sequence above is recalled, not verified against the source.
   per-column switch inherits that behaviour.
 - **`EncodingStrategyResolver.ShouldAttemptDictionary` has no callers.** It duplicates the check in
   `DictionaryEncoder.TryEncode` and would need the per-column resolution if it were ever wired up.
-- **Every distinct value is copied twice.** `BytesHashTable.GetOrAdd` stores its own `key.ToArray()` for
-  comparison, and the caller then does `uniqueEntries.Add(valueBytes.ToArray())` for the dictionary page —
-  two allocations per distinct value, in all three arms. Collapsing them needs `GetOrAdd` to be handed the
-  array the caller is going to keep, which is a call-site change in each arm rather than a change to the
-  table.
