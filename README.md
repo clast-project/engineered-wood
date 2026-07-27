@@ -64,6 +64,8 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 - Arrow `RecordBatch` → Parquet with parallel column encoding
 - V2 data pages by default with type-aware encodings
 - Analyze-before-write dictionary encoding (20% cardinality threshold)
+- Run-end encoded input columns, dictionary-encoded from their runs (a constant
+  column costs O(runs), not O(rows), to hold and to write; the file is identical)
 - Auto-splitting of large batches into multiple row groups
 - Per-column compression and encoding overrides
 - Column statistics (min/max/null_count) with binary truncation

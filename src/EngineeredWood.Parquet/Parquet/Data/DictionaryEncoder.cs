@@ -4,6 +4,8 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 
 namespace EngineeredWood.Parquet.Data;
 
@@ -23,8 +25,30 @@ internal static class DictionaryEncoder
         /// <summary>Number of unique values in the dictionary.</summary>
         public required int DictionaryCount { get; init; }
 
-        /// <summary>Dictionary index for each non-null value (length == nonNullCount).</summary>
-        public required int[] Indices { get; init; }
+        /// <summary>
+        /// Dictionary index for each non-null value (length == nonNullCount), or null when
+        /// <see cref="IndexRuns"/> carries the same sequence in run form instead.
+        /// </summary>
+        public required int[]? Indices { get; init; }
+
+        /// <summary>
+        /// The indices as runs, for a column that arrived run-end encoded. Set INSTEAD of
+        /// <see cref="Indices"/>: materializing one index per row is exactly the O(N) allocation such a
+        /// column exists to avoid, and the page encoder consumes runs directly.
+        /// </summary>
+        public DictionaryIndexRuns? IndexRuns { get; init; }
+    }
+
+    /// <summary>
+    /// Dictionary indices in run form — <c>Values[r]</c> repeated <c>Lengths[r]</c> times, concatenated.
+    /// The sequence covers NON-NULL rows only, exactly as <see cref="DictionaryResult.Indices"/> does, so a
+    /// run of nulls contributes nothing here rather than a run of some placeholder index.
+    /// </summary>
+    internal readonly struct DictionaryIndexRuns
+    {
+        public required int[] Values { get; init; }
+
+        public required int[] Lengths { get; init; }
     }
 
     /// <summary>
@@ -45,6 +69,11 @@ internal static class DictionaryEncoder
         // For very small columns, dictionary overhead isn't worthwhile
         if (nonNullCount == 0)
             return null;
+
+        // A run-end encoded column is dictionary-encoded from its RUNS. Everything below reads one value
+        // slot per row, which such a column does not have.
+        if (array is RunEndEncodedArray ree)
+            return TryEncodeRuns(ree, physicalType, typeLength, nonNullCount, options.DictionaryPageSizeLimit);
 
         return physicalType switch
         {
@@ -224,6 +253,177 @@ internal static class DictionaryEncoder
             DictionaryCount = uniqueEntries.Count,
             Indices = indices,
         };
+    }
+
+    /// <summary>
+    /// Builds the dictionary for a run-end encoded column out of its RUNS: one hash per run rather than
+    /// per row, and indices emitted in run form, so both the time and the allocation are O(runs). A
+    /// constant column — one run — costs one lookup and a two-element index run whatever its row count.
+    ///
+    /// <para>Nulls come from the run's value, which is the only place a run-end encoded array keeps them
+    /// (its own <c>IsNull</c> answers false for every row). A null run contributes no indices at all,
+    /// matching what the per-row encoders do with a def level of 0.</para>
+    ///
+    /// <para>Values are compared as BYTES, like the constant probes above, where the fixed-width per-row
+    /// path compares as values. The difference costs at most a duplicate dictionary entry (+0.0 and -0.0
+    /// are equal but differ in bytes) and never a wrong value, since byte-identical entries read back
+    /// identical.</para>
+    /// </summary>
+    private static DictionaryResult? TryEncodeRuns(
+        RunEndEncodedArray array,
+        PhysicalType physicalType,
+        int typeLength,
+        int nonNullCount,
+        int pageSizeLimit)
+    {
+        var values = array.Values;
+
+        // The run arm reads value slots straight out of the raw buffers, so it has to recognise the
+        // LAYOUT and not merely the physical type. MapArrowType routes LargeString (64-bit offsets) and
+        // StringView (a different layout entirely) to BYTE_ARRAY alongside String/Binary, and reading
+        // either of those as 32-bit offsets is silent corruption rather than a failure. An unrecognised
+        // layout declines here, which lands the column on the expansion path where the per-row encoders
+        // handle it exactly as they do today.
+        bool lengthPrefixed = physicalType == PhysicalType.ByteArray;
+        int slotWidth = 0;
+        if (lengthPrefixed
+            ? values.Data.DataType is not (Apache.Arrow.Types.StringType or BinaryType)
+            : !TryGetSlotWidth(values.Data.DataType, physicalType, typeLength, out slotWidth))
+        {
+            return null;
+        }
+
+        int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
+
+        // Sized from the RUN count, not the row count. The per-row arms have to size for the cardinality
+        // cap — a fifth of the rows — because that is all they know before they start hashing; here the
+        // runs are an exact upper bound on the distinct values, and one run cannot hold two of them. On a
+        // constant column of a million rows that is the difference between 16 slots and half a million
+        // (8 MB of table for a one-entry dictionary), which would have swallowed the whole saving.
+        int distinctBound = Math.Min(maxCardinality, values.Length) + 1;
+        var table = new BytesHashTable(Math.Max(16, distinctBound * 2));
+        var uniqueEntries = new List<byte[]>();
+        var runIndices = new List<int>();
+        var runLengths = new List<int>();
+        int totalDictBytes = 0;
+        long countedNonNull = 0;
+
+        foreach (var run in RunEndEncoding.EnumerateRuns(array))
+        {
+            if (values.IsNull(run.PhysicalIndex))
+                continue;
+
+            countedNonNull += run.Length;
+
+            var valueBytes = RunValueBytes(values, run.PhysicalIndex, lengthPrefixed, slotWidth);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
+
+            if (dictIdx == uniqueEntries.Count)
+            {
+                if (uniqueEntries.Count >= maxCardinality)
+                    return null;
+
+                uniqueEntries.Add(valueBytes.ToArray());
+                totalDictBytes += (lengthPrefixed ? 4 : 0) + valueBytes.Length;
+
+                if (totalDictBytes > pageSizeLimit)
+                    return null;
+            }
+
+            // Two runs that map to the same entry are one run in the index stream — they are adjacent
+            // there whenever the runs between them were null, and the RLE encoder cannot merge what it is
+            // handed as two.
+            if (runIndices.Count > 0 && runIndices[runIndices.Count - 1] == dictIdx)
+                runLengths[runLengths.Count - 1] += run.Length;
+            else
+            {
+                runIndices.Add(dictIdx);
+                runLengths.Add(run.Length);
+            }
+        }
+
+        // The caller derived the definition levels from these same runs, so a disagreement means the two
+        // views of this column have diverged — the array carries nulls the levels do not admit, or the
+        // reverse. Declining sends it down the expansion path, where it is encoded on the caller's terms
+        // rather than written with an index stream the levels cannot address.
+        if (countedNonNull != nonNullCount)
+            return null;
+
+        var dictPage = new byte[totalDictBytes];
+        int pos = 0;
+        foreach (var entry in uniqueEntries)
+        {
+            if (lengthPrefixed)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(dictPage.AsSpan(pos), entry.Length);
+                pos += 4;
+            }
+
+            entry.CopyTo(dictPage.AsSpan(pos));
+            pos += entry.Length;
+        }
+
+        return new DictionaryResult
+        {
+            DictionaryPageData = dictPage,
+            DictionaryCount = uniqueEntries.Count,
+            Indices = null,
+            IndexRuns = new DictionaryIndexRuns
+            {
+                Values = runIndices.ToArray(),
+                Lengths = runLengths.ToArray(),
+            },
+        };
+    }
+
+    /// <summary>One value slot of a run-end encoded column's values child, as raw bytes.</summary>
+    private static ReadOnlySpan<byte> RunValueBytes(
+        IArrowArray values, int index, bool lengthPrefixed, int slotWidth)
+    {
+        var data = values.Data;
+        int slot = data.Offset + index;
+
+        if (!lengthPrefixed)
+            return data.Buffers[1].Span.Slice(slot * slotWidth, slotWidth);
+
+        var offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+        int start = offsets[slot];
+        return data.Buffers[2].Span.Slice(start, offsets[slot + 1] - start);
+    }
+
+    /// <summary>
+    /// The byte width of one value slot, and whether the Arrow type actually LAYS OUT its values at that
+    /// width. Both halves matter: Int8 through Int16 are written as the 4-byte INT32 physical type, and
+    /// reading their 1- and 2-byte buffers as 4-byte slots packs several rows into each value. The caller
+    /// widens such a column before this point; the check is what keeps that a requirement rather than an
+    /// assumption.
+    /// </summary>
+    private static bool TryGetSlotWidth(
+        IArrowType valueType, PhysicalType physicalType, int typeLength, out int width)
+    {
+        switch (physicalType)
+        {
+            case PhysicalType.Int32:
+                width = 4;
+                return valueType is Int32Type or UInt32Type or Date32Type or Time32Type or Decimal32Type;
+            case PhysicalType.Int64:
+                width = 8;
+                return valueType is Int64Type or UInt64Type or Time64Type or TimestampType
+                    or DurationType or Decimal64Type;
+            case PhysicalType.Float:
+                width = 4;
+                return valueType is FloatType;
+            case PhysicalType.Double:
+                width = 8;
+                return valueType is DoubleType;
+            case PhysicalType.FixedLenByteArray:
+                // Decimal128Type and Decimal256Type derive from FixedSizeBinaryType, so both are covered.
+                width = typeLength;
+                return typeLength > 0 && valueType is FixedSizeBinaryType or HalfFloatType;
+            default:
+                width = 0;
+                return false;
+        }
     }
 
     /// <summary>

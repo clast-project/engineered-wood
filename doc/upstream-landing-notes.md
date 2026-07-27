@@ -554,3 +554,32 @@ Fix approach (needs a short research pass first, like the VACUUM one, to confirm
 confirm Spark UTF-8 percent-encodes non-ASCII in `add.path`, then update `DeltaPath.Encode` to
 percent-encode each non-ASCII char's UTF-8 bytes as `%XX`, and verify `Decode` (`Uri.UnescapeDataString`)
 round-trips. Don't guess the encoding — a wrong "fix" is worse than the current faithful port.
+
+### C. Run-end encoding for constant columns — DONE (2026-07-27)
+
+All three phases landed. Phase 1 (`df70b7e`) taught the dictionary encoder to recognise a constant column
+from its plain-Arrow form; phases 2 and 3 took the memory that phase 1 deliberately left, since phase 1
+had already spent the encode-speed argument.
+
+The Parquet writer now accepts `RunEndEncodedArray` columns and encodes them from their RUNS — schema
+mapping, definition levels, dictionary, index stream, page splitting and row-group splitting all run-aware
+— and `CdfWriter` builds `_change_type` as one run. Measured on 1M rows: the column costs 840 B instead of
+24 MB, the write allocates 1.09 MB instead of 5.09 MB and takes 1.75 ms instead of 3.87. A five-run
+low-cardinality column — the shape the design note asked to be measured before committing — goes from
+13.5 MB / 12.15 ms to 1.09 MB / 1.04 ms. **The files are byte-identical in every case**, which is the
+assertion the tests carry rather than a round-trip through our own reader.
+
+Two things worth knowing before touching this again:
+
+- **`IsNull` lies on a run-end encoded array.** It has no validity bitmap — nulls live in the values child,
+  one per run — so it answers false for every row of an all-null column. Anything deriving definition
+  levels, statistics or a null count from it is silently wrong.
+- **The hash-table sizing was the trap.** Sized from the cardinality cap the way the per-row arms must be,
+  the run arm allocated 8.4 MB of table for a one-entry dictionary and swallowed the whole saving, with
+  every correctness test still green. The run count is an exact upper bound on the distinct values;
+  `TryEncode_ConstantRunEndEncodedColumn_AllocatesNothingPerRow` fails if that regresses (verified).
+
+Three of the five constant-column sources deliberately stayed on `ArrowCompute.Repeat` — the two read-path
+ones (their batches go to callers, whose schema expectations are not ours to change) and IcebergCompat's
+partition materialization (it can flow to a caller-supplied `DataFileWriter`). Reasoning in full, plus the
+measurements and the gotchas: [`ree-constant-column-encoding.md`](ree-constant-column-encoding.md).

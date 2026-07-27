@@ -77,43 +77,93 @@ internal sealed class RleBitPackedEncoder
             while (i < values.Length && values[i] == value)
                 i++;
 
-            int runLength = i - runStart;
-
-            if (runLength >= 8 && _pendingCount == 0)
-            {
-                // Pure RLE run, no pending values to flush first
-                WriteRleRun(value, runLength);
-                continue;
-            }
-
-            // Add run values to pending, emitting whole groups of 8 as they become available
-            int runPos = 0;
-            while (runPos < runLength)
-            {
-                _pending[_pendingCount++] = value;
-                runPos++;
-
-                if ((_pendingCount & 7) != 0)
-                    continue; // mid-group: nothing can be emitted yet
-
-                int remaining = runLength - runPos;
-                if (remaining >= 8)
-                {
-                    // The rest of this run is cheaper as RLE; flush the literals accumulated so far
-                    // (a whole number of groups) as a single run, then switch.
-                    FlushLiterals();
-                    WriteRleRun(value, remaining);
-                    runPos = runLength;
-                }
-                else if (_pendingCount == _maxLiteralValues)
-                {
-                    FlushLiterals();
-                }
-            }
+            AppendRun(value, i - runStart);
         }
 
         // Emit remaining values as a final partial group (padding is safe at end of stream)
         FlushLiterals();
+    }
+
+    /// <summary>
+    /// Encodes a sequence already known as runs — <paramref name="values"/>[r] repeated
+    /// <paramref name="lengths"/>[r] times — without materializing the values it stands for.
+    ///
+    /// <para>Byte-identical to <see cref="Encode"/> over the expanded sequence, which is what makes it a
+    /// substitution rather than a second encoding: <see cref="Encode"/>'s only use of the expanded form is
+    /// to REDISCOVER these runs. Adjacent runs holding the same value are the one case where the two part
+    /// company — they encode as two RLE runs here and one there — so callers that can merge them should
+    /// (<see cref="DictionaryEncoder"/> does).</para>
+    /// </summary>
+    public void EncodeRuns(ReadOnlySpan<int> values, ReadOnlySpan<int> lengths)
+    {
+        if (values.Length != lengths.Length)
+        {
+            throw new ArgumentException(
+                $"Got {values.Length} run values and {lengths.Length} run lengths.", nameof(lengths));
+        }
+
+        BeginRuns();
+        for (int r = 0; r < values.Length; r++)
+            AppendRun(values[r], lengths[r]);
+        EndRuns();
+    }
+
+    /// <summary>
+    /// Starts a run-at-a-time encode, for a caller that discovers its runs as it goes rather than holding
+    /// them all. Pair with <see cref="AppendRun"/> and <see cref="EndRuns"/>; nothing is complete until
+    /// <see cref="EndRuns"/> flushes the trailing partial group.
+    /// </summary>
+    public void BeginRuns()
+    {
+        _pending ??= new int[_maxLiteralValues];
+        _pendingCount = 0;
+    }
+
+    /// <summary>Finishes a <see cref="BeginRuns"/> sequence.</summary>
+    public void EndRuns() => FlushLiterals();
+
+    /// <summary>
+    /// Emits one run of identical values: as an RLE run where that is legal and cheaper, otherwise through
+    /// the literal buffer. Shared by every entry point so a run encodes the same way however it was found.
+    /// </summary>
+    public void AppendRun(int value, int runLength)
+    {
+        // The bit-width guard matches Encode's: at width 0 every value is 0 and the stream carries nothing,
+        // so a run must not emit a header either.
+        if (_bitWidth == 0 || runLength <= 0)
+            return;
+
+        if (runLength >= 8 && _pendingCount == 0)
+        {
+            // Pure RLE run, no pending values to flush first
+            WriteRleRun(value, runLength);
+            return;
+        }
+
+        // Add run values to pending, emitting whole groups of 8 as they become available
+        int runPos = 0;
+        while (runPos < runLength)
+        {
+            _pending![_pendingCount++] = value;
+            runPos++;
+
+            if ((_pendingCount & 7) != 0)
+                continue; // mid-group: nothing can be emitted yet
+
+            int remaining = runLength - runPos;
+            if (remaining >= 8)
+            {
+                // The rest of this run is cheaper as RLE; flush the literals accumulated so far
+                // (a whole number of groups) as a single run, then switch.
+                FlushLiterals();
+                WriteRleRun(value, remaining);
+                runPos = runLength;
+            }
+            else if (_pendingCount == _maxLiteralValues)
+            {
+                FlushLiterals();
+            }
+        }
     }
 
     /// <summary>

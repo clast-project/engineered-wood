@@ -63,12 +63,20 @@ internal static class ColumnChunkWriter
         if (isNullable)
         {
             defLevels = new int[rowCount];
-            nonNullCount = 0;
-            for (int i = 0; i < rowCount; i++)
+
+            if (array is RunEndEncodedArray ree)
             {
-                bool isNull = array.IsNull(i);
-                defLevels[i] = isNull ? 0 : 1;
-                if (!isNull) nonNullCount++;
+                nonNullCount = FillRunEndEncodedDefLevels(ree, defLevels);
+            }
+            else
+            {
+                nonNullCount = 0;
+                for (int i = 0; i < rowCount; i++)
+                {
+                    bool isNull = array.IsNull(i);
+                    defLevels[i] = isNull ? 0 : 1;
+                    if (!isNull) nonNullCount++;
+                }
             }
         }
 
@@ -130,6 +138,19 @@ internal static class ColumnChunkWriter
         // these check defLevels[i] == 0 for null, which only works when maxDefLevel <= 1.
         int[]? valueDefLevels = NormalizeDefLevels(defLevels, maxDefLevel);
 
+        // A run-end encoded column is brought into a shape the rest of this method can read before any of
+        // it runs: its window compacted away (the encoders read the children directly, and a sliced view
+        // leaves rows in them that the array does not expose), and — for FLOAT/DOUBLE — expanded outright,
+        // since those are always full-scanned for the NaN count below and there is no run-aware form of
+        // that scan. Everything after this point sees either a whole-window run-end encoded column or a
+        // plain one.
+        if (array is RunEndEncodedArray reeColumn)
+        {
+            array = physicalType is PhysicalType.Float or PhysicalType.Double
+                ? RunEndEncoding.Expand(RunEndEncoding.Compact(reeColumn))
+                : RunEndEncoding.Compact(reeColumn);
+        }
+
         // Int8/UInt8/Int16/UInt16 are written as the 4-byte Int32 physical type, but every value extraction
         // below (DictionaryEncoder, PLAIN, the V2 encoders, StatisticsCollector) reinterprets the raw Arrow
         // value buffer AT THE PHYSICAL WIDTH — reading a 1-byte buffer as int packs four rows into each
@@ -137,23 +158,31 @@ internal static class ColumnChunkWriter
         // read when it does not. Widen once here so every consumer downstream sees a 4-byte buffer, the
         // same single-normalization shape as the FLBA byte reversal below.
         if (physicalType == PhysicalType.Int32
-            && array.Data.DataType is Int8Type or UInt8Type or Int16Type or UInt16Type)
+            && ValueType(array) is Int8Type or UInt8Type or Int16Type or UInt16Type)
         {
             // Sign- vs zero-extension follows the source type; nulls and row positions are preserved.
-            array = ArrowCompute.Widen(array, Int32Type.Default);
+            array = MapValues(array, a => ArrowCompute.Widen(a, Int32Type.Default));
         }
 
         // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
         // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
         if (physicalType == PhysicalType.FixedLenByteArray &&
-            array.Data.DataType is Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type)
+            ValueType(array) is Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type)
         {
-            array = ReverseFlbaDecimalBytes(array, typeLength);
+            array = MapValues(array, a => ReverseFlbaDecimalBytes(a, typeLength));
         }
 
         // Try dictionary encoding (uses normalized levels for null detection)
         var dictResult = DictionaryEncoder.TryEncode(
             array, physicalType, typeLength, valueDefLevels, nonNullCount, options);
+
+        // Nothing past the dictionary has a run-aware path — the PLAIN and V2 encoders, the statistics
+        // scan and the page-size estimate all read one value slot per row. A column the dictionary
+        // declined is therefore expanded here and encoded exactly as a plain one would be. This costs the
+        // memory the encoding exists to save, which is why it is the fallback rather than the route:
+        // in practice a run-encoded column is low-cardinality by construction and the dictionary takes it.
+        if (dictResult is null && array is RunEndEncodedArray declined)
+            array = RunEndEncoding.Expand(declined);
 
         ColumnChunkResult result;
 
@@ -189,7 +218,7 @@ internal static class ColumnChunkWriter
         // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
         // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
         // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
-        if (!SignedOrderMatchesLogical(array.Data.DataType))
+        if (!SignedOrderMatchesLogical(ValueType(array)))
         {
             stats = new Statistics
             {
@@ -212,7 +241,15 @@ internal static class ColumnChunkWriter
                 ndv, options.BloomFilterFpp, options.BloomFilterMaxBytes);
 
             var bfBuilder = new SplitBlockBloomFilterBuilder(filterBytes);
-            BloomFilterArrowEncoder.AddArrowValues(bfBuilder, array, physicalType, typeLength);
+
+            // A Bloom filter is a SET: a run contributes its value once, and the rows after the first add
+            // nothing a membership test could observe. So a run-end encoded column is reduced to one value
+            // per run rather than expanded — same filter, O(runs) to build.
+            BloomFilterArrowEncoder.AddArrowValues(
+                bfBuilder,
+                array is RunEndEncodedArray reeBloom ? RunValues(reeBloom) : array,
+                physicalType,
+                typeLength);
 
             result = new ColumnChunkResult
             {
@@ -344,6 +381,11 @@ internal static class ColumnChunkWriter
         var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
         var indexEncoder = new RleBitPackedEncoder(bitWidth, maxLiteralGroups: options.MaxLiteralGroups);
 
+        // Run-form indices are walked with a cursor rather than sliced, since a page boundary can fall in
+        // the middle of a run — and the cursor is what keeps the whole column O(runs): the alternative,
+        // expanding the runs to slice them, is the per-row array the run form exists to avoid.
+        var runCursor = dictResult.IndexRuns is { } runs ? new IndexRunCursor(runs) : default;
+
         int offset = 0;
         int indexOffset = 0;
         while (offset < rowCount)
@@ -353,20 +395,26 @@ internal static class ColumnChunkWriter
                 ? CountNonNull(defLevels!, offset, pageValues, maxDefLevel)
                 : pageValues;
 
-            var pageIndices = dictResult.Indices.AsSpan(indexOffset, pageNonNull);
+            // Encoded up front rather than inside each page writer: both need the same bytes in the same
+            // thread-static buffer, and only here is it known which form the indices arrived in.
+            int valuesLen = dictResult.IndexRuns is null
+                ? EncodeDictionaryIndicesToBuffer(
+                    dictResult.Indices.AsSpan(indexOffset, pageNonNull), pageNonNull, bitWidth, indexEncoder)
+                : EncodeDictionaryIndexRunsToBuffer(
+                    ref runCursor, pageNonNull, bitWidth, indexEncoder);
 
             if (options.DataPageVersion == DataPageVersion.V2)
             {
-                WriteDictDataPageV2(output, pageIndices, offset, pageValues, pageNonNull,
-                    bitWidth, maxDefLevel, maxRepLevel, defLevels, repLevels, options,
-                    defEncoder, repEncoder, indexEncoder,
+                WriteDictDataPageV2(output, valuesLen, offset, pageValues, pageNonNull,
+                    maxDefLevel, maxRepLevel, defLevels, repLevels, options,
+                    defEncoder, repEncoder,
                     ref totalUncompressedSize, ref totalCompressedSize);
             }
             else
             {
-                WriteDictDataPageV1(output, pageIndices, offset, pageValues, pageNonNull,
-                    bitWidth, maxDefLevel, maxRepLevel, defLevels, repLevels, options,
-                    defEncoder, repEncoder, indexEncoder,
+                WriteDictDataPageV1(output, valuesLen, offset, pageValues, pageNonNull,
+                    maxDefLevel, maxRepLevel, defLevels, repLevels, options,
+                    defEncoder, repEncoder,
                     ref totalUncompressedSize, ref totalCompressedSize);
             }
 
@@ -442,13 +490,16 @@ internal static class ColumnChunkWriter
         return pageSize;
     }
 
+    /// <param name="uncompressedValuesSize">
+    /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
+    /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
+    /// </param>
     private static void WriteDictDataPageV2(
         MemoryStream output,
-        ReadOnlySpan<int> indices, int rowOffset, int numValues, int nonNullCount,
-        int bitWidth, int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
+        int uncompressedValuesSize, int rowOffset, int numValues, int nonNullCount,
+        int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        RleBitPackedEncoder indexEncoder,
         ref int totalUncompressed, ref int totalCompressed)
     {
         // Encode repetition levels (RLE, no length prefix for V2)
@@ -468,10 +519,6 @@ internal static class ColumnChunkWriter
             defEncoder.Encode(defLevels.AsSpan(rowOffset, numValues));
             defLevelLen = defEncoder.Length;
         }
-
-        // Encode indices into reusable buffer: 1-byte bit width + RLE/BP hybrid
-        int uncompressedValuesSize = EncodeDictionaryIndicesToBuffer(
-            indices, nonNullCount, bitWidth, indexEncoder);
 
         // Compress values section only (V2: levels are uncompressed)
         int compressedValuesLen = CompressTo(
@@ -526,13 +573,16 @@ internal static class ColumnChunkWriter
         totalCompressed += compressedPageSize;
     }
 
+    /// <param name="valuesLen">
+    /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
+    /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
+    /// </param>
     private static void WriteDictDataPageV1(
         MemoryStream output,
-        ReadOnlySpan<int> indices, int rowOffset, int numValues, int nonNullCount,
-        int bitWidth, int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
+        int valuesLen, int rowOffset, int numValues, int nonNullCount,
+        int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        RleBitPackedEncoder indexEncoder,
         ref int totalUncompressed, ref int totalCompressed)
     {
         // Build uncompressed body: rep levels + def levels + values
@@ -552,8 +602,6 @@ internal static class ColumnChunkWriter
             defEncoder.Encode(defLevels.AsSpan(rowOffset, numValues));
             defRleLen = defEncoder.Length;
         }
-
-        int valuesLen = EncodeDictionaryIndicesToBuffer(indices, nonNullCount, bitWidth, indexEncoder);
 
         int repPrefixedLen = repRleLen > 0 ? 4 + repRleLen : 0;
         int defPrefixedLen = defRleLen > 0 ? 4 + defRleLen : 0;
@@ -618,20 +666,87 @@ internal static class ColumnChunkWriter
         RleBitPackedEncoder indexEncoder)
     {
         if (nonNullCount == 0)
-        {
-            EnsureValuesBuffer(1);
-            t_valuesBuffer![0] = (byte)bitWidth;
-            return 1;
-        }
+            return EmptyIndexBuffer(bitWidth);
 
         indexEncoder.Reset();
         indexEncoder.Encode(indices);
+        return FinishIndexBuffer(bitWidth, indexEncoder);
+    }
 
+    /// <summary>
+    /// The run-form twin of <see cref="EncodeDictionaryIndicesToBuffer"/>: encodes the next
+    /// <paramref name="nonNullCount"/> indices straight out of the runs, advancing
+    /// <paramref name="cursor"/> past them. Produces the same bytes the per-row form would, since the
+    /// RLE/bit-packing hybrid is itself run-driven — it just skips rediscovering the runs.
+    /// </summary>
+    private static int EncodeDictionaryIndexRunsToBuffer(
+        ref IndexRunCursor cursor, int nonNullCount, int bitWidth, RleBitPackedEncoder indexEncoder)
+    {
+        if (nonNullCount == 0)
+            return EmptyIndexBuffer(bitWidth);
+
+        indexEncoder.Reset();
+        indexEncoder.BeginRuns();
+        cursor.EncodeNext(nonNullCount, indexEncoder);
+        indexEncoder.EndRuns();
+        return FinishIndexBuffer(bitWidth, indexEncoder);
+    }
+
+    /// <summary>A page with no values: the bit-width byte and nothing else.</summary>
+    private static int EmptyIndexBuffer(int bitWidth)
+    {
+        EnsureValuesBuffer(1);
+        t_valuesBuffer![0] = (byte)bitWidth;
+        return 1;
+    }
+
+    /// <summary>Prefixes the encoded indices with the bit-width byte the page format requires.</summary>
+    private static int FinishIndexBuffer(int bitWidth, RleBitPackedEncoder indexEncoder)
+    {
         int totalLen = 1 + indexEncoder.Length;
         EnsureValuesBuffer(totalLen);
         t_valuesBuffer![0] = (byte)bitWidth;
         indexEncoder.WrittenSpan.CopyTo(t_valuesBuffer.AsSpan(1));
         return totalLen;
+    }
+
+    /// <summary>
+    /// A position within run-form dictionary indices, so consecutive pages can each take their share of a
+    /// run that straddles them.
+    /// </summary>
+    private struct IndexRunCursor
+    {
+        private readonly int[] _values;
+        private readonly int[] _lengths;
+        private int _run;
+        private int _taken; // rows already consumed from _run
+
+        public IndexRunCursor(DictionaryEncoder.DictionaryIndexRuns runs)
+        {
+            _values = runs.Values;
+            _lengths = runs.Lengths;
+            _run = 0;
+            _taken = 0;
+        }
+
+        /// <summary>Feeds the next <paramref name="count"/> indices to <paramref name="encoder"/> as runs.</summary>
+        public void EncodeNext(int count, RleBitPackedEncoder encoder)
+        {
+            while (count > 0 && _run < _values.Length)
+            {
+                int take = Math.Min(_lengths[_run] - _taken, count);
+                encoder.AppendRun(_values[_run], take);
+
+                _taken += take;
+                count -= take;
+
+                if (_taken == _lengths[_run])
+                {
+                    _run++;
+                    _taken = 0;
+                }
+            }
+        }
     }
 
     [ThreadStatic]
@@ -1378,6 +1493,62 @@ internal static class ColumnChunkWriter
         Decimal32Type or Decimal64Type => true, // INT32/INT64 physical — signed numeric ordering
         _ => false, // UTF-8 strings/binary (unsigned lexical), unsigned ints, decimal FLBA, nested, ...
     };
+
+    /// <summary>
+    /// Fills a run-end encoded column's definition levels, a run at a time, and returns its non-null row
+    /// count.
+    ///
+    /// <para>The nulls come from each run's VALUE. A run-end encoded array has no validity bitmap of its
+    /// own, so <c>array.IsNull(row)</c> — what the per-row loop this replaces would call — answers false
+    /// for every row of a column that is entirely null, which would write null rows as whatever bytes sat
+    /// in the value slot.</para>
+    /// </summary>
+    private static int FillRunEndEncodedDefLevels(RunEndEncodedArray array, int[] defLevels)
+    {
+        var values = array.Values;
+        int row = 0;
+        int nonNullCount = 0;
+
+        foreach (var run in RunEndEncoding.EnumerateRuns(array))
+        {
+            if (!values.IsNull(run.PhysicalIndex))
+            {
+                defLevels.AsSpan(row, run.Length).Fill(1);
+                nonNullCount += run.Length;
+            }
+
+            row += run.Length;
+        }
+
+        return nonNullCount;
+    }
+
+    /// <summary>
+    /// The type whose values a column holds — its own, or for a run-end encoded column the type of its
+    /// values child, since that is what lands in the file.
+    /// </summary>
+    private static IArrowType ValueType(IArrowArray array) =>
+        array.Data.DataType is RunEndEncodedType ree ? ree.ValuesDataType : array.Data.DataType;
+
+    /// <summary>
+    /// Applies a whole-column transform where it belongs: to the values child of a run-end encoded column
+    /// (one value per run — the transform never sees the rows), or to a plain column directly. Requires a
+    /// compacted array, so the runs the values pair with are all of them.
+    /// </summary>
+    private static IArrowArray MapValues(IArrowArray array, Func<IArrowArray, IArrowArray> transform) =>
+        array is RunEndEncodedArray ree
+            ? new RunEndEncodedArray(ree.RunEnds, transform(ree.Values))
+            : transform(array);
+
+    /// <summary>One value per run, in run order — the distinct-ish values of a run-end encoded column.</summary>
+    private static IArrowArray RunValues(RunEndEncodedArray array)
+    {
+        var physical = new List<int>();
+        foreach (var run in RunEndEncoding.EnumerateRuns(array))
+            physical.Add(run.PhysicalIndex);
+
+        return ArrowCompute.Take(array.Values, physical);
+    }
 
     private static int[]? NormalizeDefLevels(int[]? defLevels, int maxDefLevel)
     {

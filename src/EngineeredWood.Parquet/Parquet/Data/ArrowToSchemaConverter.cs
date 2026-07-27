@@ -286,6 +286,17 @@ internal static class ArrowToSchemaConverter
             FixedSizeBinaryType fsb => (PhysicalType.FixedLenByteArray, fsb.ByteWidth,
                 null, null, null, null),
 
+            // Run-end encoding is a write-side memory layout, not a type: no Parquet file holds runs, so
+            // the column writes as its VALUE type and a reader cannot tell the difference. Nested value
+            // types are refused rather than unwrapped — a group is decomposed into leaves by
+            // NestedLevelWriter, which walks rows and has no run-aware path.
+            RunEndEncodedType ree => ree.ValuesDataType is StructType or ListType or MapType
+                    or LargeListType or FixedSizeListType
+                ? throw new NotSupportedException(
+                    $"A run-end encoded column of '{ree.ValuesDataType.Name}' is not supported for Parquet "
+                    + "writing; only flat value types are.")
+                : MapArrowType(ree.ValuesDataType),
+
             // ExtensionType: encode using the storage type's physical layout,
             // and emit the matching logical-type annotation when we recognise
             // the extension by name. arrow.uuid -> UuidType + FLBA(16). Any

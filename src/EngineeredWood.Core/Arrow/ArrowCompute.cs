@@ -85,6 +85,11 @@ public static class ArrowCompute
             case FixedSizeListArray a:
                 return TakeFixedSizeList(a, indices);
 
+            // Run-end encoded columns gather as runs and stay run-end encoded — see RunEndEncoding.Take for
+            // why the representation is preserved even where gathering breaks every run.
+            case RunEndEncodedArray a:
+                return RunEndEncoding.Take(a, indices);
+
             default:
             {
                 // Every fixed-width type — signed/unsigned ints, floats, HalfFloat, Date/Time/Timestamp/

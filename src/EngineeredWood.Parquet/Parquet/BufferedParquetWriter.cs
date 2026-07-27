@@ -398,7 +398,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         int[]? defLevels,
         int numRows)
     {
-        int[] indices = dictResult.Indices;
+        // Every dictionary this writer builds carries one index per row: it accumulates ROWS, appending an
+        // index as each arrives. The run form comes only out of DictionaryEncoder's run-end-encoded arm,
+        // which nothing here reaches — so this is an assertion, not a case left unhandled.
+        int[] indices = dictResult.Indices
+            ?? throw new InvalidOperationException(
+                "A buffered column cannot be reconstructed from run-form dictionary indices.");
+
         byte[] dictPage = dictResult.DictionaryPageData;
         int dictCount = dictResult.DictionaryCount;
 

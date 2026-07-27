@@ -295,6 +295,15 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             return EngineeredWood.Arrow.ArrowCompute.Take(array, indices);
         }
 
+        // A run-end encoded column splits by RUN, not by row: the slice is a view whose children still hold
+        // every run in the original, and compacting re-clips them. O(runs), so auto-splitting a constant
+        // column across row groups costs a few bytes per group rather than a copy of every row in it.
+        if (array is RunEndEncodedArray ree)
+        {
+            return EngineeredWood.Arrow.RunEndEncoding.Compact(
+                (RunEndEncodedArray)ree.Slice(offset, length));
+        }
+
         // Use Arrow's builder pattern to create a zero-offset copy of the slice
         var sliced = ((Apache.Arrow.Array)array).Slice(offset, length);
         var slicedData = sliced.Data;

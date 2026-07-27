@@ -1,6 +1,7 @@
-# Run-end encoding for constant columns — phases 2 and 3
+# Run-end encoding for constant columns
 
-Phase 1 has landed. This note carries the remaining design so the work can be picked up cold.
+All three phases have landed. This note records what the write path now does, what it measures, and which
+of the constant-column sources deliberately did NOT adopt the encoding.
 
 ## Why this exists
 
@@ -14,82 +15,101 @@ The write path materializes columns that hold one value in every row:
 | IcebergCompat | partition values materialized INTO the data file | any |
 | `DeltaTable.ConstInt64` | commit version on rewritten rows | int64 |
 
-All of them now build through `ArrowCompute.Repeat`, which tiles the value rather than appending per row.
-That is O(N) in memory but with a memcpy-shaped constant: a 1M-row `_change_type` column is 24 MB
-(16 bytes of value + 4 of offset per row).
+`ArrowCompute.Repeat` tiles the value rather than appending per row, which is O(N) in memory with a
+memcpy-shaped constant: a 1M-row `_change_type` column is 24 MB (16 bytes of value + 4 of offset per row).
 
-Run-end encoding is the representation that makes it O(1) — one run, ~32 bytes, whatever the row count.
-Apache.Arrow 23 ships `RunEndEncodedArray` and `RunEndEncodedType`.
+Run-end encoding is the representation that makes it O(1) — one run, ~840 bytes measured, whatever the row
+count. Apache.Arrow 23 ships `RunEndEncodedArray` and `RunEndEncodedType`.
 
-## What phase 1 already took
+## What landed
 
-Phase 1 deliberately did NOT introduce a new array type. It made the Parquet writer recognise a constant
-column from its existing plain-Arrow form and skip the per-row hashing that dominated encoding it.
-Measured on `DictionaryEncoder.TryEncode` alone, 1M rows, min of 30 runs:
+**Phase 1** (`df70b7e`) made the Parquet writer recognise a constant column from its plain-Arrow form and
+skip the per-row hashing, without introducing a new array type: constant string 11.0 → 1.1 ms per 1M rows,
+constant int64 3.6 → 0.2 ms. **That spent the encode-speed argument**, and phases 2–3 were re-scoped onto
+the memory alone before they were written.
 
-| column | before | after |
+**Phase 2** — the writer accepts run-end encoded columns:
+
+- `ArrowToSchemaConverter.MapArrowType` maps `RunEndEncodedType` to its VALUE type, so the Parquet schema,
+  and therefore the file, is exactly what the plain form produces. Run-end encoding over a nested value
+  type is refused rather than unwrapped (`NestedLevelWriter` walks rows and has no run-aware path).
+- `ColumnChunkWriter` derives definition levels a run at a time, compacts a sliced window, and applies the
+  Int8/16 widening and the decimal-FLBA byte reversal to the VALUES child rather than to the rows.
+- `DictionaryEncoder.TryEncodeRuns` builds the dictionary from run values — one hash per run — and returns
+  indices in run form (`DictionaryIndexRuns`) rather than one per row.
+- `RleBitPackedEncoder` gained `EncodeRuns` / `BeginRuns` / `AppendRun` / `EndRuns`, so a run reaches the
+  page as an RLE run without a materialized `int[]`. The page loop walks runs with a cursor, since a page
+  boundary can fall inside one.
+- Everything else expands: FLOAT/DOUBLE up front (they are always full-scanned for the NaN count), and any
+  column the dictionary declines, which lands it on the per-row path unchanged.
+
+**Phase 3** — `CdfWriter` builds `_change_type` run-end encoded, via `RunEndEncoding.Constant`.
+
+`RunEndEncoding` (in `EngineeredWood.Core`) carries the primitives: `Constant`, `Expand`, `Compact`,
+`Take`, and an allocation-free `EnumerateRuns`. `ArrowCompute.Take` dispatches to it, and gathering keeps
+the column run-end encoded — even where that is the larger representation, because a column whose type
+disagrees with its field is a mismatch nothing downstream checks.
+
+## Measured
+
+1M rows, `"update_postimage"`, minimum of 5 after 3 warm-up writes:
+
+| | plain | run-encoded |
 | --- | --- | --- |
-| constant string | 11.0 ms | 1.1 ms |
-| constant int64 | 3.6 ms | 0.2 ms |
-| non-constant (5 shapes) | — | unchanged within noise |
+| build the column | 24,000,280 B | **840 B** |
+| write it (allocated) | 5,091,960 B | **1,092,528 B** |
+| write it (elapsed) | 3.87 ms | **1.75 ms** |
+| five-run low-cardinality column, allocated | 13,481,128 B | **1,092,944 B** |
+| five-run low-cardinality column, elapsed | 12.15 ms | **1.04 ms** |
 
-**This matters for scoping phases 2–3: the encode-speed argument for REE is largely spent.** What REE still
-buys is the *memory* — the 24 MB above — and a general run-aware path for low-cardinality columns that are
-not constant. Do not re-justify this work on encode speed without re-measuring against the phase 1 baseline.
+The ~1 MB residue in both run-encoded writes is the output `MemoryStream`'s initial capacity, which is
+sized from the row count and has nothing to do with the column. The five-run row is the part that
+generalizes past constants — the run-aware dictionary path the phase-2 note asked to be measured before
+committing to it.
 
-## Phase 2 — accept REE at the writer boundary
+Files are byte-identical in every case, which is what
+`RunEndEncodedWriteTests` asserts throughout rather than round-tripping through our own reader.
 
-`ColumnChunkWriter` rejects an REE array today. Two places:
+**The hash table was the trap.** The per-row arms size `BytesHashTable` from the cardinality cap — a fifth
+of the ROW count — because that is all they know before they start hashing. Sized that way, encoding a
+1M-row constant column allocated 8.4 MB of table for a one-entry dictionary and swallowed the entire
+saving, with every correctness test still passing. The run count is an exact upper bound on the distinct
+values, and `TryEncode_ConstantRunEndEncodedColumn_AllocatesNothingPerRow` fails at 8,389,152 bytes if the
+sizing regresses (verified).
 
-- `EncodeByteArrayValues` (`ColumnChunkWriter.cs:1247`) tests `array is StringArray || array is BinaryArray`
-  and throws at `:1254` otherwise.
-- `PhysicalType` resolution has no mapping from `RunEndEncodedType` to its value type.
+## What did NOT adopt it, and why
 
-Work:
+Run-end encoding is contained to the write path, and to the sources whose columns reach nothing but our own
+Parquet writer. Three of the five constant-column sources above were left on `ArrowCompute.Repeat`:
 
-1. Map `RunEndEncodedType` to the physical type of its values.
-2. In `DictionaryEncoder.TryEncode`, add an REE arm that walks runs instead of rows. A single-run REE
-   reduces to the phase 1 constant result. Multi-run REE builds the dictionary from run values and expands
-   indices per run — this is the part that generalizes past constants.
-3. Optionally teach `RleBitPackedEncoder` to emit a run directly (`EncodeRun(value, count)`), so a run does
-   not round-trip through a materialized `int[]`. Phase 1 left `Indices` as a zeroed `int[]`; killing that
-   allocation needs a constant/run marker on `DictionaryResult` and a change to the page loop in
-   `WriteDictionaryColumn`, which is why it was not done.
+- **`CdfReader.AddMetadataColumns` and `PartitionUtils.AddPartitionColumns`** are the READ path. Their
+  batches go to whoever asked for the data, and the Arrow schema they declare is part of that contract —
+  `_change_type` as `RunEndEncodedType(int32, utf8)` would be a breaking change to every consumer.
+  `CdfWriter.AddChangeTypeColumn` therefore kept its plain form (the read path calls it) and the encoded
+  form is a separate, private method.
+- **`PartitionUtils.AppendPartitionColumns`** (IcebergCompat) can flow to a caller-supplied
+  `DeltaTableOptions.DataFileWriter` instead of our writer. A host writer given a run-end encoded column
+  would have to handle a layout it never agreed to.
+- **`DeltaTable.ConstInt64`** returns a typed `Int64Array` that rides through the row-tracking plumbing as
+  `(Int64Array, Int64Array)` tuples. Adopting the encoding there is a refactor of that plumbing for 8
+  bytes a row, which is the smallest of the five.
 
-Non-dictionary fallback also needs an arm, or an explicit refusal: if a column is REE and the dictionary
-bails, something must expand the runs.
-
-## Phase 3 — produce REE at the sources
-
-**Decide where REE is introduced before writing any of this.** It determines the blast radius:
-
-- **Late** — construct the REE array immediately before `WriteRowGroupAsync`. It never reaches
-  `StatsCollector`, `ColumnMappingRecursive.ToPhysical`, the schema-evolution reconcile, or
-  `ArrowCompute.Take`. Small, independently shippable. Captures nothing extra on encode speed after phase 1,
-  so with phase 1 landed **this option now buys almost nothing** — the memory is still materialized.
-- **Early** — build the column as REE in `CdfWriter` / partition materialization and let it flow. This is
-  where the 24 MB actually goes away. Cost: every consumer on the path needs an REE arm, including
-  `ArrowCompute.Take` (DML rewrites and compaction gather CDF batches), and the batch schema must declare
-  `RunEndEncodedType`, which is visible to anything inspecting the Arrow schema.
-
-Given phase 1, early introduction is the only variant that pays. Scope it as such or not at all.
+All three can adopt it without new machinery — `RunEndEncoding.Constant` plus a field type — if the
+containment argument ever changes. That is a decision about blast radius, not a missing capability.
 
 ## Constraints and gotchas
 
-- **Read stays plain.** No REE exists in a Parquet file, so the reader never produces one. REE is a
-  write-side representation only; do not expect round-tripping.
-- **`_change_type` is spec-defined.** Spark and delta-rs read it as a plain string column. That is the
-  *Parquet* type and is unaffected — but only as long as nothing on the write path reinterprets the Arrow
-  type.
-- **`ArrowCompute.Take` has no REE arm** and currently throws `NotSupportedException` for types it cannot
-  gather, by design. Adding REE there is a prerequisite for early introduction, not an optional extra.
-- **Nulls.** Phase 1's constant probe requires `defLevels is null` because it reads every row. An REE arm
-  has the same question to answer: a run-encoded column with nulls needs its def levels reconciled against
-  run boundaries.
-
-## Suggested first step
-
-Re-measure before committing to phase 2. The phase 1 numbers moved the goalposts: benchmark a
-*low-cardinality, non-constant* column (the `low-card string` / `low-card int64` shapes in the phase 1
-harness, ~5 ms per 1M rows) to see what a run-aware dictionary path would actually save there. If that
-number is small, phases 2–3 are a memory optimization only, and should be justified on memory alone.
+- **Read stays plain.** No Parquet file holds runs, so the reader never produces one. Do not expect
+  round-tripping: a column written from runs reads back as its value type.
+- **Nulls are not where the rest of Arrow puts them.** A run-end encoded array has no validity bitmap; its
+  nulls are in the values child, one per RUN. `array.IsNull(row)` answers FALSE for every row of a column
+  that is entirely null. Anything deriving definition levels, statistics or a null count from `IsNull` is
+  silently wrong on such a column — pinned by
+  `IsNull_AnswersFalseForANullRun_WhichIsWhyNullsAreReadFromTheValues`.
+- **A slice is a view.** The children still hold every run in the original; only `Data.Offset` says which
+  rows are in scope. Anything reading the children directly must `Compact` first.
+- **`BufferedParquetWriter` cannot take one.** It accumulates rows and builds an index per row; it throws
+  rather than silently mishandling run-form indices.
+- **`_change_type` is spec-defined.** Spark and delta-rs read it as a plain string column, and they still
+  do — that is the *Parquet* type, and `CdfChangeTypeLayoutTests` asserts the written `_change_data` file
+  holds a required UTF8 column.
