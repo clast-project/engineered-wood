@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.Schema;
@@ -77,9 +78,11 @@ internal static class CdfWriter
     /// </summary>
     public static RecordBatch AddChangeTypeColumn(RecordBatch batch, string changeType)
     {
-        var changeTypeBuilder = new StringArray.Builder();
-        for (int i = 0; i < batch.Length; i++)
-            changeTypeBuilder.Append(changeType);
+        // One change type per batch, so the column is constant: the UTF-8 bytes are tiled across it rather
+        // than appended a row at a time. Repeat also allocates no validity buffer, which suits a column the
+        // field below declares non-nullable.
+        var changeTypeColumn = ArrowCompute.Repeat(
+            StringType.Default, System.Text.Encoding.UTF8.GetBytes(changeType), batch.Length);
 
         var columns = new IArrowArray[batch.ColumnCount + 1];
         var fields = new List<Field>(batch.ColumnCount + 1);
@@ -90,7 +93,7 @@ internal static class CdfWriter
             fields.Add(batch.Schema.FieldsList[i]);
         }
 
-        columns[batch.ColumnCount] = changeTypeBuilder.Build();
+        columns[batch.ColumnCount] = changeTypeColumn;
         fields.Add(new Field(CdfConfig.ChangeTypeColumn, StringType.Default, false));
 
         var schema = new Apache.Arrow.Schema.Builder();
