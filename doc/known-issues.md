@@ -402,15 +402,66 @@ Parquet unit, and only Delta cannot carry it.
 **Stats collection gaps.**
 
 - `tightBounds` is never written.
-- `stats_parsed` is built by `StatsParsedBuilder` for checkpoint writes
-  but `CheckpointReader.ExtractAdd` reads only the JSON `stats` string.
 - `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
   are ignored; every eligible column gets stats.
 
 (String-stat truncation and nested-struct recursion are both implemented —
 `StatsCollector.TruncateMaxString` and `CollectStruct`. Nested stats are
 verified externally: `EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows`
-asserts Spark prunes on `payload.score` and still returns every matching row.)
+asserts Spark prunes on `payload.score` and still returns every matching row.
+The checkpoint's own copy of the JSON stats is verified by
+`EwCheckpointed_MinMaxStats_SparkSkipsFilesReadingTheCheckpointAlone`, which hides
+the earlier commits so only the checkpoint can answer the scan.)
+
+**`stats_parsed`.** `StatsParsedBuilder` writes typed per-file bounds as
+`add.stats_parsed` — inside the add struct, where delta-spark writes them and the
+only place its readers look. It is an implementation extension, not a spec'd
+field: `stats_parsed` appears nowhere in `PROTOCOL.md` (checked), so delta-spark's
+layout is the only definition there is, and EW's is measured against it rather
+than copied from prose.
+
+Which delta-spark you run decides whether it reads or writes the column at all.
+4.0.0 (the pairing tier 3 pins) does neither — its `buildCheckpoint` adds only
+`partitionValues_parsed` and its `loadActions` maps `add.stats` and nothing else;
+the `extractStats` call landed after that tag. **4.1.0 writes `add.stats_parsed`
+by default** (`checkpoint.writeStatsAsStruct` defaults to `true`) and reads it
+back, but only as a fallback: `Snapshot.loadActions` re-encodes the typed struct
+to JSON **iff** the add struct has `stats_parsed` and lacks `stats`, then drops
+the field. A checkpoint carrying both — Delta's default, and EW's — is always read
+from the JSON. delta-rs 1.6.2 writes JSON stats only. All measured.
+
+`delta.checkpoint.writeStatsAsJson` / `delta.checkpoint.writeStatsAsStruct` are
+honoured (`CheckpointStatsMode`), both defaulting to true as in delta-spark, and
+settable at create time through `DeltaTable.CreateAsync(configuration: ...)`.
+Turning JSON off leaves the typed struct as the only statistics, which is the
+shape `EwCheckpointed_StructStatsOnly_SparkPrunesFromTheTypedStats` uses to prove
+Spark prunes from EW's typed values — it needs delta-spark 4.1+ and self-skips on
+4.0.
+
+Bounds carry each column's own Arrow type (`decimal(p,s)`, `timestamp`), decimal
+digits decoded exactly rather than through `System.Decimal`; nested structs
+recurse; and boolean/binary/array/map columns are absent from `minValues`/
+`maxValues` while still counted in `nullCount` — matching delta-spark 4.1.0's own
+checkpoint, measured for
+`(id BIGINT, amount DECIMAL(9,2), d DATE, ts TIMESTAMP, s STRING, b BOOLEAN)`:
+
+```
+add.stats_parsed.numRecords          bigint
+add.stats_parsed.minValues           struct<id:bigint,amount:decimal(9,2),d:date,ts:timestamp,s:string>
+add.stats_parsed.maxValues           struct<id:bigint,amount:decimal(9,2),d:date,ts:timestamp,s:string>
+add.stats_parsed.nullCount           struct<id:bigint,amount:bigint,d:bigint,ts:bigint,s:bigint,b:bigint>
+```
+
+A bound that will not fit the column's own type is written as null (no bound)
+rather than rounded, since a wrong bound skips a file that matches.
+
+**Remaining gap — EW does not read `stats_parsed`.** `CheckpointReader.ExtractAdd`
+parses only `add.stats`, so a checkpoint written with
+`delta.checkpoint.writeStatsAsJson=false` — by EW or by delta-spark — reads back
+in EW with no statistics. Field lookup is by name and tolerates the absent column,
+so this degrades to scanning every file rather than failing; but every file-skipping
+decision is silently lost. Delta's own fix is the `to_json(stats_parsed)` re-encode
+in `Snapshot.loadActions`.
 
 **CommitInfo.** `InCommitTimestamp.CreateCommitInfo` emits `timestamp`,
 `operation`, `inCommitTimestamp`, `engineInfo` and `operationParameters`

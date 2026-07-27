@@ -33,6 +33,7 @@ state; a `__EW_DONE__<name>` marker then goes to the real stdout so the caller c
 without polling. Anything Spark prints to stdout is noise the caller scans past -- which is
 exactly why the payload travels by file and only the wakeup goes through stdout.
 """
+import glob
 import json
 import os
 import sys
@@ -244,6 +245,161 @@ def cmd_scan(args):
     }
 
 
+def _flatten_schema(dtype, prefix=""):
+    """Spark StructType -> {dotted field path: type string}, recursing into structs only.
+
+    Arrays/maps stop at their own entry: the checkpoint schema's nesting that matters here is
+    struct-shaped (add.stats_parsed.minValues.<column>), and descending into map entries would bury
+    that under noise.
+    """
+    from pyspark.sql.types import StructType
+
+    out = {}
+    for field in dtype.fields:
+        path = f"{prefix}{field.name}"
+        out[path] = field.dataType.simpleString()
+        if isinstance(field.dataType, StructType):
+            out.update(_flatten_schema(field.dataType, path + "."))
+    return out
+
+
+def _checkpoint_file(path):
+    """The newest classic checkpoint parquet under a table's _delta_log, or None."""
+    files = sorted(glob.glob(os.path.join(path, "_delta_log", "*.checkpoint.parquet")))
+    return files[-1] if files else None
+
+
+def _stats_parsed_prefix(schema_paths):
+    """Where typed per-file stats live in a checkpoint, as a select-expression prefix."""
+    for candidate in ("add.stats_parsed", "stats_parsed"):
+        if candidate in schema_paths:
+            return candidate
+    return None
+
+
+def cmd_checkpoint_stats(args):
+    """Read an EW table THROUGH ITS CHECKPOINT and report both the typed stats and the pruning.
+
+    Two things nothing else covers. First, every commit JSON BELOW the checkpoint version is moved
+    aside before Spark opens the table, so those files' adds and statistics can only come from the
+    checkpoint -- one whose stats are missing or wrong then prunes a file it should have read and
+    silently returns FEWER ROWS. (Strictly below, not at or below: unlike delta-rs, Spark's
+    SnapshotManagement insists on a commit file at the version it loads and fails with "Could not find
+    any delta files for version N" if the checkpoint's own commit is gone too. Tests therefore put the
+    file that must be PRUNED in an early, hidden commit.) Second, the checkpoint parquet is read
+    directly (as parquet, not as a log) so the test can assert where typed stats live and what types
+    they carry, which is invisible from the table read: Delta prefers the JSON `stats` string when a
+    checkpoint carries both.
+
+    `stats_column` selects a column whose per-file typed bounds come back in `typed_stats`.
+    """
+    spark = _spark()
+    path = args["path"]
+
+    cp = _checkpoint_file(path)
+    if not cp:
+        return {"ok": False, "error": "no checkpoint file was written"}
+    cp_version = int(os.path.basename(cp).split(".")[0])
+
+    # Read the checkpoint as a plain parquet file first: this must not go through Delta, or the
+    # DeltaLog cache would pin a snapshot built while the commits were still visible.
+    cp_df = spark.read.parquet(_uri(cp))
+    schema_paths = _flatten_schema(cp_df.schema)
+    prefix = _stats_parsed_prefix(schema_paths)
+
+    typed_stats = []
+    column = args.get("stats_column")
+    if prefix and column:
+        # add.stats is absent when the table turns JSON stats off -- selecting it unconditionally
+        # would fail on exactly the struct-stats-only shape these tests exist to exercise.
+        selects = ["add.path AS path"]
+        if "add.stats" in schema_paths:
+            selects.append("add.stats AS stats_json")
+        selects += [
+            f"{prefix}.numRecords AS num_records",
+            f"{prefix}.minValues.`{column}` AS min_value",
+            f"{prefix}.maxValues.`{column}` AS max_value",
+            f"{prefix}.nullCount.`{column}` AS null_count",
+        ]
+        rows = cp_df.where("add.path is not null").selectExpr(*selects).collect()
+        typed_stats = sorted((r.asDict(recursive=True) for r in rows),
+                             key=lambda r: r["path"])
+
+    moved = []
+    for f in sorted(glob.glob(os.path.join(path, "_delta_log", "*.json"))):
+        base = os.path.basename(f)
+        if base[0].isdigit() and int(base.split(".")[0]) < cp_version:
+            os.rename(f, f + ".hidden")
+            moved.append(base)
+
+    df = spark.read.format("delta").load(_uri(path))
+    filtered = df.filter(args["filter"]) if args.get("filter") else df
+    return {
+        "checkpoint_version": cp_version,
+        "checkpoint_schema": schema_paths,
+        "stats_parsed_at": prefix,
+        "typed_stats": typed_stats,
+        "hidden_commits": moved,
+        "files_total": len(df.inputFiles()),
+        "files_scanned": len(filtered.inputFiles()),
+        "row_count": filtered.count(),
+        "rows": _rows(filtered),
+    }
+
+
+def cmd_reference_checkpoint_schema(args):
+    """Write a table WITH SPARK at checkpointInterval=1 and report its checkpoint's schema.
+
+    The reference answer for where typed stats belong and what type each column's bounds carry --
+    the spec describes `stats_parsed` loosely enough that the implementation is the specification in
+    practice. Tests compare EW's checkpoint against this rather than against a hand-copied layout
+    that would silently rot when Delta changes it.
+
+    `stats_as_struct` asks for typed stats via `delta.checkpoint.writeStatsAsStruct` (plus the
+    session confs that gate it). Delta writes typed stats INSIDE the add struct, as
+    `add.stats_parsed` -- `Checkpoints.buildCheckpoint` folds them into the rebuilt `add` column
+    alongside `partitionValues_parsed`. Which build you run decides whether they appear at all:
+
+      delta-spark 4.0.0 (this tier's pinned pairing): never. Its `buildCheckpoint` adds only
+        `partitionValues_parsed`; the `extractStats` call landed after the tag, so the flag is a no-op.
+      delta-spark 4.1.0: yes, and by DEFAULT -- `checkpoint.writeStatsAsStruct` defaults to true, so
+        checkpoints carry `add.stats` and `add.stats_parsed` both (measured).
+
+    The flag is kept so the behaviour is pinned either way.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    props = ["'delta.checkpointInterval' = '1'"]
+    if args.get("stats_as_struct"):
+        props.append("'delta.checkpoint.writeStatsAsStruct' = 'true'")
+        spark.conf.set("spark.databricks.delta.checkpoint.writeStatsAsStruct", "true")
+        spark.conf.set("spark.databricks.delta.statsAsStructInCheckpoint.forcedDisabled", "false")
+    spark.sql(
+        f"CREATE OR REPLACE TABLE delta.`{path}` "
+        "(id BIGINT, amount DECIMAL(9,2), d DATE, ts TIMESTAMP, s STRING, b BOOLEAN) "
+        f"USING delta TBLPROPERTIES ({', '.join(props)})")
+    spark.sql(
+        f"INSERT INTO delta.`{path}` VALUES "
+        "(1, 1.50, DATE'2021-06-20', TIMESTAMP'2021-06-20 10:00:00', 'a', true)")
+
+    cp = _checkpoint_file(args["path"])
+    if not cp:
+        return {"ok": False, "error": "Spark wrote no checkpoint despite checkpointInterval=1"}
+
+    schema_paths = _flatten_schema(spark.read.parquet(_uri(cp)).schema)
+    prefix = _stats_parsed_prefix(schema_paths)
+    return {
+        "checkpoint_file": os.path.basename(cp),
+        "table_properties": {r["key"]: r["value"] for r in
+                             (row.asDict() for row in
+                              spark.sql(f"SHOW TBLPROPERTIES delta.`{path}`").collect())},
+        "checkpoint_schema": schema_paths,
+        "stats_parsed_at": prefix,
+        "stats_parsed_fields": {k: v for k, v in schema_paths.items()
+                                if prefix and k.startswith(prefix + ".")},
+    }
+
+
 def cmd_read_changes(args):
     """Read an EW table's Change Data Feed via Spark's readChangeFeed.
 
@@ -339,6 +495,8 @@ COMMANDS = {
     "write": cmd_write,
     "sql": cmd_sql,
     "scan": cmd_scan,
+    "checkpoint_stats": cmd_checkpoint_stats,
+    "reference_checkpoint_schema": cmd_reference_checkpoint_schema,
     "create": cmd_create,
 }
 

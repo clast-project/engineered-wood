@@ -120,6 +120,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ColumnMappingMode.Id"/>, the protocol is upgraded to
     /// Reader v2 / Writer v5 and column mapping metadata is assigned.
     /// </param>
+    /// <param name="configuration">
+    /// Table properties (<c>delta.*</c>) to record in the table's metadata, e.g.
+    /// <c>delta.checkpoint.writeStatsAsJson</c> or <c>delta.deletedFileRetentionDuration</c>. The
+    /// properties implied by the other arguments — column mapping, deletion vectors, row tracking —
+    /// are applied on top, so those arguments remain the source of truth for the features they enable.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public static async ValueTask<DeltaTable> CreateAsync(
         ITableFileSystem fileSystem,
@@ -130,6 +136,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? clusteringColumns = null,
         bool enableDeletionVectors = false,
         bool enableRowTracking = false,
+        IReadOnlyDictionary<string, string>? configuration = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -159,7 +166,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
         int minWriterVersion = 2;
-        Dictionary<string, string>? configuration = null;
+        // Caller-supplied properties seed the configuration; the feature flags below overwrite their
+        // own keys, so an argument and a property that disagree resolve to the argument.
+        Dictionary<string, string>? configurationBuilder = configuration is { Count: > 0 }
+            ? new Dictionary<string, string>(configuration.Count)
+            : null;
+        if (configurationBuilder is not null)
+        {
+            foreach (var kvp in configuration!)
+                configurationBuilder[kvp.Key] = kvp.Value;
+        }
 
         if (columnMappingMode != ColumnMappingMode.None)
         {
@@ -177,19 +193,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 _ => "none",
             };
 
-            configuration = new Dictionary<string, string>
-            {
-                [ColumnMapping.ModeKey] = modeStr,
-                [ColumnMapping.MaxColumnIdKey] = maxId.ToString(),
-            };
+            configurationBuilder ??= new Dictionary<string, string>();
+            configurationBuilder[ColumnMapping.ModeKey] = modeStr;
+            configurationBuilder[ColumnMapping.MaxColumnIdKey] = maxId.ToString();
         }
 
         // Deletion vectors are opt-in: set the table property so the DELETE path knows it may soft-delete
         // rows with a DV, and declare the reader+writer feature below so foreign readers apply them.
         if (enableDeletionVectors)
         {
-            configuration ??= new Dictionary<string, string>();
-            configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
+            configurationBuilder ??= new Dictionary<string, string>();
+            configurationBuilder[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
         }
 
         // Row tracking is opt-in: set the property and store the two spec-required hidden column names now
@@ -198,12 +212,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // The rowTracking + domainMetadata writer features are declared below.
         if (enableRowTracking)
         {
-            configuration ??= new Dictionary<string, string>();
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
+            configurationBuilder ??= new Dictionary<string, string>();
+            configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
             var (rowIdCol, rowCommitVersionCol) =
                 DeltaLake.RowTracking.RowTrackingConfig.GenerateMaterializedColumnNames();
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
-            configuration[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
+            configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey] = rowIdCol;
+            configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey] =
                 rowCommitVersionCol;
         }
 
@@ -343,7 +357,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Format = Format.Parquet,
                 SchemaString = schemaString,
                 PartitionColumns = partitionColumns ?? [],
-                Configuration = configuration,
+                Configuration = configurationBuilder,
                 CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             },
         };
@@ -356,7 +370,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
         // the history (and resolvable by timestamp time travel) rather than being the one silent version.
         var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, configuration, "CREATE TABLE");
+            actions, configurationBuilder, "CREATE TABLE");
         await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
 
         var snapshot = await SnapshotBuilder.BuildAsync(

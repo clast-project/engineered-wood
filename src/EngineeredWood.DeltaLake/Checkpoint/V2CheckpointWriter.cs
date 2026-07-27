@@ -30,7 +30,7 @@ public sealed class V2CheckpointWriter
         ParquetWriteOptions? parquetOptions = null)
     {
         _fs = fileSystem;
-        _parquetOptions = parquetOptions;
+        _parquetOptions = CheckpointParquetOptions.For(parquetOptions);
     }
 
     /// <summary>
@@ -139,8 +139,9 @@ public sealed class V2CheckpointWriter
         await using (var file = await _fs.CreateAsync(sidecarPath, cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
+            // Declared before the writer so it is disposed last; its buffers are native memory.
+            using var batch = CheckpointWriter.BuildCheckpointBatchPublic(sidecarSnapshot, out _);
             await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
-            var batch = CheckpointWriter.BuildCheckpointBatchPublic(sidecarSnapshot, out _);
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
         }
 
