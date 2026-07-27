@@ -36,6 +36,12 @@ internal static class CdfWriter
         ParquetWriteOptions? parquetOptions,
         CancellationToken cancellationToken)
     {
+        // Partition columns never live in the file bytes — they ride on the action's partitionValues and the
+        // reader re-materializes them POSITIONALLY against the table schema. A caller whose rows came from the
+        // read path (which materializes partition columns) would otherwise write them into the file, and the
+        // reader would both duplicate the partition column and shift every column after it out of the feed.
+        rows = DropPartitionColumns(rows, snapshot.Metadata.PartitionColumns);
+
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
@@ -91,6 +97,32 @@ internal static class CdfWriter
         foreach (var f in fields)
             schema.Field(f);
 
+        return new RecordBatch(schema.Build(), columns, batch.Length);
+    }
+
+    // Drops the partition columns (matched by LOGICAL name — the shape callers pass) from a batch. A no-op for
+    // an unpartitioned table, and for a batch that never carried them (rows read straight from a data file).
+    private static RecordBatch DropPartitionColumns(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns)
+    {
+        if (partitionColumns.Count == 0)
+            return batch;
+
+        var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        var keep = new List<int>(batch.ColumnCount);
+        for (int i = 0; i < batch.ColumnCount; i++)
+            if (!partSet.Contains(batch.Schema.FieldsList[i].Name))
+                keep.Add(i);
+        if (keep.Count == batch.ColumnCount)
+            return batch;
+
+        var columns = new IArrowArray[keep.Count];
+        var schema = new Apache.Arrow.Schema.Builder();
+        for (int i = 0; i < keep.Count; i++)
+        {
+            columns[i] = batch.Column(keep[i]);
+            schema.Field(batch.Schema.FieldsList[keep[i]]);
+        }
         return new RecordBatch(schema.Build(), columns, batch.Length);
     }
 

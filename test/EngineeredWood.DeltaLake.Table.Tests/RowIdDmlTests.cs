@@ -377,4 +377,89 @@ public class RowIdDmlTests : IDisposable
             [new Int64Array.Builder().Append(1).Build()], 1);
         await Assert.ThrowsAsync<ArgumentException>(() => table.UpdateByRowIdsAsync(bad).AsTask());
     }
+
+    // ── Change Data Feed on a row-id DELETE ──
+
+    private static Apache.Arrow.Schema RegionSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("region", StringType.Default, true))
+        .Field(new Field("val", Int64Type.Default, true))
+        .Build();
+
+    private static RecordBatch RegionBatch(long startId, int count, string region)
+    {
+        var ids = new Int64Array.Builder();
+        var regions = new StringArray.Builder();
+        var vals = new Int64Array.Builder();
+        for (int i = 0; i < count; i++)
+        {
+            ids.Append(startId + i);
+            regions.Append(region);
+            vals.Append(100 + startId + i);
+        }
+        return new RecordBatch(RegionSchema, [ids.Build(), regions.Build(), vals.Build()], count);
+    }
+
+    private Task<DeltaTable> CreateCdfTableAsync(
+        Apache.Arrow.Schema schema,
+        IReadOnlyList<string>? partitionColumns = null,
+        bool enableDeletionVectors = false)
+        => DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema,
+            partitionColumns: partitionColumns,
+            enableDeletionVectors: enableDeletionVectors,
+            configuration: new Dictionary<string, string>
+            {
+                { EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey, "true" },
+            }).AsTask();
+
+    /// <summary>The feed over a version range as sorted "changeType|col=value|…" rows (metadata columns dropped,
+    /// every data column of the feed's schema included in order — so a lost or duplicated column shows up).</summary>
+    private async Task<List<string>> FeedRowsAsync(long from, long to)
+    {
+        await using var reader = await OpenAsync();
+        var rows = new List<string>();
+        await foreach (var b in reader.ReadChangesAsync(from, to))
+        {
+            var changeType = (StringArray)b.Column(EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.ChangeTypeColumn);
+            for (int i = 0; i < b.Length; i++)
+            {
+                var parts = new List<string> { changeType.GetString(i) };
+                for (int c = 0; c < b.ColumnCount; c++)
+                {
+                    string name = b.Schema.FieldsList[c].Name;
+                    if (name == EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.ChangeTypeColumn
+                        || name == EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.CommitVersionColumn
+                        || name == EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.CommitTimestampColumn)
+                        continue;
+                    parts.Add($"{name}={CellText(b.Column(c), i)}");
+                }
+                rows.Add(string.Join("|", parts));
+            }
+        }
+        rows.Sort(StringComparer.Ordinal);
+        return rows;
+    }
+
+    private static string CellText(IArrowArray column, int i) => column switch
+    {
+        Int64Array a => a.IsNull(i) ? "null" : a.GetValue(i)!.Value.ToString(),
+        StringArray s => s.IsNull(i) ? "null" : s.GetString(i),
+        _ => column.GetType().Name,
+    };
+
+    [Fact]
+    public async Task DeleteByRowIdsViaVectors_PartitionedCdfTable_FeedKeepsEveryColumn()
+    {
+        // Same shape through the deletion-vector path, whose CDC rows also come from the read path (which
+        // materializes partition columns).
+        await using var table = await CreateCdfTableAsync(
+            RegionSchema, partitionColumns: ["region"], enableDeletionVectors: true);
+        await table.WriteAsync([RegionBatch(1, 3, "east")]);
+
+        var ids = await RowIdsOf(table, 3);
+        var (_, version) = await table.DeleteByRowIdsViaVectorsAsync(ids);
+
+        Assert.Equal(["delete|id=3|region=east|val=103"], await FeedRowsAsync(version, version));
+    }
 }
