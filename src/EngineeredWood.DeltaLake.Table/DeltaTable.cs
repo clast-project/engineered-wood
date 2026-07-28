@@ -1920,6 +1920,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Begins a transaction pinned to <paramref name="snapshot"/> rather than to <see cref="CurrentSnapshot"/>.
+    ///
+    /// <para>For a host whose transaction spans several of ITS OWN statements: it pins a version at its first
+    /// read — which is what its row identifiers and deletion-vector positions were captured against — but
+    /// cannot hold this table open in between, so by the time it has work to stage, <see cref="CurrentSnapshot"/>
+    /// is no longer the version it read. Basing the transaction on the pinned snapshot is what makes the commit
+    /// loop's validation meaningful: every commit that landed SINCE that version is what has to be checked, and
+    /// starting from the latest version instead validates against an EMPTY set of concurrent commits — passing
+    /// vacuously rather than merely being mis-pinned.</para>
+    ///
+    /// <para>The same caller-supplied-snapshot parameter that
+    /// <see cref="PlanFiles(EngineeredWood.Expressions.Predicate, Snapshot.Snapshot, StructType)"/>,
+    /// <see cref="ComputeDeletionVectorActionsAsync"/> and <see cref="RebaseDvDmlActionsAsync"/> already take,
+    /// so a host that plans, computes and commits against one pinned version can say so once per call rather
+    /// than hoping the table has not moved. It also makes <see cref="DeltaTransaction.Snapshot"/>'s existing
+    /// contract reachable: that property tells a caller to plan against the transaction's base snapshot so the
+    /// file ordinals a staged delete is keyed by agree with what the transaction validates — which a caller
+    /// could not honour while the base was always the latest version.</para>
+    /// </summary>
+    /// <param name="snapshot">The version to read from and validate against. Obtain it with
+    /// <see cref="GetSnapshotAtVersionAsync"/>.</param>
+    /// <param name="isolationLevel">As <see cref="StartTransaction(IsolationLevel)"/>.</param>
+    public DeltaTransaction StartTransaction(
+        Snapshot.Snapshot snapshot,
+        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+    {
+        ThrowIfDisposed();
+        if (snapshot is null)
+            throw new ArgumentNullException(nameof(snapshot));
+        return new DeltaTransaction(this, snapshot, isolationLevel);
+    }
+
+    /// <summary>
     /// Runs the optimistic-concurrency commit loop for <paramref name="transaction"/>. A DELETE reads
     /// exactly the files it removes, so the removed paths are both the read-set (concurrentDeleteRead)
     /// and the planned removes (delete/delete).
