@@ -26,9 +26,20 @@ namespace EngineeredWood.DeltaLake.Table;
 /// updates (<see cref="UpdateAsync"/>) can be staged, including several on one transaction. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
 /// delete/update reads the files it rewrites, so it aborts only if a concurrent commit removed one of
-/// them. Overwrite modes and row-level (same-file, disjoint-row) concurrency are planned additions; a
-/// row-tracking table's staged work still commits uncontended but aborts rather than rebase (its
-/// <c>baseRowId</c> would need recomputing against the advanced high-water mark).</para>
+/// them — and a delete of DIFFERENT rows in a file someone else also deleted from reconciles row-by-row
+/// rather than aborting, including across a concurrent compaction that rewrote the file away. Row ids stay
+/// correct throughout: staged work reserves a contiguous range, and a rebase re-derives it against the
+/// advanced high-water mark. Overwrite modes are not stageable — they remove the whole active set, which
+/// is exactly what a rebase cannot re-derive.</para>
+///
+/// <para><b>Host-staged work.</b> A host that owns its own data plane — its own parquet codec behind
+/// <see cref="IDataFileWriter"/>, its own engine deciding which rows to delete — stages work it has
+/// ALREADY done rather than handing over batches and predicates: <see cref="StageDataFiles"/>,
+/// <see cref="StageRowDeletesAsync"/>, <see cref="StageSchemaChange"/>,
+/// <see cref="StageChangeDataAsync"/>, and <see cref="StageActions"/>. These commit through the same
+/// conflict-check, rebase, and retry loop as the computed ones, so an embedding host does not reimplement
+/// it. Plan against <see cref="Snapshot"/> so the file ordinals a staged delete is keyed by agree with
+/// what the transaction validates.</para>
 /// </summary>
 public sealed class DeltaTransaction
 {
@@ -48,6 +59,11 @@ public sealed class DeltaTransaction
     // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
     // (row-level concurrency) instead of aborting. Only DELETEs contribute; appends and updates do not.
     private readonly List<DeltaTable.DeleteDvEdit> _dvEdits = [];
+    // Where the NEXT staged add starts reserving stable row ids. Each staging call must continue from here
+    // rather than restart at the base snapshot's high-water mark: two appends staged on one transaction
+    // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
+    // to one identity. Null until the first row-tracking stage reads the base mark.
+    private long? _nextRowId;
     private bool _committed;
 
     internal DeltaTransaction(
@@ -60,6 +76,16 @@ public sealed class DeltaTransaction
 
     /// <summary>The table version this transaction reads from and validates against.</summary>
     public long ReadVersion => _baseSnapshot.Version;
+
+    /// <summary>
+    /// The pinned snapshot this transaction reads, plans, and validates against. Pass it wherever a
+    /// host-driven step needs to agree with the transaction on what the table looks like — most importantly
+    /// <see cref="DeltaTable.PlanFiles"/>, whose <see cref="PlannedFile.FileOrdinal"/> values are the keys
+    /// <see cref="StageRowDeletesAsync"/> expects. Planning against
+    /// <see cref="DeltaTable.CurrentSnapshot"/> instead would silently key positions to a different file
+    /// ordering once another writer commits.
+    /// </summary>
+    public Snapshot.Snapshot Snapshot => _baseSnapshot;
 
     /// <summary>The isolation level this transaction is validated at.</summary>
     public IsolationLevel IsolationLevel { get; }
@@ -77,6 +103,13 @@ public sealed class DeltaTransaction
     internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
 
     /// <summary>
+    /// The row id the next staged add would reserve, or null if nothing staged advanced it. The commit emits
+    /// ONE high-water-mark action from this — see <see cref="StageInternal"/> for why the per-operation ones
+    /// are held back.
+    /// </summary>
+    internal long? NextRowId => _nextRowId;
+
+    /// <summary>
     /// Stages an append of <paramref name="batches"/>, evaluated against this transaction's pinned read
     /// version. An append is a blind write — it depends on nothing the table currently holds — so it
     /// never conflicts with a concurrent delete or append and two concurrent transactional appends both
@@ -92,12 +125,13 @@ public sealed class DeltaTransaction
         EnsureNotCommitted();
         _table.ValidateWritable(_baseSnapshot, isAppend: true);
 
-        var actions = await _table.ComputeWriteActionsAsync(
+        var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
             overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken, rowIdStart: _nextRowId).ConfigureAwait(false);
 
-        _dataActions.AddRange(actions);
+        _nextRowId = nextRowId;
+        StageInternal(actions);
         _operations.Add("WRITE");
 
         long rows = 0;
@@ -124,7 +158,7 @@ public sealed class DeltaTransaction
         var plan = await _table.ComputeDeleteActionsAsync(_baseSnapshot, predicate, cancellationToken)
             .ConfigureAwait(false);
 
-        _dataActions.AddRange(plan.DataActions);
+        StageInternal(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _dvEdits.AddRange(plan.DvEdits);
@@ -149,7 +183,7 @@ public sealed class DeltaTransaction
             _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate)
             .ConfigureAwait(false);
 
-        _dataActions.AddRange(plan.DataActions);
+        StageInternal(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _dvEdits.AddRange(plan.DvEdits);
@@ -176,9 +210,11 @@ public sealed class DeltaTransaction
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
         var plan = await _table.ComputeUpdateActionsAsync(
-            _baseSnapshot, predicate, updater, cancellationToken).ConfigureAwait(false);
+            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId)
+            .ConfigureAwait(false);
 
-        _dataActions.AddRange(plan.Actions);
+        _nextRowId = plan.NextRowId;
+        StageInternal(plan.Actions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _operations.Add("UPDATE");
@@ -202,15 +238,164 @@ public sealed class DeltaTransaction
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
-            prunePredicate: predicate).ConfigureAwait(false);
+            prunePredicate: predicate, rowIdStart: _nextRowId).ConfigureAwait(false);
 
-        _dataActions.AddRange(plan.Actions);
+        _nextRowId = plan.NextRowId;
+        StageInternal(plan.Actions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _readPredicates.Add(predicate);
         _operations.Add("UPDATE");
 
         return plan.TotalUpdated;
+    }
+
+    // ── Host-staged work ───────────────────────────────────────────────────────────────────────────────
+    //
+    // The methods above compute their own data: they are the shape for a caller that hands engineered-wood
+    // batches and predicates. A host that owns its data plane (its own parquet codec behind IDataFileWriter,
+    // its own execution engine deciding which rows to delete) arrives with the work ALREADY DONE, and needs to
+    // put it into the same transaction so it commits atomically with everything else — and, more importantly,
+    // so it goes through the same conflict-check/rebase/retry loop instead of a hand-rolled one.
+
+    /// <summary>
+    /// Stages data files the caller has already written — by <see cref="DeltaTable.WriteDataFilesAsync"/>, or
+    /// straight to storage by the host's own writer — as an append. The files exist; this records the
+    /// <c>add</c> actions that will publish them, reserving each file's stable row-id range if the table has
+    /// row tracking.
+    ///
+    /// <para>Append-shaped only, like <see cref="WriteAsync"/>: the overwrite family removes the whole active
+    /// set, which is precisely what a rebase cannot re-derive. Throws if the table has identity columns or
+    /// IcebergCompat, which need write-time per-row processing an outside writer did not do — check
+    /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> first.</para>
+    /// </summary>
+    public void StageDataFiles(IReadOnlyList<WrittenDataFile> files)
+    {
+        EnsureNotCommitted();
+        if (files is null)
+            throw new ArgumentNullException(nameof(files));
+        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+        if (files.Count == 0)
+            return;
+
+        var (actions, nextRowId) = _table.BuildStagedAppendActions(_baseSnapshot, files, _nextRowId);
+        _nextRowId = nextRowId;
+        StageInternal(actions);
+        _operations.Add("WRITE");
+    }
+
+    /// <summary>
+    /// Stages a deletion-vector DELETE of rows the caller identified itself — the host-driven counterpart of
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, for an engine that
+    /// evaluated its own predicate and knows which rows must go. Rows are addressed as ABSOLUTE in-file
+    /// positions keyed by the file's ordinal in this transaction's pinned snapshot — the ordinals
+    /// <see cref="DeltaTable.PlanFiles"/> reports when planned against <see cref="Snapshot"/>, and the high
+    /// bits of the transient rowids the read paths emit. Returns the rows newly hidden.
+    ///
+    /// <para>Each touched file's existing vector is unioned with the new positions, so repeated deletes
+    /// compose, and a position already covered is not counted or replayed. The per-file edits are recorded, so
+    /// at commit a concurrent delete of DIFFERENT rows in the same file reconciles row-by-row and a concurrent
+    /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
+    /// </summary>
+    public async ValueTask<long> StageRowDeletesAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        if (positionsByOrdinal is null)
+            throw new ArgumentNullException(nameof(positionsByOrdinal));
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        if (positionsByOrdinal.Count == 0)
+            return 0;
+
+        var result = await _table.ComputeDvActionsWithEditsAsync(
+            positionsByOrdinal, _baseSnapshot, cancellationToken).ConfigureAwait(false);
+        if (result.RowsDeleted == 0)
+            return 0;
+
+        StageInternal(result.Actions);
+        _dvEdits.AddRange(result.Edits);
+        foreach (string path in result.TouchedPaths)
+            _removedPaths.Add(path);
+        _operations.Add("DELETE");
+        return result.RowsDeleted;
+    }
+
+    /// <summary>
+    /// Stages a schema change computed by one of <see cref="DeltaTable"/>'s <c>Compute*</c> methods
+    /// (<see cref="DeltaTable.ComputeAddColumn"/>, <see cref="DeltaTable.ComputeRenameColumn"/>, …), so an
+    /// ALTER lands in the SAME version as the data written under it. Compute the change against this
+    /// transaction's <see cref="Snapshot"/>; a concurrent commit that changes metadata or protocol aborts the
+    /// transaction rather than silently overwriting it.
+    /// </summary>
+    public void StageSchemaChange(DeltaTable.DeferredSchemaChange change)
+    {
+        EnsureNotCommitted();
+        StageInternal(change.Actions);
+        _operations.Add("ALTER");
+    }
+
+    /// <summary>
+    /// Stages Change Data Feed rows for the statement the caller just executed — its deleted rows, or an
+    /// update's pre- and post-images — as <c>_change_data</c> file(s) fused into this transaction's commit.
+    /// <paramref name="changeType"/> is one of <c>delete</c> / <c>update_preimage</c> / <c>update_postimage</c>
+    /// / <c>insert</c>; the <c>_change_type</c> column is added for you.
+    ///
+    /// <para><paramref name="rows"/> carry the table's logical columns INCLUDING partition columns: the rows
+    /// are split per partition and each file's <c>partitionValues</c> encoded the way a data file's are, which
+    /// is work a caller cannot do from outside the assembly. A commit carrying any cdc action is read
+    /// cdc-only, so a change file staged here replaces — rather than adds to — what the reader would otherwise
+    /// infer from this version's adds and removes.</para>
+    /// </summary>
+    public async ValueTask StageChangeDataAsync(
+        RecordBatch rows, string changeType, CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        if (rows is null)
+            throw new ArgumentNullException(nameof(rows));
+        if (rows.Length == 0)
+            return;
+        _table.ValidateChangeDataStageable(_baseSnapshot, changeType);
+
+        var files = await _table.WriteChangeDataFilesForAsync(
+            _baseSnapshot, rows, changeType, cancellationToken).ConfigureAwait(false);
+        StageInternal(files);
+    }
+
+    /// <summary>
+    /// Stages arbitrary pre-built actions — the escape hatch for what the typed methods do not cover
+    /// (a <see cref="TransactionId"/> for an idempotent producer, a <see cref="DomainMetadata"/> of the host's
+    /// own). The actions are committed verbatim, so the caller owns their correctness; anything carrying
+    /// snapshot-relative state (row-id ranges, deletion-vector positions) belongs in a typed method instead,
+    /// which is what lets the commit loop rebase it.
+    /// </summary>
+    public void StageActions(IReadOnlyList<DeltaAction> actions, string? operation = null)
+    {
+        EnsureNotCommitted();
+        if (actions is null)
+            throw new ArgumentNullException(nameof(actions));
+        StageInternal(actions);
+        if (!string.IsNullOrEmpty(operation))
+            _operations.Add(operation!);
+    }
+
+    /// <summary>
+    /// Adds staged actions, holding back the row-tracking high-water mark. That action is a per-domain
+    /// SINGLETON — every staging call computes one, and a version carrying two <c>domainMetadata</c> entries
+    /// for one domain is malformed — so the transaction re-emits exactly one from its running counter at
+    /// commit time.
+    /// </summary>
+    private void StageInternal(IEnumerable<DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is DomainMetadata dm && string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            _dataActions.Add(action);
+        }
     }
 
     /// <summary>

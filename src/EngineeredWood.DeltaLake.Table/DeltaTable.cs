@@ -1882,8 +1882,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Predicates = transaction.ReadPredicates,
         };
 
+        // The row-tracking high-water mark is emitted ONCE for the whole transaction, from the counter each
+        // staged operation advanced. Per-operation marks are held back at staging time: several of them in one
+        // version is malformed, and the last one written would win regardless of which reserved the most.
+        var actions = transaction.DataActions;
+        if (transaction.NextRowId is { } nextRowId && nextRowId > baseSnapshot.RowIdHighWaterMark)
+        {
+            var withMark = new List<DeltaAction>(actions.Count + 1);
+            withMark.AddRange(actions);
+            withMark.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+            actions = withMark;
+        }
+
         return CommitOccAsync(
-            baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
+            baseSnapshot, actions, reads, transaction.RemovedPaths,
             transaction.IsolationLevel, transaction.Operation, rebaseSafe: true,
             cancellationToken,
             rowLevelDeletes: transaction.DvEdits);
@@ -2653,7 +2665,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// count — everything a commit needs, without committing. Shared by the auto-committing
     /// <see cref="UpdateAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
     internal sealed record UpdateActions(
-        IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated);
+        IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated, long NextRowId);
 
     /// <summary>
     /// Computes the actions for an UPDATE against <paramref name="snapshot"/> WITHOUT committing. Like a
@@ -2663,12 +2675,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// as in <see cref="ComputeDeleteActionsAsync"/> — a pruned file has no matching row to update, so the
     /// removed-file set is unchanged; only the read is avoided.</para>
     /// </summary>
+    /// <param name="rowIdStart">Where the rewrite's post-image adds begin reserving stable row ids — see
+    /// <see cref="ComputeWriteActionsAsync"/>' parameter of the same name. Null starts at the snapshot's mark.</param>
     internal async ValueTask<UpdateActions> ComputeUpdateActionsAsync(
         Snapshot.Snapshot snapshot,
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken,
-        Expressions.Predicate? prunePredicate = null)
+        Expressions.Predicate? prunePredicate = null,
+        long? rowIdStart = null)
     {
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -2693,7 +2708,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         long newVersion = snapshot.Version + 1;
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -2916,7 +2931,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
-        return new UpdateActions(actions, removedPaths, totalUpdated);
+        return new UpdateActions(actions, removedPaths, totalUpdated, nextRowId);
     }
 
     // Reorders/subsets a resolved row-id (or commit-version) array to match a rewritten batch's row order.
@@ -3038,24 +3053,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         if (rows is null)
             throw new ArgumentNullException(nameof(rows));
-        if (changeType is not (DeltaLake.ChangeDataFeed.CdfConfig.Insert
-            or DeltaLake.ChangeDataFeed.CdfConfig.Delete
-            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage
-            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage))
-        {
-            throw new ArgumentException(
-                $"changeType must be one of 'insert', 'delete', 'update_preimage', 'update_postimage' "
-                + $"(got '{changeType}').", nameof(changeType));
-        }
-        if (!DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration))
-        {
-            throw new InvalidOperationException(
-                "Change Data Feed is not enabled on this table — a _change_data file would never be read. "
-                + "Create the table with the 'delta.enableChangeDataFeed' property set to 'true'.");
-        }
+        ValidateChangeDataStageable(CurrentSnapshot, changeType);
 
         return await ChangeDataFeed.CdfWriter.WriteAsync(
             _fs, CurrentSnapshot, rows, changeType,
@@ -3413,7 +3413,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         ValidateWritable(snapshot, isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
 
-        var actions = await ComputeWriteActionsAsync(
+        var (actions, _) = await ComputeWriteActionsAsync(
             snapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
             cancellationToken).ConfigureAwait(false);
 
@@ -3433,14 +3433,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the append path of <see cref="DeltaTransaction"/> — the transaction only calls it with
     /// <see cref="DeltaWriteMode.Append"/>, so the overwrite branches stay inert there.
     /// </summary>
-    internal async ValueTask<IReadOnlyList<DeltaAction>> ComputeWriteActionsAsync(
+    /// <param name="rowIdStart">Where this batch of adds begins reserving stable row ids, for a caller staging
+    /// SEVERAL appends against one snapshot (a transaction): each call must continue from the previous call's
+    /// <c>NextRowId</c>, not restart at the snapshot's high-water mark, or the two batches reserve the SAME ids.
+    /// Null starts at the snapshot's mark, which is right for a single-shot commit.</param>
+    internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId)> ComputeWriteActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode,
         IReadOnlyDictionary<string, string>? overwritePartitions,
         bool dynamicPartitionOverwrite,
         IReadOnlyList<string>? repartitionTo,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long? rowIdStart = null)
     {
         // Nanosecond and second Arrow timestamps have no faithful Delta/Parquet encoding. Creation and
         // schema evolution reject them via SchemaConverter, but a write into an EXISTING table converts no
@@ -3546,7 +3551,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Row tracking: prepare high water mark
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
         long newVersion = snapshot.Version + 1;
 
         // Identity columns: prepare configs
@@ -3758,7 +3763,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
-        return actions;
+        return (actions, nextRowId);
     }
 
     /// <summary>
@@ -4312,6 +4317,126 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The preconditions for writing a <c>_change_data</c> file: the table must be writable at its protocol,
+    /// have Change Data Feed on (a CDC file on a non-CDF table is dead weight no reader consults), and the
+    /// change type must be one the spec defines. Shared by <see cref="WriteChangeDataFileAsync"/> and
+    /// <see cref="DeltaTransaction.StageChangeDataAsync"/>.
+    /// </summary>
+    internal void ValidateChangeDataStageable(Snapshot.Snapshot snapshot, string changeType)
+    {
+        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        if (changeType is not (DeltaLake.ChangeDataFeed.CdfConfig.Insert
+            or DeltaLake.ChangeDataFeed.CdfConfig.Delete
+            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage
+            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage))
+        {
+            throw new ArgumentException(
+                $"changeType must be one of 'insert', 'delete', 'update_preimage', 'update_postimage' "
+                + $"(got '{changeType}').", nameof(changeType));
+        }
+        if (!DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration))
+        {
+            throw new InvalidOperationException(
+                "Change Data Feed is not enabled on this table — a _change_data file would never be read. "
+                + "Create the table with the 'delta.enableChangeDataFeed' property set to 'true'.");
+        }
+    }
+
+    /// <summary>
+    /// Builds the <c>add</c> actions for files a host already wrote, against <paramref name="snapshot"/> and
+    /// WITHOUT committing — the staging counterpart of <see cref="CommitDataFilesAsync"/>' per-file loop, for
+    /// <see cref="DeltaTransaction.StageDataFiles"/>. Append-shaped only: the overwrite family removes the
+    /// active set, which is exactly what a rebase cannot re-derive, so a transaction does not stage it.
+    /// </summary>
+    internal (IReadOnlyList<DeltaAction> Actions, long NextRowId) BuildStagedAppendActions(
+        Snapshot.Snapshot snapshot, IReadOnlyList<WrittenDataFile> files, long? rowIdStart)
+    {
+        if (files.Count > 0 && !SupportsExternalDataFileCommit)
+        {
+            throw new NotSupportedException(
+                "StageDataFiles: table has identity columns or IcebergCompat — these require engineered-wood's "
+                + "own writer (check SupportsExternalDataFileCommit, or stage via WriteAsync).");
+        }
+
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        long newVersion = snapshot.Version + 1;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var actions = new List<DeltaAction>(files.Count + 1);
+
+        foreach (var f in files)
+        {
+            actions.Add(new AddFile
+            {
+                Path = DeltaPath.Encode(f.RelativePath),
+                PartitionValues = f.PartitionValues ?? new Dictionary<string, string>(),
+                Size = f.SizeBytes,
+                ModificationTime = now,
+                DataChange = true,
+                Stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}",
+                BaseRowId = rowTrackingEnabled ? nextRowId : null,
+                DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                Tags = f.Tags,
+            });
+            if (rowTrackingEnabled)
+                nextRowId += f.NumRecords;
+        }
+
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+
+        return (actions, nextRowId);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="rows"/> as <c>_change_data</c> file(s) against <paramref name="snapshot"/>,
+    /// splitting by partition per the data-file convention — each partition's rows in their own file, the
+    /// partition columns OUT of the bytes, and the file's <c>partitionValues</c> physical-keyed. The
+    /// partition-aware counterpart of <see cref="WriteChangeDataFileAsync"/>, which takes the values ready-made:
+    /// producing them means encoding the Delta partition-value convention (null as JSON null rather than the
+    /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel, dates and timestamps in the spec's formats), which
+    /// no caller outside this assembly can do — <see cref="Partitioning.PartitionUtils"/> is internal.
+    /// On an unpartitioned table this is one file, so a caller need not special-case it.
+    /// </summary>
+    internal async ValueTask<IReadOnlyList<CdcFile>> WriteChangeDataFilesForAsync(
+        Snapshot.Snapshot snapshot, RecordBatch rows, string changeType, CancellationToken cancellationToken)
+    {
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        if (partitionColumns is not { Count: > 0 })
+        {
+            return
+            [
+                await ChangeDataFeed.CdfWriter.WriteAsync(
+                    _fs, snapshot, rows, changeType, EmptyPartitionValues, _options.ParquetWriteOptions,
+                    cancellationToken).ConfigureAwait(false),
+            ];
+        }
+
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+        var written = new List<CdcFile>();
+        foreach (var (partValues, dataBatch) in Partitioning.PartitionUtils.SplitByPartition(rows, partitionColumns))
+        {
+            if (dataBatch.Length == 0)
+                continue;
+            IReadOnlyDictionary<string, string> keyed = partValues;
+            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            {
+                var byPhysical = new Dictionary<string, string>(partValues.Count, StringComparer.Ordinal);
+                foreach (var kv in partValues)
+                    byPhysical[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                keyed = byPhysical;
+            }
+            // CdfWriter strips the partition columns itself, but SplitByPartition already removed them; the
+            // second removal is a no-op, so the batch arrives shaped exactly like a data file's.
+            written.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                _fs, snapshot, dataBatch, changeType, keyed, _options.ParquetWriteOptions,
+                cancellationToken).ConfigureAwait(false));
+        }
+        return written;
+    }
+
+    /// <summary>
     /// Plans the scan for a predicate WITHOUT reading any data: returns the snapshot's active files that
     /// might contain matching rows, each with its ordinal in the path-sorted active set. This is the same
     /// superset-safe verdict the library's own read paths apply — a file is dropped only when its partition
@@ -4393,10 +4518,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot? resolveAgainst = null)
     {
         ThrowIfDisposed();
-        var snapshot = resolveAgainst ?? CurrentSnapshot;
+        var result = await ComputeDvActionsWithEditsAsync(
+            positionsByOrdinal, resolveAgainst ?? CurrentSnapshot, cancellationToken).ConfigureAwait(false);
+        return (result.Actions, result.RowsDeleted);
+    }
+
+    /// <summary>
+    /// The body of <see cref="ComputeDeletionVectorActionsAsync"/>, additionally reporting the per-file
+    /// <see cref="DeleteDvEdit"/>s and the touched paths. A <see cref="DeltaTransaction"/> needs those: the edits
+    /// are what let the commit loop reconcile this delete row-by-row against a concurrent one rather than abort,
+    /// and the paths are its read-set. The public wrapper drops them because a caller driving the rebase by hand
+    /// passes its positions back to <see cref="RebaseDvDmlActionsAsync"/> instead.
+    /// </summary>
+    internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, IReadOnlyList<DeleteDvEdit> Edits,
+        IReadOnlyList<string> TouchedPaths, long RowsDeleted)> ComputeDvActionsWithEditsAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        Snapshot.Snapshot snapshot,
+        CancellationToken cancellationToken)
+    {
         var ordered = OrderedActiveFiles(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
+        var edits = new List<DeleteDvEdit>();
+        var touched = new List<string>();
         long totalDeleted = 0;
 
         foreach (var kvp in positionsByOrdinal)
@@ -4412,12 +4556,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 : new HashSet<long>();
 
             long newlyDeleted = 0;
+            var newRows = new List<long>();
             foreach (long p in kvp.Value)
+            {
                 if (allDeleted.Add(p))
+                {
                     newlyDeleted++;
+                    // Only the rows NEWLY hidden are this delete's intent — a position the file's existing
+                    // vector already covered was deleted by an earlier commit, and replaying it as ours would
+                    // make a concurrent writer's overlapping delete look like a row-level conflict.
+                    newRows.Add(p);
+                }
+            }
             if (newlyDeleted == 0)
                 continue;
             totalDeleted += newlyDeleted;
+            edits.Add(new DeleteDvEdit(addFile.Path, newRows));
+            touched.Add(addFile.Path);
 
             var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
                 .ConfigureAwait(false);
@@ -4437,7 +4592,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             });
         }
 
-        return (actions, totalDeleted);
+        return (actions, edits, touched, totalDeleted);
     }
 
     /// <summary>
