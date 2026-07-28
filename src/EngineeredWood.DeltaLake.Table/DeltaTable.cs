@@ -2065,6 +2065,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                     currentActions = resolution.Value.Actions;
                     resolvedPaths = resolution.Value.ResolvedPaths;
+
+                    // Under Serializable, commit order IS the logical order: a concurrent commit that CHANGED
+                    // DATA in a file this delete read may not be reconciled away, however disjoint the rows —
+                    // that is the interleaving the stricter level exists to forbid, and the level's own rule
+                    // (IsolationLevel) is that a dataChange=true remove of a file we read conflicts at BOTH
+                    // levels. So the reconciliation survives here only where the concurrent commit did not
+                    // change data: a compaction's dataChange=false rewrite rearranges bytes without changing
+                    // which rows the table contains, so remapping our rows onto the new file admits no
+                    // interleaving the level forbids. Dropping a path from the resolved set does not force a
+                    // conflict — it just restores the normal checks for it, so a delete whose files nobody
+                    // touched still rebases and lands.
+                    if (isolationLevel == IsolationLevel.Serializable)
+                        resolvedPaths = KeepOnlyDataPreservingResolutions(resolvedPaths, concurrent);
                 }
                 else
                 {
@@ -2093,6 +2106,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
         }
+    }
+
+    /// <summary>
+    /// Narrows a row-level resolution to what <see cref="IsolationLevel.Serializable"/> admits: the paths no
+    /// concurrent commit removed with <c>dataChange=true</c>.
+    ///
+    /// <para>Row-level reconciliation has two mechanisms, and the isolation level bounds them differently.
+    /// The DV union reconciles a concurrent DELETE — a <c>dataChange=true</c> remove/re-add of a file this
+    /// transaction read — which is a conflict at both levels, so under Serializable it must not be silenced.
+    /// The remap across a rewrite reconciles a COMPACTION, whose removes and adds carry
+    /// <c>dataChange=false</c>: contents unchanged, only rearranged, which the conflict checker already
+    /// exempts from read conflicts at both levels. Relocating rows across it admits no non-serializable
+    /// interleaving, so it survives here. A copy-on-write UPDATE's rewrite is a <c>dataChange=true</c> remove
+    /// and is dropped with the rest.</para>
+    ///
+    /// <para>Gating the resolution as a whole (one bool for both mechanisms) would abort the compaction case
+    /// too, which no reading of the level requires.</para>
+    /// </summary>
+    private static ISet<string> KeepOnlyDataPreservingResolutions(
+        ISet<string> resolvedPaths,
+        IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent)
+    {
+        var kept = new HashSet<string>(resolvedPaths, StringComparer.Ordinal);
+        foreach (var (_, actions) in concurrent)
+        {
+            foreach (var action in actions)
+            {
+                if (action is RemoveFile { DataChange: true } remove)
+                    kept.Remove(remove.Path);
+            }
+        }
+
+        return kept;
     }
 
     /// <summary>
