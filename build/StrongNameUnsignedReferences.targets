@@ -1,0 +1,133 @@
+<Project>
+
+  <!--
+    Strong-names unsigned NuGet references at build time.
+
+    Needed because this repository's assemblies are signed (see the root
+    Directory.Build.props) and .NET Framework refuses to bind an unsigned assembly from a
+    signed one: the net472 legs fail at run time with "A strongly-named assembly is
+    required" (HRESULT 0x80131044). .NET Core does not enforce that rule, so net8.0 and
+    net10.0 pass either way and the failure only ever appears on the net472 leg.
+
+    The test and benchmark projects cannot simply be left unsigned instead: they are named
+    as friends by the signed libraries under src/, and a signed assembly may only grant
+    InternalsVisibleTo to another signed assembly (CS1726).
+
+    ParquetSharp is the only unsigned assembly left in the graph and is still unsigned at
+    24.0.0, so there is nothing to upgrade to. Its own managed dependencies (Apache.Arrow,
+    Microsoft.Bcl.HashCode, System.Memory) are all signed already, so signing it alone is
+    enough — there is no cascade.
+
+    A project opts in by importing this file and listing assembly names:
+
+      <ItemGroup>
+        <UnsignedReferenceToSign Include="ParquetSharp" />
+      </ItemGroup>
+
+    Nothing signed here is ever distributed. These projects do not pack, and the rewritten
+    copies live in obj/. The originals in the NuGet cache are never modified — rewriting
+    them in place would corrupt the package for every other project on the machine and make
+    builds depend on whether this had run before.
+  -->
+
+  <PropertyGroup>
+    <_CecilAssembly>$(PkgMono_Cecil)/lib/netstandard2.0/Mono.Cecil.dll</_CecilAssembly>
+  </PropertyGroup>
+
+  <!--
+    Mono.Cecil is loaded by path with Assembly.LoadFrom and driven through reflection rather
+    than being declared as a <Reference>. An inline task's assembly is compiled and loaded
+    from memory, and MSBuild does not reliably resolve third-party references for it at run
+    time; loading by an explicit path removes that failure mode entirely.
+  -->
+  <UsingTask TaskName="StrongNameAssembly"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <CecilPath ParameterType="System.String" Required="true" />
+      <InputPath ParameterType="System.String" Required="true" />
+      <OutputPath ParameterType="System.String" Required="true" />
+      <KeyPath ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs">
+        <![CDATA[
+          var cecil = System.Reflection.Assembly.LoadFrom(CecilPath);
+          var assemblyDefinition = cecil.GetType("Mono.Cecil.AssemblyDefinition");
+          var writerParameters = cecil.GetType("Mono.Cecil.WriterParameters");
+
+          System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(OutputPath));
+
+          var read = assemblyDefinition.GetMethod("ReadAssembly", new System.Type[] { typeof(string) });
+          var assembly = read.Invoke(null, new object[] { InputPath });
+          try
+          {
+              var parameters = System.Activator.CreateInstance(writerParameters);
+              writerParameters.GetProperty("StrongNameKeyBlob")
+                              .SetValue(parameters, System.IO.File.ReadAllBytes(KeyPath));
+
+              var write = assemblyDefinition.GetMethod(
+                  "Write", new System.Type[] { typeof(string), writerParameters });
+              write.Invoke(assembly, new object[] { OutputPath, parameters });
+          }
+          finally
+          {
+              ((System.IDisposable)assembly).Dispose();
+          }
+
+          Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+              "Strong-named " + System.IO.Path.GetFileName(InputPath) + " -> " + OutputPath);
+        ]]>
+      </Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="StrongNameUnsignedReferences"
+          AfterTargets="ResolveAssemblyReferences"
+          Condition="'@(UnsignedReferenceToSign)' != '' and '$(SignAssembly)' == 'true'">
+
+    <Error Condition="!Exists('$(_CecilAssembly)')"
+           Text="Mono.Cecil was not found at $(_CecilAssembly). A project importing StrongNameUnsignedReferences.targets must reference Mono.Cecil with GeneratePathProperty=&quot;true&quot;." />
+
+    <PropertyGroup>
+      <_NamesToSign>;@(UnsignedReferenceToSign);</_NamesToSign>
+
+      <!--
+        Resolved here rather than at import time: IntermediateOutputPath is not set until the
+        SDK targets have been imported, which happens after this file. Computing it during
+        evaluation yields <project>/signed-refs/ — shared by every TargetFramework, so with
+        the up-to-date check below the first inner build to run would win and the others
+        would silently bind ITS ParquetSharp (net472 against the net8.0 build, say). Inside
+        the target the path is per-TFM, which is what keeps the three builds apart. It also
+        keeps the rewritten copies under obj/, where they are already gitignored.
+      -->
+      <_SignedReferenceDir>$(MSBuildProjectDirectory)/$(IntermediateOutputPath)signed-refs/</_SignedReferenceDir>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <_ReferenceToSign Include="@(ReferencePath)"
+                        Condition="$(_NamesToSign.Contains(';%(Filename);'))" />
+    </ItemGroup>
+
+    <!--
+      The signed copy is keyed by package version, so upgrading the package produces a new
+      path rather than silently reusing a stale rewrite of the previous one.
+    -->
+    <StrongNameAssembly CecilPath="$(_CecilAssembly)"
+                        InputPath="%(_ReferenceToSign.FullPath)"
+                        OutputPath="$(_SignedReferenceDir)%(_ReferenceToSign.NuGetPackageVersion)/%(_ReferenceToSign.Filename)%(_ReferenceToSign.Extension)"
+                        KeyPath="$(AssemblyOriginatorKeyFile)"
+                        Condition="!Exists('$(_SignedReferenceDir)%(_ReferenceToSign.NuGetPackageVersion)/%(_ReferenceToSign.Filename)%(_ReferenceToSign.Extension)')" />
+
+    <ItemGroup>
+      <_SignedReference Include="$(_SignedReferenceDir)%(_ReferenceToSign.NuGetPackageVersion)/%(_ReferenceToSign.Filename)%(_ReferenceToSign.Extension)" />
+
+      <!-- Compile against the signed copy, and copy it to the output instead of the original. -->
+      <ReferencePath Remove="@(_ReferenceToSign)" />
+      <ReferencePath Include="@(_SignedReference)" />
+      <ReferenceCopyLocalPaths Remove="@(_ReferenceToSign)" />
+      <ReferenceCopyLocalPaths Include="@(_SignedReference)" />
+    </ItemGroup>
+  </Target>
+
+</Project>
