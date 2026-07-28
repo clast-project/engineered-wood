@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.RowTracking;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
 
@@ -10,7 +11,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
 /// The read-side TRANSIENT row-id surface — <see cref="DeltaTable.ReadAllWithRowIdsAsync"/> /
-/// <see cref="DeltaTable.ReadAtVersionWithRowIdsAsync"/> append a trailing <c>_metadata.row_id</c> =
+/// <see cref="DeltaTable.ReadAtVersionWithRowIdsAsync"/> append a trailing <c>_ew_row_address</c> =
 /// <c>(fileOrdinal &lt;&lt; 40) | absolutePosition</c>, and <see cref="DeltaTable.OrderedActiveBaseRowIdsAsync"/>
 /// gives the per-ordinal <c>baseRowId</c>. NOT a stable Delta id — it round-trips WITHIN a snapshot to the
 /// row-id DML surface (a host reads rows, keeps the ids, then deletes/updates exactly those rows). This is the
@@ -34,7 +35,6 @@ public class ReadWithRowIdsTests : IDisposable
         }
     }
 
-    private const int RowIdPositionBits = 40;
 
     private static Apache.Arrow.Schema IdSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -58,7 +58,7 @@ public class ReadWithRowIdsTests : IDisposable
         await foreach (var batch in batches)
         {
             var id = (Int64Array)batch.Column("id");
-            var rid = (Int64Array)batch.Column("_metadata.row_id");
+            var rid = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
                 rows.Add((id.GetValue(i)!.Value, rid.GetValue(i)!.Value));
         }
@@ -90,12 +90,12 @@ public class ReadWithRowIdsTests : IDisposable
         // Each transient id decodes to (path-sorted ordinal, in-file position). Two files → ordinals 0 and 1;
         // every id maps back to exactly one file, and positions restart per file.
         var byOrdinal = rows
-            .GroupBy(r => (int)(r.RowId >> RowIdPositionBits))
+            .GroupBy(r => TransientRowAddress.FileOrdinal(r.RowId))
             .OrderBy(g => g.Key).ToList();
         Assert.Equal(2, byOrdinal.Count);
         foreach (var g in byOrdinal)
         {
-            var positions = g.Select(r => r.RowId & ((1L << RowIdPositionBits) - 1)).OrderBy(p => p).ToArray();
+            var positions = g.Select(r => TransientRowAddress.Position(r.RowId)).OrderBy(p => p).ToArray();
             Assert.Equal(Enumerable.Range(0, g.Count()).Select(i => (long)i).ToArray(), positions);
         }
     }
@@ -134,10 +134,11 @@ public class ReadWithRowIdsTests : IDisposable
         var toDelete = rows.Where(r => r.Id is 3 or 4).Select(r => r.RowId).ToList();
 
         // decode the transient ids into positionsByOrdinal and drive the DV DELETE
-        long posMask = (1L << RowIdPositionBits) - 1;
         var positionsByOrdinal = toDelete
-            .GroupBy(rid => (int)(rid >> RowIdPositionBits))
-            .ToDictionary(g => g.Key, g => (IReadOnlyCollection<long>)g.Select(rid => rid & posMask).ToList());
+            .GroupBy(TransientRowAddress.FileOrdinal)
+            .ToDictionary(
+                g => g.Key,
+                g => (IReadOnlyCollection<long>)g.Select(TransientRowAddress.Position).ToList());
 
         var pinned = table.CurrentSnapshot;
         var (dvActions, deleted) = await table.ComputeDeletionVectorActionsAsync(
@@ -186,5 +187,73 @@ public class ReadWithRowIdsTests : IDisposable
         rows.Sort();
         Assert.Equal(new long[] { 1, 2, 3 }, rows.Select(r => r.Id).ToArray());
         Assert.Equal(new long[] { 0, 1, 2 }, rows.Select(r => r.RowId).ToArray()); // one file at v1
+    }
+
+    // ── the address is not the identity ──
+
+    /// <summary>
+    /// The emitted column must NOT be Spark's <c>_metadata.row_id</c>. The two were once the same string, and
+    /// a host reading that name expecting the STABLE row-tracking id instead got a snapshot-scoped address —
+    /// a different number, silently. This is the guard on that separation, and on the name
+    /// <c>_metadata.row_id</c> staying free for the stable id it belongs to.
+    /// </summary>
+    [Fact]
+    public async Task EmittedColumn_IsTheAddress_NotSparksStableRowIdName()
+    {
+        Assert.NotEqual(RowTrackingConfig.RowIdColumnName, TransientRowAddress.ColumnName);
+
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 3)]);
+
+        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        {
+            Assert.True(batch.Schema.GetFieldIndex(TransientRowAddress.ColumnName) >= 0);
+            Assert.True(batch.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName) < 0);
+        }
+    }
+
+    [Fact]
+    public void PackAndUnpack_RoundTrip()
+    {
+        Assert.Equal(0, TransientRowAddress.FileOrdinal(TransientRowAddress.Pack(0, 0)));
+        Assert.Equal(0, TransientRowAddress.Position(TransientRowAddress.Pack(0, 0)));
+
+        foreach (var (ordinal, position) in new[]
+        {
+            (0, 0L), (0, 1L), (1, 0L), (7, 12345L),
+            (TransientRowAddress.MaxFileOrdinal, 0L),
+            (0, TransientRowAddress.MaxPosition),
+            (123, TransientRowAddress.MaxPosition),
+        })
+        {
+            long address = TransientRowAddress.Pack(ordinal, position);
+            Assert.True(address >= 0); // the packing must never spill into the sign bit
+            Assert.Equal(ordinal, TransientRowAddress.FileOrdinal(address));
+            Assert.Equal(position, TransientRowAddress.Position(address));
+        }
+    }
+
+    /// <summary>The helpers must agree with what the read path actually emits — they are what a host decodes
+    /// an address with, so a drift between them would be silent.</summary>
+    [Fact]
+    public async Task Helpers_DecodeWhatTheReadPathEmits()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
+        await table.WriteAsync([Batch(1, 2)]);
+        await table.WriteAsync([Batch(100, 3)]);
+
+        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var byOrdinal = rows.GroupBy(r => TransientRowAddress.FileOrdinal(r.RowId))
+            .OrderBy(g => g.Key).ToList();
+
+        Assert.Equal(new[] { 0, 1 }, byOrdinal.Select(g => g.Key).ToArray());
+        foreach (var group in byOrdinal)
+        {
+            var positions = group.Select(r => TransientRowAddress.Position(r.RowId)).OrderBy(p => p).ToArray();
+            Assert.Equal(Enumerable.Range(0, positions.Length).Select(i => (long)i).ToArray(), positions);
+            foreach (var row in group)
+                Assert.Equal(row.RowId, TransientRowAddress.Pack(group.Key, TransientRowAddress.Position(row.RowId)));
+        }
     }
 }

@@ -38,7 +38,6 @@ public class HostRowIdentityTests : IDisposable
         }
     }
 
-    private const int RowIdPositionBits = 40;
 
     private static Apache.Arrow.Schema BuildSchema() => new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -65,7 +64,7 @@ public class HostRowIdentityTests : IDisposable
     /// Every row's (user id → STABLE row id) resolved the way a spec reader does: read each active file's
     /// parquet directly, take the materialized row-id column where the file has one, else derive
     /// <c>baseRowId + position</c>. Deliberately NOT via <c>ReadAllWithRowIdsAsync</c>, whose
-    /// <c>_metadata.row_id</c> column is the snapshot-relative TRANSIENT address — same name, different
+    /// <c>_ew_row_address</c> column is the snapshot-relative TRANSIENT address — same name, different
     /// number (it is documented as "NOT a stable Delta row id").
     /// </summary>
     private async Task<Dictionary<long, long?>> StableIdsAsync(DeltaTable table)
@@ -102,12 +101,12 @@ public class HostRowIdentityTests : IDisposable
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
-            var rids = (Int64Array)batch.Column("_metadata.row_id");
+            var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
             {
                 long rid = rids.GetValue(i)!.Value;
                 located[ids.GetValue(i)!.Value] =
-                    ((int)(rid >> RowIdPositionBits), rid & ((1L << RowIdPositionBits) - 1));
+                    (TransientRowAddress.FileOrdinal(rid), TransientRowAddress.Position(rid));
             }
         }
         return located;
@@ -145,7 +144,7 @@ public class HostRowIdentityTests : IDisposable
         Assert.Equal(want.OrderBy(x => x), returned.Select(r => r.RowId).OrderBy(x => x));
 
         static long Rid((int Ordinal, long Position) p) =>
-            ((long)p.Ordinal << RowIdPositionBits) | p.Position;
+            TransientRowAddress.Pack(p.Ordinal, p.Position);
     }
 
     [Fact]
@@ -155,8 +154,8 @@ public class HostRowIdentityTests : IDisposable
             Fs, BuildSchema(), enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 5)]);
         var at = await LocateRowsAsync(table);
-        long deletedRid = ((long)at[3].Ordinal << RowIdPositionBits) | at[3].Position;
-        long keptRid = ((long)at[4].Ordinal << RowIdPositionBits) | at[4].Position;
+        long deletedRid = TransientRowAddress.Pack(at[3].Ordinal, at[3].Position);
+        long keptRid = TransientRowAddress.Pack(at[4].Ordinal, at[4].Position);
 
         await table.DeleteAsync(Ex.Equal("id", 3L));
 
@@ -417,5 +416,5 @@ public class HostRowIdentityTests : IDisposable
     }
 
     private static long Rid((int Ordinal, long Position) p) =>
-        ((long)p.Ordinal << RowIdPositionBits) | p.Position;
+        TransientRowAddress.Pack(p.Ordinal, p.Position);
 }

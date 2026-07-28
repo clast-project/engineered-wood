@@ -37,7 +37,6 @@ public class PlanFilesTests : IDisposable
         }
     }
 
-    private const int RowIdPositionBits = 40;
 
     private static Apache.Arrow.Schema IdSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -76,10 +75,10 @@ public class PlanFilesTests : IDisposable
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
-            var rids = (Int64Array)batch.Column("_metadata.row_id");
+            var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
             {
-                int ordinal = (int)(rids.GetValue(i)!.Value >> RowIdPositionBits);
+                int ordinal = TransientRowAddress.FileOrdinal(rids.GetValue(i)!.Value);
                 if (!byOrdinal.TryGetValue(ordinal, out var list))
                     byOrdinal[ordinal] = list = [];
                 list.Add(ids.GetValue(i)!.Value);

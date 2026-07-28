@@ -113,7 +113,7 @@ public class PartitionedRewriteLayoutTests : IDisposable
         await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
         {
             var id = (Int64Array)b.Column("id");
-            var rid = (Int64Array)b.Column("_metadata.row_id");
+            var rid = (Int64Array)b.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < b.Length; i++)
                 if (wanted.Contains(id.GetValue(i)!.Value))
                     result.Add(rid.GetValue(i)!.Value);
@@ -191,7 +191,7 @@ public class PartitionedRewriteLayoutTests : IDisposable
             long rid = (await RowIdsOfAsync(table, 3)).Single();
             var updates = new RecordBatch(
                 new Apache.Arrow.Schema.Builder()
-                    .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                    .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
                     .Field(new Field("val", Int64Type.Default, true))
                     .Build(),
                 [

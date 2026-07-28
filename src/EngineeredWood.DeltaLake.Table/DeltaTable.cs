@@ -3200,9 +3200,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     // ── Read-side transient row ids ────────────────────────────────────────────────────────────────────
     //
-    // A read that appends a trailing non-null Int64 _metadata.row_id = (fileOrdinal << RowIdPositionBits) |
-    // ABSOLUTE in-file position (path-sorted active set; the DV-inclusive parquet row index). NOT a stable
-    // Delta row id — valid only within one snapshot. It round-trips to the row-id DML surface
+    // A read that appends a trailing non-null Int64 TransientRowAddress.ColumnName = (fileOrdinal <<
+    // PositionBits) | ABSOLUTE in-file position (path-sorted active set; the DV-inclusive parquet row index).
+    // NOT a stable Delta row id — valid only within one snapshot. It round-trips to the row-id DML surface
     // (ComputeDeletionVectorActionsAsync / ReadRowsByRowIdsAsync consume the same (ordinal, absPos)), so a host
     // (e.g. DuckDB) can read rows, keep the ids, then delete/update exactly those rows — even on a plain table
     // with no deletion vectors or row-tracking feature, the maximally reader-compatible path.
@@ -3228,8 +3228,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Like <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
-    /// but appends a trailing non-null Int64 <c>_metadata.row_id</c> = a TRANSIENT rowid
-    /// <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c>. NOT a stable Delta row id — it
+    /// but appends a trailing non-null Int64 <c>_ew_row_address</c> = a TRANSIENT rowid
+    /// <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c>. NOT a stable Delta row id — it
     /// round-trips to the row-id DML surface within the SAME snapshot so a host can locate the rows it read
     /// (a plain copy-on-write DELETE needs no deletion vectors or row tracking).
     /// </summary>
@@ -3244,7 +3244,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Time travel WITH the transient rowid column — the version analog of <see cref="ReadAllWithRowIdsAsync"/>.
-    /// Each batch carries the trailing <c>_metadata.row_id</c> over the version's path-sorted active files.
+    /// Each batch carries the trailing <c>_ew_row_address</c> over the version's path-sorted active files.
     /// </summary>
     public async IAsyncEnumerable<RecordBatch> ReadAtVersionWithRowIdsAsync(
         long version,
@@ -3261,7 +3261,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
-    // Shared iterator: path-sorted active files, each emitted batch carrying the trailing _metadata.row_id built
+    // Shared iterator: path-sorted active files, each emitted batch carrying the trailing TransientRowAddress.ColumnName built
     // from ReadFileAsync's absolute-position out-param (master surfaces positions as an out-param rather than an
     // appended column, so the wrapper appends the transient id itself — keeping ReadFileAsync's read path intact).
     private async IAsyncEnumerable<RecordBatch> ReadWithTransientRowIdsAsync(
@@ -3292,10 +3292,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     long absolute = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
                         ? absPos.GetValue(i)!.Value : i;
-                    idb.Append(((long)ordinal << RowIdPositionBits) | absolute);
+                    idb.Append(TransientRowAddress.Pack(ordinal, absolute));
                 }
                 yield return RowTracking.RowTrackingWriter.AddRowIdColumn(
-                    batch, idb.Build(), DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn);
+                    batch, idb.Build(), TransientRowAddress.ColumnName);
             }
         }
     }
@@ -4440,8 +4440,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // active set (OrderedActiveFiles) — stable within one snapshot, which is why a buffered transaction pins the
     // version its ordinals were captured against (atVersion / resolveAgainst) and re-validates before committing.
 
-    // The transient rowid packs (path-sorted file ordinal &lt;&lt; RowIdPositionBits) | absolute-in-file position.
-    private const int RowIdPositionBits = 40;
+    // The transient rowid packs (path-sorted file ordinal, absolute in-file position) — see
+    // <see cref="TransientRowAddress"/>, which owns the encoding and the public pack/unpack helpers.
 
     private static List<Actions.AddFile> OrderedActiveFiles(Snapshot.Snapshot snapshot)
     {
@@ -4758,14 +4758,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or use the copy-on-write "
                 + "DeleteByRowIdsAsync.");
 
-        long posMask = (1L << RowIdPositionBits) - 1;
+
         var positionsByFile = new Dictionary<int, HashSet<long>>();
         foreach (var rid in rowIds)
         {
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = TransientRowAddress.FileOrdinal(rid);
             if (!positionsByFile.TryGetValue(ordinal, out var set))
                 positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(rid & posMask);
+            set.Add(TransientRowAddress.Position(rid));
         }
 
         var ordered = OrderedActiveFiles(snapshot);
@@ -4858,7 +4858,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Deletes the rows addressed by the TRANSIENT rowids in <paramref name="rowIds"/> (each =
-    /// <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c>, from <see cref="ReadAllWithRowIdsAsync"/>
+    /// <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c>, from <see cref="ReadAllWithRowIdsAsync"/>
     /// over the SAME snapshot) using <b>copy-on-write</b>: each affected file is rewritten without the deleted
     /// rows and committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO row-tracking feature needed,
     /// so the result is maximally reader-compatible (Fabric OneLake, Spark, delta-kernel). Row tracking, when
@@ -5013,14 +5013,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // Decodes transient rowids into absolute in-file positions per path-sorted file ordinal.
     private static Dictionary<int, HashSet<long>> DecodeRowIdPositions(IReadOnlyCollection<long> rowIds)
     {
-        long posMask = (1L << RowIdPositionBits) - 1;
+
         var positionsByFile = new Dictionary<int, HashSet<long>>();
         foreach (var rid in rowIds)
         {
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = TransientRowAddress.FileOrdinal(rid);
             if (!positionsByFile.TryGetValue(ordinal, out var set))
                 positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(rid & posMask);
+            set.Add(TransientRowAddress.Position(rid));
         }
         return positionsByFile;
     }
@@ -5128,7 +5128,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Per-file copy-on-write UPDATE by TRANSIENT rowid (the companion to <see cref="DeleteByRowIdsAsync"/>).
-    /// <paramref name="rowIds"/> = <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c> (same
+    /// <paramref name="rowIds"/> = <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c> (same
     /// encoding as <see cref="ReadAllWithRowIdsAsync"/>). Only files containing a target row are rewritten: each
     /// such file's user batches are read (DV-filtered, in position order) and handed to
     /// <paramref name="rewriteFile"/> — which returns the SAME rows with the SET columns modified on the matched
@@ -5165,7 +5165,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Copy-on-write UPDATE by TRANSIENT rowid from a batch of new values — the convenience form for the
     /// "update from a host-side join" scenario, so the caller supplies no substitution code at all.
     /// <paramref name="updates"/> carries one row per rowid to change: a rowid column (named
-    /// <paramref name="rowIdColumn"/>, default <see cref="DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn"/>
+    /// <paramref name="rowIdColumn"/>, default <see cref="TransientRowAddress.ColumnName"/>
     /// — what <see cref="ReadAllWithRowIdsAsync"/> emits) plus one column per SET column, named by its LOGICAL
     /// table-column name and typed to match. For every source row whose rowid appears in <paramref name="updates"/>,
     /// each SET column's value is replaced with the corresponding value from <paramref name="updates"/> (type-
@@ -5181,7 +5181,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         if (updates is null)
             throw new ArgumentNullException(nameof(updates));
-        rowIdColumn ??= DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn;
+        rowIdColumn ??= TransientRowAddress.ColumnName;
 
         int ridIdx = updates.Schema.GetFieldIndex(rowIdColumn);
         if (ridIdx < 0)
@@ -5323,7 +5323,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
                         ? absPos.GetValue(i)!.Value : i;
-                    ridb.Append(((long)ordinal << RowIdPositionBits) | abs);
+                    ridb.Append(TransientRowAddress.Pack(ordinal, abs));
                 }
                 rowIdsPerBatch.Add(ridb.Build());
             }
@@ -5430,7 +5430,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; RowIdPositionBits)
+    /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits)
     /// | absolutePosition</c> against the snapshot pinned by <paramref name="atVersion"/>) — the read-back step a
     /// buffered UPDATE's post-image is built from. Deletion-vector-excluded rows never match (the read filters
     /// them), and files without a requested position are not read.
@@ -5459,17 +5459,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
             ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
             : CurrentSnapshot;
-        long posMask = (1L << RowIdPositionBits) - 1;
+
         var positionsByFile = new Dictionary<int, HashSet<long>>();
         foreach (var rid in rowIds)
         {
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = TransientRowAddress.FileOrdinal(rid);
             if (!positionsByFile.TryGetValue(ordinal, out var set))
             {
                 set = new HashSet<long>();
                 positionsByFile[ordinal] = set;
             }
-            set.Add(rid & posMask);
+            set.Add(TransientRowAddress.Position(rid));
         }
 
         var ordered = OrderedActiveFiles(snapshot);
@@ -5485,7 +5485,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var absOut = new List<Int64Array?>();
             var idsOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
             var versOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
-            long ordinalBits = (long)kvp.Key << RowIdPositionBits;
+            int fileOrdinal = kvp.Key;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
                                                       strippedRowIdsOut: idsOut,
@@ -5521,7 +5521,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     var transient = new long[rows.Count];
                     for (int k = 0; k < rows.Count; k++)
-                        transient[k] = ordinalBits | absPos.GetValue(rows[k])!.Value;
+                        transient[k] = TransientRowAddress.Pack(fileOrdinal, absPos.GetValue(rows[k])!.Value);
                     rowIdsOut.Add(transient);
                 }
                 yield return TakeRowsFromBatch(batch, rows);

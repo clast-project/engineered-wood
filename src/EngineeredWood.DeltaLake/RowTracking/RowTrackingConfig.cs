@@ -13,16 +13,20 @@ public static class RowTrackingConfig
     public const string EnableKey = "delta.enableRowTracking";
 
     /// <summary>
-    /// The column name for materialized row IDs in data files.
-    /// This is a hidden metadata column, not part of the user-visible schema.
+    /// The spec's virtual column for a row's STABLE row id — what Spark exposes as
+    /// <c>_metadata.row_id</c>, resolved per row as the materialized value if the file has one, else
+    /// <c>add.baseRowId + position</c>. Reserved: engineered-wood resolves this value internally (see
+    /// <c>DeltaTable.ReadRowsByRowIdsAsync</c>' <c>sourceRowTrackingOut</c>) but does not yet surface it as a
+    /// read column of this name.
+    /// <para>NOT the address <c>ReadAllWithRowIdsAsync</c> emits — that is
+    /// <c>TransientRowAddress.ColumnName</c>, a snapshot-scoped locator rather than an identity. The two were
+    /// once the same string, which read as a promise of durability the address cannot keep.</para>
     /// </summary>
     public const string RowIdColumnName = "_metadata.row_id";
 
-    /// <summary>Virtual column name exposed to readers for the row ID.</summary>
-    public const string VirtualRowIdColumn = "_metadata.row_id";
-
-    /// <summary>Virtual column name exposed to readers for the commit version.</summary>
-    public const string VirtualRowCommitVersionColumn = "_metadata.row_commit_version";
+    /// <summary>The spec's virtual column for a row's stable COMMIT VERSION, the companion of
+    /// <see cref="RowIdColumnName"/> and reserved on the same terms.</summary>
+    public const string RowCommitVersionColumnName = "_metadata.row_commit_version";
 
     /// <summary>
     /// Returns true if row tracking is enabled for the table.

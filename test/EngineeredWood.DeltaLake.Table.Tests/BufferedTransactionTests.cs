@@ -234,7 +234,6 @@ public class BufferedTransactionTests : IDisposable
     // the rewriter also changed stays a row-level conflict, and a table without row tracking keeps the clean
     // rewrite conflict because there are no stable ids to follow.
 
-    private const int RowIdPositionBits = 40;
 
     private async Task<DeltaTable> CreateRowTrackedTableAsync(params (long Start, int Count)[] files)
     {
@@ -256,12 +255,12 @@ public class BufferedTransactionTests : IDisposable
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
-            var rids = (Int64Array)batch.Column("_metadata.row_id");
+            var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
             {
                 long rid = rids.GetValue(i)!.Value;
                 located[ids.GetValue(i)!.Value] =
-                    ((int)(rid >> RowIdPositionBits), rid & ((1L << RowIdPositionBits) - 1));
+                    (TransientRowAddress.FileOrdinal(rid), TransientRowAddress.Position(rid));
             }
         }
         return located;

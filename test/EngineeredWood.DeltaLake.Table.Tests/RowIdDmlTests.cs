@@ -56,7 +56,7 @@ public class RowIdDmlTests : IDisposable
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var id = (Int64Array)batch.Column("id");
-            var rid = (Int64Array)batch.Column("_metadata.row_id");
+            var rid = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
                 if (wanted.Contains(id.GetValue(i)!.Value))
                     result.Add(rid.GetValue(i)!.Value);
@@ -285,7 +285,7 @@ public class RowIdDmlTests : IDisposable
         long rid4 = (await RowIdsOf(table, 4)).Single();
         var updates = new RecordBatch(
             new Apache.Arrow.Schema.Builder()
-                .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
                 .Field(new Field("score", Int64Type.Default, true))
                 .Build(),
             [
@@ -447,7 +447,7 @@ public class RowIdDmlTests : IDisposable
         long rid2 = (await RowIdsOf(table, 2)).Single();
         var updates = new RecordBatch(
             new Apache.Arrow.Schema.Builder()
-                .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
                 .Field(new Field("score", Int64Type.Default, true))
                 .Build(),
             [

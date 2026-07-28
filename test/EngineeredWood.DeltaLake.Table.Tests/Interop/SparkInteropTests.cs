@@ -385,7 +385,7 @@ public class SparkInteropTests : IDisposable
             await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
             {
                 var id = (Int64Array)b.Column("id");
-                var rowId = (Int64Array)b.Column("_metadata.row_id");
+                var rowId = (Int64Array)b.Column(TransientRowAddress.ColumnName);
                 for (int i = 0; i < b.Length; i++)
                     if (id.GetValue(i) == 20) rid20 = rowId.GetValue(i)!.Value;
             }
@@ -1354,7 +1354,7 @@ public class SparkInteropTests : IDisposable
             partitionColumns: ["region"],
             configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
 
-    /// <summary>Transient rowids (<c>_metadata.row_id</c>) of the rows whose <c>id</c> is listed.</summary>
+    /// <summary>Transient row addresses (<c>_ew_row_address</c>) of the rows whose <c>id</c> is listed.</summary>
     private static async Task<List<long>> RowIdsOfAsync(DeltaTable table, params long[] ids)
     {
         var wanted = new HashSet<long>(ids);
@@ -1362,7 +1362,7 @@ public class SparkInteropTests : IDisposable
         await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
         {
             var id = (Int64Array)b.Column("id");
-            var rid = (Int64Array)b.Column("_metadata.row_id");
+            var rid = (Int64Array)b.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < b.Length; i++)
                 if (wanted.Contains(id.GetValue(i)!.Value))
                     result.Add(rid.GetValue(i)!.Value);
@@ -1401,7 +1401,7 @@ public class SparkInteropTests : IDisposable
             long rid2 = (await RowIdsOfAsync(table, 2)).Single();
             var updates = new RecordBatch(
                 new Apache.Arrow.Schema.Builder()
-                    .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                    .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
                     .Field(new Field("value", StringType.Default, true))
                     .Build(),
                 [

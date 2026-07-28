@@ -43,20 +43,26 @@ Files are returned with their deletion vectors unresolved. Read the deleted posi
 
 ## 3. Address rows
 
-`FileOrdinal` plus an absolute in-file position is the coordinate the row-level APIs speak. The read paths
-also emit it packed into a single value:
+`FileOrdinal` plus an absolute in-file position is the coordinate the row-level APIs speak, packed into one
+`long` by `TransientRowAddress`:
 
+```csharp
+long address = TransientRowAddress.Pack(fileOrdinal, positionInFile);
+int  ordinal  = TransientRowAddress.FileOrdinal(address);
+long position = TransientRowAddress.Position(address);
 ```
-transient row id = (fileOrdinal << 40) | absolutePositionInFile
-```
 
-`ReadAllWithRowIdsAsync` surfaces it as the `_metadata.row_id` column, so a host can correlate rows it read
-with the coordinates it later mutates. Note this is a *transient* address, valid only against the snapshot
-it came from — distinct from row **tracking**, whose `baseRowId` is a stable identity that survives rewrites.
+`ReadAllWithRowIdsAsync` emits it as the `TransientRowAddress.ColumnName` (`_ew_row_address`) column, so a
+host can correlate rows it read with the coordinates it later mutates. Use the helpers rather than
+open-coding the shift — the split is `TransientRowAddress.PositionBits` and is not part of the format.
 
-> **The name is shared, the number is not.** Spark's `_metadata.row_id` is the STABLE row-tracking id;
-> engineered-wood's `ReadAllWithRowIdsAsync` column of the same name is the transient address above. Do not
-> persist it or compare it across snapshots.
+> **An address, not an identity.** `_ew_row_address` says WHERE a row sits, and only in the snapshot it came
+> from: a concurrent append renumbers ordinals, and any rewrite moves positions. Never persist one, never
+> compare two from different snapshots.
+>
+> Delta's own stable id — Spark's `_metadata.row_id`, backed by row tracking's `baseRowId` — is a different
+> number, reported by `sourceRowTrackingOut` below. The two columns had the same name until recently, which
+> read as a promise of durability the address cannot keep.
 
 `ReadRowsByRowIdsAsync` reads exactly the rows for a set of those addresses, and reports both coordinates
 back through out-parameters:
