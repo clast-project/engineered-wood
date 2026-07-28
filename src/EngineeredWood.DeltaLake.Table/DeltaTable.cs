@@ -4897,16 +4897,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="CommitOccAsync"/>'s row-level path) instead of aborting. Returns the rows newly deleted and the
     /// committed version. The committing, DV-based sibling of <see cref="ComputeDeletionVectorActionsAsync"/>.
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
-        IReadOnlyCollection<long> rowIds,
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionViaVectorsAsync(
+        FileRowSelection selection,
         CancellationToken cancellationToken = default,
         bool rowLevelRetry = false)
     {
         ThrowIfDisposed();
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.RowsByFile.Count == 0)
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
@@ -4917,16 +4919,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 + "DeleteByRowIdsAsync.");
 
 
-        var positionsByFile = new Dictionary<int, HashSet<long>>();
-        foreach (var rid in rowIds)
-        {
-            int ordinal = TransientRowAddress.FileOrdinal(rid);
-            if (!positionsByFile.TryGetValue(ordinal, out var set))
-                positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(TransientRowAddress.Position(rid));
-        }
-
-        var ordered = OrderedActiveFiles(snapshot);
+        var resolved = ResolveSelection(selection, snapshot, nameof(DeleteBySelectionViaVectorsAsync));
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
@@ -4934,19 +4927,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvEdits = new List<DeleteDvEdit>();
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByFile)
+        foreach (var (addFile, positions) in resolved)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
 
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
                     .ConfigureAwait(false))
                 : new HashSet<long>();
             var newPositions = new List<long>();
-            foreach (long p in kvp.Value)
+            foreach (long p in positions)
                 if (allDeleted.Add(p))
                     newPositions.Add(p);
             if (newPositions.Count == 0)
@@ -6628,4 +6617,98 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _disposed = true;
         return default;
     }
+
+    /// <summary>The snapshot's active adds keyed by <c>add.path</c>. One active add per path is a log
+    /// invariant (a deletion-vector update is a remove+add pair), so a duplicate means an inconsistent log
+    /// rather than something to pick between.</summary>
+    private static Dictionary<string, Actions.AddFile> ActiveFilesByPath(Snapshot.Snapshot snapshot)
+    {
+        var byPath = new Dictionary<string, Actions.AddFile>(snapshot.ActiveFiles.Count, StringComparer.Ordinal);
+        foreach (var f in snapshot.ActiveFiles.Values)
+        {
+            // Dictionary.TryAdd does not exist on netstandard2.0 (this library targets it for net472).
+            if (byPath.ContainsKey(f.Path))
+            {
+                throw new DeltaFormatException(
+                    $"the active file set of version {snapshot.Version} contains more than one add for path "
+                    + $"'{f.Path}' — the log is inconsistent (a deletion-vector update must be a remove+add "
+                    + "pair, leaving one active add per path)");
+            }
+            byPath[f.Path] = f;
+        }
+        return byPath;
+    }
+
+    /// <summary>
+    /// Resolves a selection against <paramref name="snapshot"/>, THROWING on a path that is not active —
+    /// the whole point of keying by path. Sorted by path so the resulting actions are deterministic.
+    /// </summary>
+    /// <remarks>
+    /// Materialises one <see cref="HashSet{T}"/> per file deliberately. The copy-on-write loop probes the
+    /// selected positions ONCE PER ROW, so passing the caller's <see cref="IReadOnlyCollection{T}"/> straight
+    /// through compiles fine and silently binds those probes to LINQ's O(n) <c>Contains</c>, making the rewrite
+    /// O(rows × selected).
+    /// </remarks>
+    private static List<(Actions.AddFile File, HashSet<long> Positions)> ResolveSelection(
+        FileRowSelection selection, Snapshot.Snapshot snapshot, string op)
+    {
+        var byPath = ActiveFilesByPath(snapshot);
+        var resolved = new List<(Actions.AddFile, HashSet<long>)>(selection.RowsByFile.Count);
+        foreach (var kvp in selection.RowsByFile)
+        {
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+            {
+                throw new InvalidOperationException(
+                    $"{op}: file '{kvp.Key}' is not active in version {snapshot.Version} of the table — it was "
+                    + "removed or rewritten (compaction, copy-on-write) since the selection was captured; "
+                    + "re-read the rows to act on");
+            }
+            resolved.Add((addFile, kvp.Value as HashSet<long> ?? new HashSet<long>(kvp.Value)));
+        }
+        resolved.Sort((a, b) => string.CompareOrdinal(a.Item1.Path, b.Item1.Path));
+        return resolved;
+    }
+
+    /// <summary>
+    /// Decodes transient row addresses into a <see cref="FileRowSelection"/> against
+    /// <paramref name="snapshot"/> — what the rowid-keyed adapters do, kept in one place. Retains the
+    /// historical LENIENCY of those adapters: an ordinal outside the active set is skipped rather than
+    /// throwing, because that is their long-standing contract.
+    /// </summary>
+    private static FileRowSelection SelectionFromRowIds(
+        IReadOnlyCollection<long> rowIds, Snapshot.Snapshot snapshot)
+    {
+        var ordered = OrderedActiveFiles(snapshot);
+        var byPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (long rid in rowIds)
+        {
+            int ordinal = TransientRowAddress.FileOrdinal(rid);
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            string path = ordered[ordinal].Path;
+            if (!byPath.TryGetValue(path, out var set))
+                byPath[path] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(TransientRowAddress.Position(rid));
+        }
+        return new FileRowSelection(byPath);
+    }
+
+    /// <summary>
+    /// The rowid-keyed form of <see cref="DeleteBySelectionViaVectorsAsync"/>, kept for callers holding
+    /// transient addresses: it decodes them against the CURRENT snapshot and delegates. Prefer the
+    /// selection form when the caller knows the file — see <see cref="FileRowSelection"/> for why an
+    /// ordinal is a poor key at a DML boundary.
+    /// </summary>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
+        IReadOnlyCollection<long> rowIds,
+        CancellationToken cancellationToken = default,
+        bool rowLevelRetry = false)
+    {
+        ThrowIfDisposed();
+        if (rowIds.Count == 0)
+            return new ValueTask<(long, long)>((0L, CurrentSnapshot.Version));
+        return DeleteBySelectionViaVectorsAsync(
+            SelectionFromRowIds(rowIds, CurrentSnapshot), cancellationToken, rowLevelRetry);
+    }
+
 }
