@@ -133,6 +133,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// overwrite caller-supplied ones; caller-supplied row-tracking materialized column names win.</para>
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="preAssignedSchema">
+    /// A Delta schema whose column-mapping field ids and physical names were assigned BEFORE this call, used
+    /// verbatim in place of converting <paramref name="schema"/>. For a host that streams a CTAS's data files
+    /// eagerly, before the table exists: physical names are random GUIDs, so letting the create mint fresh
+    /// ones would orphan every file already written under the old names. Assign the mapping first, write the
+    /// files against it, then create with the same schema here.
+    /// <para><paramref name="schema"/> is ignored when this is supplied. Under column mapping the schema must
+    /// already carry ids; the metadata's max-column-id is derived from it rather than reassigned.</para>
+    /// </param>
     public static async ValueTask<DeltaTable> CreateAsync(
         ITableFileSystem fileSystem,
         Apache.Arrow.Schema schema,
@@ -143,7 +152,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool enableDeletionVectors = false,
         bool enableRowTracking = false,
         IReadOnlyDictionary<string, string>? configuration = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Schema.StructType? preAssignedSchema = null)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
@@ -166,8 +176,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (latestVersion >= 0)
             throw new InvalidOperationException("Delta table already exists.");
 
-        // Convert Arrow schema to Delta schema
-        var deltaSchema = SchemaConverter.FromArrowSchema(schema);
+        // Convert Arrow schema to Delta schema — unless the caller assigned one ALREADY (see the parameter
+        // doc: a CTAS whose data files were written before commit 0 exists).
+        var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -205,9 +216,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minReaderVersion = 2;
             minWriterVersion = 5;
 
-            // Assign column mapping IDs and physical names
-            var (mappedSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
-            deltaSchema = mappedSchema;
+            int maxId;
+            if (preAssignedSchema is not null)
+            {
+                // Re-assigning would mint FRESH physical names — random GUIDs — and every data file the
+                // caller already wrote under the old ones would become unreadable. Keep what was assigned and
+                // only derive the max id the metadata must record.
+                maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
+                if (maxId == 0)
+                {
+                    throw new DeltaFormatException(
+                        "preAssignedSchema declares no column-mapping field ids, but the table is being "
+                        + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
+                        + "writing the data files, or create without column mapping.");
+                }
+            }
+            else
+            {
+                // Assign column mapping IDs and physical names
+                var (mappedSchema, assignedMaxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
+                deltaSchema = mappedSchema;
+                maxId = assignedMaxId;
+            }
 
             string modeStr = mappingMode switch
             {
@@ -461,10 +491,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Opens an existing Delta table, or creates a new one if it doesn't exist.
     /// </summary>
     /// <remarks>
-    /// <paramref name="columnMappingMode"/> and <paramref name="configuration"/> apply only on the CREATE
-    /// path — an existing table keeps the mode and properties it was created with, because changing either
-    /// is a metadata commit (see <see cref="SetSchemaAsync"/>), not something an open should do silently.
+    /// <paramref name="columnMappingMode"/>, <paramref name="configuration"/> and
+    /// <paramref name="preAssignedSchema"/> apply only on the CREATE path — an existing table keeps the mode
+    /// and properties it was created with, because changing either is a metadata commit (see
+    /// <see cref="SetSchemaAsync"/>), not something an open should do silently.
     /// </remarks>
+    /// <param name="preAssignedSchema">See <see cref="CreateAsync"/>. Ignored when the table already exists —
+    /// which is the case this overload exists for, so a host retrying a CTAS after a crash reopens the table
+    /// its earlier attempt created rather than failing.</param>
     public static async ValueTask<DeltaTable> OpenOrCreateAsync(
         ITableFileSystem fileSystem,
         Apache.Arrow.Schema schema,
@@ -473,7 +507,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? clusteringColumns = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         IReadOnlyDictionary<string, string>? configuration = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Schema.StructType? preAssignedSchema = null)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
@@ -489,7 +524,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             columnMappingMode: columnMappingMode,
             clusteringColumns: clusteringColumns,
             configuration: configuration,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken,
+            preAssignedSchema: preAssignedSchema).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3951,6 +3987,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The name the caller-supplied materialized row ids travel under while they ride the partition split.
+    /// Never written: the column is stripped before the batch is renamed, and the ids go back on under the
+    /// table's DECLARED materialized column name. A name no Delta schema can collide with (a table column
+    /// would have to be called this literally).
+    /// </summary>
+    private const string RowIdRideAlongColumn = "__engineered_wood_materialized_row_id_ridealong";
+
+    /// <summary>Returns the batch without <paramref name="name"/>, or unchanged if it has no such column.</summary>
+    private static RecordBatch DropColumn(RecordBatch batch, string name)
+    {
+        var columns = new List<IArrowArray>(batch.ColumnCount);
+        var schema = new Apache.Arrow.Schema.Builder();
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            if (string.Equals(batch.Schema.FieldsList[i].Name, name, StringComparison.Ordinal))
+                continue;
+            columns.Add(batch.Column(i));
+            schema.Field(batch.Schema.FieldsList[i]);
+        }
+        return columns.Count == batch.ColumnCount
+            ? batch
+            : new RecordBatch(schema.Build(), columns, batch.Length);
+    }
+
+    /// <summary>
     /// Writes <paramref name="batches"/> to append-shaped parquet data files WITHOUT committing, returning the
     /// descriptors to hand to <see cref="CommitDataFilesAsync"/>. Partition split, recursive column-mapping
     /// physical rename + field-id stamping, the variant logical-type policy, the <see cref="IDataFileWriter"/>
@@ -3965,11 +4026,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the committed snapshot doesn't know yet; the pending schema (whose added columns already carry their
     /// column-mapping ids / physical names) drives the physical rename + stats keying, and the paired commit
     /// includes the matching metaData action.</param>
+    /// <param name="materializedRowIds">The rows' ORIGINAL stable row ids, flat and aligned with
+    /// <paramref name="batches"/> (one entry per row, batches concatenated in order) — for a host's own
+    /// copy-on-write rewrite, an UPDATE's post-images most of all, where the rows are MOVED to a new file and
+    /// so can no longer be identified by <c>baseRowId + position</c>. Each id is written into the table's
+    /// declared materialized row-id column, which a spec reader honors over the add's <c>baseRowId</c>, so a
+    /// row keeps its identity across the rewrite. A null entry leaves that row to the default (a genuinely new
+    /// row in a mixed batch). The commit VERSION is deliberately not materialized: it should advance to the
+    /// rewriting commit, which is exactly what the add's <c>defaultRowCommitVersion</c> already says.
+    /// <para>Requires the table to declare <c>delta.rowTracking.materializedRowIdColumnName</c>. The ids ride
+    /// the partition split with their rows, and are kept out of the physical rename and the statistics.</para>
+    /// </param>
     public async ValueTask<IReadOnlyList<WrittenDataFile>> WriteDataFilesAsync(
         IReadOnlyList<RecordBatch> batches,
         CancellationToken cancellationToken = default,
         Schema.StructType? schemaOverride = null,
-        bool identityValuesPreGenerated = false)
+        bool identityValuesPreGenerated = false,
+        IReadOnlyList<long?>? materializedRowIds = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -3991,16 +4064,69 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
         var files = new List<WrittenDataFile>();
 
+        string? matRowIdName = null;
+        if (materializedRowIds is not null)
+        {
+            matRowIdName = DeltaLake.RowTracking.RowTrackingConfig
+                .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration).RowIdColumnName;
+            if (matRowIdName is null)
+            {
+                throw new InvalidOperationException(
+                    "materializedRowIds: the table does not declare "
+                    + "'delta.rowTracking.materializedRowIdColumnName', so there is no column to write the ids "
+                    + "into and a spec reader would derive them from baseRowId + position instead. Enable row "
+                    + "tracking at create time.");
+            }
+            long totalRows = 0;
+            foreach (var b in batches)
+                totalRows += b.Length;
+            if (materializedRowIds.Count != totalRows)
+            {
+                throw new ArgumentException(
+                    "materializedRowIds must carry one entry per row across all batches: got "
+                    + $"{materializedRowIds.Count} for {totalRows} rows.", nameof(materializedRowIds));
+            }
+        }
+
+        int rowIdOffset = 0;
         foreach (var batch in batches)
         {
             if (batch.Length == 0)
                 continue;
 
-            var partitions = Partitioning.PartitionUtils.SplitByPartition(batch, partitionColumns);
-            foreach (var (partValues, dataBatch) in partitions)
+            // Carry the ids as an ordinary column THROUGH the partition split, so each row keeps its own id
+            // across the regrouping — the split gathers rows by partition, and a flat side-list would no
+            // longer line up. Stripped again below, before anything that reads the batch as table data.
+            var splitInput = batch;
+            if (materializedRowIds is not null)
             {
-                if (dataBatch.Length == 0)
+                var rideAlong = new Int64Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long? id = materializedRowIds[rowIdOffset + i];
+                    if (id is null)
+                        rideAlong.AppendNull();
+                    else
+                        rideAlong.Append(id.Value);
+                }
+                splitInput = RowTracking.RowTrackingWriter.AddRowIdColumn(
+                    batch, rideAlong.Build(), RowIdRideAlongColumn, nullable: true);
+            }
+            rowIdOffset += batch.Length;
+
+            var partitions = Partitioning.PartitionUtils.SplitByPartition(splitInput, partitionColumns);
+            foreach (var (partValues, splitBatch) in partitions)
+            {
+                if (splitBatch.Length == 0)
                     continue;
+
+                var dataBatch = splitBatch;
+                Int64Array? rideAlongIds = null;
+                if (materializedRowIds is not null)
+                {
+                    rideAlongIds = (Int64Array)splitBatch.Column(RowIdRideAlongColumn);
+                    dataBatch = DropColumn(splitBatch, RowIdRideAlongColumn);
+                }
 
                 // Rename logical columns to physical names + stamp field ids at every nesting level.
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
@@ -4026,6 +4152,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var writeBatch = _options.EmitVariantLogicalType
                     ? physicalBatch
                     : VariantColumnCoercion.StripAnnotation(physicalBatch);
+
+                // The materialized ids go back on AFTER the physical rename — the column's name comes from
+                // table metadata and is already physical, so passing it through the mapping would rename it.
+                if (rideAlongIds is not null)
+                {
+                    writeBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(
+                        writeBatch, rideAlongIds, matRowIdName!, nullable: true);
+                }
 
                 long fileSize;
                 if (_options.DataFileWriter is { } dataFileWriter)
@@ -5308,11 +5442,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
     /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
     /// manage.</param>
+    /// <param name="rowIdsOut">When non-null, one row-aligned array per YIELDED batch giving each row's
+    /// TRANSIENT rowid — the value that was requested in <paramref name="rowIds"/>. Batching and
+    /// deletion-vector filtering both break any positional correspondence between what was asked for and what
+    /// comes back, so this is the key a caller pairs the two by. Distinct from
+    /// <paramref name="sourceRowTrackingOut"/>: this is the snapshot-relative ADDRESS, that is the STABLE
+    /// identity.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        List<long[]>? rowIdsOut = null)
     {
         ThrowIfDisposed();
         var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
@@ -5344,6 +5485,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var absOut = new List<Int64Array?>();
             var idsOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
             var versOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
+            long ordinalBits = (long)kvp.Key << RowIdPositionBits;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
                                                       strippedRowIdsOut: idsOut,
@@ -5374,6 +5516,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
                     }
                     sourceRowTrackingOut.Add((ids, vers));
+                }
+                if (rowIdsOut is not null)
+                {
+                    var transient = new long[rows.Count];
+                    for (int k = 0; k < rows.Count; k++)
+                        transient[k] = ordinalBits | absPos.GetValue(rows[k])!.Value;
+                    rowIdsOut.Add(transient);
                 }
                 yield return TakeRowsFromBatch(batch, rows);
             }

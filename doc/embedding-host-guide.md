@@ -54,6 +54,40 @@ transient row id = (fileOrdinal << 40) | absolutePositionInFile
 with the coordinates it later mutates. Note this is a *transient* address, valid only against the snapshot
 it came from — distinct from row **tracking**, whose `baseRowId` is a stable identity that survives rewrites.
 
+> **The name is shared, the number is not.** Spark's `_metadata.row_id` is the STABLE row-tracking id;
+> engineered-wood's `ReadAllWithRowIdsAsync` column of the same name is the transient address above. Do not
+> persist it or compare it across snapshots.
+
+`ReadRowsByRowIdsAsync` reads exactly the rows for a set of those addresses, and reports both coordinates
+back through out-parameters:
+
+- `rowIdsOut` — each returned row's transient rowid. Batching and deletion-vector filtering both break any
+  positional correspondence between what you asked for and what came back, so this is what you pair them by.
+- `sourceRowTrackingOut` — each row's STABLE id and commit version: the materialized value where the file has
+  one, otherwise the spec derivation `baseRowId + position` / `defaultRowCommitVersion`. Null only for a
+  source that predates row tracking. This is the identity to carry through a rewrite.
+
+### Preserving identity across your own rewrite
+
+A host-side UPDATE moves rows to a new file, so their ids can no longer be derived from position. Read the
+stable ids, then hand them back when writing the post-image:
+
+```csharp
+var tracking = new List<(long?[] Ids, long?[] Versions)>();
+var postImages = new List<RecordBatch>();
+await foreach (var batch in table.ReadRowsByRowIdsAsync(targets, sourceRowTrackingOut: tracking))
+    postImages.Add(YourEngine.Apply(batch));
+
+var files = await table.WriteDataFilesAsync(
+    postImages, materializedRowIds: tracking.SelectMany(t => t.Ids).ToList());
+```
+
+The ids are written into the table's declared materialized row-id column, which a spec reader honors over the
+add's `baseRowId`. They ride the partition split with their rows and stay out of the physical rename and the
+statistics. The commit *version* is deliberately not materialized — it should advance to the rewriting
+commit, which the add's `defaultRowCommitVersion` already says. Requires the table to declare
+`delta.rowTracking.materializedRowIdColumnName`.
+
 ## 4. Swap in your own codec
 
 `IDataFileReader` and `IDataFileWriter` replace the built-in parquet path, wired through `DeltaTableOptions`.
@@ -104,6 +138,25 @@ last, and a rebase re-derives the whole range against the advanced high-water ma
 public for a host that genuinely needs to own the retry loop — one driving its own distributed commit
 protocol, say. If you are using them to do what the table above describes, use the transaction instead: the
 ordering, the read-set bookkeeping, and the row-id arithmetic are invariants the loop already enforces.
+
+## CTAS: writing files before the table exists
+
+A host streaming a `CREATE TABLE AS SELECT` wants its data files on storage before commit 0 is written. Under
+column mapping that is a trap: physical names are random GUIDs, so if `CreateAsync` assigns them the files
+already written are orphaned. Assign the mapping yourself, write against it, then create with the same schema:
+
+```csharp
+var (assigned, _) = ColumnMapping.AssignColumnMapping(SchemaConverter.FromArrowSchema(arrowSchema));
+// ... your writer emits files using assigned's physical names ...
+
+await using var table = await DeltaTable.CreateAsync(
+    fs, arrowSchema, columnMappingMode: ColumnMappingMode.Name, preAssignedSchema: assigned);
+```
+
+`preAssignedSchema` is used verbatim — the max-column-id in the metadata is derived from it rather than
+reassigned, and a schema with no field ids under a mapping mode is rejected rather than producing an
+unreadable table. `OpenOrCreateAsync` takes it too, so a CTAS retried after a crash reopens what its earlier
+attempt created.
 
 ## Limits
 
