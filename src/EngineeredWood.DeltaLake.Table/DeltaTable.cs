@@ -6014,6 +6014,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return IntervalParser.TryParse(raw, out var parsed) ? parsed : null;
     }
 
+    /// <summary>
+    /// Every physical column name a data file may carry the row-tracking materialization under: the two the
+    /// table DECLARES (<c>delta.rowTracking.materializedRowIdColumnName</c> /
+    /// <c>…materializedRowCommitVersionColumnName</c>) plus the legacy internal names a pre-1.0 EngineeredWood
+    /// wrote — deliberately the same set
+    /// <see cref="RowTracking.RowTrackingWriter.StripMaterializedColumns"/> is prepared to strip, because a
+    /// read that does not ASK for what the strip would take resolves ids off the wrong values entirely.
+    /// <para>Empty when the table declares neither name (no row tracking, or a spec-invalid table that cannot
+    /// materialize anyway) — a read must then name no extra column at all.</para>
+    /// </summary>
+    private static IReadOnlyList<string> MaterializedRowTrackingColumnNames(Snapshot.Snapshot snapshot)
+    {
+        var (rowIdName, rowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        if (rowIdName is null && rowVerName is null)
+            return [];
+
+        var names = new List<string>(4);
+        if (rowIdName is not null)
+            names.Add(rowIdName);
+        if (rowVerName is not null)
+            names.Add(rowVerName);
+        names.Add(RowTracking.RowTrackingWriter.RowIdColumn);
+        names.Add(RowTracking.RowTrackingWriter.RowCommitVersionColumn);
+        return names;
+    }
+
     private async IAsyncEnumerable<RecordBatch> ReadFileAsync(
         AddFile addFile,
         IReadOnlyList<string>? columns,
@@ -6081,6 +6108,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
                     .ToList();
             }
+
+            // Row tracking: the hidden materialized columns are NOT schema fields, so neither projection above
+            // ever names them — and reading a rewrite output without them silently re-derives every row's id
+            // from baseRowId + position, which on that file is a FRESH id rather than the row's own. The seam
+            // hides the file's schema by design, so there is no way to name them only for the files that carry
+            // them, and naming a column a file lacks is a hard error for a host that binds columns by name.
+            // Read every column instead: on the narrow intersection of codec seam AND row tracking, correct
+            // ids are worth more than the projection.
+            if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
+                seamColumns = null;
 
             var seamBatches = dataFileReader.ReadAsync(
                 EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken);
@@ -6159,6 +6196,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             parquetSchema = await reader.GetSchemaAsync(cancellationToken)
                 .ConfigureAwait(false);
+        }
+
+        // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
+        // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
+        // build a file-level column list without them, and every id then falls back to baseRowId + position.
+        // Here the file's own schema IS available, so name them and let the file-present intersect below drop
+        // them again for a file that carries none — which is every fresh append, the common case.
+        if (fileColumns is not null)
+        {
+            var trackingColumns = MaterializedRowTrackingColumnNames(snapshot);
+            if (trackingColumns.Count > 0)
+            {
+                var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
+                withTracking.AddRange(fileColumns);
+                withTracking.AddRange(trackingColumns);
+                fileColumns = withTracking;
+            }
         }
 
         // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not

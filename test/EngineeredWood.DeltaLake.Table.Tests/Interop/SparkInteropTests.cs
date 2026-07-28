@@ -361,6 +361,102 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// <para>The same preservation claim as <see cref="EwUpdated_RowTracking_SparkReadsPreservedIds"/> on a
+    /// PARTITIONED table, and updated TWICE. Both differences are load-bearing.</para>
+    ///
+    /// <para>Partitioning changes how EW builds each file's read column list: it names the schema's fields
+    /// explicitly instead of reading every column, and the hidden materialized row-tracking columns are not
+    /// schema fields. A single UPDATE cannot see the difference — its source is a fresh append, whose ids come
+    /// from <c>baseRowId + position</c> with no materialized column to miss. Only the SECOND rewrite has to
+    /// read materialized ids back off the first one's output. Before the read path was taught to ask for those
+    /// columns, this test read 3,4,5: the ids were re-derived from the rewritten file's own fresh
+    /// <c>baseRowId</c>, so every row silently changed identity while keeping its data.</para>
+    ///
+    /// <para>Spark is the oracle that makes it a conformance claim rather than EW agreeing with itself — it
+    /// resolves <c>_metadata.row_id</c> from the declared materialized column independently.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwUpdatedTwice_RowTracking_Partitioned_SparkReadsPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, IdValueRegionSchema, partitionColumns: ["region"], enableRowTracking: true))
+        {
+            // One partition -> one file: ids 0,1,2. The partitioning, not the file fan-out, is under test.
+            await table.WriteAsync([IdValueRegionBatch([10, 20, 30], ["a", "b", "c"], ["us", "us", "us"])]);
+
+            await UpdateValueAsync(table, "b", "B"); // rewrite 1: materializes ids 0,1,2
+            await UpdateValueAsync(table, "a", "A"); // rewrite 2: must READ those back
+        }
+
+        var idToRowId = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]);
+        Assert.Equal(2L, idToRowId[30]);
+    }
+
+    /// <summary>
+    /// The partitioned double-rewrite preservation claim again, under NAME-mode column mapping — the other
+    /// branch of the same read-path column list, where the schema's fields resolve to physical
+    /// <c>col-&lt;guid&gt;</c> names before the file is read. The materialized row-tracking columns carry their
+    /// own declared physical names and are NOT part of that mapping, so they have to survive a code path that
+    /// translates every other column. Spark reads the ids through both the column mapping and the row-tracking
+    /// materialization at once.
+    /// </summary>
+    [Fact]
+    public async Task EwUpdatedTwice_RowTracking_MappedPartitioned_SparkReadsPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, IdValueRegionSchema, partitionColumns: ["region"],
+            columnMappingMode: ColumnMappingMode.Name, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdValueRegionBatch([10, 20, 30], ["a", "b", "c"], ["us", "us", "us"])]);
+
+            await UpdateValueAsync(table, "b", "B");
+            await UpdateValueAsync(table, "a", "A");
+        }
+
+        var idToRowId = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]);
+        Assert.Equal(2L, idToRowId[30]);
+    }
+
+    /// <summary>Sets <c>value</c> to <paramref name="newValue"/> on the rows currently holding
+    /// <paramref name="matchValue"/>, over <see cref="IdValueRegionSchema"/>. The updater receives the
+    /// partition column materialized by the read and must hand it back.</summary>
+    private static async Task UpdateValueAsync(DeltaTable table, string matchValue, string newValue)
+    {
+        await table.UpdateAsync(
+            b =>
+            {
+                var value = (StringArray)b.Column("value");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < value.Length; i++)
+                    mask.Append(value.GetString(i) == matchValue);
+                return mask.Build();
+            },
+            b =>
+            {
+                var value = new StringArray.Builder();
+                for (int i = 0; i < b.Length; i++)
+                    value.Append(newValue);
+                return new RecordBatch(IdValueRegionSchema,
+                    [b.Column("id"), value.Build(), b.Column("region")], b.Length);
+            });
+    }
+
+    /// <summary>The <c>read_row_ids</c> result as id → stable row id.</summary>
+    private static Dictionary<long, long> RowIdsById(System.Text.Json.JsonElement result) =>
+        result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+    /// <summary>
     /// The copy-on-write DELETE-by-row-id (gap 2): a host reads rows with their transient rowids and deletes one
     /// by rewriting its file WITHOUT deletion vectors — the maximally reader-compatible path. On a row-tracking
     /// table the rewrite must still PRESERVE the survivors' stable ids (materialized column). EW writes ids 0,1,2,
