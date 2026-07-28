@@ -214,8 +214,21 @@ Design facts worth keeping:
    — Spark 4.0.1 `readChangeFeed` resolves an EW mapped+partitioned feed to logical names + partition value +
    change types. Full matrix green: 366 non-interop, 25 Spark, 13 delta-rs.
 
-   **Deferred (no parked test, follow-up):** the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync`
-   conflicts when a modified file was concurrently rewritten (the AUTO commit path already remaps by stable id).
+   **Buffered remap-across-rewrite — LANDED (was the last deferred item here).** `RebaseDvDmlActionsAsync` no
+   longer conflicts when a touched file was concurrently rewritten: the vanished-path case now routes through
+   `RemapRowLevelDeletesAsync`, the same Layer 3 (B) stable-row-id remap the auto-commit path reaches via
+   `ResolveRowLevelDeletesAsync`. Rewritten-away touched paths are collected as `DeleteDvEdit`s BEFORE any DV is
+   written (so the no-row-tracking abort is clean), their staged remove/add pairs are dropped, and the remap's
+   pairs on the NEW files replace them — keeping those files' own `baseRowId`, since they are DV pairs, not
+   post-images, so the high-water mark is untouched. The split is per FILE: in one rebase a surviving file
+   re-unions while a rewritten-away one remaps. Conflicts stay precise and now distinguishable by message —
+   concurrently deleted (id absent) and concurrently updated (id present, commit version advanced) both report
+   "row-level conflict", while a table without row tracking reports that stable ids are unavailable.
+   Buffered and auto-commit DML share ONE remap, so a host's multi-statement transaction composes through a
+   concurrent OPTIMIZE instead of aborting. Ported from pr-4 `d8b041e`; tests: `BufferedTransactionTests` +6
+   (compaction, copy-on-write UPDATE, mixed survivor+rewritten, concurrent-delete conflict, concurrent-update
+   conflict, no-row-tracking conflict) — all 6 fail against the pre-fix implementation. 582 Table + 217 core
+   green on net10.0/net8.0/net472.
 
 Remaining slice-9 tail (unrelated to row tracking OR the buffered seam): the overwrite-family rebase
 (partition-predicate read-set) and M4 read-side `_metadata.row_id`.

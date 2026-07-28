@@ -5228,16 +5228,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// ROW-LEVEL rebase for the buffered surface: re-targets a DV DML action set computed against
     /// <paramref name="from"/> onto <paramref name="to"/> when a concurrent writer swapped a touched file's
-    /// deletion vector. Per <c>remove</c>+<c>add</c> DV pair (matched by path): the path must still be ACTIVE
-    /// in <paramref name="to"/> (a concurrent rewrite/compaction of the file is a conflict here — the auto
-    /// commit path remaps by stable id, the explicit buffered remap is a follow-up); THIS transaction's
+    /// deletion vector. Per <c>remove</c>+<c>add</c> DV pair (matched by path), by whether the path survived:
+    /// <list type="bullet">
+    /// <item><b>Still ACTIVE in <paramref name="to"/></b> — the pair re-unions. THIS transaction's
     /// newly-deleted positions (<paramref name="newPositionsByOrdinal"/>, keyed by <paramref name="from"/>'s
     /// path-sorted ordinals) must be DISJOINT from the concurrent deletions (an intersection = the same row
     /// deleted/updated by both ⇒ row-level conflict); disjoint ⇒ the pair re-issues against the CURRENT state
-    /// (<c>remove</c>(path, current DV) + <c>add</c>(path, current DV ∪ ours)). Post-image adds (paths not in
-    /// <paramref name="from"/>) get row-tracking <c>baseRowId</c>/<c>defaultRowCommitVersion</c> re-derived from
-    /// <paramref name="to"/>, and the high-water-mark domain rebuilt. Metadata/protocol changes between the
-    /// snapshots throw. The caller re-runs commitInfo assembly after the rebase.
+    /// (<c>remove</c>(path, current DV) + <c>add</c>(path, current DV ∪ ours)).</item>
+    /// <item><b>REWRITTEN AWAY</b> by a concurrent compaction / copy-on-write UPDATE — the rows are relocated
+    /// by STABLE ROW ID onto the new files instead of aborting, through the same Layer 3 (B) remap the
+    /// autocommit path uses (<see cref="RemapRowLevelDeletesAsync"/>, reached from
+    /// <see cref="ResolveRowLevelDeletesAsync"/> there): the staged pair is dropped and replaced by DV pairs on
+    /// the new files. The row's commit version discriminates relocated-untouched from concurrently-modified, so
+    /// a row the rewriter also changed is still a row-level conflict. Requires row tracking — without stable
+    /// ids to follow, a rewritten-away touched file remains a conflict.</item>
+    /// </list>
+    /// Post-image adds (paths not in <paramref name="from"/>) get row-tracking
+    /// <c>baseRowId</c>/<c>defaultRowCommitVersion</c> re-derived from <paramref name="to"/>, and the
+    /// high-water-mark domain rebuilt; the remap's re-adds are NOT post-images — they keep the new files' own
+    /// <c>baseRowId</c> and leave the high-water mark alone. Metadata/protocol changes between the snapshots
+    /// throw. The caller re-runs commitInfo assembly after the rebase.
     /// </summary>
     public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
@@ -5283,6 +5293,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var rebased = new List<DeltaAction>(actions.Count);
 
+        // Touched files REWRITTEN AWAY concurrently (compaction / copy-on-write UPDATE): their staged DV pairs
+        // have nothing left to re-union against, so the rows are relocated by STABLE ROW ID onto the new files
+        // instead — the same Layer 3 (B) remap the autocommit path reaches through ResolveRowLevelDeletesAsync.
+        // Collected up front so the no-row-tracking conflict aborts before any deletion vector is written.
+        List<DeleteDvEdit>? remapEdits = null;
+        foreach (var kvp in oursByPath)
+        {
+            if (toByPath.ContainsKey(kvp.Key))
+                continue;
+            if (!rowTrackingEnabled)
+            {
+                throw new DeltaConflictException(
+                    $"concurrent rewrite/compaction of file '{kvp.Key}' this transaction modifies — cannot "
+                    + "rebase the buffered transaction (row tracking is disabled, so its rows cannot be "
+                    + "remapped by stable id); retry it");
+            }
+            (remapEdits ??= []).Add(new DeleteDvEdit(
+                kvp.Key, kvp.Value as IReadOnlyList<long> ?? [.. kvp.Value]));
+        }
+
         foreach (var action in actions)
         {
             switch (action)
@@ -5291,21 +5321,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     if (!toByPath.TryGetValue(remove.Path, out var current))
                     {
-                        // The file was REWRITTEN (compaction / copy-on-write) concurrently. The auto commit
-                        // path remaps the rows by stable id; the explicit buffered remap-across-rewrite is a
-                        // follow-up, so conflict here.
-                        throw new DeltaConflictException(
-                            $"concurrent rewrite/compaction of file '{remove.Path}' this transaction modifies — "
-                            + "cannot rebase the buffered transaction; retry it");
+                        // Rewritten away — this pair is replaced wholesale by the remap after the loop.
+                        break;
                     }
                     rebased.Add(remove with { DeletionVector = current.DeletionVector });
                     break;
                 }
                 case AddFile add when oursByPath.TryGetValue(add.Path, out var ours):
                 {
+                    if (!toByPath.TryGetValue(add.Path, out var current))
+                    {
+                        // Rewritten away — handled by the remap, paired with the skipped remove above.
+                        break;
+                    }
                     // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
                     // row-level disjointness check against the concurrent deletions.
-                    var current = toByPath[add.Path]; // present — the paired remove above would have thrown
                     var currentDeleted = current.DeletionVector is not null
                         ? new HashSet<long>(await _dvReader.ReadAsync(current.DeletionVector, cancellationToken)
                             .ConfigureAwait(false))
@@ -5363,6 +5393,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     rebased.Add(action);
                     break;
             }
+        }
+        if (remapEdits is not null)
+        {
+            // Layer 3 (B): relocate the rewritten-away files' rows by stable id onto the new files. The re-adds
+            // are DV pairs on files that already exist in `to`, NOT post-images, so they keep their own
+            // baseRowId and consume no row-id space — which is why they are appended outside the loop rather
+            // than routed through the post-image case above.
+            var resolvedPaths = new HashSet<string>(StringComparer.Ordinal); // the checker bookkeeping the
+            // autocommit caller needs; the buffered caller re-validates via CheckLogicalRebaseAsync instead,
+            // where the remap's remove(newPath, current DV) matches the still-active file and passes.
+            var remapped = await RemapRowLevelDeletesAsync(from, to, remapEdits, resolvedPaths, cancellationToken)
+                .ConfigureAwait(false);
+            if (remapped is null)
+            {
+                throw new DeltaConflictException(
+                    "row-level conflict remapping across a concurrent rewrite/compaction: a row this "
+                    + "transaction deletes/updates was concurrently deleted or updated, or its stable id could "
+                    + "not be resolved — retry the transaction");
+            }
+            rebased.AddRange(remapped);
         }
         if (rowTrackingEnabled && anyPostImage)
         {
