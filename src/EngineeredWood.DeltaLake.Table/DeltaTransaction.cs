@@ -64,6 +64,9 @@ public sealed class DeltaTransaction
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
     // to one identity. Null until the first row-tracking stage reads the base mark.
     private long? _nextRowId;
+    // Staged idempotent-producer versions, keyed by appId, each with the version it requires the table to be
+    // at. Kept out of _actions: the commit loop has to re-check them per attempt (see StageAppTransaction).
+    private readonly Dictionary<string, AppTransactionStage> _appTransactions = new(StringComparer.Ordinal);
     private bool _committed;
 
     internal DeltaTransaction(
@@ -415,4 +418,43 @@ public sealed class DeltaTransaction
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
     }
+
+    /// <summary>
+    /// Stages an idempotent-producer version for <paramref name="appId"/> — a <c>txn</c> action committed
+    /// atomically with this transaction's work, guarded by a compare-and-set against
+    /// <paramref name="expectedPrevious"/>.
+    ///
+    /// <para>Not <see cref="StageActions"/> with a hand-built <see cref="TransactionId"/>, for the reason that
+    /// method's own remarks give: the guard is SNAPSHOT-RELATIVE state, so it has to be re-validated on every
+    /// commit attempt rather than once by the caller. The failure it prevents needs two producers running the
+    /// same batch: this transaction's first attempt loses the race to its twin, and on the retry the read-set
+    /// check passes — nothing it read was invalidated — so without the CAS inside the loop it would commit the
+    /// batch a SECOND time. Checked before the first attempt too, against the base snapshot, so a batch that
+    /// was already committed before this transaction opened fails without writing anything.</para>
+    /// </summary>
+    /// <param name="appId">The producer's identifier, as recorded in <c>txn.appId</c>.</param>
+    /// <param name="version">The version this batch advances the producer to.</param>
+    /// <param name="expectedPrevious">The version the producer must currently be at; <c>null</c> means it must
+    /// have NO recorded version yet (a first batch). A mismatch throws
+    /// <see cref="InvalidOperationException"/> — deliberately not <see cref="DeltaConflictException"/>, which
+    /// the commit loop retries, because re-attempting cannot make an already-committed batch un-commit.</param>
+    public void StageAppTransaction(string appId, long version, long? expectedPrevious = null)
+    {
+        EnsureNotCommitted();
+        if (string.IsNullOrEmpty(appId))
+            throw new ArgumentException("appId must be a non-empty application identifier.", nameof(appId));
+        _appTransactions[appId] = new AppTransactionStage(version, expectedPrevious);
+        _operations.Add("WRITE");
+    }
+
+    /// <summary>
+    /// The staged idempotent-producer versions and the previous version each requires. Read by
+    /// <see cref="DeltaTable.CommitTransactionAsync"/>, which turns them into <c>txn</c> actions and hands the
+    /// expectations to the commit loop so they are re-checked per attempt.
+    /// </summary>
+    internal IReadOnlyDictionary<string, AppTransactionStage> AppTransactions => _appTransactions;
+
+    /// <summary>A staged producer version paired with the version it requires the table to be at.</summary>
+    internal readonly record struct AppTransactionStage(long Version, long? ExpectedPrevious);
+
 }

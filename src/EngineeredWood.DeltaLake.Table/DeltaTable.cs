@@ -1955,11 +1955,32 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions = withMark;
         }
 
+        // Idempotent-producer versions become `txn` actions here rather than at staging time, so the caller
+        // does not hand-build one; their compare-and-set travels separately because the commit loop must
+        // re-validate it on every attempt (see DeltaTransaction.StageAppTransaction).
+        if (transaction.AppTransactions.Count > 0)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var withTxns = new List<DeltaAction>(actions.Count + transaction.AppTransactions.Count);
+            withTxns.AddRange(actions);
+            foreach (var kv in transaction.AppTransactions)
+            {
+                withTxns.Add(new TransactionId
+                {
+                    AppId = kv.Key,
+                    Version = kv.Value.Version,
+                    LastUpdated = now,
+                });
+            }
+            actions = withTxns;
+        }
+
         return CommitOccAsync(
             baseSnapshot, actions, reads, transaction.RemovedPaths,
             transaction.IsolationLevel, transaction.Operation, rebaseSafe: true,
             cancellationToken,
-            rowLevelDeletes: transaction.DvEdits);
+            rowLevelDeletes: transaction.DvEdits,
+            appTransactions: transaction.AppTransactions);
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -1988,12 +2009,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string operation,
         bool rebaseSafe,
         CancellationToken cancellationToken,
-        IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null)
+        IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
+        IReadOnlyDictionary<string, DeltaTransaction.AppTransactionStage>? appTransactions = null)
     {
         ThrowIfDisposed();
 
         if (dataActions.Count == 0)
             return baseSnapshot.Version; // nothing staged — no commit
+
+        bool hasAppTransactions = appTransactions is { Count: > 0 };
+        // Before writing anything: a batch already committed as of the base version must fail here rather
+        // than be written again.
+        if (hasAppTransactions)
+            ValidateAppTransactions(appTransactions!, baseSnapshot);
 
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -2025,11 +2053,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
             {
                 // Row-level DELETE/DELETE reconciliation needs the concurrent files' current deletion vectors,
-                // and a row-tracking rebase needs the advanced high-water mark, so both build the latest
-                // snapshot; a plain (non-tracking) append/update rebase only needs the version.
+                // a row-tracking rebase needs the advanced high-water mark, and an idempotent-producer
+                // compare-and-set needs the versions recorded as of this attempt — so all three build the
+                // latest snapshot; a plain (non-tracking) append/update rebase only needs the version.
                 long latest;
                 Snapshot.Snapshot? latestSnapshot = null;
-                if (rowLevel || rowTrackingEnabled)
+                if (rowLevel || rowTrackingEnabled || hasAppTransactions)
                 {
                     latestSnapshot = await SnapshotBuilder.UpdateAsync(
                         baseSnapshot, _log, cancellationToken).ConfigureAwait(false);
@@ -2039,6 +2068,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     latest = await _log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
                 }
+
+                // Re-validated per attempt, and BEFORE the conflict checker: the read-set check would pass
+                // (nothing this transaction read was invalidated) and let a twin producer's already-committed
+                // batch be written a second time.
+                if (hasAppTransactions)
+                    ValidateAppTransactions(appTransactions!, latestSnapshot!);
 
                 var concurrent = new List<(long, IReadOnlyList<DeltaAction>)>();
                 for (long v = baseSnapshot.Version + 1; v <= latest; v++)
@@ -6628,4 +6663,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _disposed = true;
         return default;
     }
+
+    /// <summary>
+    /// Compare-and-set for staged idempotent-producer versions against <paramref name="against"/>: each
+    /// <c>appId</c> must currently sit at exactly the version its caller expected. Throws
+    /// <see cref="InvalidOperationException"/> rather than <see cref="DeltaConflictException"/> on purpose —
+    /// the commit loop retries the latter, and retrying cannot make an already-committed batch un-commit.
+    /// </summary>
+    private static void ValidateAppTransactions(
+        IReadOnlyDictionary<string, DeltaTransaction.AppTransactionStage> staged, Snapshot.Snapshot against)
+    {
+        foreach (var kv in staged)
+        {
+            long? current = against.AppTransactions.TryGetValue(kv.Key, out var recorded)
+                ? recorded.Version
+                : null;
+            if (current != kv.Value.ExpectedPrevious)
+            {
+                throw new InvalidOperationException(
+                    $"idempotent producer '{kv.Key}' is at version "
+                    + (current?.ToString() ?? "<none>")
+                    + $" but the staged batch expected "
+                    + (kv.Value.ExpectedPrevious?.ToString() ?? "<none>")
+                    + $"; the batch advancing it to {kv.Value.Version} was not committed.");
+            }
+        }
+    }
+
 }
