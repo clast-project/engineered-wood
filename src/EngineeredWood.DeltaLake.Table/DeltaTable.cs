@@ -540,6 +540,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     #region Schema Evolution
 
+    /// <summary>Converts one incoming Arrow field to its Delta field, through a one-field schema so the
+    /// conversion is the same type mapping a whole schema gets.</summary>
+    private static StructField ToDeltaField(Field arrowField) =>
+        SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema([arrowField], null)).Fields[0];
+
     /// <summary>
     /// Schema evolution — appends a nullable column. Writes a metadata-only commit (a new
     /// <see cref="MetadataAction"/> whose schema = the current schema ++ <paramref name="newColumn"/>); NO data
@@ -549,13 +554,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// column arrives with ids on every descendant — and <c>delta.columnMapping.maxColumnId</c> is bumped.
     /// Returns the new version.
     /// </summary>
+    public ValueTask<long> AddColumnAsync(
+        Field newColumn, CancellationToken cancellationToken = default) =>
+        AddColumnAsync(ToDeltaField(newColumn), cancellationToken);
+
+    /// <summary>
+    /// <see cref="AddColumnAsync(Field, CancellationToken)"/> taking the DELTA field directly, for a column
+    /// whose Delta type the Arrow conversion cannot express or would reshape. The motivating case is
+    /// <c>variant</c>: a host whose Arrow boundary carries variants in some transport form declares a binary
+    /// column, which would be added to the table as Delta <c>binary</c> — this overload lets it say
+    /// <c>variant</c> and mean it. The Delta-typed counterpart of <see cref="CreateAsync"/>'
+    /// <c>preAssignedSchema</c>.
+    /// <para>The caller owns the field's correctness. Do NOT pre-assign column-mapping metadata on it: ids and
+    /// physical names are assigned here, recursively, continuing past the table's <c>maxColumnId</c>.</para>
+    /// </summary>
     public async ValueTask<long> AddColumnAsync(
-        Field newColumn, CancellationToken cancellationToken = default)
+        StructField newColumn, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
-        if (!newColumn.IsNullable)
+        if (!newColumn.Nullable)
             throw new InvalidOperationException(
                 $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
 
@@ -569,9 +588,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
         }
 
-        // Convert the incoming Arrow field to a Delta field (via a one-field schema — reuses the type mapping).
-        var newDeltaField = SchemaConverter.FromArrowSchema(
-            new Apache.Arrow.Schema([newColumn], null)).Fields[0];
+        var newDeltaField = newColumn;
 
         string newSchemaString;
         var newConfig = config;
@@ -637,12 +654,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// composes on the first's pending schema/protocol. Pure computation, no IO.
     /// </summary>
     public DeferredSchemaChange ComputeAddColumn(
-        Field newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+        Field newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null) =>
+        ComputeAddColumn(ToDeltaField(newColumn), baseMetadata, baseProtocol);
+
+    /// <summary>
+    /// <see cref="ComputeAddColumn(Field, MetadataAction, ProtocolAction)"/> taking the DELTA field directly —
+    /// see <see cref="AddColumnAsync(StructField, CancellationToken)"/> for when that matters. Stage the
+    /// result on a <see cref="DeltaTransaction"/> with <see cref="DeltaTransaction.StageSchemaChange"/>.
+    /// </summary>
+    public DeferredSchemaChange ComputeAddColumn(
+        StructField newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
-        if (!newColumn.IsNullable)
+        if (!newColumn.Nullable)
             throw new InvalidOperationException(
                 $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
 
@@ -660,8 +686,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
         }
 
-        var newDeltaField = SchemaConverter.FromArrowSchema(
-            new Apache.Arrow.Schema([newColumn], null)).Fields[0];
+        var newDeltaField = newColumn;
 
         StructType newSchema;
         var newConfig = config;

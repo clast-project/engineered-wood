@@ -101,6 +101,34 @@ The library still handles deletion-vector filtering, schema-evolution backfill, 
 materialization, type widening, and row-tracking materialization around your codec — those are log
 semantics, not file-format concerns.
 
+### The write path is value-blind
+
+Between your batch and your `IDataFileWriter`, the library moves and renames columns but never inspects what
+is *in* them. So you may present **your own physical representation** for a column whose Delta type you have
+declared — the partition split, the physical rename, and the statistics collector all pass it through.
+
+This is what lets a host handle a representation the library has no mode for. The motivating case is
+`variant`: if your Arrow boundary cannot carry the canonical struct storage, exchange each value as one
+self-delimiting blob, convert on your own side, and declare the column `variant` via `preAssignedSchema` or
+the Delta-typed `AddColumnAsync`/`ComputeAddColumn` overloads:
+
+```csharp
+await table.AddColumnAsync(new StructField
+{
+    Name = "payload", Type = new PrimitiveType { TypeName = "variant" }, Nullable = true,
+});
+```
+
+Those overloads exist because the Arrow ones infer the Delta type from the Arrow field — a marker-tagged
+binary column would be added as Delta `binary`, permanently, in a metadata commit.
+
+**The read path is deliberately not symmetric.** A variant-declared column must arrive as the physical
+struct-of-binary (or an already-wrapped `VariantArray`); anything else throws rather than emit a column that
+contradicts the declared type. A host reader splits its blob into `(metadata, value)` — in-process work that
+never crosses a foreign ABI — and gets a canonical `VariantArray` back, which it converts on its own side.
+
+Both properties are pinned by `CodecSeamValueBlindnessTests`.
+
 ## 5. Stage work on the transaction
 
 This is the part that most repays reading. A host arrives with work **already done**, so it stages results
