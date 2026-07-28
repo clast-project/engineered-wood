@@ -64,6 +64,8 @@ public sealed class DeltaTransaction
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
     // to one identity. Null until the first row-tracking stage reads the base mark.
     private long? _nextRowId;
+    // Set by SetOperation: what the host says this transaction did, which beats the inference.
+    private string? _operationOverride;
     private bool _committed;
 
     internal DeltaTransaction(
@@ -100,7 +102,8 @@ public sealed class DeltaTransaction
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
 
-    internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
+    internal string Operation =>
+        _operationOverride ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
 
     /// <summary>
     /// The row id the next staged add would reserve, or null if nothing staged advanced it. The commit emits
@@ -415,4 +418,65 @@ public sealed class DeltaTransaction
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
     }
+
+    /// <summary>
+    /// Stages data files with the two things <see cref="StageDataFiles"/> cannot express: files that already
+    /// carry this table's identity values, and rows to hide with an inline deletion vector.
+    ///
+    /// <para>Asynchronous for the same reason <see cref="StageRowDeletesAsync"/> is: hiding rows means WRITING
+    /// a deletion vector. With <paramref name="deletedPositionsByFileIndex"/> null and
+    /// <paramref name="identityValuesPreGenerated"/> false this is exactly
+    /// <see cref="StageDataFiles"/>.</para>
+    /// </summary>
+    /// <param name="files">As <see cref="StageDataFiles"/>.</param>
+    /// <param name="deletedPositionsByFileIndex">Positions to hide, keyed by index into
+    /// <paramref name="files"/>. The add is committed WITH an inline deletion vector, so those rows never
+    /// appear in any committed version — which is what lets a host delete rows it inserted in the SAME
+    /// transaction without a rewrite. Keyed by file INDEX rather than by path because these files are in no
+    /// snapshot yet, so no path can name them.</param>
+    /// <param name="identityValuesPreGenerated">The files already contain this table's identity values, so the
+    /// refusal that normally protects identity columns from an external writer does not apply. The caller owns
+    /// having generated them consistently with the table's recorded high-water mark.</param>
+    /// <param name="cancellationToken">Cancels the deletion-vector writes.</param>
+    public async ValueTask StageDataFilesAsync(
+        IReadOnlyList<WrittenDataFile> files,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
+        bool identityValuesPreGenerated = false,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        if (files is null)
+            throw new ArgumentNullException(nameof(files));
+        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+        if (files.Count == 0)
+            return;
+
+        var dvs = deletedPositionsByFileIndex is { Count: > 0 }
+            ? await _table.BuildInlineDeletionVectorsAsync(deletedPositionsByFileIndex, cancellationToken)
+                .ConfigureAwait(false)
+            : null;
+        var (actions, nextRowId) = _table.BuildStagedAppendActions(
+            _baseSnapshot, files, _nextRowId, identityValuesPreGenerated, dvs);
+        _nextRowId = nextRowId;
+        StageInternal(actions);
+        _operations.Add("WRITE");
+    }
+
+    /// <summary>
+    /// Names the operation this transaction records in <c>commitInfo</c>, overriding what it would infer from
+    /// the staging calls it received.
+    ///
+    /// <para>The inference cannot do better than <c>WRITE</c> once a transaction mixes kinds, but a host
+    /// usually knows exactly what its statement was — and the history is read by people and tools deciding
+    /// what a version did, so <c>WRITE</c> for what was really an <c>UPDATE</c>, or for a fused
+    /// multi-statement transaction, loses information nothing downstream can recover.</para>
+    /// </summary>
+    public void SetOperation(string operation)
+    {
+        EnsureNotCommitted();
+        if (string.IsNullOrEmpty(operation))
+            throw new ArgumentException("operation must be a non-empty name.", nameof(operation));
+        _operationOverride = operation;
+    }
+
 }

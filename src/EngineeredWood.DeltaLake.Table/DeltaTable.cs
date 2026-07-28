@@ -4641,13 +4641,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// active set, which is exactly what a rebase cannot re-derive, so a transaction does not stage it.
     /// </summary>
     internal (IReadOnlyList<DeltaAction> Actions, long NextRowId) BuildStagedAppendActions(
-        Snapshot.Snapshot snapshot, IReadOnlyList<WrittenDataFile> files, long? rowIdStart)
+        Snapshot.Snapshot snapshot, IReadOnlyList<WrittenDataFile> files, long? rowIdStart,
+        bool identityValuesPreGenerated = false,
+        IReadOnlyDictionary<int, DeletionVector>? deletionVectorsByFileIndex = null)
     {
-        if (files.Count > 0 && !SupportsExternalDataFileCommit)
+        // Mirrors CommitDataFilesAsync' gate, including its bypass: a caller that generated the identity
+        // values itself has already done the work this writer exists to do, so the table's identity columns
+        // are no longer a reason to refuse its files. IcebergCompat still is.
+        if (files.Count > 0 && !SupportsExternalDataFileCommit
+            && !(identityValuesPreGenerated && !IsIcebergCompat))
         {
             throw new NotSupportedException(
                 "StageDataFiles: table has identity columns or IcebergCompat — these require engineered-wood's "
-                + "own writer (check SupportsExternalDataFileCommit, or stage via WriteAsync).");
+                + "own writer (check SupportsExternalDataFileCommit, or stage via WriteAsync). For identity "
+                + "columns, pass identityValuesPreGenerated when the values are already in the files.");
         }
 
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
@@ -4656,8 +4663,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(files.Count + 1);
 
-        foreach (var f in files)
+        for (int fi = 0; fi < files.Count; fi++)
         {
+            var f = files[fi];
+            // An add born WITH a deletion vector: rows this transaction inserted and then deleted before
+            // committing, so they never appear in any committed version. Stats stay physical-row stats,
+            // marked tightBounds=false per the spec (they are loose supersets once rows are hidden).
+            DeletionVector? dv = null;
+            string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+            if (deletionVectorsByFileIndex is not null
+                && deletionVectorsByFileIndex.TryGetValue(fi, out var built))
+            {
+                dv = built;
+                stats = StatsWithLooseBounds(stats);
+            }
             actions.Add(new AddFile
             {
                 Path = DeltaPath.Encode(f.RelativePath),
@@ -4665,9 +4684,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Size = f.SizeBytes,
                 ModificationTime = now,
                 DataChange = true,
-                Stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}",
+                Stats = stats,
                 BaseRowId = rowTrackingEnabled ? nextRowId : null,
                 DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                DeletionVector = dv,
                 Tags = f.Tags,
             });
             if (rowTrackingEnabled)
@@ -6628,4 +6648,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _disposed = true;
         return default;
     }
+
+    /// <summary>
+    /// Writes an inline deletion vector per entry of <paramref name="deletedPositionsByFileIndex"/>, keyed the
+    /// same way, for adds that are not in any snapshot yet (so no path can name them).
+    /// </summary>
+    internal async ValueTask<IReadOnlyDictionary<int, DeletionVector>?> BuildInlineDeletionVectorsAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> deletedPositionsByFileIndex,
+        CancellationToken cancellationToken)
+    {
+        Dictionary<int, DeletionVector>? built = null;
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        foreach (var kv in deletedPositionsByFileIndex)
+        {
+            if (kv.Value.Count == 0)
+                continue;
+            built ??= new Dictionary<int, DeletionVector>();
+            built[kv.Key] = await dvWriter.CreateAsync(kv.Value, kv.Value.Count, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        return built;
+    }
+
 }
