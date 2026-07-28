@@ -55,6 +55,9 @@ public sealed class DeltaTransaction
     // They become the transaction's ReadSet.Predicates so a concurrent add matching one is a
     // concurrentAppend conflict. Left empty by the functional-predicate and append-only paths.
     private readonly List<Expressions.Predicate> _readPredicates = [];
+    // Set by StageWholeTableRead: the host's scan had no pushable predicate, so every concurrent add and
+    // remove is potentially relevant.
+    private bool _readWholeTable;
     // Per-file row-level edits from staged DELETEs (the rows each removed, by absolute position). They let
     // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
     // (row-level concurrency) instead of aborting. Only DELETEs contribute; appends and updates do not.
@@ -415,4 +418,38 @@ public sealed class DeltaTransaction
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
     }
+
+    /// <summary>
+    /// Declares a predicate this transaction READ, so a concurrent add that could satisfy it is a
+    /// concurrentAppend conflict.
+    ///
+    /// <para>The <see cref="DeltaTable.DeleteAsync(Expressions.Predicate, CancellationToken)"/> /
+    /// <c>UpdateAsync</c> overloads record their own predicate, but a host that ran its OWN scan and staged
+    /// the result has no other way to say what that scan depended on — and a transaction that declares
+    /// nothing is treated as having read only the files it removes. Under
+    /// <see cref="IsolationLevel.Serializable"/> that is the difference between detecting a concurrent append
+    /// into the range this transaction read and silently accepting it.</para>
+    /// </summary>
+    public void StageReadPredicate(Expressions.Predicate predicate)
+    {
+        EnsureNotCommitted();
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
+        _readPredicates.Add(predicate);
+    }
+
+    /// <summary>
+    /// Declares that this transaction read the WHOLE table — the honest answer when a host's scan had no
+    /// pushable predicate, since every concurrent add and remove is then potentially relevant. Strictly
+    /// stronger than any set of predicates: it makes <see cref="StageReadPredicate"/> redundant.
+    /// </summary>
+    public void StageWholeTableRead()
+    {
+        EnsureNotCommitted();
+        _readWholeTable = true;
+    }
+
+    /// <summary>Whether <see cref="StageWholeTableRead"/> was called; feeds <c>ReadSet.WholeTable</c>.</summary>
+    internal bool ReadWholeTable => _readWholeTable;
+
 }

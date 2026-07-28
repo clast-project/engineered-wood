@@ -1941,6 +1941,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             Files = transaction.RemovedPaths,
             Predicates = transaction.ReadPredicates,
+            WholeTable = transaction.ReadWholeTable,
         };
 
         // The row-tracking high-water mark is emitted ONCE for the whole transaction, from the counter each
