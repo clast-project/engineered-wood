@@ -4312,6 +4312,69 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Plans the scan for a predicate WITHOUT reading any data: returns the snapshot's active files that
+    /// might contain matching rows, each with its ordinal in the path-sorted active set. This is the same
+    /// superset-safe verdict the library's own read paths apply — a file is dropped only when its partition
+    /// values or column statistics PROVE no row can match, and the surviving files are not row-filtered — so
+    /// a host assembling its own scan (its own parquet reader behind
+    /// <see cref="IDataFileReader"/>, an engine that pushes the predicate down itself) prunes identically to
+    /// <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
+    /// and must still apply the predicate per row.
+    /// <para>
+    /// The ordinal is what makes the result composable with the row-level seam: it addresses
+    /// <see cref="ComputeDeletionVectorActionsAsync"/>, <see cref="RebaseDvDmlActionsAsync"/>,
+    /// <see cref="CommitDataFilesAsync"/>, and the transient rowid encoding. See
+    /// <see cref="PlannedFile.FileOrdinal"/> for its exact domain — notably that ordinals are assigned before
+    /// pruning (the result is ascending but GAPPED) and are valid only against the snapshot planned from.
+    /// </para>
+    /// Deletion vectors are NOT resolved: a returned file's <see cref="Actions.AddFile.DeletionVector"/> is
+    /// reported as-is and the caller decides how to exclude those positions (read them with
+    /// <see cref="DeletionVectorReader"/>, or let its own engine do it).
+    /// No I/O is performed — the snapshot is already materialized and statistics are read from it.
+    /// </summary>
+    /// <param name="filter">The predicate to prune by. Null (or a true predicate) keeps every active file,
+    /// which is how a caller enumerates the addressing domain itself.</param>
+    /// <param name="snapshot">The snapshot to plan against; defaults to <see cref="CurrentSnapshot"/>. Pass
+    /// one explicitly when the ordinals must agree with a pinned version — a rewrite that lists against the
+    /// same snapshot its commit pins as <c>expectedVersion</c> cannot be made to conflict by a writer landing
+    /// between the two calls.</param>
+    /// <param name="schemaOverride">The schema supplying the prune key map (column types and, under column
+    /// mapping, logical→physical names); defaults to the snapshot's. Pass one to plan against a schema the
+    /// snapshot does not have yet — an uncommitted transaction's pending ADD/RENAME COLUMN, where a predicate
+    /// on the new name would otherwise resolve to nothing and prune nothing.
+    /// <para>
+    /// The CALLER owns this schema's correctness. An unknown column is safe (it evaluates Unknown, keeping
+    /// the file), but a name mapped to the WRONG physical name reads another column's statistics and can
+    /// prove <c>AlwaysFalse</c> for a file that does contain matching rows — silently dropping data. Supply
+    /// only a schema derived from this table's own.
+    /// </para></param>
+    public IReadOnlyList<PlannedFile> PlanFiles(
+        EngineeredWood.Expressions.Predicate? filter = null,
+        Snapshot.Snapshot? snapshot = null,
+        StructType? schemaOverride = null)
+    {
+        ThrowIfDisposed();
+        var planSnapshot = snapshot ?? CurrentSnapshot;
+        var ordered = OrderedActiveFiles(planSnapshot);
+        var pruner = filter is null ? null : new DeltaFilePruner(
+            schemaOverride ?? planSnapshot.Schema, planSnapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
+
+        var planned = new List<PlannedFile>(ordered.Count);
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            // The ordinal is the loop index, NOT the survivor count: a pruned file consumes its position
+            // because the addressing domain is the full active set, not the surviving subset. Renumbering
+            // here would point every fed-back position at the wrong file — silently, since the DV/rowid
+            // APIs cannot tell a stale ordinal from a fresh one.
+            if (pruner is not null && !pruner.ShouldInclude(ordered[i], filter!))
+                continue;
+            planned.Add(new PlannedFile(i, ordered[i]));
+        }
+        return planned;
+    }
+
+    /// <summary>
     /// Computes the deletion-vector actions for the given deleted positions WITHOUT committing — the deferred
     /// half of a DV DELETE, for a buffered (multi-statement) transaction that fuses its DML + appends into one
     /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Positions are keyed by the
