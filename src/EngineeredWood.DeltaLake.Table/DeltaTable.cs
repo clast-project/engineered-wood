@@ -3420,6 +3420,114 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Reads the table with the two trailing <c>_metadata</c> LOCATOR columns — where each row physically SITS
+    /// in this snapshot, in Spark's vocabulary, so a caller can name the same rows back at a DML boundary.
+    /// </summary>
+    /// <remarks>
+    /// <list type="table">
+    ///   <item><term><c>_metadata.file_path</c> (string, non-null)</term><description>the log <c>add.path</c>,
+    ///     URL-encoded exactly as stored — pair it with the row index to name the row at a DML
+    ///     boundary.</description></item>
+    ///   <item><term><c>_metadata.row_index</c> (int64, non-null)</term><description>the row's ABSOLUTE physical
+    ///     position in its file, COUNTING rows masked by the deletion vector (Spark's
+    ///     <c>_metadata.row_index</c> semantics), which is what makes repeated DV deletes compose.</description></item>
+    /// </list>
+    /// <para>
+    /// This is a LOCATOR — a physical address, valid for THIS snapshot only. For durable IDENTITY use
+    /// <see cref="ReadAllWithRowTrackingAsync"/>, which owns <c>_metadata.row_id</c> /
+    /// <c>_metadata.row_commit_version</c> and their resolution; this method deliberately does not re-emit them,
+    /// so one concept has one owner. The two surfaces share the <c>_metadata.*</c> namespace and the same flat
+    /// dot-named spelling, and both append AFTER the read pipeline.
+    /// </para>
+    /// <para>
+    /// Relationship to <see cref="ReadAllWithRowIdsAsync"/>: these two columns are the UNPACKED, spec-named form
+    /// of that method's <c>_ew_row_address</c> — the same physical address, spelled as the file that holds the
+    /// row rather than as its ordinal in a path-sorted set. Prefer this form at a boundary that must VALIDATE
+    /// what it was handed: an <c>add.path</c> that is no longer active is recognisably wrong, whereas a stale
+    /// ordinal is indistinguishable from a fresh one. It also needs no shared convention about file ordering and
+    /// has no packing limit.
+    /// </para>
+    /// </remarks>
+    public IAsyncEnumerable<RecordBatch> ReadAllWithMetadataAsync(
+        IReadOnlyList<string>? columns = null,
+        EngineeredWood.Expressions.Predicate? filter = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return ReadWithMetadataAsync(CurrentSnapshot, columns, filter, cancellationToken);
+    }
+
+    // Shared iterator. Both locator columns are ALREADY computed by the maintained read path — the absolute
+    // position arrives as a ReadFileAsync out-param and the path comes from the planned add — so this is pure
+    // assembly, and it inherits projection, column mapping, partition re-add, schema reconciliation and
+    // deletion-vector semantics for free. It does NOT re-emit the identity pair: those are
+    // ReadAllWithRowTrackingAsync's columns, resolved by its own logic, and one concept should have one owner.
+    private async IAsyncEnumerable<RecordBatch> ReadWithMetadataAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        foreach (var planned in PlanFiles(filter, snapshot))
+        {
+            var absOut = new List<Int64Array?>();
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(planned.File, columns, snapshot, cancellationToken,
+                                                     strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+            {
+                bi++;
+                yield return AppendLocatorColumns(
+                    batch, planned.File.Path, bi < absOut.Count ? absOut[bi] : null);
+            }
+        }
+    }
+
+    /// <summary>The row's file, as the log's <c>add.path</c> — emitted by
+    /// <see cref="ReadAllWithMetadataAsync"/>. Flat and dot-named, matching the spelling
+    /// <see cref="ReadAllWithRowTrackingAsync"/> uses for the identity pair, so the whole
+    /// <c>_metadata.*</c> family is one convention.</summary>
+    public const string MetadataFilePathColumn = "_metadata.file_path";
+
+    /// <summary>The row's ABSOLUTE physical position in its file, COUNTING rows masked by the deletion vector
+    /// (Spark's <c>_metadata.row_index</c> semantics) — emitted by
+    /// <see cref="ReadAllWithMetadataAsync"/>.</summary>
+    public const string MetadataRowIndexColumn = "_metadata.row_index";
+
+    // Appends the two trailing LOCATOR columns, FLAT and dot-named — the same spelling
+    // ReadAllWithRowTrackingAsync uses for the identity pair (RowTrackingConfig.RowIdColumnName), so the whole
+    // `_metadata.*` family is one convention rather than two encodings of one namespace. absPositions is
+    // row-aligned with `batch` when present; a null array (or a short one) falls back to the in-batch index —
+    // the same tolerance ReadWithTransientRowIdsAsync applies to its own out-param.
+    private static RecordBatch AppendLocatorColumns(
+        RecordBatch batch, string filePath, Int64Array? absPositions)
+    {
+        var pathBuilder = new StringArray.Builder();
+        var idxBuilder = new Int64Array.Builder();
+        for (int i = 0; i < batch.Length; i++)
+        {
+            pathBuilder.Append(filePath);
+            idxBuilder.Append(absPositions is not null && i < absPositions.Length && !absPositions.IsNull(i)
+                ? absPositions.GetValue(i)!.Value : i);
+        }
+
+        var schemaBuilder = new Apache.Arrow.Schema.Builder();
+        foreach (var f in batch.Schema.FieldsList)
+            schemaBuilder.Field(f);
+        schemaBuilder.Field(new Field(
+            MetadataFilePathColumn, Apache.Arrow.Types.StringType.Default, false));
+        schemaBuilder.Field(new Field(
+            MetadataRowIndexColumn, Apache.Arrow.Types.Int64Type.Default, false));
+
+        var arrays = new List<IArrowArray>(batch.ColumnCount + 2);
+        for (int c = 0; c < batch.ColumnCount; c++)
+            arrays.Add(batch.Column(c));
+        arrays.Add(pathBuilder.Build());
+        arrays.Add(idxBuilder.Build());
+
+        return new RecordBatch(schemaBuilder.Build(), arrays, batch.Length);
+    }
+
+    /// <summary>
     /// The preconditions for reading the row-tracking columns: the table must actually track row identity, and
     /// the two generated column names must be free. Both failures are refused rather than papered over — an
     /// all-null id column on a table with no row tracking, or a user column shadowed by a generated one, would
