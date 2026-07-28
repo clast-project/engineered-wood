@@ -144,6 +144,19 @@ EW_REQUIRE_SPARK_INTEROP=1
 With either set, an unavailable toolchain becomes a hard failure naming the
 exact missing prerequisite instead of a silent skip.
 
+#### A stalled Spark driver looks like a failing assertion
+
+All Spark commands share ONE serve-mode process, serialized by a lock
+(`InteropDriver.RunServed`), with a 600 s per-command timeout (`Spark.cs`). If
+that process stalls, the timeout is charged to whichever test happened to hold
+the lock — so a hung JVM surfaces as *that* test failing, with no hint that the
+cause was infrastructural. **Check the run's total duration before believing
+the failure.** A tier-3 full suite is ~55 s on this machine; observed once at
+11 m 16 s with a single interop test "failing", which is the 600 s timeout plus
+the normal run, and which did not reproduce across three subsequent clean runs.
+Re-run before diagnosing, and prefer `--filter "FullyQualifiedName~Interop"`
+(~54 s) to isolate a genuine interop failure from a stall under load.
+
 ### Regenerating Avro Test Data
 
 The Avro test suite includes pre-generated `.avro` files in

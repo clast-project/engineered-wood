@@ -15,9 +15,10 @@ namespace EngineeredWood.DeltaLake.Table;
 /// it came from: a concurrent append inserts a path into the sort order and renumbers every ordinal after it,
 /// and any rewrite moves rows to new positions. Never persist one, never compare two from different
 /// snapshots. A row's durable identity is Delta ROW TRACKING's <c>baseRowId</c>-derived stable id — a
-/// different number entirely, reported by <see cref="DeltaTable.ReadRowsByRowIdsAsync"/>'
-/// <c>sourceRowTrackingOut</c>, and named by
-/// <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>.</para>
+/// different number entirely, read as a column by <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/>
+/// (named <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>) and reported out-of-band by
+/// <see cref="DeltaTable.ReadRowsByRowIdsAsync"/>' <c>sourceRowTrackingOut</c>. Reach for that one to
+/// remember a row; reach for this one to locate the rows you just read.</para>
 ///
 /// <para>Deliberately NOT tied to the row-tracking feature: the address works on a plain table with no
 /// deletion vectors and no row-tracking declared, which is the point — it is the maximally

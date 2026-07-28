@@ -1,5 +1,21 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
+**M4 LANDED 2026-07-28 — read-side stable ids (gap 3, the last optional milestone).**
+`DeltaTable.ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append the spec's two generated
+columns, `_metadata.row_id` and `_metadata.row_commit_version`, resolved per row as the materialized value
+where the file has one, else `add.baseRowId + position` / `add.defaultRowCommitVersion`. The resolution itself
+was already on the read path (the rowid out-params the rewrite paths consume); M4 is the wrapper that appends
+it as columns AFTER the pipeline, so the schema reconciliation inside `ProcessFileBatchesAsync` — defined
+against the table's Delta schema — never sees a column that is not in it, and `DeltaTable.ArrowSchema` keeps
+meaning one thing. Both columns are nullable (a file predating row tracking has no derivable id); a
+non-row-tracking table and a user column colliding with a generated name are both refused rather than served
+nulls. Named for the FEATURE, not by an adjective distinguishing them from `ReadAllWithRowIdsAsync` — that
+pair is one word apart otherwise, which is the trap `72b3888` already had to undo once at the column level.
+**MEASURED**: `EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion` asserts EW's resolution equals Spark's
+row by row (not against hardcoded ids) over a table mixing materialized and positional files — the first test
+of what EW READS rather than what it writes. Not covered: CDF (`ReadChangesAsync` goes through `CdfReader`,
+a separate path), and configuring the emitted column NAMES (deliberately deferred until a host needs it).
+
 **Fixed 2026-07-28 — a PARTITIONED row-tracking table lost stable ids on the SECOND rewrite.** `ReadFileAsync`
 names the file's columns explicitly whenever the table is partitioned (schema fields minus partition columns)
 or the read is projected, and the hidden materialized columns are not schema fields — so they were never
@@ -205,7 +221,7 @@ emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_
 |---|---|---|---|
 | 1 | Writes a hardcoded non-spec `__delta_row_id` column, even for default-id files that need none | Stop writing it for fresh appends; rely on `baseRowId` + position. Only ever write a **materialized** column, under its metadata-declared name, when ids are non-derivable (rewrites). | **DONE** — append writes none; a rewrite writes the materialized columns under the metadata-declared physical names (`RowTrackingWriter.AddRowIdAndCommitVersionColumns`). |
 | 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; stamp field IDs under column mapping. | **DONE (names)** — stored by `CreateAsync`; a rewrite writes under those names. Field-IDs-under-column-mapping still deferred (M2 validated name-mode; id-mode + RT rewrite is an untested edge). |
-| 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. | deferred (M4, optional) |
+| 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. | **DONE (2026-07-28, M4)** — `ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` + `_metadata.row_commit_version` (nullable Int64), resolved materialized-else-`baseRowId + position`. MEASURED equal to Spark's own resolution row by row (`EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion`) over a table mixing both paths. Refuses a non-row-tracking table and a user-column name collision. CDF (`ReadChangesAsync`) still does not carry them. |
 | 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Materialize each survivor's **original** id + commit version (a changed row's version advances; an untouched row keeps its). | **DONE** — `ComputeUpdateActionsAsync`; MEASURED against Spark. |
 | 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). | **DONE** — `CompactionExecutor` materializes id + version from the source's own materialized column or `baseRowId + position` / `defaultRowCommitVersion`; MEASURED against Spark. |
 | 6 | No `CreateAsync` enablement | Add `enableRowTracking: true` → set property + declare `rowTracking` + `domainMetadata` writer features + seed materialized-column-name metadata. | **DONE** — `CreateAsync(..., enableRowTracking: true)`. |

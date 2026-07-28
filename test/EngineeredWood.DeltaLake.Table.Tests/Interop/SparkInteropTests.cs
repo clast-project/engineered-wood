@@ -427,6 +427,86 @@ public class SparkInteropTests : IDisposable
         Assert.Equal(2L, idToRowId[30]);
     }
 
+    /// <summary>
+    /// <para>The read-side conformance claim: EW's own <c>ReadAllWithRowTrackingAsync</c> must resolve every
+    /// row's <c>_metadata.row_id</c> and <c>_metadata.row_commit_version</c> to the SAME values Spark
+    /// resolves for the same rows. Every other row-tracking interop test measures what EW WRITES; this is the
+    /// first that measures what EW READS, which is a separate claim — EW could write a spec-correct
+    /// materialized column and still resolve it wrongly on the way back (prefer the wrong override, mis-handle
+    /// the null fallback, count surviving rows instead of physical positions).</para>
+    ///
+    /// <para>The table deliberately mixes both resolution paths in one read: the UPDATE rewrites the first
+    /// file, so its rows' ids come from the MATERIALIZED column, while the second file's are still
+    /// <c>baseRowId + position</c>. Asserting agreement row by row — rather than against hardcoded 0,1,2 —
+    /// is what makes Spark the oracle instead of a second opinion on EW's own convention.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        var ewTracking = new Dictionary<long, (long? RowId, long? Version)>();
+
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdRegionBatch([10, 20], ["us", "eu"])]); // file 0: ids 0,1
+            await table.WriteAsync([IdRegionBatch([30], ["apac"])]);         // file 1: id 2
+
+            // Rewrites file 0 only -> its ids become materialized; file 1's stay positional.
+            await table.UpdateAsync(
+                b =>
+                {
+                    var region = (StringArray)b.Column("region");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < region.Length; i++)
+                        mask.Append(region.GetString(i) == "eu");
+                    return mask.Build();
+                },
+                b =>
+                {
+                    var region = new StringArray.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        region.Append("EU");
+                    return new RecordBatch(IdRegionSchema, [b.Column("id"), region.Build()], b.Length);
+                });
+
+            await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var rowIds = (Int64Array)batch.Column(
+                    EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName);
+                var versions = (Int64Array)batch.Column(
+                    EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    ewTracking[ids.GetValue(i)!.Value] = (
+                        rowIds.IsNull(i) ? null : rowIds.GetValue(i),
+                        versions.IsNull(i) ? null : versions.GetValue(i));
+                }
+            }
+        }
+
+        static long? Val(System.Text.Json.JsonElement row, string name) =>
+            row.GetProperty(name).ValueKind == System.Text.Json.JsonValueKind.Null
+                ? null : row.GetProperty(name).GetInt64();
+
+        var sparkTracking = Spark.Invoke("read_row_ids", new { path = _tempDir })
+            .GetProperty("rows").EnumerateArray()
+            .ToDictionary(
+                r => r.GetProperty("id").GetInt64(),
+                r => (RowId: Val(r, "row_id"), Version: Val(r, "row_commit_version")));
+
+        Assert.Equal(sparkTracking.Count, ewTracking.Count);
+        foreach (var (id, expected) in sparkTracking.OrderBy(kv => kv.Key))
+            Assert.Equal(expected, ewTracking[id]); // EW's resolution == Spark's, row by row
+
+        // Guard against agreeing vacuously: all three rows are present, with the ids the mixed
+        // materialized/positional table is supposed to produce.
+        Assert.Equal(3, sparkTracking.Count);
+        Assert.Equal([0L, 1L, 2L], sparkTracking.Values.Select(v => v.RowId!.Value).OrderBy(v => v).ToArray());
+    }
+
     /// <summary>Sets <c>value</c> to <paramref name="newValue"/> on the rows currently holding
     /// <paramref name="matchValue"/>, over <see cref="IdValueRegionSchema"/>. The updater receives the
     /// partition column materialized by the read and must hand it back.</summary>

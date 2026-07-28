@@ -343,8 +343,16 @@ concurrent rewrite). All of this is measured cross-engine on Spark 4.0
 refuses a copy-on-write REWRITE of a row-tracking table that does NOT declare
 its materialized column-name properties (a spec-invalid shape EW never creates,
 but a foreign engine could) — without those names EW cannot preserve ids through
-the rewrite. Appending to and reading such a table is still allowed. Background:
-`doc/row-tracking-conformance-brief.md`.
+the rewrite. Appending to and reading such a table is still allowed.
+
+Readers can now see the ids: `ReadAllWithRowTrackingAsync` /
+`ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` and
+`_metadata.row_commit_version`, measured equal to Spark's own resolution row by
+row. Two gaps remain on that surface — the Change Data Feed
+(`ReadChangesAsync`) does NOT carry them, since it reads through `CdfReader`
+rather than the main read path; and the emitted column names are fixed, with no
+option to rename them for a host that cannot use a dotted identifier.
+Background: `doc/row-tracking-conformance-brief.md`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single

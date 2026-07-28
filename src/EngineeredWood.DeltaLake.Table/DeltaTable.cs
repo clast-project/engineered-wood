@@ -3325,6 +3325,139 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    // ── Delta ROW TRACKING columns: a row's STABLE identity ──
+    // The spec's two generated columns, resolved per row as the file's materialized value where it has one,
+    // else add.baseRowId + position / add.defaultRowCommitVersion. This is the identity Spark exposes as
+    // _metadata.row_id — it survives UPDATE, DELETE, OVERWRITE and compaction, and is comparable across
+    // snapshots. NOT the TransientRowAddress the methods above emit, which says only where a row currently
+    // sits; the two have been confused before (see TransientRowAddress' remarks), so they are deliberately
+    // named for what they are rather than by one distinguishing adjective.
+
+    /// <summary>
+    /// Like <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
+    /// but appends Delta's two row-tracking columns — <c>_metadata.row_id</c> and
+    /// <c>_metadata.row_commit_version</c> (<see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>
+    /// / <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName"/>), carrying each row's
+    /// STABLE identity: the file's materialized value where it has one, else <c>add.baseRowId + position</c> /
+    /// <c>add.defaultRowCommitVersion</c>. The values match what a conformant engine (Spark) reads for the same
+    /// rows, and survive rewrites — a row keeps its id through UPDATE, copy-on-write DELETE, OVERWRITE and
+    /// compaction.
+    /// <para>Both columns are NULLABLE: a file predating row tracking on the table carries no
+    /// <c>baseRowId</c>, and its rows have no derivable id. Requires <c>delta.enableRowTracking=true</c> —
+    /// reading a table without it throws rather than returning an all-null column that would read as
+    /// "these rows have no identity" instead of "this table does not track identity".</para>
+    /// </summary>
+    public IAsyncEnumerable<RecordBatch> ReadAllWithRowTrackingAsync(
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return ReadWithRowTrackingAsync(CurrentSnapshot, columns, filter, cancellationToken);
+    }
+
+    /// <summary>
+    /// Time travel WITH the row-tracking columns — the version analog of
+    /// <see cref="ReadAllWithRowTrackingAsync"/>. Because the ids are stable, a row read at two different
+    /// versions reports the SAME <c>_metadata.row_id</c>, which is what makes this usable for diffing a row
+    /// across history; its <c>_metadata.row_commit_version</c> is the version that last changed it.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAtVersionWithRowTrackingAsync(
+        long version,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken).ConfigureAwait(false);
+        await foreach (var batch in ReadWithRowTrackingAsync(snapshot, columns, filter, cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    // Shared iterator. The per-row resolution already exists on the read path (ReadFileAsync surfaces it via
+    // the rowid out-params, which the rewrite paths consume to preserve ids); this appends it as columns
+    // AFTER the pipeline, so the schema reconciliation inside ProcessFileBatchesAsync — which is defined
+    // against the table's Delta schema — never sees a column that is not in it.
+    private async IAsyncEnumerable<RecordBatch> ReadWithRowTrackingAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        RequireRowTrackingRead(snapshot);
+
+        var pruner = filter is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns,
+            _options.PreferTypedCheckpointStats);
+
+        foreach (var addFile in OrderedActiveFiles(snapshot))
+        {
+            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+                continue;
+
+            var idsOut = new List<Int64Array?>();
+            var versOut = new List<Int64Array?>();
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken,
+                                                      strippedRowIdsOut: idsOut,
+                                                      strippedVersionsOut: versOut).ConfigureAwait(false))
+            {
+                bi++;
+                var ids = bi < idsOut.Count ? idsOut[bi] : null;
+                var vers = bi < versOut.Count ? versOut[bi] : null;
+                yield return RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+                    batch,
+                    ids ?? AllNullInt64(batch.Length),
+                    vers ?? AllNullInt64(batch.Length),
+                    DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
+                    DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName,
+                    nullable: true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The preconditions for reading the row-tracking columns: the table must actually track row identity, and
+    /// the two generated column names must be free. Both failures are refused rather than papered over — an
+    /// all-null id column on a table with no row tracking, or a user column shadowed by a generated one, would
+    /// each be read as data rather than as the mistake it is.
+    /// </summary>
+    private static void RequireRowTrackingRead(Snapshot.Snapshot snapshot)
+    {
+        if (!DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
+        {
+            throw new InvalidOperationException(
+                "Reading the row-tracking columns requires 'delta.enableRowTracking=true' on the table. This "
+                + "table does not track row identity, so its rows have no stable id to report — use "
+                + "ReadAllWithRowIdsAsync for a snapshot-scoped row ADDRESS instead.");
+        }
+
+        foreach (var field in snapshot.ArrowSchema.FieldsList)
+        {
+            if (field.Name == DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName
+                || field.Name == DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName)
+            {
+                throw new InvalidOperationException(
+                    $"The table has a column named '{field.Name}', which collides with the Delta row-tracking "
+                    + "generated column of that name. The read cannot report both.");
+            }
+        }
+    }
+
+    /// <summary>An all-null Int64 array of <paramref name="length"/> rows — the row-tracking value for a batch
+    /// whose file carries no derivable identity at all (no materialized column and no
+    /// <c>add.baseRowId</c>).</summary>
+    private static Int64Array AllNullInt64(int length)
+    {
+        var b = new Int64Array.Builder().Reserve(length);
+        for (int i = 0; i < length; i++)
+            b.AppendNull();
+        return b.Build();
+    }
+
     /// <summary>
     /// Writes RecordBatch data as a new commit.
     /// Returns the committed version number.
