@@ -1517,7 +1517,7 @@ public class SparkInteropTests : IDisposable
         var sparkAll = SparkChanges(appendVersion, overwriteVersion);
         var ewAll = await EwChangesAsync(appendVersion, overwriteVersion);
         Assert.Equal(sparkAll, ewAll);
-        Assert.Single(sparkAll.Where(t => t is { Ct: "delete", Id: 2 }));
+        Assert.Single(sparkAll, t => t is { Ct: "delete", Id: 2 });
     }
 
     /// <summary>
