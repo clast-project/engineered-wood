@@ -208,6 +208,11 @@ public class PlanFilesTests : IDisposable
     {
         await using var table = await ThreeFileTableAsync(Fs);
         var pinned = table.CurrentSnapshot;
+        // Captured BEFORE the append: identify the pinned set by path identity. Matching a filename against
+        // the row range it holds does not work — data files are GUID-named, and a GUID contains any given
+        // 3-hex-digit string often enough to fail in CI (7c7e889d3007… contains "300").
+        var pinnedPaths = pinned.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).ToArray();
 
         await table.WriteAsync([Batch(300, 10)]); // a fourth file lands
 
@@ -217,7 +222,9 @@ public class PlanFilesTests : IDisposable
         var atPinned = table.PlanFiles(filter: null, snapshot: pinned);
         Assert.Equal(3, atPinned.Count);
         Assert.Equal(new[] { 0, 1, 2 }, atPinned.Select(p => p.FileOrdinal).ToArray());
-        Assert.DoesNotContain(atPinned, p => p.File.Path.Contains("300", StringComparison.Ordinal));
+        // PlanFiles returns path-sorted, so this is an exact set comparison: the pinned plan is the
+        // pre-append active set and nothing else.
+        Assert.Equal(pinnedPaths, atPinned.Select(p => p.File.Path).ToArray());
     }
 
     [Fact]
