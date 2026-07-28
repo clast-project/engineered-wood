@@ -1997,7 +1997,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
-        bool rowLevel = rowLevelDeletes is { Count: > 0 };
+        // Row-level reconciliation is a WRITE_SERIALIZABLE behaviour, so the LEVEL is part of the condition
+        // and not only the presence of DV edits. Under Serializable, commit order IS the logical order: a
+        // second writer touching a file the first also touched conflicts at FILE granularity however disjoint
+        // the rows are, and reconciling there admits precisely the interleaving that level exists to forbid.
+        bool rowLevel = rowLevelDeletes is { Count: > 0 }
+            && isolationLevel != IsolationLevel.Serializable;
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
 
@@ -2071,8 +2076,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     currentActions = dataActions; // stable source; row-tracking ids re-derived below
                 }
 
+                // Under WriteSerializable a reconciled row-level delete skips the READ checks entirely. The
+                // row-level validation above already established that no row this transaction removes was
+                // concurrently removed or moved beyond reach, and that is the whole guarantee the level
+                // offers — commits may be reordered relative to reads, only writes may not conflict.
+                // Narrowing the exemption to just the reconciled PATHS would still abort transactions the
+                // level is defined to admit: a file this transaction merely READ and never touched can be
+                // compacted away by a concurrent writer without invalidating any row it deletes.
+                // Serializable keeps the full check — making commit order the logical order is its purpose.
+                var effectiveReads = rowLevel ? Concurrency.ReadSet.Blind : reads;
                 var verdict = Concurrency.ConflictChecker.Check(
-                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
+                    effectiveReads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                     throw new DeltaConflictException(verdict.Message!);
 
