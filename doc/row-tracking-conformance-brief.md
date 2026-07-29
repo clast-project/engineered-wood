@@ -1,5 +1,18 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
+**FOREIGN→EW MEASURED 2026-07-28 (gap 7's remaining half) — no production change needed.**
+The direction this brief repeatedly warned was unproven: a row-tracking table SPARK creates, writes, and
+materializes, then EngineeredWood reads and rewrites. Measured shape (do not assume it — it was probed, not
+inferred): Spark names its hidden columns `_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>` — HYPHENATED,
+unlike EW's own `_row_id_<hex>` — declares `rowTracking`+`domainMetadata`+`appendOnly`+`invariants` at
+reader 1 / writer 7, and after an UPDATE leaves ONE file whose `baseRowId` is 3 while its rows' materialized
+ids are 0,1,2. That gap is what makes the tests discriminating, and it is asserted rather than described:
+a reader ignoring the materialized column reports 3,4,5. Three tests cover read, UPDATE-preserve and
+compaction-preserve; all three were confirmed to FAIL when the read resolution is neutered (the compaction one
+needs its own probe — `CompactionExecutor` bypasses `ProcessFileBatchesAsync` and strips the columns itself).
+**EW needed no change to pass**: the foreign-name handling was already correct, only unverified. What this
+retires is a risk, not a defect.
+
 **M4 LANDED 2026-07-28 — read-side stable ids (gap 3, the last optional milestone).**
 `DeltaTable.ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append the spec's two generated
 columns, `_metadata.row_id` and `_metadata.row_commit_version`, resolved per row as the materialized value
@@ -225,7 +238,7 @@ emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_
 | 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Materialize each survivor's **original** id + commit version (a changed row's version advances; an untouched row keeps its). | **DONE** — `ComputeUpdateActionsAsync`; MEASURED against Spark. |
 | 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). | **DONE** — `CompactionExecutor` materializes id + version from the source's own materialized column or `baseRowId + position` / `defaultRowCommitVersion`; MEASURED against Spark. |
 | 6 | No `CreateAsync` enablement | Add `enableRowTracking: true` → set property + declare `rowTracking` + `domainMetadata` writer features + seed materialized-column-name metadata. | **DONE** — `CreateAsync(..., enableRowTracking: true)`. |
-| 7 | No interop coverage | Tier-3 Spark tests both directions (EW writes → Spark reads ids; Spark writes → EW reads/preserves ids). | **DONE (EW→foreign)** — Spark reads EW-appended ids AND EW rewrite-preserved ids (`EwUpdated_/EwCompacted_RowTracking_SparkReadsPreservedIds`); delta-rs reads a rewritten table with no leaked columns. Extended 2026-07-28 to PARTITIONED tables, plain and Name-mode-mapped, rewritten TWICE (`EwUpdatedTwice_RowTracking_Partitioned_/…_MappedPartitioned_SparkReadsPreservedIds`) — the shape that caught the read-path id loss above; a single rewrite cannot. Spark→EW preservation (EW re-preserves ids a Spark UPDATE materialized) still un-covered. |
+| 7 | No interop coverage | Tier-3 Spark tests both directions (EW writes → Spark reads ids; Spark writes → EW reads/preserves ids). | **DONE (EW→foreign)** — Spark reads EW-appended ids AND EW rewrite-preserved ids (`EwUpdated_/EwCompacted_RowTracking_SparkReadsPreservedIds`); delta-rs reads a rewritten table with no leaked columns. Extended 2026-07-28 to PARTITIONED tables, plain and Name-mode-mapped, rewritten TWICE (`EwUpdatedTwice_RowTracking_Partitioned_/…_MappedPartitioned_SparkReadsPreservedIds`) — the shape that caught the read-path id loss above; a single rewrite cannot. **FOREIGN→EW closed 2026-07-28** (`SparkWritten_RowTracking_EwReadsTheSameStableIds` / `…_EwUpdatePreservesSparksMaterializedIds` / `…_EwCompactionPreservesSparksMaterializedIds`): Spark creates + materializes, EW reads the same ids and preserves them through its own UPDATE and compaction. Needed NO production change — the capability was already correct, only unmeasured. Both directions now covered. |
 | 8 | The write gate | Remove `RejectRowTrackingWrite` once the above hold. | **DONE (effectively)** — now refuses a rewrite ONLY when the declared materialized names are absent (a spec-invalid table). Every EW-created RT table has them → all writes allowed. |
 
 ## Implementation plan (ordered) — port pr-4, then validate

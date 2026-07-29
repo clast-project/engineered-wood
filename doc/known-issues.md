@@ -339,7 +339,10 @@ concurrency rebases under row tracking (append/update re-derive `baseRowId` from
 the advanced high-water mark; a losing DELETE remaps by stable row id across a
 concurrent rewrite). All of this is measured cross-engine on Spark 4.0
 (`SparkInteropTests` — Spark reads the preserved / rebased ids via
-`_metadata.row_id`). The one residual: `DeltaTable.RejectRowTrackingWrite`
+`_metadata.row_id`), in BOTH directions: EW-written tables Spark reads, and
+Spark-written tables (with Spark's own hyphenated materialized column names)
+that EW reads and then rewrites without losing the ids Spark assigned.
+The one residual: `DeltaTable.RejectRowTrackingWrite`
 refuses a copy-on-write REWRITE of a row-tracking table that does NOT declare
 its materialized column-name properties (a spec-invalid shape EW never creates,
 but a foreign engine could) — without those names EW cannot preserve ids through
