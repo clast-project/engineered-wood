@@ -3081,11 +3081,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
+        // The materialized column names are fixed at enablement and never change, so the CURRENT snapshot's
+        // metadata names them correctly for every version in the range — the same simplification the feed
+        // already makes for the schema itself.
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         return ChangeDataFeed.CdfReader.ReadChangesAsync(
             _fs, _log, startVersion, endVersion, _dataFileReadOptions,
             snapshot.ArrowSchema, snapshot.Schema,
             ColumnMapping.GetMode(snapshot.Metadata.Configuration),
             snapshot.Metadata.PartitionColumns,
+            matRowIdName, matRowVerName,
             cancellationToken);
     }
 

@@ -36,11 +36,23 @@ internal static class CdfReader
         DeltaStructType DeltaSchema,
         ColumnMappingMode MappingMode,
         IReadOnlyList<string> PartitionColumns,
-        IReadOnlyDictionary<string, string> LogicalToPhysical);
+        IReadOnlyDictionary<string, string> LogicalToPhysical,
+        string? MaterializedRowIdName,
+        string? MaterializedRowVersionName)
+    {
+        /// <summary>True when the table DECLARES its hidden materialized row-tracking column names — the
+        /// gate for touching them at all, so a table without row tracking is read exactly as before.</summary>
+        public bool HasMaterializedColumns =>
+            MaterializedRowIdName is not null || MaterializedRowVersionName is not null;
+    }
 
     /// <summary>
     /// Reads changes from <paramref name="startVersion"/> to <paramref name="endVersion"/> (inclusive).
     /// Each batch includes <c>_change_type</c>, <c>_commit_version</c>, and <c>_commit_timestamp</c> columns.
+    /// <para>On a row-tracking table the hidden MATERIALIZED columns (named by
+    /// <paramref name="materializedRowIdName"/> / <paramref name="materializedRowVersionName"/>) are stripped
+    /// from every batch. They are stored inline in both a change file and a data file, and they are not part
+    /// of the feed a caller asked for.</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -52,13 +64,16 @@ internal static class CdfReader
         DeltaStructType deltaSchema,
         ColumnMappingMode mappingMode,
         IReadOnlyList<string> partitionColumns,
+        string? materializedRowIdName = null,
+        string? materializedRowVersionName = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var ctx = new CdfSchemaContext(
             logicalArrowSchema, deltaSchema, mappingMode, partitionColumns,
             mappingMode == ColumnMappingMode.None
                 ? new Dictionary<string, string>()
-                : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode));
+                : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode),
+            materializedRowIdName, materializedRowVersionName);
 
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
@@ -157,6 +172,18 @@ internal static class CdfReader
             // The file already carries _change_type (per-row); split it off so the physical data columns can be
             // mapped to logical + interleaved with the re-materialized partition columns, then re-attach it.
             var (physicalData, changeType) = SplitChangeType(batch);
+
+            // The hidden row-tracking columns come off next, before anything positional runs: the partition
+            // interleave walks the TABLE schema and pulls data columns in order, so a column the schema does
+            // not know about either falls off the end or shifts the ones after it. Gated on the table actually
+            // DECLARING the names — the strip also recognizes legacy internal ones, which on a table that does
+            // not track rows would mean dropping a user column that merely shares the name.
+            if (ctx.HasMaterializedColumns)
+            {
+                (physicalData, _, _) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                    physicalData, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
+            }
+
             var logical = MapToLogicalWithPartitions(
                 physicalData, (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues, ctx);
             var withChangeType = changeType is null
@@ -201,7 +228,15 @@ internal static class CdfReader
         await foreach (var rawBatch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
+            // A data file carries the hidden row-tracking columns for every row a rewrite moved; they are not
+            // schema fields, so they must come off before the logical mapping and partition interleave.
             var batch = rawBatch;
+            if (ctx.HasMaterializedColumns)
+            {
+                (batch, _, _) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                    batch, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
+            }
+
             if (dvRows is not null)
             {
                 batch = DeletionVectorFilter.Filter(batch, dvRows, batchStartRow);
