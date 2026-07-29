@@ -1699,6 +1699,163 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
 
+    /// <summary>
+    /// EW writes a ROW TRACKING + CDF table and Spark reads the feed. The claim is that the two hidden
+    /// materialized columns EW now puts in every <c>_change_data</c> file — which is how a change row carries
+    /// any identity at all, a <c>cdc</c> action having no <c>baseRowId</c> — do not disturb a conformant
+    /// reader: Spark reports the table's own columns and change types and nothing else.
+    ///
+    /// <para>Worth measuring rather than assuming, because Spark's <c>readChangeFeed</c> does NOT surface
+    /// row ids (measured: <c>_metadata</c> does not even resolve on the feed), so the columns are ones it
+    /// never asked for. A reader that resolved the change file against the table schema positionally, rather
+    /// than by name, would surface them as data.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_RowTrackingChangeDataFeed_SparkReadsTheFeedWithoutTheHiddenColumns()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long insertVersion, updateVersion;
+        string matRowIdName, matRowVerName;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            enableRowTracking: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            var (rid, rver) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+                .TryGetMaterializedColumnNames(table.CurrentSnapshot.Metadata.Configuration);
+            matRowIdName = rid!;
+            matRowVerName = rver!;
+
+            insertVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]);
+            updateVersion = table.CurrentSnapshot.Version + 1;
+            await table.UpdateAsync(
+                b =>
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 20);
+                    return mask.Build();
+                },
+                b =>
+                {
+                    int rIdx = b.Schema.GetFieldIndex("region");
+                    var cols = new IArrowArray[b.ColumnCount];
+                    for (int i = 0; i < b.ColumnCount; i++)
+                        cols[i] = i == rIdx ? new StringArray.Builder().Append("EU").Build() : b.Column(i);
+                    return new RecordBatch(b.Schema, cols, b.Length);
+                });
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = insertVersion, end = updateVersion });
+
+        var columns = result.GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        Assert.Equal(
+            ["id", "region", "_change_type", "_commit_version", "_commit_timestamp"],
+            columns);
+        Assert.DoesNotContain(matRowIdName, columns);
+        Assert.DoesNotContain(matRowVerName, columns);
+
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (Ct: r.GetProperty("_change_type").GetString(),
+                          Id: r.GetProperty("id").GetInt64(),
+                          Region: r.GetProperty("region").GetString()))
+            .ToList();
+        Assert.Equal(5, rows.Count); // 3 inserts + pre-image + post-image
+        Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 20 && t.Region == "eu");
+        Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 20 && t.Region == "EU");
+
+        // And the ids themselves still resolve for Spark on the TABLE — the change files did not disturb them.
+        var ids = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal([0L, 1L, 2L], ids.Values.OrderBy(v => v).ToArray());
+    }
+
+    /// <summary>
+    /// The direction that decides whether EW's feed-side resolution is conformant or merely self-consistent:
+    /// SPARK writes a row-tracking + CDF table and does its own UPDATE and DELETE, and EW reads the resulting
+    /// CHANGE FEED with <c>ReadChangesWithRowTrackingAsync</c>. Every identity in the feed must be the one
+    /// Spark assigned, resolved out of Spark's own change files.
+    ///
+    /// <para>Two things make this discriminating, both MEASURED from Spark 4.0.1 rather than assumed.
+    /// Spark's materialized columns are named <c>_row-id-col-&lt;uuid&gt;</c> — hyphenated, unlike EW's
+    /// <c>_row_id_&lt;hex&gt;</c> — so EW has to find them through the table's declared property. And Spark
+    /// writes the <c>update_postimage</c> row's commit version as NULL, leaving it to be defaulted; a reader
+    /// that reported that null verbatim would say the post-image row has no version, when it plainly belongs
+    /// to the commit that produced it.</para>
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 10L, "us" }, new object[] { 20L, "eu" }, new object[] { 30L, "apac" },
+            },
+            options = new Dictionary<string, string>
+            {
+                ["delta.enableRowTracking"] = "true",
+                ["delta.enableChangeDataFeed"] = "true",
+            },
+            sql = new[] { "UPDATE delta.`{path}` SET region = 'EU' WHERE id = 20" },
+        });
+
+        // Spark's own view of each surviving row's stable id, taken BEFORE the delete removes one of them.
+        var sparkIds = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal([0L, 1L, 2L], sparkIds.Values.OrderBy(v => v).ToArray());
+
+        Spark.Invoke("sql", new { path = _tempDir, sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 30" } });
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var feed = new List<(string Change, long Id, long? RowId, long? RowVersion, long Commit)>();
+        await foreach (var batch in table.ReadChangesWithRowTrackingAsync(0, table.CurrentSnapshot.Version))
+        {
+            var change = (StringArray)batch.Column("_change_type");
+            var id = (Int64Array)batch.Column("id");
+            var rowId = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName);
+            var rowVer = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
+            var commit = (Int64Array)batch.Column("_commit_version");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                feed.Add((change.GetString(i), id.GetValue(i)!.Value,
+                          rowId.IsNull(i) ? null : rowId.GetValue(i),
+                          rowVer.IsNull(i) ? null : rowVer.GetValue(i),
+                          commit.GetValue(i)!.Value));
+            }
+
+            // Spark's hidden columns are Spark-named; none of them may reach the feed.
+            Assert.DoesNotContain(batch.Schema.FieldsList,
+                f => f.Name.StartsWith("_row-id-col-", StringComparison.Ordinal)
+                     || f.Name.StartsWith("_row-commit-version-col-", StringComparison.Ordinal));
+        }
+
+        // The UPDATE: both images of id=20 report the id SPARK gave that row, not a fresh or positional one.
+        var pre = Assert.Single(feed, r => r.Change == "update_preimage");
+        var post = Assert.Single(feed, r => r.Change == "update_postimage");
+        Assert.Equal(20, pre.Id);
+        Assert.Equal(sparkIds[20], pre.RowId);
+        Assert.Equal(sparkIds[20], post.RowId);
+
+        // Spark leaves the post-image's commit version NULL, meaning "the version being committed".
+        Assert.Equal(post.Commit, post.RowVersion);
+        Assert.True(pre.RowVersion < post.RowVersion,
+            $"the pre-image should belong to an earlier version than the post-image, got "
+            + $"{pre.RowVersion} and {post.RowVersion}");
+
+        // The DELETE: the removed row reports the identity it had while it was still in the table.
+        var deleted = Assert.Single(feed, r => r.Change == "delete");
+        Assert.Equal(30, deleted.Id);
+        Assert.Equal(sparkIds[30], deleted.RowId);
+    }
+
     // Creates an UNMAPPED table partitioned by region with CDF enabled at creation.
     private async Task<DeltaTable> CreatePartitionedCdfTableAsync() =>
         await DeltaTable.CreateAsync(

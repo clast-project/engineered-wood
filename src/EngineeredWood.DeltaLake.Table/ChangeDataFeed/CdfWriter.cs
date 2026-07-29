@@ -6,6 +6,7 @@ using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.RowTracking;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
@@ -27,6 +28,9 @@ internal static class CdfWriter
     /// The synthetic <c>_change_type</c> column is added AFTER the rename, so it stays an unmapped, plainly-named
     /// column. Partition columns are NOT stored in the file bytes (data-file convention) — they ride on the
     /// returned action's <paramref name="partitionValues"/> and the reader re-materializes them.
+    /// <para>On a ROW TRACKING table the two hidden materialized columns go in as well, carrying
+    /// <paramref name="rowIds"/> / <paramref name="rowCommitVersions"/> — see
+    /// <see cref="AddMaterializedRowTracking"/> for why a cdc file cannot do without them.</para>
     /// </summary>
     public static async ValueTask<CdcFile> WriteAsync(
         ITableFileSystem fs,
@@ -35,7 +39,9 @@ internal static class CdfWriter
         string changeType,
         IReadOnlyDictionary<string, string> partitionValues,
         ParquetWriteOptions? parquetOptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Int64Array? rowIds = null,
+        Int64Array? rowCommitVersions = null)
     {
         // Partition columns never live in the file bytes — they ride on the action's partitionValues and the
         // reader re-materializes them POSITIONALLY against the table schema. A caller whose rows came from the
@@ -46,6 +52,10 @@ internal static class CdfWriter
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
+
+        // Row-tracking identity, under the declared physical names — after the rename (the names are already
+        // physical) and before _change_type, which is the layout Spark writes.
+        rows = AddMaterializedRowTracking(rows, snapshot, rowIds, rowCommitVersions);
 
         // Add _change_type column (unmapped — added after the physical rename)
         var batchWithChangeType = AddRunEncodedChangeTypeColumn(rows, changeType);
@@ -72,6 +82,69 @@ internal static class CdfWriter
             DataChange = false,
         };
     }
+
+    /// <summary>
+    /// Puts each change row's STABLE row id + row commit version into the table's declared hidden
+    /// materialized columns, when the table tracks row identity. A no-op otherwise, so a table without row
+    /// tracking writes exactly the file it always did.
+    ///
+    /// <para>Materializing is the ONLY way identity reaches a change file: a <c>cdc</c> action has no
+    /// <c>baseRowId</c> / <c>defaultRowCommitVersion</c> fields (unlike <c>add</c> and <c>remove</c>), so
+    /// there is no positional fallback for a reader to resolve against. Absent these columns a change row
+    /// simply has no id.</para>
+    ///
+    /// <para>MEASURED against Spark 4.0.1 / delta-spark 4.0.0 on a row-tracking + CDF table: its change files
+    /// carry both columns, positioned after the user columns and before <c>_change_type</c> — the layout
+    /// written here. Spark leaves a value NULL where the default would supply it (an <c>update_postimage</c>
+    /// row's commit version, which is the version being committed); engineered-wood writes that version
+    /// explicitly instead, which resolves to the same number without depending on a reader implementing the
+    /// fallback. A null is still written where a value is genuinely unknown — a row from a file predating
+    /// row tracking has no original id to carry.</para>
+    ///
+    /// <para>Both columns are written whenever the table declares them, even with no values supplied (the
+    /// host seam <c>DeltaTable.WriteChangeDataFileAsync</c> may not have ids in hand), so every change file
+    /// in a version has the same schema. A reader unioning them then sees one shape rather than two.</para>
+    /// </summary>
+    private static RecordBatch AddMaterializedRowTracking(
+        RecordBatch rows,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
+        Int64Array? rowIds,
+        Int64Array? rowCommitVersions)
+    {
+        if (!RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
+            return rows;
+
+        var (rowIdName, rowVerName) =
+            RowTrackingConfig.TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        if (rowIdName is null || rowVerName is null)
+        {
+            // A spec-invalid table declaring row tracking without its column names. Writing under a guessed
+            // name would put an unreadable column in the file; the rewrite paths refuse such a table outright
+            // (DeltaTable.RejectRowTrackingWrite) and the feed follows suit by carrying no identity.
+            return rows;
+        }
+
+        if (rowIds is not null && rowIds.Length != rows.Length)
+            throw new ArgumentException(
+                $"Row-tracking ids for a change file must have one value per row: got {rowIds.Length} for "
+                + $"{rows.Length} rows.", nameof(rowIds));
+        if (rowCommitVersions is not null && rowCommitVersions.Length != rows.Length)
+            throw new ArgumentException(
+                $"Row-tracking commit versions for a change file must have one value per row: got "
+                + $"{rowCommitVersions.Length} for {rows.Length} rows.", nameof(rowCommitVersions));
+
+        return RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+            rows,
+            rowIds ?? AllNullInt64(rows.Length),
+            rowCommitVersions ?? AllNullInt64(rows.Length),
+            rowIdName, rowVerName, nullable: true);
+    }
+
+    /// <summary>An all-null Int64 column of <paramref name="length"/> rows — "this row's identity is not
+    /// known", which is distinct from the column being absent only in that the file's schema stays uniform.
+    /// </summary>
+    private static Int64Array AllNullInt64(int length) =>
+        (Int64Array)ArrowCompute.MakeNullArray(Int64Type.Default, length);
 
     /// <summary>
     /// Adds a <c>_change_type</c> column to a RecordBatch as a plain string column — one value slot per

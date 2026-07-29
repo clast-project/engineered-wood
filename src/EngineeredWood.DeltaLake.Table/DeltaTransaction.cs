@@ -347,8 +347,16 @@ public sealed class DeltaTransaction
     /// cdc-only, so a change file staged here replaces — rather than adds to — what the reader would otherwise
     /// infer from this version's adds and removes.</para>
     /// </summary>
+    /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one per row of
+    /// <paramref name="rows"/>, ordinarily what <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/> reported
+    /// for it. A change file is the only place a change row's identity can live (a <c>cdc</c> action has no
+    /// <c>baseRowId</c>), so omitting these leaves the staged rows with NULL ids on the feed.</param>
+    /// <param name="rowCommitVersions">The commit-version companion of <paramref name="rowIds"/>: the version
+    /// each row was last changed in. Omitted, every row defaults to the version this transaction commits —
+    /// correct for a post-image, wrong for a pre-image.</param>
     public async ValueTask StageChangeDataAsync(
-        RecordBatch rows, string changeType, CancellationToken cancellationToken = default)
+        RecordBatch rows, string changeType, CancellationToken cancellationToken = default,
+        Int64Array? rowIds = null, Int64Array? rowCommitVersions = null)
     {
         EnsureNotCommitted();
         if (rows is null)
@@ -358,7 +366,8 @@ public sealed class DeltaTransaction
         _table.ValidateChangeDataStageable(_baseSnapshot, changeType);
 
         var files = await _table.WriteChangeDataFilesForAsync(
-            _baseSnapshot, rows, changeType, cancellationToken).ConfigureAwait(false);
+            _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions)
+            .ConfigureAwait(false);
         StageInternal(files);
     }
 

@@ -19,9 +19,25 @@ internal static class PartitionUtils
     /// </summary>
     public static List<(Dictionary<string, string> PartitionValues, RecordBatch Data)> SplitByPartition(
         RecordBatch batch, IReadOnlyList<string> partitionColumns)
+        => SplitByPartitionWithSourceRows(batch, partitionColumns)
+            .Select(g => (g.PartitionValues, g.Data)).ToList();
+
+    /// <summary>
+    /// <see cref="SplitByPartition"/> plus each group's SOURCE ROW INDICES, in the order the group's rows
+    /// appear in its batch. A caller holding a per-row array that travels alongside the data — the change
+    /// feed's row-tracking ids — needs the indices to split that array the same way; without them the split
+    /// reorders rows and the array no longer describes them.
+    /// </summary>
+    public static List<(Dictionary<string, string> PartitionValues, RecordBatch Data, List<int> SourceRows)>
+        SplitByPartitionWithSourceRows(RecordBatch batch, IReadOnlyList<string> partitionColumns)
     {
         if (partitionColumns.Count == 0)
-            return [(new Dictionary<string, string>(), batch)];
+        {
+            var all = new List<int>(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+                all.Add(i);
+            return [(new Dictionary<string, string>(), batch, all)];
+        }
 
         // Find partition column indices
         var partColIndices = new int[partitionColumns.Count];
@@ -66,12 +82,12 @@ internal static class PartitionUtils
         var dataSchema = BuildNonPartitionSchema(batch.Schema, partColIndices);
 
         // Build output batches
-        var result = new List<(Dictionary<string, string>, RecordBatch)>();
+        var result = new List<(Dictionary<string, string>, RecordBatch, List<int>)>();
 
         foreach (var group in groups)
         {
             var dataBatch = BuildFilteredBatch(batch, dataSchema, partColIndices, group.Value.Rows);
-            result.Add((group.Value.Values, dataBatch));
+            result.Add((group.Value.Values, dataBatch, group.Value.Rows));
         }
 
         return result;

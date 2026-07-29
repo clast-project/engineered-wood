@@ -320,6 +320,9 @@ internal static class CompactionExecutor
                 // Keyed by (path, deletionVector) — a remove omitting the DV leaves the compacted-away file
                 // active and duplicates its rows.
                 DeletionVector = oldFile.DeletionVector,
+                // A remove carries the row-tracking fields of the add it removes (spec; Spark 4.0.1 does).
+                BaseRowId = oldFile.BaseRowId,
+                DefaultRowCommitVersion = oldFile.DefaultRowCommitVersion,
             });
         }
 

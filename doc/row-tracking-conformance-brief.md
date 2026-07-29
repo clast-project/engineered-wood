@@ -1,5 +1,44 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
+**CDF CARRIES THE ROW-TRACKING COLUMNS as of 2026-07-28 — the last gap on the read surface but one.**
+MEASURED FIRST (Spark 4.0.1 / delta-spark 4.0.0, probed rather than reasoned about): a row-tracking + CDF
+table's `_change_data` files DO carry both materialized columns, after the user columns and before
+`_change_type`; a `cdc` action carries NO `baseRowId`/`defaultRowCommitVersion` (unlike `add` and `remove`),
+so materializing is the ONLY way identity reaches a change row — there is no positional fallback; Spark
+writes an `update_postimage` row's commit version as **NULL** (meaning "the version being committed") while
+the pre-image and delete rows carry the row's original version explicitly; and Spark's own `readChangeFeed`
+does **not** expose row ids at all (`_metadata` does not resolve on the feed), so EW's exposure goes beyond
+the reference implementation. Spark also populates `baseRowId`/`defaultRowCommitVersion` on **remove**
+actions, which EW did not.
+
+What landed: (a) `CdfWriter` materializes both columns into every change file on a row-tracking table,
+under the declared physical names, with each row's identity threaded in from the five DML paths that write
+change files (predicate DELETE, DV DELETE by rowid, copy-on-write DELETE, predicate UPDATE, UPDATE by
+rowid) — the post-image version is written EXPLICITLY rather than as Spark's null, which resolves to the
+same number without relying on a reader implementing the fallback; (b) `DeltaTable.ReadChangesWithRowTrackingAsync`
+emits `_metadata.row_id` + `_metadata.row_commit_version` on the feed, resolved materialized-else-positional
+from a data file and materialized-else-`_commit_version` from a change file; (c) remove actions now carry
+the row-tracking fields of the add they remove, which is what makes an OVERWRITE's inferred delete rows
+resolvable; (d) the public `WriteChangeDataFileAsync` host seam takes the two arrays.
+
+**A LIVE BUG was fixed on the way** (landed as its own commit): `CdfReader` opens change files and data files
+directly rather than through the main read path, so a row-tracking table's hidden materialized columns LEAKED
+into the feed as two extra Int64 columns. UNPARTITIONED tables only — `AddPartitionColumns` consumes data
+columns positionally against the table schema, which takes exactly the user columns and leaves the hidden
+ones off the end, so a partitioned table was already dropping them by accident. (Measured, not assumed: a
+partitioned leak test passes with the strip neutered, which is why the partitioned coverage asserts IDS.)
+Reproduced against real Spark output: neutering the strip fails
+`SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds` on the leak assertion.
+
+MEASURED both directions: `EwWritten_RowTrackingChangeDataFeed_SparkReadsTheFeedWithoutTheHiddenColumns`
+(Spark reads an EW feed and reports exactly the table's columns — the new hidden columns do not disturb it,
+which is worth measuring because Spark never asks for them) and
+`SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds` (EW resolves Spark's hyphenated
+`_row-id-col-<uuid>` values out of Spark's own change files; pre/post images of the updated row report the
+id Spark assigned, the post-image's null version resolves to the commit, and a Spark-deleted row reports the
+identity it had). Non-interop cover in `CdfRowTrackingTests` (10), each confirmed to fail with the writer or
+the reader neutered. Remaining on this surface: the emitted column NAMES are still not configurable.
+
 **FOREIGN→EW MEASURED 2026-07-28 (gap 7's remaining half) — no production change needed.**
 The direction this brief repeatedly warned was unproven: a row-tracking table SPARK creates, writes, and
 materializes, then EngineeredWood reads and rewrites. Measured shape (do not assume it — it was probed, not
@@ -26,8 +65,8 @@ nulls. Named for the FEATURE, not by an adjective distinguishing them from `Read
 pair is one word apart otherwise, which is the trap `72b3888` already had to undo once at the column level.
 **MEASURED**: `EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion` asserts EW's resolution equals Spark's
 row by row (not against hardcoded ids) over a table mixing materialized and positional files — the first test
-of what EW READS rather than what it writes. Not covered: CDF (`ReadChangesAsync` goes through `CdfReader`,
-a separate path), and configuring the emitted column NAMES (deliberately deferred until a host needs it).
+of what EW READS rather than what it writes. Not covered at the time: CDF (closed 2026-07-28 — see the top of
+this document) and configuring the emitted column NAMES (deliberately deferred until a host needs it).
 
 **Fixed 2026-07-28 — a PARTITIONED row-tracking table lost stable ids on the SECOND rewrite.** `ReadFileAsync`
 names the file's columns explicitly whenever the table is partitioned (schema fields minus partition columns)

@@ -38,10 +38,11 @@ internal static class CdfReader
         IReadOnlyList<string> PartitionColumns,
         IReadOnlyDictionary<string, string> LogicalToPhysical,
         string? MaterializedRowIdName,
-        string? MaterializedRowVersionName)
+        string? MaterializedRowVersionName,
+        bool EmitRowTracking)
     {
-        /// <summary>True when the table DECLARES its hidden materialized row-tracking column names — the
-        /// gate for touching them at all, so a table without row tracking is read exactly as before.</summary>
+        /// <summary>True when the table DECLARES its hidden materialized column names — the gate for
+        /// touching them at all, so a table without row tracking is read exactly as before.</summary>
         public bool HasMaterializedColumns =>
             MaterializedRowIdName is not null || MaterializedRowVersionName is not null;
     }
@@ -49,10 +50,11 @@ internal static class CdfReader
     /// <summary>
     /// Reads changes from <paramref name="startVersion"/> to <paramref name="endVersion"/> (inclusive).
     /// Each batch includes <c>_change_type</c>, <c>_commit_version</c>, and <c>_commit_timestamp</c> columns.
-    /// <para>On a row-tracking table the hidden MATERIALIZED columns (named by
+    /// <para>The table's hidden materialized row-tracking columns (named by
     /// <paramref name="materializedRowIdName"/> / <paramref name="materializedRowVersionName"/>) are stripped
-    /// from every batch. They are stored inline in both a change file and a data file, and they are not part
-    /// of the feed a caller asked for.</para>
+    /// from every batch — a change file and a data file both store them inline, and they are not part of the
+    /// feed a caller asked for. With <paramref name="emitRowTracking"/> they come back as the spec's two
+    /// GENERATED columns instead, resolved per row; see <see cref="ResolveRowTracking"/>.</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -66,6 +68,7 @@ internal static class CdfReader
         IReadOnlyList<string> partitionColumns,
         string? materializedRowIdName = null,
         string? materializedRowVersionName = null,
+        bool emitRowTracking = false,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var ctx = new CdfSchemaContext(
@@ -73,7 +76,7 @@ internal static class CdfReader
             mappingMode == ColumnMappingMode.None
                 ? new Dictionary<string, string>()
                 : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode),
-            materializedRowIdName, materializedRowVersionName);
+            materializedRowIdName, materializedRowVersionName, emitRowTracking);
 
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
@@ -129,7 +132,8 @@ internal static class CdfReader
                     await foreach (var batch in ReadDataFileAsChangesAsync(
                         fs, remove.Path, remove.PartitionValues, remove.DeletionVector,
                         CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, ctx, dvReader, cancellationToken)
+                        commitTimestamp, readOptions, ctx, dvReader,
+                        remove.BaseRowId, remove.DefaultRowCommitVersion, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -142,7 +146,8 @@ internal static class CdfReader
                     await foreach (var batch in ReadDataFileAsChangesAsync(
                         fs, add.Path, add.PartitionValues, add.DeletionVector,
                         CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, ctx, dvReader, cancellationToken)
+                        commitTimestamp, readOptions, ctx, dvReader,
+                        add.BaseRowId, add.DefaultRowCommitVersion, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -178,19 +183,30 @@ internal static class CdfReader
             // not know about either falls off the end or shifts the ones after it. Gated on the table actually
             // DECLARING the names — the strip also recognizes legacy internal ones, which on a table that does
             // not track rows would mean dropping a user column that merely shares the name.
+            var cleanPhysical = physicalData;
+            Int64Array? matIds = null, matVers = null;
             if (ctx.HasMaterializedColumns)
             {
-                (physicalData, _, _) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                (cleanPhysical, matIds, matVers) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
                     physicalData, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
             }
 
             var logical = MapToLogicalWithPartitions(
-                physicalData, (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues, ctx);
+                cleanPhysical, (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues, ctx);
             var withChangeType = changeType is null
                 ? logical
                 : AppendColumn(logical,
                     new Field(CdfConfig.ChangeTypeColumn, StringType.Default, false), changeType);
-            yield return AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
+            var withMetadata = AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
+
+            // A cdc action carries no baseRowId / defaultRowCommitVersion, so the materialized value is the
+            // whole story for the id. The commit version falls back to this commit — that is what a null
+            // means in a change file Spark wrote, and it is the version the row belongs to by definition.
+            yield return ctx.EmitRowTracking
+                ? ResolveRowTracking(
+                    withMetadata, matIds, matVers,
+                    baseRowId: null, defaultRowCommitVersion: commitVersion, absolutePositions: null)
+                : withMetadata;
         }
     }
 
@@ -205,6 +221,8 @@ internal static class CdfReader
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
         DeletionVectorReader dvReader,
+        long? baseRowId,
+        long? defaultRowCommitVersion,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
@@ -223,24 +241,40 @@ internal static class CdfReader
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
-        // DV positions are absolute within the file, and batches arrive in file order.
+        // DV positions are absolute within the file, and batches arrive in file order. The running offset is
+        // also what a row's positional id is derived from, so it advances on every batch, not only when a
+        // deletion vector made it necessary.
         long batchStartRow = 0;
         await foreach (var rawBatch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
-            // A data file carries the hidden row-tracking columns for every row a rewrite moved; they are not
-            // schema fields, so they must come off before the logical mapping and partition interleave.
-            var batch = rawBatch;
+            long thisBatchStart = batchStartRow;
+            batchStartRow += rawBatch.Length;
+
+            // Hidden row-tracking columns off first — a data file carries them for every row a rewrite moved,
+            // and they are indexed by RAW position, so they must be captured before the DV filter renumbers.
+            var rawBatch2 = rawBatch;
+            Int64Array? rawMatIds = null, rawMatVers = null;
             if (ctx.HasMaterializedColumns)
             {
-                (batch, _, _) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
-                    batch, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
+                (rawBatch2, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                    rawBatch, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
             }
 
+            // Source indices of the rows that survive DV filtering, in emit order — the map back to the raw
+            // arrays above, and to each row's absolute in-file position.
+            List<int>? survivorSrc = ctx.EmitRowTracking ? new List<int>(rawBatch2.Length) : null;
+            if (survivorSrc is not null)
+            {
+                for (int i = 0; i < rawBatch2.Length; i++)
+                    if (dvRows is null || !dvRows.Contains(thisBatchStart + i))
+                        survivorSrc.Add(i);
+            }
+
+            var batch = rawBatch2;
             if (dvRows is not null)
             {
-                batch = DeletionVectorFilter.Filter(batch, dvRows, batchStartRow);
-                batchStartRow += rawBatch.Length;
+                batch = DeletionVectorFilter.Filter(batch, dvRows, thisBatchStart);
                 if (batch.Length == 0)
                     continue; // every row of this batch was already deleted
             }
@@ -250,8 +284,89 @@ internal static class CdfReader
             var cleanBatch = StripChangeTypeColumn(batch);
             var logical = MapToLogicalWithPartitions(cleanBatch, partitionValues, ctx);
             var withChangeType = CdfWriter.AddChangeTypeColumn(logical, changeType);
-            yield return AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
+            var withMetadata = AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
+
+            if (!ctx.EmitRowTracking)
+            {
+                yield return withMetadata;
+                continue;
+            }
+
+            // Inferred from a data file, so the full resolution applies: the materialized value where the file
+            // has one, else the action's baseRowId + the row's absolute position / its defaultRowCommitVersion.
+            var positions = new long[survivorSrc!.Count];
+            for (int k = 0; k < survivorSrc.Count; k++)
+                positions[k] = thisBatchStart + survivorSrc[k];
+
+            yield return ResolveRowTracking(
+                withMetadata,
+                Gather(rawMatIds, survivorSrc), Gather(rawMatVers, survivorSrc),
+                baseRowId, defaultRowCommitVersion, positions);
         }
+    }
+
+    /// <summary>Picks <paramref name="src"/>'s values at <paramref name="indices"/> (the DV survivors), so a
+    /// raw-position-indexed array lines up with the emitted batch. Null in, null out.</summary>
+    private static Int64Array? Gather(Int64Array? src, List<int> indices)
+    {
+        if (src is null)
+            return null;
+        var b = new Int64Array.Builder().Reserve(indices.Count);
+        foreach (int i in indices)
+        {
+            if (i < src.Length && !src.IsNull(i))
+                b.Append(src.GetValue(i)!.Value);
+            else
+                b.AppendNull();
+        }
+        return b.Build();
+    }
+
+    /// <summary>
+    /// Appends the Delta spec's two GENERATED row-tracking columns — <c>_metadata.row_id</c> and
+    /// <c>_metadata.row_commit_version</c> — resolving each row the way a conformant reader does: the
+    /// MATERIALIZED value when the source carries one, else the positional default.
+    ///
+    /// <para>The default differs by source, which is why it is a parameter rather than a rule here. From a
+    /// data file (the inferred feed) it is <c>baseRowId + absolute position</c> and the action's
+    /// <c>defaultRowCommitVersion</c>, matching <c>DeltaTable.ReadAllWithRowTrackingAsync</c> exactly. From a
+    /// change file there is no <c>baseRowId</c> to add to — a <c>cdc</c> action has no such field — so an
+    /// unmaterialized id stays NULL, while the version defaults to the commit that produced the file.</para>
+    ///
+    /// <para>Both columns are nullable: a change touching a file that predates row tracking on the table has
+    /// no identity to report, and reporting a fabricated one would be worse than reporting none.</para>
+    /// </summary>
+    private static RecordBatch ResolveRowTracking(
+        RecordBatch batch,
+        Int64Array? materializedIds,
+        Int64Array? materializedVersions,
+        long? baseRowId,
+        long? defaultRowCommitVersion,
+        IReadOnlyList<long>? absolutePositions)
+    {
+        var idb = new Int64Array.Builder().Reserve(batch.Length);
+        var vrb = new Int64Array.Builder().Reserve(batch.Length);
+
+        for (int i = 0; i < batch.Length; i++)
+        {
+            long? mid = materializedIds is not null && i < materializedIds.Length && !materializedIds.IsNull(i)
+                ? materializedIds.GetValue(i) : null;
+            long? id = mid ?? (baseRowId is { } br && absolutePositions is not null && i < absolutePositions.Count
+                ? br + absolutePositions[i] : (long?)null);
+            if (id is { } iv) idb.Append(iv); else idb.AppendNull();
+
+            long? mv = materializedVersions is not null && i < materializedVersions.Length
+                       && !materializedVersions.IsNull(i)
+                ? materializedVersions.GetValue(i) : null;
+            long? ver = mv ?? defaultRowCommitVersion;
+            if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+        }
+
+        return RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+            batch, idb.Build(), vrb.Build(),
+            DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
+            DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName,
+            nullable: true);
     }
 
     // Maps a PHYSICAL-layout data batch (physical names, partition columns absent) to the LOGICAL schema and
