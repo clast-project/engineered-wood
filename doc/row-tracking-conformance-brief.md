@@ -1,5 +1,15 @@
 # Row tracking: brief for landing a spec-conformant writer (port + validate)
 
+**THE FIELD-ID DEFERRAL WAS A NON-GAP — CLOSED 2026-07-29.** The one item gap 2 left open (materialized
+columns carry no parquet `field_id`, so an `id`-mode reader has nothing to resolve them by) was PROBED
+rather than reasoned about, and Spark 4.0.1 does exactly what EW does: no `field_id` on the materialized
+columns or `_change_type`, in data files and `_change_data` files alike, with `maxColumnId` reserving none
+for them. Spark reads EW's `id`-mode row-tracking table correctly through a materializing UPDATE, and the
+feed comes back with logical columns only. Pinned by
+`EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed`; gap 2 and the spec summary below are
+corrected accordingly. Side finding: with CDF on, Spark leaves a `_change_type` column INSIDE the rewritten
+main data file (verified a committed `add`, not an orphan) — EW does not, i.e. EW is stricter here.
+
 **CDF CARRIES THE ROW-TRACKING COLUMNS as of 2026-07-28 — the last gap on the read surface but one.**
 MEASURED FIRST (Spark 4.0.1 / delta-spark 4.0.0, probed rather than reasoned about): a row-tracking + CDF
 table's `_change_data` files DO carry both materialized columns, after the user columns and before
@@ -260,8 +270,10 @@ commit version**, each carried in one of two ways:
    *moved* by a rewrite), it is stored per-row in a hidden physical column. The column **physical names are
    stored in table metadata**: `delta.rowTracking.materializedRowIdColumnName` and
    `delta.rowTracking.materializedRowCommitVersionColumnName`. Names are UUID-based to avoid colliding with
-   user columns; under column mapping they carry field IDs. A non-null materialized value **overrides** the
-   default for that row.
+   user columns; they carry **no parquet field ID** even under `id`-mode column mapping, so the declared
+   physical NAME is the only way to find them in either mapping mode (MEASURED 2026-07-29 — see the note
+   under gap 2; this line previously claimed the opposite, reasoned from the spec rather than probed). A
+   non-null materialized value **overrides** the default for that row.
 
 High-water mark: `delta.rowTracking` domainMetadata `{"rowIdHighWaterMark": highestAssignedId}` — already
 emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_id` /
@@ -272,7 +284,7 @@ emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_
 | # | Gap | Fix | Status |
 |---|---|---|---|
 | 1 | Writes a hardcoded non-spec `__delta_row_id` column, even for default-id files that need none | Stop writing it for fresh appends; rely on `baseRowId` + position. Only ever write a **materialized** column, under its metadata-declared name, when ids are non-derivable (rewrites). | **DONE** — append writes none; a rewrite writes the materialized columns under the metadata-declared physical names (`RowTrackingWriter.AddRowIdAndCommitVersionColumns`). |
-| 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; stamp field IDs under column mapping. | **DONE (names)** — stored by `CreateAsync`; a rewrite writes under those names. Field-IDs-under-column-mapping still deferred (M2 validated name-mode; id-mode + RT rewrite is an untested edge). |
+| 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; ~~stamp field IDs under column mapping~~ — the field-ID half was a **misreading of the spec**, see status. | **DONE (2026-07-29)** — names stored by `CreateAsync`; a rewrite writes under those names. The field-ID half turned out to be a **non-gap, MEASURED not reasoned**: Spark 4.0.1 stamps NO `field_id` on the materialized columns (or on `_change_type`) in its OWN `id`-mode row-tracking files, data files and `_change_data` files alike, and `delta.columnMapping.maxColumnId` reserves none for them — the physical name is the sole lookup key in both modes. EW's output is the same shape, and Spark resolves EW's ids through `id`-mode mapping after a materializing UPDATE. Pinned by `EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed`, which asserts the footer shape both ways so an invented id fails there rather than in a foreign reader. |
 | 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. | **DONE (2026-07-28, M4)** — `ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` + `_metadata.row_commit_version` (nullable Int64), resolved materialized-else-`baseRowId + position`. MEASURED equal to Spark's own resolution row by row (`EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion`) over a table mixing both paths. Refuses a non-row-tracking table and a user-column name collision. CDF (`ReadChangesAsync`) still does not carry them. |
 | 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Materialize each survivor's **original** id + commit version (a changed row's version advances; an untouched row keeps its). | **DONE** — `ComputeUpdateActionsAsync`; MEASURED against Spark. |
 | 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). | **DONE** — `CompactionExecutor` materializes id + version from the source's own materialized column or `baseRowId + position` / `defaultRowCommitVersion`; MEASURED against Spark. |
@@ -294,8 +306,9 @@ validation) that pr-4 lacks.
    shifts positions); prefer porting pr-4's materialize-always unless there's a reason not to.
 2. **Add `CreateAsync` enablement — pr-4 does NOT have this.** Gaps 2, 6. Generate UUID materialized-column
    physical names, store them in `delta.rowTracking.materializedRowIdColumnName` /
-   `…materializedRowCommitVersionColumnName`, declare `rowTracking`+`domainMetadata`, stamp field IDs under
-   column mapping. Without this EW can only preserve ids on a table a foreign engine already set up.
+   `…materializedRowCommitVersionColumnName`, declare `rowTracking`+`domainMetadata`. Without this EW can
+   only preserve ids on a table a foreign engine already set up. (This step originally also said "stamp
+   field IDs under column mapping" — struck 2026-07-29, measured wrong; see gap 2.)
 3. **Stop writing the spurious column for default-id appends** (gap 1, if pr-4 still does — verify): a fresh
    append needs only `baseRowId`, no materialized column.
 4. **VALIDATE on Spark/delta-rs tier 3 — pr-4 never did this, and it is the highest-risk step.** Gap 7. Both
