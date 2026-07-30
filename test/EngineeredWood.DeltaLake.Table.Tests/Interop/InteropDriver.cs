@@ -219,17 +219,28 @@ internal sealed class InteropDriver
 
             // Contains, not equality: Spark may emit a partial line with no trailing newline, which
             // would leave our marker appended to its text rather than alone on a line.
-            var wait = Task.Run(() =>
-            {
-                string? line;
-                while ((line = proc.StandardOutput.ReadLine()) is not null)
+            //
+            // Read on a DEDICATED thread, not a pool one. This method blocks the calling thread for up to
+            // TimeoutMs, and xUnit runs test classes in parallel — so several of the pool's threads can be
+            // sitting in that Wait at once. On .NET Framework the pool injects new threads about one every
+            // 500 ms, so a pool-scheduled reader (or the pool-dispatched stderr drain in EnsureServer) can go
+            // unscheduled for a long time; the driver's stderr pipe then fills, Spark BLOCKS writing to it
+            // mid-command, and this times out after 600 s against a JVM that is perfectly healthy. Measured:
+            // that is exactly how the net472 leg failed, reporting the stall against whichever test happened
+            // to hold the lock.
+            var wait = Task.Factory.StartNew(
+                () =>
                 {
-                    if (line.Contains(expected, StringComparison.Ordinal))
-                        return true;
-                }
+                    string? line;
+                    while ((line = proc.StandardOutput.ReadLine()) is not null)
+                    {
+                        if (line.Contains(expected, StringComparison.Ordinal))
+                            return true;
+                    }
 
-                return false;
-            });
+                    return false;
+                },
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             if (!wait.Wait(TimeoutMs))
             {

@@ -339,7 +339,10 @@ concurrency rebases under row tracking (append/update re-derive `baseRowId` from
 the advanced high-water mark; a losing DELETE remaps by stable row id across a
 concurrent rewrite). All of this is measured cross-engine on Spark 4.0
 (`SparkInteropTests` — Spark reads the preserved / rebased ids via
-`_metadata.row_id`). The one residual: `DeltaTable.RejectRowTrackingWrite`
+`_metadata.row_id`), in BOTH directions: EW-written tables Spark reads, and
+Spark-written tables (with Spark's own hyphenated materialized column names)
+that EW reads and then rewrites without losing the ids Spark assigned.
+The one residual: `DeltaTable.RejectRowTrackingWrite`
 refuses a copy-on-write REWRITE of a row-tracking table that does NOT declare
 its materialized column-name properties (a spec-invalid shape EW never creates,
 but a foreign engine could) — without those names EW cannot preserve ids through
@@ -348,11 +351,14 @@ the rewrite. Appending to and reading such a table is still allowed.
 Readers can now see the ids: `ReadAllWithRowTrackingAsync` /
 `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` and
 `_metadata.row_commit_version`, measured equal to Spark's own resolution row by
-row. Two gaps remain on that surface — the Change Data Feed
-(`ReadChangesAsync`) does NOT carry them, since it reads through `CdfReader`
-rather than the main read path; and the emitted column names are fixed, with no
-option to rename them for a host that cannot use a dotted identifier.
-Background: `doc/row-tracking-conformance-brief.md`.
+row. The Change Data Feed carries them too, as of the CDF row-tracking work:
+`ReadChangesWithRowTrackingAsync` emits the same two columns on the feed, every
+`_change_data` file EW writes on a row-tracking table materializes the hidden
+id/commit-version columns (a `cdc` action has no `baseRowId`, so materializing
+is the only way identity reaches a change row), and both directions are measured
+against Spark 4.0.1. One gap remains on that surface: the emitted column names
+are fixed, with no option to rename them for a host that cannot use a dotted
+identifier. Background: `doc/row-tracking-conformance-brief.md`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single

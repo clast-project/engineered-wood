@@ -147,15 +147,29 @@ exact missing prerequisite instead of a silent skip.
 #### A stalled Spark driver looks like a failing assertion
 
 All Spark commands share ONE serve-mode process, serialized by a lock
-(`InteropDriver.RunServed`), with a 600 s per-command timeout (`Spark.cs`). If
-that process stalls, the timeout is charged to whichever test happened to hold
-the lock — so a hung JVM surfaces as *that* test failing, with no hint that the
-cause was infrastructural. **Check the run's total duration before believing
-the failure.** A tier-3 full suite is ~55 s on this machine; observed once at
-11 m 16 s with a single interop test "failing", which is the 600 s timeout plus
-the normal run, and which did not reproduce across three subsequent clean runs.
-Re-run before diagnosing, and prefer `--filter "FullyQualifiedName~Interop"`
-(~54 s) to isolate a genuine interop failure from a stall under load.
+(`InteropDriver.InvokeOnServer`), with a 600 s per-command timeout (`Spark.cs`).
+If that process stalls, the timeout is charged to whichever test happened to
+hold the lock — so a hung JVM surfaces as *that* test failing, with no hint that
+the cause was infrastructural. **Check the run's total duration before believing
+the failure.** A tier-3 full suite is ~55 s on this machine; a stall shows up as
+~11 m with one interop test "failing", which is the 600 s timeout plus the
+normal run.
+
+**Root cause found and fixed (2026-07-28).** It was not the JVM. `InvokeOnServer`
+blocks its calling thread for up to 600 s waiting for the done-marker, and xUnit
+runs the three interop test classes in PARALLEL, so several thread-pool threads
+sit in that wait at once. The stdout reader used to be a `Task.Run` — a pool
+task — and the stderr drain (`BeginErrorReadLine`) dispatches on the pool too.
+On **.NET Framework** the pool injects new threads at roughly one per 500 ms, so
+under enough concurrent commands the drain goes unscheduled, the driver's stderr
+pipe fills, and Spark BLOCKS mid-command writing to it. Hence net472-only,
+load-dependent, and never reproducible when running one test.
+Measured: adding two Spark-using tests took the net472 `Interop` filter from
+67 passed / 1 m 3 s to 68 passed + 1 timeout / 11 m 23 s; moving the reader to a
+dedicated `LongRunning` thread took it to 69 passed / 1 m 14 s. If this ever
+returns, raise `ThreadPool.SetMinThreads` or put the interop classes in one
+xUnit collection — they share a single Spark process, so parallelism across them
+buys nothing anyway.
 
 ### Regenerating Avro Test Data
 

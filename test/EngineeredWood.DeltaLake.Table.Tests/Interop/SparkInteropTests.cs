@@ -507,6 +507,182 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([0L, 1L, 2L], sparkTracking.Values.Select(v => v.RowId!.Value).OrderBy(v => v).ToArray());
     }
 
+    // ── the FOREIGN → EW direction: a row-tracking table Spark created, wrote, and materialized ──
+    //
+    // Everything above measures EW's output. These measure EW against SPARK's output, which is the
+    // direction that exercises what EW cannot control: Spark picks its own materialized column names
+    // (measured: `_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>` -- HYPHENATED, unlike EW's own
+    // `_row_id_<hex>`), its own high-water mark, and its own rewrite layout.
+    //
+    // The setup below is deliberately post-UPDATE, because that is the only shape where the two possible
+    // readings differ: Spark's UPDATE rewrites the file, so the survivors' ids live in the MATERIALIZED
+    // column (0,1,2) while the new file's own baseRowId is 3. A reader that ignores the materialized column
+    // reports 3,4,5 -- every row silently renamed. A fresh append cannot distinguish the two.
+
+    /// <summary>Spark creates a row-tracking table, writes three rows, then UPDATEs one — which rewrites the
+    /// file and materializes every survivor's original id under Spark's own column name. Returns Spark's
+    /// view of each row's stable id.</summary>
+    private async Task<Dictionary<long, long>> WriteSparkRowTrackingTableWithMaterializedIdsAsync()
+    {
+        var written = Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 10L, "us" }, new object[] { 20L, "eu" }, new object[] { 30L, "apac" },
+            },
+            options = new Dictionary<string, string> { ["delta.enableRowTracking"] = "true" },
+            sql = new[] { "UPDATE delta.`{path}` SET region = 'EU' WHERE region = 'eu'" },
+        });
+
+        // Spark must actually have enabled the feature and declared BOTH materialized column names — without
+        // them EW would (correctly) refuse to rewrite, and the tests below would be measuring the refusal.
+        var properties = written.GetProperty("detail").GetProperty("properties");
+        Assert.Equal("true", properties.GetProperty(
+            EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.EnableKey).GetString());
+        foreach (string key in new[]
+        {
+            EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey,
+            EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey,
+        })
+        {
+            Assert.False(string.IsNullOrEmpty(properties.GetProperty(key).GetString()));
+        }
+
+        var ids = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal([0L, 1L, 2L], ids.Values.OrderBy(v => v).ToArray());
+
+        // The setup is only meaningful if those ids are MATERIALIZED rather than positional. Spark's UPDATE
+        // rewrote the file, so what it left behind starts past the ids it reports — meaning 0,1,2 cannot be
+        // derived from baseRowId + position and can only have come from the hidden column. Asserted, not
+        // assumed: if a future Spark stopped materializing here, every test below would quietly degrade into
+        // a positional check that proves nothing.
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+            Assert.True(add.BaseRowId >= 3, $"expected a rewritten file past id 2, got baseRowId {add.BaseRowId}");
+
+        return ids;
+    }
+
+    /// <summary>
+    /// EW READS a foreign row-tracking table and resolves the same stable ids Spark does. The materialized
+    /// column is Spark-named and Spark-valued — EW has to find it through the table's declared property
+    /// rather than by any convention of its own — and must resolve it in preference to the file's
+    /// <c>baseRowId</c>, which after Spark's rewrite points somewhere else entirely.
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_RowTracking_EwReadsTheSameStableIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        var ewIds = new Dictionary<long, long?>();
+        await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var rowIds = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName);
+            for (int i = 0; i < batch.Length; i++)
+                ewIds[ids.GetValue(i)!.Value] = rowIds.IsNull(i) ? null : rowIds.GetValue(i);
+        }
+
+        Assert.Equal(sparkIds.Count, ewIds.Count);
+        foreach (var (id, expected) in sparkIds.OrderBy(kv => kv.Key))
+            Assert.Equal(expected, ewIds[id]);
+
+        // Spark's hidden column must not leak into an ordinary read either.
+        await foreach (var batch in table.ReadAllAsync())
+            Assert.Equal(["id", "region"], batch.Schema.FieldsList.Select(f => f.Name).ToArray());
+    }
+
+    /// <summary>
+    /// The claim item 5 exists for, and the one this effort had never measured: EW REWRITES a table whose ids
+    /// a FOREIGN engine materialized, and every row keeps the identity Spark gave it. EW must read Spark's
+    /// materialized values, carry them through its own copy-on-write UPDATE, and write them back under
+    /// Spark's column name — then Spark, reading its own table afterwards, must still recognize every row.
+    /// <para>The row EW updates is deliberately NOT the row Spark updated, so the result distinguishes
+    /// "carried the materialized column through" from "happened to leave the file alone".</para>
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_RowTracking_EwUpdatePreservesSparksMaterializedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
+
+        await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+        {
+            // EW rewrites the file again, updating the 'us' row Spark did not touch.
+            await table.UpdateAsync(
+                b =>
+                {
+                    var region = (StringArray)b.Column("region");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < region.Length; i++)
+                        mask.Append(region.GetString(i) == "us");
+                    return mask.Build();
+                },
+                b =>
+                {
+                    var region = new StringArray.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        region.Append("US");
+                    // Rebuild on the batch's OWN schema: a Spark-created table's columns are nullable, and
+                    // substituting EW's stricter IdRegionSchema would misdescribe them.
+                    return new RecordBatch(b.Schema, [b.Column("id"), region.Build()], b.Length);
+                });
+        }
+
+        var afterEw = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+
+        Assert.Equal(sparkIds.Count, afterEw.Count);
+        foreach (var (id, expected) in sparkIds.OrderBy(kv => kv.Key))
+            Assert.Equal(expected, afterEw[id]); // Spark's ids survived EW's rewrite
+
+        var regions = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal(
+            [(10L, "US"), (20L, "EU"), (30L, "apac")],
+            RowsFromJson(regions).OrderBy(r => r.Id).ToArray());
+    }
+
+    /// <summary>
+    /// The same preservation claim through COMPACTION, which is a separate rewrite path
+    /// (<c>CompactionExecutor</c>, not the DML rewrite) and merges rows from several files into one — so a
+    /// single <c>baseRowId</c> cannot describe the result and the materialized column is the only way the
+    /// foreign ids can survive.
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_RowTracking_EwCompactionPreservesSparksMaterializedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
+
+        await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+        {
+            // A second file, so the compaction genuinely merges rather than rewriting one file in place.
+            await table.WriteAsync([IdRegionBatch([40], ["latam"])]);
+            Assert.Equal(2, table.CurrentSnapshot.ActiveFiles.Count);
+
+            Assert.NotNull(await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));
+
+            // The merge actually happened — otherwise "ids preserved" would only mean "files untouched".
+            await using var compacted = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+            Assert.Single(compacted.CurrentSnapshot.ActiveFiles);
+        }
+
+        var afterEw = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+
+        foreach (var (id, expected) in sparkIds.OrderBy(kv => kv.Key))
+            Assert.Equal(expected, afterEw[id]);
+        Assert.Equal(4, afterEw.Count);
+        Assert.DoesNotContain(afterEw[40], sparkIds.Values); // the appended row got a fresh, unused id
+    }
+
     /// <summary>Sets <c>value</c> to <paramref name="newValue"/> on the rows currently holding
     /// <paramref name="matchValue"/>, over <see cref="IdValueRegionSchema"/>. The updater receives the
     /// partition column materialized by the read and must hand it back.</summary>
@@ -1521,6 +1697,303 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "insert" && t.Id == 2 && t.Value == "b");
         Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 1 && t.Value == "a");
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
+    }
+
+    /// <summary>
+    /// EW writes a ROW TRACKING + CDF table and Spark reads the feed. The claim is that the two hidden
+    /// materialized columns EW now puts in every <c>_change_data</c> file — which is how a change row carries
+    /// any identity at all, a <c>cdc</c> action having no <c>baseRowId</c> — do not disturb a conformant
+    /// reader: Spark reports the table's own columns and change types and nothing else.
+    ///
+    /// <para>Worth measuring rather than assuming, because Spark's <c>readChangeFeed</c> does NOT surface
+    /// row ids (measured: <c>_metadata</c> does not even resolve on the feed), so the columns are ones it
+    /// never asked for. A reader that resolved the change file against the table schema positionally, rather
+    /// than by name, would surface them as data.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_RowTrackingChangeDataFeed_SparkReadsTheFeedWithoutTheHiddenColumns()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long insertVersion, updateVersion;
+        string matRowIdName, matRowVerName;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            enableRowTracking: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            var (rid, rver) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+                .TryGetMaterializedColumnNames(table.CurrentSnapshot.Metadata.Configuration);
+            matRowIdName = rid!;
+            matRowVerName = rver!;
+
+            insertVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]);
+            updateVersion = table.CurrentSnapshot.Version + 1;
+            await table.UpdateAsync(
+                b =>
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 20);
+                    return mask.Build();
+                },
+                b =>
+                {
+                    int rIdx = b.Schema.GetFieldIndex("region");
+                    var cols = new IArrowArray[b.ColumnCount];
+                    for (int i = 0; i < b.ColumnCount; i++)
+                        cols[i] = i == rIdx ? new StringArray.Builder().Append("EU").Build() : b.Column(i);
+                    return new RecordBatch(b.Schema, cols, b.Length);
+                });
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = insertVersion, end = updateVersion });
+
+        var columns = result.GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        Assert.Equal(
+            ["id", "region", "_change_type", "_commit_version", "_commit_timestamp"],
+            columns);
+        Assert.DoesNotContain(matRowIdName, columns);
+        Assert.DoesNotContain(matRowVerName, columns);
+
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (Ct: r.GetProperty("_change_type").GetString(),
+                          Id: r.GetProperty("id").GetInt64(),
+                          Region: r.GetProperty("region").GetString()))
+            .ToList();
+        Assert.Equal(5, rows.Count); // 3 inserts + pre-image + post-image
+        Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 20 && t.Region == "eu");
+        Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 20 && t.Region == "EU");
+
+        // And the ids themselves still resolve for Spark on the TABLE — the change files did not disturb them.
+        var ids = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal([0L, 1L, 2L], ids.Values.OrderBy(v => v).ToArray());
+    }
+
+    /// <summary>
+    /// <para>ID-MODE column mapping + row tracking + CDF — the combination that decides whether the hidden
+    /// materialized columns need a parquet <c>field_id</c>. In <c>id</c> mode a conformant reader resolves
+    /// data-file columns by field id, but the two materialized row-tracking columns are NOT in the table
+    /// schema, so no id exists for them: EW appends them after
+    /// <see cref="ColumnMappingRecursive.ToPhysical"/> has stamped every mapped field, and the
+    /// <c>_change_data</c> files inherit that shape. Whether that leaves them unresolvable was open.</para>
+    ///
+    /// <para>MEASURED against Spark 4.0.1 / delta-spark 4.0.0 — both halves of the answer:</para>
+    /// <list type="bullet">
+    /// <item>Spark resolves EW's ids THROUGH id-mode mapping: a materializing UPDATE preserves 0,1,2 with each
+    /// row's original commit version, exactly as in name mode.</item>
+    /// <item>Spark's OWN id-mode row-tracking files stamp NO field id on the materialized columns or on
+    /// <c>_change_type</c>, in data files and change files alike, and <c>delta.columnMapping.maxColumnId</c>
+    /// counts only the user columns — so the declared physical NAME is the sole lookup key for these columns in
+    /// BOTH mapping modes. The footer assertions below pin EW to that shape, so a later change that
+    /// "helpfully" invents an id for them fails here rather than in a foreign reader.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long insertVersion, updateVersion;
+        string matRowIdName, matRowVerName;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema,
+            columnMappingMode: ColumnMappingMode.Id,
+            enableRowTracking: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            var (rid, rver) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+                .TryGetMaterializedColumnNames(table.CurrentSnapshot.Metadata.Configuration);
+            matRowIdName = rid!;
+            matRowVerName = rver!;
+
+            insertVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]); // ids 0,1,2
+            updateVersion = table.CurrentSnapshot.Version + 1;
+            await table.UpdateAsync(
+                b =>
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var mask = new BooleanArray.Builder();
+                    for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 20);
+                    return mask.Build();
+                },
+                b =>
+                {
+                    int rIdx = b.Schema.GetFieldIndex("region");
+                    var cols = new IArrowArray[b.ColumnCount];
+                    for (int i = 0; i < b.ColumnCount; i++)
+                        cols[i] = i == rIdx ? new StringArray.Builder().Append("EU").Build() : b.Column(i);
+                    return new RecordBatch(b.Schema, cols, b.Length);
+                });
+        }
+
+        // The rewrite moved every row to a new file, so these ids can only come from the materialized column —
+        // resolved by Spark under id-mode mapping, which is the claim.
+        var rowIdResult = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = RowIdsById(rowIdResult);
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]);
+        Assert.Equal(2L, idToRowId[30]);
+
+        // Only the updated row's commit version advances; the untouched rows keep the version that created them.
+        var idToVersion = rowIdResult.GetProperty("rows").EnumerateArray().ToDictionary(
+            r => r.GetProperty("id").GetInt64(),
+            r => r.GetProperty("row_commit_version").GetInt64());
+        Assert.Equal(insertVersion, idToVersion[10]);
+        Assert.Equal(updateVersion, idToVersion[20]);
+        Assert.Equal(insertVersion, idToVersion[30]);
+
+        // The footer shape, against Spark's own: mapped columns carry their field id; the materialized columns
+        // and _change_type carry NONE and are found by name.
+        var files = await ParquetFieldIdsAsync();
+        foreach (var (file, columns) in files)
+        {
+            foreach (var (name, fieldId) in columns)
+            {
+                if (name == matRowIdName || name == matRowVerName || name == CdfConfig.ChangeTypeColumn)
+                    Assert.Null(fieldId);
+                else
+                    Assert.NotNull(fieldId);
+            }
+        }
+
+        // Both kinds of file must actually carry the materialized columns, or the assertion above is vacuous:
+        // the rewritten data file (its rows moved) and the change file (a cdc action has no baseRowId at all).
+        var materializing = files
+            .Where(f => f.Columns.Any(c => c.Name == matRowIdName))
+            .Select(f => f.File).ToList();
+        Assert.Contains(materializing, f => !f.Contains(CdfConfig.ChangeDataDir, StringComparison.Ordinal));
+        Assert.Contains(materializing, f => f.Contains(CdfConfig.ChangeDataDir, StringComparison.Ordinal));
+
+        // And the feed itself still reads clean: logical columns only, no hidden column leaking out as data.
+        var changes = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = insertVersion, end = updateVersion });
+        Assert.Equal(
+            ["id", "region", "_change_type", "_commit_version", "_commit_timestamp"],
+            changes.GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList());
+    }
+
+    /// <summary>
+    /// Every data file and <c>_change_data</c> file of the table under test, as (path relative to the table
+    /// root, top-level columns with their parquet field id). Reading the FOOTER is the point: it is the only
+    /// way to see what a foreign reader resolves against, which an Arrow-level round-trip through EW's own
+    /// reader cannot show.
+    /// </summary>
+    private async Task<List<(string File, List<(string Name, int? FieldId)> Columns)>> ParquetFieldIdsAsync()
+    {
+        var result = new List<(string, List<(string, int?)>)>();
+        string changeDataDir = Path.Combine(_tempDir, CdfConfig.ChangeDataDir);
+
+        // OrderBy rather than Order(), and the manual relative path below rather than Path.GetRelativePath:
+        // this project also targets net472, where neither exists.
+        var paths = Directory.GetFiles(_tempDir, "*.parquet")
+            .OrderBy(p => p, StringComparer.Ordinal).ToList();
+        if (Directory.Exists(changeDataDir))
+        {
+            paths.AddRange(Directory.GetFiles(changeDataDir, "*.parquet")
+                .OrderBy(p => p, StringComparer.Ordinal));
+        }
+
+        foreach (string path in paths)
+        {
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new EngineeredWood.Parquet.ParquetFileReader(file, ownsFile: false);
+            var schema = await reader.GetSchemaAsync();
+            result.Add((
+                path.Substring(_tempDir.Length)
+                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                schema.Root.Children.Select(c => (c.Name, c.Element.FieldId)).ToList()));
+        }
+
+        Assert.NotEmpty(result);
+        return result;
+    }
+
+    /// <summary>
+    /// The direction that decides whether EW's feed-side resolution is conformant or merely self-consistent:
+    /// SPARK writes a row-tracking + CDF table and does its own UPDATE and DELETE, and EW reads the resulting
+    /// CHANGE FEED with <c>ReadChangesWithRowTrackingAsync</c>. Every identity in the feed must be the one
+    /// Spark assigned, resolved out of Spark's own change files.
+    ///
+    /// <para>Two things make this discriminating, both MEASURED from Spark 4.0.1 rather than assumed.
+    /// Spark's materialized columns are named <c>_row-id-col-&lt;uuid&gt;</c> — hyphenated, unlike EW's
+    /// <c>_row_id_&lt;hex&gt;</c> — so EW has to find them through the table's declared property. And Spark
+    /// writes the <c>update_postimage</c> row's commit version as NULL, leaving it to be defaulted; a reader
+    /// that reported that null verbatim would say the post-image row has no version, when it plainly belongs
+    /// to the commit that produced it.</para>
+    /// </summary>
+    [Fact]
+    public async Task SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 10L, "us" }, new object[] { 20L, "eu" }, new object[] { 30L, "apac" },
+            },
+            options = new Dictionary<string, string>
+            {
+                ["delta.enableRowTracking"] = "true",
+                ["delta.enableChangeDataFeed"] = "true",
+            },
+            sql = new[] { "UPDATE delta.`{path}` SET region = 'EU' WHERE id = 20" },
+        });
+
+        // Spark's own view of each surviving row's stable id, taken BEFORE the delete removes one of them.
+        var sparkIds = RowIdsById(Spark.Invoke("read_row_ids", new { path = _tempDir }));
+        Assert.Equal([0L, 1L, 2L], sparkIds.Values.OrderBy(v => v).ToArray());
+
+        Spark.Invoke("sql", new { path = _tempDir, sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 30" } });
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var feed = new List<(string Change, long Id, long? RowId, long? RowVersion, long Commit)>();
+        await foreach (var batch in table.ReadChangesWithRowTrackingAsync(0, table.CurrentSnapshot.Version))
+        {
+            var change = (StringArray)batch.Column("_change_type");
+            var id = (Int64Array)batch.Column("id");
+            var rowId = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName);
+            var rowVer = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
+            var commit = (Int64Array)batch.Column("_commit_version");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                feed.Add((change.GetString(i), id.GetValue(i)!.Value,
+                          rowId.IsNull(i) ? null : rowId.GetValue(i),
+                          rowVer.IsNull(i) ? null : rowVer.GetValue(i),
+                          commit.GetValue(i)!.Value));
+            }
+
+            // Spark's hidden columns are Spark-named; none of them may reach the feed.
+            Assert.DoesNotContain(batch.Schema.FieldsList,
+                f => f.Name.StartsWith("_row-id-col-", StringComparison.Ordinal)
+                     || f.Name.StartsWith("_row-commit-version-col-", StringComparison.Ordinal));
+        }
+
+        // The UPDATE: both images of id=20 report the id SPARK gave that row, not a fresh or positional one.
+        var pre = Assert.Single(feed, r => r.Change == "update_preimage");
+        var post = Assert.Single(feed, r => r.Change == "update_postimage");
+        Assert.Equal(20, pre.Id);
+        Assert.Equal(sparkIds[20], pre.RowId);
+        Assert.Equal(sparkIds[20], post.RowId);
+
+        // Spark leaves the post-image's commit version NULL, meaning "the version being committed".
+        Assert.Equal(post.Commit, post.RowVersion);
+        Assert.True(pre.RowVersion < post.RowVersion,
+            $"the pre-image should belong to an earlier version than the post-image, got "
+            + $"{pre.RowVersion} and {post.RowVersion}");
+
+        // The DELETE: the removed row reports the identity it had while it was still in the table.
+        var deleted = Assert.Single(feed, r => r.Change == "delete");
+        Assert.Equal(30, deleted.Id);
+        Assert.Equal(sparkIds[30], deleted.RowId);
     }
 
     // Creates an UNMAPPED table partitioned by region with CDF enabled at creation.

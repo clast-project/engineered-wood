@@ -2066,6 +2066,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                     currentActions = resolution.Value.Actions;
                     resolvedPaths = resolution.Value.ResolvedPaths;
+
+                    // Under Serializable, commit order IS the logical order: a concurrent commit that CHANGED
+                    // DATA in a file this delete read may not be reconciled away, however disjoint the rows —
+                    // that is the interleaving the stricter level exists to forbid, and the level's own rule
+                    // (IsolationLevel) is that a dataChange=true remove of a file we read conflicts at BOTH
+                    // levels. So the reconciliation survives here only where the concurrent commit did not
+                    // change data: a compaction's dataChange=false rewrite rearranges bytes without changing
+                    // which rows the table contains, so remapping our rows onto the new file admits no
+                    // interleaving the level forbids. Dropping a path from the resolved set does not force a
+                    // conflict — it just restores the normal checks for it, so a delete whose files nobody
+                    // touched still rebases and lands.
+                    if (isolationLevel == IsolationLevel.Serializable)
+                        resolvedPaths = KeepOnlyDataPreservingResolutions(resolvedPaths, concurrent);
                 }
                 else
                 {
@@ -2094,6 +2107,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
         }
+    }
+
+    /// <summary>
+    /// Narrows a row-level resolution to what <see cref="IsolationLevel.Serializable"/> admits: the paths no
+    /// concurrent commit removed with <c>dataChange=true</c>.
+    ///
+    /// <para>Row-level reconciliation has two mechanisms, and the isolation level bounds them differently.
+    /// The DV union reconciles a concurrent DELETE — a <c>dataChange=true</c> remove/re-add of a file this
+    /// transaction read — which is a conflict at both levels, so under Serializable it must not be silenced.
+    /// The remap across a rewrite reconciles a COMPACTION, whose removes and adds carry
+    /// <c>dataChange=false</c>: contents unchanged, only rearranged, which the conflict checker already
+    /// exempts from read conflicts at both levels. Relocating rows across it admits no non-serializable
+    /// interleaving, so it survives here. A copy-on-write UPDATE's rewrite is a <c>dataChange=true</c> remove
+    /// and is dropped with the rest.</para>
+    ///
+    /// <para>Gating the resolution as a whole (one bool for both mechanisms) would abort the compaction case
+    /// too, which no reading of the level requires.</para>
+    /// </summary>
+    private static ISet<string> KeepOnlyDataPreservingResolutions(
+        ISet<string> resolvedPaths,
+        IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent)
+    {
+        var kept = new HashSet<string>(resolvedPaths, StringComparer.Ordinal);
+        foreach (var (_, actions) in concurrent)
+        {
+            foreach (var action in actions)
+            {
+                if (action is RemoveFile { DataChange: true } remove)
+                    kept.Remove(remove.Path);
+            }
+        }
+
+        return kept;
     }
 
     /// <summary>
@@ -2195,6 +2241,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
                 DeletionVector = latestAdd.DeletionVector,
+                // A remove carries the row-tracking fields of the add it removes (spec; measured on Spark
+                // 4.0.1, which populates both on every remove of a row-tracking table). They are what lets a
+                // reader resolve the identity of rows that are only visible through the removed file — the
+                // Change Data Feed's inferred "delete" rows, whose source carries no materialized column.
+                BaseRowId = latestAdd.BaseRowId,
+                DefaultRowCommitVersion = latestAdd.DefaultRowCommitVersion,
             });
 
             result.Add(latestAdd with
@@ -2364,6 +2416,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
                 DeletionVector = cand.DeletionVector,
+                BaseRowId = cand.BaseRowId,
+                DefaultRowCommitVersion = cand.DefaultRowCommitVersion,
             });
             result.Add(cand with
             {
@@ -2540,6 +2594,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long totalDeleted = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         // Deletion vectors are opt-in. When disabled, a DELETE may only remove WHOLE files (a clean
         // file/partition boundary); a partial match that would need a soft-delete throws below.
         bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
@@ -2560,6 +2618,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             var newDeletedIndices = new List<long>();
             var deletedRowBatches = new List<RecordBatch>(); // For CDC
+            // Paired 1:1 with deletedRowBatches: each deleted row's STABLE id + commit version, for the change
+            // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
+            var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
             long rowOffset = 0;
 
             await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
@@ -2577,6 +2638,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
                 if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
                     logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+
+                // This path reads the file's raw columns rather than going through ReadFileAsync, so the hidden
+                // materialized row-tracking columns (present on any file a rewrite produced) are still attached.
+                // Take them off before the predicate runs — a user predicate should never be handed a column
+                // that is not in the table's schema — and keep their values to identify the deleted rows.
+                Int64Array? rawMatIds = null, rawMatVers = null;
+                if (matRowIdName is not null || matRowVerName is not null)
+                {
+                    (logicalBatch, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter
+                        .StripMaterializedColumns(logicalBatch, matRowIdName, matRowVerName);
+                }
+
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
 
@@ -2595,7 +2668,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 // Collect deleted row data for CDC
                 if (cdfEnabled && matchRows.Count > 0)
+                {
                     deletedRowBatches.Add(TakeRowsFromBatch(logicalBatch, matchRows));
+                    if (rowTrackingEnabled)
+                    {
+                        deletedRowTracking.Add(ResolveRowTrackingAt(
+                            matchRows, rawMatIds, rawMatVers, addFile.BaseRowId,
+                            addFile.DefaultRowCommitVersion, rowOffset));
+                    }
+                }
 
                 rowOffset += batch.Length;
             }
@@ -2629,6 +2710,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
+                BaseRowId = addFile.BaseRowId,
+                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
             removedPaths.Add(addFile.Path);
 
@@ -2654,12 +2737,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Write CDC file for deleted rows
             if (cdfEnabled)
             {
-                foreach (var deletedBatch in deletedRowBatches)
+                for (int b = 0; b < deletedRowBatches.Count; b++)
                 {
+                    var trk = b < deletedRowTracking.Count ? deletedRowTracking[b] : ((Int64Array, Int64Array)?)null;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken, trk?.Item1, trk?.Item2).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
             }
@@ -2800,6 +2884,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
             var preimages = new List<RecordBatch>();
             var postimages = new List<RecordBatch>();
+            // Paired 1:1 with preimages/postimages: the identity to materialize in each change file.
+            var changeTracking = new List<(Int64Array PreIds, Int64Array PreVers,
+                                           Int64Array PostIds, Int64Array PostVers)>();
 
             for (int bi = 0; bi < batches.Count; bi++)
             {
@@ -2842,11 +2929,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ? (TakeIds(batchIds, matchRows), ConstInt64(newVersion, matchRows.Count))
                         : ((Int64Array, Int64Array)?)null);
 
-                    // Collect preimage and postimage for CDC
+                    // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
+                    // are the SAME rows, so both carry the same ids; only the commit version differs — the
+                    // pre-image belongs to the version that last wrote it, the post-image to this one.
                     if (cdfEnabled)
                     {
                         preimages.Add(matchBatch);
                         postimages.Add(updatedBatch);
+                        if (rowTrackingEnabled)
+                        {
+                            var ids = batchIds is not null
+                                ? TakeIds(batchIds, matchRows) : AllNullInt64(matchRows.Count);
+                            changeTracking.Add((
+                                ids,
+                                batchVers is not null ? TakeIds(batchVers, matchRows) : AllNullInt64(matchRows.Count),
+                                ids,
+                                ConstInt64(newVersion, matchRows.Count)));
+                        }
                     }
                 }
 
@@ -2944,6 +3043,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // Keyed by (path, deletionVector) — see the Overwrite remove. The rewritten file already
                 // has the DV's deletions applied, so the source must be removed under its DV-qualified key.
                 DeletionVector = addFile.DeletionVector,
+                BaseRowId = addFile.BaseRowId,
+                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
             removedPaths.Add(addFile.Path);
 
@@ -2970,20 +3071,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Write CDC files for update preimage/postimage
             if (cdfEnabled)
             {
-                foreach (var pre in preimages)
+                for (int b = 0; b < preimages.Count; b++)
                 {
+                    var trk = b < changeTracking.Count ? changeTracking[b] : default;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        _fs, snapshot, preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken, trk.PreIds, trk.PreVers).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
-                foreach (var post in postimages)
+                for (int b = 0; b < postimages.Count; b++)
                 {
+                    var trk = b < changeTracking.Count ? changeTracking[b] : default;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                        _fs, snapshot, postimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken, trk.PostIds, trk.PostVers).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
             }
@@ -3001,6 +3104,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // row through Int64Array.Builder.
     private static Int64Array TakeIds(Int64Array src, List<int> idx) =>
         (Int64Array)ArrowCompute.Take(src, idx);
+
+    // The row-tracking identity of the rows at `rows` (indices into a raw, unfiltered batch whose first row
+    // sits at absolute file position `batchStartRow`), resolved the way a conformant reader does: the
+    // MATERIALIZED value where the file carries one, else add.baseRowId + absolute position and the file's
+    // defaultRowCommitVersion. Used by the paths that read a file's raw columns themselves rather than going
+    // through ReadFileAsync, which surfaces the same resolution via its out-params.
+    private static (Int64Array Ids, Int64Array Vers) ResolveRowTrackingAt(
+        List<int> rows, Int64Array? materializedIds, Int64Array? materializedVersions,
+        long? baseRowId, long? defaultRowCommitVersion, long batchStartRow)
+    {
+        var idb = new Int64Array.Builder().Reserve(rows.Count);
+        var vrb = new Int64Array.Builder().Reserve(rows.Count);
+        foreach (int i in rows)
+        {
+            long? mid = materializedIds is not null && i < materializedIds.Length && !materializedIds.IsNull(i)
+                ? materializedIds.GetValue(i) : null;
+            long? id = mid ?? (baseRowId is { } br ? br + batchStartRow + i : (long?)null);
+            if (id is { } iv) idb.Append(iv); else idb.AppendNull();
+
+            long? mv = materializedVersions is not null && i < materializedVersions.Length
+                       && !materializedVersions.IsNull(i)
+                ? materializedVersions.GetValue(i) : null;
+            long? ver = mv ?? defaultRowCommitVersion;
+            if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+        }
+        return (idb.Build(), vrb.Build());
+    }
 
     // A constant Int64 column (the commit version assigned to every matched/updated row). Tiled by Repeat
     // rather than appended per row, which also drops the validity buffer a builder allocates for a column
@@ -3081,12 +3211,55 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        return ReadChangesCoreAsync(
+            CurrentSnapshot, startVersion, endVersion, emitRowTracking: false, cancellationToken);
+    }
+
+    /// <summary>
+    /// The Change Data Feed WITH each change row's STABLE identity — <see cref="ReadChangesAsync"/> plus
+    /// Delta's two row-tracking columns, <c>_metadata.row_id</c> and <c>_metadata.row_commit_version</c>
+    /// (<see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/> /
+    /// <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName"/>). This is what lets a
+    /// consumer of the feed JOIN a change to the row it happened to: an <c>update_preimage</c> and its
+    /// <c>update_postimage</c> report the SAME id, and that id is the one
+    /// <see cref="ReadAllWithRowTrackingAsync"/> reports for the row in the table.
+    ///
+    /// <para>Resolution matches the main read path where the feed comes from a data file (materialized value,
+    /// else <c>baseRowId + position</c>). Where it comes from a <c>_change_data</c> file the id can only be
+    /// the materialized one — a <c>cdc</c> action has no <c>baseRowId</c> — so a change file written without
+    /// row-tracking columns (by an older engineered-wood, or any writer that omits them) reports NULL ids
+    /// rather than wrong ones. The commit version there defaults to the version being read.</para>
+    ///
+    /// <para>Requires <c>delta.enableRowTracking=true</c>, on the same terms as
+    /// <see cref="ReadAllWithRowTrackingAsync"/>: a table that does not track identity is refused rather than
+    /// served two all-null columns.</para>
+    /// </summary>
+    public IAsyncEnumerable<RecordBatch> ReadChangesWithRowTrackingAsync(
+        long startVersion, long endVersion,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
+        RequireRowTrackingRead(snapshot);
+        return ReadChangesCoreAsync(
+            snapshot, startVersion, endVersion, emitRowTracking: true, cancellationToken);
+    }
+
+    // The materialized column names are fixed at enablement and never change, so the CURRENT snapshot's
+    // metadata names them correctly for every version in the range — the same simplification the feed already
+    // makes for the schema itself.
+    private IAsyncEnumerable<RecordBatch> ReadChangesCoreAsync(
+        Snapshot.Snapshot snapshot, long startVersion, long endVersion, bool emitRowTracking,
+        CancellationToken cancellationToken)
+    {
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         return ChangeDataFeed.CdfReader.ReadChangesAsync(
             _fs, _log, startVersion, endVersion, _dataFileReadOptions,
             snapshot.ArrowSchema, snapshot.Schema,
             ColumnMapping.GetMode(snapshot.Metadata.Configuration),
             snapshot.Metadata.PartitionColumns,
+            matRowIdName, matRowVerName, emitRowTracking,
             cancellationToken);
     }
 
@@ -3109,10 +3282,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// delta-kernel resolve the feed correctly; <see cref="ReadChangesAsync"/> maps them back to logical and
     /// re-materializes the partition columns.
     /// </remarks>
+    /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one value per row of
+    /// <paramref name="rows"/>, ordinarily the <c>_metadata.row_id</c> that
+    /// <see cref="ReadAllWithRowTrackingAsync"/> reported for it. A <c>cdc</c> action has no
+    /// <c>baseRowId</c> for a reader to derive an id from, so a change file left without these carries no
+    /// identity at all: <see cref="ReadChangesWithRowTrackingAsync"/> reports NULL for its rows. Ignored on
+    /// a table that does not track row identity.</param>
+    /// <param name="rowCommitVersions">The commit-version companion of <paramref name="rowIds"/>. Pass the
+    /// version each row was last changed in; leaving it null defaults every row to the version the change
+    /// file is committed in, which is right for a post-image and wrong for a pre-image.</param>
     public async ValueTask<CdcFile> WriteChangeDataFileAsync(
         RecordBatch rows, string changeType,
         IReadOnlyDictionary<string, string>? partitionValues = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Int64Array? rowIds = null,
+        Int64Array? rowCommitVersions = null)
     {
         ThrowIfDisposed();
         if (rows is null)
@@ -3122,7 +3306,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await ChangeDataFeed.CdfWriter.WriteAsync(
             _fs, CurrentSnapshot, rows, changeType,
             partitionValues ?? EmptyPartitionValues,
-            _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
+            _options.ParquetWriteOptions, cancellationToken,
+            rowIds, rowCommitVersions).ConfigureAwait(false);
     }
 
     private static readonly IReadOnlyDictionary<string, string> EmptyPartitionValues =
@@ -3739,6 +3924,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // deletion-vector-carrying file never reconciles and the file stays active forever
                     // (duplicated rows after an Overwrite of a DV-deleted table).
                     DeletionVector = existingFile.DeletionVector,
+                    BaseRowId = existingFile.BaseRowId,
+                    DefaultRowCommitVersion = existingFile.DefaultRowCommitVersion,
                 });
             }
         }
@@ -3918,6 +4105,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     PartitionValues = existingFile.PartitionValues,
                     Size = existingFile.Size,
                     DeletionVector = existingFile.DeletionVector, // match the active (path, DV) entry
+                    BaseRowId = existingFile.BaseRowId,
+                    DefaultRowCommitVersion = existingFile.DefaultRowCommitVersion,
                 });
             }
         }
@@ -4451,6 +4640,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         PartitionValues = existingFile.PartitionValues,
                         Size = existingFile.Size,
                         DeletionVector = existingFile.DeletionVector,
+                        BaseRowId = existingFile.BaseRowId,
+                        DefaultRowCommitVersion = existingFile.DefaultRowCommitVersion,
                     });
                 }
             }
@@ -4477,6 +4668,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         PartitionValues = existingFile.PartitionValues,
                         Size = existingFile.Size,
                         DeletionVector = existingFile.DeletionVector,
+                        BaseRowId = existingFile.BaseRowId,
+                        DefaultRowCommitVersion = existingFile.DefaultRowCommitVersion,
                     });
                 }
             }
@@ -4692,7 +4885,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// On an unpartitioned table this is one file, so a caller need not special-case it.
     /// </summary>
     internal async ValueTask<IReadOnlyList<CdcFile>> WriteChangeDataFilesForAsync(
-        Snapshot.Snapshot snapshot, RecordBatch rows, string changeType, CancellationToken cancellationToken)
+        Snapshot.Snapshot snapshot, RecordBatch rows, string changeType, CancellationToken cancellationToken,
+        Int64Array? rowIds = null, Int64Array? rowCommitVersions = null)
     {
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         if (partitionColumns is not { Count: > 0 })
@@ -4701,14 +4895,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             [
                 await ChangeDataFeed.CdfWriter.WriteAsync(
                     _fs, snapshot, rows, changeType, EmptyPartitionValues, _options.ParquetWriteOptions,
-                    cancellationToken).ConfigureAwait(false),
+                    cancellationToken, rowIds, rowCommitVersions).ConfigureAwait(false),
             ];
         }
 
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
         var written = new List<CdcFile>();
-        foreach (var (partValues, dataBatch) in Partitioning.PartitionUtils.SplitByPartition(rows, partitionColumns))
+        // The split REORDERS rows into per-partition groups, so any per-row array travelling with them has to
+        // be gathered by the same source indices or it would describe the wrong rows.
+        foreach (var (partValues, dataBatch, sourceRows) in
+                 Partitioning.PartitionUtils.SplitByPartitionWithSourceRows(rows, partitionColumns))
         {
             if (dataBatch.Length == 0)
                 continue;
@@ -4724,7 +4921,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // second removal is a no-op, so the batch arrives shaped exactly like a data file's.
             written.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                 _fs, snapshot, dataBatch, changeType, keyed, _options.ParquetWriteOptions,
-                cancellationToken).ConfigureAwait(false));
+                cancellationToken,
+                rowIds is not null ? TakeIds(rowIds, sourceRows) : null,
+                rowCommitVersions is not null ? TakeIds(rowCommitVersions, sourceRows) : null)
+                .ConfigureAwait(false));
         }
         return written;
     }
@@ -4876,6 +5076,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
+                BaseRowId = addFile.BaseRowId,
+                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
             actions.Add(addFile with
             {
@@ -4963,6 +5165,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
+                BaseRowId = addFile.BaseRowId,
+                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
             actions.Add(addFile with
             {
@@ -4978,10 +5182,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // "delete" change file.
             if (cdfEnabled)
             {
+                bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+                    snapshot.Metadata.Configuration);
                 var newSet = new HashSet<long>(newPositions);
                 var absOut = new List<Int64Array?>();
+                // The deleted rows' stable identity, for the change file. ReadFileAsync resolves it (materialized
+                // else baseRowId + position) on the same batches the positions come from, so they stay aligned.
+                var idsOut = rowTracking ? new List<Int64Array?>() : null;
+                var versOut = rowTracking ? new List<Int64Array?>() : null;
                 int bi = -1;
                 await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                          strippedRowIdsOut: idsOut,
+                                                          strippedVersionsOut: versOut,
                                                           strippedAbsPositionsOut: absOut).ConfigureAwait(false))
                 {
                     bi++;
@@ -4994,10 +5206,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                             delRows.Add(i);
                     if (delRows.Count > 0)
                     {
+                        var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                        var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
                         var cdc = await ChangeDataFeed.CdfWriter.WriteAsync(
                             _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                             addFile.PartitionValues, _options.ParquetWriteOptions,
-                            cancellationToken).ConfigureAwait(false);
+                            cancellationToken,
+                            batchIds is not null ? TakeIds(batchIds, delRows) : null,
+                            batchVers is not null ? TakeIds(batchVers, delRows) : null).ConfigureAwait(false);
                         actions.Add(cdc);
                     }
                 }
@@ -5074,6 +5290,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Change Data Feed: the rows this delete removes, captured as they stream past (a copy-on-write
             // delete rewrites the file, so nothing on disk afterwards holds them).
             var deletedBatches = cdfEnabled ? new List<RecordBatch>() : null;
+            // Paired 1:1 with deletedBatches: each deleted row's identity as it was before the rewrite.
+            var deletedTracking = cdfEnabled ? new List<(Int64Array? Ids, Int64Array? Vers)>() : null;
             long deletedHere = 0;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
@@ -5097,13 +5315,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         keepRows.Add(i);
                     }
                 }
+                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+
                 if (delRows is { Count: > 0 })
+                {
                     deletedBatches!.Add(TakeRowsFromBatch(batch, delRows));
+                    deletedTracking!.Add((
+                        batchIds is not null ? TakeIds(batchIds, delRows) : null,
+                        batchVers is not null ? TakeIds(batchVers, delRows) : null));
+                }
                 if (keepRows.Count == 0)
                     continue;
 
-                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
-                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
                 if (keepRows.Count == batch.Length)
                 {
                     outputBatches.Add(batch);
@@ -5141,12 +5365,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // carries cdc actions is read cdc-only, so these rows are the whole truth of the change.
             if (deletedBatches is not null)
             {
-                foreach (var deletedBatch in deletedBatches)
+                for (int b = 0; b < deletedBatches.Count; b++)
                 {
+                    var trk = deletedTracking![b];
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false));
+                        cancellationToken, trk.Ids, trk.Vers).ConfigureAwait(false));
                 }
             }
         }
@@ -5213,6 +5438,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             PartitionValues = source.PartitionValues,
             Size = source.Size,
             DeletionVector = source.DeletionVector, // rewritten file has the DV's deletions applied
+            BaseRowId = source.BaseRowId,
+            DefaultRowCommitVersion = source.DefaultRowCommitVersion,
         };
 
         long addedRows = 0;
@@ -5498,7 +5725,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
             // Change Data Feed: the pre/post image of exactly the rows this update touched, paired per source
             // batch (the rewriter preserves batch structure and row order, so index i means the same row in both).
-            var changePairs = cdfEnabled ? new List<(RecordBatch Pre, RecordBatch Post)>() : null;
+            var changePairs = cdfEnabled
+                ? new List<(RecordBatch Pre, RecordBatch Post, Int64Array? Ids, Int64Array? PreVers)>()
+                : null;
             long updatedHere = 0;
             for (int bi = 0; bi < userBatches.Count; bi++)
             {
@@ -5535,8 +5764,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 outTracking?.Add(materializeIds ? (idb!.Build(), vdb!.Build()) : ((Int64Array, Int64Array)?)null);
                 if (matchedRows is { Count: > 0 })
                 {
-                    changePairs!.Add((TakeRowsFromBatch(src, matchedRows),
-                                      TakeRowsFromBatch(rewritten[bi], matchedRows)));
+                    // Both images are the same rows, so one id array serves both; the pre-image keeps the
+                    // version that last wrote the row, the post-image takes this commit's.
+                    changePairs!.Add((
+                        TakeRowsFromBatch(src, matchedRows),
+                        TakeRowsFromBatch(rewritten[bi], matchedRows),
+                        batchIds is not null ? TakeIds(batchIds, matchedRows) : null,
+                        batchVers is not null ? TakeIds(batchVers, matchedRows) : null));
                 }
             }
 
@@ -5561,16 +5795,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // a rewrite is every row of the file deleted and re-inserted.
             if (changePairs is not null)
             {
-                foreach (var (pre, post) in changePairs)
+                foreach (var (pre, post, ids, preVers) in changePairs)
                 {
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false));
+                        cancellationToken, ids, preVers).ConfigureAwait(false));
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false));
+                        cancellationToken,
+                        ids, ids is not null ? ConstInt64(newVersion, ids.Length) : null).ConfigureAwait(false));
                 }
             }
         }
