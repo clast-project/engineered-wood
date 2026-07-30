@@ -1887,9 +1887,15 @@ public class SparkInteropTests : IDisposable
         var result = new List<(string, List<(string, int?)>)>();
         string changeDataDir = Path.Combine(_tempDir, CdfConfig.ChangeDataDir);
 
-        var paths = Directory.GetFiles(_tempDir, "*.parquet").Order().ToList();
+        // OrderBy rather than Order(), and the manual relative path below rather than Path.GetRelativePath:
+        // this project also targets net472, where neither exists.
+        var paths = Directory.GetFiles(_tempDir, "*.parquet")
+            .OrderBy(p => p, StringComparer.Ordinal).ToList();
         if (Directory.Exists(changeDataDir))
-            paths.AddRange(Directory.GetFiles(changeDataDir, "*.parquet").Order());
+        {
+            paths.AddRange(Directory.GetFiles(changeDataDir, "*.parquet")
+                .OrderBy(p => p, StringComparer.Ordinal));
+        }
 
         foreach (string path in paths)
         {
@@ -1897,7 +1903,8 @@ public class SparkInteropTests : IDisposable
             using var reader = new EngineeredWood.Parquet.ParquetFileReader(file, ownsFile: false);
             var schema = await reader.GetSchemaAsync();
             result.Add((
-                Path.GetRelativePath(_tempDir, path),
+                path.Substring(_tempDir.Length)
+                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
                 schema.Root.Children.Select(c => (c.Name, c.Element.FieldId)).ToList()));
         }
 
