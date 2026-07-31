@@ -286,6 +286,48 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Stages already-written data files with full parity to
+    /// <see cref="DeltaTable.CommitDataFilesAsync"/> — the same append, plus the two things only the
+    /// auto-committing surface could express. Use <see cref="StageDataFiles"/> for the plain case; reach for
+    /// this one only when you need an argument below.
+    ///
+    /// <para>Returns the rows the commit will make VISIBLE: every file's row count, less anything
+    /// <paramref name="bornDeleted"/> hides.</para>
+    /// </summary>
+    /// <param name="bornDeleted">Rows this transaction inserted and then deleted, so they never appear in any
+    /// committed version — keyed by <see cref="WrittenDataFile.RelativePath"/>, which is what
+    /// <c>add.path</c> becomes. The add is born with an inline deletion vector and its stats marked
+    /// <c>tightBounds=false</c>, as the spec requires once a vector hides rows the bounds were computed over.
+    /// The key can only name a file in this same call — these files are in no snapshot yet — and a path or
+    /// position that does not is reported rather than dropped.</param>
+    /// <param name="identityValuesPreGenerated">The caller generated the identity-column values itself (see
+    /// <see cref="DeltaTable.GenerateIdentityValues"/>), so the write-time per-row processing an outside
+    /// writer skipped has already happened. Without this an identity table's appends cannot be staged at
+    /// all — the reason this overload exists.</param>
+    public async ValueTask<long> StageDataFilesAsync(
+        IReadOnlyList<WrittenDataFile> files,
+        RowSelection? bornDeleted = null,
+        bool identityValuesPreGenerated = false,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        if (files is null)
+            throw new ArgumentNullException(nameof(files));
+        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+        if (files.Count == 0)
+            return 0;
+
+        var (actions, nextRowId, liveRows) = await _table.BuildStagedAppendActionsAsync(
+            _baseSnapshot, files, bornDeleted, identityValuesPreGenerated, _nextRowId, cancellationToken)
+            .ConfigureAwait(false);
+
+        _nextRowId = nextRowId;
+        StageInternal(actions);
+        _operations.Add("WRITE");
+        return liveRows;
+    }
+
+    /// <summary>
     /// Stages a deletion-vector DELETE of rows the caller identified itself — the host-driven counterpart of
     /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, for an engine that
     /// evaluated its own predicate and knows which rows must go. Rows are named by
