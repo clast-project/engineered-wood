@@ -70,9 +70,11 @@ public class StagedCommitParityTests : IDisposable
         ["extraActions"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.StageActions), "actions"),
         // What commitInfo records.
         ["operation"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.StageActions), "operation"),
-        // First-committer-wins pinning: a transaction is pinned to the snapshot it started at, by
-        // construction, and reports it.
-        ["expectedVersion"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.ReadVersion)),
+        // First-committer-wins pinning. A transaction is pinned by construction — and, since slice 3, to a
+        // version the host chooses rather than always to CurrentSnapshot, which is what makes the pinning
+        // mean the same thing on both surfaces.
+        ["expectedVersion"] = new(
+            typeof(DeltaTable), nameof(DeltaTable.StartTransactionAsync), "baseVersion"),
         ["cancellationToken"] = new(
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync), "cancellationToken"),
     };
