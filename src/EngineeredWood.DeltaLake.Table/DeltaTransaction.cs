@@ -38,8 +38,8 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <see cref="StageRowDeletesAsync"/>, <see cref="StageSchemaChange"/>,
 /// <see cref="StageChangeDataAsync"/>, and <see cref="StageActions"/>. These commit through the same
 /// conflict-check, rebase, and retry loop as the computed ones, so an embedding host does not reimplement
-/// it. Plan against <see cref="Snapshot"/> so the file ordinals a staged delete is keyed by agree with
-/// what the transaction validates.</para>
+/// it. Plan against <see cref="Snapshot"/> so the rows a staged delete names agree with what the
+/// transaction validates.</para>
 /// </summary>
 public sealed class DeltaTransaction
 {
@@ -81,6 +81,7 @@ public sealed class DeltaTransaction
     /// The pinned snapshot this transaction reads, plans, and validates against. Pass it wherever a
     /// host-driven step needs to agree with the transaction on what the table looks like — most importantly
     /// <see cref="DeltaTable.PlanFiles"/>, whose <see cref="PlannedFile.FileOrdinal"/> values are the keys
+    /// <see cref="RowSelection.FromRowAddresses"/> resolves into the paths
     /// <see cref="StageRowDeletesAsync"/> expects. Planning against
     /// <see cref="DeltaTable.CurrentSnapshot"/> instead would silently key positions to a different file
     /// ordering once another writer commits.
@@ -287,10 +288,10 @@ public sealed class DeltaTransaction
     /// <summary>
     /// Stages a deletion-vector DELETE of rows the caller identified itself — the host-driven counterpart of
     /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, for an engine that
-    /// evaluated its own predicate and knows which rows must go. Rows are addressed as ABSOLUTE in-file
-    /// positions keyed by the file's ordinal in this transaction's pinned snapshot — the ordinals
-    /// <see cref="DeltaTable.PlanFiles"/> reports when planned against <see cref="Snapshot"/>, and the high
-    /// bits of the transient rowids the read paths emit. Returns the rows newly hidden.
+    /// evaluated its own predicate and knows which rows must go. Rows are named by
+    /// <see cref="RowSelection"/>: absolute in-file positions per <c>add.path</c>. Build it against
+    /// <see cref="Snapshot"/> — this transaction's pinned version — so the addresses and what the commit
+    /// validates agree. Returns the rows newly hidden.
     ///
     /// <para>Each touched file's existing vector is unioned with the new positions, so repeated deletes
     /// compose, and a position already covered is not counted or replayed. The per-file edits are recorded, so
@@ -298,18 +299,18 @@ public sealed class DeltaTransaction
     /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
     /// </summary>
     public async ValueTask<long> StageRowDeletesAsync(
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        RowSelection selection,
         CancellationToken cancellationToken = default)
     {
         EnsureNotCommitted();
-        if (positionsByOrdinal is null)
-            throw new ArgumentNullException(nameof(positionsByOrdinal));
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
-        if (positionsByOrdinal.Count == 0)
+        if (selection.IsEmpty)
             return 0;
 
         var result = await _table.ComputeDvActionsWithEditsAsync(
-            positionsByOrdinal, _baseSnapshot, cancellationToken).ConfigureAwait(false);
+            selection, _baseSnapshot, cancellationToken).ConfigureAwait(false);
         if (result.RowsDeleted == 0)
             return 0;
 

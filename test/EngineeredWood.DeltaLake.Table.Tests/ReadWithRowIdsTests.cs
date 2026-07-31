@@ -101,7 +101,7 @@ public class ReadWithRowIdsTests : IDisposable
     }
 
     [Fact]
-    public async Task ReadAllWithRowIds_RoundTripsToReadRowsByRowIds()
+    public async Task ReadAllWithRowIds_RoundTripsToReadRows()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 6)]); // ids 1..6
@@ -112,7 +112,8 @@ public class ReadWithRowIdsTests : IDisposable
         Assert.Equal(2, picked.Count);
 
         var readBack = new List<long>();
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(picked))
+        var selection = RowSelection.FromRowAddresses(picked, table.CurrentSnapshot);
+        await foreach (var batch in table.ReadRowsAsync(selection))
         {
             var id = (Int64Array)batch.Column("id");
             for (int i = 0; i < batch.Length; i++)

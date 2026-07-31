@@ -17,7 +17,7 @@ public static class RowTrackingConfig
     /// <c>_metadata.row_id</c>, resolved per row as the materialized value if the file has one, else
     /// <c>add.baseRowId + position</c>. Emitted under this name by
     /// <c>DeltaTable.ReadAllWithRowTrackingAsync</c> / <c>ReadAtVersionWithRowTrackingAsync</c>, and reported
-    /// out-of-band by <c>DeltaTable.ReadRowsByRowIdsAsync</c>' <c>sourceRowTrackingOut</c>. Measured equal to
+    /// out-of-band by <c>DeltaTable.ReadRowsAsync</c>' <c>sourceRowTrackingOut</c>. Measured equal to
     /// Spark's resolution of the same rows.
     /// <para>NOT the address <c>ReadAllWithRowIdsAsync</c> emits — that is
     /// <c>TransientRowAddress.ColumnName</c>, a snapshot-scoped locator rather than an identity. The two were

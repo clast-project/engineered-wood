@@ -10,17 +10,19 @@ namespace EngineeredWood.DeltaLake.Table;
 /// snapshot's file-addressing domain.
 /// </summary>
 /// <param name="FileOrdinal">
-/// The file's position in the snapshot's PATH-SORTED active set — the coordinate the row-level seam is
-/// addressed by: the key of <see cref="DeltaTable.ComputeDeletionVectorActionsAsync"/>'
-/// <c>positionsByOrdinal</c>, of <see cref="DeltaTable.RebaseDvDmlActionsAsync"/>'
-/// <c>newPositionsByOrdinal</c>, and of <see cref="DeltaTable.CommitDataFilesAsync"/>'
-/// <c>deletedPositionsByFileIndex</c>; also the high bits of a transient rowid
-/// (<c>(fileOrdinal &lt;&lt; 40) | absolute-in-file position</c>).
+/// The file's position in the snapshot's PATH-SORTED active set — the high bits of a
+/// <see cref="TransientRowAddress"/> (<c>(fileOrdinal &lt;&lt; 40) | absolute-in-file position</c>), and the
+/// key of the lower-layer primitives <see cref="DeltaTable.ComputeDeletionVectorActionsAsync"/>
+/// (<c>positionsByOrdinal</c>), <see cref="DeltaTable.RebaseDvDmlActionsAsync"/>
+/// (<c>newPositionsByOrdinal</c>) and <see cref="DeltaTable.CommitDataFilesAsync"/>
+/// (<c>deletedPositionsByFileIndex</c>).
 /// <para>
-/// Ordinals are assigned over the WHOLE active set BEFORE pruning, so a pruned file still consumes its
-/// ordinal and the returned sequence is ascending but gapped. They are meaningful only against the
-/// snapshot they were planned from: a concurrent append can insert a path anywhere in the sort order and
-/// renumber everything after it, so a caller holding ordinals across a version change must re-plan.
+/// The row-level DML boundary is keyed by <see cref="File"/>'s PATH instead — see
+/// <see cref="RowSelection"/> — precisely because an ordinal cannot be told stale. Ordinals are assigned
+/// over the WHOLE active set BEFORE pruning, so a pruned file still consumes its ordinal and the returned
+/// sequence is ascending but gapped. They are meaningful only against the snapshot they were planned from:
+/// a concurrent append can insert a path anywhere in the sort order and renumber everything after it, so a
+/// caller holding ordinals across a version change must re-plan.
 /// </para>
 /// </param>
 /// <param name="File">The <c>add</c> action, carrying the path, partition values, statistics, deletion

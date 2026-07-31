@@ -4,21 +4,23 @@
 namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
-/// The read side's row ADDRESS: a single <see cref="long"/> packing a file's path-sorted ordinal in a
-/// snapshot's active set together with a row's absolute position inside that file. It is the coordinate the
-/// row-level DML surface speaks — <see cref="DeltaTable.ReadAllWithRowIdsAsync"/> emits it,
-/// <see cref="DeltaTable.ReadRowsByRowIdsAsync"/>, <see cref="DeltaTable.DeleteByRowIdsAsync"/> and
-/// <see cref="DeltaTable.UpdateByRowIdsAsync"/> consume it — so a host can read rows, keep their addresses,
-/// then mutate exactly those rows.
+/// A PACKING CODEC for a row address: a single <see cref="long"/> holding a file's path-sorted ordinal in a
+/// snapshot's active set together with a row's absolute position inside that file. It exists for a host whose
+/// own rowid must be one <c>BIGINT</c> — DuckDB's, say — and which therefore has to pack something.
+///
+/// <para><b>Not the DML boundary key.</b> The row-level DML surface speaks <see cref="RowSelection"/>, which
+/// is keyed by <c>add.path</c> and so cannot go stale in the ways an ordinal can. Unpack addresses into one
+/// with <see cref="RowSelection.FromRowAddresses"/>, passing the snapshot they were minted against; that is
+/// where a stale address is caught.</para>
 ///
 /// <para><b>An address, not an identity.</b> It says WHERE a row currently sits, and only within the snapshot
 /// it came from: a concurrent append inserts a path into the sort order and renumbers every ordinal after it,
 /// and any rewrite moves rows to new positions. Never persist one, never compare two from different
 /// snapshots. A row's durable identity is Delta ROW TRACKING's <c>baseRowId</c>-derived stable id — a
-/// different number entirely, read as a column by <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/>
-/// (named <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>) and reported out-of-band by
-/// <see cref="DeltaTable.ReadRowsByRowIdsAsync"/>' <c>sourceRowTrackingOut</c>. Reach for that one to
-/// remember a row; reach for this one to locate the rows you just read.</para>
+/// different number entirely, read as a column (named
+/// <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>) and reported out-of-band by
+/// <see cref="DeltaTable.ReadRowsAsync"/>' <c>sourceRowTrackingOut</c>. Reach for that one to remember a row;
+/// reach for this one to locate the rows you just read.</para>
 ///
 /// <para>Deliberately NOT tied to the row-tracking feature: the address works on a plain table with no
 /// deletion vectors and no row-tracking declared, which is the point — it is the maximally
@@ -27,10 +29,9 @@ namespace EngineeredWood.DeltaLake.Table;
 public static class TransientRowAddress
 {
     /// <summary>
-    /// The column <see cref="DeltaTable.ReadAllWithRowIdsAsync"/> appends, and the default key column of
-    /// <see cref="DeltaTable.UpdateByRowIdsAsync"/>. Named to stay clear of Spark's <c>_metadata</c> struct,
-    /// whose <c>_metadata.row_id</c> is the STABLE row-tracking id — the same name for a different number
-    /// would be read as a promise of durability this value cannot keep.
+    /// The column a read carrying the packed address appends. Named to stay clear of Spark's <c>_metadata</c>
+    /// struct, whose <c>_metadata.row_id</c> is the STABLE row-tracking id — the same name for a different
+    /// number would be read as a promise of durability this value cannot keep.
     /// </summary>
     public const string ColumnName = "_ew_row_address";
 

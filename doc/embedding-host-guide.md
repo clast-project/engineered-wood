@@ -43,8 +43,48 @@ Files are returned with their deletion vectors unresolved. Read the deleted posi
 
 ## 3. Address rows
 
-`FileOrdinal` plus an absolute in-file position is the coordinate the row-level APIs speak, packed into one
-`long` by `TransientRowAddress`:
+**`RowSelection` is the row-level DML boundary key**, and the only one. It is per data file, keyed by the
+file's `add.path` exactly as the snapshot records it, holding the ABSOLUTE in-file positions selected —
+absolute meaning the parquet row index, counting rows a deletion vector hides. `DeleteRowsAsync`,
+`UpdateRowsAsync`, `ReadRowsAsync` and `DeltaTransaction.StageRowDeletesAsync` all take one.
+
+There are three ways to build it:
+
+```csharp
+// Straight from your own scan output.
+RowSelection.ByPath(positionsByPath);
+
+// From batches read with DeltaRowMetadata.Locator — the _metadata.file_path / _metadata.row_index pair.
+RowSelection.FromLocatorColumns(batches);
+
+// From packed single-BIGINT addresses, resolved against THE SNAPSHOT THEY WERE MINTED AGAINST.
+RowSelection.FromRowAddresses(addresses, txn.Snapshot);
+```
+
+### Why the key is a path
+
+A `FileOrdinal` is the file's index in the *path-sorted active set*, so it means something only in the
+snapshot it came from: a concurrent append inserts a path into the sort order and renumbers everything after
+it. An ordinal that has gone stale but is still *in range* silently addresses a **different file**; one that
+falls out of range silently selects **nothing**. Neither is detectable at the point of use.
+
+`FromRowAddresses` resolves the ordinal to a path *at construction*, against a snapshot you pass explicitly.
+That is where a stale address is caught, while you still have the context to explain it:
+
+```csharp
+// Default: throw, naming the ordinal and the size of the active set it fell outside.
+RowSelection.FromRowAddresses(addresses, txn.Snapshot);
+// Opt back into the old silent skip if you genuinely tolerate it.
+RowSelection.FromRowAddresses(addresses, txn.Snapshot, StaleAddressPolicy.Skip);
+```
+
+A stale *path* is detectable, so the DML reports it rather than skipping: if a concurrent commit removed or
+rewrote a file the selection names, `DeleteRowsAsync` / `UpdateRowsAsync` / `ReadRowsAsync` throw naming it.
+Stage the delete on a `DeltaTransaction` instead and the commit loop reconciles that case for you (§5).
+
+### The packing codec
+
+A host whose own rowid must be one `BIGINT` — DuckDB's, say — packs the pair with `TransientRowAddress`:
 
 ```csharp
 long address = TransientRowAddress.Pack(fileOrdinal, positionInFile);
@@ -52,9 +92,8 @@ int  ordinal  = TransientRowAddress.FileOrdinal(address);
 long position = TransientRowAddress.Position(address);
 ```
 
-`ReadAllWithRowIdsAsync` emits it as the `TransientRowAddress.ColumnName` (`_ew_row_address`) column, so a
-host can correlate rows it read with the coordinates it later mutates. Use the helpers rather than
-open-coding the shift — the split is `TransientRowAddress.PositionBits` and is not part of the format.
+Use the helpers rather than open-coding the shift — the split is `TransientRowAddress.PositionBits` and is
+not part of the format. This is a *codec*, not the DML key: unpack it into a `RowSelection` before mutating.
 
 > **An address, not an identity.** `_ew_row_address` says WHERE a row sits, and only in the snapshot it came
 > from: a concurrent append renumbers ordinals, and any rewrite moves positions. Never persist one, never
@@ -64,14 +103,15 @@ open-coding the shift — the split is `TransientRowAddress.PositionBits` and is
 > number, reported by `sourceRowTrackingOut` below. The two columns had the same name until recently, which
 > read as a promise of durability the address cannot keep.
 
-`ReadRowsByRowIdsAsync` reads exactly the rows for a set of those addresses, and reports both coordinates
-back through out-parameters:
+`ReadRowsAsync(selection, sourceRowTrackingOut:)` reads exactly the selected rows.
+`sourceRowTrackingOut` reports, per yielded batch and row-aligned with it, each row's STABLE id and commit
+version: the materialized value where the file has one, otherwise the spec derivation `baseRowId + position`
+/ `defaultRowCommitVersion`. Null only for a source that predates row tracking. This is the identity to carry
+through a rewrite.
 
-- `rowIdsOut` — each returned row's transient rowid. Batching and deletion-vector filtering both break any
-  positional correspondence between what you asked for and what came back, so this is what you pair them by.
-- `sourceRowTrackingOut` — each row's STABLE id and commit version: the materialized value where the file has
-  one, otherwise the spec derivation `baseRowId + position` / `defaultRowCommitVersion`. Null only for a
-  source that predates row tracking. This is the identity to carry through a rewrite.
+To pair returned rows with what you asked for, read with `DeltaRowMetadata.Locator` — batching and
+deletion-vector filtering both break any positional correspondence, and the locator pair is the same key the
+selection is built on.
 
 ### Preserving identity across your own rewrite
 
@@ -81,7 +121,7 @@ stable ids, then hand them back when writing the post-image:
 ```csharp
 var tracking = new List<(long?[] Ids, long?[] Versions)>();
 var postImages = new List<RecordBatch>();
-await foreach (var batch in table.ReadRowsByRowIdsAsync(targets, sourceRowTrackingOut: tracking))
+await foreach (var batch in table.ReadRowsAsync(selection, sourceRowTrackingOut: tracking))
     postImages.Add(YourEngine.Apply(batch));
 
 var files = await table.WriteDataFilesAsync(
@@ -137,7 +177,7 @@ rather than handing over batches and predicates:
 | Method | Stages |
 |---|---|
 | `StageDataFiles(files)` | Data files you already wrote (append-shaped) |
-| `StageRowDeletesAsync(positionsByOrdinal)` | A deletion-vector DELETE of rows you identified |
+| `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§3) |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
 | `StageActions(actions)` | Anything else — `txn` ids, your own domain metadata |
@@ -148,13 +188,18 @@ var txn = table.StartTransaction();
 var planned = table.PlanFiles(predicate, snapshot: txn.Snapshot);
 // ... your engine scans those files and decides what changes ...
 
+var selection = RowSelection.FromRowAddresses(doomedAddresses, txn.Snapshot);
+
 var files = await table.WriteDataFilesAsync(newRows);   // or your own writer
 txn.StageDataFiles(files);
-await txn.StageRowDeletesAsync(positionsByOrdinal);
+await txn.StageRowDeletesAsync(selection);
 await txn.StageChangeDataAsync(deletedRows, "delete");
 
 long version = await txn.CommitAsync();   // ONE atomic version
 ```
+
+Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
+delete names agree with what the commit validates.
 
 **Do not reimplement the commit loop.** `CommitAsync` runs the same optimistic-concurrency loop the
 built-in operations use: it checks conflicts against every version that landed since the transaction
