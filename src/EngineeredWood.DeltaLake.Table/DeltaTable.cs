@@ -404,7 +404,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
         // cosmetic, because writer v5's extra implied features only impose obligations on tables that
         // actually declare a constraint or generated column, and HonorWriterFeatures already fails
-        // closed on those. See doc/upstream-landing-notes.md for the full measurement.
+        // closed on those. See doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
         if (mappingMode != ColumnMappingMode.None &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
@@ -2616,7 +2616,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// post-image add's <c>baseRowId</c> from <paramref name="latestSnapshot"/>'s high-water mark and its
     /// <c>defaultRowCommitVersion</c> to <paramref name="attemptVersion"/>, and rebuilds the
     /// <c>delta.rowTracking</c> high-water-mark domain to match — mirroring Spark's row-id reassignment on
-    /// conflict resolution and pr-4's <c>RebaseDvDmlActionsAsync</c>.
+    /// conflict resolution.
     ///
     /// <para>A post-image add is a data-change <see cref="AddFile"/> carrying a <c>baseRowId</c> whose path is
     /// NOT active in <paramref name="baseSnapshot"/> and was NOT produced by the row-level DELETE resolution

@@ -11,8 +11,8 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 ///
 /// <para><b>Why this exists.</b> Every other Delta test in this suite round-trips through EW's own
 /// reader, which proves reader and writer agree — not that either matches the Delta spec. Every
-/// interop bug in <c>doc/upstream-landing-notes.md</c> (DV framing, <c>add.path</c> encoding,
-/// checkpoint content, physical names) round-tripped perfectly. These tests use an independent
+/// interop bug this tier has found (DV framing, <c>add.path</c> encoding, checkpoint content,
+/// physical names) round-tripped perfectly beforehand. These tests use an independent
 /// implementation as the oracle.</para>
 ///
 /// <para>Cheapest tier: no JVM, one <c>pip install deltalake</c>. Cannot read column-mapped tables

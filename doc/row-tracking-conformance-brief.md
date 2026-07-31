@@ -1,386 +1,140 @@
-# Row tracking: brief for landing a spec-conformant writer (port + validate)
+# Delta row tracking — conformance record
 
-**THE FIELD-ID DEFERRAL WAS A NON-GAP — CLOSED 2026-07-29.** The one item gap 2 left open (materialized
-columns carry no parquet `field_id`, so an `id`-mode reader has nothing to resolve them by) was PROBED
-rather than reasoned about, and Spark 4.0.1 does exactly what EW does: no `field_id` on the materialized
-columns or `_change_type`, in data files and `_change_data` files alike, with `maxColumnId` reserving none
-for them. Spark reads EW's `id`-mode row-tracking table correctly through a materializing UPDATE, and the
-feed comes back with logical columns only. Pinned by
-`EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed`; gap 2 and the spec summary below are
-corrected accordingly. Side finding: with CDF on, Spark leaves a `_change_type` column INSIDE the rewritten
-main data file (verified a committed `add`, not an orphan) — EW does not, i.e. EW is stricter here.
+**Status: complete and measured in both directions.** Row tracking is spec-conformant on the write
+side, exposed on the read side, carried through the Change Data Feed, and validated against Spark 4.0.1
+/ 4.1 and delta-rs 1.6.2 with EngineeredWood as both producer and consumer.
 
-**CDF CARRIES THE ROW-TRACKING COLUMNS as of 2026-07-28 — the last gap on the read surface but one.**
-MEASURED FIRST (Spark 4.0.1 / delta-spark 4.0.0, probed rather than reasoned about): a row-tracking + CDF
-table's `_change_data` files DO carry both materialized columns, after the user columns and before
-`_change_type`; a `cdc` action carries NO `baseRowId`/`defaultRowCommitVersion` (unlike `add` and `remove`),
-so materializing is the ONLY way identity reaches a change row — there is no positional fallback; Spark
-writes an `update_postimage` row's commit version as **NULL** (meaning "the version being committed") while
-the pre-image and delete rows carry the row's original version explicitly; and Spark's own `readChangeFeed`
-does **not** expose row ids at all (`_metadata` does not resolve on the feed), so EW's exposure goes beyond
-the reference implementation. Spark also populates `baseRowId`/`defaultRowCommitVersion` on **remove**
-actions, which EW did not.
+This document records what the spec requires, what EngineeredWood does, and — the part worth not
+re-deriving — the facts about Spark's behaviour that were established by **probing rather than
+reasoning**. Several of them contradict what the spec text suggests.
 
-What landed: (a) `CdfWriter` materializes both columns into every change file on a row-tracking table,
-under the declared physical names, with each row's identity threaded in from the five DML paths that write
-change files (predicate DELETE, DV DELETE by rowid, copy-on-write DELETE, predicate UPDATE, UPDATE by
-rowid) — the post-image version is written EXPLICITLY rather than as Spark's null, which resolves to the
-same number without relying on a reader implementing the fallback; (b) `DeltaTable.ReadChangesWithRowTrackingAsync`
-emits `_metadata.row_id` + `_metadata.row_commit_version` on the feed, resolved materialized-else-positional
-from a data file and materialized-else-`_commit_version` from a change file; (c) remove actions now carry
-the row-tracking fields of the add they remove, which is what makes an OVERWRITE's inferred delete rows
-resolvable; (d) the public `WriteChangeDataFileAsync` host seam takes the two arrays.
+## What the spec requires
 
-**A LIVE BUG was fixed on the way** (landed as its own commit): `CdfReader` opens change files and data files
-directly rather than through the main read path, so a row-tracking table's hidden materialized columns LEAKED
-into the feed as two extra Int64 columns. UNPARTITIONED tables only — `AddPartitionColumns` consumes data
-columns positionally against the table schema, which takes exactly the user columns and leaves the hidden
-ones off the end, so a partitioned table was already dropping them by accident. (Measured, not assumed: a
-partitioned leak test passes with the strip neutered, which is why the partitioned coverage asserts IDS.)
-Reproduced against real Spark output: neutering the strip fails
-`SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds` on the leak assertion.
+Row tracking is a writer feature (`rowTracking`) depending on the `domainMetadata` writer feature,
+enabled by `delta.enableRowTracking=true`. Every row has a stable **row ID** and a **row commit
+version**, carried one of two ways:
 
-MEASURED both directions: `EwWritten_RowTrackingChangeDataFeed_SparkReadsTheFeedWithoutTheHiddenColumns`
-(Spark reads an EW feed and reports exactly the table's columns — the new hidden columns do not disturb it,
-which is worth measuring because Spark never asks for them) and
-`SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds` (EW resolves Spark's hyphenated
-`_row-id-col-<uuid>` values out of Spark's own change files; pre/post images of the updated row report the
-id Spark assigned, the post-image's null version resolves to the commit, and a Spark-deleted row reports the
-identity it had). Non-interop cover in `CdfRowTrackingTests` (10), each confirmed to fail with the writer or
-the reader neutered. The one remaining gap on this surface — the emitted column NAMES — is CLOSED as of the
-host-seam consolidation: `DeltaReadOptions.MetadataPrefix` and `DeltaChangeReadOptions.MetadataPrefix` set
-the prefix (default `_metadata.`), and a metadata name colliding with a table column is refused rather than
-shadowed.
+1. **Default values — no column.** `rowId = add.baseRowId + positionInFile`, and
+   `add.defaultRowCommitVersion` gives the version. A freshly appended file needs only these two `add`
+   fields and no materialized column. Position is the physical position in the file; a deletion vector
+   does not renumber.
 
-**FOREIGN→EW MEASURED 2026-07-28 (gap 7's remaining half) — no production change needed.**
-The direction this brief repeatedly warned was unproven: a row-tracking table SPARK creates, writes, and
-materializes, then EngineeredWood reads and rewrites. Measured shape (do not assume it — it was probed, not
-inferred): Spark names its hidden columns `_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>` — HYPHENATED,
-unlike EW's own `_row_id_<hex>` — declares `rowTracking`+`domainMetadata`+`appendOnly`+`invariants` at
-reader 1 / writer 7, and after an UPDATE leaves ONE file whose `baseRowId` is 3 while its rows' materialized
-ids are 0,1,2. That gap is what makes the tests discriminating, and it is asserted rather than described:
-a reader ignoring the materialized column reports 3,4,5. Three tests cover read, UPDATE-preserve and
-compaction-preserve; all three were confirmed to FAIL when the read resolution is neutered (the compaction one
-needs its own probe — `CompactionExecutor` bypasses `ProcessFileBatchesAsync` and strips the columns itself).
-**EW needed no change to pass**: the foreign-name handling was already correct, only unverified. What this
-retires is a risk, not a defect.
+2. **Materialized values — a hidden column.** When a row's identity cannot be derived from position
+   because a rewrite moved it, it is stored per row in a hidden physical column. The physical names
+   live in table metadata as `delta.rowTracking.materializedRowIdColumnName` and
+   `delta.rowTracking.materializedRowCommitVersionColumnName`. A non-null materialized value overrides
+   the default for that row.
 
-**M4 LANDED 2026-07-28 — read-side stable ids (gap 3, the last optional milestone).**
-`DeltaTable.ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append the spec's two generated
-columns, `_metadata.row_id` and `_metadata.row_commit_version`, resolved per row as the materialized value
-where the file has one, else `add.baseRowId + position` / `add.defaultRowCommitVersion`. The resolution itself
-was already on the read path (the rowid out-params the rewrite paths consume); M4 is the wrapper that appends
-it as columns AFTER the pipeline, so the schema reconciliation inside `ProcessFileBatchesAsync` — defined
-against the table's Delta schema — never sees a column that is not in it, and `DeltaTable.ArrowSchema` keeps
-meaning one thing. Both columns are nullable (a file predating row tracking has no derivable id); a
-non-row-tracking table and a user column colliding with a generated name are both refused rather than served
-nulls. Named for the FEATURE, not by an adjective distinguishing them from `ReadAllWithRowIdsAsync` — that
-pair is one word apart otherwise, which is the trap `72b3888` already had to undo once at the column level.
-**MEASURED**: `EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion` asserts EW's resolution equals Spark's
-row by row (not against hardcoded ids) over a table mixing materialized and positional files — the first test
-of what EW READS rather than what it writes. Not covered at the time: CDF (closed 2026-07-28 — see the top of
-this document) and configuring the emitted column NAMES (deliberately deferred until a host needs it).
+High-water mark: the `delta.rowTracking` domainMetadata carries `{"rowIdHighWaterMark":
+highestAssignedId}`. Note that this stores the highest *assigned* id while EngineeredWood's internal
+counter holds the *next* id. The domain value holds the line when the highest-id file leaves the
+active set, so ids are never reassigned.
 
-**Fixed 2026-07-28 — a PARTITIONED row-tracking table lost stable ids on the SECOND rewrite.** `ReadFileAsync`
-names the file's columns explicitly whenever the table is partitioned (schema fields minus partition columns)
-or the read is projected, and the hidden materialized columns are not schema fields — so they were never
-requested, `StripMaterializedColumns` found nothing, and every id fell back to `baseRowId + position`, which on
-a rewrite output is a FRESH id. One UPDATE could not expose it (its source is a fresh append with no
-materialized column to miss); the second silently changed every row's identity while preserving its data.
-Fixed by naming the declared (and legacy) materialized columns in the file-level column list, with the existing
-file-present intersect dropping them again for the appends that carry none; the codec-seam branch has no footer
-to intersect against, so it reads all columns instead when the table declares materialized names. MEASURED on
-Spark 4.0.1/4.1 — `EwUpdatedTwice_RowTracking_Partitioned_/…_MappedPartitioned_SparkReadsPreservedIds` read
-id 4 where 0 was expected before the fix. Compaction was never affected (it reads raw parquet with no column
-list). Regression coverage: `RowTrackingPartitionedIdLossTests`, including a guard that the now-requested
-hidden columns are still stripped before a caller sees them.
+## What EngineeredWood does
 
-**Status: Milestone 3 LANDED (2026-07-20, pending commit) — row-level concurrency across a rewrite (Layer 3 B).**
-A losing DELETE whose target file was concurrently compacted/UPDATE-rewritten is remapped by STABLE ROW ID onto
-the new file(s) instead of aborting, and a DELETE-only transaction is now rebase-safe under row tracking
-(retires limitation 2 for deletes). New: `RemapRowLevelDeletesAsync` (adapted from pr-4's
-`RemapRowsAcrossRewriteAsync`, onto master's M2 read-out-params + a new `strippedAbsPositionsOut`),
-`ResolveRowLevelDeletesAsync` splits DV-union vs remap. MEASURED on Spark 4.0.1
-(`SparkInteropTests.EwDeleteRemappedThroughCompaction_SparkReadsSurvivorsWithPreservedIds`: Spark reads the
-remapped result — DV on the compacted materialized-id file — returns survivors with original ids, omits the
-remapped-away row). NOT ported: rebasing a losing UPDATE/append's post-image add (pr-4's
-`RebaseDvDmlActionsAsync` baseRowId re-derivation) — the other half of limitation 2. Full matrix green (310
-non-interop, 21 Spark, 12 delta-rs). See `doc/slice9-concurrency-resume.md` step 7.
+- **Append** assigns `baseRowId` + `defaultRowCommitVersion` and writes no materialized column.
+- **Copy-on-write rewrite** (UPDATE / OVERWRITE / DELETE / compaction) materializes each moved row's
+  original id and commit version into the declared hidden columns. A changed row's commit version
+  advances to the rewrite's version; an untouched-but-relocated row keeps its original. A fresh
+  `baseRowId` still goes on the new `add` as the fallback for null-materialized rows.
+- **Read** strips the hidden columns before any caller sees them, and can surface each surviving row's
+  resolved id and version through out-params — which is what lets a second rewrite preserve a first
+  rewrite's ids.
+- **`ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync`** append the spec's two
+  generated columns, resolved materialized-else-positional. Both are nullable, since a file predating
+  row tracking has no derivable id. A non-row-tracking table and a user column colliding with a
+  generated name are both refused rather than served nulls.
+- **CDF** materializes both columns into every `_change_data` file on a row-tracking table, and
+  `ReadChangesWithRowTrackingAsync` emits them on the feed.
+- **Column names** are configurable via `DeltaReadOptions.MetadataPrefix` /
+  `DeltaChangeReadOptions.MetadataPrefix` (default `_metadata.`); a prefix colliding with a table
+  column is refused rather than shadowed.
+- **Concurrency** rebases under row tracking rather than aborting — see
+  [`delta-concurrency.md`](delta-concurrency.md).
 
-**Status: Milestone 2 LANDED (2026-07-20) — a copy-on-write rewrite (UPDATE / OVERWRITE /
-compaction) now PRESERVES stable row ids by materializing each moved row's original id + commit version into
-the declared hidden columns, MEASURED against Spark 4.0.1.** `RowTrackingWriter` grew the materialization
-overloads (`AddRowIdColumn(batch, Int64Array, name)`, `AddRowIdAndCommitVersionColumns(..., rowIdName,
-rowVerName)`) + a name-parameterized `StripMaterializedColumns`; `RowTrackingConfig.TryGetMaterializedColumnNames`
-returns the declared physical names. `ComputeUpdateActionsAsync` and `CompactionExecutor` materialize every
-survivor's original id (a changed row's commit version advances to the update's version, an untouched-but-
-rewritten row keeps its original); a fresh `baseRowId`/`defaultRowCommitVersion` still goes on the new add for
-the null-materialized fallback, and the HWM domain advances. The READ path
-(`ReadFileAsync`/`ProcessFileBatchesAsync`) strips the hidden columns up front (so they never leak to a
-reader) and can surface each surviving row's RESOLVED id/version via optional out-params, which the UPDATE
-rewrite consumes so a row's id survives a SECOND rewrite. `RejectRowTrackingWrite` now refuses a rewrite ONLY
-when the declared materialized-column names are ABSENT (a spec-invalid foreign table); every EW-created table
-has them, so UPDATE/DELETE/OVERWRITE/compaction are allowed.
-**MEASURED (the validation the whole effort demanded):**
-`SparkInteropTests.EwUpdated_RowTracking_SparkReadsPreservedIds` + `EwCompacted_RowTracking_SparkReadsPreservedIds`
-— Spark 4.0.1 reads `_metadata.row_id` = the ORIGINAL 0,1,2 back through an EW UPDATE (which reorders rows)
-AND a compaction, which is the exact measurement that distinguishes correct materialization from the
-`baseRowId + position` fallback. `DeltaRsInteropTests.EwUpdated_RowTracking_DeltaRsReadsUserColumnsOnly` —
-delta-rs 1.6.2 reads the rewritten table and the hidden columns do NOT leak. Full matrix green: 305 non-interop
-(net10) + 303 (net8/net472) + 35 interop.
+`RejectRowTrackingWrite` now refuses only a rewrite of a table that does not declare its materialized
+column-name properties — a spec-invalid shape EngineeredWood never creates, but a foreign engine could.
+Without those names ids cannot be preserved through the rewrite. Appending to and reading such a table
+is still allowed.
 
-**Milestone 1 LANDED (2026-07-20) — appends spec-conformant + writable.** `CreateAsync(..., enableRowTracking:
-true)` generates + stores the two materialized-column-name properties and declares `rowTracking` +
-`domainMetadata` (writer 7); an APPEND assigns `baseRowId`/`defaultRowCommitVersion` and writes NO materialized
-column. Remaining = Layer 3 (B) row-level concurrency across rewrites (needs id-based remap; see
-`doc/slice9-concurrency-resume.md`) and M4 read-side `_metadata.row_id` exposure (optional). This document
-captured everything learned so a future session could finish without re-deriving it.
+## Measured facts about Spark
 
-**IMPORTANT (corrected 2026-07-20): this is PORT + VALIDATE, not greenfield.** The `pr-4` branch (local:
-`git show pr-4:…`) **already implements** row-tracking-through-rewrite and both row-level-concurrency
-mechanisms. Master lacks it only because the write-path refactor was landed *refactor-only* (`808b944`),
-which stripped the buffered-transaction / logical-rebase machinery — and the row-tracking materialization
-went out with it. So the work is: **port pr-4's machinery onto master's write path, then add the
-cross-engine (Spark) validation pr-4 never had.** See "What pr-4 already implements" below.
+Each of these was probed before any code was written, and each contradicts something that was
+previously believed or reasoned from the spec text.
 
-Then **measure against Spark before trusting any spec detail below** — the whole slice-9 effort repeatedly
-found that reasoning about other implementations was wrong and only measurement corrected it, and row
-tracking has *zero* interop coverage in either master or pr-4, so **nothing here has been validated
-cross-engine** — including pr-4's implementation.
+- **No parquet `field_id` on the materialized columns**, or on `_change_type`, even under `id`-mode
+  column mapping — in data files and `_change_data` files alike, with `delta.columnMapping.maxColumnId`
+  reserving none for them. The declared physical *name* is the sole lookup key in both mapping modes.
+  This had been recorded as a deferred gap on the reasoning that an `id`-mode reader would need field
+  ids to resolve them; the reasoning was wrong and the gap never existed.
+- **A `cdc` action carries no `baseRowId` or `defaultRowCommitVersion`**, unlike `add` and `remove`. So
+  materializing is the *only* way identity reaches a change row — there is no positional fallback on
+  the feed.
+- **Spark writes an `update_postimage` row's commit version as NULL**, meaning "the version being
+  committed", while pre-image and delete rows carry the row's original version explicitly.
+  EngineeredWood writes the post-image version explicitly instead; it resolves to the same number
+  without relying on a reader implementing the fallback.
+- **Spark's own `readChangeFeed` does not expose row ids at all** — `_metadata` does not resolve on the
+  feed. EngineeredWood's exposure goes beyond the reference implementation here.
+- **Spark populates `baseRowId` / `defaultRowCommitVersion` on `remove` actions.** EngineeredWood did
+  not, which is what made an OVERWRITE's inferred delete rows unresolvable; it does now.
+- **Spark leaves a `_change_type` column inside the rewritten main data file** when CDF is on (verified
+  on a committed `add`, not an orphan). EngineeredWood does not — it is stricter here.
+- **Spark's materialized column names are hyphenated** — `_row-id-col-<uuid>` /
+  `_row-commit-version-col-<uuid>` — unlike EngineeredWood's `_row_id_<hex>`. A Spark table declares
+  `rowTracking` + `domainMetadata` + `appendOnly` + `invariants` at reader 1 / writer 7, and after an
+  UPDATE leaves one file whose `baseRowId` is 3 while its rows' materialized ids are 0, 1, 2. That gap
+  is what makes the foreign-read tests discriminating: a reader ignoring the materialized column
+  reports 3, 4, 5.
 
-## TL;DR
+## Two bugs this work found
 
-- **Master's** row tracking is broken on rewrite (strips the row-id column, drops `baseRowId`) and is refused
-  for writes. Reads stay fine — `baseRowId` is just log metadata. Refusing is strictly safer than the prior
-  behavior, which **silently corrupted** foreign row-tracking tables.
-- **pr-4** is not the broken version: it materializes each survivor's original id + commit version through
-  UPDATE / copy-on-write DELETE / compaction, keyed off the spec `delta.rowTracking.materializedRowIdColumnName`
-  metadata, and remaps DML across rewrites by stable row id (`RemapRowsAcrossRewriteAsync`). Its own tests are
-  green.
-- **Two real gaps remain even in pr-4**: (a) it *consumes* the materialized-column metadata but does not
-  *generate* it — there is no `CreateAsync` enablement, so it handles writing to a FOREIGN (Spark-created)
-  row-tracking table but cannot create a spec-conformant one; (b) **no interop validation** — spec-conformance
-  is unproven, not proven, and this effort's history says unproven cross-engine assumptions are usually wrong.
-- So the landing plan is: port pr-4's writer + remap, add a `CreateAsync` enablement (generate the metadata),
-  and validate on Spark/delta-rs tier 3 — then lift the gate.
+Both are worth keeping because their *shape* can recur.
 
-## Why it's read-only right now
+**A partitioned row-tracking table lost stable ids on the second rewrite.** `ReadFileAsync` names the
+file's columns explicitly whenever the table is partitioned or the read is projected — and the hidden
+materialized columns are not schema fields, so they were never requested, `StripMaterializedColumns`
+found nothing, and every id fell back to `baseRowId + position`, which on a rewrite output is a *fresh*
+id. One UPDATE could not expose this, because its source is a fresh append with no materialized column
+to miss; the second silently changed every row's identity while preserving its data. Fixed by naming
+the declared (and legacy) materialized columns in the file-level column list, with the existing
+file-present intersect dropping them again for appends that carry none. The codec-seam branch has no
+footer to intersect against, so it reads all columns when the table declares materialized names.
+Compaction was never affected — it reads raw parquet with no column list.
 
-`RejectRowTrackingWrite(snapshot)` (in `DeltaTable.cs`) throws `NotSupportedException` when
-`RowTrackingConfig.IsEnabled(config)`. It gates:
-- `ValidateWritable` — covers append / overwrite / delete / update (every data write funnels through it), and
-- `CompactAsync` — a separate entry point that does not call `ValidateWritable`.
+**A row-tracking table's hidden columns leaked into the CDF feed.** `CdfReader` opens change files and
+data files directly rather than through the main read path, so the materialized columns surfaced as two
+extra Int64 columns. Unpartitioned tables only: `AddPartitionColumns` consumes data columns positionally
+against the table schema, which takes exactly the user columns and leaves the hidden ones off the end,
+so a partitioned table was already dropping them by accident. That accident is why the partitioned
+coverage asserts ids rather than just absence.
 
-Reads are untouched, and the `delta.rowTracking` high-water mark is still reconciled on read. There is **no
-`CreateAsync` surface to enable row tracking**, so the only way to reach the write path at all is opening a
-table a *foreign* engine (Spark/Databricks) created — which is exactly where writing wrong corrupts real
-invariants. Lifting the gate is the last step of the work below.
+## Interop coverage
 
-## Current EW state on MASTER (precise)
+Both directions are measured, and each test was confirmed to fail with the relevant production code
+neutered rather than merely passing.
 
-This section is **master**, which is the broken/refused version. What pr-4 has instead is the next section.
-
-Config + helpers — `src/EngineeredWood.DeltaLake/RowTracking/RowTrackingConfig.cs`:
-- `EnableKey = "delta.enableRowTracking"`, `DomainName = "delta.rowTracking"`.
-- `BuildHighWaterMarkAction(nextAvailableRowId)` → domainMetadata `{"rowIdHighWaterMark": next-1}` (stores
-  the **highest assigned** id; EW's internal counter is the **next** id). `TryReadHighWaterMark`,
-  `ComputeHighWaterMark(activeFiles)` (derives from `baseRowId + estimatedRowCount`, estimate from
-  `stats.numRecords`). Reconciled into `Snapshot.RowIdHighWaterMark` at snapshot-build time; the domain HWM
-  holds the line when the highest-id file leaves the active set (so ids are never reassigned). This read-side
-  reconciliation is correct and worth keeping.
-- **Dead constants**: `RowIdColumnName`/`VirtualRowIdColumn = "_metadata.row_id"` and
-  `VirtualRowCommitVersionColumn` are defined but **never used** — EW exposes no row IDs to readers.
-
-Writer helper — `src/EngineeredWood.DeltaLake.Table/RowTracking/RowTrackingWriter.cs`:
-- `RowIdColumn = "__delta_row_id"` — a **hardcoded, non-spec** physical name.
-- `AddRowIdColumn(batch, baseRowId)` appends `__delta_row_id = baseRowId + i`. `StripRowIdColumn`,
-  `GetOrGenerateRowIds`, `BuildCommitVersionArray` (commit-version column, unused end-to-end).
-
-Write path — `ComputeWriteActionsAsync` (`DeltaTable.cs`, ~line 2196+):
-- When `rowTrackingEnabled`: `AddRowIdColumn(physicalBatch, fileBaseRowId)`, then **writes the batch
-  INCLUDING `__delta_row_id` into the parquet**, sets `AddFile.BaseRowId = fileBaseRowId` and
-  `DefaultRowCommitVersion = newVersion`, advances the counter, and emits the `delta.rowTracking` HWM
-  domainMetadata.
-
-Read path — `ReadFileAsync` (`DeltaTable.cs`, ~line 2777): `StripRowIdColumn(result)` drops `__delta_row_id`
-after reading. So EW writes a spurious column and hides it again; a foreign reader sees an undeclared
-physical column.
-
-UPDATE — `ComputeUpdateActionsAsync` (`DeltaTable.cs`, ~1695 / ~1742): **strips** the row-id column and
-builds `new AddFile { … }` with **no `BaseRowId`/`DefaultRowCommitVersion`**, and **reorders** rows (matched
-rows first, then kept). A copy-on-write rewrite therefore loses row identity entirely.
-
-Compaction — `Compaction/CompactionExecutor.cs` (~110 / ~306 / ~343): assigns **fresh** `baseRowId`s and
-emits the HWM, but does **not** carry each surviving row's original id — weak "preservation" only.
-
-Protocol — `ProtocolVersions.cs`: `rowTracking` and `domainMetadata` are in `SupportedWriterFeatures` (not
-reader features). A table listing `rowTracking` in `readerFeatures` is still rejected by
-`ValidateReadSupport` (see `doc/known-issues.md`, "rowTracking read-side classification").
-
-**No interop test exists** for row tracking, in any direction.
-
-## What pr-4 already implements (the real starting point)
-
-Inspect with `git show pr-4:<path>` / `git grep … pr-4`. pr-4's branch is green (its own tests pass); it was
-never taken onto master because it is entangled with the buffered-transaction + `IDataFileRewriter` machinery
-that the write-path refactor deliberately stripped.
-
-- **Writer** (`pr-4:.../RowTracking/RowTrackingWriter.cs`): adds `RowCommitVersionColumn =
-  "__delta_row_commit_version"` and the materialization overloads master lacks — `AddRowIdColumn(batch,
-  Int64Array rowIds)` (materialize explicit original ids on a CoW rewrite) and
-  `AddRowIdAndCommitVersionColumns(batch, rowIds, commitVersions, nullable)` (both columns for compaction,
-  where rows from several source files mix so a single `baseRowId`/`defaultRowCommitVersion` can't represent
-  them). The `nullable` form handles a source predating row tracking (per-row NULL → reader falls back to the
-  new file's `baseRowId + position`).
-- **DML rewrite paths** (`pr-4:.../DeltaTable.cs`): a `materializeIds` flag gated on the config key
-  `delta.rowTracking.materializedRowIdColumnName` drives UPDATE (`UpdateByRowIdsAsync`, ~2042), copy-on-write
-  DELETE (`DeleteByRowIdsAsync` ~1592, `DeleteByRowIdsViaVectorsAsync` ~1872), and the append path (~2104,
-  ~2372). Fresh `baseRowId`/`defaultRowCommitVersion` still go on the new `add`; survivors carry their
-  ORIGINAL id/version in the materialized columns. `__delta_row_id` is an internal working name reconciled to
-  the configured physical name.
-- **Row-level concurrency** (the Layer 3 payload): `ReadAllWithRowIdsAsync` (~2987) exposes stable ids with
-  the encoding `(fileOrdinal << 40) | absolutePositionInFile`; `RebaseDvDmlActionsAsync` (~4195) is the
-  rebase, which calls `RemapRowsAcrossRewriteAsync` (~4369) — relocate rows by stable id (materialized, else
-  `baseRowId + position`), using the row's COMMIT VERSION as the concurrent-modification discriminator
-  (relocated-untouched keeps its version; a concurrently updated/deleted row conflicts). pr-4's own
-  `RowLevelConcurrencyTests` describes both mechanisms: **v1** DV re-union (== the Layer 3 (A) already landed
-  on master) and **v2** remap-across-rewrite (== Layer 3 (B)). Its note: *"Databricks' own row-level
-  concurrency still conflicts with compaction — the remap goes beyond it."*
-- **Compaction** (`pr-4:.../Compaction/CompactionExecutor.cs`): reads the materialized-column name (~93) and
-  carries original ids/versions through the merge.
-- **Entangled with the codec seam**: the rewrite paths have a `nativeRewrite` branch that delegates to
-  `IDataFileRewriter.ReadRewriteAsync(…, RowTrackingRewrite)` (`pr-4:.../IDataFileRewriter.cs`). The built-in
-  (non-native) path is independent, so the port need not take the seam — but be aware the two are interwoven
-  in pr-4's source.
-
-**What pr-4 does NOT do** (the two gaps that remain after a port): it *consumes* the
-`materializedRowIdColumnName` metadata but never *generates* it (no `CreateAsync` enablement — the tests
-hand-configure it to `__delta_row_id`; a Spark table supplies its own UUID-based name), and it has **no
-Spark/delta-rs interop test** — so "spec-conformant" is unproven.
-
-## What the Delta spec requires (verify before relying)
-
-Row tracking is a **writer feature** (`rowTracking`) that depends on the `domainMetadata` writer feature.
-Enabled by table property `delta.enableRowTracking=true`. Every row has a stable **row ID** and a **row
-commit version**, each carried in one of two ways:
-
-1. **Default (fresh) values — no column.** `add.baseRowId` + physical position gives the row ID
-   (`rowId = baseRowId + positionInFile`); `add.defaultRowCommitVersion` gives the commit version. A
-   freshly-appended file needs **only** these two `add` fields — **no materialized column**. (Verify how
-   position interacts with a deletion vector — physical position in the file, DV does not renumber.)
-
-2. **Materialized values — a hidden column.** When a row's ID/version can't be derived from position (it was
-   *moved* by a rewrite), it is stored per-row in a hidden physical column. The column **physical names are
-   stored in table metadata**: `delta.rowTracking.materializedRowIdColumnName` and
-   `delta.rowTracking.materializedRowCommitVersionColumnName`. Names are UUID-based to avoid colliding with
-   user columns; they carry **no parquet field ID** even under `id`-mode column mapping, so the declared
-   physical NAME is the only way to find them in either mapping mode (MEASURED 2026-07-29 — see the note
-   under gap 2; this line previously claimed the opposite, reasoned from the spec rather than probed). A
-   non-null materialized value **overrides** the default for that row.
-
-High-water mark: `delta.rowTracking` domainMetadata `{"rowIdHighWaterMark": highestAssignedId}` — already
-emitted/reconciled by EW. Reader exposure: the generated columns `_metadata.row_id` /
-`_metadata.row_commit_version` (EW has the constant names but never populates them).
-
-## Gap analysis (current → conformant)
-
-| # | Gap | Fix | Status |
-|---|---|---|---|
-| 1 | Writes a hardcoded non-spec `__delta_row_id` column, even for default-id files that need none | Stop writing it for fresh appends; rely on `baseRowId` + position. Only ever write a **materialized** column, under its metadata-declared name, when ids are non-derivable (rewrites). | **DONE** — append writes none; a rewrite writes the materialized columns under the metadata-declared physical names (`RowTrackingWriter.AddRowIdAndCommitVersionColumns`). |
-| 2 | No `materializedRowIdColumnName` / `…CommitVersionColumnName` metadata; no field IDs | Assign UUID physical names at enablement, store in metadata; ~~stamp field IDs under column mapping~~ — the field-ID half was a **misreading of the spec**, see status. | **DONE (2026-07-29)** — names stored by `CreateAsync`; a rewrite writes under those names. The field-ID half turned out to be a **non-gap, MEASURED not reasoned**: Spark 4.0.1 stamps NO `field_id` on the materialized columns (or on `_change_type`) in its OWN `id`-mode row-tracking files, data files and `_change_data` files alike, and `delta.columnMapping.maxColumnId` reserves none for them — the physical name is the sole lookup key in both modes. EW's output is the same shape, and Spark resolves EW's ids through `id`-mode mapping after a materializing UPDATE. Pinned by `EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed`, which asserts the footer shape both ways so an invented id fails there rather than in a foreign reader. |
-| 3 | Reader exposes no row IDs | Populate `_metadata.row_id` (= `baseRowId + pos`, overridden by the materialized column) if/when readers should see them. Not strictly required to *write* correctly, but needed for read-side row-id features. | **DONE (2026-07-28, M4)** — `ReadAllWithRowTrackingAsync` / `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` + `_metadata.row_commit_version` (nullable Int64), resolved materialized-else-`baseRowId + position`. MEASURED equal to Spark's own resolution row by row (`EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion`) over a table mixing both paths. Refuses a non-row-tracking table and a user-column name collision. CDF (`ReadChangesAsync`) still does not carry them. |
-| 4 | UPDATE strips ids, drops `baseRowId`, reorders rows | Materialize each survivor's **original** id + commit version (a changed row's version advances; an untouched row keeps its). | **DONE** — `ComputeUpdateActionsAsync`; MEASURED against Spark. |
-| 5 | Compaction re-assigns ids instead of preserving | Write a materialized column carrying each surviving row's **original** id (the hard path). | **DONE** — `CompactionExecutor` materializes id + version from the source's own materialized column or `baseRowId + position` / `defaultRowCommitVersion`; MEASURED against Spark. |
-| 6 | No `CreateAsync` enablement | Add `enableRowTracking: true` → set property + declare `rowTracking` + `domainMetadata` writer features + seed materialized-column-name metadata. | **DONE** — `CreateAsync(..., enableRowTracking: true)`. |
-| 7 | No interop coverage | Tier-3 Spark tests both directions (EW writes → Spark reads ids; Spark writes → EW reads/preserves ids). | **DONE (EW→foreign)** — Spark reads EW-appended ids AND EW rewrite-preserved ids (`EwUpdated_/EwCompacted_RowTracking_SparkReadsPreservedIds`); delta-rs reads a rewritten table with no leaked columns. Extended 2026-07-28 to PARTITIONED tables, plain and Name-mode-mapped, rewritten TWICE (`EwUpdatedTwice_RowTracking_Partitioned_/…_MappedPartitioned_SparkReadsPreservedIds`) — the shape that caught the read-path id loss above; a single rewrite cannot. **FOREIGN→EW closed 2026-07-28** (`SparkWritten_RowTracking_EwReadsTheSameStableIds` / `…_EwUpdatePreservesSparksMaterializedIds` / `…_EwCompactionPreservesSparksMaterializedIds`): Spark creates + materializes, EW reads the same ids and preserves them through its own UPDATE and compaction. Needed NO production change — the capability was already correct, only unmeasured. Both directions now covered. |
-| 8 | The write gate | Remove `RejectRowTrackingWrite` once the above hold. | **DONE (effectively)** — now refuses a rewrite ONLY when the declared materialized names are absent (a spec-invalid table). Every EW-created RT table has them → all writes allowed. |
-
-## Implementation plan (ordered) — port pr-4, then validate
-
-The gap table's "fix" column describes the destination; pr-4 already implements most of it (gaps 1-partial,
-4, 5, and the materialization). The order below is what to PORT and, critically, what to ADD (enablement +
-validation) that pr-4 lacks.
-
-1. **Port pr-4's row-tracking-through-rewrite writer.** Gaps 4, 5, and the materialization half of 1. Bring
-   the `RowTrackingWriter` overloads + the `materializeIds` paths (UPDATE / CoW DELETE / compaction) onto
-   master's write path. Note pr-4 **materializes always** (uniform, proven by its tests) rather than the
-   "preserve row order + `baseRowId`, no materialized column" *alternative* the gap table's row 4 sketches —
-   the order-preservation trick avoids the materialized column but is unproven and fragile (a pre-existing DV
-   shifts positions); prefer porting pr-4's materialize-always unless there's a reason not to.
-2. **Add `CreateAsync` enablement — pr-4 does NOT have this.** Gaps 2, 6. Generate UUID materialized-column
-   physical names, store them in `delta.rowTracking.materializedRowIdColumnName` /
-   `…materializedRowCommitVersionColumnName`, declare `rowTracking`+`domainMetadata`. Without this EW can
-   only preserve ids on a table a foreign engine already set up. (This step originally also said "stamp
-   field IDs under column mapping" — struck 2026-07-29, measured wrong; see gap 2.)
-3. **Stop writing the spurious column for default-id appends** (gap 1, if pr-4 still does — verify): a fresh
-   append needs only `baseRowId`, no materialized column.
-4. **VALIDATE on Spark/delta-rs tier 3 — pr-4 never did this, and it is the highest-risk step.** Gap 7. Both
-   directions: EW writes → Spark reads ids/versions correctly (incl. after a rewrite); Spark writes a
-   row-tracking table → EW reads and preserves ids. This effort's history says unproven cross-engine
-   assumptions are usually wrong; do not lift the gate until this is green.
-5. **Port the remap + row-level concurrency (Layer 3 B).** See next section.
-6. **Read-side row IDs (optional).** Gap 3.
-7. **Lift the gate.** Gap 8. Remove `RejectRowTrackingWrite`.
-
-## Relationship to Layer 3 (B) — row-level concurrency across rewrites
-
-**DONE (2026-07-20).** DELETE side (Milestone 3): `DeltaTable.RemapRowLevelDeletesAsync` on master (a port of
-pr-4's `RemapRowsAcrossRewriteAsync`, adapted onto master's M2 read-out-params rather than pr-4's transient
-rowid column), called from `ResolveRowLevelDeletesAsync` when a delete's file was rewritten away. UPDATE/append
-side (limitation 2's other half): `DeltaTable.RebaseRowTrackingAddIds` re-derives each rebasing post-image add's
-`baseRowId` from `latestSnapshot.RowIdHighWaterMark` + `defaultRowCommitVersion` from the attempt version and
-rebuilds the HWM domain (a port of pr-4's `RebaseDvDmlActionsAsync` post-image branch); all callers pass
-`rebaseSafe: true`. Both measured on Spark. The original brief below describes pr-4's "v2" mechanics the DELETE
-remap implements:
-
-- **Record row IDs, not just positions.** Master's `DeleteDvEdit` records absolute positions (stable across a
-  DV swap — that is what makes (A) work). (B) also needs the **row IDs** so a rewrite that relocates rows can
-  be followed; pr-4 exposes them via `ReadAllWithRowIdsAsync` (`(fileOrdinal << 40) | absolutePosition`).
-- **Remap on a delete/rewrite collision** (pr-4's `RemapRowsAcrossRewriteAsync`): the target file is gone,
-  replaced by successor file(s); relocate each deleted row ID by the successor's materialized column (else
-  `baseRowId + position`), and use the row's **commit version** as the concurrent-modification discriminator
-  — a relocated-untouched row keeps its version and both land; a concurrently updated/deleted row conflicts.
-- **Relax `rebaseSafe: false` for row tracking** (retires limitation 2): DONE. DELETEs rebase via DV
-  union/remap (existing/new files keep their own baseRowId); appends and UPDATE post-image adds rebase via
-  `RebaseRowTrackingAddIds` (baseRowId re-derived from the advanced high-water mark). Only the overwrite family
-  stays single-attempt now, for the unrelated whole-active-set read-set reason.
-
-Un-skips (all `[Fact(Skip = RowLevelConcurrency)]` in `PendingCoverageTests.cs`), once the rewrite-writer
-port (plan step 1) and the remap port (step 5) land: `ConcurrentUpdateAndDelete_DisjointRows_BothLand`,
-`DeleteThroughConcurrentCompaction_Remapped`, `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`.
-pr-4's own `RowLevelConcurrencyTests` is the reference for what these should assert.
-
-## Interop validation (measure, don't assume)
-
-Nothing about EW row tracking has been checked cross-engine — **including pr-4's implementation** (it has no
-interop tests either). Before trusting the spec details above OR pr-4's port:
-- **Spark 4.0 supports row tracking** — use it as the oracle. Setup: `JAVA_HOME` (JDK 17) + `HADOOP_HOME`
-  (winutils) + `EW_REQUIRE_SPARK_INTEROP=1` (see `reference_spark_interop_toolchain` memory / `doc/running-tests.md`).
-  Add tests to `test/EngineeredWood.DeltaLake.Table.Tests/Interop/SparkInteropTests.cs`, modeled on the DV
-  ones. Key claims to measure: (a) Spark reads EW-appended `baseRowId` ids correctly; (b) after an
-  EW rewrite, ids Spark reads match the originals; (c) EW reads Spark-written row-tracking tables
-  (materialized columns, non-default ids) correctly.
-- **delta-rs**: measure whether/which version reads row tracking. Recall delta-rs 1.6.2 *refuses* deletion
-  vectors (safe), so it may refuse or ignore row tracking too — do not assume, check, and pin the observed
-  behavior like the DV tests do.
+- **EngineeredWood → foreign.** Spark reads appended ids and rewrite-preserved ids, including on
+  partitioned tables (plain and Name-mode-mapped) rewritten *twice* — the shape that caught the id loss
+  above, which a single rewrite cannot. Spark resolves ids through `id`-mode column mapping after a
+  materializing UPDATE. Spark reads an EngineeredWood change feed and reports exactly the table's
+  columns. delta-rs reads a rewritten table with no leaked columns.
+- **Foreign → EngineeredWood.** Spark creates, writes and materializes; EngineeredWood reads the same
+  ids and preserves them through its own UPDATE and compaction, and resolves Spark's hyphenated names
+  out of Spark's own change files. This direction needed **no production change** — the capability was
+  already correct, only unmeasured. What it retired was a risk, not a defect.
 
 ## Entry points
 
-**pr-4 (the source to port from — `git show pr-4:<path>`):**
-- `RowTracking/RowTrackingWriter.cs` — the materialization overloads (`AddRowIdColumn(batch, Int64Array)`,
-  `AddRowIdAndCommitVersionColumns`) + `RowCommitVersionColumn`.
-- `DeltaTable.cs` — `DeleteByRowIdsAsync` (~1592), `DeleteByRowIdsViaVectorsAsync` (~1872),
-  `UpdateByRowIdsAsync` (~2042), `ReadAllWithRowIdsAsync` (~2987), `RebaseDvDmlActionsAsync` (~4195),
-  `RemapRowsAcrossRewriteAsync` (~4369); the `materializeIds` flag + append materialization (~2104, ~2372).
-- `Compaction/CompactionExecutor.cs` (~93) — compaction id/version materialization.
-- `IDataFileRewriter.cs` — `RowTrackingRewrite` + `ReadRewriteAsync` (the native path the built-in port can ignore).
-- `test/…/RowLevelConcurrencyTests.cs` — the reference for the two mechanisms and the required config.
-
-**master (the destination):**
-- `src/EngineeredWood.DeltaLake/RowTracking/RowTrackingConfig.cs` — property/domain/HWM (read-side keep).
-- `src/EngineeredWood.DeltaLake.Table/RowTracking/RowTrackingWriter.cs` — master's positional-only writer.
-- `DeltaTable.ComputeWriteActionsAsync` (~2196), `ComputeUpdateActionsAsync` (~1596), `ReadFileAsync` (~2777),
-  `RejectRowTrackingWrite`, `CreateAsync`, `CommitOccAsync` / `ResolveRowLevelDeletesAsync` (Layer 3 (A) hook).
-- `Compaction/CompactionExecutor.cs`, `ProtocolVersions.cs`.
-- Tests: `RowTrackingTests.cs`, `RowTrackingHighWaterMarkTests.cs` (currently assert the read-only refusal +
-  read-side HWM reconciliation), `PendingCoverageTests.cs` (the parked (B) stubs), `Interop/SparkInteropTests.cs`.
+- `src/EngineeredWood.DeltaLake/RowTracking/RowTrackingConfig.cs` — property/domain keys, high-water
+  mark build and reconcile, `TryGetMaterializedColumnNames`.
+- `src/EngineeredWood.DeltaLake.Table/RowTracking/RowTrackingWriter.cs` — `AddRowIdColumn`,
+  `AddRowIdAndCommitVersionColumns` (the nullable form handles a source predating row tracking), and
+  the name-parameterized `StripMaterializedColumns`.
+- `DeltaTable.cs` — `ComputeWriteActionsAsync`, `ComputeUpdateActionsAsync`, `ReadFileAsync`,
+  `RejectRowTrackingWrite`, `CreateAsync(enableRowTracking:)`.
+- `Compaction/CompactionExecutor.cs` — carries original ids and versions through the merge. Note it
+  bypasses `ProcessFileBatchesAsync` and strips the columns itself.
+- `Cdf/CdfWriter.cs` / `CdfReader.cs` — change-file materialization and feed resolution.
+- Tests: `RowTrackingTests`, `RowTrackingHighWaterMarkTests`, `RowTrackingPartitionedIdLossTests`,
+  `CdfRowTrackingTests`, and the row-tracking cases in `SparkInteropTests` / `DeltaRsInteropTests`.

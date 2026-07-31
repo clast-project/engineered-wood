@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.DeltaLake.Actions;
@@ -16,8 +16,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// that landed since it started. Pure input→verdict, no table or I/O, so they run instantly and isolate
 /// the decision from the transaction plumbing that will drive it.
 ///
-/// <para>These are the seven cases parked in <see cref="PendingCoverageTests"/> under "Logical rebase /
-/// ConflictChecker parity".</para>
+/// <para>These are the seven logical-rebase / ConflictChecker-parity cases.</para>
 /// </summary>
 public class ConflictCheckerTests
 {

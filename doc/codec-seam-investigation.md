@@ -1,11 +1,22 @@
-# The codec seam (`IDataFileWriter` / `IDataFileReader` / `IDataFileRewriter`) — investigation
+# The codec seam (`IDataFileWriter` / `IDataFileReader`) — investigation
 
-**Status: research complete, seam decision still open (last touched 2026-07-21).** Written to record the
-findings behind the "seam question" in `doc/upstream-landing-notes.md`, whose recorded rationale turned out
-to be wrong. The SEAM decision (keep `IDataFileRewriter` / codec-only / drop — §6–7) has not been acted on;
-`doc/upstream-landing-notes.md` still carries the superseded version. Note that Delta-layer VARIANT support
-has since landed on master (independently of the seam), which closes the feature gap §5.1 described — see the
-dated UPDATE there; §5.1's original reasoning is preserved for the record but is superseded on master.
+**Status: the seam decision is settled; some of the audit findings are not.**
+
+The decision was whether to keep a narrow **codec** seam (`IDataFileReader` / `IDataFileWriter`, bytes ⇄
+Arrow batches) or a broader **execution** seam (`IDataFileRewriter`, which delegated DML semantics to the
+host's SQL engine). The codec seam stayed and the execution seam was never taken; the downstream consumer
+subsequently adopted the codec seam plus row-id DML, so `IDataFileRewriter` exists nowhere — not in
+EngineeredWood, not upstream. §6–7 record *why* the line falls where it does, which is what matters if
+widening the seam is ever proposed again.
+
+**What remains open is the keep-and-fix half: the contract obligations in §5.3–7.** They are real gaps in
+a shipping `[Experimental]` API, and `CodecSeamTests` still covers no partitioned case, which is why
+several of them went unnoticed.
+
+Two sections are historical and marked as such: §5.1 (a variant-registration bug that was retracted — the
+path was unreachable, and Delta-layer variant support has since landed anyway) and §5.2 (a copy-on-write
+UPDATE writing to the wrong directory, fixed). Their original reasoning is preserved because the *shape*
+of each mistake is instructive.
 
 ## Sources
 
@@ -67,7 +78,7 @@ ways:
 - **The correctness bugs**: decimal read corruption, DV byte format, DataPage-V2-by-default, signed
   min/max without `column_orders`, missing `path_in_schema`, null-struct definition/value
   misalignment, all-null pages declaring a delta encoding with a 0-byte payload, thrift field dispatch
-  desync. All closeable, and most already landed on master via the PR slices.
+  desync. All closeable, and most have since landed.
 - **VARIANT annotation on write + extension registration on the Delta layer's reader.** Open — see §5.
 
 Category 1 is not a standing argument for the seam. It is a maturity delta at a point in time; every
@@ -151,7 +162,7 @@ positions, row ids and commit versions are preserved for free, with no materiali
      `DeltaFormatException("Cannot convert Arrow type ... to Delta type.")` (`SchemaConverter.cs:170-171`).
 
    So engineered-wood already fails closed, and `pr-4`'s `ThrowIfVariantRewrite` guard has nothing to
-   guard on master. Pinned by `SchemaConverterTests.VariantDeltaType_IsRejected_NotSilentlyMappedToStruct`
+   guard here. Pinned by `SchemaConverterTests.VariantDeltaType_IsRejected_NotSilentlyMappedToStruct`
    and `...VariantArrowType_IsRejected_NotSilentlyMappedToStruct`, which also assert the
    not-StructType-derived property directly — if `VariantType` ever became struct-derived upstream, the
    `ArrowStructType` arm *would* silently convert it to a Delta `struct<metadata,value>`, and that is the
@@ -163,7 +174,7 @@ positions, row ids and commit versions are preserved for free, with no materiali
    on the Delta read path become a live question.
 
    **UPDATE (2026-07-21) — the feature gap above is now CLOSED, and the schema-rejection premise no longer
-   holds.** Delta-layer variant support landed on master after this section was written (independently of the
+   holds.** Delta-layer variant support landed after this section was written (independently of the
    seam decision). Concretely, everything the paragraph above listed as "what remains" now exists:
    - `SchemaConverter` maps `"variant"` in **both** directions and no longer throws: read
      `"variant" => VariantType.Default` (`SchemaConverter.cs:106`), write
@@ -184,7 +195,7 @@ positions, row ids and commit versions are preserved for free, with no materiali
    paths this section worried about is now pinned directly — `Compaction_OfVariantTable_PreservesValues` and
    `Delete_OnVariantTable_PreservesTheExtensionType` (plus `VariantInteropTests` cross-validating on Spark /
    delta-rs); `DeltaTableOptions.EmitVariantLogicalType` controls whether the annotation is emitted on write
-   (`VariantColumnCoercion.StripAnnotation` when off). So on master this whole item is historical: no defect,
+   (`VariantColumnCoercion.StripAnnotation` when off). So this whole item is historical: no defect,
    no remaining feature gap. The seam decision in §6–7 is unaffected — variant was always a passenger (§1),
    not the seam's reason to exist.
 
@@ -237,7 +248,7 @@ positions, row ids and commit versions are preserved for free, with no materiali
    source's partition directory (reuse the source path's encoded prefix verbatim; decode for the physical
    write), mirroring the compaction rewrite — so a host codec receives the correct partitioned `fileName`
    too. Measured: delta-rs read the root-dropped file fine (partition values are authoritative from the log),
-   so it was a spec-layout bug, not data loss. See `doc/upstream-landing-notes.md` gap #6 for the tests.
+   so it was a spec-layout bug, not data loss.
 3. **`relativePath` encoding is unspecified and the call sites disagree.** The reader's XML doc says
    "URL-decoded"; the writer's says nothing. `DeltaTable.cs` (write path) passes the **raw** name;
    `CompactionExecutor` passes an explicitly `DeltaPath.Decode`d one. They agree only because both
@@ -254,36 +265,38 @@ positions, row ids and commit versions are preserved for free, with no materiali
    `CleanField` preserves them) both matter to the host, and the contract says nothing.
 6. **`CodecSeamTests` does not cover partitioned tables through the seam at all**, which is why 2–4
    went unnoticed.
+7. **A host codec faces schema evolution itself, unstated.** The read path hands its projection straight
+   to the host decoder, so EW cannot intersect that list against the file's real columns the way the
+   built-in path now does. A column added by a later `AddColumnAsync` is absent from older files; the
+   built-in reader backfills it as NULL, but a host decoder asked for it will fail or return nothing
+   depending on its own behaviour. The obligation belongs in the contract.
 
-## 6. Framing for the decision
+## 6. Why the seam is codec-shaped
 
-The two seams are not the same kind of commitment:
+The two candidate seams were not the same kind of commitment:
 
 - `IDataFileWriter` / `IDataFileReader` are a **codec** seam — narrow, honest, roughly what the slogan
   describes once "data" is shrunk to "bytes."
 - `IDataFileRewriter` is an **execution** seam. It delegates *semantics*, not encoding: the DELETE
   predicate, the UPDATE join and value substitution, schema-evolution NULL backfill, and
   row-id/commit-version computation all move into DuckDB SQL. It is also the interface that cannot be
-  honoured without row-tracking-through-rewrite (absent on master), and it declines column-mapped and
-  schema-evolved files anyway. `9302723` was right to leave it out.
+  honoured without row-tracking-through-rewrite (which did not exist when the decision was taken), and it
+  declines column-mapped and schema-evolved files anyway. Leaving it out was right.
 
-If the seam **stays**: fix 3–6 above, and be explicit that it is a per-file, materialized, batch-in
-contract. Hosts wanting streaming partitioned writes or in-engine sort/filter will keep going around it,
-as fabricator already does with three non-interface entry points. Widening it toward "hand me a query
-plan" is a categorically larger API and probably not the right shape for EW.
+Because the seam stayed, what follows from it: it is a **per-file, materialized, batch-in contract**, and
+that should be explicit. Hosts wanting streaming partitioned writes or in-engine sort/filter will keep
+going around it, as the downstream consumer already does with three non-interface entry points. Widening
+it toward "hand me a query plan" is a categorically larger API and not the right shape for EW — §7 says
+why. The `ProcessFileBatchesAsync` extraction underneath the seam is behaviour-preserving and would have
+been worth keeping under either outcome.
 
-If the seam **goes**: category 2 is what is being declined — a defensible line, provided it is drawn
-deliberately rather than on the assumption that variant was the whole story. `9302723` is a clean single
-commit to revert; the `ProcessFileBatchesAsync` extraction underneath is behaviour-preserving and should
-be **kept either way**.
+The obligations that survive the decision are §5.3–7; §5.1 was retracted (no bug), §5.1a and §5.2 are
+fixed.
 
-Either way, the standalone items that survive the decision are the codec-seam contract obligations in
-§5.3–6 (both framings keep reader+writer); §5.1 was retracted (no bug), §5.1a and §5.2 are fixed.
+## 7. Where an execution seam would earn its keep
 
-## 7. A more consistent split — two framings, and where the rewriter earns its keep
-
-*A recommendation to weigh, **not** the recommendation. The abstraction-level mismatch below is real, but
-which resolution is right turns on a question this document cannot settle: **who owns query execution.***
+The analysis that decided §6, kept because it is the argument to answer if widening the seam is ever
+proposed. The question it turns on is **who owns query execution for DML**.
 
 **The observation.** `IDataFileReader`/`IDataFileWriter` sit at the CODEC level (Arrow batch ⇄ parquet
 bytes). `IDataFileRewriter` sits at the EXECUTION level — it runs the DELETE filter / UPDATE substitution in
@@ -337,14 +350,13 @@ having, Framing 2 is the architecture, the rewriter is consistent within it, and
 means *naming the compute-vs-metadata boundary and expecting execution entry points* — not collapsing to
 codec. The mismatch this section opened with is a mismatch only under Framing 1; under Framing 2 it dissolves.
 
-Either framing keeps the §5.3–6 codec obligations, and either can ship without the rewriter *today* — Framing
-1 permanently, Framing 2 until join/MERGE DML is actually wanted. What should NOT happen is keeping the
-rewriter as-is while *assuming* Framing 1: that is the abstraction-level mismatch with no owning story, which
-is the state this section exists to flag.
+Either framing keeps the §5.3–7 codec obligations, and either can ship without the rewriter — Framing 1
+permanently, Framing 2 until join/MERGE DML is actually wanted. What should not happen is keeping an
+execution seam while *assuming* Framing 1: an abstraction-level mismatch with no owning story.
 
-**Update (2026-07-21).** master now serves the Framing-1 "update from a host-side join" case directly, without
-the rewriter: `ReadAllWithRowIdsAsync` → host join → `UpdateByRowIdsAsync(updates)` (a rowid-keyed value batch;
-type-agnostic substitution via concat + take). So the deciding case in this section has a concrete API on the
-codec side. The pr-4 → master reconciliation this implies (drop `IDataFileRewriter`, keep the codec
-reader/writer, move the transform to the row-id DML) is written up for the PR #4 author in
-[`pr4-to-master-migration.md`](pr4-to-master-migration.md).
+**How it resolved.** Framing 1's deciding case — "update from a host-side join" — is served directly on
+the codec side: read stable row addresses, join host-side, then `UpdateByRowIdsAsync(updates)` with a
+rowid-keyed value batch (type-agnostic substitution via concat + take). That gave the hard case a concrete
+API without an execution seam, which is what settled §6. If join/MERGE DML against host tables ever
+becomes a goal, this section is the argument to re-open — the principle above (an execution seam earns its
+keep exactly when the transform is a *query*, not a pure function of the source row) is the test to apply.
