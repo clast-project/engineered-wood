@@ -554,10 +554,8 @@ public sealed class LanceTable : IAsyncDisposable
 
         var indices = new int[columns.Count];
         var fields = new Apache.Arrow.Field[columns.Count];
-        // HashSet<T>(int capacity) is net5+ only; netstandard2.0 has no
-        // capacity-aware ctor. The hint just saves a few rehashes for very
-        // wide projections, so we drop it.
         var seen = new HashSet<int>();
+        seen.EnsureCapacity(columns.Count);
         for (int i = 0; i < columns.Count; i++)
         {
             if (!nameToIndex.TryGetValue(columns[i], out int idx))
