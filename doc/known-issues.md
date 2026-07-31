@@ -11,15 +11,16 @@ pushdown, see [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
 For the forward-looking encryption design, see
 [`encryption-design.md`](encryption-design.md).
 
-> **Last verified against the code: 2026-07-21.** The Delta section was
-> re-checked claim by claim on that date (row tracking, the buffered-transaction
-> seam, nested-field ALTER, row-id DML, predicate DELETE/UPDATE, variant, and
-> CDF column-mapping had all landed since the prior pass); the Parquet section
-> was last re-checked 2026-07-19. If you are relying on
-> an entry here, confirm it against the code before acting on it — this file
-> records absences, and absences are exactly what nothing fails when they
-> stop being true. The Delta entries additionally have external coverage now
-> (delta-rs and PySpark) in
+> **Last verified against the code: 2026-07-31**, when every section was
+> re-checked claim by claim — the ORC, Avro, Iceberg and Expressions sections
+> for the first time. They held up: three entries needed correcting (ORC's
+> LZ4 support, ORC's writer identification, and the precision of Parquet's
+> `distinct_count` claim) and the rest were accurate.
+>
+> If you are relying on an entry here, confirm it against the code before
+> acting on it — this file records absences, and absences are exactly what
+> nothing fails when they stop being true. The Delta entries additionally have
+> external coverage (delta-rs and PySpark) in
 > `test/EngineeredWood.DeltaLake.Table.Tests/Interop/`.
 
 ---
@@ -81,7 +82,10 @@ and `ListViewType`.
 - `RowGroup.SortingColumns` can be encoded and decoded but
   `ParquetWriteOptions` exposes no API to set it, so callers cannot
   produce sorted row groups with a sort manifest.
-- `Statistics.distinct_count` is never computed or written.
+- `Statistics.distinct_count` is never computed. The field is plumbed —
+  `Statistics.DistinctCount` is nullable and `ColumnChunkWriter` copies it
+  to the Thrift struct — but `StatisticsCollector` never populates it, so
+  it is always absent from written files.
 
 ### Correctness / interop issues
 
@@ -172,8 +176,9 @@ exposes `V2` / `DictionaryV2`. Files Hive 0.11 or other V1-only readers
 can consume cannot be produced.
 
 **Compression codecs.** `LZO` and `Brotli` are spec-defined
-(`orc_proto.proto` includes both) but `OrcCompression.ToCodec` throws on
-both. `LZ4` is likewise unsupported.
+(`orc_proto.proto` declares both) but `OrcCompression.ToCodec` maps
+neither, so both fall through to its `NotSupportedException`. `NONE`,
+`ZLIB`, `SNAPPY`, `LZ4` and `ZSTD` are all mapped.
 
 **ACID / transactional ORC.** The Hive 3 ACID extensions (synthetic
 `originalTransaction`/`bucket`/`rowId`/`currentTransaction`/`operation`
@@ -190,10 +195,25 @@ without `Calendar`, Date/Timestamp interpretation is ambiguous to
 conformant readers. Without `WriterTimezone`, non-instant `Timestamp`
 columns cannot be correctly localized.
 
-**Writer identification.** Both `Footer.Writer` and
-`PostScript.WriterVersion` are hard-coded to `6`, which is the registered
-CUDF writer code. EngineeredWood-produced files misidentify as CUDF to
-conformant readers.
+**Writer identification.** `OrcWriter` sets both `Footer.Writer` and
+`PostScript.WriterVersion` to the same constant `6`. The two fields have
+different meanings, and only one of the values is right:
+
+- `PostScript.WriterVersion = 6` is **correct**. The spec reserves values
+  below 6 for the ORC Java writer and says every other writer should start
+  its own sequence at 6, which is what "original" means for the C++,
+  Presto, Scritchley Go, Trino and CUDF writers alike.
+- `Footer.Writer = 6` is **not a registered producer id**. The ids
+  `orc_proto.proto` documents stop at 5 (0 = ORC Java, 1 = ORC C++,
+  2 = Presto, 3 = Scritchley Go, 4 = Trino, 5 = CUDF), so a conformant
+  reader cannot identify the producer of an EngineeredWood file.
+
+The consequence is worse than cosmetic, because `writer_version` is only
+interpretable *relative to the writer id*. A reader that falls back to Java
+semantics for an unknown producer reads version 6 as "ORC-135 fixed
+(timestamp statistics use utc)" — a guarantee EngineeredWood does not meet,
+since it never populates `TimestampStatistics.MinimumUtc` / `MaximumUtc`
+(see the timestamp entry below).
 
 ### Correctness / interop issues
 
@@ -263,9 +283,11 @@ writer non-union pick-compatible) are not implemented.
 
 **Complex-type default values.** `DefaultValueApplicator` substitutes
 `null` when a missing reader field has an `array`/`map`/`record`/`fixed`
-default. The spec requires JSON arrays/objects to be applied element-by-
-element, and fixed defaults to be ISO-8859-1-decoded bytes. Only
-primitive and enum defaults are honored.
+default — "for complex types, null is the safest fallback", as the code
+says. The spec requires JSON arrays/objects to be applied element-by-
+element, and fixed defaults to be ISO-8859-1-decoded bytes. Honored today:
+primitive defaults, enum defaults, and logical-typed `fixed` defaults
+(`AppendFixedLogicalDefault` covers the decimal case).
 
 **Schema registry integration.** `SchemaStore` is a local ID→schema map;
 there is no HTTP fetch of Confluent/Apicurio endpoints. Framing is
