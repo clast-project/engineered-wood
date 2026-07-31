@@ -18,7 +18,15 @@ namespace EngineeredWood.Orc;
 public sealed class OrcWriter : IAsyncDisposable, IDisposable
 {
     private static readonly byte[] OrcMagic = "ORC"u8.ToArray();
-    private const uint WriterCode = 6; // External writer convention
+    // PostScript.writer_version: the spec reserves values below 6 for the ORC Java writer and tells every
+    // other writer to start its own sequence at 6, so 6 is the correct "original" value for us.
+    private const uint WriterVersionCode = 6;
+
+    // Footer.writer: the PRODUCER id, a different field with a different registry. orc_proto.proto documents
+    // 0..5 (5 = CUDF) and we are not in it, so readers cannot identify us. Reusing the writer_version value
+    // here is not right, but changing it is an on-disk behaviour change -- see doc/known-issues.md, ORC
+    // "Writer identification", including why an unknown producer id makes writer_version uninterpretable.
+    private const uint WriterCode = 6;
     private const string SoftwareVersion = "EngineeredWood.Orc 0.1";
 
     private readonly ISequentialFile _file;
@@ -710,7 +718,7 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
             FooterLength = (ulong)footerData.Length,
             Compression = _options.Compression,
             CompressionBlockSize = (ulong)_options.CompressionBlockSize,
-            WriterVersion = WriterCode,
+            WriterVersion = WriterVersionCode,
             MetadataLength = (ulong)metadataLength,
             Magic = "ORC"
         };
