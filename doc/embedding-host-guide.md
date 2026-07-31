@@ -221,10 +221,23 @@ rather than handing over batches and predicates:
 | Method | Stages |
 |---|---|
 | `StageDataFiles(files)` | Data files you already wrote (append-shaped) |
+| `StageDataFilesAsync(files, bornDeleted:, identityValuesPreGenerated:)` | The same, with full parity to `CommitDataFilesAsync` |
 | `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§4) |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
 | `StageActions(actions)` | Anything else — `txn` ids, your own domain metadata |
+
+Use the plain `StageDataFiles` unless you need one of the async form's two arguments:
+
+- **`bornDeleted`** — rows this transaction inserted and then deleted, so they never appear in *any*
+  committed version. The add is born with an inline deletion vector (and `tightBounds=false` stats, which
+  the spec requires once a vector hides rows the bounds were computed over) rather than the commit carrying
+  an insert that a later one undoes. Keyed by `WrittenDataFile.RelativePath` — which is what `add.path`
+  becomes — so it is a `RowSelection` like every other DML key. It can only name a file in the same call;
+  these files are in no snapshot yet.
+- **`identityValuesPreGenerated`** — you called `GenerateIdentityValues` yourself, so the per-row write-time
+  work an outside writer skipped has already happened. Without it an identity table's appends **cannot be
+  staged at all**, which meant a host on such a table had no transaction to put anything else into either.
 
 ```csharp
 var txn = table.StartTransaction();
@@ -244,6 +257,12 @@ long version = await txn.CommitAsync();   // ONE atomic version
 
 Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
 delete names agree with what the commit validates.
+
+**Whatever the auto-committing surface can express, the staged surface can express.** That is an invariant,
+not an aspiration: `StagedCommitParityTests` walks `CommitDataFilesAsync`' parameters by reflection and
+requires each to be either mapped to a real member of `DeltaTransaction` or allow-listed with a reason. The
+next capability added without a staged counterpart fails a build rather than waiting for a host to report
+it. The allow-list holds only the overwrite/rewrite family — see **Limits**.
 
 **Do not reimplement the commit loop.** `CommitAsync` runs the same optimistic-concurrency loop the
 built-in operations use: it checks conflicts against every version that landed since the transaction
@@ -285,8 +304,12 @@ attempt created.
 
 - **Overwrite modes are not stageable.** They remove the whole active set, which is exactly what a rebase
   cannot re-derive. Use the auto-committing `WriteAsync(mode: Overwrite)` / `DynamicOverwriteAsync`.
-- **Identity columns and IcebergCompat reject externally-written files** — both need write-time per-row
-  processing an outside writer did not do. Check `DeltaTable.SupportsExternalDataFileCommit`.
+- **The rewrite family is not stageable either** — a `dataChange=false` compaction or a clustering
+  OPTIMIZE removes the files it replaces, and a rewrite's fresh add embeds the attempted version's row-id
+  high-water mark, so it cannot be replayed verbatim onto a newer one. Use `CompactAsync`.
+- **IcebergCompat rejects externally-written files** — it needs write-time per-row processing an outside
+  writer did not do. Check `DeltaTable.SupportsExternalDataFileCommit`. Identity columns are the same, with
+  one escape: generate the values yourself and pass `identityValuesPreGenerated`.
 - **A transaction is single-use and not thread-safe.** Many transactions may race across threads; drive each
   from one.
 

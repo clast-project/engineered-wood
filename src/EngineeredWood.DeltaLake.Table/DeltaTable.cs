@@ -4915,21 +4915,75 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     internal (IReadOnlyList<DeltaAction> Actions, long NextRowId) BuildStagedAppendActions(
         Snapshot.Snapshot snapshot, IReadOnlyList<WrittenDataFile> files, long? rowIdStart)
     {
-        if (files.Count > 0 && !SupportsExternalDataFileCommit)
+        // No born-deleted rows means no deletion vector to write, so this path performs no I/O and the
+        // ValueTask below is already completed — which is what lets the synchronous StageDataFiles keep its
+        // signature while sharing one definition of what a staged add looks like.
+        var pending = BuildStagedAppendActionsAsync(
+            snapshot, files, bornDeleted: null, identityValuesPreGenerated: false, rowIdStart,
+            CancellationToken.None);
+        System.Diagnostics.Debug.Assert(pending.IsCompleted, "the no-DV staging path must not perform I/O");
+        var (actions, nextRowId, _) = pending.GetAwaiter().GetResult();
+        return (actions, nextRowId);
+    }
+
+    /// <summary>
+    /// The staged-append action builder, with the two things <see cref="CommitDataFilesAsync"/> could express
+    /// and the staged surface could not: rows deleted inside the same transaction that inserted them, and an
+    /// identity table whose values the caller generated itself.
+    /// </summary>
+    /// <param name="bornDeleted">Rows of the not-yet-committed <paramref name="files"/> that this transaction
+    /// deleted AFTER inserting them, keyed by <see cref="WrittenDataFile.RelativePath"/>. Each such add is born
+    /// with an INLINE deletion vector, so the rows never appear in any committed version — and its stats are
+    /// marked <c>tightBounds=false</c>, which the spec requires once a vector hides rows the bounds were
+    /// computed over.</param>
+    /// <returns>The actions, the next free stable row id, and the rows the commit will make VISIBLE
+    /// (every file's <c>numRecords</c> less anything <paramref name="bornDeleted"/> hides).</returns>
+    internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId, long LiveRows)>
+        BuildStagedAppendActionsAsync(
+            Snapshot.Snapshot snapshot,
+            IReadOnlyList<WrittenDataFile> files,
+            RowSelection? bornDeleted,
+            bool identityValuesPreGenerated,
+            long? rowIdStart,
+            CancellationToken cancellationToken)
+    {
+        // Mirrors CommitDataFilesAsync' gate exactly: identity columns need write-time per-row processing an
+        // outside writer did not do, UNLESS the caller generated the values itself (GenerateIdentityValues) —
+        // which is what makes an identity table's appends stageable at all. IcebergCompat has no such escape.
+        if (files.Count > 0 && !SupportsExternalDataFileCommit
+            && !(identityValuesPreGenerated && !IsIcebergCompat))
         {
             throw new NotSupportedException(
                 "StageDataFiles: table has identity columns or IcebergCompat — these require engineered-wood's "
-                + "own writer (check SupportsExternalDataFileCommit, or stage via WriteAsync).");
+                + "own writer (check SupportsExternalDataFileCommit, generate the identity values yourself and "
+                + "pass identityValuesPreGenerated, or stage via WriteAsync).");
         }
+
+        var deletedByPath = ValidateBornDeleted(files, bornDeleted);
 
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
         long newVersion = snapshot.Version + 1;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(files.Count + 1);
+        long liveRows = 0;
 
         foreach (var f in files)
         {
+            DeletionVector? dv = null;
+            string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+            long hidden = 0;
+            if (deletedByPath is not null
+                && deletedByPath.TryGetValue(f.RelativePath, out var positions) && positions.Count > 0)
+            {
+                var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+                dv = await dvWriter.CreateAsync(positions, positions.Count, cancellationToken)
+                    .ConfigureAwait(false);
+                stats = StatsWithLooseBounds(stats);
+                hidden = positions.Count;
+            }
+            liveRows += f.NumRecords - hidden;
+
             actions.Add(new AddFile
             {
                 Path = DeltaPath.Encode(f.RelativePath),
@@ -4937,11 +4991,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Size = f.SizeBytes,
                 ModificationTime = now,
                 DataChange = true,
-                Stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}",
+                Stats = stats,
                 BaseRowId = rowTrackingEnabled ? nextRowId : null,
                 DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                DeletionVector = dv,
                 Tags = f.Tags,
             });
+            // The row-id range covers every PHYSICAL row, hidden ones included: a born-deleted row still
+            // occupies its position in the file, so skipping it would misalign every id after it.
             if (rowTrackingEnabled)
                 nextRowId += f.NumRecords;
         }
@@ -4949,7 +5006,49 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
-        return (actions, nextRowId);
+        return (actions, nextRowId, liveRows);
+    }
+
+    /// <summary>
+    /// Checks a <c>bornDeleted</c> selection against the files it is supposed to describe. The key only ever
+    /// has to identify a file within the SAME call's <paramref name="files"/> list — these files are in no
+    /// snapshot yet — so a path naming none of them, or a position past the file's own row count, is a caller
+    /// error rather than something to resolve later and silently drop.
+    /// </summary>
+    private static Dictionary<string, IReadOnlyCollection<long>>? ValidateBornDeleted(
+        IReadOnlyList<WrittenDataFile> files, RowSelection? bornDeleted)
+    {
+        if (bornDeleted is null || bornDeleted.IsEmpty)
+            return null;
+
+        var rowsByPath = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var f in files)
+            rowsByPath[f.RelativePath] = f.NumRecords;
+
+        var result = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (var kvp in bornDeleted.Entries)
+        {
+            if (!rowsByPath.TryGetValue(kvp.Key, out long numRecords))
+            {
+                throw new ArgumentException(
+                    $"bornDeleted names '{kvp.Key}', which is not among the files being staged. It keys by "
+                    + "WrittenDataFile.RelativePath, and can only name a file in this same call — the rows are "
+                    + "ones this transaction inserted and then deleted.",
+                    nameof(bornDeleted));
+            }
+            foreach (long position in kvp.Value)
+            {
+                if (position >= numRecords)
+                {
+                    throw new ArgumentException(
+                        $"bornDeleted names position {position} in '{kvp.Key}', which has only {numRecords} "
+                        + "row(s).",
+                        nameof(bornDeleted));
+                }
+            }
+            result[kvp.Key] = kvp.Value;
+        }
+        return result;
     }
 
     /// <summary>
