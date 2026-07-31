@@ -71,9 +71,11 @@ public class StagedCommitParityTests : IDisposable
         // What commitInfo records. A PROPERTY since slice 4, not a per-call argument: Delta's operation
         // field is one string per commit, so it describes the transaction rather than any one staged thing.
         ["operation"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.Operation)),
-        // First-committer-wins pinning: a transaction is pinned to the snapshot it started at, by
-        // construction, and reports it.
-        ["expectedVersion"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.ReadVersion)),
+        // First-committer-wins pinning. A transaction is pinned by construction — and, since slice 3, to a
+        // version the host chooses rather than always to CurrentSnapshot, which is what makes the pinning
+        // mean the same thing on both surfaces.
+        ["expectedVersion"] = new(
+            typeof(DeltaTable), nameof(DeltaTable.StartTransactionAsync), "baseVersion"),
         ["cancellationToken"] = new(
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync), "cancellationToken"),
     };

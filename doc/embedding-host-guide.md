@@ -10,7 +10,9 @@ without engineered-wood ever touching the bytes — while still getting spec-con
 
 ## 1. Pin a snapshot
 
-Everything else keys off one pinned version. Start a transaction and use its snapshot for every step:
+Everything else keys off one pinned version, and **all four steps below take it explicitly** — plan, read,
+address, commit. Any step left to `CurrentSnapshot` is a step that can silently disagree with the other
+three.
 
 ```csharp
 var txn = table.StartTransaction();
@@ -19,6 +21,30 @@ var snapshot = txn.Snapshot;   // NOT table.CurrentSnapshot
 
 `DeltaTable.CurrentSnapshot` advances whenever another writer commits. `DeltaTransaction.Snapshot` does not,
 which is what makes file ordinals (below) mean the same thing at plan time and at commit time.
+
+### When the transaction starts later than the pin
+
+A host whose transaction spans several of its own statements pins a version at the *first* statement, but may
+only open the transaction at the flush. `StartTransaction()` bases on `CurrentSnapshot`, which makes the
+commit loop's validation **vacuous**: it asks what landed since the latest version, and the answer is
+nothing. Base it on the version the work was actually planned against instead:
+
+```csharp
+// A version number is what a host that cannot keep the table open between statements can carry.
+var txn = await table.StartTransactionAsync(pinnedVersion);
+
+// Or, when you still hold the snapshot itself — another transaction's, say. No I/O.
+var txn = table.StartTransaction(pinnedSnapshot);
+```
+
+Both refuse a version ahead of the table, and the snapshot form refuses a snapshot belonging to a *different*
+Delta table — its active set is a different one, so every path, ordinal and row-id range derived from it would
+address the wrong file with nothing looking wrong.
+
+The difference is observable. A transaction pinned to the version its rows were addressed against sees a
+concurrent delete of the same row and raises `DeltaConflictException`; the same work on a current-based
+transaction finds the row already hidden, reports **zero rows deleted**, and commits nothing — the host is
+never told another writer got there first. (Both behaviours are pinned by `PinnedVersionTests`.)
 
 ## 2. Plan the scan yourself
 
@@ -50,10 +76,15 @@ await foreach (var batch in table.ReadAsync(new DeltaReadOptions
 {
     Columns  = ["id", "payload"],
     Filter   = predicate,                       // same superset-safe prune as PlanFiles
-    AtVersion = pinnedVersion,                  // omit for the current snapshot
+    Snapshot = txn.Snapshot,                    // read the version you pinned (§1)
     Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
 }))
 ```
+
+**Inside a transaction, always set `Snapshot`.** Left unset the read follows `CurrentSnapshot`, so its rows —
+and any address minted from them — can come from a version the transaction is not validating against.
+`AtVersion` is the time-travel form for a caller with no snapshot in hand; setting both throws rather than
+picking one, since two ways to name a version that can disagree is the hazard this removes.
 
 `DeltaRowMetadata` is `[Flags]`, and that is the point: the three kinds resolve from the *same* per-file
 read, so asking for two costs one pass rather than two reads of the table — and the values agree row for
@@ -72,7 +103,8 @@ prefix is there to resolve.
 
 **`GetReadSchema(options)` returns the schema `ReadAsync` will emit, without reading anything** — the same
 projection, the same metadata columns, in the same order. A scan that has to advertise its schema at bind
-time gets it here instead of paying for a metadata open.
+time gets it here instead of paying for a metadata open. It honours `Snapshot` (resolving one costs no I/O,
+so you get the pinned version's schema) but not `AtVersion`, which would need a log read.
 
 ```csharp
 Schema advertised = table.GetReadSchema(options);
@@ -147,7 +179,10 @@ not part of the format. This is a *codec*, not the DML key: unpack it into a `Ro
 > number, reported by `sourceRowTrackingOut` below. The two columns had the same name until recently, which
 > read as a promise of durability the address cannot keep.
 
-`ReadRowsAsync(selection, sourceRowTrackingOut:)` reads exactly the selected rows.
+`ReadRowsAsync(selection, resolveAgainst: txn.Snapshot, sourceRowTrackingOut:)` reads exactly the selected
+rows. Pass `resolveAgainst` inside a transaction: without it the read follows `CurrentSnapshot`, where a
+concurrent rewrite makes the selection's paths look stale when they are exactly the ones the transaction is
+still validating against.
 `sourceRowTrackingOut` reports, per yielded batch and row-aligned with it, each row's STABLE id and commit
 version: the materialized value where the file has one, otherwise the spec derivation `baseRowId + position`
 / `defaultRowCommitVersion`. Null only for a source that predates row tracking. This is the identity to carry
