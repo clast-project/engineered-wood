@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Diagnostics.CodeAnalysis;
+
 using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Scalars.Variant;
@@ -78,8 +80,10 @@ public static class VariantShredding
     /// unshredded representation it already holds.
     /// </summary>
     /// <param name="values">
-    /// One decoded value per row. Rows marked in <paramref name="isSqlNull"/> are ignored, so any
-    /// placeholder may sit there.
+    /// One decoded value per row. A row marked in <paramref name="isSqlNull"/> contributes nothing to
+    /// the inferred schema and is masked out of the result, so a placeholder may sit there — it is
+    /// still handed to the shredder, so it must be a value the shredder accepts;
+    /// <see cref="VariantValue.Null"/> is the obvious choice.
     /// </param>
     /// <param name="isSqlNull">
     /// Per-row SQL-null mask, or an empty span when no row is null. SQL null-ness rides the storage
@@ -100,8 +104,7 @@ public static class VariantShredding
     public static bool TryShred(
         IReadOnlyList<VariantValue> values,
         ReadOnlySpan<bool> isSqlNull,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)]
-        out VariantArray? shredded)
+        [NotNullWhen(true)] out VariantArray? shredded)
     {
         if (values is null)
         {
@@ -158,8 +161,7 @@ public static class VariantShredding
     /// </summary>
     public static bool TryShred(
         VariantArray array,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)]
-        out VariantArray? shredded)
+        [NotNullWhen(true)] out VariantArray? shredded)
     {
         if (array is null)
         {
@@ -191,6 +193,16 @@ public static class VariantShredding
     private static VariantArray WithValidity(VariantArray variant, ReadOnlySpan<bool> isNull, int nullCount)
     {
         var storage = variant.StorageArray.Data;
+        if (storage.Offset != 0)
+        {
+            // The bitmap below is built from bit 0 while the ArrayData keeps its offset, so a SLICED
+            // storage array would shift which rows read as NULL. ShreddedVariantArrayBuilder always
+            // returns an unsliced array; if that ever changes, fail loudly rather than silently
+            // mis-attributing null-ness.
+            throw new NotSupportedException(
+                $"Cannot apply a SQL-null mask to a sliced variant storage array (offset {storage.Offset}).");
+        }
+
         var validity = new ArrowBuffer.BitmapBuilder(isNull.Length);
         for (int i = 0; i < isNull.Length; i++)
         {

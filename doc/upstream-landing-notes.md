@@ -92,9 +92,23 @@ master between 07-25 and 07-27, and master's versions are supersets — see the 
 8. **`VariantTransport`** — a marker-tagged self-delimiting BINARY-per-row form ⇄ `VariantArray` for
    hosts whose Arrow boundary cannot carry an extension type over struct storage, behind a new
    `DeltaTableOptions.VariantTransportBlob`. It carries a **general-purpose passenger worth separating**:
-   variant **shredding on write**, which master lacks entirely and which `known-issues.md` records as a
-   real interop asymmetry against Spark and DuckDB. Shredding is also what drags in the new
+   variant **shredding on write**, which master lacks entirely. Shredding is also what drags in the new
    `Apache.Arrow.Operations` dependency on the Delta layer.
+
+   **Correction (2026-07-30).** An earlier version of this entry called shredding-on-write a "real
+   interop asymmetry against Spark and DuckDB" and attributed that to `known-issues.md`. Neither half
+   holds: `known-issues.md` says nothing about shredding, and EW's unshredded output is **spec-legal**
+   and measured readable by Spark 4.1, delta-rs 1.6.2 and DuckDB (the validated matrix under item 5
+   below). The genuine motivation is `typed_value`'s per-field statistics and predicate pruning, better
+   encoding than an opaque variant blob, and layout parity with what Spark and DuckDB emit — a missing
+   optimisation, not a correctness gap. The passenger was still worth separating; the reason stated for
+   it was wrong.
+
+   **Landed (2026-07-30, PR #6.)** The shredding MECHANISM is on master: `VariantShredding.TryShred`
+   over decoded values or a canonical array, with a file-level round trip pinning the physical layout.
+   The gap this entry names is only **half** closed — no writer path calls it, so EW still emits
+   unshredded unless a caller shreds first. The writer-facing option and the interop measurement are
+   follow-ups; see item 5's caveat.
 9. **Public `DeltaFilePruner`** — currently `internal`; an API-surface concession, trivial to make.
 
 ### Merge hazard
@@ -320,8 +334,12 @@ having to on 2026-07-27 (`9258706`). The independent CoW-UPDATE finding was fixe
    Two caveats: nested wrapping needs the annotation (it keys off the parquet reader's
    variant-awareness), so an *unannotated* nested variant — Spark 4.0.x, or EW's own
    `EmitVariantLogicalType=false` output — is not wrapped (the Delta-layer coercion is top-level only);
-   and there is still **no shredding on write** — EW emits the storage struct as-is, spec-legal but an
-   interop asymmetry against Spark/DuckDB. Neither caveat affects the common (annotated) path.
+   and **no writer path shreds** — EW emits the storage struct as-is. That output is spec-legal and is
+   the form the validated matrix below was measured on; shredding would buy `typed_value` statistics,
+   predicate pruning and layout parity with Spark/DuckDB, not correctness. The mechanism landed
+   2026-07-30 (`VariantShredding.TryShred`, PR #6) but nothing calls it yet, so a caller must shred
+   before handing EW the batch; a `ParquetWriteOptions` knob and an interop measurement of EW's
+   shredded output are open. Neither caveat affects the common (annotated) path.
 
    **Externally validated (2026-07-19)** against delta-rs 1.6.2, Spark 4.0.1 and Spark 4.1.1, both
    directions, via `VariantInteropTests`. This is where round-trip-through-EW was proven insufficient —
