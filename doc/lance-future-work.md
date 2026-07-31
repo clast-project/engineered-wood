@@ -5,6 +5,13 @@ Snapshot of remaining gaps in `EngineeredWood.Lance` and
 landing. Sorted within each section by likely user impact (highest
 first).
 
+> **Last verified against the code: 2026-07-31.** One entry had closed since
+> the list was written — nested-typed `UpdateAsync` / `CompactAsync`, which the
+> shared `ArrowCompute.Take` unblocked. The rest still hold: HalfFloat,
+> LargeString/LargeBinary and the union types remain absent from both sides;
+> the writer still emits only `Flat` / `Variable` values and wraps ZSTD around
+> fixed-width primitives alone; multi-page nested writes still throw.
+
 ## Type coverage
 
 | Type | Reader | Writer | Notes |
@@ -34,8 +41,7 @@ first).
 | Feature | Status | Notes |
 |---|---|---|
 | Multi-page nested types in the writer | not yet | `WriteColumnAsync(name, IReadOnlyList<IArrowArray>)` rejects struct / list / FSL / map. The reader handles multi-page nested without issue. |
-| `UpdateAsync` with nested-typed columns | not yet | `TakeRows` only handles leaf shapes. Re-using the recursive read walker for take would close this. |
-| `CompactAsync` with nested-typed columns | not yet | Same `TakeRows` limitation. |
+| `UpdateAsync` / `CompactAsync` with nested-typed columns | **done** | `TakeRows` is gone; both gather survivors with the shared `ArrowCompute.Take`, which handles struct / list / large-list / FSL / map / extension types as well as leaves. A type neither it nor `LanceFileWriter` accepts now raises `NotSupportedException` rather than being written through unfiltered. |
 | `CompactAsync` size targets / target-fragments | not yet | Always packs every compactable source fragment into a single output. Production deployments typically want target-row-count or target-byte-size knobs and parallel rewrite. |
 | Fragment-level concurrency control (CAS commit) | not yet | Manifest filename uses `{u64::MAX - version}.manifest`; concurrent appenders can race. Need atomic-create or rename-based CAS, plus retry-with-rebase logic. |
 | `DeleteAsync` / `UpdateAsync` with predicates over indexed columns | not yet | We don't use the secondary indices for fragment pruning during write-side operations. Reader does. |
@@ -82,8 +88,9 @@ priority order:
 3. **Roaring-bitmap deletion files (writer)** — once the deletion set
    is dense (say >50%), the bitmap is much smaller than the IPC
    `Int32Array`.
-4. **`UpdateAsync` / `CompactAsync` with nested types** — extend
-   `TakeRows` (or replace it with a recursive walker) to handle
-   StructArray / ListArray / FixedSizeListArray / MapArray.
-5. **Fragment-level CAS** — rename-based commit + retry-with-rebase
+4. **Fragment-level CAS** — rename-based commit + retry-with-rebase
    on conflict. Required for any production multi-writer workflow.
+5. **Multi-page nested writes** — `WriteColumnAsync(name, IReadOnlyList<IArrowArray>)`
+   still throws for struct / list / large-list / FSL. This is now the
+   binding constraint on nested-column rewrites, since the gather side
+   was closed by `ArrowCompute.Take`.
