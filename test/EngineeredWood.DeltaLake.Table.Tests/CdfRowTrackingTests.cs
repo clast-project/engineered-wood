@@ -104,7 +104,7 @@ public class CdfRowTrackingTests : IDisposable
         ReadFeedWithTrackingAsync(DeltaTable table, long from, long to)
     {
         var result = new List<(string, long, long?, long?, long)>();
-        foreach (var b in await CollectAsync(table.ReadChangesWithRowTrackingAsync(from, to)))
+        foreach (var b in await CollectAsync(table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = from, EndVersion = to, Metadata = DeltaRowMetadata.RowTracking })))
         {
             var change = (StringArray)b.Column(b.Schema.GetFieldIndex("_change_type"));
             var id = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
@@ -209,7 +209,7 @@ public class CdfRowTrackingTests : IDisposable
 
         // The identity a feed consumer sees must be the identity the table reports, or it cannot join the two.
         var byId = new Dictionary<long, long?>();
-        foreach (var b in await CollectAsync(table.ReadAllWithRowTrackingAsync(null, null)))
+        foreach (var b in await CollectAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking })))
         {
             var id = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
             var rowId = (Int64Array)b.Column(b.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName));
@@ -286,7 +286,7 @@ public class CdfRowTrackingTests : IDisposable
 
         // Both feed sources are covered: the change files the UPDATE wrote, and the data files the OVERWRITE
         // version is inferred from (whose source carries materialized columns from that same UPDATE).
-        var batches = await CollectAsync(table.ReadChangesAsync(0, table.CurrentSnapshot.Version));
+        var batches = await CollectAsync(table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = table.CurrentSnapshot.Version }));
         Assert.NotEmpty(batches);
         foreach (var b in batches)
         {
@@ -341,7 +341,7 @@ public class CdfRowTrackingTests : IDisposable
             });
 
         foreach (var b in await CollectAsync(
-                     table.ReadChangesWithRowTrackingAsync(updateVersion, updateVersion)))
+                     table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = updateVersion, EndVersion = updateVersion, Metadata = DeltaRowMetadata.RowTracking })))
         {
             var names = b.Schema.FieldsList.Select(f => f.Name).ToList();
             // The partition interleave walks the table schema pulling data columns positionally, so a hidden
@@ -412,7 +412,7 @@ public class CdfRowTrackingTests : IDisposable
         await table.WriteAsync([Rows((1, "a"))]);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await CollectAsync(table.ReadChangesWithRowTrackingAsync(0, table.CurrentSnapshot.Version)));
+            await CollectAsync(table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = table.CurrentSnapshot.Version, Metadata = DeltaRowMetadata.RowTracking })));
         Assert.Contains("delta.enableRowTracking", ex.Message);
     }
 

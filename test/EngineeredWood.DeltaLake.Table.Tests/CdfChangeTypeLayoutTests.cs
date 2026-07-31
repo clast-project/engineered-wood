@@ -115,7 +115,7 @@ public class CdfChangeTypeLayoutTests : IDisposable
         await table.WriteAsync([Rows(schema, (1, "a"), (2, "b"))]);
 
         var batches = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(1, 1))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 1, EndVersion = 1 }))
             batches.Add(b);
 
         var batch = Assert.Single(batches);
@@ -152,7 +152,7 @@ public class CdfChangeTypeLayoutTests : IDisposable
             });
 
         var seen = new List<(long Id, string ChangeType, string Value)>();
-        await foreach (var b in table.ReadChangesAsync(2, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 2, EndVersion = 2 }))
         {
             var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
             var values = (StringArray)b.Column(b.Schema.GetFieldIndex("value"));

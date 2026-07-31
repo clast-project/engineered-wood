@@ -472,7 +472,7 @@ public class SparkInteropTests : IDisposable
                     return new RecordBatch(IdRegionSchema, [b.Column("id"), region.Build()], b.Length);
                 });
 
-            await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
             {
                 var ids = (Int64Array)batch.Column("id");
                 var rowIds = (Int64Array)batch.Column(
@@ -582,7 +582,7 @@ public class SparkInteropTests : IDisposable
         await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
 
         var ewIds = new Dictionary<long, long?>();
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rowIds = (Int64Array)batch.Column(
@@ -735,7 +735,7 @@ public class SparkInteropTests : IDisposable
 
             // the transient rowid of the id-20 row, then a copy-on-write delete of exactly it
             long rid20 = -1;
-            await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
             {
                 var id = (Int64Array)b.Column("id");
                 var rowId = (Int64Array)b.Column(TransientRowAddress.ColumnName);
@@ -1956,7 +1956,7 @@ public class SparkInteropTests : IDisposable
 
         await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
         var feed = new List<(string Change, long Id, long? RowId, long? RowVersion, long Commit)>();
-        await foreach (var batch in table.ReadChangesWithRowTrackingAsync(0, table.CurrentSnapshot.Version))
+        await foreach (var batch in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = table.CurrentSnapshot.Version, Metadata = DeltaRowMetadata.RowTracking }))
         {
             var change = (StringArray)batch.Column("_change_type");
             var id = (Int64Array)batch.Column("id");
@@ -2010,7 +2010,7 @@ public class SparkInteropTests : IDisposable
     {
         var wanted = new HashSet<long>(ids);
         var result = new List<long>();
-        await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var id = (Int64Array)b.Column("id");
             var rid = (Int64Array)b.Column(TransientRowAddress.ColumnName);
@@ -2301,7 +2301,7 @@ public class SparkInteropTests : IDisposable
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.OpenAsync(fs);
         var rows = new List<(string, long)>();
-        await foreach (var b in table.ReadChangesAsync(start, end))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = start, EndVersion = end }))
         {
             var ids = (Int64Array)b.Column("id");
             var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));

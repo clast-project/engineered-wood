@@ -351,14 +351,18 @@ the rewrite. Appending to and reading such a table is still allowed.
 Readers can now see the ids: `ReadAllWithRowTrackingAsync` /
 `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` and
 `_metadata.row_commit_version`, measured equal to Spark's own resolution row by
-row. The Change Data Feed carries them too, as of the CDF row-tracking work:
-`ReadChangesWithRowTrackingAsync` emits the same two columns on the feed, every
+row — requested as `DeltaRowMetadata.RowTracking` on `ReadAsync`. The Change
+Data Feed carries them too, as of the CDF row-tracking work: the same metadata
+flag on `ReadChangesAsync` emits the two columns on the feed, every
 `_change_data` file EW writes on a row-tracking table materializes the hidden
 id/commit-version columns (a `cdc` action has no `baseRowId`, so materializing
 is the only way identity reaches a change row), and both directions are measured
-against Spark 4.0.1. One gap remains on that surface: the emitted column names
-are fixed, with no option to rename them for a host that cannot use a dotted
-identifier. Background: `doc/row-tracking-conformance-brief.md`.
+against Spark 4.0.1. The last gap on that surface — fixed emitted column names,
+with no option to rename them for a host that cannot use a dotted identifier —
+is CLOSED: `DeltaReadOptions.MetadataPrefix` /
+`DeltaChangeReadOptions.MetadataPrefix` rename them, and a collision with a
+table's own column is refused rather than shadowed. Background:
+`doc/row-tracking-conformance-brief.md`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single

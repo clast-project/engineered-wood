@@ -349,7 +349,7 @@ public sealed class DeltaTransaction
     /// infer from this version's adds and removes.</para>
     /// </summary>
     /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one per row of
-    /// <paramref name="rows"/>, ordinarily what <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/> reported
+    /// <paramref name="rows"/>, ordinarily what a <see cref="DeltaRowMetadata.RowTracking"/> read reported
     /// for it. A change file is the only place a change row's identity can live (a <c>cdc</c> action has no
     /// <c>baseRowId</c>), so omitting these leaves the staged rows with NULL ids on the feed.</param>
     /// <param name="rowCommitVersions">The commit-version companion of <paramref name="rowIds"/>: the version

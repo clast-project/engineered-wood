@@ -71,7 +71,7 @@ public class ReadWithRowIdsTests : IDisposable
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(10, 4)]); // ids 10..13, one file → ordinal 0, positions 0..3
 
-        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }));
         rows.Sort();
         Assert.Equal(new long[] { 10, 11, 12, 13 }, rows.Select(r => r.Id).ToArray());
         // ordinal 0 → transient ids are exactly the in-file positions 0..3
@@ -85,7 +85,7 @@ public class ReadWithRowIdsTests : IDisposable
         await table.WriteAsync([Batch(1, 2)]); // file A
         await table.WriteAsync([Batch(100, 3)]); // file B — a second active file
 
-        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }));
 
         // Each transient id decodes to (path-sorted ordinal, in-file position). Two files → ordinals 0 and 1;
         // every id maps back to exactly one file, and positions restart per file.
@@ -106,7 +106,7 @@ public class ReadWithRowIdsTests : IDisposable
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 6)]); // ids 1..6
 
-        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }));
         // pick the transient ids of ids 2 and 5 and read them straight back
         var picked = rows.Where(r => r.Id is 2 or 5).Select(r => r.RowId).ToList();
         Assert.Equal(2, picked.Count);
@@ -131,7 +131,7 @@ public class ReadWithRowIdsTests : IDisposable
         await table.WriteAsync([Batch(1, 6)]); // ids 1..6
 
         // a host reads the rows, keeps the transient ids, and deletes ids 3 and 4 by those ids
-        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }));
         var toDelete = rows.Where(r => r.Id is 3 or 4).Select(r => r.RowId).ToList();
 
         // decode the transient ids into positionsByOrdinal and drive the DV DELETE
@@ -184,7 +184,7 @@ public class ReadWithRowIdsTests : IDisposable
         long v1 = table.CurrentSnapshot.Version;
         await table.WriteAsync([Batch(100, 2)]); // v2 adds more
 
-        var rows = await ReadWithIds(table.ReadAtVersionWithRowIdsAsync(v1, null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { AtVersion = v1, Metadata = DeltaRowMetadata.RowAddress }));
         rows.Sort();
         Assert.Equal(new long[] { 1, 2, 3 }, rows.Select(r => r.Id).ToArray());
         Assert.Equal(new long[] { 0, 1, 2 }, rows.Select(r => r.RowId).ToArray()); // one file at v1
@@ -207,7 +207,7 @@ public class ReadWithRowIdsTests : IDisposable
             new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
         await table.WriteAsync([Batch(1, 3)]);
 
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             Assert.True(batch.Schema.GetFieldIndex(TransientRowAddress.ColumnName) >= 0);
             Assert.True(batch.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName) < 0);
@@ -244,7 +244,7 @@ public class ReadWithRowIdsTests : IDisposable
         await table.WriteAsync([Batch(1, 2)]);
         await table.WriteAsync([Batch(100, 3)]);
 
-        var rows = await ReadWithIds(table.ReadAllWithRowIdsAsync(null, null));
+        var rows = await ReadWithIds(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }));
         var byOrdinal = rows.GroupBy(r => TransientRowAddress.FileOrdinal(r.RowId))
             .OrderBy(g => g.Key).ToList();
 

@@ -68,7 +68,7 @@ public class CdfWriteSeamTests : IDisposable
     private static async Task<List<RecordBatch>> ReadChangesAsync(DeltaTable table, long from, long to)
     {
         var list = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(from, to))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = from, EndVersion = to }))
             list.Add(b);
         return list;
     }

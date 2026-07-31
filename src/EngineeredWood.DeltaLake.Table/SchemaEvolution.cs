@@ -33,6 +33,25 @@ internal static class SchemaEvolution
         // Reconcile every expected column (recursing into STRUCT children — a field ADDed/DROPped inside a
         // nested struct after this file was written must be backfilled/removed at its nesting level too).
         bool changed = batch.Schema.FieldsList.Count != expectedFields.Count;
+
+        // ORDER is part of the reconciliation, not just membership. The loop below emits in expectedFields
+        // order, but the !changed fast path returns the source batch VERBATIM — so without this check the
+        // emitted column order depended on whether anything else happened to need rebuilding: a projection
+        // came back in the caller's order from a file that matched the schema, and in the table's order from
+        // one that needed a backfill. Two files of the SAME table could disagree, which is not a shape any
+        // caller can bind to and not a schema GetReadSchema could promise.
+        if (!changed)
+        {
+            for (int i = 0; i < expectedFields.Count; i++)
+            {
+                if (!string.Equals(
+                        batch.Schema.FieldsList[i].Name, expectedFields[i].Name, StringComparison.Ordinal))
+                {
+                    changed = true;
+                    break;
+                }
+            }
+        }
         var arrays = new List<IArrowArray>(expectedFields.Count);
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
         foreach (var f in expectedFields)

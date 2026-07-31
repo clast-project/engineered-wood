@@ -70,7 +70,7 @@ public class ChangeDataFeedTests : IDisposable
 
         // Read changes for version 1 (the write)
         var changes = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(1, 1))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 1, EndVersion = 1 }))
             changes.Add(b);
 
         Assert.NotEmpty(changes);
@@ -118,7 +118,7 @@ public class ChangeDataFeedTests : IDisposable
 
         // Read changes for the delete version
         var changes = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(2, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 2, EndVersion = 2 }))
             changes.Add(b);
 
         // Should have CDC file with "delete" change type
@@ -178,7 +178,7 @@ public class ChangeDataFeedTests : IDisposable
 
         var deleted = new List<long>();
         var inserted = new List<long>();
-        await foreach (var b in table.ReadChangesAsync(3, 3))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 3, EndVersion = 3 }))
         {
             var idCol = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
             var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
@@ -229,7 +229,7 @@ public class ChangeDataFeedTests : IDisposable
 
         // Read changes for the update version
         var changes = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(2, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 2, EndVersion = 2 }))
             changes.Add(b);
 
         // Should have both preimage and postimage CDC entries
@@ -271,7 +271,7 @@ public class ChangeDataFeedTests : IDisposable
 
         // Read changes across versions 1-2
         var changes = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(1, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 1, EndVersion = 2 }))
             changes.Add(b);
 
         int totalRows = changes.Sum(b => b.Length);
@@ -307,7 +307,7 @@ public class ChangeDataFeedTests : IDisposable
 
         // ReadChanges should still work — infers from add actions
         var changes = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(1, 1))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 1, EndVersion = 1 }))
             changes.Add(b);
 
         Assert.NotEmpty(changes);
@@ -353,7 +353,7 @@ public class ChangeDataFeedTests : IDisposable
 
         var deleted = new List<long>();
         var inserted = new List<long>();
-        await foreach (var b in table.ReadChangesAsync(2, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 2, EndVersion = 2 }))
         {
             var idCol = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
             var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));

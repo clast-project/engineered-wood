@@ -189,7 +189,7 @@ public class RowTrackingPartitionedIdLossTests : IDisposable
 
         // Address every row, then ask the read path for each one's stable id.
         var addresses = new List<long>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var rid = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)

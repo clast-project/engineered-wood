@@ -25,15 +25,17 @@ namespace EngineeredWood.DeltaLake.Table;
 /// </summary>
 public sealed class RowSelection
 {
-    /// <summary>The default prefix of the locator column pair, matching Spark's <c>_metadata</c> struct.</summary>
-    public const string DefaultMetadataPrefix = "_metadata.";
+    /// <summary>The default prefix of the locator column pair. Alias of
+    /// <see cref="DeltaMetadataColumns.DefaultPrefix"/>, which owns the naming.</summary>
+    public const string DefaultMetadataPrefix = DeltaMetadataColumns.DefaultPrefix;
 
-    /// <summary>The locator column carrying the file's <c>add.path</c>, after the metadata prefix.</summary>
-    public const string FilePathColumnSuffix = "file_path";
+    /// <summary>The locator column carrying the file's <c>add.path</c>, after the metadata prefix. Alias of
+    /// <see cref="DeltaMetadataColumns.FilePathSuffix"/>.</summary>
+    public const string FilePathColumnSuffix = DeltaMetadataColumns.FilePathSuffix;
 
-    /// <summary>The locator column carrying the row's ABSOLUTE in-file position, after the metadata
-    /// prefix.</summary>
-    public const string RowIndexColumnSuffix = "row_index";
+    /// <summary>The locator column carrying the row's ABSOLUTE in-file position, after the metadata prefix.
+    /// Alias of <see cref="DeltaMetadataColumns.RowIndexSuffix"/>.</summary>
+    public const string RowIndexColumnSuffix = DeltaMetadataColumns.RowIndexSuffix;
 
     private static readonly long[] NoPositions = [];
 
@@ -77,9 +79,9 @@ public sealed class RowSelection
     }
 
     /// <summary>
-    /// The selection read straight back off batches carrying <c>DeltaRowMetadata.Locator</c>: the
+    /// The selection read straight back off batches carrying <see cref="DeltaRowMetadata.Locator"/>: the
     /// <c>{prefix}file_path</c> (Utf8) and <c>{prefix}row_index</c> (Int64) pair. This is the loop the read
-    /// and DML sides close — a host scans with <c>DeltaRowMetadata.Locator</c>, filters the batches
+    /// and DML sides close — a host scans with <see cref="DeltaRowMetadata.Locator"/>, filters the batches
     /// with its own engine, and hands the survivors straight back.
     /// </summary>
     public static RowSelection FromLocatorColumns(
