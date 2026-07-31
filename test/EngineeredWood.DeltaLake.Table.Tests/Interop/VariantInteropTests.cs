@@ -22,6 +22,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// and nested cases self-skip on 4.0.x via <see cref="SparkHasGaVariant"/>, so the suite stays green on
 /// whichever Spark is on hand.</para>
 /// </summary>
+[Collection("Interop")]
 public class VariantInteropTests : IDisposable
 {
     private readonly string _tempDir;

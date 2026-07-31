@@ -267,11 +267,78 @@ def cmd_read_variant(args):
     return {"version": dt.version(), "row_count": tbl.num_rows, "rows": rows}
 
 
+def cmd_parquet_variant_layout(args):
+    """Report a parquet file's PHYSICAL variant layout, as parquet-cpp sees it.
+
+    This tier's environment carries pyarrow (deltalake depends on it), used here as an independent
+    implementation of the parquet spec rather than as a Delta reader -- neither Spark nor DuckDB will
+    show what is actually on disk, because both materialise the logical value, so a layout only EW
+    knew how to read would pass unnoticed there. The shredding spec is a layout contract: `metadata`
+    required, `value` nullable and NULL wherever a row shredded cleanly, and one value/typed_value
+    pair per hoisted field under `typed_value`.
+
+    Nullability comes from the ARROW schema and physical types from the parquet leaves, because
+    pyarrow's ColumnSchema exposes no repetition field of its own.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(args["path"])
+    col = args.get("col", "v")
+
+    schema = pf.schema
+    leaves = {}
+    for i in range(len(schema)):
+        c = schema.column(i)
+        leaves[c.path] = {
+            "physical_type": c.physical_type,
+            "logical_type": str(c.logical_type),
+            "max_definition_level": c.max_definition_level,
+            "max_repetition_level": c.max_repetition_level,
+        }
+
+    nullable = {}
+
+    def walk(field, prefix):
+        path = f"{prefix}.{field.name}" if prefix else field.name
+        nullable[path] = bool(field.nullable)
+        if pa.types.is_struct(field.type):
+            for child in field.type:
+                walk(child, path)
+
+    for field in pf.schema_arrow:
+        walk(field, "")
+
+    table = pf.read()
+    rows = []
+    for cell in table.column(col).to_pylist():
+        if cell is None:
+            rows.append({"null": True})
+        else:
+            rows.append({
+                "null": False,
+                "has_metadata": cell.get("metadata") is not None,
+                "residual_value_null": cell.get("value") is None,
+                "has_typed_value": cell.get("typed_value") is not None,
+            })
+
+    return {
+        "num_rows": pf.metadata.num_rows,
+        "num_row_groups": pf.metadata.num_row_groups,
+        "arrow_type": str(pf.schema_arrow.field(col).type),
+        "schema_text": str(schema),
+        "leaves": leaves,
+        "nullable": nullable,
+        "rows": rows,
+    }
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
     "read_epoch_micros": cmd_read_epoch_micros,
     "read_variant": cmd_read_variant,
+    "parquet_variant_layout": cmd_parquet_variant_layout,
     "describe": cmd_describe,
     "checkpoint_only_read": cmd_checkpoint_only_read,
     "raw_log": cmd_raw_log,
