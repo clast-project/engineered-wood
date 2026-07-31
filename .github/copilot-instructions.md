@@ -10,9 +10,12 @@ This project is a performance-critical C# codebase that targets multiple .NET ru
 |----------|-----------|-----|-------|
 | **Primary** | .NET 10+ | `net10.0` | Optimize for this target; use latest APIs directly |
 | Near-term | .NET 8 | `net8.0` | LTS release; polyfill or conditional-compile where needed |
-| Near-term | .NET Framework 4.7.2 | `net472` | Legacy support; fallback implementations are expected to be slower |
+| Floor | .NET Standard 2.0 | `netstandard2.0` | The portability floor for every library; fallback implementations are expected to be slower |
 
-All projects multi-target across these frameworks. Use `#if` preprocessor directives to provide the best implementation for each target:
+**Every library under `src/` targets `net10.0;net8.0;netstandard2.0`.** The
+`net472` TFM appears only in the test projects and the `Parquet.TestTool`
+executable — do not assume it when writing library code. Use `#if` preprocessor
+directives to provide the best implementation for each target:
 
 ```csharp
 #if NET10_0_OR_GREATER
@@ -20,13 +23,32 @@ All projects multi-target across these frameworks. Use `#if` preprocessor direct
 #elif NET8_0_OR_GREATER
     // .NET 8 implementation — use available modern APIs
 #else
-    // .NET Framework 4.7.2 fallback — correctness over speed is acceptable
+    // netstandard2.0 fallback — correctness over speed is acceptable
 #endif
 ```
 
+### What netstandard2.0 actually costs you
+
+This is the leg that breaks builds, and it is far more restrictive than
+.NET Framework 4.7.2 would be. Recurring traps:
+
+- **No `Half`, `DateOnly`, `TimeOnly`, or `Index`/`Range`.** A `HalfFloatArray`
+  cannot even be constructed there, so APIs reaching one must either be
+  unreachable on that leg or throw with an explanation.
+- **No `Span`-returning BCL APIs**, and no `Encoding.GetString(ReadOnlySpan<byte>)`,
+  `Stream.Read(Span<byte>)`, or `Convert.TryFromBase64Chars` — the span overloads
+  largely do not exist.
+- **No `Array.Fill`**, no `string.Contains(char)`, no `Dictionary.TryAdd`, no
+  `HashCode`, no `MathF` in places you expect it.
+- **`System.Runtime.CompilerServices.Unsafe` and `System.Memory` come from
+  packages**, not the platform, so their behaviour and availability differ.
+
+Guard with `#if NET8_0_OR_GREATER` (not `#if NET472`), and prefer adding a small
+polyfill over contorting the shared code path.
+
 When a feature or API does not exist on an older target, it is acceptable — and encouraged — to **copy small, self-contained portions of the .NET runtime** into the project under an `Internal/` or `Polyfills/` folder. Examples include:
 
-- `SequenceReader<T>` for span-based parsing on .NET Framework
+- `SequenceReader<T>` for span-based parsing on netstandard2.0
 - `Dictionary<TKey, TValue>` with alternate lookup support
 - `SearchValues<T>` or `FrozenDictionary<TKey, TValue>` backports
 - String interpolation handler patterns
@@ -58,7 +80,7 @@ If a language feature requires runtime support that PolySharp does not cover, ad
 
 - **File-scoped namespaces**: Always use `namespace Foo;` rather than `namespace Foo { }`.
 - **Nullable reference types**: Always enabled (`<Nullable>enable</Nullable>`). Annotate all public API signatures. Prefer `!` (null-forgiving) only when the compiler cannot prove non-null and you have verified it — never to silence warnings lazily.
-- **No global usings**: Do not use `<ImplicitUsings>enable</ImplicitUsings>` or `global using` directives. Each file should declare its own `using` statements. This keeps dependencies explicit and makes files self-contained.
+- **Implicit usings are enabled**: every library sets `<ImplicitUsings>enable</ImplicitUsings>`, so the common `System.*` namespaces are already in scope — do not re-declare them. Hand-written `global using` directives are reserved for deliberate type aliases that resolve a name collision (see `EngineeredWood.Orc/GlobalUsings.cs`, which aliases `GrowableBuffer` to the Core type and disambiguates `Stream`). Do not add one to save typing.
 - **`var`**: Use `var` when the type is obvious from the right-hand side. Use explicit types when clarity is needed.
 - **Expression-bodied members**: Prefer for single-expression properties, methods, and operators.
 - **Access modifiers**: Always explicit — never rely on defaults.
@@ -75,7 +97,7 @@ Performance is the **primary design consideration**. When in doubt, favor the fa
 
 1. **Allocations are the enemy.** Minimize heap allocations, especially on hot paths. Prefer stack allocation, pooling, and value types.
 2. **Measure, don't guess.** Use BenchmarkDotNet to validate performance claims. Micro-optimizations without benchmarks are not trustworthy.
-3. **Optimize for .NET 10 first**, then provide a reasonable fallback for older targets. A 2× slower fallback on .NET 4.7.2 is acceptable if the .NET 10 path is optimal.
+3. **Optimize for .NET 10 first**, then provide a reasonable fallback for older targets. A 2× slower fallback on netstandard2.0 is acceptable if the .NET 10 path is optimal.
 4. **Inlining matters.** Keep hot-path methods small. Use `[MethodImpl(MethodImplOptions.AggressiveInlining)]` judiciously — only when benchmarking confirms benefit. Do not use it speculatively.
 5. **Branch prediction**: Arrange `if`/`else` so the common case is first. Use `[MethodImpl(MethodImplOptions.NoInlining)]` on cold error-throwing helpers to keep the hot path small.
 6. **Sealed classes**: Seal classes that are not designed for inheritance. This enables devirtualization.
@@ -111,7 +133,7 @@ Span<byte> buffer = length <= StackAllocThreshold
 - Use `ReadOnlySpan<char>` for parsing and searching within strings.
 - Prefer `string.Equals(a, b, StringComparison.Ordinal)` over `==` when the comparison type matters.
 - Use `SearchValues<char>` (.NET 8+) or `IndexOfAny` with known value sets over character-by-character scanning.
-- For multi-target string search, provide a `SearchValues` path for .NET 8+ and a fallback for .NET Framework.
+- For multi-target string search, provide a `SearchValues` path for .NET 8+ and a fallback for netstandard2.0.
 
 ---
 
@@ -137,13 +159,24 @@ while (remaining > 0) { /* ... */ }
 ```
 
 - **Alignment**: When performance-critical, align input pointers to vector boundaries to avoid split cache-line loads.
-- On .NET Framework 4.7.2 where `System.Runtime.Intrinsics` is unavailable, fall back to scalar code. Do not attempt to polyfill SIMD for .NET Framework — it is not worth the complexity.
+- On netstandard2.0, where `System.Runtime.Intrinsics` is unavailable, fall back to scalar code. Do not attempt to polyfill SIMD there — it is not worth the complexity.
 
 ---
 
 ## Native AOT Compatibility
 
 All code should be compatible with Native AOT compilation. This ensures maximum performance for ahead-of-time compiled deployments.
+
+**This is an enforced build gate, not advice.** `src/Directory.Build.props` sets
+`IsAotCompatible` **and** `TreatWarningsAsErrors` for the `net10.0` leg of every
+library, so any new trim/AOT incompatibility (the IL2xxx / IL3xxx families)
+**fails the build** rather than producing a warning. The gate is scoped to
+net10.0 because the analyzers do not run on netstandard2.0.
+
+A practical consequence: `EngineeredWood.Iceberg` and the Delta Lake projects use
+source-generated `System.Text.Json` with **no reflection fallback**, so any new
+serializable type must be registered in the relevant `JsonSerializerContext` or
+serialization will fail at runtime.
 
 ### Rules
 
@@ -152,7 +185,7 @@ All code should be compatible with Native AOT compilation. This ensures maximum 
 - **Source generators over reflection**: Use `System.Text.Json` source generators, `LoggerMessage` generators, regex source generators (`[GeneratedRegex]`), and similar.
 - **Trim-safe patterns**: Do not rely on unreferenced types being preserved. Test with `<PublishTrimmed>true</PublishTrimmed>` and `<TrimmerSingleWarn>false</TrimmerSingleWarn>` to surface warnings.
 - **No `dynamic` keyword** — it depends on runtime code generation.
-- On .NET Framework 4.7.2, AOT is not applicable. Use `#if` guards if a pattern requires different implementation for AOT vs. non-AOT targets:
+- On netstandard2.0, AOT is not applicable. Use `#if` guards if a pattern requires different implementation for AOT vs. non-AOT targets:
 
 ```csharp
 #if NET8_0_OR_GREATER
@@ -178,7 +211,7 @@ Common acceptable uses:
 - `MemoryMarshal.GetReference` to pin a span for pointer arithmetic.
 - `Unsafe.SkipInit<T>` to avoid redundant zero-initialization.
 
-Always provide a safe fallback via `#if` or as the default path for .NET Framework when unsafe helpers (like `System.Runtime.CompilerServices.Unsafe`) are unavailable.
+Always provide a safe fallback via `#if`, or as the default path, for netstandard2.0 when unsafe helpers (like `System.Runtime.CompilerServices.Unsafe`) are only available as a package reference.
 
 ---
 
@@ -189,11 +222,10 @@ Use these standard preprocessor symbols for multi-targeting:
 | Symbol | When defined |
 |--------|-------------|
 | `NET10_0_OR_GREATER` | .NET 10+ |
-| `NET8_0_OR_GREATER` | .NET 8+ |
-| `NET7_0_OR_GREATER` | .NET 7+ |
-| `NETFRAMEWORK` | .NET Framework (any version) |
-| `NETSTANDARD` | .NET Standard (if applicable) |
-| `NET472_OR_GREATER` | .NET Framework 4.7.2+ |
+| `NET8_0_OR_GREATER` | .NET 8+ — **the usual guard**; its `#else` is the netstandard2.0 leg |
+| `NET6_0_OR_GREATER` | .NET 6+ — used where a type arrived in 6 (e.g. `Half`, `DateOnly`) |
+| `NETSTANDARD2_0` | The portability floor. Prefer guarding on the positive `NET*_OR_GREATER` form instead |
+| `NETFRAMEWORK` / `NET472_OR_GREATER` | .NET Framework — reachable only from the test projects and `Parquet.TestTool`, never from library code |
 
 Define custom symbols in the `.csproj` if finer-grained control is needed:
 
@@ -215,9 +247,9 @@ Define custom symbols in the `.csproj` if finer-grained control is needed:
 ### Benchmarks
 
 - Use **BenchmarkDotNet** for all performance-sensitive code.
-- Benchmark across all target frameworks (`--runtimes net10.0 net8.0 net472`).
+- Benchmark across the library target frameworks (`--runtimes net10.0 net8.0`).
 - Include benchmarks for realistic data sizes (not just micro-benchmarks with 10 elements).
-- Store benchmark results in the repository (e.g., `benchmarks/results/`) so regressions are detectable.
+- BenchmarkDotNet writes to `BenchmarkDotNet.Artifacts/`, which is **gitignored**. Quote the numbers that matter into the commit message or a `doc/` note rather than relying on the artifacts being committed.
 - When proposing a performance change, include before/after benchmark results.
 
 ---
@@ -226,25 +258,28 @@ Define custom symbols in the `.csproj` if finer-grained control is needed:
 
 ```
 src/
-  ProjectName/
+  EngineeredWood.<Area>/
     Internal/           # Internal helpers, copied runtime code
     Polyfills/          # PolySharp-adjacent manual polyfills
     *.cs
-tests/
-  ProjectName.Tests/
-benchmarks/
-  ProjectName.Benchmarks/
+test/                   # NOTE: singular, and benchmarks live here too
+  EngineeredWood.<Area>.Tests/
+  EngineeredWood.<Area>.Benchmarks/
+  EngineeredWood.Parquet.Compatibility/
 ```
+
+The solution file is `engineered-wood.slnx`. File-per-type, with the namespace
+matching the folder structure.
 
 ---
 
 ## Summary of Key Rules
 
-1. **Multi-target**: net10.0, net8.0, net472. Optimize for .NET 10.
+1. **Multi-target**: net10.0, net8.0, netstandard2.0 for libraries. Optimize for .NET 10.
 2. **C# 14** with PolySharp. Use modern features freely.
-3. **No global usings.** File-scoped namespaces. Nullable enabled.
+3. **Implicit usings on**; hand-written `global using` only for alias collisions. File-scoped namespaces. Nullable enabled.
 4. **Minimize allocations.** Use Span, ArrayPool, stackalloc, value types.
-5. **SIMD via Vector128/256/512** on .NET 8+. Scalar fallback for .NET Framework.
+5. **SIMD via Vector128/256/512** on .NET 8+. Scalar fallback for netstandard2.0.
 6. **AOT-compatible.** No reflection.emit, no dynamic, prefer source generators.
 7. **Unsafe only when justified** by benchmarks and bounded in scope.
 8. **Copy .NET runtime code** when needed to bring modern APIs to older targets.
