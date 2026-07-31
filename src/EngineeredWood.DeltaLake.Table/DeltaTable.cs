@@ -2022,25 +2022,91 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             Files = transaction.RemovedPaths,
             Predicates = transaction.ReadPredicates,
+            // What the HOST declared it read (DeclareWholeTableRead), which the loop cannot infer — it never
+            // saw the scan. Honoured at both isolation levels; see the method's own remarks for the proposal
+            // that would narrow it and why it is not implemented.
+            WholeTable = transaction.DeclaredWholeTableRead,
         };
 
         // The row-tracking high-water mark is emitted ONCE for the whole transaction, from the counter each
         // staged operation advanced. Per-operation marks are held back at staging time: several of them in one
         // version is malformed, and the last one written would win regardless of which reserved the most.
         var actions = transaction.DataActions;
-        if (transaction.NextRowId is { } nextRowId && nextRowId > baseSnapshot.RowIdHighWaterMark)
+        var required = transaction.AppTransactions;
+        if ((transaction.NextRowId is { } nextRowId && nextRowId > baseSnapshot.RowIdHighWaterMark)
+            || required.Count > 0)
         {
-            var withMark = new List<DeltaAction>(actions.Count + 1);
-            withMark.AddRange(actions);
-            withMark.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
-            actions = withMark;
+            var extended = new List<DeltaAction>(actions.Count + 1 + required.Count);
+            extended.AddRange(actions);
+            if (transaction.NextRowId is { } mark && mark > baseSnapshot.RowIdHighWaterMark)
+                extended.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(mark));
+            // The txn actions are emitted HERE rather than when required, so the precondition and the action
+            // it guards come from one source and cannot drift apart.
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            foreach (var r in required)
+                extended.Add(new TransactionId { AppId = r.AppId, Version = r.Version, LastUpdated = now });
+            actions = extended;
         }
 
         return CommitOccAsync(
             baseSnapshot, actions, reads, transaction.RemovedPaths,
-            transaction.IsolationLevel, transaction.Operation, rebaseSafe: true,
+            transaction.IsolationLevel, transaction.EffectiveOperation, rebaseSafe: true,
             cancellationToken,
-            rowLevelDeletes: transaction.DvEdits);
+            rowLevelDeletes: transaction.DvEdits,
+            appTransactions: required);
+    }
+
+    /// <summary>
+    /// Re-validates the transaction's app-transaction preconditions against the base version plus everything
+    /// that landed since. Run once before the first attempt and again before every retry — a precondition is
+    /// a fact about the table, not staged output, so it has to be re-asked each time the table moves.
+    ///
+    /// <para>Throws <see cref="InvalidOperationException"/>, deliberately NOT
+    /// <see cref="DeltaConflictException"/>: the commit loop retries the latter, and no amount of retrying
+    /// makes an already-committed batch un-commit. A producer told "conflict" would keep trying to write a
+    /// batch the table already holds.</para>
+    /// </summary>
+    private static void ValidateAppTransactions(
+        IReadOnlyList<DeltaTransaction.AppTransactionRequirement> required,
+        Snapshot.Snapshot baseSnapshot,
+        IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)>? concurrent)
+    {
+        foreach (var r in required)
+        {
+            if (r.ExpectedPrevious is not { } expected)
+                continue; // no precondition — write unconditionally
+
+            // The base version's record, overridden by any concurrent commit that moved it. Reading the
+            // concurrent commits directly avoids materializing a whole snapshot just to answer this.
+            long? current = baseSnapshot.AppTransactions.TryGetValue(r.AppId, out var recorded)
+                ? recorded.Version
+                : null;
+            if (concurrent is not null)
+            {
+                foreach (var (_, actions) in concurrent)
+                {
+                    foreach (var action in actions)
+                    {
+                        if (action is TransactionId txn
+                            && string.Equals(txn.AppId, r.AppId, StringComparison.Ordinal))
+                        {
+                            current = txn.Version;
+                        }
+                    }
+                }
+            }
+
+            if (current != expected)
+            {
+                throw new InvalidOperationException(
+                    $"App transaction precondition failed for '{r.AppId}': expected the table to record "
+                    + $"version {expected}, but it records "
+                    + (current is { } c ? c.ToString() : "no transaction at all")
+                    + $". Version {r.Version} was NOT committed. This is not a conflict to retry — retrying "
+                    + "cannot make an already-committed batch un-commit; re-read the recorded version and "
+                    + "decide whether this batch still needs writing.");
+            }
+        }
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -2069,9 +2135,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string operation,
         bool rebaseSafe,
         CancellationToken cancellationToken,
-        IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null)
+        IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
+        IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null)
     {
         ThrowIfDisposed();
+
+        // Once against the base version, before anything is attempted: a precondition already false is worth
+        // reporting before writing files or burning an attempt.
+        if (appTransactions is { Count: > 0 })
+            ValidateAppTransactions(appTransactions, baseSnapshot, concurrent: null);
 
         if (dataActions.Count == 0)
             return baseSnapshot.Version; // nothing staged — no commit
@@ -2164,6 +2236,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     currentActions = dataActions; // stable source; row-tracking ids re-derived below
                 }
+
+                // Before the conflict verdict: a violated precondition is not a conflict and must not be
+                // reported as one, whatever the checker would have said.
+                if (appTransactions is { Count: > 0 })
+                    ValidateAppTransactions(appTransactions, baseSnapshot, concurrent);
 
                 var verdict = Concurrency.ConflictChecker.Check(
                     reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);

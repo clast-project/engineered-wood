@@ -64,6 +64,13 @@ public sealed class DeltaTransaction
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
     // to one identity. Null until the first row-tracking stage reads the base mark.
     private long? _nextRowId;
+    // Preconditions: facts about the base version that must hold on EVERY commit attempt. Distinct from
+    // staged effects, which are rebased and retried — a precondition cannot become true by retrying.
+    private readonly List<AppTransactionRequirement> _appTransactions = [];
+    // Declarations: what the HOST read, which the commit loop cannot infer because it never saw the scan.
+    private bool _declaredWholeTableRead;
+    // What commitInfo records, when the caller says rather than letting it be inferred.
+    private string? _operation;
     private bool _committed;
 
     internal DeltaTransaction(
@@ -101,7 +108,42 @@ public sealed class DeltaTransaction
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
 
-    internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
+    /// <summary>
+    /// What this transaction's <c>commitInfo</c> records as its operation. Null — the default — keeps the
+    /// inference: a transaction that staged exactly one kind of work reports that kind, and a mixed one
+    /// reports <c>"WRITE"</c>, because Delta's operation field is ONE string per commit and no engine has a
+    /// name for a fused DELETE+INSERT. Set it and it wins.
+    ///
+    /// <para>A property rather than a per-call argument because it describes the TRANSACTION, not any one
+    /// staged thing: several staging calls cannot each name the commit's operation.</para>
+    /// </summary>
+    /// <exception cref="ArgumentException">The value is an empty or whitespace string. Null is how you ask
+    /// for the inference; <c>""</c> would silently commit an operation-less commitInfo.</exception>
+    public string? Operation
+    {
+        get => _operation;
+        set
+        {
+            if (value is not null && string.IsNullOrWhiteSpace(value))
+            {
+                throw new ArgumentException(
+                    "Operation must be null (infer it) or a non-empty name. An empty string would commit a "
+                    + "commitInfo naming no operation.",
+                    nameof(value));
+            }
+            _operation = value;
+        }
+    }
+
+    /// <summary>The operation the commit actually records: the caller's if set, else the inference.</summary>
+    internal string EffectiveOperation =>
+        _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
+
+    /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
+    internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
+
+    /// <summary>Whether the host declared that its scan read the whole table.</summary>
+    internal bool DeclaredWholeTableRead => _declaredWholeTableRead;
 
     /// <summary>
     /// The row id the next staged add would reserve, or null if nothing staged advanced it. The commit emits
@@ -421,14 +463,109 @@ public sealed class DeltaTransaction
     /// snapshot-relative state (row-id ranges, deletion-vector positions) belongs in a typed method instead,
     /// which is what lets the commit loop rebase it.
     /// </summary>
-    public void StageActions(IReadOnlyList<DeltaAction> actions, string? operation = null)
+    public void StageActions(IReadOnlyList<DeltaAction> actions)
     {
         EnsureNotCommitted();
         if (actions is null)
             throw new ArgumentNullException(nameof(actions));
         StageInternal(actions);
-        if (!string.IsNullOrEmpty(operation))
-            _operations.Add(operation!);
+    }
+
+    // ── Preconditions ──────────────────────────────────────────────────────────────────────────────────
+    //
+    // Not effects. An effect is staged output: the commit loop rebases it onto a newer version and retries.
+    // A precondition is a fact about the base version, re-checked before EVERY attempt — and it cannot
+    // become true by retrying, so a violation throws InvalidOperationException rather than
+    // DeltaConflictException, which the loop would retry.
+
+    /// <summary>
+    /// Idempotent-producer compare-and-set: commits a <c>txn</c> action recording that
+    /// <paramref name="appId"/> has reached <paramref name="version"/>, atomically with everything else this
+    /// transaction stages, guarded by <paramref name="expectedPrevious"/>.
+    ///
+    /// <para>This is what lets a streaming producer make "write this batch exactly once" true across
+    /// retries: the batch's data and the record of having written it land in ONE version, so there is no
+    /// window in which one exists without the other.</para>
+    ///
+    /// <para><b>Why the violation is not a conflict.</b> A failed precondition throws
+    /// <see cref="InvalidOperationException"/>, not <see cref="DeltaConflictException"/>. The commit loop
+    /// RETRIES the latter, and retrying cannot make an already-committed batch un-commit — a producer told
+    /// "conflict" would keep trying to write a batch that is already in the table.</para>
+    /// </summary>
+    /// <param name="appId">The producer's identifier. One transaction may require at most one version per
+    /// appId: two <c>txn</c> actions for one appId in a single commit is malformed, and the surviving one
+    /// would be whichever the reader saw last.</param>
+    /// <param name="version">The version to record for <paramref name="appId"/>.</param>
+    /// <param name="expectedPrevious">The version the table must ALREADY record for
+    /// <paramref name="appId"/>, re-checked against every concurrent commit before each attempt. Null — the
+    /// default — writes unconditionally. Note that null is "do not check", not "expect no prior record":
+    /// the absence of a record cannot be asserted through this parameter, and a first-ever write simply
+    /// omits it.</param>
+    public void RequireAppTransaction(string appId, long version, long? expectedPrevious = null)
+    {
+        EnsureNotCommitted();
+        if (string.IsNullOrEmpty(appId))
+            throw new ArgumentException("appId must be a non-empty identifier.", nameof(appId));
+
+        foreach (var existing in _appTransactions)
+        {
+            if (string.Equals(existing.AppId, appId, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"This transaction already requires an app transaction for '{appId}'. A commit carries "
+                    + "at most one txn action per appId; requiring two would leave which one lands to the "
+                    + "reader's action ordering.");
+            }
+        }
+
+        _appTransactions.Add(new AppTransactionRequirement(appId, version, expectedPrevious));
+    }
+
+    // ── Declarations ───────────────────────────────────────────────────────────────────────────────────
+    //
+    // Neither effects nor preconditions: they WIDEN the read set the conflict checker tests concurrent
+    // commits against. The library cannot infer them — the host's own engine did the scan — and, unlike a
+    // precondition, a declaration is subject to POLICY: the isolation level decides what conflicts with it.
+
+    /// <summary>
+    /// Declares that this transaction's work depended on the rows matching <paramref name="predicate"/> —
+    /// what the HOST's own scan read, which the commit loop has no other way to know.
+    ///
+    /// <para>A concurrent commit that ADDS a file matching the predicate is then a
+    /// <c>concurrentAppend</c> conflict under <see cref="IsolationLevel.Serializable"/>; under
+    /// <see cref="IsolationLevel.WriteSerializable"/> a blind append is exempt, which is what distinguishes
+    /// the two levels. Declaring several predicates widens the set — any one matching conflicts.</para>
+    /// </summary>
+    public void DeclareRead(Expressions.Predicate predicate)
+    {
+        EnsureNotCommitted();
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
+        _readPredicates.Add(predicate);
+    }
+
+    /// <summary>
+    /// Declares that this transaction's work depended on the WHOLE table — stronger than any set of
+    /// predicates, since every concurrent add and remove becomes relevant. The honest declaration when a
+    /// scan had no pushable predicate, and the one a host reaches for precisely when it has nothing better
+    /// to say.
+    ///
+    /// <para><b>Caveat, and it is undecided rather than merely undocumented.</b> A proposal carried
+    /// downstream (issue #15, open question 4) would DROP this declaration when the transaction also stages
+    /// row-level deletes and runs at <see cref="IsolationLevel.WriteSerializable"/> — which is the default —
+    /// on the reasoning that commits may be reordered relative to reads at that level. It is NOT implemented
+    /// here: today the declaration is honoured at both levels, and a <c>dataChange=true</c> remove of a file
+    /// covered by it raises <c>concurrentDeleteRead</c>, which is what Delta does (Spark gates only
+    /// <c>concurrentAppend</c> on the isolation level). The proposal is a DEPARTURE from that, gated on the
+    /// level rather than an implementation of it, and if it is ever adopted it should be an explicit
+    /// per-transaction opt-in rather than an inference — a library must not claim on a host's behalf that it
+    /// read less than it declared. Recorded here because it is the one behaviour in this seam a host cannot
+    /// observe from the outside.</para>
+    /// </summary>
+    public void DeclareWholeTableRead()
+    {
+        EnsureNotCommitted();
+        _declaredWholeTableRead = true;
     }
 
     /// <summary>
@@ -467,4 +604,8 @@ public sealed class DeltaTransaction
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
     }
+
+    /// <summary>One <see cref="RequireAppTransaction"/> call: the <c>txn</c> action to write, plus the
+    /// compare-and-set guard the commit loop re-checks before every attempt.</summary>
+    internal sealed record AppTransactionRequirement(string AppId, long Version, long? ExpectedPrevious);
 }

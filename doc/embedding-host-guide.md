@@ -251,7 +251,21 @@ Both properties are pinned by `CodecSeamValueBlindnessTests`.
 ## 6. Stage work on the transaction
 
 This is the part that most repays reading. A host arrives with work **already done**, so it stages results
-rather than handing over batches and predicates:
+rather than handing over batches and predicates.
+
+**Three prefixes, three retry contracts.** The distinction is not cosmetic — it is what the commit loop does
+when each one fails:
+
+| Prefix | Is | On a concurrent commit |
+|---|---|---|
+| `Stage*` | an **effect** — staged output | rebased and retried |
+| `Require*` | a **precondition** — a fact about the base version | re-checked every attempt; violation throws `InvalidOperationException` and is **not** retried |
+| `Declare*` | a **declaration** — what your scan read | widens the read set; what conflicts with it depends on the isolation level |
+
+A precondition cannot become true by retrying, which is why it does not raise `DeltaConflictException`: the
+loop would retry that, and no amount of retrying makes an already-committed batch un-commit. A declaration is
+the opposite — it is subject to *policy*, so the same declaration and the same racer can produce different
+verdicts at different isolation levels.
 
 | Method | Stages |
 |---|---|
@@ -260,7 +274,10 @@ rather than handing over batches and predicates:
 | `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§4) |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
-| `StageActions(actions)` | Anything else — `txn` ids, your own domain metadata |
+| `StageActions(actions)` | Anything else — your own domain metadata |
+| `RequireAppTransaction(appId, version, expectedPrevious:)` | Idempotent-producer compare-and-set |
+| `DeclareRead(predicate)` | What your own scan depended on |
+| `DeclareWholeTableRead()` | The same, when the scan had no pushable predicate |
 
 Use the plain `StageDataFiles` unless you need one of the async form's two arguments:
 
@@ -292,6 +309,45 @@ long version = await txn.CommitAsync();   // ONE atomic version
 
 Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
 delete names agree with what the commit validates.
+
+### Exactly-once producers
+
+`RequireAppTransaction` commits the `txn` action recording your progress **atomically with the data it
+describes**, so there is no window in which one exists without the other:
+
+```csharp
+txn.RequireAppTransaction("my-producer", version: batchId, expectedPrevious: lastCommittedBatchId);
+```
+
+`expectedPrevious` is re-checked against every concurrent commit before each attempt. A violation throws
+`InvalidOperationException` naming what the table actually records — re-read it and decide whether the batch
+still needs writing. Omitting `expectedPrevious` writes unconditionally; note that it means "do not check",
+not "expect no prior record".
+
+### Declaring what you read
+
+The commit loop can see what you *wrote*, but never what your engine *read* — so a scan's dependencies have
+to be declared:
+
+```csharp
+txn.DeclareRead(predicate);      // a concurrent add matching this is a concurrentAppend under Serializable
+txn.DeclareWholeTableRead();     // stronger: every concurrent add AND remove becomes relevant
+```
+
+Under `WriteSerializable` — the default — a concurrent *blind append* is exempt from `DeclareRead`; under
+`Serializable` it conflicts. That difference is the levels' whole distinction, and it is why these are
+`Declare*` and not `Require*`.
+
+### What the commit records
+
+`Operation` is a property, not a per-call argument, because Delta's operation field is one string per commit:
+
+```csharp
+txn.Operation = "MERGE";   // null (the default) keeps the inference
+```
+
+Left null, a transaction that staged one kind of work reports that kind and a mixed one reports `"WRITE"` —
+which is exactly when you want to say something better.
 
 **Whatever the auto-committing surface can express, the staged surface can express.** That is an invariant,
 not an aspiration: `StagedCommitParityTests` walks `CommitDataFilesAsync`' parameters by reflection and
