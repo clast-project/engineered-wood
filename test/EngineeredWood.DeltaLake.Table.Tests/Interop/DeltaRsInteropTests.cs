@@ -14,8 +14,8 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// Tier-1 external validation against delta-rs. See <see cref="DeltaRs"/> for why round-tripping
 /// alone was not enough and how the availability gate works.
 ///
-/// <para>Each test names the slice from <c>doc/upstream-landing-notes.md</c> whose correctness it
-/// pins, so a failure points at the change that regressed rather than at "interop".</para>
+/// <para>Each test names the specific spec behaviour whose correctness it pins, so a failure points
+/// at the change that regressed rather than at "interop".</para>
 /// </summary>
 [Collection("Interop")]
 public class DeltaRsInteropTests : IDisposable

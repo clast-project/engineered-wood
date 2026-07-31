@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -178,8 +178,7 @@ public class BufferedTransactionTests : IDisposable
 
     /// <summary>The buffered consumer shape: DML positions are captured against a PINNED snapshot; a concurrent
     /// DV delete lands while the "transaction" is open; at COMMIT the actions rebase onto the latest snapshot
-    /// (DV union), pass CheckLogicalRebaseAsync, and land in one commit — both deletes compose (disjoint rows).
-    /// Un-parked from PendingCoverageTests.</summary>
+    /// (DV union), pass CheckLogicalRebaseAsync, and land in one commit — both deletes compose (disjoint rows).</summary>
     [Fact]
     public async Task BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete()
     {
@@ -214,7 +213,7 @@ public class BufferedTransactionTests : IDisposable
 
     /// <summary>A Delta application transaction (the <c>txn</c> action): an idempotent producer commits its
     /// application-level version ATOMICALLY with the data via a fused commit; the snapshot exposes the
-    /// high-water mark. Un-parked from PendingCoverageTests.</summary>
+    /// high-water mark.</summary>
     [Fact]
     public async Task AppTransactionAction_RoundTrips()
     {

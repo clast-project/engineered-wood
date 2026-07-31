@@ -82,7 +82,11 @@ probe only imports `deltalake`, which succeeds.
 
 Tier 2 (DuckDB) was evaluated and **dropped as a Delta tier**: delta-rs embeds
 delta-kernel-rs, which is what DuckDB's delta extension is, so tier 1
-already subsumes it. See [`upstream-landing-notes.md`](upstream-landing-notes.md).
+already subsumes it. What would have been genuinely DuckDB-only is a third
+parquet reader — already covered at the right layer by
+`test/EngineeredWood.Parquet.Compatibility/` — and predicate pushdown through a
+foreign planner, which the stats and pruning tests reach from the tiers that
+already exist.
 
 It came back for one thing that reasoning does not cover: **VARIANT**. DuckDB's
 variant type and parquet reader are its own code, not delta-kernel-rs, so for a

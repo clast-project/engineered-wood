@@ -20,8 +20,7 @@ For the forward-looking encryption design, see
 > records absences, and absences are exactly what nothing fails when they
 > stop being true. The Delta entries additionally have external coverage now
 > (delta-rs and PySpark) in
-> `test/EngineeredWood.DeltaLake.Table.Tests/Interop/`; see
-> [`upstream-landing-notes.md`](upstream-landing-notes.md).
+> `test/EngineeredWood.DeltaLake.Table.Tests/Interop/`.
 
 ---
 
@@ -85,6 +84,27 @@ and `ListViewType`.
 - `Statistics.distinct_count` is never computed or written.
 
 ### Correctness / interop issues
+
+**VARIANT — three caveats, none affecting the common annotated path.**
+
+- *The shredded layout is not preserved on read.* A shredded column is
+  reassembled into an ordinary unshredded `VariantArray` — correct and
+  uniform, but a caller cannot inspect `typed_value` afterwards. If that is
+  ever needed (predicate pushdown into `typed_value`), it should become an
+  explicit opt-in on `ParquetReadOptions` rather than a change of default.
+- *An unannotated NESTED variant is not wrapped.* Nested wrapping keys off
+  the parquet reader's variant-awareness, so a variant inside a
+  struct/list/map that carries no logical-type annotation — Spark 4.0.x
+  output, or EW's own with `EmitVariantLogicalType=false` — reads back as a
+  bare struct. The Delta-layer coercion that repairs this is top-level only.
+- *Two upstream Arrow gaps are worked around in `VariantShredding`.* The
+  shred pipeline has no validity, so a SQL-null row cannot be expressed and
+  `VariantShredding.WithValidity` exists to repair the result
+  ([apache/arrow-dotnet#398](https://github.com/apache/arrow-dotnet/issues/398));
+  and there are no array-level entry points, so `Reassemble` and the decode
+  loops are ours to carry
+  ([#399](https://github.com/apache/arrow-dotnet/issues/399)). If both land,
+  `VariantShredding.cs` shrinks to a few calls.
 
 **Deprecated `min`/`max` restricted to signed-order types.** The
 deprecated `Statistics.min`/`max` fields (defined with signed byte
@@ -541,6 +561,13 @@ and a `TransactionId` can be fused into a commit via `CommitDataFilesAsync`'
 …)` overload that packages the idempotency check + `txn` action for a streaming
 writer, so today the caller must wire those primitives together by hand.
 
+**File pruning is not reachable by an embedding host.** `DeltaFilePruner` —
+the unified partition + stats pruner — is `internal`. A host that owns its
+own execution engine can get a pruned file list from `PlanFiles`, but
+cannot apply EW's pruning to a candidate set it assembled itself. Making the
+type public is the whole change; the constraint is API surface, not
+capability.
+
 **High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
 feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
@@ -640,8 +667,20 @@ legacy `minReader=2`/`minWriter=5` pair; Spark emits a hybrid
 appendOnly]`). Both are spec-legal and Spark reads EW's form. Note that
 delta-rs cannot read column-mapped tables in EITHER form — it is an
 unimplemented feature there, not a declaration mismatch — so changing this
-would not widen reader support. See
-[`upstream-landing-notes.md`](upstream-landing-notes.md).
+would not widen reader support.
+
+Both halves are measured. Spark reads EW's form
+(`EwWritten_ColumnMapping_SparkResolvesPhysicalNamesToLogical`), and delta-rs
+1.6.2 rejects reader 2 (legacy) and reader 3 + a `columnMapping` reader
+feature alike. Writer v5's extra implied features
+(`checkConstraints` / `generatedColumns`) impose obligations only on tables
+that actually declare a constraint or generated column, and
+`HonorWriterFeatures` already fails closed on those — so the divergence is
+cosmetic. **Recommendation: leave it alone.** Full v3/v7 is strictly worse,
+raising the reader bar 2→3 for no gain. The read side needs no work either
+way: EW detects column mapping from `delta.columnMapping.mode` in the
+configuration rather than from the protocol version, so it already reads
+Spark's hybrid form.
 
 ---
 

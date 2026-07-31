@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -17,9 +17,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// entirely, remain genuine conflicts.
 ///
 /// <para>This covers Layer 3 sub-problem (A) — DELETE/DELETE deletion-vector union — which needs no
-/// row tracking because DV positions are stable across a concurrent DV-delete. Sub-problem (B) (a delete
-/// remapped through a concurrent compaction/UPDATE rewrite by stable row id) is separate and still
-/// parked in <see cref="PendingCoverageTests"/>.</para>
+/// row tracking because DV positions are stable across a concurrent DV-delete. Sub-problem (B) — a delete
+/// remapped through a concurrent compaction/UPDATE rewrite by stable row id — is covered by the remap
+/// cases further down this file.</para>
 /// </summary>
 public class RowLevelConcurrencyTests : IDisposable
 {

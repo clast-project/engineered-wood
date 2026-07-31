@@ -435,6 +435,6 @@ attempt created.
 
 ## See also
 
-- `doc/pr4-to-master-migration.md` — porting notes for the downstream patch set this seam grew out of
-- `doc/slice9-concurrency-resume.md` — the concurrency work: OCC, row-level DML, the stable-id remap
-- `doc/codec-seam-investigation.md` — why `IDataFile*` exists
+- `doc/delta-concurrency.md` — the concurrency machinery: OCC, row-level DML, the stable-id remap
+- `doc/codec-seam-investigation.md` — why `IDataFile*` exists, and its open contract obligations
+- `doc/known-issues.md` — the gaps a host is most likely to hit

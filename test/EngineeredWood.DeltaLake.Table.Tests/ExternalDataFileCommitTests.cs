@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Text.Json;
@@ -180,7 +180,7 @@ public class ExternalDataFileCommitTests : IDisposable
 
     /// <summary>A REWRITE commit (compaction / clustering OPTIMIZE): removes AND adds carry dataChange=false
     /// (CDF readers exclude it, appendOnly permits it — it removes files, not rows) and each add is stamped
-    /// with add.clusteringProvider. Un-parked from PendingCoverageTests.</summary>
+    /// with add.clusteringProvider.</summary>
     [Fact]
     public async Task CommitDataFiles_RewriteShape_DataChangeFalseAndClusteringProvider()
     {
@@ -221,8 +221,7 @@ public class ExternalDataFileCommitTests : IDisposable
     }
 
     /// <summary>expectedVersion turns the append OCC retry into a conflict-ABORT — snapshot-coupled
-    /// extraActions must not silently land on a table a concurrent writer moved (first-committer-wins).
-    /// Un-parked from PendingCoverageTests.</summary>
+    /// extraActions must not silently land on a table a concurrent writer moved (first-committer-wins).</summary>
     [Fact]
     public async Task ExpectedVersion_ConcurrentWriter_ConflictAborts()
     {
