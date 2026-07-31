@@ -505,6 +505,103 @@ def cmd_write_nested_variant(args):
     return {"spark": spark.version, "written": len(values)}
 
 
+def cmd_conflict_semantics(args):
+    """What Delta's OWN conflict checker does with a declared read, and which isolation levels exist.
+
+    EW asserts two things about Delta that it inferred from reading the source rather than from watching
+    it run: that `delta.isolationLevel` distinguishes Serializable from WriteSerializable, and that a
+    transaction declaring a whole-table read conflicts with a concurrent commit that touches the table.
+    Both feed issue #15's open question 4, and neither had ever been observed.
+
+    Driving this needs the JVM's OptimisticTransaction directly -- there is no SQL for "declare a read and
+    then commit something unrelated", because Spark's own statements declare their reads implicitly. So
+    this reaches through py4j:
+
+      DeltaLog.forTable(spark, path).startTransaction()  ->  txn.readWholeTable() / txn.filterFiles()
+      ... a racer commits by ordinary SQL ...
+      txn.commit(Seq(SetTransaction(...)), DeltaOperations.ManualUpdate)
+
+    `readWholeTable()` is the exact analogue of EW's `DeltaTransaction.DeclareWholeTableRead()`, which is
+    what makes this a measurement rather than an analogy. The staged action is a SetTransaction because it
+    is inert: it commits without touching data, so the verdict is entirely about the declaration.
+    """
+    spark = _spark()
+    jvm = spark._jvm
+    base = args["path"]
+
+    # ── which isolation levels does this build accept? ──
+    levels = {}
+    for level in ("Serializable", "WriteSerializable"):
+        uri = _uri(os.path.join(base, "lvl_" + level))
+        try:
+            spark.sql(f"CREATE TABLE delta.`{uri}` (id BIGINT) USING DELTA "
+                      f"TBLPROPERTIES ('delta.isolationLevel'='{level}')")
+            levels[level] = "accepted"
+        except Exception as e:
+            levels[level] = "rejected: " + str(e).splitlines()[0][:200]
+
+    def make_table(name, deletion_vectors):
+        uri = _uri(os.path.join(base, name))
+        props = ("TBLPROPERTIES ('delta.enableDeletionVectors'='true')" if deletion_vectors else "")
+        spark.sql(f"CREATE TABLE delta.`{uri}` (id BIGINT) USING DELTA {props}")
+        spark.range(0, 5).selectExpr("id").write.format("delta").mode("append").save(uri)
+        spark.range(100, 105).selectExpr("id").write.format("delta").mode("append").save(uri)
+        return uri
+
+    def run(scenario):
+        uri = make_table(scenario["name"], scenario.get("deletion_vectors", False))
+
+        delta_log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, uri)
+        txn = delta_log.startTransaction()
+        if scenario["declare"] == "whole_table":
+            txn.readWholeTable()
+        elif scenario["declare"] == "filter_files":
+            txn.filterFiles()
+
+        if scenario["racer"] == "delete":
+            spark.sql(f"DELETE FROM delta.`{uri}` WHERE id = 101")
+        elif scenario["racer"] == "append":
+            spark.range(500, 502).selectExpr("id").write.format("delta").mode("append").save(uri)
+
+        # DeltaOperations.ManualUpdate is a NESTED Scala case object: JVM name
+        # DeltaOperations$ManualUpdate$, singleton in MODULE$. Class.forName must use DELTA's own
+        # classloader -- delta-spark arrives via ivy in a child loader the py4j gateway cannot see.
+        loader = delta_log.getClass().getClassLoader()
+        op = (jvm.java.lang.Class
+              .forName("org.apache.spark.sql.delta.DeltaOperations$ManualUpdate$", True, loader)
+              .getField("MODULE$").get(None))
+        staged = jvm.java.util.ArrayList()
+        staged.add(jvm.org.apache.spark.sql.delta.actions.SetTransaction(
+            "ew-conflict-probe", 1, jvm.scala.Option.apply(None)))
+        actions = jvm.org.apache.spark.api.python.PythonUtils.toSeq(staged)
+
+        try:
+            txn.commit(actions, op)
+            return dict(scenario, verdict="committed")
+        except Exception as e:
+            text = str(e)
+            java_exc = getattr(e, "java_exception", None)
+            if java_exc is not None:
+                text += " " + java_exc.toString()
+            kind = next((m for m in ("ConcurrentDeleteRead", "ConcurrentAppend",
+                                     "ConcurrentDeleteDelete", "MetadataChanged", "ProtocolChanged",
+                                     "ConcurrentTransaction")
+                         if m in text), "unrecognised")
+            return dict(scenario, verdict=kind)
+
+    scenarios = [
+        {"name": "whole_vs_delete_cow", "declare": "whole_table", "racer": "delete"},
+        {"name": "whole_vs_delete_dv", "declare": "whole_table", "racer": "delete",
+         "deletion_vectors": True},
+        {"name": "whole_vs_blind_append", "declare": "whole_table", "racer": "append"},
+        {"name": "filtered_vs_delete_dv", "declare": "filter_files", "racer": "delete",
+         "deletion_vectors": True},
+        {"name": "undeclared_vs_delete", "declare": "none", "racer": "delete",
+         "deletion_vectors": True},
+    ]
+    return {"isolation_levels": levels, "scenarios": [run(sc) for sc in scenarios]}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
@@ -520,6 +617,7 @@ COMMANDS = {
     "checkpoint_stats": cmd_checkpoint_stats,
     "reference_checkpoint_schema": cmd_reference_checkpoint_schema,
     "create": cmd_create,
+    "conflict_semantics": cmd_conflict_semantics,
 }
 
 
