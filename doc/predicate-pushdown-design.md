@@ -15,6 +15,7 @@ combinators. The current and planned uses are:
 | Stats-based file pruning | Delta Lake | Skip files using `AddFile.stats` min/max |
 | CHECK constraints | Delta Lake | Validate every row satisfies a boolean expression on write |
 | Generated columns | Delta Lake | Compute a column's value from an expression on write |
+| Row-level delete / update | Lance | Select the rows a predicate-based DML statement touches |
 | Post-filter | Any reader | Drop rows that survived coarse pruning but don't match |
 
 This document covers the architecture for unifying these needs across formats and
@@ -28,6 +29,13 @@ migrated onto the shared library, and the Arrow-based row evaluator in
 `EngineeredWood.Expressions.Arrow`. Phases 9–14 (SparkSql parser, Delta
 CHECK/generated-column wiring, Parquet column/offset index, ORC stripe pruning)
 are not yet started. See the phase table at the bottom for per-phase status.
+
+**Reading this document.** It was written before any of it existed, and the body
+still describes the destination rather than the current tree — the code samples
+below are design sketches, not extracts. Where a section describes something
+that has not shipped, it now says so inline. The two places where the built
+result diverges from the sketch are the row evaluator's consumers (see
+"Used by") and its bounded column-type coverage.
 
 When this document was first written, only Iceberg had an expression tree —
 Parquet had a design but no implementation, and ORC, Delta, and the row-level
@@ -300,21 +308,44 @@ public interface IFunctionRegistry
 The default `ArrowRowEvaluator` handles all built-in predicates and operators
 (comparisons, AND/OR/NOT, IS NULL, IN, arithmetic, CAST). Format-specific
 function libraries are registered via `IFunctionRegistry` — Spark SQL functions
-like `YEAR`, `SUBSTRING`, `DATE_FORMAT` come from the `EngineeredWood.SparkSql`
-package's function registry.
+like `YEAR`, `SUBSTRING`, `DATE_FORMAT` would come from the
+`EngineeredWood.SparkSql` package's function registry. No registry ships today,
+so a `FunctionCall` expression throws unless the caller supplies one.
+
+**Column-type coverage is bounded**, which is a real constraint rather than a
+detail: `Boolean`, `Int8/16/32/64`, `UInt8/16/32/64`, `Float`, `Double`,
+`String`, `Binary`, `Date32/64`, `Timestamp`, and `Decimal32/64/128/256`. A
+predicate over any other column type — `Time32`/`Time64`, `HalfFloat`, or a
+nested column — throws `NotSupportedException` at evaluation time. Statistics
+pruning is independent and broader, so pruning can succeed on a column the row
+evaluator cannot evaluate.
+
+Note that the Delta and Parquet readers narrow a decimal column to the smallest
+`Decimal{32,64,128,256}Array` that fits its precision, so all four widths are
+reachable; a `decimal(12,2)` arrives as `Decimal64Array`.
 
 ### Used by
 
+Shipping today:
+
+- **Delta Lake predicate DELETE / UPDATE**: the `Expressions.Predicate`
+  overloads evaluate the predicate to a per-row mask, and the same predicate
+  becomes the transaction's `ReadSet.Predicates` so concurrency conflict
+  detection is precise rather than conservative.
+- **Lance predicate delete / update**: `LanceTable` and `LanceDatasetWriter`
+  construct an `ArrowRowEvaluator` per operation and keep only the rows the
+  predicate selects.
+
+Designed but not implemented (both blocked on the SparkSql parser, phases 9–10):
+
 - **Delta Lake CHECK constraints**: evaluate the constraint predicate against
   every batch being written; if any row evaluates to false (or null), abort the
-  write.
+  write. Today `HonorWriterFeatures` detects an active constraint and **refuses
+  the write** rather than evaluating it.
 - **Delta Lake generated columns**: evaluate the generation expression to
-  produce the column's values; for validation, compute
-  `(materialized <=> generated) IS TRUE` per row.
-- **Parquet post-filter** (future): after row group pruning identifies candidate
-  groups, the row evaluator filters the materialized batches to drop
-  non-matching rows.
-- **Any reader**: caller-provided post-filter applied to the output stream.
+  produce the column's values. Same refusal applies today.
+- **Parquet post-filter**: after row group pruning identifies candidate groups,
+  filter the materialized batches to drop non-matching rows.
 
 ## Parquet Predicate Pushdown
 
@@ -428,9 +459,27 @@ predicates (`GreaterThan`, `LessThan`, etc.) cannot use bloom filters.
 
 ### Stats-based file pruning
 
-Implement `IStatisticsAccessor<ColumnStats>` for Delta's `ColumnStats` type
-(parsed from `AddFile.stats` JSON). Filter `Snapshot.ActiveFiles` before
-reading:
+> **Implemented, but not in the shape sketched here.** Partition and statistics
+> pruning were unified into a single pass in `DeltaFilePruner` rather than the
+> two separate steps below, and the public entry point is
+> `ReadAllAsync(columns, filter, ct)`. Two things learned after this section was
+> written and worth knowing before touching it:
+>
+> - **Decimal bounds must not go through `System.Decimal`.**
+>   `JsonElement.TryGetDecimal` and `decimal.TryParse` silently *round* a value
+>   with more than 28–29 significant digits and return `true`. A rounded bound is
+>   a wrong bound, a wrong bound skips a file that matches, and the query
+>   silently returns fewer rows. `DeltaLiteralDecoder` parses the raw digits into
+>   an unscaled `BigInteger` and materializes `System.Decimal` only when lossless.
+> - **A checkpoint's typed statistics are read in preference to the JSON.**
+>   `CheckpointStatsView` maps `stats_parsed` columns once per batch so a bound
+>   costs one indexed read instead of parsing each file's whole statistics blob
+>   inside the pruning loop. The JSON fallback is load-bearing, not vestigial:
+>   `stats_parsed` omits boolean bounds.
+
+The original design: implement `IStatisticsAccessor<ColumnStats>` for Delta's
+`ColumnStats` type (parsed from `AddFile.stats` JSON), and filter
+`Snapshot.ActiveFiles` before reading:
 
 ```csharp
 public IAsyncEnumerable<RecordBatch> ReadAllAsync(
@@ -460,6 +509,12 @@ public IAsyncEnumerable<RecordBatch> ReadAllAsync(
 ```
 
 ### CHECK constraints
+
+> **Not implemented** (phase 10, blocked on phase 9). What ships today is the
+> fail-closed guard: `DeltaTable.HonorWriterFeatures` detects an active
+> `delta.constraints.*` and rejects the write rather than committing rows it
+> cannot validate. The design below is the intended replacement, and
+> `DeltaTableOptions.ExpressionParser` does not exist yet.
 
 On write, parse `delta.constraints.{name}` into a `Predicate`, evaluate against
 each batch, and abort if any row fails:
@@ -494,6 +549,9 @@ public sealed record DeltaTableOptions
 ```
 
 ### Generated columns
+
+> **Not implemented** (phase 10, blocked on phase 9), and refused on write the
+> same way CHECK constraints are.
 
 On write, parse `delta.generationExpression` from each generated column's
 metadata. For each batch:
