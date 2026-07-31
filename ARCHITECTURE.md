@@ -10,6 +10,13 @@ abstraction.
 
 This document describes the implementation. For usage and build instructions, see `README.md`.
 
+> **Coverage note.** The per-format sections below go deep on Parquet, Avro, ORC
+> and Vortex. Lance has no equivalent section yet — its projects appear in the
+> layout below, and the design is written up in
+> [`doc/lance-reader-design.md`](doc/lance-reader-design.md) (historical) and
+> [`doc/lance-future-work.md`](doc/lance-future-work.md) (current gaps) until one
+> is written.
+
 ## Project layout
 
 ```
@@ -835,12 +842,36 @@ DeltaTable.WriteAsync(batches)
   │    ├─ Partition split → one file per (partition values, batch slice)
   │    ├─ Column mapping rename (logical → physical)
   │    ├─ Optional partition materialization (IcebergCompat)
-  │    ├─ Row tracking column injection (if enabled)
+  │    ├─ Row tracking: nothing on an append (baseRowId + position suffices);
+  │    │   a copy-on-write REWRITE materializes each moved row's original
+  │    │   id + commit version into the declared hidden columns
   │    └─ ParquetFileWriter.WriteRowGroupAsync
   ├─ Build AddFile actions (Stats, BaseRowId, DefaultRowCommitVersion, etc.)
-  ├─ TransactionLog.WriteCommitAsync (NDJSON, atomic temp + rename)
+  ├─ CommitOccAsync — the optimistic-concurrency loop
+  │    ├─ TransactionLog.WriteCommitAsync (NDJSON, atomic temp + rename)
+  │    └─ on collision: read readVersion+1..latest, run ConflictChecker,
+  │       rebase and retry if nothing we read was invalidated, else abort
   └─ Auto-checkpoint at CheckpointInterval
 ```
+
+### Concurrency and the transaction surface
+
+Commits go through an optimistic-concurrency loop rather than failing on any
+collision. `DeltaTransaction` (public, via `StartTransaction`) records a read
+version plus staged actions, and `ConflictChecker` is a pure verdict function
+over the commits that landed in between. Conflicts are resolved at row
+granularity where possible: two deletes of disjoint rows in one file union their
+deletion vectors, and a delete whose file was concurrently compacted is remapped
+by stable row id. Details in [`doc/delta-concurrency.md`](doc/delta-concurrency.md).
+
+### Embedding seam
+
+A host that owns its own Parquet codec and execution engine can use
+EngineeredWood for the log alone: `IDataFileReader` / `IDataFileWriter` swap the
+codec, and `PlanFiles` / `WriteDataFilesAsync` / `CommitDataFilesAsync` let the
+host drive read, write and commit against a pinned snapshot. Both seams are
+`[Experimental]`. See [`doc/embedding-host-guide.md`](doc/embedding-host-guide.md)
+and [`doc/codec-seam-investigation.md`](doc/codec-seam-investigation.md).
 
 ### Decoding stats and partitions
 
@@ -848,7 +879,7 @@ DeltaTable.WriteAsync(batches)
 
 ### Supported features
 
-Reader v3 / Writer v7 with all named features supported (see README for the list). Iceberg compatibility (V1 and V2) is implemented as a writer constraint that ensures the Delta table's structure is convertible to Iceberg by an external tool — it does not produce Iceberg metadata directly.
+Reader v3 / Writer v7. The README lists the named features that are implemented; a table requiring one that is not is rejected rather than mis-read, and the enforcement features (`appendOnly`, `invariants`, `checkConstraints`, `generatedColumns`) fail closed when genuinely active. Iceberg compatibility (V1 and V2) is implemented as a writer constraint that ensures the Delta table's structure is convertible to Iceberg by an external tool — it does not produce Iceberg metadata directly.
 
 ---
 
@@ -856,11 +887,21 @@ Reader v3 / Writer v7 with all named features supported (see README for the list
 
 Apache Iceberg metadata, manifest read/write, and scan planning. Format versions 1, 2, and 3 (including geometry/geography, variant, default values, row IDs).
 
+> **Experimental, and read-oriented.** Two limits shape everything below. The
+> manifest Avro codec is a subset of the declared V2 schema — it omits
+> `lower_bounds` / `upper_bounds`, the partition tuple, and several V2/V3 fields
+> — so manifests EngineeredWood writes are not consumable by other Iceberg
+> engines, and manifests it reads lose their bounds. And the partition transforms
+> below are **declarations only**: they parse, serialize and name, but none can
+> be applied to a value, so partition values cannot be derived from data.
+> Consequently `TableScan` prunes on statistics carried in memory, not on
+> partition transforms. Full list in [`doc/known-issues.md`](doc/known-issues.md).
+
 ### Components
 
 - **Table metadata** (`TableMetadata.cs`) — JSON representation of Iceberg table state including snapshots, schemas, partition specs, sort orders.
 - **Manifest layer** (`Manifest/`) — `DataFile`, `ManifestEntry`, `ManifestListEntry`. `ManifestIO` reads/writes Avro-encoded manifest files using `EngineeredWood.Avro`. Statistics on `DataFile` (`ColumnLowerBounds`, `ColumnUpperBounds`, `NullValueCounts`) use the shared `LiteralValue` struct.
-- **Partition transforms** (`Transform.cs`) — Identity, Void, Bucket, Truncate, Year, Month, Day, Hour. Composed into `PartitionField` in `PartitionSpec`.
+- **Partition transforms** (`Transform.cs`) — Identity, Void, Bucket, Truncate, Year, Month, Day, Hour, as `abstract record Transform` cases. Composed into `PartitionField` in `PartitionSpec`. They carry their parameters (`BucketTransform(int NumBuckets)`) and drive partition-field naming, but implement no `Apply(value)` — the bucket hash (Murmur3 over per-type canonical bytes), truncation, and temporal extraction are all unimplemented.
 - **Catalog** (`ICatalog.cs`) — Abstract catalog with `FileSystemCatalog` and `InMemoryCatalog` implementations.
 - **Expressions** (`Expressions/`) — Iceberg consumes the shared `EngineeredWood.Expressions` library. `Iceberg.Expressions.Expressions` is a thin Iceberg-flavored factory that preserves the historical API surface (`AlwaysTrue()`, `Apply()`, `NotNull()` aliases) while producing shared types underneath.
 

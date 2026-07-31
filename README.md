@@ -16,7 +16,7 @@ A .NET library for reading and writing columnar file formats — **Apache Parque
 
 - **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
 - **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, predicate-based delete/update on Lance datasets, and zone-stats pruning on Vortex — one predicate type works against any of them.
-- **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
+- **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 table metadata with statistics-based scan planning — experimental, and not yet a conformant Iceberg writer.
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
 - **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
@@ -464,7 +464,8 @@ and patches), `fastlanes.for`, `fastlanes.delta`, `fastlanes.rle`
 EngineeredWood ships two layers: a low-level transaction log API
 (`EngineeredWood.DeltaLake`) for metadata/stats consumers and a high-level
 table API (`EngineeredWood.DeltaLake.Table`) for Arrow-based read/write.
-Reader v3 / Writer v7 with full named feature support.
+Reader v3 / Writer v7; the named features it implements are listed below, and a
+table requiring one it does not implement is rejected rather than mis-read.
 
 ### Reading
 
@@ -474,6 +475,10 @@ Reader v3 / Writer v7 with full named feature support.
 - Deletion vector filtering (RoaringBitmap, inline + file-based)
 - Type widening on read (int/float/date/decimal widenings via `delta.typeChanges` metadata)
 - Column mapping (id and name modes); row tracking; in-commit timestamps
+- VARIANT columns, surfaced as the `arrow.parquet.variant` extension type;
+  shredded layouts (which Spark and DuckDB write by default) are reassembled
+- Stable row ids on read — `_metadata.row_id` / `_metadata.row_commit_version`,
+  on both plain reads and the change data feed, with a configurable prefix
 
 ### Writing
 
@@ -487,15 +492,38 @@ Reader v3 / Writer v7 with full named feature support.
 
 ### Supported reader features
 
-`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`
+`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`,
+`v2Checkpoint`, `vacuumProtocolCheck`, `variantType`
 
 ### Supported writer features
 
-`changeDataFeed`, `columnMapping`, `deletionVectors`, `domainMetadata`,
+`appendOnly`, `changeDataFeed`, `checkConstraints`, `clustering`,
+`columnMapping`, `deletionVectors`, `domainMetadata`, `generatedColumns`,
 `icebergCompatV1`, `icebergCompatV2`, `identityColumns`, `inCommitTimestamp`,
-`rowTracking`, `timestampNtz`, `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`
+`invariants`, `rowTracking`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+`vacuumProtocolCheck`, `variantType`
+
+Two of those need qualifying. The **enforcement** features — `appendOnly`,
+`invariants`, `checkConstraints`, `generatedColumns` — are listed because a
+writer-v7 protocol must enumerate the legacy features explicitly, and merely
+listing them imposes no obligation. When one is genuinely *active*,
+`HonorWriterFeatures` fails closed: `delta.appendOnly=true` blocks non-append
+data changes, and an active constraint or generation expression rejects the
+write rather than committing data it cannot validate (evaluating those needs a
+SQL parser, which is not implemented). **`clustering` is interop only** — the
+`delta.clustering` domain and `add.clusteringProvider` round-trip so a clustered
+table can be appended to and DML'd, but EngineeredWood does not write clustered
+layouts.
 
 ## Features — Iceberg
+
+> **Experimental.** The metadata layer is usable for reading Iceberg tables
+> written by other engines. Manifest **writing** is incomplete — the Avro codec
+> omits lower/upper bounds and partition tuples — and partition transforms are
+> declarative only, with no transform able to be applied to a value. So
+> EngineeredWood cannot yet round-trip a table that other Iceberg engines will
+> accept. Do not use it as a writer. See
+> [`doc/known-issues.md`](doc/known-issues.md) for the full list.
 
 `EngineeredWood.Iceberg` provides Apache Iceberg metadata parsing,
 manifest reading/writing, table metadata (v1, v2, v3), partition specs,
