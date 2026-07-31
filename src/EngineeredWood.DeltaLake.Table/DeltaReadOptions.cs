@@ -36,6 +36,23 @@ public sealed record DeltaReadOptions
     /// </summary>
     public string MetadataPrefix { get; init; } = DeltaMetadataColumns.DefaultPrefix;
 
-    /// <summary>Time travel: read this version instead of the latest. Null reads the current snapshot.</summary>
+    /// <summary>
+    /// Time travel: read this version instead of the latest. Null reads the current snapshot. Mutually
+    /// exclusive with <see cref="Snapshot"/> — setting both throws rather than picking one.
+    /// </summary>
     public long? AtVersion { get; init; }
+
+    /// <summary>
+    /// Read against a snapshot the caller already pinned — ordinarily
+    /// <see cref="DeltaTransaction.Snapshot"/>, so that planning, reading, addressing and committing all name
+    /// ONE version. Resolves with no I/O, unlike <see cref="AtVersion"/>.
+    ///
+    /// <para>This is what makes the host guide's "pin one version and use it everywhere" true at every step
+    /// rather than at three of four. Without it a read inside a transaction silently follows
+    /// <see cref="DeltaTable.CurrentSnapshot"/>, so the rows it returns — and any address minted from them —
+    /// can come from a version the transaction is not validating against.</para>
+    ///
+    /// <para>Mutually exclusive with <see cref="AtVersion"/>; setting both throws.</para>
+    /// </summary>
+    public Snapshot.Snapshot? Snapshot { get; init; }
 }

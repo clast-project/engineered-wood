@@ -1920,6 +1920,87 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Begins a transaction based on a version the host pinned EARLIER — what its row addresses, deletion-vector
+    /// positions and scan decisions were captured against — rather than on whatever is current now.
+    ///
+    /// <para><b>Why this exists.</b> For a transaction spanning several of the host's own statements,
+    /// <see cref="StartTransaction(IsolationLevel)"/> makes the commit loop's validation VACUOUS: it asks "what
+    /// landed since the latest version?", and the answer is nothing. Basing on the version the work was actually
+    /// planned against is what makes the check mean something — a concurrent commit between the host's first
+    /// statement and its commit is then seen and adjudicated instead of silently ignored.</para>
+    ///
+    /// <para>A version number is what a host that cannot keep the table open between statements can carry
+    /// across its own statement boundary; <see cref="StartTransaction(Snapshot.Snapshot, IsolationLevel)"/> is
+    /// for a caller already holding the snapshot itself.</para>
+    /// </summary>
+    /// <param name="baseVersion">The pinned version. Must exist, and must not be ahead of the current one.</param>
+    public async ValueTask<DeltaTransaction> StartTransactionAsync(
+        long baseVersion,
+        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (baseVersion > CurrentSnapshot.Version)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(baseVersion),
+                $"Cannot base a transaction on version {baseVersion}: the table is at "
+                + $"{CurrentSnapshot.Version}, so that version does not exist yet.");
+        }
+
+        var baseSnapshot = baseVersion == CurrentSnapshot.Version
+            ? CurrentSnapshot
+            : await GetSnapshotAtVersionAsync(baseVersion, cancellationToken).ConfigureAwait(false);
+        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+    }
+
+    /// <summary>
+    /// Begins a transaction on a snapshot the caller already holds — another transaction's
+    /// <see cref="DeltaTransaction.Snapshot"/>, or one from <see cref="GetSnapshotAtVersionAsync"/>. The
+    /// snapshot form of <see cref="StartTransactionAsync"/>, with the same purpose and no I/O.
+    /// </summary>
+    /// <param name="baseSnapshot">The version to base on. Must be a snapshot OF THIS TABLE — one from another
+    /// table would silently key every ordinal, path and row-id range to the wrong file set — and must not be
+    /// ahead of the current version.</param>
+    public DeltaTransaction StartTransaction(
+        Snapshot.Snapshot baseSnapshot,
+        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+    {
+        ThrowIfDisposed();
+        if (baseSnapshot is null)
+            throw new ArgumentNullException(nameof(baseSnapshot));
+        RequireSnapshotOfThisTable(baseSnapshot, nameof(baseSnapshot));
+        if (baseSnapshot.Version > CurrentSnapshot.Version)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(baseSnapshot),
+                $"Cannot base a transaction on version {baseSnapshot.Version}: the table is at "
+                + $"{CurrentSnapshot.Version}, so that version does not exist yet.");
+        }
+        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+    }
+
+    /// <summary>
+    /// Rejects a snapshot that belongs to a different table. The Delta table id is in every version's
+    /// <c>metaData</c> and never changes, so this is exact — and the failure it prevents is silent: another
+    /// table's snapshot has its own active set, so every file ordinal, path and row-id range computed from it
+    /// would address the wrong thing without anything looking wrong.
+    /// </summary>
+    private void RequireSnapshotOfThisTable(Snapshot.Snapshot snapshot, string paramName)
+    {
+        string mine = CurrentSnapshot.Metadata.Id;
+        string theirs = snapshot.Metadata.Id;
+        if (!string.Equals(mine, theirs, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"The snapshot belongs to Delta table '{theirs}', but this is table '{mine}'. Its active "
+                + "file set is a different one, so every path, ordinal and row-id range derived from it "
+                + "would address the wrong file.",
+                paramName);
+        }
+    }
+
+    /// <summary>
     /// Runs the optimistic-concurrency commit loop for <paramref name="transaction"/>. A DELETE reads
     /// exactly the files it removes, so the removed paths are both the read-set (concurrentDeleteRead)
     /// and the planned removes (delete/delete).
@@ -3377,6 +3458,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para>Batches are emitted in the snapshot's PATH-SORTED active-file order, which is the order
     /// <see cref="DeltaRowMetadata.RowAddress"/>' file ordinals are assigned in.</para>
+    ///
+    /// <para>Which version is read: <see cref="DeltaReadOptions.Snapshot"/> if set (no I/O), else
+    /// <see cref="DeltaReadOptions.AtVersion"/>, else the current snapshot. Inside a transaction, pass its
+    /// <see cref="DeltaTransaction.Snapshot"/> — otherwise the read follows
+    /// <see cref="CurrentSnapshot"/> and can return rows from a version the transaction is not validating
+    /// against.</para>
     /// </summary>
     public async IAsyncEnumerable<RecordBatch> ReadAsync(
         DeltaReadOptions? options = null,
@@ -3384,9 +3471,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         options ??= new DeltaReadOptions();
-        var snapshot = options.AtVersion is { } v && v != CurrentSnapshot.Version
-            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
-            : CurrentSnapshot;
+        var snapshot = ResolveReadSnapshot(options);
+        if (snapshot is null)
+        {
+            snapshot = await GetSnapshotAtVersionAsync(options.AtVersion!.Value, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         await foreach (var batch in ReadCoreAsync(snapshot, options, cancellationToken)
                            .ConfigureAwait(false))
@@ -3404,17 +3494,44 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Validated on the same terms as the read: asking for
     /// <see cref="DeltaRowMetadata.RowTracking"/> on a table without row tracking, or for a metadata column
     /// whose name a table column already occupies, throws here too rather than at first batch.</para>
+    ///
+    /// <para>Resolved against <see cref="DeltaReadOptions.Snapshot"/> when one is set — a pinned snapshot
+    /// costs no I/O, so the schema is the PINNED version's. <see cref="DeltaReadOptions.AtVersion"/> is
+    /// deliberately NOT honoured here: resolving it would need a log read, and this method promises none.
+    /// Pass the snapshot instead when the version's own schema matters.</para>
     /// </summary>
     public Apache.Arrow.Schema GetReadSchema(DeltaReadOptions options)
     {
         ThrowIfDisposed();
         if (options is null)
             throw new ArgumentNullException(nameof(options));
-        // Time travel would need I/O to resolve, and this method promises none. The metadata columns do not
-        // vary by version, and a projection over an older schema is the caller's to reconcile.
-        var snapshot = CurrentSnapshot;
+        var snapshot = ResolveReadSnapshot(options) ?? CurrentSnapshot;
         ValidateReadMetadata(snapshot, options.Metadata, options.MetadataPrefix);
         return BuildReadSchema(snapshot, options);
+    }
+
+    /// <summary>
+    /// The snapshot a read resolves to WITHOUT I/O: the caller's pinned one, or the current one when neither
+    /// pin nor time-travel version was asked for. Null means only <see cref="DeltaReadOptions.AtVersion"/>
+    /// can answer, which needs a log read.
+    /// </summary>
+    private Snapshot.Snapshot? ResolveReadSnapshot(DeltaReadOptions options)
+    {
+        if (options.Snapshot is { } pinned)
+        {
+            // Two ways to name a version, silently disagreeing, is exactly the hazard this option exists to
+            // remove — so it is refused rather than resolved by precedence.
+            if (options.AtVersion is not null)
+            {
+                throw new ArgumentException(
+                    "DeltaReadOptions.Snapshot and .AtVersion both name the version to read, and they are "
+                    + "mutually exclusive. Set one.",
+                    nameof(options));
+            }
+            RequireSnapshotOfThisTable(pinned, nameof(options));
+            return pinned;
+        }
+        return options.AtVersion is { } v && v != CurrentSnapshot.Version ? null : CurrentSnapshot;
     }
 
     /// <summary>
@@ -6045,15 +6162,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
     /// manage. This is the STABLE identity to carry through a rewrite, as distinct from the snapshot-scoped
     /// address the selection is built from.</param>
+    /// <param name="resolveAgainst">The snapshot to resolve the selection's paths against — ordinarily
+    /// <see cref="DeltaTransaction.Snapshot"/>, the same version the selection was built from. Defaults to
+    /// <see cref="CurrentSnapshot"/>, which is right for a one-shot read but wrong inside a transaction: a
+    /// concurrent rewrite would make the selection's paths look stale when they are exactly the ones the
+    /// transaction is still validating against. Named to match
+    /// <see cref="ComputeDeletionVectorActionsAsync"/>' parameter of the same purpose.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
         RowSelection selection,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        Snapshot.Snapshot? resolveAgainst = null)
     {
         ThrowIfDisposed();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
-        var snapshot = CurrentSnapshot;
+        if (resolveAgainst is not null)
+            RequireSnapshotOfThisTable(resolveAgainst, nameof(resolveAgainst));
+        var snapshot = resolveAgainst ?? CurrentSnapshot;
         var byPath = ActiveFilesByPath(snapshot);
 
         foreach (var kvp in selection.Entries.OrderBy(k => k.Key, StringComparer.Ordinal))
