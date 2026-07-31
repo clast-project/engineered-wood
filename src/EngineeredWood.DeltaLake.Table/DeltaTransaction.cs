@@ -69,6 +69,15 @@ public sealed class DeltaTransaction
     private readonly List<AppTransactionRequirement> _appTransactions = [];
     // Declarations: what the HOST read, which the commit loop cannot infer because it never saw the scan.
     private bool _declaredWholeTableRead;
+    // Files the host declared its own scan read, keyed by add.path. DELIBERATELY a set of its own rather than
+    // more entries in _removedPaths: that collection doubles as the commit loop's plannedRemovePaths, which
+    // drives the delete/delete check, so a file merely READ would be taken for one this transaction plans to
+    // REMOVE — turning a concurrent delete of it into a spurious ConcurrentDeleteDelete instead of the
+    // ConcurrentDeleteRead it is. The two are unioned into ReadSet.Files at commit time and nowhere else.
+    private readonly HashSet<string> _declaredReadPaths = new(StringComparer.Ordinal);
+    // The base snapshot's active paths, materialized on the first DeclareFilesRead call so a host declaring
+    // one file at a time does not walk the active set per call. The snapshot is pinned, so this cannot go stale.
+    private HashSet<string>? _basePaths;
     // What commitInfo records, when the caller says rather than letting it be inferred.
     private string? _operation;
     private bool _committed;
@@ -144,6 +153,10 @@ public sealed class DeltaTransaction
 
     /// <summary>Whether the host declared that its scan read the whole table.</summary>
     internal bool DeclaredWholeTableRead => _declaredWholeTableRead;
+
+    /// <summary>The files the host declared its scan read, by <c>add.path</c>. Unioned into the read-set at
+    /// commit time — never into the planned removes; see the field's own remarks.</summary>
+    internal ISet<string> DeclaredReadPaths => _declaredReadPaths;
 
     /// <summary>
     /// The row id the next staged add would reserve, or null if nothing staged advanced it. The commit emits
@@ -545,10 +558,96 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Declares that this transaction's work depended on exactly these FILES — the middle ground between
+    /// <see cref="DeclareRead"/>'s predicate and <see cref="DeclareWholeTableRead"/>'s everything, and the
+    /// form a host already holds: <see cref="DeltaTable.PlanFiles"/> hands it precisely this list.
+    ///
+    /// <code>
+    /// var planned = table.PlanFiles(predicate, snapshot: txn.Snapshot);
+    /// txn.DeclareFilesRead(planned.Select(p => p.File.Path).ToList());
+    /// </code>
+    ///
+    /// <para>A concurrent commit that makes a <c>dataChange=true</c> REMOVE of any declared file is then a
+    /// <c>concurrentDeleteRead</c> conflict, at both isolation levels — the data this transaction decided on
+    /// is gone. A remove of a file NOT declared is not, which is the whole point:
+    /// <see cref="DeclareWholeTableRead"/> aborts on every concurrent delete anywhere in the table, and a
+    /// host that scanned three files of three hundred was saying far more than the truth.</para>
+    ///
+    /// <para><b>It buys no protection against concurrent ADDS,</b> and that is semantically right rather than
+    /// a gap: a file that did not exist when you scanned was not in your read set, so a file-level
+    /// declaration cannot speak to it. A host that also cares about phantom rows declares BOTH — these paths
+    /// for what it read, <see cref="DeclareRead"/> for what it WOULD have read. They compose; they do not
+    /// compete.</para>
+    ///
+    /// <para>Repeated calls accumulate, and <see cref="DeclareWholeTableRead"/> is strictly stronger: calling
+    /// both keeps whole-table rather than erroring, since everything these paths would catch is already
+    /// caught.</para>
+    /// </summary>
+    /// <param name="paths">The files read, keyed by <c>add.path</c> — the snapshot's own path, as
+    /// <see cref="Actions.AddFile.Path"/> / <see cref="PlannedFile"/> report it, not a decoded or absolutized
+    /// form of it. This is the same key <see cref="RowSelection"/> speaks. An empty collection declares
+    /// nothing.</param>
+    /// <exception cref="ArgumentException">A path is null or empty, or names a file that is not active at
+    /// <see cref="ReadVersion"/>. Unlike a stale ordinal, a stale path is DETECTABLE, so it is reported
+    /// rather than absorbed: such a path can never match a concurrent remove, so a declaration built from
+    /// one would silently protect nothing. Nothing is declared when this throws — validate-then-apply, so a
+    /// rejected list leaves the transaction as it was.</exception>
+    public void DeclareFilesRead(IReadOnlyCollection<string> paths)
+    {
+        EnsureNotCommitted();
+        if (paths is null)
+            throw new ArgumentNullException(nameof(paths));
+        if (paths.Count == 0)
+            return;
+
+        _basePaths ??= BaseActivePaths();
+
+        foreach (string path in paths)
+        {
+            if (string.IsNullOrEmpty(path))
+                throw new ArgumentException("paths contains a null or empty path.", nameof(paths));
+
+            if (!_basePaths.Contains(path))
+            {
+                throw new ArgumentException(
+                    $"'{path}' is not an active file at version {_baseSnapshot.Version}, which is the version "
+                    + "this transaction reads and validates against. Declare the paths PlanFiles returned for "
+                    + "this transaction's Snapshot: a path from another version — or a decoded or absolutized "
+                    + "form of one — can never match a concurrent remove, so the declaration would silently "
+                    + "protect nothing.",
+                    nameof(paths));
+            }
+        }
+
+        foreach (string path in paths)
+            _declaredReadPaths.Add(path);
+    }
+
+    /// <summary>
+    /// The base snapshot's active files by <c>add.path</c>. Not
+    /// <see cref="Snapshot.Snapshot.ActiveFiles"/>' own keys, which are the spec's reconciliation key
+    /// <c>(path, deletionVector.uniqueId)</c> — a file carrying a deletion vector is not found under its bare
+    /// path there, and a host that read such a file would be told its own planned path does not exist.
+    /// </summary>
+    private HashSet<string> BaseActivePaths()
+    {
+        // No capacity overload: HashSet(int, IEqualityComparer) is not in netstandard2.0.
+        var paths = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var add in _baseSnapshot.ActiveFiles.Values)
+            paths.Add(add.Path);
+        return paths;
+    }
+
+    /// <summary>
     /// Declares that this transaction's work depended on the WHOLE table — stronger than any set of
     /// predicates, since every concurrent add and remove becomes relevant. The honest declaration when a
     /// scan had no pushable predicate, and the one a host reaches for precisely when it has nothing better
     /// to say.
+    ///
+    /// <para>Say less when you can say less. <see cref="DeclareFilesRead"/> states the files a scan actually
+    /// touched — which <see cref="DeltaTable.PlanFiles"/> already handed you — and a concurrent delete
+    /// somewhere else then does not abort you. Reach for whole-table when the scan genuinely had no bound,
+    /// not merely because the file list was inconvenient to carry.</para>
     ///
     /// <para><b>Caveat, and it is undecided rather than merely undocumented.</b> A proposal carried
     /// downstream (issue #15, open question 4) would DROP this declaration when the transaction also stages

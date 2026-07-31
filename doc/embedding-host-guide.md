@@ -277,7 +277,8 @@ verdicts at different isolation levels.
 | `StageActions(actions)` | Anything else — your own domain metadata |
 | `RequireAppTransaction(appId, version, expectedPrevious:)` | Idempotent-producer compare-and-set |
 | `DeclareRead(predicate)` | What your own scan depended on |
-| `DeclareWholeTableRead()` | The same, when the scan had no pushable predicate |
+| `DeclareFilesRead(paths)` | The files it actually read — what `PlanFiles` just handed you |
+| `DeclareWholeTableRead()` | The same, when the scan had no bound at all |
 
 Use the plain `StageDataFiles` unless you need one of the async form's two arguments:
 
@@ -327,16 +328,44 @@ not "expect no prior record".
 ### Declaring what you read
 
 The commit loop can see what you *wrote*, but never what your engine *read* — so a scan's dependencies have
-to be declared:
+to be declared. Three shapes, and they are not alternatives to pick one of: they answer different questions,
+and a scan that has answers to two should give both.
+
+| Declaration | Says | Catches a concurrent… |
+|---|---|---|
+| `DeclareRead(predicate)` | the rows my scan *would* have matched | **add** matching the predicate (`concurrentAppend`) |
+| `DeclareFilesRead(paths)` | the files my scan *did* read | **remove** of one of those files (`concurrentDeleteRead`) |
+| `DeclareWholeTableRead()` | everything | every add **and** every remove |
 
 ```csharp
-txn.DeclareRead(predicate);      // a concurrent add matching this is a concurrentAppend under Serializable
-txn.DeclareWholeTableRead();     // stronger: every concurrent add AND remove becomes relevant
+var planned = table.PlanFiles(predicate, snapshot: txn.Snapshot);
+txn.DeclareFilesRead(planned.Select(p => p.File.Path).ToList());   // what I read
+txn.DeclareRead(predicate);                                        // what I would have read
 ```
+
+`DeclareFilesRead` is the middle ground, and the form you already hold — planning handed you exactly this
+list. Keyed by `add.path`, the same key `RowSelection` speaks. Declaring three files of three hundred means a
+concurrent delete in the other 297 does not abort you, which is the entire difference from
+`DeclareWholeTableRead`.
+
+Two things it deliberately does **not** do:
+
+- **No protection against concurrent adds.** A file that did not exist when you scanned was not in your read
+  set, so a file list cannot speak to phantom rows. That is what the predicate is for — hence declaring both
+  above. They compose; they do not compete.
+- **No rescue when you really did read everything.** If the declared set covers the racer's files, the abort
+  is correct, and no declaration shape avoids it. (Spark behaves the same: `filterFiles()` over all files
+  still aborts against a concurrent delete.)
+
+A path that is not active at `txn.ReadVersion` throws `ArgumentException`, and nothing is declared when it
+does. A stale path is *detectable*, unlike a stale ordinal, and one that matches nothing would silently
+protect nothing. `DeclareWholeTableRead` is strictly stronger, so calling it alongside `DeclareFilesRead`
+simply keeps whole-table rather than erroring.
 
 Under `WriteSerializable` — the default — a concurrent *blind append* is exempt from `DeclareRead`; under
 `Serializable` it conflicts. That difference is the levels' whole distinction, and it is why these are
-`Declare*` and not `Require*`.
+`Declare*` and not `Require*`. `DeclareFilesRead` reads the same at both levels: a `dataChange=true` remove of
+a file you read invalidates what you decided whichever level you are at.
 
 ### What the commit records
 
