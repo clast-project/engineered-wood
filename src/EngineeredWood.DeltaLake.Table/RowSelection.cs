@@ -222,10 +222,13 @@ public sealed class RowSelection
 
     // Always copies, never aliases the caller's collection: a RowSelection is immutable once built, and a
     // caller holding a mutable set it also passed in could otherwise change what the DML addresses after the
-    // fact. (No capacity ctor here — HashSet<T>(int) does not exist on netstandard2.0.)
+    // fact.
     private static IReadOnlyCollection<long> Dedupe(IReadOnlyCollection<long> positions)
     {
         var deduped = new HashSet<long>();
+        // Sized for the no-duplicates case, the one a DML row set is overwhelmingly likely to be. Over-sizing
+        // when there are duplicates costs one bucket array; under-sizing costs a rehash per prime step.
+        deduped.EnsureCapacity(positions.Count);
         foreach (long p in positions)
         {
             if (p < 0)
