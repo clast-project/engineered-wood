@@ -72,7 +72,7 @@ standing between a spec divergence and shipping it.
 |---|---|---|---|
 | 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 21 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
 | 2 — DuckDB | `pip install duckdb` (1.4+) | 2 | VARIANT parquet reads through an implementation that is not delta-kernel-rs. Sub-second. |
-| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 38 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads. ~40s to run. |
+| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 44 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~70s to run. |
 
 **The `[pyarrow]` extra is not optional.** `deltalake` 1.6 made pyarrow an extra,
 and the tier-1 driver reads through pyarrow — install the bare package and the
@@ -159,6 +159,25 @@ EW_REQUIRE_DUCKDB_INTEROP=1
 
 With either set, an unavailable toolchain becomes a hard failure naming the
 exact missing prerequisite instead of a silent skip.
+
+#### Reaching Delta's internals, not just its SQL
+
+`ConflictSemanticsInteropTests` is the one tier-3 class that drives the JVM directly rather than through
+SQL: Delta has no statement for "declare a read, then commit something unrelated", because Spark's own
+statements declare their reads implicitly. It goes through py4j to
+`DeltaLog.forTable(...).startTransaction()` and calls `readWholeTable()` / `filterFiles()`, which are the
+exact analogues of EW's `DeclareWholeTableRead()` / `DeclareRead()`.
+
+Two py4j details that are easy to get wrong and cost an afternoon:
+
+- `DeltaOperations.ManualUpdate` is a **nested Scala case object**, so its JVM name is
+  `DeltaOperations$ManualUpdate$` and the instance lives in the static `MODULE$` field. Reach it by
+  reflection, not attribute access.
+- `Class.forName` must be given **Delta's own classloader** (take it off any live Delta object). delta-spark
+  arrives via ivy in a child loader that the py4j gateway's default loader cannot see.
+
+The whole scenario matrix runs once per class via a fixture — six tests reading one measurement — because
+each run costs a session plus five table builds.
 
 #### The interop classes share one xUnit collection
 
