@@ -2020,7 +2020,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
         var reads = new Concurrency.ReadSet
         {
-            Files = transaction.RemovedPaths,
+            // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read
+            // (DeclareFilesRead). A NEW set when there are declared paths — never transaction.RemovedPaths
+            // itself, which is ALSO passed below as plannedRemovePaths and drives the delete/delete check.
+            // Adding a merely-read file to that object would make a concurrent delete of it report as
+            // ConcurrentDeleteDelete ("this transaction also removes it") for a file this transaction never
+            // removes, instead of the ConcurrentDeleteRead it is.
+            Files = UnionReadFiles(transaction),
             Predicates = transaction.ReadPredicates,
             // What the HOST declared it read (DeclareWholeTableRead), which the loop cannot infer — it never
             // saw the scan. Honoured at both isolation levels; see the method's own remarks for the proposal
@@ -2107,6 +2113,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     + "decide whether this batch still needs writing.");
             }
         }
+    }
+
+    /// <summary>
+    /// The read-set's file half: what the transaction rewrites, unioned with what its host declared it read.
+    /// Returns the transaction's own removed-path set unchanged when nothing was declared — the common case,
+    /// and one copy fewer — and a fresh set otherwise, because that object is also the commit loop's
+    /// <c>plannedRemovePaths</c> and must keep meaning ONLY what this transaction removes.
+    /// </summary>
+    private static ISet<string> UnionReadFiles(DeltaTransaction transaction)
+    {
+        if (transaction.DeclaredReadPaths.Count == 0)
+            return transaction.RemovedPaths;
+
+        var union = new HashSet<string>(transaction.RemovedPaths, StringComparer.Ordinal);
+        union.UnionWith(transaction.DeclaredReadPaths);
+        return union;
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>

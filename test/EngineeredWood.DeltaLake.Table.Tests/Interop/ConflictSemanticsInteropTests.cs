@@ -135,10 +135,11 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
     }
 
     /// <summary>A file-level read (Delta's <c>filterFiles()</c>, the analogue of EW's
-    /// <see cref="DeltaTransaction.DeclareRead"/> over every file) aborts on the same interleaving — so
+    /// <see cref="DeltaTransaction.DeclareFilesRead"/> over every file) aborts on the same interleaving — so
     /// the abort does not depend on the read being declared as WHOLE-table. Recorded because it bounds
-    /// what "declare something narrower instead" can buy a host: narrower helps only when it actually
-    /// excludes the racer's files.</summary>
+    /// what "declare something narrower instead" can buy a host, which is exactly what
+    /// <see cref="DeltaTransaction.DeclareFilesRead"/> lets one say: narrower helps only when it actually
+    /// excludes the racer's files, and here it does not.</summary>
     [Fact]
     public void FileLevelReader_AlsoAbortsAgainstAConcurrentDelete()
     {

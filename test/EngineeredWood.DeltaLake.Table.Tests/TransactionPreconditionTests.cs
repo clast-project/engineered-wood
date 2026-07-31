@@ -334,6 +334,265 @@ public class TransactionPreconditionTests : IDisposable
         await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
     }
 
+    // ── DeclareFilesRead: the middle ground ──
+
+    /// <summary>
+    /// A table of two files, so "the files I read" and "the whole table" can differ: ids 1..3 in one,
+    /// 100..105 in another. Returns a table already holding both.
+    /// </summary>
+    private async Task<DeltaTable> TwoFileTableAsync()
+    {
+        var table = await DeltaTable.CreateAsync(Fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 3)]);
+        await table.WriteAsync([Batch(100, 6)]);
+        return table;
+    }
+
+    /// <summary>The path of the ONE file holding the low ids, planned exactly as a host would plan it —
+    /// through <see cref="DeltaTable.PlanFiles"/> against the transaction's own snapshot. Asserting a single
+    /// survivor keeps a pruning regression from quietly turning these tests into whole-table ones.</summary>
+    private static string LowIdFile(DeltaTable table, DeltaTransaction txn)
+    {
+        var planned = table.PlanFiles(Ex.LessThan("id", 50L), snapshot: txn.Snapshot);
+        return Assert.Single(planned).File.Path;
+    }
+
+    /// <summary>
+    /// The declaration's whole reason to exist: a concurrent delete of a file the host DID read invalidates
+    /// what it decided, exactly as whole-table would have said — but see the next test for what it no longer
+    /// says.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_ConcurrentDeleteOfADeclaredFile_Conflicts()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        txn.DeclareFilesRead([LowIdFile(host, txn)]);
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 2L)); // in the declared file
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
+    /// <summary>
+    /// The narrowing. The same interleaving, the same racer — a delete of a file the host never read — and
+    /// the file-level declaration lets it through where whole-table (today's only option, next test) aborts.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_ConcurrentDeleteElsewhere_DoesNotConflict()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        txn.DeclareFilesRead([LowIdFile(host, txn)]);
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 101L)); // the OTHER file — not declared
+
+        await txn.CommitAsync();
+        Assert.Equal(
+            new long[] { 1, 2, 3, 100, 102, 103, 104, 105, 1000 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>The same racer against the only declaration a host could make before this: whole-table
+    /// aborts on a delete of a file it never read.</summary>
+    [Fact]
+    public async Task DeclareWholeTableRead_TheSameConcurrentDeleteElsewhere_Conflicts()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        txn.DeclareWholeTableRead();
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 101L));
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
+    /// <summary>
+    /// The implementation trap, made observable: the declared paths must widen the READ set and not the
+    /// planned-remove set. This transaction removes nothing, so a concurrent delete of a file it merely read
+    /// is <c>concurrentDeleteRead</c>. Were the two sets shared, the delete/delete branch would fire first
+    /// and diagnose a removal this transaction never planned.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_DoesNotMakeAReadFileLookLikeAPlannedRemove()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        txn.DeclareFilesRead([LowIdFile(host, txn)]);
+        await txn.WriteAsync([Batch(1000, 1)]); // an append — this transaction removes NOTHING
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 2L));
+
+        var conflict = await Assert.ThrowsAsync<DeltaConflictException>(
+            async () => await txn.CommitAsync());
+        Assert.Contains("which this transaction read", conflict.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("also removes", conflict.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Stated up front rather than discovered: a file-level declaration says nothing about concurrent ADDS,
+    /// at either level. A file that did not exist when the host scanned was not in its read set. Serializable
+    /// here, so the verdict is not the isolation level's blind-append exemption doing the work.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_ConcurrentAppend_DoesNotConflict()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction(IsolationLevel.Serializable);
+        txn.DeclareFilesRead([LowIdFile(host, txn)]);
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.WriteAsync([Batch(2, 1)]); // an id the declared file's range covers
+
+        await txn.CommitAsync();
+    }
+
+    /// <summary>
+    /// The two declarations compose rather than compete: files for what was read, a predicate for what WOULD
+    /// have been read. A host that cares about phantom rows needs both, and this is the pair that gets it —
+    /// same transaction, same racer as the test above, opposite verdict.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_ComposesWithDeclareRead_ForThePhantomAppend()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction(IsolationLevel.Serializable);
+        txn.DeclareFilesRead([LowIdFile(host, txn)]);   // what it read
+        txn.DeclareRead(Ex.LessThan("id", 50L));        // what it would have read
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.WriteAsync([Batch(2, 1)]);      // matches the predicate
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
+    /// <summary>
+    /// Whole-table is strictly stronger, so calling both KEEPS whole-table rather than erroring: everything
+    /// the paths would catch, it already catches. Either call order, since neither is "the last word".
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DeclareFilesRead_WithWholeTableRead_KeepsWholeTable(bool wholeTableFirst)
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        string low = LowIdFile(host, txn);
+        if (wholeTableFirst)
+        {
+            txn.DeclareWholeTableRead();
+            txn.DeclareFilesRead([low]);
+        }
+        else
+        {
+            txn.DeclareFilesRead([low]);
+            txn.DeclareWholeTableRead();
+        }
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 101L)); // outside the declared files, inside the table
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
+    /// <summary>
+    /// A stale PATH is detectable — unlike a stale ordinal — so it is reported rather than absorbed: a path
+    /// no version-N file carries can never match a concurrent remove, so the declaration built from it would
+    /// silently protect nothing.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_PathNotInTheBaseSnapshot_Throws()
+    {
+        await using var table = await TwoFileTableAsync();
+        var txn = table.StartTransaction();
+
+        var ex = Assert.Throws<ArgumentException>(() => txn.DeclareFilesRead(["part-nope.parquet"]));
+        Assert.Contains("not an active file", ex.Message, StringComparison.Ordinal);
+
+        Assert.Throws<ArgumentException>(() => txn.DeclareFilesRead([""]));
+        Assert.Throws<ArgumentNullException>(() => txn.DeclareFilesRead(null!));
+    }
+
+    /// <summary>Validate-then-apply: a list with one bad path declares NOTHING, so the transaction is left
+    /// as it was rather than half-declared. Proven by the racer a real declaration would have caught.</summary>
+    [Fact]
+    public async Task DeclareFilesRead_RejectedList_DeclaresNothing()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        string low = LowIdFile(host, txn);
+
+        Assert.Throws<ArgumentException>(() => txn.DeclareFilesRead([low, "part-nope.parquet"]));
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 2L)); // in `low` — would conflict had it been declared
+
+        await txn.CommitAsync();
+    }
+
+    /// <summary>Nothing to declare declares nothing, and an already-committed transaction cannot be told
+    /// anything at all.</summary>
+    [Fact]
+    public async Task DeclareFilesRead_EmptyIsANoOp_AndCommittedIsAnError()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+        var txn = table.StartTransaction();
+        txn.DeclareFilesRead([]);
+        await txn.WriteAsync([Batch(1, 1)]);
+        await txn.CommitAsync();
+
+        Assert.Throws<InvalidOperationException>(() => txn.DeclareFilesRead(["whatever.parquet"]));
+    }
+
+    /// <summary>
+    /// The composition the guide shows, end to end: plan against the transaction's snapshot, declare exactly
+    /// what planning returned. Declaring EVERY file is whole-table by another name — and the abort is then
+    /// correct, since the host really did read it all.
+    /// </summary>
+    [Fact]
+    public async Task DeclareFilesRead_OfEveryPlannedFile_IsWholeTableByAnotherName()
+    {
+        await using var table = await TwoFileTableAsync();
+
+        await using var host = await OpenAsync();
+        var txn = host.StartTransaction();
+        var planned = host.PlanFiles(snapshot: txn.Snapshot);
+        Assert.Equal(2, planned.Count);
+        txn.DeclareFilesRead(planned.Select(p => p.File.Path).ToList());
+        await txn.WriteAsync([Batch(1000, 1)]);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(Ex.Equal("id", 101L));
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
     [Fact]
     public async Task WithoutADeclaration_TheSameConcurrentDeleteIsIgnored()
     {
