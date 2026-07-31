@@ -5,7 +5,7 @@ using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Operations.VariantJson;
 using Apache.Arrow.Scalars.Variant;
-using EngineeredWood.Parquet.Data;
+using EngineeredWood.Parquet;
 
 namespace EngineeredWood.Tests.Parquet;
 
@@ -147,5 +147,88 @@ public class VariantShreddingTests
         var canonical = Canonical(new[] { Obj(1, "x"), Obj(2, "y") });
         Assert.False(canonical.IsShredded);
         Assert.Same(canonical, VariantShredding.Reassemble(canonical));
+    }
+
+    /// <summary>
+    /// The split exists so ONE schema can span several batches: inferring on batch 1 and shredding
+    /// batch 2 into that same layout is what keeps a multi-row-group file to a single schema.
+    /// </summary>
+    [Fact]
+    public void InferOnce_ThenShredASecondBatch_IntoTheSameLayout()
+    {
+        var first = new[] { Obj(1, "x"), Obj(2, "y") };
+        var second = new[] { Obj(3, "z"), Obj(4, "w") };
+
+        var schema = VariantShredding.InferSchema(first, default);
+        Assert.NotNull(schema);
+
+        var a = VariantShredding.Shred(first, default, schema!);
+        var b = VariantShredding.Shred(second, default, schema!);
+
+        // Same layout, independently produced — the property a shared file schema depends on.
+        Assert.True(a.IsShredded);
+        Assert.True(b.IsShredded);
+        Assert.Equal(a.Data.DataType.ToString(), b.Data.DataType.ToString());
+
+        var back = VariantShredding.Reassemble(b);
+        for (int i = 0; i < second.Length; i++)
+            Assert.Equal(Json(second[i]), Json(back.GetLogicalVariantValue(i)));
+    }
+
+    /// <summary>
+    /// A row that does not fit the schema is not an error — it rides the residual <c>value</c>, which
+    /// is the mechanism that lets one layout cover a whole file.
+    /// </summary>
+    [Fact]
+    public void ShreddingAValueTheSchemaDoesNotDescribe_KeepsItInTheResidual()
+    {
+        var schema = VariantShredding.InferSchema(new[] { Obj(1, "x"), Obj(2, "y") }, default);
+        Assert.NotNull(schema);
+
+        var alien = VariantValue.FromString("nothing like an object");
+        var shredded = VariantShredding.Shred(new[] { Obj(3, "z"), alien }, default, schema!);
+
+        var back = VariantShredding.Reassemble(shredded);
+        Assert.Equal(Json(Obj(3, "z")), Json(back.GetLogicalVariantValue(0)));
+        Assert.Equal(Json(alien), Json(back.GetLogicalVariantValue(1)));
+    }
+
+    /// <summary>
+    /// The inference policy is the caller's to set: a field present in half the rows clears the
+    /// default frequency threshold and is hoisted, but not a stricter one.
+    /// </summary>
+    [Fact]
+    public void ShredOptions_ChangeWhatIsHoisted()
+    {
+        // "b" appears in 2 of 4 rows — exactly the 0.5 default, and below a 0.9 threshold.
+        var values = new[]
+        {
+            Obj(1, "x"),
+            Obj(2, "y"),
+            VariantValue.FromObject(new Dictionary<string, VariantValue> { ["a"] = VariantValue.FromInt32(3) }),
+            VariantValue.FromObject(new Dictionary<string, VariantValue> { ["a"] = VariantValue.FromInt32(4) }),
+        };
+
+        var lenient = VariantShredding.InferSchema(values, default);
+        var strict = VariantShredding.InferSchema(values, default, new ShredOptions { MinFieldFrequency = 0.9 });
+
+        Assert.NotNull(lenient);
+        Assert.NotNull(strict);
+        Assert.Contains("b", lenient!.ObjectFields.Keys);
+        Assert.DoesNotContain("b", strict!.ObjectFields.Keys);
+        Assert.Contains("a", strict.ObjectFields.Keys);
+
+        // Whichever fields are hoisted, the values survive: the rest is residual.
+        var back = VariantShredding.Reassemble(VariantShredding.Shred(values, default, strict));
+        for (int i = 0; i < values.Length; i++)
+            Assert.Equal(Json(values[i]), Json(back.GetLogicalVariantValue(i)));
+    }
+
+    [Fact]
+    public void InferSchema_OnAColumnWithNoShape_ReturnsNull()
+    {
+        var mixed = new[] { Obj(1, "x"), VariantValue.FromInt32(7), VariantValue.FromString("plain") };
+        Assert.Null(VariantShredding.InferSchema(mixed, default));
+        Assert.Null(VariantShredding.InferSchema(new[] { VariantValue.Null }, new[] { true }));
     }
 }

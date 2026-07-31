@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using Apache.Arrow;
+using Apache.Arrow.Operations.Shredding;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
@@ -22,6 +23,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     private readonly List<RowGroup> _rowGroups = new();
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
+    private Dictionary<string, ShredSchema?>? _variantShredDecisions;
     private bool _headerWritten;
     private bool _closed;
     private bool _disposed;
@@ -66,11 +68,17 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // rows. Only paid when a column actually carries an offset.
         batch = CompactSlicedColumns(batch);
 
-        // First call: write header and convert schema
+        // Variant shredding, if enabled, changes each shredded column's storage TYPE — so the layout
+        // has to be decided before the schema is captured, and from the same batch. Decided once and
+        // reused: a parquet file has one schema, and a later batch that re-inferred a different shape
+        // would be encoded against this one. Applied per row group in WriteSingleRowGroupAsync, after
+        // the split below, so a shredded array never goes through MaterializeSlice.
+        EnsureVariantShredDecisions(batch);
+
+        // First call: write header. The schema is captured in WriteSingleRowGroupAsync instead, once
+        // shredding has been applied, so that what is written and what the footer declares agree.
         if (!_headerWritten)
         {
-            _arrowSchema = batch.Schema;
-            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema);
             await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
             _headerWritten = true;
         }
@@ -97,6 +105,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         RecordBatch batch,
         CancellationToken cancellationToken)
     {
+        batch = ApplyVariantShredding(batch);
+
+        // Captured from the first row group AFTER shredding, so the declared schema is the one the
+        // column writers below actually encode.
+        if (_arrowSchema is null)
+        {
+            _arrowSchema = batch.Schema;
+            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema);
+        }
+
         // Decompose all Arrow columns into leaf columns (flat columns produce 1 leaf each,
         // nested columns produce multiple leaves)
         int arrowColumnCount = batch.ColumnCount;
@@ -261,6 +279,83 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Decides, once per file, which top-level variant columns are shredded and into what layout.
+    /// A null entry records a column deliberately left unshredded, so the decision is not re-taken on
+    /// every batch.
+    /// </summary>
+    private void EnsureVariantShredDecisions(RecordBatch batch)
+    {
+        if (_options.ShredVariants is null && _options.VariantShredSchemas is null)
+            return; // shredding disabled
+        if (_variantShredDecisions is not null)
+            return; // already decided, from the first batch
+
+        var decisions = new Dictionary<string, ShredSchema?>(StringComparer.Ordinal);
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            if (batch.Column(i) is not VariantArray variant)
+                continue;
+
+            string name = batch.Schema.FieldsList[i].Name;
+            if (_options.VariantShredSchemas is not null
+                && _options.VariantShredSchemas.TryGetValue(name, out var declared))
+            {
+                decisions[name] = declared; // an explicit layout shreds even where inference would decline
+                continue;
+            }
+
+            decisions[name] = _options.ShredVariants is null
+                ? null
+                : VariantShredding.InferSchema(variant, _options.ShredVariants);
+        }
+
+        _variantShredDecisions = decisions;
+    }
+
+    /// <summary>
+    /// Replaces each variant column that has a shred layout with its shredded form, rebuilding the
+    /// batch's schema to match — the storage struct gains a <c>typed_value</c> child, so the Arrow
+    /// field type changes with it.
+    /// </summary>
+    private RecordBatch ApplyVariantShredding(RecordBatch batch)
+    {
+        if (_variantShredDecisions is null || _variantShredDecisions.Count == 0)
+            return batch;
+
+        IArrowArray[]? columns = null;
+        Field[]? fields = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            if (batch.Column(i) is not VariantArray variant)
+                continue;
+
+            var field = batch.Schema.FieldsList[i];
+            if (!_variantShredDecisions.TryGetValue(field.Name, out var schema) || schema is null)
+                continue;
+
+            if (columns is null)
+            {
+                columns = new IArrowArray[batch.ColumnCount];
+                fields = new Field[batch.ColumnCount];
+                for (int j = 0; j < batch.ColumnCount; j++)
+                {
+                    columns[j] = batch.Column(j);
+                    fields[j] = batch.Schema.FieldsList[j];
+                }
+            }
+
+            var shredded = VariantShredding.Shred(variant, schema);
+            columns[i] = shredded;
+            fields![i] = new Field(field.Name, shredded.Data.DataType, field.IsNullable, field.Metadata);
+        }
+
+        return columns is null
+            ? batch
+            : new RecordBatch(
+                new Apache.Arrow.Schema(fields!, batch.Schema.Metadata), columns, batch.Length);
+    }
+
+    /// <summary>
     /// Creates a zero-offset copy of a batch slice.
     /// Arrow's <c>Array.Slice</c> creates offset-based views, but the write path
     /// reads value buffers from index 0 — so we must materialize each slice.
@@ -303,6 +398,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             for (int i = 0; i < length; i++)
                 indices[i] = offset + i;
             return EngineeredWood.Arrow.ArrowCompute.Take(array, indices);
+        }
+
+        // An EXTENSION column (VARIANT, GUID) cannot take either path below: Apache.Arrow's
+        // ExtensionArray derives from object, not from Array, so the cast at the end throws
+        // InvalidCastException — which is what an auto-split batch carrying a variant or guid column
+        // used to do. Materialize the STORAGE and re-wrap, so the extension type survives the split.
+        if (array is ExtensionArray extension)
+        {
+            var storage = MaterializeSliceCore(extension.Storage, offset, length);
+            return extension.ExtensionType.CreateArray(storage);
         }
 
         // A run-end encoded column splits by RUN, not by row: the slice is a view whose children still hold
@@ -444,8 +549,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         {
             await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
             _headerWritten = true;
-            _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
         }
+
+        // The header is written before the first row group but the schema is captured during it, so a
+        // row group that throws leaves this null. Falling back here keeps dispose from replacing that
+        // exception with an NRE out of the footer.
+        _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
         // Calculate total rows
         long totalRows = 0;
