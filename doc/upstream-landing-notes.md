@@ -112,9 +112,20 @@ master between 07-25 and 07-27, and master's versions are supersets — see the 
    `VariantShredding` moved to the `EngineeredWood.Parquet` namespace with inference split from
    shredding (`InferSchema` + `Shred`) — necessary because a parquet file has ONE schema while every
    operation sees one batch, so the layout is inferred from the first row group and reused. Rows that
-   do not fit ride the residual. Still open: an interop measurement of EW's shredded output against
-   Spark/delta-rs/DuckDB, and upstream gaps in `Apache.Arrow.Operations` (no validity in the shred
-   pipeline, no array-level entry points) that `VariantShredding` works around.
+   do not fit ride the residual.
+
+   **Measured (2026-07-31.)** `VariantShreddingInteropTests`: **Spark 4.1.1** reads EW's shredded
+   parquet as a native `variant` column and `to_json` decodes every value; **DuckDB 1.5.5** reads it as
+   `VARIANT` through its own reader (re-added as a tier for exactly this — its variant type is not
+   delta-kernel-rs, so the reasoning that dropped it as a Delta tier does not apply); **pyarrow**
+   confirms the on-disk layout is the spec's — `metadata` required, `value` nullable and NULL on a
+   cleanly shredded row, one `value`/`typed_value` pair per hoisted field. The canonical layout is the
+   control in each. Still open upstream, and filed against `apache/arrow-dotnet` (2026-07-31):
+   [#398](https://github.com/apache/arrow-dotnet/issues/398) — the shred pipeline has no validity, so a
+   SQL-null row cannot be expressed and `VariantShredding.WithValidity` exists to repair the result;
+   [#399](https://github.com/apache/arrow-dotnet/issues/399) — no array-level entry points, so
+   `Reassemble` and the decode loops are ours to carry. If both land, `VariantShredding.cs` shrinks to
+   a few calls.
 9. **Public `DeltaFilePruner`** — currently `internal`; an API-surface concession, trivial to make.
 
 ### Merge hazard
@@ -345,8 +356,8 @@ having to on 2026-07-27 (`9258706`). The independent CoW-UPDATE finding was fixe
    statistics, predicate pruning and layout parity with Spark/DuckDB, not correctness, which is why it
    is off by default. Enable it with `ParquetWriteOptions.ShredVariants` (2026-07-31), whose layout is
    inferred from the first row group and reused for the file, or pin it with `VariantShredSchemas`.
-   An interop measurement of EW's shredded output is still open. Neither caveat affects the common
-   (annotated) path.
+   EW's shredded output is **externally validated** (2026-07-31) against Spark 4.1.1, DuckDB 1.5.5 and
+   pyarrow — see item 8. Neither caveat affects the common (annotated) path.
 
    **Externally validated (2026-07-19)** against delta-rs 1.6.2, Spark 4.0.1 and Spark 4.1.1, both
    directions, via `VariantInteropTests`. This is where round-trip-through-EW was proven insufficient —

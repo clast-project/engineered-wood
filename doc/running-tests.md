@@ -70,8 +70,9 @@ standing between a spec divergence and shipping it.
 
 | Tier | Install | Tests | Reaches |
 |---|---|---|---|
-| 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 19 | Log/checkpoint replay, path encoding, per-file stats, filtered reads. Seconds to run. |
-| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 36 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival. ~40s to run. |
+| 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 21 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
+| 2 — DuckDB | `pip install duckdb` (1.4+) | 2 | VARIANT parquet reads through an implementation that is not delta-kernel-rs. Sub-second. |
+| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 38 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads. ~40s to run. |
 
 **The `[pyarrow]` extra is not optional.** `deltalake` 1.6 made pyarrow an extra,
 and the tier-1 driver reads through pyarrow — install the bare package and the
@@ -79,9 +80,23 @@ tier does not skip, it FAILS, all 19 tests at once with
 `ImportError: Pyarrow is required, install deltalake[pyarrow]`. The availability
 probe only imports `deltalake`, which succeeds.
 
-Tier 2 (DuckDB) was evaluated and **dropped**: delta-rs embeds
+Tier 2 (DuckDB) was evaluated and **dropped as a Delta tier**: delta-rs embeds
 delta-kernel-rs, which is what DuckDB's delta extension is, so tier 1
 already subsumes it. See [`upstream-landing-notes.md`](upstream-landing-notes.md).
+
+It came back for one thing that reasoning does not cover: **VARIANT**. DuckDB's
+variant type and parquet reader are its own code, not delta-kernel-rs, so for a
+shredded variant column it is a genuinely independent implementation — and it
+costs no JVM. `VariantShreddingInteropTests` uses it that way, on raw parquet
+files with no Delta log involved. Needs DuckDB **1.4+** (VARIANT does not exist
+before that; an older one reads a shredded column as a bare struct, which would
+read as a conformance failure rather than a missing feature), so it takes its
+own interpreter override:
+
+```
+$env:EW_DUCKDB_PYTHON = "…\ew-duckdb\Scripts\python.exe"   # unset -> python on PATH
+$env:EW_REQUIRE_DUCKDB_INTEROP = "1"
+```
 
 **Version pairing matters.** `delta-spark`'s major version must match
 `pyspark`'s — 4.x with Spark 4.0, 3.x with Spark 3.5. The assertions were
@@ -139,10 +154,25 @@ in CI:**
 ```
 EW_REQUIRE_DELTA_INTEROP=1
 EW_REQUIRE_SPARK_INTEROP=1
+EW_REQUIRE_DUCKDB_INTEROP=1
 ```
 
 With either set, an unavailable toolchain becomes a hard failure naming the
 exact missing prerequisite instead of a silent skip.
+
+#### The interop classes share one xUnit collection
+
+`Interop/InteropCollection.cs` puts every interop test class in a single
+`[Collection("Interop")]` with parallelization disabled. They share ONE
+serve-mode Spark process and one lock, so running the classes concurrently buys
+no throughput — it only puts more threads into the 600-second wait described
+below, where a command that is merely QUEUED can exhaust its timeout and fail
+under the name of an innocent test.
+
+Measured when the fourth interop class was added (2026-07-31): 70 passed /
+1 m 13 s before it, 75 passed + 1 timeout / **11 m 28 s** with it and no
+collection, 76 passed / 1 m 32 s once collected. Do not add an interop class
+without the attribute.
 
 #### A stalled Spark driver looks like a failing assertion
 

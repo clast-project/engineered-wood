@@ -439,6 +439,27 @@ def cmd_read_variant(args):
             "rows": [{"id": r[id_col], "vjson": r["vjson"]} for r in rows]}
 
 
+def cmd_read_parquet_variant(args):
+    """Read a RAW parquet file EW wrote (no Delta log) and report its variant column.
+
+    The shredded-write path is a parquet concern, not a table-format one, so this reads the file
+    directly. Two things are reported and both matter: the column's Spark type, which is `variant`
+    only if Spark recognised the annotated group -- a shredded group has a third child, so a reader
+    that keyed off the two-child storage shape would fall back to a struct here -- and to_json(v),
+    which forces Spark to DECODE each value out of typed_value plus any residual.
+    """
+    spark = _spark()
+    df = spark.read.parquet(_uri(args["path"]))
+    id_col, v_col = args.get("id_col", "id"), args.get("col", "v")
+    rows = (df.selectExpr(id_col, f"to_json({v_col}) AS vjson", f"{v_col} IS NULL AS is_null")
+              .orderBy(id_col).collect())
+    return {
+        "spark": spark.version,
+        "column_type": df.schema[v_col].dataType.simpleString(),
+        "rows": [{"id": r[id_col], "vjson": r["vjson"], "null": r["is_null"]} for r in rows],
+    }
+
+
 def cmd_write_variant(args):
     """Write a variant table WITH Spark (parse_json on JSON literals), for the reference -> EW direction.
 
@@ -490,6 +511,7 @@ COMMANDS = {
     "read_row_ids": cmd_read_row_ids,
     "read_changes": cmd_read_changes,
     "read_variant": cmd_read_variant,
+    "read_parquet_variant": cmd_read_parquet_variant,
     "write_variant": cmd_write_variant,
     "write_nested_variant": cmd_write_nested_variant,
     "write": cmd_write,

@@ -17,6 +17,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// <para>Each test names the slice from <c>doc/upstream-landing-notes.md</c> whose correctness it
 /// pins, so a failure points at the change that regressed rather than at "interop".</para>
 /// </summary>
+[Collection("Interop")]
 public class DeltaRsInteropTests : IDisposable
 {
     private readonly string _tempDir;

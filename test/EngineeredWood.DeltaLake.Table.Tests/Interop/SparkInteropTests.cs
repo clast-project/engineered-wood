@@ -24,6 +24,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// files actually touched. Anything delta-rs can check belongs in <see cref="DeltaRsInteropTests"/>,
 /// which runs in seconds.</para>
 /// </summary>
+[Collection("Interop")]
 public class SparkInteropTests : IDisposable
 {
     private readonly string _tempDir;
