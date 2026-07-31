@@ -120,8 +120,12 @@ master between 07-25 and 07-27, and master's versions are supersets — see the 
    delta-kernel-rs, so the reasoning that dropped it as a Delta tier does not apply); **pyarrow**
    confirms the on-disk layout is the spec's — `metadata` required, `value` nullable and NULL on a
    cleanly shredded row, one `value`/`typed_value` pair per hoisted field. The canonical layout is the
-   control in each. Still open: upstream gaps in `Apache.Arrow.Operations` (no validity in the shred
-   pipeline, no array-level entry points) that `VariantShredding` works around.
+   control in each. Still open upstream, and filed against `apache/arrow-dotnet` (2026-07-31):
+   [#398](https://github.com/apache/arrow-dotnet/issues/398) — the shred pipeline has no validity, so a
+   SQL-null row cannot be expressed and `VariantShredding.WithValidity` exists to repair the result;
+   [#399](https://github.com/apache/arrow-dotnet/issues/399) — no array-level entry points, so
+   `Reassemble` and the decode loops are ours to carry. If both land, `VariantShredding.cs` shrinks to
+   a few calls.
 9. **Public `DeltaFilePruner`** — currently `internal`; an API-surface concession, trivial to make.
 
 ### Merge hazard
