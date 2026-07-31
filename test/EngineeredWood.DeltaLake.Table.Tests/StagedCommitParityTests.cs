@@ -68,8 +68,9 @@ public class StagedCommitParityTests : IDisposable
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync), "bornDeleted"),
         // Arbitrary pre-built actions fused into the same commit.
         ["extraActions"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.StageActions), "actions"),
-        // What commitInfo records.
-        ["operation"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.StageActions), "operation"),
+        // What commitInfo records. A PROPERTY since slice 4, not a per-call argument: Delta's operation
+        // field is one string per commit, so it describes the transaction rather than any one staged thing.
+        ["operation"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.Operation)),
         // First-committer-wins pinning: a transaction is pinned to the snapshot it started at, by
         // construction, and reports it.
         ["expectedVersion"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.ReadVersion)),
