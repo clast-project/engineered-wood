@@ -110,7 +110,7 @@ public class PartitionedRewriteLayoutTests : IDisposable
     {
         var wanted = new HashSet<long>(ids);
         var result = new List<long>();
-        await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var id = (Int64Array)b.Column("id");
             var rid = (Int64Array)b.Column(TransientRowAddress.ColumnName);

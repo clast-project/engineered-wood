@@ -128,7 +128,7 @@ public class ReadWithRowTrackingTests : IDisposable
         await table.WriteAsync([Rows((10, "a"), (20, "b"))]); // v1, file 0: ids 0,1
         await table.WriteAsync([Rows((30, "c"))]);            // v2, file 1: id 2
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
 
         Assert.Equal((0L, 1L), tracking["a"]);
         Assert.Equal((1L, 1L), tracking["b"]);
@@ -149,7 +149,7 @@ public class ReadWithRowTrackingTests : IDisposable
 
         await table.UpdateAsync(b => Eq(b, "b"), b => SetValue(b, "B")); // v2
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
 
         Assert.Equal((0L, 1L), tracking["a"]);
         Assert.Equal((1L, 2L), tracking["B"]); // same id, version advanced to the UPDATE's
@@ -167,7 +167,7 @@ public class ReadWithRowTrackingTests : IDisposable
 
         Assert.NotNull(await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
         Assert.Equal(0L, tracking["a"].Id);
         Assert.Equal(1L, tracking["b"].Id);
         Assert.Equal(2L, tracking["c"].Id);
@@ -184,7 +184,7 @@ public class ReadWithRowTrackingTests : IDisposable
 
         await table.DeleteAsync(b => Eq(b, "b"));
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
         Assert.Equal(["a", "c"], tracking.Keys.OrderBy(k => k).ToArray());
         Assert.Equal(0L, tracking["a"].Id);
         Assert.Equal(2L, tracking["c"].Id); // NOT 1 — the DV hole is not closed up
@@ -204,7 +204,7 @@ public class ReadWithRowTrackingTests : IDisposable
         await table.UpdateAsync(b => Eq(b, "b"), b => SetPartitionedValue(b, "B"));
         await table.UpdateAsync(b => Eq(b, "a"), b => SetPartitionedValue(b, "A"));
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
         Assert.Equal(0L, tracking["A"].Id);
         Assert.Equal(1L, tracking["B"].Id);
         Assert.Equal(2L, tracking["c"].Id);
@@ -230,14 +230,14 @@ public class ReadWithRowTrackingTests : IDisposable
         await table.WriteAsync([Rows((10, "a"), (20, "b"))]);
         await table.UpdateAsync(b => Eq(b, "a"), b => SetValue(b, "A")); // materialize, so ids are read back
 
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(["value"], null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Columns = ["value"], Metadata = DeltaRowMetadata.RowTracking }))
         {
             Assert.Equal(
                 ["value", RowTrackingConfig.RowIdColumnName, RowTrackingConfig.RowCommitVersionColumnName],
                 batch.Schema.FieldsList.Select(f => f.Name).ToArray());
         }
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(["value"], null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Columns = ["value"], Metadata = DeltaRowMetadata.RowTracking }));
         Assert.Equal(0L, tracking["A"].Id);
         Assert.Equal(1L, tracking["b"].Id);
     }
@@ -250,7 +250,7 @@ public class ReadWithRowTrackingTests : IDisposable
         await using var table = await CreateAsync();
         await table.WriteAsync([Rows((10, "a"))]);
 
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             foreach (string name in new[]
             {
@@ -279,11 +279,11 @@ public class ReadWithRowTrackingTests : IDisposable
         // its stable id stays 1.
         await table.UpdateAsync(b => Eq(b, "b"), b => SetValue(b, "B"));
 
-        var tracking = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var tracking = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
         Assert.Equal(1L, tracking["B"].Id);
 
         long addressOfB = -1;
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var values = (StringArray)batch.Column("value");
             var addr = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
@@ -294,9 +294,9 @@ public class ReadWithRowTrackingTests : IDisposable
         Assert.NotEqual(tracking["B"].Id, addressOfB);
 
         // ...and neither read emits the other's column.
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
             Assert.True(batch.Schema.GetFieldIndex(TransientRowAddress.ColumnName) < 0);
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
             Assert.True(batch.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName) < 0);
     }
 
@@ -315,8 +315,8 @@ public class ReadWithRowTrackingTests : IDisposable
 
         await table.UpdateAsync(b => Eq(b, "b"), b => SetValue(b, "B")); // v2 rewrites the file
 
-        var atV1 = await TrackingByValueAsync(table.ReadAtVersionWithRowTrackingAsync(v1, null, null));
-        var now = await TrackingByValueAsync(table.ReadAllWithRowTrackingAsync(null, null));
+        var atV1 = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { AtVersion = v1, Metadata = DeltaRowMetadata.RowTracking }));
+        var now = await TrackingByValueAsync(table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }));
 
         Assert.Equal((1L, 1L), atV1["b"]);  // before the update: id 1, version 1
         Assert.Equal((1L, 2L), now["B"]);   // after: same identity, new commit version
@@ -338,7 +338,7 @@ public class ReadWithRowTrackingTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await foreach (var _ in table.ReadAllWithRowTrackingAsync(null, null)) { }
+            await foreach (var _ in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking })) { }
         });
         Assert.Contains("delta.enableRowTracking", ex.Message);
     }
@@ -358,7 +358,7 @@ public class ReadWithRowTrackingTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await foreach (var _ in table.ReadAllWithRowTrackingAsync(null, null)) { }
+            await foreach (var _ in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking })) { }
         });
         Assert.Contains(RowTrackingConfig.RowIdColumnName, ex.Message);
     }

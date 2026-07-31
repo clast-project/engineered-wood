@@ -3199,67 +3199,108 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     #endregion
 
     /// <summary>
-    /// Reads row-level changes between two versions using the Change Data Feed.
-    /// Each batch includes <c>_change_type</c> ("insert", "delete", "update_preimage",
-    /// "update_postimage"), <c>_commit_version</c>, and <c>_commit_timestamp</c> columns.
-    /// For versions with CDC files, those are used directly. For versions without,
-    /// changes are inferred from add/remove actions.
+    /// Reads row-level changes over a version range using the Change Data Feed. Each batch carries
+    /// <c>_change_type</c> ("insert", "delete", "update_preimage", "update_postimage"),
+    /// <c>_commit_version</c> and <c>_commit_timestamp</c>. For versions with CDC files those are used
+    /// directly; for versions without, changes are inferred from add/remove actions.
+    ///
+    /// <para>With <see cref="DeltaRowMetadata.RowTracking"/> each change row also carries its STABLE
+    /// identity, which is what lets a consumer JOIN a change to the row it happened to: an
+    /// <c>update_preimage</c> and its <c>update_postimage</c> report the SAME id, and that id is the one
+    /// <see cref="ReadAsync"/> reports for the row in the table. Resolution matches the main read path where
+    /// the feed comes from a data file (materialized value, else <c>baseRowId + position</c>). Where it comes
+    /// from a <c>_change_data</c> file the id can only be the materialized one — a <c>cdc</c> action has no
+    /// <c>baseRowId</c> — so a change file written without row-tracking columns (by an older
+    /// engineered-wood, or any writer that omits them) reports NULL ids rather than wrong ones. The commit
+    /// version there defaults to the version being read.</para>
     /// </summary>
     public IAsyncEnumerable<RecordBatch> ReadChangesAsync(
-        long startVersion, long endVersion,
+        DeltaChangeReadOptions options,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return ReadChangesCoreAsync(
-            CurrentSnapshot, startVersion, endVersion, emitRowTracking: false, cancellationToken);
-    }
+        if (options is null)
+            throw new ArgumentNullException(nameof(options));
 
-    /// <summary>
-    /// The Change Data Feed WITH each change row's STABLE identity — <see cref="ReadChangesAsync"/> plus
-    /// Delta's two row-tracking columns, <c>_metadata.row_id</c> and <c>_metadata.row_commit_version</c>
-    /// (<see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/> /
-    /// <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName"/>). This is what lets a
-    /// consumer of the feed JOIN a change to the row it happened to: an <c>update_preimage</c> and its
-    /// <c>update_postimage</c> report the SAME id, and that id is the one
-    /// <see cref="ReadAllWithRowTrackingAsync"/> reports for the row in the table.
-    ///
-    /// <para>Resolution matches the main read path where the feed comes from a data file (materialized value,
-    /// else <c>baseRowId + position</c>). Where it comes from a <c>_change_data</c> file the id can only be
-    /// the materialized one — a <c>cdc</c> action has no <c>baseRowId</c> — so a change file written without
-    /// row-tracking columns (by an older engineered-wood, or any writer that omits them) reports NULL ids
-    /// rather than wrong ones. The commit version there defaults to the version being read.</para>
-    ///
-    /// <para>Requires <c>delta.enableRowTracking=true</c>, on the same terms as
-    /// <see cref="ReadAllWithRowTrackingAsync"/>: a table that does not track identity is refused rather than
-    /// served two all-null columns.</para>
-    /// </summary>
-    public IAsyncEnumerable<RecordBatch> ReadChangesWithRowTrackingAsync(
-        long startVersion, long endVersion,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
-        RequireRowTrackingRead(snapshot);
-        return ReadChangesCoreAsync(
-            snapshot, startVersion, endVersion, emitRowTracking: true, cancellationToken);
+        bool emitRowTracking = (options.Metadata & DeltaRowMetadata.RowTracking) != 0;
+
+        // Locator and RowAddress both name a row's place in the ACTIVE set, and a _change_data file is not in
+        // it — so neither address would mean anything a caller could key by. Refused by declaration rather
+        // than left to be discovered.
+        var unsupported = options.Metadata & ~DeltaRowMetadata.RowTracking;
+        if (unsupported != DeltaRowMetadata.None)
+        {
+            throw new ArgumentException(
+                $"DeltaRowMetadata.{unsupported} is not available on the change feed: a _change_data file is "
+                + "not in the snapshot's active set, so a file ordinal or add.path there does not address a "
+                + "row anything else can resolve. Only DeltaRowMetadata.RowTracking is valid here.",
+                nameof(options));
+        }
+        if (emitRowTracking)
+            ValidateReadMetadata(snapshot, DeltaRowMetadata.RowTracking, options.MetadataPrefix);
+
+        return ReadChangesCoreAsync(snapshot, options, emitRowTracking, cancellationToken);
     }
 
     // The materialized column names are fixed at enablement and never change, so the CURRENT snapshot's
     // metadata names them correctly for every version in the range — the same simplification the feed already
     // makes for the schema itself.
-    private IAsyncEnumerable<RecordBatch> ReadChangesCoreAsync(
-        Snapshot.Snapshot snapshot, long startVersion, long endVersion, bool emitRowTracking,
-        CancellationToken cancellationToken)
+    private async IAsyncEnumerable<RecordBatch> ReadChangesCoreAsync(
+        Snapshot.Snapshot snapshot, DeltaChangeReadOptions options, bool emitRowTracking,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
-        return ChangeDataFeed.CdfReader.ReadChangesAsync(
-            _fs, _log, startVersion, endVersion, _dataFileReadOptions,
+
+        var emitted = ChangeDataFeed.CdfReader.ReadChangesAsync(
+            _fs, _log, options.StartVersion, options.EndVersion, _dataFileReadOptions,
             snapshot.ArrowSchema, snapshot.Schema,
             ColumnMapping.GetMode(snapshot.Metadata.Configuration),
             snapshot.Metadata.PartitionColumns,
             matRowIdName, matRowVerName, emitRowTracking,
+            options.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix,
+            options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix,
             cancellationToken);
+
+        // Keep set for the projection, if one was asked for. The feed's own three columns are never dropped
+        // — they are what makes a change row a change — and neither are the metadata columns just added.
+        HashSet<string>? keep = null;
+        if (options.Columns is not null)
+        {
+            keep = new HashSet<string>(options.Columns, StringComparer.Ordinal)
+            {
+                DeltaLake.ChangeDataFeed.CdfConfig.ChangeTypeColumn,
+                DeltaLake.ChangeDataFeed.CdfConfig.CommitVersionColumn,
+                DeltaLake.ChangeDataFeed.CdfConfig.CommitTimestampColumn,
+            };
+            if (emitRowTracking)
+            {
+                keep.Add(options.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix);
+                keep.Add(options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix);
+            }
+        }
+
+        await foreach (var batch in emitted.ConfigureAwait(false))
+            yield return keep is null ? batch : ProjectBatch(batch, keep);
+    }
+
+    /// <summary>Drops the columns not in <paramref name="keep"/>, preserving order. A post-read projection:
+    /// the feed's files were read in full, so this shrinks what crosses the API boundary, not what is read
+    /// from storage.</summary>
+    private static RecordBatch ProjectBatch(RecordBatch batch, HashSet<string> keep)
+    {
+        var builder = new Apache.Arrow.Schema.Builder();
+        var columns = new List<IArrowArray>(batch.ColumnCount);
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            var field = batch.Schema.FieldsList[c];
+            if (!keep.Contains(field.Name))
+                continue;
+            builder.Field(field);
+            columns.Add(batch.Column(c));
+        }
+        return new RecordBatch(builder.Build(), columns, batch.Length);
     }
 
     /// <summary>
@@ -3283,9 +3324,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </remarks>
     /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one value per row of
     /// <paramref name="rows"/>, ordinarily the <c>_metadata.row_id</c> that
-    /// <see cref="ReadAllWithRowTrackingAsync"/> reported for it. A <c>cdc</c> action has no
+    /// a read with <see cref="DeltaRowMetadata.RowTracking"/> reported for it. A <c>cdc</c> action has no
     /// <c>baseRowId</c> for a reader to derive an id from, so a change file left without these carries no
-    /// identity at all: <see cref="ReadChangesWithRowTrackingAsync"/> reports NULL for its rows. Ignored on
+    /// identity at all: the feed reports NULL for its rows. Ignored on
     /// a table that does not track row identity.</param>
     /// <param name="rowCommitVersions">The commit-version companion of <paramref name="rowIds"/>. Pass the
     /// version each row was last changed in; leaving it null defaults every row to the version the change
@@ -3330,7 +3371,56 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads all data from the current snapshot as a stream of RecordBatches.
+    /// Reads the table — one entry point for every combination of projection, pruning, version and per-row
+    /// metadata. See <see cref="DeltaReadOptions"/>; passing null reads every column of the current snapshot
+    /// with no metadata, i.e. the same as <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>.
+    ///
+    /// <para>Batches are emitted in the snapshot's PATH-SORTED active-file order, which is the order
+    /// <see cref="DeltaRowMetadata.RowAddress"/>' file ordinals are assigned in.</para>
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAsync(
+        DeltaReadOptions? options = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        options ??= new DeltaReadOptions();
+        var snapshot = options.AtVersion is { } v && v != CurrentSnapshot.Version
+            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
+            : CurrentSnapshot;
+
+        await foreach (var batch in ReadCoreAsync(snapshot, options, cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// The schema <see cref="ReadAsync"/> will emit for these options, WITHOUT reading anything — the
+    /// table's own fields (projected by <see cref="DeltaReadOptions.Columns"/>) followed by the requested
+    /// metadata columns in <see cref="DeltaRowMetadata"/> declaration order. A host that advertises a scan's
+    /// schema at bind time, before any data is read, gets it here instead of paying for a metadata open.
+    ///
+    /// <para>Validated on the same terms as the read: asking for
+    /// <see cref="DeltaRowMetadata.RowTracking"/> on a table without row tracking, or for a metadata column
+    /// whose name a table column already occupies, throws here too rather than at first batch.</para>
+    /// </summary>
+    public Apache.Arrow.Schema GetReadSchema(DeltaReadOptions options)
+    {
+        ThrowIfDisposed();
+        if (options is null)
+            throw new ArgumentNullException(nameof(options));
+        // Time travel would need I/O to resolve, and this method promises none. The metadata columns do not
+        // vary by version, and a projection over an older schema is the caller's to reconcile.
+        var snapshot = CurrentSnapshot;
+        ValidateReadMetadata(snapshot, options.Metadata, options.MetadataPrefix);
+        return BuildReadSchema(snapshot, options);
+    }
+
+    /// <summary>
+    /// Reads all data from the current snapshot as a stream of RecordBatches — the ordinary-caller form, so
+    /// that reading a table does not require constructing a record. Exposes no per-row metadata; that is
+    /// <see cref="ReadAsync"/>'s job.
     /// </summary>
     public IAsyncEnumerable<RecordBatch> ReadAllAsync(
         IReadOnlyList<string>? columns = null,
@@ -3344,29 +3434,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The reader does NOT re-apply the predicate per row; callers wanting
     /// exact row-level filtering must do that on the returned batches.
     /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
+    public IAsyncEnumerable<RecordBatch> ReadAllAsync(
         IReadOnlyList<string>? columns,
         EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        var snapshot = CurrentSnapshot;
-        var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns,
-            _options.PreferTypedCheckpointStats);
-
-        foreach (var addFile in snapshot.ActiveFiles.Values)
-        {
-            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
-                continue;
-
-            await foreach (var batch in ReadFileAsync(
-                addFile, columns, snapshot, cancellationToken).ConfigureAwait(false))
-            {
-                yield return batch;
-            }
-        }
-    }
+        CancellationToken cancellationToken = default) =>
+        ReadAsync(new DeltaReadOptions { Columns = columns, Filter = filter }, cancellationToken);
 
     /// <summary>
     /// Reads data from a specific version (time travel).
@@ -3382,31 +3454,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// See <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
     /// for filter semantics.
     /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAtVersionAsync(
+    public IAsyncEnumerable<RecordBatch> ReadAtVersionAsync(
         long version,
         IReadOnlyList<string>? columns,
         EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken)
-            .ConfigureAwait(false);
-        var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns,
-            _options.PreferTypedCheckpointStats);
-
-        foreach (var addFile in snapshot.ActiveFiles.Values)
-        {
-            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
-                continue;
-
-            await foreach (var batch in ReadFileAsync(
-                addFile, columns, snapshot, cancellationToken).ConfigureAwait(false))
-            {
-                yield return batch;
-            }
-        }
-    }
+        CancellationToken cancellationToken = default) =>
+        ReadAsync(
+            new DeltaReadOptions { AtVersion = version, Columns = columns, Filter = filter },
+            cancellationToken);
 
     // ── Read-side transient row ids ────────────────────────────────────────────────────────────────────
     //
@@ -3436,198 +3491,206 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return ids;
     }
 
-    /// <summary>
-    /// Like <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
-    /// but appends a trailing non-null Int64 <c>_ew_row_address</c> = a TRANSIENT rowid
-    /// <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c>. NOT a stable Delta row id — it
-    /// round-trips to the row-id DML surface within the SAME snapshot so a host can locate the rows it read
-    /// (a plain copy-on-write DELETE needs no deletion vectors or row tracking).
-    /// </summary>
-    public IAsyncEnumerable<RecordBatch> ReadAllWithRowIdsAsync(
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        return ReadWithTransientRowIdsAsync(CurrentSnapshot, columns, filter, cancellationToken);
-    }
+    // ── The one read path ──────────────────────────────────────────────────────────────────────────────
+    //
+    // All three metadata kinds resolve from the SAME per-file read: ReadFileAsync already surfaces each
+    // surviving row's absolute in-file position and its resolved stable id/commit version as out-params, so
+    // asking for two kinds costs one pass rather than two reads of the table. (They used to be two private
+    // iterators calling ReadFileAsync with different out-params, which is why a host wanting a mutation key
+    // AND a stable identity had to read twice.) Files are walked in PATH-SORTED order in every case, which
+    // is what makes RowAddress' file ordinals mean anything, and makes the plain read's batch order
+    // deterministic rather than dictionary order.
 
-    /// <summary>
-    /// Time travel WITH the transient rowid column — the version analog of <see cref="ReadAllWithRowIdsAsync"/>.
-    /// Each batch carries the trailing <c>_ew_row_address</c> over the version's path-sorted active files.
-    /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAtVersionWithRowIdsAsync(
-        long version,
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken).ConfigureAwait(false);
-        await foreach (var batch in ReadWithTransientRowIdsAsync(snapshot, columns, filter, cancellationToken)
-                           .ConfigureAwait(false))
-        {
-            yield return batch;
-        }
-    }
-
-    // Shared iterator: path-sorted active files, each emitted batch carrying the trailing TransientRowAddress.ColumnName built
-    // from ReadFileAsync's absolute-position out-param (master surfaces positions as an out-param rather than an
-    // appended column, so the wrapper appends the transient id itself — keeping ReadFileAsync's read path intact).
-    private async IAsyncEnumerable<RecordBatch> ReadWithTransientRowIdsAsync(
+    private async IAsyncEnumerable<RecordBatch> ReadCoreAsync(
         Snapshot.Snapshot snapshot,
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        DeltaReadOptions options,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var pruner = filter is null ? null : new DeltaFilePruner(
+        var metadata = options.Metadata;
+        ValidateReadMetadata(snapshot, metadata, options.MetadataPrefix);
+
+        bool wantAddress = (metadata & DeltaRowMetadata.RowAddress) != 0;
+        bool wantLocator = (metadata & DeltaRowMetadata.Locator) != 0;
+        bool wantTracking = (metadata & DeltaRowMetadata.RowTracking) != 0;
+        bool wantPositions = wantAddress || wantLocator;
+
+        var metadataFields = MetadataFields(metadata, options.MetadataPrefix);
+        var pruner = options.Filter is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
+
         var ordered = OrderedActiveFiles(snapshot);
         for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
         {
             var addFile = ordered[ordinal];
-            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+            if (pruner is not null && !pruner.ShouldInclude(addFile, options.Filter!))
                 continue;
 
-            var absOut = new List<Int64Array?>();
+            // Only ask ReadFileAsync for the out-params this read actually needs: each one costs a
+            // per-row builder pass inside the pipeline.
+            var absOut = wantPositions ? new List<Int64Array?>() : null;
+            var idsOut = wantTracking ? new List<Int64Array?>() : null;
+            var versOut = wantTracking ? new List<Int64Array?>() : null;
+            byte[]? pathBytes = wantLocator
+                ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+
             int bi = -1;
-            await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken,
-                                                      strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+            await foreach (var batch in ReadFileAsync(
+                               addFile, options.Columns, snapshot, cancellationToken,
+                               strippedRowIdsOut: idsOut, strippedVersionsOut: versOut,
+                               strippedAbsPositionsOut: absOut).ConfigureAwait(false))
             {
                 bi++;
-                var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var idb = new Int64Array.Builder().Reserve(batch.Length);
-                for (int i = 0; i < batch.Length; i++)
+                if (metadataFields.Count == 0)
                 {
-                    long absolute = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
-                        ? absPos.GetValue(i)!.Value : i;
-                    idb.Append(TransientRowAddress.Pack(ordinal, absolute));
+                    yield return batch;
+                    continue;
                 }
-                yield return RowTracking.RowTrackingWriter.AddRowIdColumn(
-                    batch, idb.Build(), TransientRowAddress.ColumnName);
+
+                var absPos = absOut is not null && bi < absOut.Count ? absOut[bi] : null;
+                var columns = new List<IArrowArray>(metadataFields.Count);
+
+                if (wantAddress)
+                {
+                    var b = new Int64Array.Builder().Reserve(batch.Length);
+                    for (int i = 0; i < batch.Length; i++)
+                        b.Append(TransientRowAddress.Pack(ordinal, AbsoluteAt(absPos, i)));
+                    columns.Add(b.Build());
+                }
+                if (wantLocator)
+                {
+                    columns.Add(ArrowCompute.Repeat(Apache.Arrow.Types.StringType.Default, pathBytes!, batch.Length));
+                    var b = new Int64Array.Builder().Reserve(batch.Length);
+                    for (int i = 0; i < batch.Length; i++)
+                        b.Append(AbsoluteAt(absPos, i));
+                    columns.Add(b.Build());
+                }
+                if (wantTracking)
+                {
+                    var ids = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                    var vers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                    columns.Add(ids ?? AllNullInt64(batch.Length));
+                    columns.Add(vers ?? AllNullInt64(batch.Length));
+                }
+
+                yield return AppendColumns(batch, metadataFields, columns);
             }
         }
     }
 
-    // ── Delta ROW TRACKING columns: a row's STABLE identity ──
-    // The spec's two generated columns, resolved per row as the file's materialized value where it has one,
-    // else add.baseRowId + position / add.defaultRowCommitVersion. This is the identity Spark exposes as
-    // _metadata.row_id — it survives UPDATE, DELETE, OVERWRITE and compaction, and is comparable across
-    // snapshots. NOT the TransientRowAddress the methods above emit, which says only where a row currently
-    // sits; the two have been confused before (see TransientRowAddress' remarks), so they are deliberately
-    // named for what they are rather than by one distinguishing adjective.
+    /// <summary>A row's ABSOLUTE in-file position: the out-param value where the read surfaced one, else the
+    /// batch offset — which is the same number for a file with no deletion vector, the only case where the
+    /// out-param is absent.</summary>
+    private static long AbsoluteAt(Int64Array? absPositions, int i) =>
+        absPositions is not null && i < absPositions.Length && !absPositions.IsNull(i)
+            ? absPositions.GetValue(i)!.Value : i;
 
-    /// <summary>
-    /// Like <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
-    /// but appends Delta's two row-tracking columns — <c>_metadata.row_id</c> and
-    /// <c>_metadata.row_commit_version</c> (<see cref="DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName"/>
-    /// / <see cref="DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName"/>), carrying each row's
-    /// STABLE identity: the file's materialized value where it has one, else <c>add.baseRowId + position</c> /
-    /// <c>add.defaultRowCommitVersion</c>. The values match what a conformant engine (Spark) reads for the same
-    /// rows, and survive rewrites — a row keeps its id through UPDATE, copy-on-write DELETE, OVERWRITE and
-    /// compaction.
-    /// <para>Both columns are NULLABLE: a file predating row tracking on the table carries no
-    /// <c>baseRowId</c>, and its rows have no derivable id. Requires <c>delta.enableRowTracking=true</c> —
-    /// reading a table without it throws rather than returning an all-null column that would read as
-    /// "these rows have no identity" instead of "this table does not track identity".</para>
-    /// </summary>
-    public IAsyncEnumerable<RecordBatch> ReadAllWithRowTrackingAsync(
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        CancellationToken cancellationToken = default)
+    /// <summary>Appends the metadata columns to a user batch. They are added AFTER the pipeline rather than
+    /// inside it, so the schema reconciliation in <see cref="ProcessFileBatchesAsync"/> — which is defined
+    /// against the table's Delta schema — never sees a column that is not in it.</summary>
+    private static RecordBatch AppendColumns(
+        RecordBatch batch, IReadOnlyList<Field> fields, IReadOnlyList<IArrowArray> values)
     {
-        ThrowIfDisposed();
-        return ReadWithRowTrackingAsync(CurrentSnapshot, columns, filter, cancellationToken);
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in batch.Schema.FieldsList)
+            builder.Field(field);
+        foreach (var field in fields)
+            builder.Field(field);
+
+        var columns = new List<IArrowArray>(batch.ColumnCount + values.Count);
+        for (int c = 0; c < batch.ColumnCount; c++)
+            columns.Add(batch.Column(c));
+        columns.AddRange(values);
+
+        return new RecordBatch(builder.Build(), columns, batch.Length);
     }
 
     /// <summary>
-    /// Time travel WITH the row-tracking columns — the version analog of
-    /// <see cref="ReadAllWithRowTrackingAsync"/>. Because the ids are stable, a row read at two different
-    /// versions reports the SAME <c>_metadata.row_id</c>, which is what makes this usable for diffing a row
-    /// across history; its <c>_metadata.row_commit_version</c> is the version that last changed it.
+    /// The metadata columns a read appends, in <see cref="DeltaRowMetadata"/> declaration order. The single
+    /// definition of that list: both <see cref="GetReadSchema"/> and <see cref="ReadCoreAsync"/> build from
+    /// it, so the promised schema and the emitted one cannot drift.
     /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAtVersionWithRowTrackingAsync(
-        long version,
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    private static List<Field> MetadataFields(DeltaRowMetadata metadata, string prefix)
     {
-        ThrowIfDisposed();
-        var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken).ConfigureAwait(false);
-        await foreach (var batch in ReadWithRowTrackingAsync(snapshot, columns, filter, cancellationToken)
-                           .ConfigureAwait(false))
+        var fields = new List<Field>(5);
+        if ((metadata & DeltaRowMetadata.RowAddress) != 0)
         {
-            yield return batch;
+            fields.Add(new Field(TransientRowAddress.ColumnName, Apache.Arrow.Types.Int64Type.Default, nullable: false));
         }
+        if ((metadata & DeltaRowMetadata.Locator) != 0)
+        {
+            fields.Add(new Field(
+                prefix + DeltaMetadataColumns.FilePathSuffix, Apache.Arrow.Types.StringType.Default, nullable: false));
+            fields.Add(new Field(
+                prefix + DeltaMetadataColumns.RowIndexSuffix, Apache.Arrow.Types.Int64Type.Default, nullable: false));
+        }
+        if ((metadata & DeltaRowMetadata.RowTracking) != 0)
+        {
+            // Nullable: a file predating row tracking on the table carries no baseRowId, so its rows have no
+            // derivable id — reported as null rather than fabricated.
+            fields.Add(new Field(
+                prefix + DeltaMetadataColumns.RowIdSuffix, Apache.Arrow.Types.Int64Type.Default, nullable: true));
+            fields.Add(new Field(
+                prefix + DeltaMetadataColumns.RowCommitVersionSuffix, Apache.Arrow.Types.Int64Type.Default, nullable: true));
+        }
+        return fields;
     }
 
-    // Shared iterator. The per-row resolution already exists on the read path (ReadFileAsync surfaces it via
-    // the rowid out-params, which the rewrite paths consume to preserve ids); this appends it as columns
-    // AFTER the pipeline, so the schema reconciliation inside ProcessFileBatchesAsync — which is defined
-    // against the table's Delta schema — never sees a column that is not in it.
-    private async IAsyncEnumerable<RecordBatch> ReadWithRowTrackingAsync(
-        Snapshot.Snapshot snapshot,
-        IReadOnlyList<string>? columns,
-        EngineeredWood.Expressions.Predicate? filter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    private static Apache.Arrow.Schema BuildReadSchema(
+        Snapshot.Snapshot snapshot, DeltaReadOptions options)
     {
-        RequireRowTrackingRead(snapshot);
+        var baseSchema = options.Columns is not null
+            ? BuildProjectedSchema(snapshot.ArrowSchema, options.Columns)
+            : snapshot.ArrowSchema;
 
-        var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns,
-            _options.PreferTypedCheckpointStats);
+        var metadataFields = MetadataFields(options.Metadata, options.MetadataPrefix);
+        if (metadataFields.Count == 0)
+            return baseSchema;
 
-        foreach (var addFile in OrderedActiveFiles(snapshot))
-        {
-            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
-                continue;
-
-            var idsOut = new List<Int64Array?>();
-            var versOut = new List<Int64Array?>();
-            int bi = -1;
-            await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken,
-                                                      strippedRowIdsOut: idsOut,
-                                                      strippedVersionsOut: versOut).ConfigureAwait(false))
-            {
-                bi++;
-                var ids = bi < idsOut.Count ? idsOut[bi] : null;
-                var vers = bi < versOut.Count ? versOut[bi] : null;
-                yield return RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
-                    batch,
-                    ids ?? AllNullInt64(batch.Length),
-                    vers ?? AllNullInt64(batch.Length),
-                    DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
-                    DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName,
-                    nullable: true);
-            }
-        }
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in baseSchema.FieldsList)
+            builder.Field(field);
+        foreach (var field in metadataFields)
+            builder.Field(field);
+        return builder.Build();
     }
 
     /// <summary>
-    /// The preconditions for reading the row-tracking columns: the table must actually track row identity, and
-    /// the two generated column names must be free. Both failures are refused rather than papered over — an
-    /// all-null id column on a table with no row tracking, or a user column shadowed by a generated one, would
-    /// each be read as data rather than as the mistake it is.
+    /// The preconditions for the requested metadata: row tracking must be enabled on the table if its
+    /// columns were asked for, and no emitted name may collide with a column the table already has. Both
+    /// failures are refused rather than papered over — an all-null id column on a table with no row
+    /// tracking, or a user column shadowed by a generated one, would each be read as data rather than as
+    /// the mistake it is. The prefix exists so a collision has somewhere to move to.
     /// </summary>
-    private static void RequireRowTrackingRead(Snapshot.Snapshot snapshot)
+    private static void ValidateReadMetadata(
+        Snapshot.Snapshot snapshot, DeltaRowMetadata metadata, string prefix)
     {
-        if (!DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
+        if (prefix is null)
+            throw new ArgumentNullException(nameof(prefix));
+        if (metadata == DeltaRowMetadata.None)
+            return;
+
+        if ((metadata & DeltaRowMetadata.RowTracking) != 0
+            && !DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
         {
             throw new InvalidOperationException(
-                "Reading the row-tracking columns requires 'delta.enableRowTracking=true' on the table. This "
+                "DeltaRowMetadata.RowTracking requires 'delta.enableRowTracking=true' on the table. This "
                 + "table does not track row identity, so its rows have no stable id to report — use "
-                + "ReadAllWithRowIdsAsync for a snapshot-scoped row ADDRESS instead.");
+                + "DeltaRowMetadata.Locator or .RowAddress for a snapshot-scoped row ADDRESS instead.");
         }
 
+        var emitted = MetadataFields(metadata, prefix);
         foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
-            if (field.Name == DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName
-                || field.Name == DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName)
+            foreach (var m in emitted)
             {
-                throw new InvalidOperationException(
-                    $"The table has a column named '{field.Name}', which collides with the Delta row-tracking "
-                    + "generated column of that name. The read cannot report both.");
+                if (string.Equals(field.Name, m.Name, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"The table has a column named '{field.Name}', which collides with the metadata "
+                        + "column of that name. The read cannot report both — set "
+                        + "DeltaReadOptions.MetadataPrefix to move the metadata columns out of the way.");
+                }
             }
         }
     }
@@ -5120,8 +5183,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Build the selection against the snapshot its addresses came from —
     /// <see cref="RowSelection.FromRowAddresses"/> for a host whose rowid is one packed <c>BIGINT</c>,
     /// <see cref="RowSelection.FromLocatorColumns"/> straight from batches read with
-    /// <c>DeltaRowMetadata.Locator</c>. A path the current snapshot no longer holds is reported rather than
-    /// silently skipped.</para>
+    /// <see cref="DeltaRowMetadata.Locator"/>. A path the current snapshot no longer holds is reported
+    /// rather than silently skipped.</para>
     ///
     /// <para>With <c>delta.enableChangeDataFeed</c> the removed rows are written as <c>delete</c> change files
     /// in both modes, so the feed reports exactly them. Row tracking is preserved.</para>

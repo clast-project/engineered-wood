@@ -83,7 +83,7 @@ public class HostStagedTransactionTests : IDisposable
         var ordered = table.CurrentSnapshot.ActiveFiles.Values
             .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
         var located = new Dictionary<long, (string, long)>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
@@ -332,7 +332,7 @@ public class HostStagedTransactionTests : IDisposable
 
         await using var check = await OpenAsync();
         var changes = new List<(long Id, string Type)>();
-        await foreach (var batch in check.ReadChangesAsync(version, version))
+        await foreach (var batch in check.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
         {
             var ids = (Int64Array)batch.Column("id");
             var types = (StringArray)batch.Column("_change_type");
@@ -383,7 +383,7 @@ public class HostStagedTransactionTests : IDisposable
 
         await using var check = await OpenAsync();
         var changes = new List<(long Id, string Region, string Type)>();
-        await foreach (var batch in check.ReadChangesAsync(version, version))
+        await foreach (var batch in check.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
         {
             var ids = (Int64Array)batch.Column("id");
             var regions = (StringArray)batch.Column("region");

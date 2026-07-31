@@ -39,7 +39,9 @@ internal static class CdfReader
         IReadOnlyDictionary<string, string> LogicalToPhysical,
         string? MaterializedRowIdName,
         string? MaterializedRowVersionName,
-        bool EmitRowTracking)
+        bool EmitRowTracking,
+        string EmittedRowIdName,
+        string EmittedRowVersionName)
     {
         /// <summary>True when the table DECLARES its hidden materialized column names — the gate for
         /// touching them at all, so a table without row tracking is read exactly as before.</summary>
@@ -69,6 +71,8 @@ internal static class CdfReader
         string? materializedRowIdName = null,
         string? materializedRowVersionName = null,
         bool emitRowTracking = false,
+        string? emittedRowIdName = null,
+        string? emittedRowVersionName = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var ctx = new CdfSchemaContext(
@@ -76,7 +80,10 @@ internal static class CdfReader
             mappingMode == ColumnMappingMode.None
                 ? new Dictionary<string, string>()
                 : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode),
-            materializedRowIdName, materializedRowVersionName, emitRowTracking);
+            materializedRowIdName, materializedRowVersionName, emitRowTracking,
+            emittedRowIdName ?? DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
+            emittedRowVersionName
+                ?? DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
 
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
@@ -205,7 +212,8 @@ internal static class CdfReader
             yield return ctx.EmitRowTracking
                 ? ResolveRowTracking(
                     withMetadata, matIds, matVers,
-                    baseRowId: null, defaultRowCommitVersion: commitVersion, absolutePositions: null)
+                    baseRowId: null, defaultRowCommitVersion: commitVersion, absolutePositions: null,
+                    ctx.EmittedRowIdName, ctx.EmittedRowVersionName)
                 : withMetadata;
         }
     }
@@ -301,7 +309,8 @@ internal static class CdfReader
             yield return ResolveRowTracking(
                 withMetadata,
                 Gather(rawMatIds, survivorSrc), Gather(rawMatVers, survivorSrc),
-                baseRowId, defaultRowCommitVersion, positions);
+                baseRowId, defaultRowCommitVersion, positions,
+                ctx.EmittedRowIdName, ctx.EmittedRowVersionName);
         }
     }
 
@@ -329,7 +338,7 @@ internal static class CdfReader
     ///
     /// <para>The default differs by source, which is why it is a parameter rather than a rule here. From a
     /// data file (the inferred feed) it is <c>baseRowId + absolute position</c> and the action's
-    /// <c>defaultRowCommitVersion</c>, matching <c>DeltaTable.ReadAllWithRowTrackingAsync</c> exactly. From a
+    /// <c>defaultRowCommitVersion</c>, matching a <c>DeltaRowMetadata.RowTracking</c> read exactly. From a
     /// change file there is no <c>baseRowId</c> to add to — a <c>cdc</c> action has no such field — so an
     /// unmaterialized id stays NULL, while the version defaults to the commit that produced the file.</para>
     ///
@@ -342,7 +351,9 @@ internal static class CdfReader
         Int64Array? materializedVersions,
         long? baseRowId,
         long? defaultRowCommitVersion,
-        IReadOnlyList<long>? absolutePositions)
+        IReadOnlyList<long>? absolutePositions,
+        string emittedRowIdName,
+        string emittedRowVersionName)
     {
         var idb = new Int64Array.Builder().Reserve(batch.Length);
         var vrb = new Int64Array.Builder().Reserve(batch.Length);
@@ -364,9 +375,7 @@ internal static class CdfReader
 
         return RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
             batch, idb.Build(), vrb.Build(),
-            DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
-            DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName,
-            nullable: true);
+            emittedRowIdName, emittedRowVersionName, nullable: true);
     }
 
     // Maps a PHYSICAL-layout data batch (physical names, partition columns absent) to the LOGICAL schema and

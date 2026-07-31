@@ -47,7 +47,10 @@ which is worth measuring because Spark never asks for them) and
 `_row-id-col-<uuid>` values out of Spark's own change files; pre/post images of the updated row report the
 id Spark assigned, the post-image's null version resolves to the commit, and a Spark-deleted row reports the
 identity it had). Non-interop cover in `CdfRowTrackingTests` (10), each confirmed to fail with the writer or
-the reader neutered. Remaining on this surface: the emitted column NAMES are still not configurable.
+the reader neutered. The one remaining gap on this surface — the emitted column NAMES — is CLOSED as of the
+host-seam consolidation: `DeltaReadOptions.MetadataPrefix` and `DeltaChangeReadOptions.MetadataPrefix` set
+the prefix (default `_metadata.`), and a metadata name colliding with a table column is refused rather than
+shadowed.
 
 **FOREIGN→EW MEASURED 2026-07-28 (gap 7's remaining half) — no production change needed.**
 The direction this brief repeatedly warned was unproven: a row-tracking table SPARK creates, writes, and

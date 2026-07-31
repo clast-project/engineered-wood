@@ -163,7 +163,7 @@ public class CreateTimeFeatureEnablementTests : IDisposable
         Assert.Null(protocol.ReaderFeatures);
 
         var changes = new List<(string ChangeType, long Id, string Value)>();
-        await foreach (var b in table.ReadChangesAsync(1, 2))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 1, EndVersion = 2 }))
         {
             var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
             var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));

@@ -53,7 +53,7 @@ public class RowIdDmlTests : IDisposable
     {
         var wanted = new HashSet<long>(ids);
         var result = new List<long>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var id = (Int64Array)batch.Column("id");
             var rid = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
@@ -70,18 +70,23 @@ public class RowIdDmlTests : IDisposable
         RowSelection.FromRowAddresses(await RowIdsOf(table, ids), table.CurrentSnapshot);
 
     /// <summary>The (add.path, absolute position) locator pair for each row whose id is in
-    /// <paramref name="ids"/> — what a read with the Locator metadata will emit once slice 1 lands, built
-    /// here from the packed address so this surface can be exercised now.</summary>
+    /// <paramref name="ids"/>, read straight off the wire — the same pair the DML consumes.</summary>
     private static async Task<List<(string Path, long Position)>> LocatorsOf(
         DeltaTable table, params long[] ids)
     {
-        var ordered = table.CurrentSnapshot.ActiveFiles.Values
-            .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        var wanted = new HashSet<long>(ids);
         var result = new List<(string, long)>();
-        foreach (long address in await RowIdsOf(table, ids))
+        await foreach (var batch in table.ReadAsync(
+            new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
         {
-            result.Add((ordered[TransientRowAddress.FileOrdinal(address)],
-                        TransientRowAddress.Position(address)));
+            var id = (Int64Array)batch.Column("id");
+            var path = (StringArray)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix);
+            var position = (Int64Array)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix);
+            for (int i = 0; i < batch.Length; i++)
+                if (wanted.Contains(id.GetValue(i)!.Value))
+                    result.Add((path.GetString(i), position.GetValue(i)!.Value));
         }
         return result;
     }
@@ -436,7 +441,7 @@ public class RowIdDmlTests : IDisposable
     {
         await using var reader = await OpenAsync();
         var rows = new List<string>();
-        await foreach (var b in reader.ReadChangesAsync(from, to))
+        await foreach (var b in reader.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = from, EndVersion = to }))
         {
             var changeType = (StringArray)b.Column(EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.ChangeTypeColumn);
             for (int i = 0; i < b.Length; i++)

@@ -209,7 +209,7 @@ public class RowSelectionTests : IDisposable
     private static async Task<Dictionary<int, List<long>>> IdsByOrdinalAsync(DeltaTable table)
     {
         var byOrdinal = new Dictionary<int, List<long>>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var id = (Int64Array)batch.Column("id");
             var rid = (Int64Array)batch.Column(TransientRowAddress.ColumnName);

@@ -41,7 +41,51 @@ Files are returned with their deletion vectors unresolved. Read the deleted posi
 `DeletionVectorReader` and exclude them however your engine prefers — pushing them down as a
 `file_row_number NOT IN (…)` predicate is usually cheaper than filtering rows in C#.
 
-## 3. Address rows
+## 3. Read, with the metadata you need
+
+`DeltaTable.ReadAsync` is the one read entry point; `DeltaReadOptions` carries everything that varies.
+
+```csharp
+await foreach (var batch in table.ReadAsync(new DeltaReadOptions
+{
+    Columns  = ["id", "payload"],
+    Filter   = predicate,                       // same superset-safe prune as PlanFiles
+    AtVersion = pinnedVersion,                  // omit for the current snapshot
+    Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
+}))
+```
+
+`DeltaRowMetadata` is `[Flags]`, and that is the point: the three kinds resolve from the *same* per-file
+read, so asking for two costs one pass rather than two reads of the table — and the values agree row for
+row, which two reads across a concurrent commit could not promise.
+
+| Flag | Appends | Use it for |
+|---|---|---|
+| `RowAddress` | `_ew_row_address` (Int64, non-null) | a host whose rowid must be one `BIGINT` |
+| `Locator` | `{prefix}file_path`, `{prefix}row_index` | feeding the DML directly (§4) |
+| `RowTracking` | `{prefix}row_id`, `{prefix}row_commit_version` | durable identity across rewrites |
+
+`MetadataPrefix` (default `_metadata.`, matching Spark's struct) renames the `Locator` and `RowTracking`
+columns. `RowAddress` is not prefixed — it has no Spark counterpart to borrow a name from. A metadata name
+that collides with one of the table's own columns is refused rather than shadowing it, which is what the
+prefix is there to resolve.
+
+**`GetReadSchema(options)` returns the schema `ReadAsync` will emit, without reading anything** — the same
+projection, the same metadata columns, in the same order. A scan that has to advertise its schema at bind
+time gets it here instead of paying for a metadata open.
+
+```csharp
+Schema advertised = table.GetReadSchema(options);
+```
+
+`ReadAllAsync` and `ReadAtVersionAsync` remain as convenience wrappers for the ordinary caller. They expose
+no metadata; that is `ReadAsync`'s job.
+
+The change feed takes the same treatment through `DeltaChangeReadOptions` — `StartVersion` / `EndVersion` /
+`Columns` / `Metadata` / `MetadataPrefix`. Only `RowTracking` is valid there: a `_change_data` file is not in
+the snapshot's active set, so neither address would name a row anything else could resolve.
+
+## 4. Address rows
 
 **`RowSelection` is the row-level DML boundary key**, and the only one. It is per data file, keyed by the
 file's `add.path` exactly as the snapshot records it, holding the ABSOLUTE in-file positions selected —
@@ -80,7 +124,7 @@ RowSelection.FromRowAddresses(addresses, txn.Snapshot, StaleAddressPolicy.Skip);
 
 A stale *path* is detectable, so the DML reports it rather than skipping: if a concurrent commit removed or
 rewrote a file the selection names, `DeleteRowsAsync` / `UpdateRowsAsync` / `ReadRowsAsync` throw naming it.
-Stage the delete on a `DeltaTransaction` instead and the commit loop reconciles that case for you (§5).
+Stage the delete on a `DeltaTransaction` instead and the commit loop reconciles that case for you (§6).
 
 ### The packing codec
 
@@ -134,7 +178,7 @@ statistics. The commit *version* is deliberately not materialized — it should 
 commit, which the add's `defaultRowCommitVersion` already says. Requires the table to declare
 `delta.rowTracking.materializedRowIdColumnName`.
 
-## 4. Swap in your own codec
+## 5. Swap in your own codec
 
 `IDataFileReader` and `IDataFileWriter` replace the built-in parquet path, wired through `DeltaTableOptions`.
 The library still handles deletion-vector filtering, schema-evolution backfill, partition-column
@@ -169,7 +213,7 @@ never crosses a foreign ABI — and gets a canonical `VariantArray` back, which 
 
 Both properties are pinned by `CodecSeamValueBlindnessTests`.
 
-## 5. Stage work on the transaction
+## 6. Stage work on the transaction
 
 This is the part that most repays reading. A host arrives with work **already done**, so it stages results
 rather than handing over batches and predicates:
@@ -177,7 +221,7 @@ rather than handing over batches and predicates:
 | Method | Stages |
 |---|---|
 | `StageDataFiles(files)` | Data files you already wrote (append-shaped) |
-| `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§3) |
+| `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§4) |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
 | `StageActions(actions)` | Anything else — `txn` ids, your own domain metadata |

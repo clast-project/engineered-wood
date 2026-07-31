@@ -103,7 +103,7 @@ public class HostRowIdentityTests : IDisposable
         var ordered = table.CurrentSnapshot.ActiveFiles.Values
             .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
         var located = new Dictionary<long, (string, long)>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);

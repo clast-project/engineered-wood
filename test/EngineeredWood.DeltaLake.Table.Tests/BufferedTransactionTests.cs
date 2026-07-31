@@ -256,7 +256,7 @@ public class BufferedTransactionTests : IDisposable
     private static async Task<Dictionary<long, (int Ordinal, long Position)>> LocateRowsAsync(DeltaTable table)
     {
         var located = new Dictionary<long, (int, long)>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
