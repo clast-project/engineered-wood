@@ -174,7 +174,9 @@ public class PartitionedRewriteLayoutTests : IDisposable
         await using (var table = await CreateAsync())
         {
             await table.WriteAsync([Batch(1, 3, "east")]);
-            await table.DeleteByRowIdsAsync(await RowIdsOfAsync(table, 2));
+            await table.DeleteRowsAsync(
+                RowSelection.FromRowAddresses(await RowIdsOfAsync(table, 2), table.CurrentSnapshot),
+                RowDeleteMode.CopyOnWrite);
         }
 
         Assert.Equal([["id", "val"]], await ActiveFileColumnsAsync());
@@ -188,17 +190,25 @@ public class PartitionedRewriteLayoutTests : IDisposable
         await using (var table = await CreateAsync())
         {
             await table.WriteAsync([Batch(1, 3, "east")]);
-            long rid = (await RowIdsOfAsync(table, 3)).Single();
-            var updates = new RecordBatch(
-                new Apache.Arrow.Schema.Builder()
-                    .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
-                    .Field(new Field("val", Int64Type.Default, true))
-                    .Build(),
-                [
-                    new Int64Array.Builder().Append(rid).Build(),
-                    new Int64Array.Builder().Append(777).Build(),
-                ], 1);
-            await table.UpdateByRowIdsAsync(updates);
+            var selection = RowSelection.FromRowAddresses(
+                await RowIdsOfAsync(table, 3), table.CurrentSnapshot);
+            await table.UpdateRowsAsync(selection, (_, batches, _) =>
+            {
+                var outp = new List<RecordBatch>(batches.Count);
+                foreach (var b in batches)
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var val = (Int64Array)b.Column("val");
+                    var nb = new Int64Array.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        nb.Append(id.GetValue(i) == 3 ? 777 : val.GetValue(i)!.Value);
+                    var columns = new IArrowArray[b.ColumnCount];
+                    for (int c = 0; c < b.ColumnCount; c++)
+                        columns[c] = b.Schema.FieldsList[c].Name == "val" ? nb.Build() : b.Column(c);
+                    outp.Add(new RecordBatch(b.Schema, columns, b.Length));
+                }
+                return outp;
+            });
         }
 
         Assert.Equal([["id", "val"]], await ActiveFileColumnsAsync());

@@ -3413,7 +3413,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // A read that appends a trailing non-null Int64 TransientRowAddress.ColumnName = (fileOrdinal <<
     // PositionBits) | ABSOLUTE in-file position (path-sorted active set; the DV-inclusive parquet row index).
     // NOT a stable Delta row id — valid only within one snapshot. It round-trips to the row-id DML surface
-    // (ComputeDeletionVectorActionsAsync / ReadRowsByRowIdsAsync consume the same (ordinal, absPos)), so a host
+    // (RowSelection.FromRowAddresses unpacks it into the path-keyed key the DML consumes), so a host
     // (e.g. DuckDB) can read rows, keep the ids, then delete/update exactly those rows — even on a plain table
     // with no deletion vectors or row-tracking feature, the maximally reader-compatible path.
 
@@ -4794,11 +4794,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // The transient rowid packs (path-sorted file ordinal, absolute in-file position) — see
     // <see cref="TransientRowAddress"/>, which owns the encoding and the public pack/unpack helpers.
 
-    private static List<Actions.AddFile> OrderedActiveFiles(Snapshot.Snapshot snapshot)
+    internal static List<Actions.AddFile> OrderedActiveFiles(Snapshot.Snapshot snapshot)
     {
         var files = new List<Actions.AddFile>(snapshot.ActiveFiles.Values);
         files.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
         return files;
+    }
+
+    /// <summary>
+    /// The active set keyed by <c>add.path</c> — what a <see cref="RowSelection"/> speaks.
+    /// <see cref="Snapshot.Snapshot.ActiveFiles"/> is NOT this map: it is keyed by the spec's reconciliation
+    /// key, <c>(path, deletionVector.uniqueId)</c>, so a file carrying a deletion vector is not found under
+    /// its bare path. One path has at most one active entry (a DV swap removes the old key), so this is
+    /// well-defined.
+    /// </summary>
+    internal static Dictionary<string, Actions.AddFile> ActiveFilesByPath(Snapshot.Snapshot snapshot)
+    {
+        var byPath = new Dictionary<string, Actions.AddFile>(
+            snapshot.ActiveFiles.Count, StringComparer.Ordinal);
+        foreach (var add in snapshot.ActiveFiles.Values)
+            byPath[add.Path] = add;
+        return byPath;
     }
 
     /// <summary>
@@ -5010,37 +5026,44 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot? resolveAgainst = null)
     {
         ThrowIfDisposed();
-        var result = await ComputeDvActionsWithEditsAsync(
-            positionsByOrdinal, resolveAgainst ?? CurrentSnapshot, cancellationToken).ConfigureAwait(false);
+        var snapshot = resolveAgainst ?? CurrentSnapshot;
+        // This is the LOWER-LAYER primitive — the surface for a host driving its own retry loop — and it keeps
+        // its historical leniency: an ordinal outside the active set is dropped rather than reported. The DML
+        // boundary (RowSelection) defaults to Throw instead.
+        var selection = RowSelection.FromOrdinals(
+            positionsByOrdinal, snapshot, StaleAddressPolicy.Skip, nameof(positionsByOrdinal));
+        var result = await ComputeDvActionsWithEditsAsync(selection, snapshot, cancellationToken)
+            .ConfigureAwait(false);
         return (result.Actions, result.RowsDeleted);
     }
 
     /// <summary>
-    /// The body of <see cref="ComputeDeletionVectorActionsAsync"/>, additionally reporting the per-file
-    /// <see cref="DeleteDvEdit"/>s and the touched paths. A <see cref="DeltaTransaction"/> needs those: the edits
-    /// are what let the commit loop reconcile this delete row-by-row against a concurrent one rather than abort,
-    /// and the paths are its read-set. The public wrapper drops them because a caller driving the rebase by hand
-    /// passes its positions back to <see cref="RebaseDvDmlActionsAsync"/> instead.
+    /// The body of <see cref="ComputeDeletionVectorActionsAsync"/>, keyed by <see cref="RowSelection"/> and
+    /// additionally reporting the per-file <see cref="DeleteDvEdit"/>s and the touched paths. A
+    /// <see cref="DeltaTransaction"/> needs those: the edits are what let the commit loop reconcile this delete
+    /// row-by-row against a concurrent one rather than abort, and the paths are its read-set. The public wrapper
+    /// drops them because a caller driving the rebase by hand passes its positions back to
+    /// <see cref="RebaseDvDmlActionsAsync"/> instead.
     /// </summary>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, IReadOnlyList<DeleteDvEdit> Edits,
         IReadOnlyList<string> TouchedPaths, long RowsDeleted)> ComputeDvActionsWithEditsAsync(
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        RowSelection selection,
         Snapshot.Snapshot snapshot,
         CancellationToken cancellationToken)
     {
-        var ordered = OrderedActiveFiles(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var byPath = ActiveFilesByPath(snapshot);
         var actions = new List<DeltaAction>();
         var edits = new List<DeleteDvEdit>();
         var touched = new List<string>();
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByOrdinal)
+        foreach (var kvp in selection.Entries)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
+            // A path is resolved against the snapshot's active set directly — there is no ordinal to be stale,
+            // and a path the snapshot does not hold is reported rather than skipped.
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+                throw StaleSelectionPath(kvp.Key, snapshot);
 
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
@@ -5090,58 +5113,83 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// DELETE by TRANSIENT rowid using DELETION VECTORS (no file rewrite): each affected file's existing DV is
-    /// unioned with the new in-file positions (decoded from <c>rowid &amp; posMask</c>) and a fresh DV written;
-    /// the commit is <c>remove</c>(old file+DV) + <c>add</c>(same file, new DV). The <paramref name="rowIds"/>
-    /// MUST be the ABSOLUTE positions <see cref="ReadAllWithRowIdsAsync"/> emits so repeated DV deletes compose.
-    /// Requires <c>delta.enableDeletionVectors</c>. With <paramref name="rowLevelRetry"/>, a concurrent DV-delete
-    /// of the SAME file re-unions when the touched rows are disjoint (row-level concurrency, via
-    /// <see cref="CommitOccAsync"/>'s row-level path) instead of aborting. Returns the rows newly deleted and the
-    /// committed version. The committing, DV-based sibling of <see cref="ComputeDeletionVectorActionsAsync"/>.
+    /// Deletes exactly the rows named by <paramref name="selection"/> — the row-level DELETE, in either of the
+    /// two shapes Delta allows (see <see cref="RowDeleteMode"/>). Returns the rows actually removed and the
+    /// committed version; a position a deletion vector already hid is not counted or replayed.
+    ///
+    /// <para>Build the selection against the snapshot its addresses came from —
+    /// <see cref="RowSelection.FromRowAddresses"/> for a host whose rowid is one packed <c>BIGINT</c>,
+    /// <see cref="RowSelection.FromLocatorColumns"/> straight from batches read with
+    /// <c>DeltaRowMetadata.Locator</c>. A path the current snapshot no longer holds is reported rather than
+    /// silently skipped.</para>
+    ///
+    /// <para>With <c>delta.enableChangeDataFeed</c> the removed rows are written as <c>delete</c> change files
+    /// in both modes, so the feed reports exactly them. Row tracking is preserved.</para>
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
-        IReadOnlyCollection<long> rowIds,
-        CancellationToken cancellationToken = default,
-        bool rowLevelRetry = false)
+    /// <param name="rowLevelRetry"><see cref="RowDeleteMode.DeletionVector"/> only: on a conflict with a
+    /// concurrent DV delete of the SAME file, re-union instead of aborting when the two touched DISJOINT rows
+    /// (row-level concurrency, via <see cref="CommitOccAsync"/>'s row-level path). Meaningless — and rejected —
+    /// for <see cref="RowDeleteMode.CopyOnWrite"/>, whose rewrite is not verbatim-rebase-safe.</param>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteRowsAsync(
+        RowSelection selection,
+        RowDeleteMode mode = RowDeleteMode.DeletionVector,
+        bool rowLevelRetry = false,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
+        if (rowLevelRetry && mode != RowDeleteMode.DeletionVector)
+            throw new ArgumentException(
+                "rowLevelRetry applies only to RowDeleteMode.DeletionVector: a copy-on-write delete rewrites "
+                + "its files, and a rewrite's fresh add cannot be replayed verbatim onto a newer version.",
+                nameof(rowLevelRetry));
+
+        return mode switch
+        {
+            RowDeleteMode.DeletionVector => DeleteRowsViaVectorsAsync(
+                selection, rowLevelRetry, cancellationToken),
+            RowDeleteMode.CopyOnWrite => DeleteRowsCopyOnWriteAsync(selection, cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown row delete mode."),
+        };
+    }
+
+    /// <summary>
+    /// <see cref="RowDeleteMode.DeletionVector"/>: each affected file's existing DV is unioned with the
+    /// selected absolute positions and a fresh DV written; the commit is <c>remove</c>(old file+DV) +
+    /// <c>add</c>(same file, new DV). The committing sibling of
+    /// <see cref="ComputeDeletionVectorActionsAsync"/>.
+    /// </summary>
+    private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsViaVectorsAsync(
+        RowSelection selection,
+        bool rowLevelRetry,
+        CancellationToken cancellationToken)
+    {
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.IsEmpty)
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
         if (!DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration))
             throw new InvalidOperationException(
-                "DeleteByRowIdsViaVectorsAsync requires deletion vectors — create the table with "
-                + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or use the copy-on-write "
-                + "DeleteByRowIdsAsync.");
+                "RowDeleteMode.DeletionVector requires deletion vectors — create the table with "
+                + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or pass "
+                + "RowDeleteMode.CopyOnWrite.");
 
-
-        var positionsByFile = new Dictionary<int, HashSet<long>>();
-        foreach (var rid in rowIds)
-        {
-            int ordinal = TransientRowAddress.FileOrdinal(rid);
-            if (!positionsByFile.TryGetValue(ordinal, out var set))
-                positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(TransientRowAddress.Position(rid));
-        }
-
-        var ordered = OrderedActiveFiles(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var byPath = ActiveFilesByPath(snapshot);
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         var dvEdits = new List<DeleteDvEdit>();
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByFile)
+        foreach (var kvp in selection.Entries)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+                throw StaleSelectionPath(kvp.Key, snapshot);
 
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
@@ -5231,32 +5279,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Deletes the rows addressed by the TRANSIENT rowids in <paramref name="rowIds"/> (each =
-    /// <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c>, from <see cref="ReadAllWithRowIdsAsync"/>
-    /// over the SAME snapshot) using <b>copy-on-write</b>: each affected file is rewritten without the deleted
-    /// rows and committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO row-tracking feature needed,
-    /// so the result is maximally reader-compatible (Fabric OneLake, Spark, delta-kernel). Row tracking, when
-    /// enabled, is preserved (survivors keep their materialized id + commit version). With
-    /// <c>delta.enableChangeDataFeed</c> the deleted rows are written as <c>delete</c> change files, so the feed
-    /// reports exactly them rather than inferring the whole rewritten file. IcebergCompat is not yet supported on
-    /// this path. Returns the rows deleted and the committed version.
+    /// <see cref="RowDeleteMode.CopyOnWrite"/>: each affected file is rewritten without the selected rows and
+    /// committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO row-tracking feature needed, so
+    /// the result is maximally reader-compatible (Fabric OneLake, Spark, delta-kernel). Row tracking, when
+    /// enabled, is preserved (survivors keep their materialized id + commit version). IcebergCompat is not yet
+    /// supported on this path.
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsAsync(
-        IReadOnlyCollection<long> rowIds,
-        CancellationToken cancellationToken = default)
+    private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsCopyOnWriteAsync(
+        RowSelection selection,
+        CancellationToken cancellationToken)
     {
-        ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.IsEmpty)
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
 
-        var positionsByFile = DecodeRowIdPositions(rowIds);
-        var ordered = OrderedActiveFiles(snapshot);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -5271,13 +5312,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByFile)
+        var byPath = ActiveFilesByPath(snapshot);
+        foreach (var kvp in selection.Entries)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
-            var targets = kvp.Value;
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+                throw StaleSelectionPath(kvp.Key, snapshot);
+            var targets = RowSelection.AsSet(kvp.Value);
 
             // Read the file (logical), keeping only rows whose ABSOLUTE position is NOT targeted; materialize
             // each survivor's original id + version so the rewrite preserves row identity.
@@ -5393,20 +5433,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return (totalDeleted, version);
     }
 
-    // Decodes transient rowids into absolute in-file positions per path-sorted file ordinal.
-    private static Dictionary<int, HashSet<long>> DecodeRowIdPositions(IReadOnlyCollection<long> rowIds)
-    {
-
-        var positionsByFile = new Dictionary<int, HashSet<long>>();
-        foreach (var rid in rowIds)
-        {
-            int ordinal = TransientRowAddress.FileOrdinal(rid);
-            if (!positionsByFile.TryGetValue(ordinal, out var set))
-                positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(TransientRowAddress.Position(rid));
-        }
-        return positionsByFile;
-    }
+    /// <summary>
+    /// A <see cref="RowSelection"/> naming a file the snapshot's active set does not hold. Unlike a stale
+    /// ORDINAL, which cannot be told from a fresh one, a stale PATH is detectable — so it is reported instead
+    /// of skipped, which is the whole point of keying the DML boundary by path.
+    /// </summary>
+    private static InvalidOperationException StaleSelectionPath(string path, Snapshot.Snapshot snapshot) =>
+        new($"The row selection names '{path}', which is not an active file at version {snapshot.Version} — "
+            + "a concurrent commit removed or rewrote it since the selection was built. Re-read the rows and "
+            + "rebuild the selection, or stage the delete on a DeltaTransaction, whose commit loop reconciles "
+            + "a concurrently-rewritten file for you.");
 
     // The corner the copy-on-write row-id DML path does not yet cover: IcebergCompat needs the committing
     // writer. (Change Data Feed IS captured — each rewritten file emits its own change files.)
@@ -5418,7 +5454,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     // Physical-writes the rewritten output batches for one file and returns the remove(old)+add(new) pair (Add is
     // null when every row was deleted → whole-file remove). Mirrors ComputeUpdateActionsAsync's write block;
-    // shared by DeleteByRowIdsAsync + UpdateByRowIdsAsync.
+    // shared by the copy-on-write DeleteRowsAsync + UpdateRowsAsync.
     private async ValueTask<(RemoveFile Remove, AddFile? Add, long AddedRows)> RewriteRowsToNewFileAsync(
         Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode,
         IReadOnlyList<RecordBatch> outputBatches,
@@ -5512,110 +5548,123 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Per-file copy-on-write UPDATE by TRANSIENT rowid (the companion to <see cref="DeleteByRowIdsAsync"/>).
-    /// <paramref name="rowIds"/> = <c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits) | absolutePosition</c> (same
-    /// encoding as <see cref="ReadAllWithRowIdsAsync"/>). Only files containing a target row are rewritten: each
-    /// such file's user batches are read (DV-filtered, in position order) and handed to
-    /// <paramref name="rewriteFile"/> — which returns the SAME rows with the SET columns modified on the matched
-    /// positions (the caller owns that typed logic; it MUST return one batch per source batch with identical row
-    /// counts) — then re-written as plain <c>remove</c>+<c>add</c>. Row tracking is preserved (an UPDATED row's
-    /// commit version advances to this commit; untouched rows keep theirs). With <c>delta.enableChangeDataFeed</c>
-    /// each touched row's before/after values are written as <c>update_preimage</c>/<c>update_postimage</c> change
-    /// files. IcebergCompat is not yet supported on this path. Returns the committed version (or the current
-    /// version if nothing matched).
+    /// Per-file copy-on-write UPDATE of exactly the rows named by <paramref name="selection"/> — the companion
+    /// to <see cref="DeleteRowsAsync"/> at <see cref="RowDeleteMode.CopyOnWrite"/>. Only files the selection
+    /// names are rewritten: each such file's user batches are read (DV-filtered, in position order) and handed
+    /// to <paramref name="rewriteFile"/> — which returns the SAME rows with the SET columns modified on the
+    /// selected positions (the caller owns that typed logic; it MUST return one batch per source batch with
+    /// identical row counts) — then re-written as plain <c>remove</c>+<c>add</c>. Row tracking is preserved (an
+    /// UPDATED row's commit version advances to this commit; untouched rows keep theirs). With
+    /// <c>delta.enableChangeDataFeed</c> each touched row's before/after values are written as
+    /// <c>update_preimage</c>/<c>update_postimage</c> change files. IcebergCompat is not yet supported on this
+    /// path. Returns the committed version (or the current version if nothing matched).
     /// </summary>
-    public ValueTask<long> UpdateByRowIdsAsync(
-        IReadOnlyCollection<long> rowIds,
-        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
+    /// <param name="rewriteFile">Receives <c>(path, sourceBatches, absolutePositionsPerBatch)</c>. The PATH is
+    /// the file's <c>add.path</c> — the same key the selection is built on, so a host that computed its new
+    /// values per file looks them up directly rather than resolving an ordinal that may have moved.
+    /// <c>absolutePositionsPerBatch[b][i]</c> is the ABSOLUTE in-file position of row <c>i</c> of source batch
+    /// <c>b</c>, so <c>(path, position)</c> is the same locator pair the selection and the read side speak, and
+    /// a host keying its new values by it substitutes them by an O(1) lookup instead of re-matching on row
+    /// content.</param>
+    public ValueTask<long> UpdateRowsAsync(
+        RowSelection selection,
+        Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
-        => UpdateByRowIdsCoreAsync(rowIds, (ordinal, batches, _) => rewriteFile(ordinal, batches),
-                                   cancellationToken);
+    {
+        ThrowIfDisposed();
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
+        if (rewriteFile is null)
+            throw new ArgumentNullException(nameof(rewriteFile));
+        return UpdateRowsCoreAsync(selection, rewriteFile, cancellationToken);
+    }
 
     /// <summary>
-    /// Copy-on-write UPDATE by TRANSIENT rowid, with each source row's rowid ALSO handed to the rewriter — so a
-    /// host that computed the new values keyed by rowid (e.g. a DuckDB join against the Delta table, producing
-    /// <c>rowid → new SET values</c>) substitutes them by an O(1) lookup instead of re-matching on row content.
-    /// <paramref name="rewriteFile"/> receives <c>(fileOrdinal, sourceBatches, rowIdsPerBatch)</c> where
-    /// <c>rowIdsPerBatch[b][i]</c> is the transient rowid of row <c>i</c> of source batch <c>b</c> (same encoding
-    /// as <paramref name="rowIds"/>); it returns the modified batches (one per source batch, identical row
-    /// counts). Everything else matches the delegate overload above.
+    /// Copy-on-write UPDATE from a batch of new values — the convenience form for the "update from a host-side
+    /// join" scenario, so the caller supplies no substitution code at all and no selection either.
+    /// <paramref name="updates"/> carries one row per row to change: the LOCATOR PAIR
+    /// (<c>{prefix}file_path</c>, <c>{prefix}row_index</c>) that a read with <c>DeltaRowMetadata.Locator</c>
+    /// emits, plus one column per SET column, named by its LOGICAL table-column name and typed to match. For
+    /// every source row the pair names, each SET column's value is replaced with the corresponding value from
+    /// <paramref name="updates"/> (type-agnostic, via concat + take — no per-type code); all other columns and
+    /// rows pass through. A duplicated locator is a caller error (last one wins). Returns the committed version
+    /// (or the current version if nothing matched).
     /// </summary>
-    public ValueTask<long> UpdateByRowIdsAsync(
-        IReadOnlyCollection<long> rowIds,
-        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
-        CancellationToken cancellationToken = default)
-        => UpdateByRowIdsCoreAsync(rowIds, rewriteFile, cancellationToken);
-
-    /// <summary>
-    /// Copy-on-write UPDATE by TRANSIENT rowid from a batch of new values — the convenience form for the
-    /// "update from a host-side join" scenario, so the caller supplies no substitution code at all.
-    /// <paramref name="updates"/> carries one row per rowid to change: a rowid column (named
-    /// <paramref name="rowIdColumn"/>, default <see cref="TransientRowAddress.ColumnName"/>
-    /// — what <see cref="ReadAllWithRowIdsAsync"/> emits) plus one column per SET column, named by its LOGICAL
-    /// table-column name and typed to match. For every source row whose rowid appears in <paramref name="updates"/>,
-    /// each SET column's value is replaced with the corresponding value from <paramref name="updates"/> (type-
-    /// agnostic, via concat + take — no per-type code); all other columns and rows pass through. Duplicate rowids
-    /// in <paramref name="updates"/> are a caller error (last one wins). Returns the committed version (or the
-    /// current version if nothing matched).
-    /// </summary>
-    public ValueTask<long> UpdateByRowIdsAsync(
+    public ValueTask<long> UpdateRowsAsync(
         RecordBatch updates,
-        string? rowIdColumn = null,
+        string metadataPrefix = RowSelection.DefaultMetadataPrefix,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         if (updates is null)
             throw new ArgumentNullException(nameof(updates));
-        rowIdColumn ??= TransientRowAddress.ColumnName;
+        if (metadataPrefix is null)
+            throw new ArgumentNullException(nameof(metadataPrefix));
 
-        int ridIdx = updates.Schema.GetFieldIndex(rowIdColumn);
-        if (ridIdx < 0)
+        string pathName = metadataPrefix + RowSelection.FilePathColumnSuffix;
+        string indexName = metadataPrefix + RowSelection.RowIndexColumnSuffix;
+        int pathIdx = updates.Schema.GetFieldIndex(pathName);
+        int indexIdx = updates.Schema.GetFieldIndex(indexName);
+        if (pathIdx < 0 || indexIdx < 0)
             throw new ArgumentException(
-                $"updates has no rowid column '{rowIdColumn}'.", nameof(updates));
-        if (updates.Column(ridIdx) is not Int64Array ridArray)
-            throw new ArgumentException(
-                $"updates rowid column '{rowIdColumn}' must be Int64.", nameof(updates));
+                $"updates must carry the locator pair '{pathName}' (Utf8) and '{indexName}' (Int64) — read the "
+                + "rows with DeltaReadOptions { Metadata = DeltaRowMetadata.Locator } and the same prefix.",
+                nameof(updates));
+        if (updates.Column(pathIdx) is not StringArray pathArray)
+            throw new ArgumentException($"updates column '{pathName}' must be Utf8.", nameof(updates));
+        if (updates.Column(indexIdx) is not Int64Array indexArray)
+            throw new ArgumentException($"updates column '{indexName}' must be Int64.", nameof(updates));
 
-        // rowid → its row index in `updates`, and the SET columns (everything except the rowid column).
-        var updIndexByRowId = new Dictionary<long, int>(updates.Length);
+        // (path, absolute position) → its row index in `updates`, and the SET columns (everything but the pair).
+        var updIndexByLocator = new Dictionary<(string Path, long Position), int>(updates.Length);
+        var positionsByPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
         for (int i = 0; i < updates.Length; i++)
-            if (!ridArray.IsNull(i))
-                updIndexByRowId[ridArray.GetValue(i)!.Value] = i;
+        {
+            if (pathArray.IsNull(i) || indexArray.IsNull(i))
+                continue;
+            string path = pathArray.GetString(i);
+            long position = indexArray.GetValue(i)!.Value;
+            updIndexByLocator[(path, position)] = i;
+            if (!positionsByPath.TryGetValue(path, out var set))
+                positionsByPath[path] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(position);
+        }
 
         var setColumns = new List<(string Name, IArrowArray Values)>();
         for (int c = 0; c < updates.ColumnCount; c++)
-            if (c != ridIdx)
+            if (c != pathIdx && c != indexIdx)
                 setColumns.Add((updates.Schema.FieldsList[c].Name, updates.Column(c)));
 
-        var rowIds = updIndexByRowId.Keys.ToArray();
-        return UpdateByRowIdsCoreAsync(
-            rowIds,
-            (ordinal, sourceBatches, rowIdsPerBatch) =>
-                ApplyRowIdKeyedUpdates(sourceBatches, rowIdsPerBatch, updIndexByRowId, setColumns),
+        return UpdateRowsCoreAsync(
+            RowSelection.ByPath(positionsByPath),
+            (path, sourceBatches, positionsPerBatch) =>
+                ApplyLocatorKeyedUpdates(path, sourceBatches, positionsPerBatch, updIndexByLocator, setColumns),
             cancellationToken);
     }
 
-    // Substitutes the SET columns' values at every source row whose rowid is in `updIndexByRowId`, pulling the
-    // new value from `setColumns` at the mapped index. Type-agnostic: per SET column, concatenate
-    // [source column, updates column] and TAKE — source row i takes index i, an updated row takes
-    // (sourceLen + updIndex). Untouched columns/rows pass through by reference.
-    private static IReadOnlyList<RecordBatch> ApplyRowIdKeyedUpdates(
+    // Substitutes the SET columns' values at every source row whose (path, absolute position) is in
+    // `updIndexByLocator`, pulling the new value from `setColumns` at the mapped index. Type-agnostic: per SET
+    // column, concatenate [source column, updates column] and TAKE — source row i takes index i, an updated row
+    // takes (sourceLen + updIndex). Untouched columns/rows pass through by reference.
+    private static IReadOnlyList<RecordBatch> ApplyLocatorKeyedUpdates(
+        string path,
         IReadOnlyList<RecordBatch> sourceBatches,
-        IReadOnlyList<Int64Array> rowIdsPerBatch,
-        IReadOnlyDictionary<long, int> updIndexByRowId,
+        IReadOnlyList<Int64Array> positionsPerBatch,
+        IReadOnlyDictionary<(string Path, long Position), int> updIndexByLocator,
         IReadOnlyList<(string Name, IArrowArray Values)> setColumns)
     {
         var result = new List<RecordBatch>(sourceBatches.Count);
         for (int b = 0; b < sourceBatches.Count; b++)
         {
             var src = sourceBatches[b];
-            var rids = rowIdsPerBatch[b];
+            var positions = positionsPerBatch[b];
 
             // take indices: normally i (from the source half); an updated row → src.Length + updIndex.
             List<int>? take = null;
             for (int i = 0; i < src.Length; i++)
             {
-                if (!rids.IsNull(i) && updIndexByRowId.TryGetValue(rids.GetValue(i)!.Value, out int updIdx))
+                if (!positions.IsNull(i)
+                    && updIndexByLocator.TryGetValue((path, positions.GetValue(i)!.Value), out int updIdx))
                 {
                     take ??= BuildIdentity(src.Length);
                     take[i] = src.Length + updIdx;
@@ -5648,23 +5697,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return list;
     }
 
-    private async ValueTask<long> UpdateByRowIdsCoreAsync(
-        IReadOnlyCollection<long> rowIds,
-        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
+    private async ValueTask<long> UpdateRowsCoreAsync(
+        RowSelection selection,
+        Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.IsEmpty)
             return snapshot.Version;
 
         HonorWriterFeatures(snapshot, isAppend: false);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
 
-        var positionsByFile = DecodeRowIdPositions(rowIds);
-        var ordered = OrderedActiveFiles(snapshot);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -5678,13 +5724,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var kvp in positionsByFile)
+        var byPath = ActiveFilesByPath(snapshot);
+        foreach (var kvp in selection.Entries)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
-            var targets = kvp.Value;
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+                throw StaleSelectionPath(kvp.Key, snapshot);
+            var targets = RowSelection.AsSet(kvp.Value);
 
             var srcIds = materializeIds ? new List<Int64Array?>() : null;
             var srcVers = materializeIds ? new List<Int64Array?>() : null;
@@ -5698,26 +5743,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (userBatches.Count == 0)
                 continue;
 
-            // Per-batch transient rowids (row-aligned), so the rewriter can key its new values by rowid.
-            var rowIdsPerBatch = new List<Int64Array>(userBatches.Count);
+            // Per-batch ABSOLUTE positions (row-aligned), so the rewriter can key its new values by the same
+            // (path, position) locator the selection speaks.
+            var positionsPerBatch = new List<Int64Array>(userBatches.Count);
             for (int bi = 0; bi < userBatches.Count; bi++)
             {
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var ridb = new Int64Array.Builder().Reserve(userBatches[bi].Length);
+                var pb = new Int64Array.Builder().Reserve(userBatches[bi].Length);
                 for (int i = 0; i < userBatches[bi].Length; i++)
                 {
                     long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
                         ? absPos.GetValue(i)!.Value : i;
-                    ridb.Append(TransientRowAddress.Pack(ordinal, abs));
+                    pb.Append(abs);
                 }
-                rowIdsPerBatch.Add(ridb.Build());
+                positionsPerBatch.Add(pb.Build());
             }
 
             // The caller rebuilds each batch's rows with the SET columns modified on the matched positions.
-            var rewritten = rewriteFile(ordinal, userBatches, rowIdsPerBatch);
+            var rewritten = rewriteFile(addFile.Path, userBatches, positionsPerBatch);
             if (rewritten.Count != userBatches.Count)
                 throw new InvalidOperationException(
-                    "UpdateByRowIdsAsync: rewriteFile must return one batch per source batch.");
+                    "UpdateRowsAsync: rewriteFile must return one batch per source batch.");
 
             // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
             // count the rows actually matched in this file.
@@ -5733,7 +5779,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var src = userBatches[bi];
                 if (rewritten[bi].Length != src.Length)
                     throw new InvalidOperationException(
-                        "UpdateByRowIdsAsync: rewriteFile must preserve each batch's row count.");
+                        "UpdateRowsAsync: rewriteFile must preserve each batch's row count.");
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
                 var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
                 var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
@@ -5823,54 +5869,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; TransientRowAddress.PositionBits)
-    /// | absolutePosition</c> against the snapshot pinned by <paramref name="atVersion"/>) — the read-back step a
-    /// buffered UPDATE's post-image is built from. Deletion-vector-excluded rows never match (the read filters
-    /// them), and files without a requested position are not read.
+    /// Reads exactly the rows named by <paramref name="selection"/> — the read-back step a host-driven UPDATE's
+    /// post-image is built from. Deletion-vector-excluded rows never match (the read filters them), and files
+    /// the selection does not name are not read. Batches come back in the selection's path order; a file
+    /// contributing no matching row yields nothing.
+    ///
+    /// <para>To pair the returned rows with what was asked for, read with <c>DeltaRowMetadata.Locator</c>
+    /// instead of this method's out-parameter: batching and deletion-vector filtering both break any positional
+    /// correspondence, and the locator pair is the same key the selection is built on.</para>
     /// </summary>
-    /// <param name="atVersion">The snapshot the rowids were SCANNED against (a buffered transaction's pinned
-    /// version). Ordinals are path-sort positions in THAT snapshot's active set — resolving them against a moved
-    /// CurrentSnapshot would read the wrong files after a concurrent commuting append shifts the ordering.</param>
     /// <param name="sourceRowTrackingOut">When non-null, one entry per YIELDED batch (row-aligned): each matched
     /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
     /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
-    /// manage.</param>
-    /// <param name="rowIdsOut">When non-null, one row-aligned array per YIELDED batch giving each row's
-    /// TRANSIENT rowid — the value that was requested in <paramref name="rowIds"/>. Batching and
-    /// deletion-vector filtering both break any positional correspondence between what was asked for and what
-    /// comes back, so this is the key a caller pairs the two by. Distinct from
-    /// <paramref name="sourceRowTrackingOut"/>: this is the snapshot-relative ADDRESS, that is the STABLE
-    /// identity.</param>
-    public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
-        IReadOnlyCollection<long> rowIds,
-        long? atVersion = null,
+    /// manage. This is the STABLE identity to carry through a rewrite, as distinct from the snapshot-scoped
+    /// address the selection is built from.</param>
+    public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
+        RowSelection selection,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default,
-        List<long[]>? rowIdsOut = null)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
-            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
-            : CurrentSnapshot;
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
+        var snapshot = CurrentSnapshot;
+        var byPath = ActiveFilesByPath(snapshot);
 
-        var positionsByFile = new Dictionary<int, HashSet<long>>();
-        foreach (var rid in rowIds)
+        foreach (var kvp in selection.Entries.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
-            int ordinal = TransientRowAddress.FileOrdinal(rid);
-            if (!positionsByFile.TryGetValue(ordinal, out var set))
-            {
-                set = new HashSet<long>();
-                positionsByFile[ordinal] = set;
-            }
-            set.Add(TransientRowAddress.Position(rid));
-        }
-
-        var ordered = OrderedActiveFiles(snapshot);
-        foreach (var kvp in positionsByFile.OrderBy(k => k.Key))
-        {
-            if (kvp.Key < 0 || kvp.Key >= ordered.Count)
-                continue;
-            var addFile = ordered[kvp.Key];
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+                throw StaleSelectionPath(kvp.Key, snapshot);
+            var targets = RowSelection.AsSet(kvp.Value);
 
             // Master's read path surfaces each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
             // RESOLVED stable id/version via out-params (materialized ids stripped from the emitted user batch),
@@ -5878,7 +5906,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var absOut = new List<Int64Array?>();
             var idsOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
             var versOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
-            int fileOrdinal = kvp.Key;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
                                                       strippedRowIdsOut: idsOut,
@@ -5891,7 +5918,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     continue;
                 var rows = new List<int>();
                 for (int i = 0; i < batch.Length; i++)
-                    if (!absPos.IsNull(i) && kvp.Value.Contains(absPos.GetValue(i)!.Value))
+                    if (!absPos.IsNull(i) && targets.Contains(absPos.GetValue(i)!.Value))
                         rows.Add(i);
                 if (rows.Count == 0)
                     continue;
@@ -5909,13 +5936,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
                     }
                     sourceRowTrackingOut.Add((ids, vers));
-                }
-                if (rowIdsOut is not null)
-                {
-                    var transient = new long[rows.Count];
-                    for (int k = 0; k < rows.Count; k++)
-                        transient[k] = TransientRowAddress.Pack(fileOrdinal, absPos.GetValue(rows[k])!.Value);
-                    rowIdsOut.Add(transient);
                 }
                 yield return TakeRowsFromBatch(batch, rows);
             }

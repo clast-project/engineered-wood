@@ -539,8 +539,8 @@ writer, so today the caller must wire those primitives together by hand.
 
 **High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
-feeds file pruning + concurrency read-set analysis); `DeleteByRowIdsAsync` /
-`UpdateByRowIdsAsync` do copy-on-write DML keyed by transient row id. Still
+feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
+`UpdateRowsAsync` do row-level DML keyed by a path-keyed `RowSelection`. Still
 missing: MERGE, RESTORE (committing a time-travel state as the current version),
 and CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw
 incremental-by-version-range read outside of CDF.
@@ -584,7 +584,7 @@ not apply. There is still **no way to enable DVs on an EXISTING table** (no
 `ALTER TABLE`-style property update / protocol upgrade), and the predicate
 `DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
 removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
-exist, keyed by transient row id — `DeleteByRowIdsAsync` / `UpdateByRowIdsAsync`
+exist — `DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite)` / `UpdateRowsAsync`
 — which rewrites the affected files with no DV. It needs neither deletion
 vectors nor row tracking, preserves row-tracking ids when the table has them,
 and writes the Change Data Feed for exactly the rows it touched; only

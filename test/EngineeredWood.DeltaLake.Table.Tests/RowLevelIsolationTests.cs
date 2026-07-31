@@ -71,8 +71,12 @@ public class RowLevelIsolationTests : IDisposable
     }
 
     /// <summary>Positions in the single file, keyed by its ordinal in the path-sorted active set.</summary>
-    private static Dictionary<int, IReadOnlyCollection<long>> AtOrdinalZero(params long[] positions)
-        => new() { [0] = positions };
+    /// <summary>The given absolute positions in the transaction's FIRST path-sorted active file, as the
+    /// path-keyed DML boundary key. Resolved against the transaction's pinned snapshot, which is the version
+    /// the positions were reasoned about.</summary>
+    private static RowSelection AtFileZero(DeltaTransaction txn, params long[] positions) =>
+        RowSelection.FromRowAddresses(
+            positions.Select(p => TransientRowAddress.Pack(0, p)).ToList(), txn.Snapshot);
 
     private async Task<int> RowCountAsync()
     {
@@ -97,12 +101,12 @@ public class RowLevelIsolationTests : IDisposable
         {
             await using var table = await OpenAsync();
             var txn = table.StartTransaction(IsolationLevel.WriteSerializable);
-            await txn.StageRowDeletesAsync(AtOrdinalZero(2));
+            await txn.StageRowDeletesAsync(AtFileZero(txn, 2));
 
             await using (var other = await OpenAsync())
             {
-                await other.DeleteByRowIdsViaVectorsAsync(
-                    new[] { TransientRowAddress.Pack(0, 7) });
+                await other.DeleteRowsAsync(RowSelection.FromRowAddresses(
+                    new[] { TransientRowAddress.Pack(0, 7) }, other.CurrentSnapshot));
             }
 
             await txn.CommitAsync();
@@ -116,12 +120,12 @@ public class RowLevelIsolationTests : IDisposable
         {
             await using var table = await OpenAsync();
             var txn = table.StartTransaction(IsolationLevel.Serializable);
-            await txn.StageRowDeletesAsync(AtOrdinalZero(2));
+            await txn.StageRowDeletesAsync(AtFileZero(txn, 2));
 
             await using (var other = await OpenAsync())
             {
-                await other.DeleteByRowIdsViaVectorsAsync(
-                    new[] { TransientRowAddress.Pack(0, 7) });
+                await other.DeleteRowsAsync(RowSelection.FromRowAddresses(
+                    new[] { TransientRowAddress.Pack(0, 7) }, other.CurrentSnapshot));
             }
 
             await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
@@ -140,7 +144,7 @@ public class RowLevelIsolationTests : IDisposable
         await using var created = await CreateAsync();
         await using var table = await OpenAsync();
         var txn = table.StartTransaction(IsolationLevel.Serializable);
-        await txn.StageRowDeletesAsync(AtOrdinalZero(2));
+        await txn.StageRowDeletesAsync(AtFileZero(txn, 2));
 
         await using (var other = await OpenAsync())
         {
@@ -176,7 +180,7 @@ public class RowLevelIsolationTests : IDisposable
         await using var tableB = await OpenAsync();
 
         var txn = tableB.StartTransaction(level);
-        await txn.StageRowDeletesAsync(AtOrdinalZero(0));
+        await txn.StageRowDeletesAsync(AtFileZero(txn, 0));
 
         await tableA.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
 
@@ -199,7 +203,7 @@ public class RowLevelIsolationTests : IDisposable
         await using var created = await CreateAsync();
         await using var table = await OpenAsync();
         var txn = table.StartTransaction(level);
-        await txn.StageRowDeletesAsync(AtOrdinalZero(2));
+        await txn.StageRowDeletesAsync(AtFileZero(txn, 2));
 
         await using (var other = await OpenAsync())
         {
@@ -255,14 +259,14 @@ public class RowLevelIsolationTests : IDisposable
 
         await using var table = await OpenAsync();
         var txn = table.StartTransaction(IsolationLevel.WriteSerializable);
-        await txn.StageRowDeletesAsync(AtOrdinalZero(0));
+        await txn.StageRowDeletesAsync(AtFileZero(txn, 0));
         Assert.Equal(0, await txn.DeleteAsync(Ex.Equal("region", "apac")));
 
         await using (var other = await OpenAsync())
         {
             // Not a blind append: it removes a file (a row-level delete of its own) as well as adding one.
             var otherTxn = other.StartTransaction();
-            await otherTxn.StageRowDeletesAsync(AtOrdinalZero(1));
+            await otherTxn.StageRowDeletesAsync(AtFileZero(otherTxn, 1));
             await otherTxn.WriteAsync([RegionBatch([9], ["apac"])]);
             await otherTxn.CommitAsync();
         }

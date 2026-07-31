@@ -22,7 +22,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// that is ITSELF a rewrite output, is a fresh id, not the row's original one.</para>
 ///
 /// <para>Scope: this is a property of <c>ReadFileAsync</c>, so it reaches UPDATE, copy-on-write DELETE, and
-/// <c>ReadRowsByRowIdsAsync</c>. Compaction reads raw parquet with no column list and is unaffected.</para>
+/// <c>ReadRowsAsync</c>. Compaction reads raw parquet with no column list and is unaffected.</para>
 /// </summary>
 public class RowTrackingPartitionedIdLossTests : IDisposable
 {
@@ -173,7 +173,7 @@ public class RowTrackingPartitionedIdLossTests : IDisposable
 
     /// <summary>
     /// The read path's own account of a row's stable id, on a partitioned table whose file carries materialized
-    /// ids. <c>ReadRowsByRowIdsAsync</c>' <c>sourceRowTrackingOut</c> is the public surface that reports the
+    /// ids. <c>ReadRowsAsync</c>' <c>sourceRowTrackingOut</c> is the public surface that reports the
     /// RESOLVED id (materialized value where present, else <c>baseRowId + position</c>) — the same resolution a
     /// read-side <c>_metadata.row_id</c> column would expose. It reports fresh ids rather than the row's real
     /// ones, which is the defect stated without a second rewrite in the way.
@@ -198,11 +198,10 @@ public class RowTrackingPartitionedIdLossTests : IDisposable
         Assert.Equal(3, addresses.Count);
 
         var tracking = new List<(long?[] Ids, long?[] Versions)>();
-        var idsOut = new List<long[]>();
         var byValue = new Dictionary<string, long?>(StringComparer.Ordinal);
         int bi = 0;
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(
-            addresses, sourceRowTrackingOut: tracking, rowIdsOut: idsOut))
+        var selection = RowSelection.FromRowAddresses(addresses, table.CurrentSnapshot);
+        await foreach (var batch in table.ReadRowsAsync(selection, sourceRowTrackingOut: tracking))
         {
             var values = (StringArray)batch.Column("value");
             for (int i = 0; i < batch.Length; i++)

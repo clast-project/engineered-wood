@@ -10,11 +10,11 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The one-shot DML-by-TRANSIENT-rowid surface: a host reads rows with
-/// <see cref="DeltaTable.ReadAllWithRowIdsAsync"/>, keeps the ids, and deletes/updates exactly those rows —
-/// <see cref="DeltaTable.DeleteByRowIdsViaVectorsAsync"/> (deletion-vector soft delete, row-level-concurrency
-/// aware) and the copy-on-write <see cref="DeltaTable.DeleteByRowIdsAsync"/> /
-/// <see cref="DeltaTable.UpdateByRowIdsAsync"/> (file rewrite, no DVs — maximally reader-compatible).
+/// The one-shot row-level DML surface: a host reads rows, keeps their addresses, resolves them into a
+/// <see cref="RowSelection"/>, and deletes/updates exactly those rows — <see cref="DeltaTable.DeleteRowsAsync"/>
+/// in both <see cref="RowDeleteMode"/>s (deletion-vector soft delete, row-level-concurrency aware; and the
+/// copy-on-write file rewrite, no DVs — maximally reader-compatible) plus
+/// <see cref="DeltaTable.UpdateRowsAsync(RowSelection, Func{string, IReadOnlyList{RecordBatch}, IReadOnlyList{Int64Array}, IReadOnlyList{RecordBatch}}, CancellationToken)"/>.
 /// </summary>
 public class RowIdDmlTests : IDisposable
 {
@@ -64,6 +64,28 @@ public class RowIdDmlTests : IDisposable
         return result;
     }
 
+    /// <summary>The rows whose id is in <paramref name="ids"/>, as the path-keyed DML boundary key —
+    /// resolved against the snapshot the addresses were read from, which is what the DML now speaks.</summary>
+    private static async Task<RowSelection> SelectionOf(DeltaTable table, params long[] ids) =>
+        RowSelection.FromRowAddresses(await RowIdsOf(table, ids), table.CurrentSnapshot);
+
+    /// <summary>The (add.path, absolute position) locator pair for each row whose id is in
+    /// <paramref name="ids"/> — what a read with the Locator metadata will emit once slice 1 lands, built
+    /// here from the packed address so this surface can be exercised now.</summary>
+    private static async Task<List<(string Path, long Position)>> LocatorsOf(
+        DeltaTable table, params long[] ids)
+    {
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        var result = new List<(string, long)>();
+        foreach (long address in await RowIdsOf(table, ids))
+        {
+            result.Add((ordered[TransientRowAddress.FileOrdinal(address)],
+                        TransientRowAddress.Position(address)));
+        }
+        return result;
+    }
+
     private async Task<List<long>> ReadIdsFresh()
     {
         await using var reader = await OpenAsync();
@@ -79,31 +101,30 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIdsViaVectors_DeletesExactlyThoseRows()
+    public async Task DeleteRowsViaVectors_DeletesExactlyThoseRows()
     {
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 6)]); // ids 1..6
 
-        var ids = await RowIdsOf(table, 3, 4);
-        var (deleted, _) = await table.DeleteByRowIdsViaVectorsAsync(ids);
+        var (deleted, _) = await table.DeleteRowsAsync(await SelectionOf(table, 3, 4));
         Assert.Equal(2, deleted);
 
         Assert.Equal(new long[] { 1, 2, 5, 6 }, await ReadIdsFresh());
     }
 
     [Fact]
-    public async Task DeleteByRowIdsViaVectors_NonDvTable_Throws()
+    public async Task DeleteRowsViaVectors_NonDvTable_Throws()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 3)]);
-        var ids = await RowIdsOf(table, 2);
+        var selection = await SelectionOf(table, 2);
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.DeleteByRowIdsViaVectorsAsync(ids));
+            await table.DeleteRowsAsync(selection));
     }
 
     [Fact]
-    public async Task DeleteByRowIdsViaVectors_RowLevelRetry_ConcurrentDisjoint_BothLand()
+    public async Task DeleteRowsViaVectors_RowLevelRetry_ConcurrentDisjoint_BothLand()
     {
         await using (var setup = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true))
@@ -114,23 +135,24 @@ public class RowIdDmlTests : IDisposable
         // two handles at the same base version, each deleting a DISJOINT row of the SAME file by rowid
         await using var tableA = await OpenAsync();
         await using var tableB = await OpenAsync();
-        var idsA = await RowIdsOf(tableA, 2);
-        var idsB = await RowIdsOf(tableB, 5);
+        var selA = await SelectionOf(tableA, 2);
+        var selB = await SelectionOf(tableB, 5);
 
-        await tableA.DeleteByRowIdsViaVectorsAsync(idsA, rowLevelRetry: true);
-        await tableB.DeleteByRowIdsViaVectorsAsync(idsB, rowLevelRetry: true); // stale → row-level rebase (DV union)
+        await tableA.DeleteRowsAsync(selA, rowLevelRetry: true);
+        await tableB.DeleteRowsAsync(selB, rowLevelRetry: true); // stale → row-level rebase (DV union)
 
         Assert.Equal(new long[] { 1, 3, 4, 6 }, await ReadIdsFresh()); // both deletes composed
     }
 
     [Fact]
-    public async Task DeleteByRowIdsViaVectors_EmptyIds_NoOp()
+    public async Task DeleteRowsViaVectors_EmptySelection_NoOp()
     {
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdSchema, enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 3)]);
         long before = table.CurrentSnapshot.Version;
-        var (deleted, version) = await table.DeleteByRowIdsViaVectorsAsync([]);
+        var (deleted, version) = await table.DeleteRowsAsync(RowSelection.ByPath(
+            new Dictionary<string, IReadOnlyCollection<long>>()));
         Assert.Equal(0, deleted);
         Assert.Equal(before, version);
     }
@@ -138,14 +160,14 @@ public class RowIdDmlTests : IDisposable
     // ── copy-on-write DELETE by row id (no deletion vectors) ──
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_DeletesRows_OnPlainTable()
+    public async Task DeleteRows_CopyOnWrite_DeletesRows_OnPlainTable()
     {
         // No DVs enabled — the copy-on-write path rewrites the file without the rows.
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 6)]); // ids 1..6, one file
 
-        var ids = await RowIdsOf(table, 3, 4);
-        var (deleted, _) = await table.DeleteByRowIdsAsync(ids);
+        var (deleted, _) = await table.DeleteRowsAsync(
+            await SelectionOf(table, 3, 4), RowDeleteMode.CopyOnWrite);
         Assert.Equal(2, deleted);
 
         Assert.Equal(new long[] { 1, 2, 5, 6 }, await ReadIdsFresh());
@@ -155,15 +177,14 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_WholeFile_DropsFile()
+    public async Task DeleteRows_CopyOnWrite_WholeFile_DropsFile()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 2)]); // file A
         await table.WriteAsync([Batch(100, 3)]); // file B
 
         // delete every row of file A (whichever ordinal it sorts to)
-        var idsA = await RowIdsOf(table, 1, 2);
-        await table.DeleteByRowIdsAsync(idsA);
+        await table.DeleteRowsAsync(await SelectionOf(table, 1, 2), RowDeleteMode.CopyOnWrite);
 
         Assert.Equal(new long[] { 100, 101, 102 }, await ReadIdsFresh());
         await using var check = await OpenAsync();
@@ -171,15 +192,15 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_RowTrackingTable_RewritesAndReads()
+    public async Task DeleteRows_CopyOnWrite_RowTrackingTable_RewritesAndReads()
     {
         // A row-tracking table: the copy-on-write rewrite materializes survivors' ids (M2 path).
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
         await table.WriteAsync([Batch(1, 5)]); // ids 1..5, baseRowId 0
 
-        var ids = await RowIdsOf(table, 2);
-        var (deleted, _) = await table.DeleteByRowIdsAsync(ids);
+        var (deleted, _) = await table.DeleteRowsAsync(
+            await SelectionOf(table, 2), RowDeleteMode.CopyOnWrite);
         Assert.Equal(1, deleted);
         Assert.Equal(new long[] { 1, 3, 4, 5 }, await ReadIdsFresh());
     }
@@ -187,11 +208,11 @@ public class RowIdDmlTests : IDisposable
     // ── copy-on-write UPDATE by row id ──
 
     // A rewriteFile callback that adds `delta` to the id of the rows whose id is in `targetIds`.
-    private static Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> AddToIds(
-        long delta, params long[] targetIds)
+    private static Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>,
+                        IReadOnlyList<RecordBatch>> AddToIds(long delta, params long[] targetIds)
     {
         var wanted = new HashSet<long>(targetIds);
-        return (_, batches) =>
+        return (_, batches, _) =>
         {
             var outp = new List<RecordBatch>(batches.Count);
             foreach (var b in batches)
@@ -210,42 +231,68 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateByRowIds_CopyOnWrite_ModifiesTargetedRows()
+    public async Task UpdateRows_CopyOnWrite_ModifiesTargetedRows()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 5)]); // ids 1..5
 
-        var ids = await RowIdsOf(table, 2, 4);
-        long version = await table.UpdateByRowIdsAsync(ids, AddToIds(1000, 2, 4));
+        long version = await table.UpdateRowsAsync(await SelectionOf(table, 2, 4), AddToIds(1000, 2, 4));
         Assert.Equal(2, version);
 
         Assert.Equal(new long[] { 1, 3, 5, 1002, 1004 }, await ReadIdsFresh());
     }
 
     [Fact]
-    public async Task UpdateByRowIds_CopyOnWrite_RowTrackingTable_RewritesAndReads()
+    public async Task UpdateRows_CopyOnWrite_RowTrackingTable_RewritesAndReads()
     {
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
         await table.WriteAsync([Batch(1, 4)]); // ids 1..4
 
-        var ids = await RowIdsOf(table, 3);
-        await table.UpdateByRowIdsAsync(ids, AddToIds(100, 3));
+        await table.UpdateRowsAsync(await SelectionOf(table, 3), AddToIds(100, 3));
 
         Assert.Equal(new long[] { 1, 2, 4, 103 }, await ReadIdsFresh());
     }
 
     [Fact]
-    public async Task UpdateByRowIds_EmptyIds_NoOp()
+    public async Task UpdateRows_EmptySelection_NoOp()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
         await table.WriteAsync([Batch(1, 3)]);
         long before = table.CurrentSnapshot.Version;
-        long version = await table.UpdateByRowIdsAsync([], AddToIds(1, 1));
+        long version = await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>()), AddToIds(1, 1));
         Assert.Equal(before, version);
     }
 
-    // ── update-from-a-host-join: the rowid-keyed overloads (no content-matching) ──
+    // ── update-from-a-host-join: the locator-keyed overloads (no content-matching) ──
+
+    /// <summary>A "join result" batch in the shape the convenience UpdateRowsAsync consumes: the locator pair
+    /// plus one Int64 SET column.</summary>
+    private static RecordBatch LocatorUpdates(
+        IReadOnlyList<(string Path, long Position)> locators, string setColumn, params long[] values)
+    {
+        var paths = new StringArray.Builder();
+        var positions = new Int64Array.Builder();
+        var set = new Int64Array.Builder();
+        for (int i = 0; i < locators.Count; i++)
+        {
+            paths.Append(locators[i].Path);
+            positions.Append(locators[i].Position);
+            set.Append(values[i]);
+        }
+        return new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field(
+                    RowSelection.DefaultMetadataPrefix + RowSelection.FilePathColumnSuffix,
+                    StringType.Default, false))
+                .Field(new Field(
+                    RowSelection.DefaultMetadataPrefix + RowSelection.RowIndexColumnSuffix,
+                    Int64Type.Default, false))
+                .Field(new Field(setColumn, Int64Type.Default, true))
+                .Build(),
+            [paths.Build(), positions.Build(), set.Build()], locators.Count);
+    }
 
     private static Apache.Arrow.Schema IdScoreSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -275,25 +322,16 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateByRowIds_ValuesBatch_KeyedByRowId_AppliesJoinResult()
+    public async Task UpdateRows_ValuesBatch_KeyedByLocator_AppliesJoinResult()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
         await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30), (4, 40), (5, 50))]);
 
-        // Simulate a DuckDB join result: the rowids to change + their new SET values, as one batch.
-        long rid2 = (await RowIdsOf(table, 2)).Single();
-        long rid4 = (await RowIdsOf(table, 4)).Single();
-        var updates = new RecordBatch(
-            new Apache.Arrow.Schema.Builder()
-                .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
-                .Field(new Field("score", Int64Type.Default, true))
-                .Build(),
-            [
-                new Int64Array.Builder().Append(rid2).Append(rid4).Build(),
-                new Int64Array.Builder().Append(999).Append(888).Build(),
-            ], 2);
+        // Simulate a DuckDB join result: the rows to change + their new SET values, as one batch.
+        var locators = await LocatorsOf(table, 2, 4);
+        var updates = LocatorUpdates(locators, "score", 999, 888);
 
-        long version = await table.UpdateByRowIdsAsync(updates);
+        long version = await table.UpdateRowsAsync(updates);
         Assert.Equal(2, version);
 
         var scores = await ReadIdScoresFresh();
@@ -305,17 +343,20 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateByRowIds_RowIdExposedDelegate_KeysNewValuesByRowId()
+    public async Task UpdateRows_PositionExposedDelegate_KeysNewValuesByLocator()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
         await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30))]);
 
-        long rid2 = (await RowIdsOf(table, 2)).Single();
-        var newScoreByRowId = new Dictionary<long, long> { [rid2] = 777 };
+        var target = (await LocatorsOf(table, 2)).Single();
+        var newScoreByLocator = new Dictionary<(string, long), long> { [target] = 777 };
 
-        await table.UpdateByRowIdsAsync(
-            newScoreByRowId.Keys.ToArray(),
-            (long ordinal, IReadOnlyList<RecordBatch> batches, IReadOnlyList<Int64Array> rids) =>
+        await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+            {
+                [target.Path] = new[] { target.Position },
+            }),
+            (string path, IReadOnlyList<RecordBatch> batches, IReadOnlyList<Int64Array> positions) =>
             {
                 var outp = new List<RecordBatch>(batches.Count);
                 for (int b = 0; b < batches.Count; b++)
@@ -324,8 +365,9 @@ public class RowIdDmlTests : IDisposable
                     var score = (Int64Array)src.Column("score");
                     var nb = new Int64Array.Builder();
                     for (int i = 0; i < src.Length; i++)
-                        nb.Append(newScoreByRowId.TryGetValue(rids[b].GetValue(i)!.Value, out long v)
-                            ? v : score.GetValue(i)!.Value);
+                        nb.Append(
+                            newScoreByLocator.TryGetValue((path, positions[b].GetValue(i)!.Value), out long v)
+                                ? v : score.GetValue(i)!.Value);
                     outp.Add(new RecordBatch(src.Schema, [src.Column("id"), nb.Build()], src.Length));
                 }
                 return outp;
@@ -338,7 +380,7 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateByRowIds_ValuesBatch_MissingRowIdColumn_Throws()
+    public async Task UpdateRows_ValuesBatch_MissingLocatorColumns_Throws()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdScoreSchema);
         await table.WriteAsync([IdScoreBatch((1, 10))]);
@@ -346,7 +388,7 @@ public class RowIdDmlTests : IDisposable
         var bad = new RecordBatch(
             new Apache.Arrow.Schema.Builder().Field(new Field("score", Int64Type.Default, true)).Build(),
             [new Int64Array.Builder().Append(1).Build()], 1);
-        await Assert.ThrowsAsync<ArgumentException>(() => table.UpdateByRowIdsAsync(bad).AsTask());
+        await Assert.ThrowsAsync<ArgumentException>(() => table.UpdateRowsAsync(bad).AsTask());
     }
 
     // ── Change Data Feed on the row-id DML paths ──
@@ -424,13 +466,13 @@ public class RowIdDmlTests : IDisposable
     };
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_FeedReportsOnlyTheDeletedRows()
+    public async Task DeleteRows_CopyOnWrite_CdfTable_FeedReportsOnlyTheDeletedRows()
     {
         await using var table = await CreateCdfTableAsync(IdSchema);
         await table.WriteAsync([Batch(1, 4)]); // ids 1..4, one file
 
-        var ids = await RowIdsOf(table, 2);
-        var (deleted, version) = await table.DeleteByRowIdsAsync(ids);
+        var (deleted, version) = await table.DeleteRowsAsync(
+            await SelectionOf(table, 2), RowDeleteMode.CopyOnWrite);
         Assert.Equal(1, deleted);
 
         // Exactly one delete — the survivors 1, 3 and 4 were rewritten, not changed.
@@ -439,23 +481,14 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateByRowIds_CopyOnWrite_CdfTable_FeedReportsPreAndPostImages()
+    public async Task UpdateRows_CopyOnWrite_CdfTable_FeedReportsPreAndPostImages()
     {
         await using var table = await CreateCdfTableAsync(IdScoreSchema);
         await table.WriteAsync([IdScoreBatch((1, 10), (2, 20), (3, 30))]);
 
-        long rid2 = (await RowIdsOf(table, 2)).Single();
-        var updates = new RecordBatch(
-            new Apache.Arrow.Schema.Builder()
-                .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
-                .Field(new Field("score", Int64Type.Default, true))
-                .Build(),
-            [
-                new Int64Array.Builder().Append(rid2).Build(),
-                new Int64Array.Builder().Append(999).Build(),
-            ], 1);
+        var updates = LocatorUpdates(await LocatorsOf(table, 2), "score", 999);
 
-        long version = await table.UpdateByRowIdsAsync(updates);
+        long version = await table.UpdateRowsAsync(updates);
 
         Assert.Equal(
             ["update_postimage|id=2|score=999", "update_preimage|id=2|score=20"],
@@ -463,7 +496,7 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_PartitionedCdfTable_FeedKeepsEveryColumn()
+    public async Task DeleteRows_CopyOnWrite_PartitionedCdfTable_FeedKeepsEveryColumn()
     {
         // Partition columns live in the action's partitionValues, never in the change file's bytes — the reader
         // re-materializes them POSITIONALLY, so a partition column written into the file would come back twice
@@ -471,14 +504,14 @@ public class RowIdDmlTests : IDisposable
         await using var table = await CreateCdfTableAsync(RegionSchema, partitionColumns: ["region"]);
         await table.WriteAsync([RegionBatch(1, 3, "east")]);
 
-        var ids = await RowIdsOf(table, 2);
-        var (_, version) = await table.DeleteByRowIdsAsync(ids);
+        var (_, version) = await table.DeleteRowsAsync(
+            await SelectionOf(table, 2), RowDeleteMode.CopyOnWrite);
 
         Assert.Equal(["delete|id=2|region=east|val=102"], await FeedRowsAsync(version, version));
     }
 
     [Fact]
-    public async Task DeleteByRowIds_CopyOnWrite_WholeFileCdfTable_FeedReportsEveryRowOnce()
+    public async Task DeleteRows_CopyOnWrite_WholeFileCdfTable_FeedReportsEveryRowOnce()
     {
         // Deleting every row of a file drops it outright — there is no add to pair with the remove, and the
         // change files are the only record of which rows went away.
@@ -486,7 +519,8 @@ public class RowIdDmlTests : IDisposable
         await table.WriteAsync([Batch(1, 2)]); // file A
         await table.WriteAsync([Batch(100, 2)]); // file B
 
-        var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOf(table, 1, 2));
+        var (deleted, version) = await table.DeleteRowsAsync(
+            await SelectionOf(table, 1, 2), RowDeleteMode.CopyOnWrite);
         Assert.Equal(2, deleted);
 
         Assert.Equal(["delete|id=1", "delete|id=2"], await FeedRowsAsync(version, version));
@@ -494,7 +528,7 @@ public class RowIdDmlTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteByRowIdsViaVectors_PartitionedCdfTable_FeedKeepsEveryColumn()
+    public async Task DeleteRowsViaVectors_PartitionedCdfTable_FeedKeepsEveryColumn()
     {
         // Same shape through the deletion-vector path, whose CDC rows also come from the read path (which
         // materializes partition columns).
@@ -502,8 +536,7 @@ public class RowIdDmlTests : IDisposable
             RegionSchema, partitionColumns: ["region"], enableDeletionVectors: true);
         await table.WriteAsync([RegionBatch(1, 3, "east")]);
 
-        var ids = await RowIdsOf(table, 3);
-        var (_, version) = await table.DeleteByRowIdsViaVectorsAsync(ids);
+        var (_, version) = await table.DeleteRowsAsync(await SelectionOf(table, 3));
 
         Assert.Equal(["delete|id=3|region=east|val=103"], await FeedRowsAsync(version, version));
     }

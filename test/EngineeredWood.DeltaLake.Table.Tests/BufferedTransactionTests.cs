@@ -125,7 +125,7 @@ public class BufferedTransactionTests : IDisposable
     }
 
     [Fact]
-    public async Task ReadRowsByRowIds_AtVersion_ExactReadBack()
+    public async Task ReadRows_AddressesResolvedAgainstPinnedSnapshot_ExactReadBack()
     {
         await using var table = await CreateTableAsync();
         long pinnedVersion = table.CurrentSnapshot.Version;
@@ -136,10 +136,14 @@ public class BufferedTransactionTests : IDisposable
             await racer.WriteAsync([BuildBatch(100, 5)]);
         }
 
-        // rowids (ordinal 0, positions 1 and 3 = ids 2 and 4) resolve against the PINNED snapshot
+        // rowids (ordinal 0, positions 1 and 3 = ids 2 and 4) resolve against the PINNED snapshot: the
+        // ordinal becomes a PATH there, and the path is what the read then looks up — so the concurrent
+        // append cannot renumber the selection out from under it.
         await using var reader = await OpenAsync();
+        var pinned = await reader.GetSnapshotAtVersionAsync(pinnedVersion);
+        var selection = RowSelection.FromRowAddresses([1L, 3L], pinned);
         var ids = new List<long>();
-        await foreach (var batch in reader.ReadRowsByRowIdsAsync([1L, 3L], atVersion: pinnedVersion))
+        await foreach (var batch in reader.ReadRowsAsync(selection))
         {
             var col = (Int64Array)batch.Column(0);
             for (int i = 0; i < batch.Length; i++)

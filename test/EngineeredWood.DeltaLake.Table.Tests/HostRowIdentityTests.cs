@@ -15,9 +15,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// The identity half of the embedding seam: a host doing its own copy-on-write rewrite must be able to read a
 /// row's STABLE id, carry it through its own engine, and write it back into the new file — otherwise every
 /// host-side UPDATE silently reassigns identities. Three pieces make that possible:
-/// <c>ReadRowsByRowIdsAsync</c>' <c>rowIdsOut</c> (pair returned rows with what was requested),
-/// its <c>sourceRowTrackingOut</c> derivation (an appended row HAS an id, it is just not materialized), and
-/// <c>WriteDataFilesAsync</c>' <c>materializedRowIds</c> (bake it into the new file). Plus
+/// <see cref="RowSelection"/> (name exactly the rows to read back, by a key that cannot go stale in range),
+/// <c>ReadRowsAsync</c>' <c>sourceRowTrackingOut</c> derivation (an appended row HAS an id, it is just not
+/// materialized), and <c>WriteDataFilesAsync</c>' <c>materializedRowIds</c> (bake it into the new file). Plus
 /// <c>preAssignedSchema</c>, which lets the files of a CTAS be written before the table exists.
 /// </summary>
 public class HostRowIdentityTests : IDisposable
@@ -95,9 +95,14 @@ public class HostRowIdentityTests : IDisposable
         return byId;
     }
 
-    private static async Task<Dictionary<long, (int Ordinal, long Position)>> LocateRowsAsync(DeltaTable table)
+    /// <summary>Every row's (user id -> its DML locator): the file's <c>add.path</c> plus the row's absolute
+    /// in-file position. The packed address is unpacked into a path HERE, against the snapshot it was read
+    /// from, which is where a stale address is caught rather than silently mis-addressing a file.</summary>
+    private static async Task<Dictionary<long, (string Path, long Position)>> LocateRowsAsync(DeltaTable table)
     {
-        var located = new Dictionary<long, (int, long)>();
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        var located = new Dictionary<long, (string, long)>();
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
@@ -106,73 +111,68 @@ public class HostRowIdentityTests : IDisposable
             {
                 long rid = rids.GetValue(i)!.Value;
                 located[ids.GetValue(i)!.Value] =
-                    (TransientRowAddress.FileOrdinal(rid), TransientRowAddress.Position(rid));
+                    (ordered[TransientRowAddress.FileOrdinal(rid)], TransientRowAddress.Position(rid));
             }
         }
         return located;
     }
 
-    // ── rowIdsOut: correlating what came back with what was asked for ──
+    /// <summary>The rows at <paramref name="rows"/> as the path-keyed DML boundary key.</summary>
+    private static RowSelection Sel(params (string Path, long Position)[] rows)
+    {
+        var byPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (var (path, position) in rows)
+        {
+            if (!byPath.TryGetValue(path, out var set))
+                byPath[path] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(position);
+        }
+        return RowSelection.ByPath(byPath);
+    }
+
+    // ── reading back exactly what was selected ──
 
     [Fact]
-    public async Task ReadRowsByRowIds_RowIdsOut_PairsEachReturnedRowWithItsRequest()
+    public async Task ReadRows_SelectionSpanningTwoFiles_ReturnsExactlyThoseRows()
     {
         await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
         await table.WriteAsync([Batch(1, 5)]);
-        await table.WriteAsync([Batch(11, 5)]); // a second file, so ordinals differ
+        await table.WriteAsync([Batch(11, 5)]); // a second file, so the selection spans two paths
         var at = await LocateRowsAsync(table);
 
-        long[] want = [Rid(at[2]), Rid(at[4]), Rid(at[13])];
-
-        var rowIdsOut = new List<long[]>();
-        var returned = new List<(long Id, long RowId)>();
-        int bi = 0;
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(want, rowIdsOut: rowIdsOut))
+        var returned = new List<long>();
+        await foreach (var batch in table.ReadRowsAsync(Sel(at[2], at[4], at[13])))
         {
             var ids = (Int64Array)batch.Column("id");
-            Assert.Equal(batch.Length, rowIdsOut[bi].Length); // row-aligned with the yielded batch
             for (int i = 0; i < batch.Length; i++)
-                returned.Add((ids.GetValue(i)!.Value, rowIdsOut[bi][i]));
-            bi++;
+                returned.Add(ids.GetValue(i)!.Value);
         }
 
-        // Every requested rowid came back paired with the row it addressed — the correspondence batching and
-        // DV filtering would otherwise destroy.
-        Assert.Equal(3, returned.Count);
-        foreach (var (id, rid) in returned)
-            Assert.Equal(Rid(at[id]), rid);
-        Assert.Equal(want.OrderBy(x => x), returned.Select(r => r.RowId).OrderBy(x => x));
-
-        static long Rid((int Ordinal, long Position) p) =>
-            TransientRowAddress.Pack(p.Ordinal, p.Position);
+        returned.Sort();
+        Assert.Equal(new long[] { 2, 4, 13 }, returned);
     }
 
     [Fact]
-    public async Task ReadRowsByRowIds_RowIdsOut_SkipsDeletionVectorHiddenRows()
+    public async Task ReadRows_SkipsDeletionVectorHiddenRows()
     {
         await using var table = await DeltaTable.CreateAsync(
             Fs, BuildSchema(), enableDeletionVectors: true);
         await table.WriteAsync([Batch(1, 5)]);
         var at = await LocateRowsAsync(table);
-        long deletedRid = TransientRowAddress.Pack(at[3].Ordinal, at[3].Position);
-        long keptRid = TransientRowAddress.Pack(at[4].Ordinal, at[4].Position);
 
         await table.DeleteAsync(Ex.Equal("id", 3L));
 
-        var rowIdsOut = new List<long[]>();
         var ids = new List<long>();
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(
-            [deletedRid, keptRid], rowIdsOut: rowIdsOut))
+        await foreach (var batch in table.ReadRowsAsync(Sel(at[3], at[4])))
         {
             var col = (Int64Array)batch.Column("id");
             for (int i = 0; i < batch.Length; i++)
                 ids.Add(col.GetValue(i)!.Value);
         }
 
-        // The hidden row simply does not come back, and rowIdsOut reports only what did — a caller reading
-        // positionally would otherwise attribute the survivor's data to the deleted row's request.
+        // The hidden row simply does not come back — a caller pairing results POSITIONALLY with its request
+        // would otherwise attribute the survivor's data to the deleted row.
         Assert.Equal([4L], ids);
-        Assert.Equal([keptRid], rowIdsOut.SelectMany(a => a).ToArray());
     }
 
     // ── sourceRowTrackingOut: the spec derivation, not just materialized values ──
@@ -188,8 +188,7 @@ public class HostRowIdentityTests : IDisposable
 
         var tracking = new List<(long?[] Ids, long?[] Versions)>();
         var seen = new List<long>();
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(
-            [Rid(at[2]), Rid(at[4])], sourceRowTrackingOut: tracking))
+        await foreach (var batch in table.ReadRowsAsync(Sel(at[2], at[4]), sourceRowTrackingOut: tracking))
         {
             var col = (Int64Array)batch.Column("id");
             for (int i = 0; i < batch.Length; i++)
@@ -217,7 +216,7 @@ public class HostRowIdentityTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var tracking = new List<(long?[] Ids, long?[] Versions)>();
-        await foreach (var _ in table.ReadRowsByRowIdsAsync([Rid(at[2])], sourceRowTrackingOut: tracking))
+        await foreach (var _ in table.ReadRowsAsync(Sel(at[2]), sourceRowTrackingOut: tracking))
         {
         }
 
@@ -237,10 +236,10 @@ public class HostRowIdentityTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         // A host-side UPDATE of id=3: read the row back with its stable identity...
-        long target = Rid(at[3]);
+        var target = Sel(at[3]);
         var tracking = new List<(long?[] Ids, long?[] Versions)>();
         var post = new List<RecordBatch>();
-        await foreach (var batch in table.ReadRowsByRowIdsAsync([target], sourceRowTrackingOut: tracking))
+        await foreach (var batch in table.ReadRowsAsync(target, sourceRowTrackingOut: tracking))
         {
             var ids = (Int64Array)batch.Column("id");
             var vals = new StringArray.Builder();
@@ -255,10 +254,7 @@ public class HostRowIdentityTests : IDisposable
         var txn = table.StartTransaction();
         var files = await table.WriteDataFilesAsync(post, materializedRowIds: originalIds);
         txn.StageDataFiles(files);
-        await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[3].Ordinal] = new[] { at[3].Position },
-        });
+        await txn.StageRowDeletesAsync(Sel(at[3]));
         await txn.CommitAsync();
 
         await using var check = await OpenAsync();
@@ -414,7 +410,4 @@ public class HostRowIdentityTests : IDisposable
                 ColumnMapping.GetPhysicalName(field, ColumnMappingMode.Name));
         }
     }
-
-    private static long Rid((int Ordinal, long Position) p) =>
-        TransientRowAddress.Pack(p.Ordinal, p.Position);
 }

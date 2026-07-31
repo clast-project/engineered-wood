@@ -743,7 +743,8 @@ public class SparkInteropTests : IDisposable
                     if (id.GetValue(i) == 20) rid20 = rowId.GetValue(i)!.Value;
             }
             Assert.True(rid20 >= 0);
-            var (deleted, _) = await table.DeleteByRowIdsAsync([rid20]);
+            var (deleted, _) = await table.DeleteRowsAsync(
+                RowSelection.FromRowAddresses([rid20], table.CurrentSnapshot), RowDeleteMode.CopyOnWrite);
             Assert.Equal(1, deleted);
         }
 
@@ -2048,21 +2049,31 @@ public class SparkInteropTests : IDisposable
 
             // UPDATE id=2's value → "z" by transient rowid (copy-on-write rewrite of its file).
             updateVersion = table.CurrentSnapshot.Version + 1;
-            long rid2 = (await RowIdsOfAsync(table, 2)).Single();
-            var updates = new RecordBatch(
-                new Apache.Arrow.Schema.Builder()
-                    .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
-                    .Field(new Field("value", StringType.Default, true))
-                    .Build(),
-                [
-                    new Int64Array.Builder().Append(rid2).Build(),
-                    new StringArray.Builder().Append("z").Build(),
-                ], 1);
-            Assert.Equal(updateVersion, await table.UpdateByRowIdsAsync(updates));
+            var selection2 = RowSelection.FromRowAddresses(
+                await RowIdsOfAsync(table, 2), table.CurrentSnapshot);
+            Assert.Equal(updateVersion, await table.UpdateRowsAsync(selection2, (_, batches, _) =>
+            {
+                var outp = new List<RecordBatch>(batches.Count);
+                foreach (var b in batches)
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var value = (StringArray)b.Column("value");
+                    var nb = new StringArray.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        nb.Append(id.GetValue(i) == 2 ? "z" : value.GetString(i));
+                    var columns = new IArrowArray[b.ColumnCount];
+                    for (int c = 0; c < b.ColumnCount; c++)
+                        columns[c] = b.Schema.FieldsList[c].Name == "value" ? nb.Build() : b.Column(c);
+                    outp.Add(new RecordBatch(b.Schema, columns, b.Length));
+                }
+                return outp;
+            }));
 
             // DELETE id=3 by transient rowid (copy-on-write again — no deletion vectors on this table).
             deleteVersion = table.CurrentSnapshot.Version + 1;
-            var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOfAsync(table, 3));
+            var (deleted, version) = await table.DeleteRowsAsync(
+                RowSelection.FromRowAddresses(await RowIdsOfAsync(table, 3), table.CurrentSnapshot),
+                RowDeleteMode.CopyOnWrite);
             Assert.Equal(1, deleted);
             Assert.Equal(deleteVersion, version);
         }

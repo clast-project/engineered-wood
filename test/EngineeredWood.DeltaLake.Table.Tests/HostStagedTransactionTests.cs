@@ -75,9 +75,14 @@ public class HostStagedTransactionTests : IDisposable
 
     /// <summary>Maps id → (file ordinal, absolute position) by decoding the transient rowid, the way a host
     /// correlates its own scan with the coordinates the DML seam speaks.</summary>
-    private static async Task<Dictionary<long, (int Ordinal, long Position)>> LocateRowsAsync(DeltaTable table)
+    /// <summary>Every row's (user id -> its DML locator): the file's <c>add.path</c> plus the row's absolute
+    /// in-file position. The packed address is unpacked into a path HERE, against the snapshot it was read
+    /// from, which is where a stale address is caught rather than silently mis-addressing a file.</summary>
+    private static async Task<Dictionary<long, (string Path, long Position)>> LocateRowsAsync(DeltaTable table)
     {
-        var located = new Dictionary<long, (int, long)>();
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        var located = new Dictionary<long, (string, long)>();
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
@@ -86,10 +91,23 @@ public class HostStagedTransactionTests : IDisposable
             {
                 long rid = rids.GetValue(i)!.Value;
                 located[ids.GetValue(i)!.Value] =
-                    (TransientRowAddress.FileOrdinal(rid), TransientRowAddress.Position(rid));
+                    (ordered[TransientRowAddress.FileOrdinal(rid)], TransientRowAddress.Position(rid));
             }
         }
         return located;
+    }
+
+    /// <summary>The rows at <paramref name="rows"/> as the path-keyed DML boundary key.</summary>
+    private static RowSelection Sel(params (string Path, long Position)[] rows)
+    {
+        var byPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (var (path, position) in rows)
+        {
+            if (!byPath.TryGetValue(path, out var set))
+                byPath[path] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(position);
+        }
+        return RowSelection.ByPath(byPath);
     }
 
     // ── Stable row ids across SEVERAL staged operations ──
@@ -201,14 +219,12 @@ public class HostStagedTransactionTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var txn = table.StartTransaction();
-        // A host plans against the TRANSACTION's snapshot, so its ordinals agree with what the commit validates.
+        // A host plans against the TRANSACTION's snapshot, so what it addresses agrees with what the
+        // commit validates.
         var planned = table.PlanFiles(Ex.LessThan("id", 5L), snapshot: txn.Snapshot);
         Assert.NotEmpty(planned);
 
-        long rows = await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[2].Ordinal] = new[] { at[2].Position, at[4].Position },
-        });
+        long rows = await txn.StageRowDeletesAsync(Sel(at[2], at[4]));
         Assert.Equal(2, rows);
         await txn.CommitAsync();
 
@@ -226,10 +242,7 @@ public class HostStagedTransactionTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var txn = table.StartTransaction();
-        await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[2].Ordinal] = new[] { at[2].Position },
-        });
+        await txn.StageRowDeletesAsync(Sel(at[2]));
 
         // a racer deletes a different row of the same file while the transaction is open
         await using (var racer = await OpenAsync())
@@ -249,10 +262,7 @@ public class HostStagedTransactionTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var txn = table.StartTransaction();
-        await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[2].Ordinal] = new[] { at[2].Position },
-        });
+        await txn.StageRowDeletesAsync(Sel(at[2]));
 
         await using (var racer = await OpenAsync())
             await racer.DeleteAsync(Ex.Equal("id", 2L)); // the same row
@@ -316,10 +326,7 @@ public class HostStagedTransactionTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var txn = table.StartTransaction();
-        await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[3].Ordinal] = new[] { at[3].Position },
-        });
+        await txn.StageRowDeletesAsync(Sel(at[3]));
         await txn.StageChangeDataAsync(Batch(3, 1), "delete");
         long version = await txn.CommitAsync();
 
@@ -428,10 +435,7 @@ public class HostStagedTransactionTests : IDisposable
         Assert.NotEmpty(planned);
 
         // 2. the host's own DML + its own written files + an ALTER, all staged
-        await txn.StageRowDeletesAsync(new Dictionary<int, IReadOnlyCollection<long>>
-        {
-            [at[3].Ordinal] = new[] { at[3].Position },
-        });
+        await txn.StageRowDeletesAsync(Sel(at[3]));
         var files = await table.WriteDataFilesAsync([Batch(20, 2)]);
         txn.StageDataFiles(files);
         txn.StageActions([new TransactionId
