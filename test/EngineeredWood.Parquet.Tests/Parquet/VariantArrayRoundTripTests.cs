@@ -8,7 +8,6 @@ using Apache.Arrow.Scalars.Variant;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
-using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 
 namespace EngineeredWood.Tests.Parquet;
@@ -173,6 +172,52 @@ public class VariantArrayRoundTripTests : IDisposable
             var got = va.GetValueBytes(i);
             Assert.Equal(values[i], got.ToArray());
         }
+    }
+
+    /// <summary>
+    /// An EXTENSION column in a batch that exceeds
+    /// <see cref="ParquetWriteOptions.RowGroupMaxRows"/> must survive the auto-split.
+    /// </summary>
+    /// <remarks>
+    /// It did not: <c>MaterializeSlice</c> reached the general path, which casts to
+    /// <c>Apache.Arrow.Array</c>, and <c>ExtensionArray</c> derives from <c>object</c> — so splitting a
+    /// batch carrying a VARIANT (or GUID) column threw <see cref="InvalidCastException"/>. Nothing
+    /// exercised it because the default row-group limit is far above any test's batch. Unrelated to
+    /// shredding: the split happens before any shredding decision, and this test leaves shredding off.
+    /// </remarks>
+    [Fact]
+    public async Task VariantColumn_LargerThanARowGroup_SurvivesTheAutoSplit()
+    {
+        string path = Path.Combine(_tempDir, "variant_split.parquet");
+        var values = Enumerable.Range(0, 10)
+            .Select(i => new byte[] { (byte)(i % 2 == 0 ? 0x00 : 0x0C) })
+            .ToArray();
+        var (batch, _, _) = MakeVariantBatch(values);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            ParquetWriteOptions.Default with { RowGroupMaxRows = 4 }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() });
+
+        var meta = await reader.ReadMetadataAsync();
+        Assert.Equal(3, meta.RowGroups.Count); // 4 + 4 + 2
+
+        int row = 0;
+        for (int g = 0; g < meta.RowGroups.Count; g++)
+        {
+            var read = await reader.ReadRowGroupAsync(g);
+            var variant = Assert.IsType<VariantArray>(read.Column(0));
+            for (int i = 0; i < variant.Length; i++, row++)
+                Assert.Equal(values[row], variant.GetValueBytes(i).ToArray());
+        }
+        Assert.Equal(values.Length, row);
     }
 
     /// <summary>

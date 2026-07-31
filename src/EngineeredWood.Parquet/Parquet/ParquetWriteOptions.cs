@@ -203,6 +203,42 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, bool>? ColumnDictionaryEnabled { get; init; }
 
     /// <summary>
+    /// Enables VARIANT shredding on write, using these inference thresholds. Default
+    /// <see langword="null"/>: variant columns are written in the canonical <c>struct&lt;metadata,
+    /// value&gt;</c> form, which is spec-legal and what every reader accepts.
+    /// </summary>
+    /// <remarks>
+    /// <para>Shredding hoists part of each value into a typed <c>typed_value</c> child, which is what
+    /// buys per-field statistics, predicate pruning and better encoding than an opaque variant blob —
+    /// and matches the layout Spark 4.x and DuckDB emit by default. It is an optimisation, not a
+    /// compatibility requirement, which is why it is opt-in.</para>
+    ///
+    /// <para><b>The shape is decided by the FIRST row group.</b> A parquet file has one schema, so
+    /// the writer infers each variant column's layout from the first batch it sees and reuses it for
+    /// the rest of the file; later rows that do not fit fall to the residual <c>value</c> rather than
+    /// failing. An unrepresentative first batch therefore costs space, not correctness. Supply
+    /// <see cref="VariantShredSchemas"/> when the shape is known ahead of the data.</para>
+    ///
+    /// <para>Top-level variant columns only. A variant nested inside a struct, list or map is written
+    /// unshredded regardless.</para>
+    /// </remarks>
+    public Apache.Arrow.Operations.Shredding.ShredOptions? ShredVariants { get; init; }
+
+    /// <summary>
+    /// Explicit shred layout per top-level variant column, keyed by column name. Bypasses inference
+    /// for the columns it names, and applies whether or not <see cref="ShredVariants"/> is set.
+    /// </summary>
+    /// <remarks>
+    /// For a producer that knows the shape — a table format carrying a declared variant schema, or a
+    /// host writing many files that must agree on one layout. Build one with
+    /// <see cref="Apache.Arrow.Operations.Shredding.ShredSchema.ForObject"/> and friends, or capture
+    /// one from <see cref="VariantShredding.InferSchema(Apache.Arrow.VariantArray, Apache.Arrow.Operations.Shredding.ShredOptions)"/>
+    /// over a representative sample. A column named here is shredded even if inference would have
+    /// declined it.
+    /// </remarks>
+    public IReadOnlyDictionary<string, Apache.Arrow.Operations.Shredding.ShredSchema>? VariantShredSchemas { get; init; }
+
+    /// <summary>
     /// Prototype. When <see langword="true"/>, consecutive bit-packed groups in RLE/bit-packed
     /// hybrid streams — definition levels, repetition levels, and dictionary indices — are batched
     /// into a single literal run (up to 63 groups) instead of emitting a run header for every
