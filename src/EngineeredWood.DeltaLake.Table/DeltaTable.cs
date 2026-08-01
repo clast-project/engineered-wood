@@ -2079,7 +2079,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         foreach (var r in required)
         {
-            if (r.ExpectedPrevious is not { } expected)
+            // Null ExpectedPrevious alone is "do not check"; RequireAbsent asserts that the table records
+            // nothing, which is a precondition null cannot express (see RequireAppTransaction's remarks).
+            if (r.ExpectedPrevious is null && !r.RequireAbsent)
                 continue; // no precondition — write unconditionally
 
             // The base version's record, overridden by any concurrent commit that moved it. Reading the
@@ -2102,11 +2104,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
 
-            if (current != expected)
+            // One comparison serves both preconditions: with RequireAbsent the expected value IS null, so
+            // "current must be null" needs no branch of its own — only the message distinguishes them.
+            if (current != r.ExpectedPrevious)
             {
                 throw new InvalidOperationException(
                     $"App transaction precondition failed for '{r.AppId}': expected the table to record "
-                    + $"version {expected}, but it records "
+                    + (r.ExpectedPrevious is { } e ? $"version {e}" : "no transaction at all")
+                    + ", but it records "
                     + (current is { } c ? c.ToString() : "no transaction at all")
                     + $". Version {r.Version} was NOT committed. This is not a conflict to retry — retrying "
                     + "cannot make an already-committed batch un-commit; re-read the recorded version and "

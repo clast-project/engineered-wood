@@ -227,6 +227,132 @@ public class TransactionPreconditionTests : IDisposable
         Assert.Equal(3, await RecordedVersionAsync("producer"));
     }
 
+    // ── requireAbsent: the precondition a FIRST batch needs ──
+    //
+    // The test above states the rule this group exists for: an omitted expectedPrevious is "do not check",
+    // so it guards nothing. That is fine for batch N, which names N-1 — and leaves batch 1 with NO guard
+    // available, since a replay of it has no prior version to name. requireAbsent is that guard.
+
+    /// <summary>A first batch commits: nothing is recorded for the producer, which is what it asserted.</summary>
+    [Fact]
+    public async Task RequireAppTransaction_RequireAbsent_FirstBatchCommits()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var txn = table.StartTransaction();
+        await txn.WriteAsync([Batch(1, 2)]);
+        txn.RequireAppTransaction("producer", version: 1, requireAbsent: true);
+        await txn.CommitAsync();
+
+        Assert.Equal(new long[] { 1, 2 }, await ReadIdsFreshAsync());
+        Assert.Equal(1, await RecordedVersionAsync("producer"));
+    }
+
+    /// <summary>
+    /// THE CASE THE FLAG EXISTS FOR, and the reason it is not a convenience. A replayed FIRST batch — the
+    /// ordinary consequence of a crash and restart — is refused instead of committing a second copy.
+    ///
+    /// <para>Note what the table looks like afterwards if it is NOT refused: the rows are duplicated and the
+    /// recorded version is rewritten with the SAME value, so nothing in the table says a batch was applied
+    /// twice. That is why an unguarded first batch is worth a parameter.</para>
+    /// </summary>
+    [Fact]
+    public async Task RequireAppTransaction_RequireAbsent_ReplayedFirstBatch_IsRefused()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var first = table.StartTransaction();
+        await first.WriteAsync([Batch(1, 2)]);
+        first.RequireAppTransaction("producer", version: 1, requireAbsent: true);
+        await first.CommitAsync();
+        long versionAfterFirst = table.CurrentSnapshot.Version;
+
+        await using var reopened = await OpenAsync();
+        var replay = reopened.StartTransaction();
+        await replay.WriteAsync([Batch(1, 2)]);   // the identical batch, identically guarded
+        replay.RequireAppTransaction("producer", version: 1, requireAbsent: true);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await replay.CommitAsync());
+        Assert.IsNotType<DeltaConflictException>(ex);   // not retryable — retrying cannot un-commit batch 1
+        Assert.Contains("producer", ex.Message);
+        Assert.Contains("expected the table to record no transaction at all", ex.Message);
+        Assert.Contains("records 1", ex.Message);
+
+        // Nothing landed, and the version did not move.
+        Assert.Equal(new long[] { 1, 2 }, await ReadIdsFreshAsync());
+        Assert.Equal(versionAfterFirst, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// Re-checked per attempt like the other precondition, and this is the shape that needs it: a TWIN
+    /// producer running the same first batch commits while this transaction is open. Ours then loses the
+    /// optimistic race and the loop retries — and on that retry the read-set check has nothing to object to,
+    /// because a concurrent APPEND invalidates no read of ours. Only the re-checked precondition stops the
+    /// batch landing twice.
+    /// </summary>
+    [Fact]
+    public async Task RequireAppTransaction_RequireAbsent_IsRecheckedAgainstConcurrentCommits()
+    {
+        await using var created = await DeltaTable.CreateAsync(Fs, IdSchema);
+        var pinned = created.CurrentSnapshot;
+
+        await using var mine = await OpenAsync();
+        var txn = mine.StartTransaction(pinned);
+        await txn.WriteAsync([Batch(1, 2)]);
+        txn.RequireAppTransaction("producer", version: 1, requireAbsent: true);
+
+        await using (var twin = await OpenAsync())
+        {
+            var twinTxn = twin.StartTransaction();
+            await twinTxn.WriteAsync([Batch(1, 2)]);
+            twinTxn.RequireAppTransaction("producer", version: 1, requireAbsent: true);
+            await twinTxn.CommitAsync();
+        }
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        Assert.Contains("producer", ex.Message);
+
+        // Exactly ONE copy of the batch is in the table.
+        Assert.Equal(new long[] { 1, 2 }, await ReadIdsFreshAsync());
+        Assert.Equal(1, await RecordedVersionAsync("producer"));
+    }
+
+    /// <summary>
+    /// The two preconditions contradict each other, so saying both is rejected rather than resolved by a
+    /// precedence rule — which would silently make one of them a no-op at the call site that asked for a
+    /// guard. Rejected at the CALL, so a transaction that was going to be wrong never gets built.
+    /// </summary>
+    [Fact]
+    public async Task RequireAppTransaction_RequireAbsentWithExpectedPrevious_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+        var txn = table.StartTransaction();
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            txn.RequireAppTransaction("producer", version: 7, expectedPrevious: 3, requireAbsent: true));
+        Assert.Contains("producer", ex.Message);
+        Assert.Contains("mutually exclusive", ex.Message);
+    }
+
+    /// <summary>
+    /// A sentinel value could not have served instead: the recorded version is the APPLICATION's own counter,
+    /// not a table version, and nothing constrains its sign — so a negative value is a legitimate record and
+    /// reserving one would reinterpret a real caller's guard. Pinned because it is the argument for the flag
+    /// existing at all, and it is a property of the action model rather than of this method.
+    /// </summary>
+    [Fact]
+    public async Task RequireAppTransaction_ANegativeVersion_IsALegitimateRecord()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var txn = table.StartTransaction();
+        await txn.WriteAsync([Batch(1, 1)]);
+        txn.RequireAppTransaction("producer", version: -1);
+        await txn.CommitAsync();
+
+        Assert.Equal(-1, await RecordedVersionAsync("producer"));
+    }
+
     [Fact]
     public async Task RequireAppTransaction_TwiceForOneAppId_Throws()
     {
