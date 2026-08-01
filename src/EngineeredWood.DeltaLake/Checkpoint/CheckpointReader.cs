@@ -84,6 +84,86 @@ public sealed class CheckpointReader
     }
 
     /// <summary>
+    /// Finds the newest checkpoint at or below <paramref name="maxVersion"/> by listing
+    /// <c>_delta_log</c>, or null if there is none. This is the fallback for an absent, unusable or
+    /// stale <c>_last_checkpoint</c>: the log directory is the truth that file only summarizes.
+    /// </summary>
+    /// <remarks>
+    /// A multi-part checkpoint counts only when every one of its parts is present — a writer that died
+    /// midway leaves a prefix, and bootstrapping from that would silently drop the files in the missing
+    /// parts. <c>Size</c> is reported as 0 because only the file listing is available here; it is
+    /// informational and nothing on the read path consumes it.
+    /// </remarks>
+    public async ValueTask<LastCheckpointInfo?> FindLatestCheckpointAsync(
+        long maxVersion, CancellationToken cancellationToken = default)
+    {
+        const string Marker = ".checkpoint.";
+
+        var classic = new HashSet<long>();
+        var v2 = new Dictionary<long, string>();
+        // version -> declared part count -> the part numbers actually seen
+        var multiPart = new Dictionary<long, Dictionary<int, HashSet<int>>>();
+
+        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            string name = Path.GetFileName(file.Path);
+            if (!DeltaVersion.TryParseCheckpointVersion(name, out long version) || version > maxVersion)
+                continue;
+
+            string[] suffix = name[(name.IndexOf(Marker, StringComparison.OrdinalIgnoreCase)
+                + Marker.Length)..].Split('.');
+
+            // <version>.checkpoint.parquet
+            if (suffix is ["parquet"])
+            {
+                classic.Add(version);
+            }
+            // <version>.checkpoint.<part>.<total>.parquet
+            else if (suffix is [var p, var t, "parquet"] &&
+                     int.TryParse(p, out int part) && int.TryParse(t, out int total) && total > 0)
+            {
+                if (!multiPart.TryGetValue(version, out var byTotal))
+                    multiPart[version] = byTotal = [];
+                if (!byTotal.TryGetValue(total, out var seen))
+                    byTotal[total] = seen = [];
+                seen.Add(part);
+            }
+            // <version>.checkpoint.<uuid>.json. The parquet-bodied V2 form is deliberately not claimed:
+            // ReadV2CheckpointAsync only decodes NDJSON, so claiming it would just fail the read.
+            else if (suffix is [_, "json"])
+            {
+                v2[version] = DeltaVersion.LogPrefix + name;
+            }
+        }
+
+        var versions = new SortedSet<long>(classic);
+        versions.UnionWith(v2.Keys);
+        versions.UnionWith(multiPart.Keys);
+
+        foreach (long version in versions.Reverse())
+        {
+            // Classic first: it is the one form every reader here handles without further lookups.
+            if (classic.Contains(version))
+                return new LastCheckpointInfo { Version = version, Size = 0 };
+
+            if (multiPart.TryGetValue(version, out var byTotal))
+            {
+                foreach (var (total, seen) in byTotal)
+                {
+                    if (seen.Count == total)
+                        return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
+                }
+            }
+
+            if (v2.TryGetValue(version, out string? path))
+                return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Reads all actions from a checkpoint file (single or multi-part).
     /// Returns the actions as <see cref="DeltaAction"/> objects.
     /// </summary>
