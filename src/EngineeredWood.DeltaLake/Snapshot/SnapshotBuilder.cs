@@ -91,6 +91,14 @@ public sealed class SnapshotBuilder
             }
         }
 
+        // Replay has to cover every version from here to the target. Anything it cannot apply leaves a
+        // hole, and a snapshot with a hole is not a version of this table — it is missing whatever those
+        // commits added, removed or renamed, with nothing in the result to say so. Recorded as we go and
+        // reported at the end, so the message names the first gap rather than the first symptom.
+        long firstNeeded = replayFrom;
+        long nextNeeded = replayFrom;
+        long? firstMissing = null;
+
         // Check for log compaction files that cover subranges
         LogCompaction? logCompaction = null;
         IReadOnlyList<(long Start, long End, string Path)> compactedFiles = [];
@@ -131,7 +139,15 @@ public sealed class SnapshotBuilder
                         .ConfigureAwait(false);
                     builder.ApplyCommit(v, preActions);
                 }
-                catch { /* Skip missing commits */ }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Missing or unreadable — either way this version does not reach the snapshot.
+                    firstMissing ??= v;
+                }
             }
 
             // Apply the compacted file
@@ -139,6 +155,7 @@ public sealed class SnapshotBuilder
                 bestCompacted.Value.Path, cancellationToken).ConfigureAwait(false);
             builder.ApplyCommit(bestCompacted.Value.End, compactedActions);
             replayFrom = bestCompacted.Value.End + 1;
+            nextNeeded = replayFrom;
         }
 
         // Read remaining commits after the compacted range
@@ -167,11 +184,30 @@ public sealed class SnapshotBuilder
         // Apply in version order
         foreach (var (version, actions) in commits.OrderBy(c => c.Version))
         {
+            if (version != nextNeeded)
+                firstMissing ??= nextNeeded;
+            nextNeeded = version + 1;
             builder.ApplyCommit(version, actions);
         }
 
+        if (nextNeeded <= targetVersion)
+            firstMissing ??= nextNeeded;
+
+        if (firstMissing is long missing)
+            throw IncompleteLog(missing, firstNeeded, targetVersion);
+
         return builder.Build();
     }
+
+    /// <summary>
+    /// A replay that cannot cover its whole range would silently return a snapshot missing whatever the
+    /// absent commits did. Naming the first uncovered version turns that into something diagnosable: on a
+    /// table whose log has been cleaned it points at the checkpoint that should have been found.
+    /// </summary>
+    private static DeltaFormatException IncompleteLog(long missing, long from, long through) =>
+        new($"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
+            $"covers it. Building a snapshot at version {through} requires every version in " +
+            $"[{from}..{through}].");
 
     /// <summary>
     /// Incrementally updates an existing snapshot by replaying only
@@ -199,6 +235,18 @@ public sealed class SnapshotBuilder
         }
 
         versions.Sort();
+
+        // Same rule as BuildAsync: an incremental update that skips a version produces a snapshot that
+        // never existed. There is no checkpoint fallback here — this path only moves forward from one.
+        long nextNeeded = current.Version + 1;
+        foreach (long v in versions)
+        {
+            if (v != nextNeeded)
+                throw IncompleteLog(nextNeeded, current.Version + 1, latestVersion);
+            nextNeeded = v + 1;
+        }
+        if (nextNeeded <= latestVersion)
+            throw IncompleteLog(nextNeeded, current.Version + 1, latestVersion);
 
         foreach (long v in versions)
         {

@@ -120,24 +120,4 @@ public sealed class TransactionLog
 
         return latest;
     }
-
-    /// <summary>
-    /// Lists checkpoint file versions in the log directory.
-    /// </summary>
-    public async IAsyncEnumerable<long> ListCheckpointVersionsAsync(
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        var seen = new HashSet<long>();
-
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
-            .ConfigureAwait(false))
-        {
-            string fileName = Path.GetFileName(file.Path);
-            if (DeltaVersion.TryParseCheckpointVersion(fileName, out long version) &&
-                seen.Add(version))
-            {
-                yield return version;
-            }
-        }
-    }
 }
