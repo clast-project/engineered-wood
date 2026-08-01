@@ -4194,6 +4194,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnsupportedTimestampUnit(b.Schema);
 
+        // Same chokepoint, same reason: this path converts no schema either, so a column the table does not
+        // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
+        // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
+        ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
+
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
         // keeps files that would no longer conform to the new partition schema).
@@ -4706,6 +4711,73 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private const string RowIdRideAlongColumn = "__engineered_wood_materialized_row_id_ridealong";
 
+    /// <summary>
+    /// Refuses a batch carrying a top-level column the write schema does not declare. Every write path drops
+    /// through <see cref="ColumnMappingRecursive.ToPhysical"/>, which passes an unmatched column through
+    /// untouched, and the parquet writer then writes whatever columns the batch has — so an undeclared column
+    /// becomes a real column of the data file. A Delta reader projects by the table schema and never surfaces
+    /// it, which is what makes this worth refusing: it costs bytes in every file written, forever, with
+    /// nothing anywhere reporting that it is there.
+    ///
+    /// <para>The motivating case is a host's own copy-on-write rewrite. The identity to preserve arrives as a
+    /// metadata COLUMN of the read (<see cref="DeltaRowMetadata.RowTracking"/>), so forwarding the read's
+    /// batch as a post-image — the obvious thing to write — buries <c>_metadata.row_id</c> in the data file.
+    /// That name gets its own sentence in the message, because "you have an extra column" is a much worse
+    /// hint than "that is the read's, not yours".</para>
+    ///
+    /// <para>Accepts a PHYSICAL name wherever the logical one would do, matching
+    /// <c>ColumnMappingRecursive</c>'s own tolerance — a batch read out of a data file and handed straight
+    /// back is legal input, and the guard must never refuse what the rename would have accepted. Top level
+    /// only: a stray nested field is a narrower mistake and not the one measured here.</para>
+    /// </summary>
+    private static void ThrowIfUndeclaredColumns(
+        IReadOnlyList<RecordBatch> batches, Schema.StructType writeSchema, string entryPoint)
+    {
+        foreach (var batch in batches)
+        {
+            foreach (var field in batch.Schema.FieldsList)
+            {
+                if (DeclaresColumn(writeSchema, field.Name))
+                    continue;
+
+                bool looksLikeReadMetadata =
+                    field.Name.StartsWith(DeltaMetadataColumns.DefaultPrefix, StringComparison.Ordinal)
+                    || string.Equals(field.Name, TransientRowAddress.ColumnName, StringComparison.Ordinal);
+
+                throw new ArgumentException(
+                    $"{entryPoint}: the batch has a column '{field.Name}' that the table does not declare. "
+                    + "It would be written into the data file as a column of its own, where a Delta reader — "
+                    + "projecting by the table schema — would never show it: silent bytes in every file. "
+                    + (looksLikeReadMetadata
+                        ? "This is a READ's metadata column, not one of yours; build the batch to the table's "
+                          + "schema rather than forwarding a read's batch. "
+                        : "Drop it from the batch, or ALTER the table to declare it. ")
+                    + "The table declares: "
+                    + string.Join(", ", writeSchema.Fields.Select(f => "'" + f.Name + "'")) + ".",
+                    nameof(batches));
+            }
+        }
+    }
+
+    /// <summary>True when <paramref name="arrowName"/> names a top-level field of <paramref name="schema"/>,
+    /// by its logical name or by its column-mapping physical name — the same either-name rule
+    /// <c>ColumnMappingRecursive.FindField</c> applies when renaming.</summary>
+    private static bool DeclaresColumn(Schema.StructType schema, string arrowName)
+    {
+        foreach (var f in schema.Fields)
+        {
+            if (string.Equals(f.Name, arrowName, StringComparison.Ordinal))
+                return true;
+            if (f.Metadata is { } md
+                && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var physical)
+                && string.Equals(physical, arrowName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// <summary>Returns the batch without <paramref name="name"/>, or unchanged if it has no such column.</summary>
     private static RecordBatch DropColumn(RecordBatch batch, string name)
     {
@@ -4733,6 +4805,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// first (or pass <paramref name="identityValuesPreGenerated"/> for a table whose identity values were
     /// generated up front via <c>GenerateIdentityValues</c>). The written files are invisible orphans until
     /// committed (rollback = never reference them; vacuum cleans).
+    ///
+    /// <para>A batch carrying a column the write schema does not declare is REFUSED, naming it: the file would
+    /// carry the column while every Delta read projected it away. Fewer columns than the table is still legal
+    /// (an absent column reads as null). See <see cref="ThrowIfUndeclaredColumns"/>.</para>
     /// </summary>
     /// <param name="schemaOverride">A buffered transaction's PENDING (ALTERed) schema — the batches carry columns
     /// the committed snapshot doesn't know yet; the pending schema (whose added columns already carry their
@@ -4771,6 +4847,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var snapshot = CurrentSnapshot;
         var writeSchema = schemaOverride ?? snapshot.Schema;
+        ThrowIfUndeclaredColumns(batches, writeSchema, nameof(WriteDataFilesAsync));
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
