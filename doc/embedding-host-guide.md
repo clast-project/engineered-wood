@@ -15,9 +15,11 @@ address, commit. Any step left to `CurrentSnapshot` is a step that can silently 
 three.
 
 ```csharp
-var txn = table.StartTransaction();
+await using var txn = table.StartTransaction();
 var snapshot = txn.Snapshot;   // NOT table.CurrentSnapshot
 ```
+
+`await using`, because staging **writes files**: see [Abandoning a transaction](#abandoning-a-transaction).
 
 `DeltaTable.CurrentSnapshot` advances whenever another writer commits. `DeltaTransaction.Snapshot` does not,
 which is what makes file ordinals (below) mean the same thing at plan time and at commit time.
@@ -293,7 +295,7 @@ Use the plain `StageDataFiles` unless you need one of the async form's two argum
   staged at all**, which meant a host on such a table had no transaction to put anything else into either.
 
 ```csharp
-var txn = table.StartTransaction();
+await using var txn = table.StartTransaction();
 
 var planned = table.PlanFiles(predicate, snapshot: txn.Snapshot);
 // ... your engine scans those files and decides what changes ...
@@ -311,6 +313,31 @@ long version = await txn.CommitAsync();   // ONE atomic version
 Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
 delete names agree with what the commit validates.
 
+### Abandoning a transaction
+
+Staging **writes files** — a staged append's parquet, a rewrite's post-image, deletion vectors, change
+files — before `CommitAsync` publishes anything. So a transaction that is refused, conflicts, or is simply
+dropped on an exception path has already put bytes on storage. `DeltaTransaction` is `IAsyncDisposable` for
+that reason:
+
+```csharp
+await using var txn = table.StartTransaction();   // deletes what it wrote, if it never commits
+```
+
+`AbortAsync(ct)` is the same cleanup under a name, for a host that decides mid-transaction not to proceed.
+Both are **no-ops after a successful commit** (those files are the table's data now) and both are
+best-effort: a delete that fails is swallowed rather than allowed to mask the error that caused the abort.
+
+Two things an abort deliberately does **not** delete, because they are not the transaction's to collect:
+
+- the data file a deletion-vector DELETE re-adds — that parquet is live table data, and only the `.bin`
+  beside it was written here;
+- files you handed to `StageDataFiles` — you wrote them, before the transaction saw them, and you may well
+  mean to stage them onto the next one.
+
+Without an abort or a dispose, an abandoned transaction's files sit on storage until VACUUM's retention
+horizon passes — for a crash-looping producer, a whole batch per restart.
+
 ### Exactly-once producers
 
 `RequireAppTransaction` commits the `txn` action recording your progress **atomically with the data it
@@ -318,7 +345,8 @@ describes**, so there is no window in which one exists without the other:
 
 ```csharp
 // Skip a batch the table already holds WITHOUT writing it: WriteAsync writes its parquet immediately, so a
-// batch staged and then refused leaves that file behind as an orphan.
+// batch staged and then refused is parquet written for nothing (the abort deletes it again, but the write
+// still happened).
 if (txn.IsAppTransactionApplied("my-producer", batchId))
     return;
 
@@ -457,7 +485,11 @@ attempt created.
   writer did not do. Check `DeltaTable.SupportsExternalDataFileCommit`. Identity columns are the same, with
   one escape: generate the values yourself and pass `identityValuesPreGenerated`.
 - **A transaction is single-use and not thread-safe.** Many transactions may race across threads; drive each
-  from one.
+  from one. A commit that throws ends it too — abort or dispose it and start a new one.
+- **The auto-committing paths other than `DeleteAsync` still leak on a failed commit.** `WriteAsync`,
+  `UpdateAsync`, `DeleteRowsAsync` and `CompactAsync` write their files and commit them without a
+  transaction to hang the cleanup on, so a conflict there leaves vacuum-able orphans as before. Drive the
+  work through a transaction if that matters to you.
 
 ## See also
 

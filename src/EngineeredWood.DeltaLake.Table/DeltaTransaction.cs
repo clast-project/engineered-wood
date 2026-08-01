@@ -22,6 +22,15 @@ namespace EngineeredWood.DeltaLake.Table;
 /// reused. Not thread-safe: drive one transaction from one thread, though many transactions may race
 /// across threads, which is the point.</para>
 ///
+/// <para><b>Staging writes files; abandoning it takes them back.</b> A staged append's parquet, a staged
+/// update's post-image, deletion vectors and change files are all on storage BEFORE
+/// <see cref="CommitAsync"/> — nothing is visible until the commit, but the bytes are there. So the
+/// transaction is <see cref="IAsyncDisposable"/>: <c>await using var txn = table.StartTransaction();</c>
+/// deletes them if the transaction is refused, aborts, or is simply dropped on an exception path, and does
+/// nothing at all once a commit has succeeded. <see cref="AbortAsync"/> is the same cleanup, named. Without
+/// one of the two, every abandoned transaction's files sit on storage until VACUUM's retention horizon
+/// passes — a crash-looping producer's whole batch, on every restart.</para>
+///
 /// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync"/>), and
 /// updates (<see cref="UpdateAsync"/>) can be staged, including several on one transaction. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
@@ -41,7 +50,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// it. Plan against <see cref="Snapshot"/> so the rows a staged delete names agree with what the
 /// transaction validates.</para>
 /// </summary>
-public sealed class DeltaTransaction
+public sealed class DeltaTransaction : IAsyncDisposable
 {
     private readonly DeltaTable _table;
     private readonly Snapshot.Snapshot _baseSnapshot;
@@ -80,7 +89,20 @@ public sealed class DeltaTransaction
     private HashSet<string>? _basePaths;
     // What commitInfo records, when the caller says rather than letting it be inferred.
     private string? _operation;
+    // The files this transaction's OWN writers put on storage — what an abort deletes. Recorded as they are
+    // written rather than derived from the staged actions at abort time, which cannot tell a fresh append's
+    // add from a deletion-vector delete's re-add of LIVE data; see WrittenFileLedger.
+    private readonly WrittenFileLedger _written = new();
+    // Whether staging is closed. Set by a commit ATTEMPT (successful or not) and by an abort: a transaction
+    // whose commit ran has already been rebased and validated, and one whose files are deleted has nothing
+    // left to stage onto.
+    private bool _completed;
+    // Whether the commit SUCCEEDED. The distinction _completed cannot make, and the one that matters most:
+    // after a successful commit the staged files are live table data, so an abort must not touch them.
     private bool _committed;
+    // Whether the files have already been collected, so a second abort — or the dispose that follows one —
+    // does no I/O and reports nothing.
+    private bool _aborted;
 
     internal DeltaTransaction(
         DeltaTable table, Snapshot.Snapshot baseSnapshot, IsolationLevel isolationLevel)
@@ -116,6 +138,10 @@ public sealed class DeltaTransaction
     internal IReadOnlyList<Expressions.Predicate> ReadPredicates => _readPredicates;
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
+
+    /// <summary>The files this transaction's own writers created, for the commit loop to keep recording into
+    /// and for <see cref="AbortAsync"/> to delete.</summary>
+    internal WrittenFileLedger Written => _written;
 
     /// <summary>
     /// What this transaction's <c>commitInfo</c> records as its operation. Null — the default — keeps the
@@ -171,20 +197,20 @@ public sealed class DeltaTransaction
     /// never conflicts with a concurrent delete or append and two concurrent transactional appends both
     /// land. It aborts only if a concurrent commit changed the table's metadata or protocol.
     ///
-    /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the data files ARE written now (an
-    /// aborted transaction leaves them as vacuum-able orphans, like the auto-committer). Returns the
-    /// number of rows staged.</para>
+    /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the data files ARE written now —
+    /// <see cref="AbortAsync"/> (or disposal) deletes them again if this transaction never commits. Returns
+    /// the number of rows staged.</para>
     /// </summary>
     public async ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: true);
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
             overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-            cancellationToken, rowIdStart: _nextRowId).ConfigureAwait(false);
+            cancellationToken, rowIdStart: _nextRowId, written: _written).ConfigureAwait(false);
 
         _nextRowId = nextRowId;
         StageInternal(actions);
@@ -208,10 +234,11 @@ public sealed class DeltaTransaction
     public async ValueTask<long> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate, CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
-        var plan = await _table.ComputeDeleteActionsAsync(_baseSnapshot, predicate, cancellationToken)
+        var plan = await _table.ComputeDeleteActionsAsync(
+            _baseSnapshot, predicate, cancellationToken, written: _written)
             .ConfigureAwait(false);
 
         StageInternal(plan.DataActions);
@@ -232,11 +259,12 @@ public sealed class DeltaTransaction
     public async ValueTask<long> DeleteAsync(
         Expressions.Predicate predicate, CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
         var plan = await _table.ComputeDeleteActionsAsync(
-            _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate)
+            _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate,
+            written: _written)
             .ConfigureAwait(false);
 
         StageInternal(plan.DataActions);
@@ -255,18 +283,20 @@ public sealed class DeltaTransaction
     /// it rewrites, so a concurrent commit that removed one of them aborts the commit.
     ///
     /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the rewritten files ARE written
-    /// now. Returns the number of rows this update matched.</para>
+    /// now — and deleted again by <see cref="AbortAsync"/> if this transaction never commits. The files this
+    /// update REPLACES are untouched by an abort: they are the table's data until the commit lands. Returns
+    /// the number of rows this update matched.</para>
     /// </summary>
     public async ValueTask<long> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
         var plan = await _table.ComputeUpdateActionsAsync(
-            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId)
+            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
             .ConfigureAwait(false);
 
         _nextRowId = plan.NextRowId;
@@ -289,12 +319,12 @@ public sealed class DeltaTransaction
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
-            prunePredicate: predicate, rowIdStart: _nextRowId).ConfigureAwait(false);
+            prunePredicate: predicate, rowIdStart: _nextRowId, written: _written).ConfigureAwait(false);
 
         _nextRowId = plan.NextRowId;
         StageInternal(plan.Actions);
@@ -327,7 +357,7 @@ public sealed class DeltaTransaction
     /// </summary>
     public void StageDataFiles(IReadOnlyList<WrittenDataFile> files)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
         _table.ValidateWritable(_baseSnapshot, isAppend: true);
@@ -365,7 +395,7 @@ public sealed class DeltaTransaction
         bool identityValuesPreGenerated = false,
         CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
         _table.ValidateWritable(_baseSnapshot, isAppend: true);
@@ -373,7 +403,10 @@ public sealed class DeltaTransaction
             return 0;
 
         var (actions, nextRowId, liveRows) = await _table.BuildStagedAppendActionsAsync(
-            _baseSnapshot, files, bornDeleted, identityValuesPreGenerated, _nextRowId, cancellationToken)
+            _baseSnapshot, files, bornDeleted, identityValuesPreGenerated, _nextRowId, cancellationToken,
+            // Only the born-deleted vector is ours. The DATA files came in already written by the host, so an
+            // abort leaves them where they are — it never staged them, and it does not own them.
+            written: _written)
             .ConfigureAwait(false);
 
         _nextRowId = nextRowId;
@@ -399,7 +432,7 @@ public sealed class DeltaTransaction
         RowSelection selection,
         CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
@@ -407,7 +440,7 @@ public sealed class DeltaTransaction
             return 0;
 
         var result = await _table.ComputeDvActionsWithEditsAsync(
-            selection, _baseSnapshot, cancellationToken).ConfigureAwait(false);
+            selection, _baseSnapshot, cancellationToken, written: _written).ConfigureAwait(false);
         if (result.RowsDeleted == 0)
             return 0;
 
@@ -428,7 +461,7 @@ public sealed class DeltaTransaction
     /// </summary>
     public void StageSchemaChange(DeltaTable.DeferredSchemaChange change)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         StageInternal(change.Actions);
         _operations.Add("ALTER");
     }
@@ -456,7 +489,7 @@ public sealed class DeltaTransaction
         RecordBatch rows, string changeType, CancellationToken cancellationToken = default,
         Int64Array? rowIds = null, Int64Array? rowCommitVersions = null)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (rows is null)
             throw new ArgumentNullException(nameof(rows));
         if (rows.Length == 0)
@@ -464,7 +497,7 @@ public sealed class DeltaTransaction
         _table.ValidateChangeDataStageable(_baseSnapshot, changeType);
 
         var files = await _table.WriteChangeDataFilesForAsync(
-            _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions)
+            _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions, written: _written)
             .ConfigureAwait(false);
         StageInternal(files);
     }
@@ -478,7 +511,7 @@ public sealed class DeltaTransaction
     /// </summary>
     public void StageActions(IReadOnlyList<DeltaAction> actions)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (actions is null)
             throw new ArgumentNullException(nameof(actions));
         StageInternal(actions);
@@ -528,7 +561,7 @@ public sealed class DeltaTransaction
     public void RequireAppTransaction(
         string appId, long version, AppTransactionPrecondition precondition = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (string.IsNullOrEmpty(appId))
             throw new ArgumentException("appId must be a non-empty identifier.", nameof(appId));
 
@@ -552,10 +585,11 @@ public sealed class DeltaTransaction
     /// refuse a commit of it.
     ///
     /// <para>Ask this BEFORE staging. <see cref="WriteAsync"/> writes its data files immediately, so a batch
-    /// staged and then refused at commit leaves that parquet behind as vacuum-able orphans; a producer that
-    /// expects to replay routinely should skip the batch rather than write it and be told no. The commit-time
-    /// precondition stays necessary either way — it closes the race between this answer and the commit, which
-    /// a concurrent twin producer can still lose you.</para>
+    /// staged and then refused at commit is parquet written for nothing; a producer that expects to replay
+    /// routinely should skip the batch rather than write it and be told no. The commit-time precondition stays
+    /// necessary either way — it closes the race between this answer and the commit, which a concurrent twin
+    /// producer can still lose you — and when it does refuse, <see cref="AbortAsync"/> takes the batch's files
+    /// back off storage rather than leaving them for VACUUM.</para>
     ///
     /// <para>Answered against this transaction's PINNED base snapshot, not the table's current version, so it
     /// answers the same question the first commit attempt will ask. Those differ whenever the transaction was
@@ -589,7 +623,7 @@ public sealed class DeltaTransaction
     /// </summary>
     public void DeclareRead(Expressions.Predicate predicate)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (predicate is null)
             throw new ArgumentNullException(nameof(predicate));
         _readPredicates.Add(predicate);
@@ -632,7 +666,7 @@ public sealed class DeltaTransaction
     /// rejected list leaves the transaction as it was.</exception>
     public void DeclareFilesRead(IReadOnlyCollection<string> paths)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         if (paths is null)
             throw new ArgumentNullException(nameof(paths));
         if (paths.Count == 0)
@@ -701,7 +735,7 @@ public sealed class DeltaTransaction
     /// </summary>
     public void DeclareWholeTableRead()
     {
-        EnsureNotCommitted();
+        EnsureOpen();
         _declaredWholeTableRead = true;
     }
 
@@ -728,18 +762,89 @@ public sealed class DeltaTransaction
     /// Validates and commits the staged work. Returns the committed version, or the read version
     /// unchanged when nothing was staged. Throws <see cref="DeltaConflictException"/> if a concurrent
     /// commit invalidated this transaction's reads.
+    ///
+    /// <para>A commit that THROWS ends the transaction too — its staged work has been rebased and refused, and
+    /// there is nothing to re-attempt. The files it wrote are still on storage at that point: abort or dispose
+    /// the transaction to take them back.</para>
     /// </summary>
     public async ValueTask<long> CommitAsync(CancellationToken cancellationToken = default)
     {
-        EnsureNotCommitted();
+        EnsureOpen();
+        _completed = true;
+        long version = await _table.CommitTransactionAsync(this, cancellationToken).ConfigureAwait(false);
+
+        // Reached only when the commit LANDED. Everything the ledger names is live table data now, so it must
+        // no longer name anything: a subsequent abort or dispose is then a no-op twice over — by state, and by
+        // there being nothing left to delete.
         _committed = true;
-        return await _table.CommitTransactionAsync(this, cancellationToken).ConfigureAwait(false);
+        _written.Clear();
+        return version;
     }
 
-    private void EnsureNotCommitted()
+    /// <summary>
+    /// Abandons this transaction and deletes the files it wrote but never committed — a staged append's
+    /// parquet, an update's post-image, the deletion vectors and change files, including any a losing commit
+    /// attempt wrote while rebasing. The transaction is then closed: a later <see cref="CommitAsync"/> fails
+    /// cleanly rather than committing <c>add</c> actions whose files are gone.
+    ///
+    /// <para><b>What it does NOT delete</b> is everything this transaction did not itself write. A
+    /// deletion-vector DELETE re-adds an EXISTING data file under a new vector — that parquet is live table
+    /// data, and only the vector beside it is ours. Files handed in by <see cref="StageDataFiles"/> are the
+    /// host's, written before they were staged and not this transaction's to collect. The distinction is
+    /// recorded as the writers run, not inferred from the staged actions, which cannot make it.</para>
+    ///
+    /// <para><b>Best-effort, and deliberately quiet.</b> A delete that fails is swallowed: an orphaned file is
+    /// what the old behaviour left behind anyway, so failing to collect one costs nothing that was not already
+    /// lost — but throwing here would replace the exception that caused the abort with a cleanup error. This
+    /// never throws.</para>
+    ///
+    /// <para>Idempotent, and a NO-OP after a successful <see cref="CommitAsync"/>: those files are the table's
+    /// now. That is what makes <c>await using var txn = table.StartTransaction();</c> safe to write
+    /// unconditionally — see <see cref="DisposeAsync"/>.</para>
+    /// </summary>
+    public async ValueTask AbortAsync(CancellationToken cancellationToken = default)
     {
+        if (_committed || _aborted)
+            return;
+
+        _aborted = true;
+        _completed = true;
+        await _table.DeleteWrittenFilesAsync(_written, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Aborts the transaction unless it has already been committed — the reason to write
+    /// <c>await using var txn = table.StartTransaction();</c>. A host that drops a transaction on an exception
+    /// path then has its data files collected without having to remember, and one that commits pays nothing:
+    /// disposal after a successful commit does no I/O at all.
+    ///
+    /// <para>Cleanup runs with no cancellation token, on purpose: disposal happens while an exception (often a
+    /// cancellation) is already unwinding, and that is exactly when the files most need collecting. Call
+    /// <see cref="AbortAsync"/> directly to pass one.</para>
+    /// </summary>
+    public ValueTask DisposeAsync() => AbortAsync(CancellationToken.None);
+
+    /// <summary>
+    /// Guards every staging call: work may only be added to a transaction that has neither committed nor
+    /// aborted. The three closed states are reported apart because the remedies differ.
+    /// </summary>
+    private void EnsureOpen()
+    {
+        if (_aborted)
+        {
+            throw new InvalidOperationException(
+                "This transaction was aborted: the files it wrote have been deleted, so nothing staged on it "
+                + "can still be committed. Start a new transaction.");
+        }
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
+        if (_completed)
+        {
+            throw new InvalidOperationException(
+                "This transaction's commit has already run and did not succeed. Its staged work was validated "
+                + "against the table and refused, so it cannot be added to or re-committed; abort or dispose it "
+                + "to take back the files it wrote, then start a new transaction.");
+        }
     }
 
     /// <summary>One <see cref="RequireAppTransaction"/> call: the <c>txn</c> action to write, plus the

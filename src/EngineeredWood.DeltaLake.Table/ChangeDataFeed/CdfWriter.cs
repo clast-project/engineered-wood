@@ -32,6 +32,8 @@ internal static class CdfWriter
     /// <paramref name="rowIds"/> / <paramref name="rowCommitVersions"/> — see
     /// <see cref="AddMaterializedRowTracking"/> for why a cdc file cannot do without them.</para>
     /// </summary>
+    /// <param name="written">Records this change file, so a transaction that stages it and never commits can
+    /// take it back. Null wherever the caller is not a transaction.</param>
     public static async ValueTask<CdcFile> WriteAsync(
         ITableFileSystem fs,
         EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
@@ -41,7 +43,8 @@ internal static class CdfWriter
         ParquetWriteOptions? parquetOptions,
         CancellationToken cancellationToken,
         Int64Array? rowIds = null,
-        Int64Array? rowCommitVersions = null)
+        Int64Array? rowCommitVersions = null,
+        WrittenFileLedger? written = null)
     {
         // Partition columns never live in the file bytes — they ride on the action's partitionValues and the
         // reader re-materializes them POSITIONALLY against the table schema. A caller whose rows came from the
@@ -61,6 +64,8 @@ internal static class CdfWriter
         var batchWithChangeType = AddRunEncodedChangeTypeColumn(rows, changeType);
 
         string fileName = $"{CdfConfig.ChangeDataDir}/{Guid.NewGuid():N}.parquet";
+        // Recorded before the write, so a write that fails part-way still leaves a deletable path behind.
+        written?.Record(fileName);
         long fileSize;
 
         await using (var file = await fs.CreateAsync(
