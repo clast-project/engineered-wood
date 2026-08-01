@@ -275,7 +275,7 @@ verdicts at different isolation levels.
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
 | `StageActions(actions)` | Anything else — your own domain metadata |
-| `RequireAppTransaction(appId, version, expectedPrevious:)` | Idempotent-producer compare-and-set |
+| `RequireAppTransaction(appId, version, precondition)` | Idempotent-producer compare-and-set |
 | `DeclareRead(predicate)` | What your own scan depended on |
 | `DeclareFilesRead(paths)` | The files it actually read — what `PlanFiles` just handed you |
 | `DeclareWholeTableRead()` | The same, when the scan had no bound at all |
@@ -317,13 +317,39 @@ delete names agree with what the commit validates.
 describes**, so there is no window in which one exists without the other:
 
 ```csharp
-txn.RequireAppTransaction("my-producer", version: batchId, expectedPrevious: lastCommittedBatchId);
+// Skip a batch the table already holds WITHOUT writing it: WriteAsync writes its parquet immediately, so a
+// batch staged and then refused leaves that file behind as an orphan.
+if (txn.IsAppTransactionApplied("my-producer", batchId))
+    return;
+
+txn.RequireAppTransaction("my-producer", version: batchId, AppTransactionPrecondition.NotApplied);
 ```
 
-`expectedPrevious` is re-checked against every concurrent commit before each attempt. A violation throws
-`InvalidOperationException` naming what the table actually records — re-read it and decide whether the batch
-still needs writing. Omitting `expectedPrevious` writes unconditionally; note that it means "do not check",
-not "expect no prior record".
+The precondition is re-checked against every concurrent commit before each attempt — the pre-check above is
+an optimisation, not the guard, and cannot close the race against a twin producer. A violation throws
+`AppTransactionPreconditionException` (an `InvalidOperationException`, deliberately **not** a
+`DeltaConflictException`, which the commit loop would retry) carrying `AppId`, `RequiredVersion`,
+`Precondition` and `ActualPrevious`, so a host need not parse the message.
+
+Four preconditions, and which one you want depends on where your version numbers come from:
+
+| Precondition | The table must record | Use it when |
+|---|---|---|
+| `None` (default) | anything — no check | you implement your own policy and just want the `txn` record |
+| `Absent` | nothing at all | this is the producer's **first** batch |
+| `Exactly(n)` | precisely `n` | your batch boundaries can **move** across a restart — see below |
+| `NotApplied` | nothing, or `< version` | Delta-Spark's rule; batch boundaries are fixed |
+
+`NotApplied` deduplicates a replay of the *same* batch and tolerates gaps, which is what you want when the
+version is a dense counter. It is **blind to a replay whose boundary moved**: with 1000 recorded, a producer
+that restarts from a stale checkpoint at 800 and resubmits 801–1300 passes `NotApplied` and writes rows
+801–1000 a second time. `Exactly(800)` refuses it, because the producer's belief about where it left off is
+precisely what the comparison tests. Delta-Spark can rely on `NotApplied` alone because its version is a
+structured-streaming `batchId` bound by the checkpoint to a fixed offset range; if you pick your own counter
+you have no such guarantee.
+
+Requirements for different appIds in one transaction are judged independently and the first failure aborts
+the whole commit — a commit is atomic, so the ones that hold cannot be applied on their own.
 
 ### Declaring what you read
 

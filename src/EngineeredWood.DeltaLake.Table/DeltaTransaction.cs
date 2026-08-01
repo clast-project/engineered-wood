@@ -494,27 +494,39 @@ public sealed class DeltaTransaction
     /// <summary>
     /// Idempotent-producer compare-and-set: commits a <c>txn</c> action recording that
     /// <paramref name="appId"/> has reached <paramref name="version"/>, atomically with everything else this
-    /// transaction stages, guarded by <paramref name="expectedPrevious"/>.
+    /// transaction stages, guarded by <paramref name="precondition"/>.
     ///
     /// <para>This is what lets a streaming producer make "write this batch exactly once" true across
     /// retries: the batch's data and the record of having written it land in ONE version, so there is no
     /// window in which one exists without the other.</para>
     ///
     /// <para><b>Why the violation is not a conflict.</b> A failed precondition throws
-    /// <see cref="InvalidOperationException"/>, not <see cref="DeltaConflictException"/>. The commit loop
+    /// <see cref="AppTransactionPreconditionException"/> — an
+    /// <see cref="InvalidOperationException"/>, not a <see cref="DeltaConflictException"/>. The commit loop
     /// RETRIES the latter, and retrying cannot make an already-committed batch un-commit — a producer told
     /// "conflict" would keep trying to write a batch that is already in the table.</para>
+    ///
+    /// <para>Requirements for DIFFERENT appIds in one transaction are evaluated independently, and the first
+    /// that fails aborts the commit naming itself. There is no combining rule to reason about because there
+    /// is no correct one: a transaction is a single commit, so partially applying it is not available.</para>
     /// </summary>
     /// <param name="appId">The producer's identifier. One transaction may require at most one version per
     /// appId: two <c>txn</c> actions for one appId in a single commit is malformed, and the surviving one
     /// would be whichever the reader saw last.</param>
     /// <param name="version">The version to record for <paramref name="appId"/>.</param>
-    /// <param name="expectedPrevious">The version the table must ALREADY record for
-    /// <paramref name="appId"/>, re-checked against every concurrent commit before each attempt. Null — the
-    /// default — writes unconditionally. Note that null is "do not check", not "expect no prior record":
-    /// the absence of a record cannot be asserted through this parameter, and a first-ever write simply
-    /// omits it.</param>
-    public void RequireAppTransaction(string appId, long version, long? expectedPrevious = null)
+    /// <param name="precondition">What the table must ALREADY record for <paramref name="appId"/>,
+    /// re-checked against every concurrent commit before each attempt. Defaults to
+    /// <see cref="AppTransactionPrecondition.None"/> — write unconditionally.
+    ///
+    /// <para>A producer's FIRST batch wants <see cref="AppTransactionPrecondition.Absent"/>: without it that
+    /// batch has no guard available at all, since a replay of it has no prior version to name, so it writes
+    /// unconditionally and the batch lands TWICE — and quietly, because the recorded version is rewritten
+    /// with the same value, leaving nothing in the table to say it happened. Later batches want
+    /// <see cref="AppTransactionPrecondition.Exactly"/> or
+    /// <see cref="AppTransactionPrecondition.NotApplied"/>; see
+    /// <see cref="AppTransactionPrecondition"/> for which, and why it matters.</para></param>
+    public void RequireAppTransaction(
+        string appId, long version, AppTransactionPrecondition precondition = default)
     {
         EnsureNotCommitted();
         if (string.IsNullOrEmpty(appId))
@@ -531,7 +543,33 @@ public sealed class DeltaTransaction
             }
         }
 
-        _appTransactions.Add(new AppTransactionRequirement(appId, version, expectedPrevious));
+        _appTransactions.Add(new AppTransactionRequirement(appId, version, precondition));
+    }
+
+    /// <summary>
+    /// Whether this transaction's base version already records <paramref name="version"/> or higher for
+    /// <paramref name="appId"/> — that is, whether <see cref="AppTransactionPrecondition.NotApplied"/> would
+    /// refuse a commit of it.
+    ///
+    /// <para>Ask this BEFORE staging. <see cref="WriteAsync"/> writes its data files immediately, so a batch
+    /// staged and then refused at commit leaves that parquet behind as vacuum-able orphans; a producer that
+    /// expects to replay routinely should skip the batch rather than write it and be told no. The commit-time
+    /// precondition stays necessary either way — it closes the race between this answer and the commit, which
+    /// a concurrent twin producer can still lose you.</para>
+    ///
+    /// <para>Answered against this transaction's PINNED base snapshot, not the table's current version, so it
+    /// answers the same question the first commit attempt will ask. Those differ whenever the transaction was
+    /// started at an explicit base version, or the table's snapshot has since moved.</para>
+    /// </summary>
+    public bool IsAppTransactionApplied(string appId, long version)
+    {
+        if (string.IsNullOrEmpty(appId))
+            throw new ArgumentException("appId must be a non-empty identifier.", nameof(appId));
+
+        long? recorded = _baseSnapshot.AppTransactions.TryGetValue(appId, out var txn)
+            ? txn.Version
+            : null;
+        return !AppTransactionPrecondition.NotApplied.Holds(recorded, version);
     }
 
     // ── Declarations ───────────────────────────────────────────────────────────────────────────────────
@@ -706,5 +744,6 @@ public sealed class DeltaTransaction
 
     /// <summary>One <see cref="RequireAppTransaction"/> call: the <c>txn</c> action to write, plus the
     /// compare-and-set guard the commit loop re-checks before every attempt.</summary>
-    internal sealed record AppTransactionRequirement(string AppId, long Version, long? ExpectedPrevious);
+    internal sealed record AppTransactionRequirement(
+        string AppId, long Version, AppTransactionPrecondition Precondition);
 }
