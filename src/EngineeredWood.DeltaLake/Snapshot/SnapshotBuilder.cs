@@ -45,23 +45,48 @@ public sealed class SnapshotBuilder
         long replayFrom = 0;
         if (checkpointReader is not null)
         {
-            var lastCheckpoint = await checkpointReader.ReadLastCheckpointAsync(cancellationToken)
+            // _last_checkpoint is an advisory hint, so it can be absent, unusable, or STALE — naming a
+            // checkpoint that log cleanup has since deleted. It can also sit above targetVersion on a
+            // time-travel read. Each of those falls through to listing the log, which is the truth the
+            // hint summarizes. Without that fallback, a table whose pre-checkpoint commits were cleaned
+            // up replays from a log that no longer starts at 0 and silently loses their files.
+            CheckpointReader reader = checkpointReader;
+            var hint = await reader.ReadLastCheckpointAsync(cancellationToken)
                 .ConfigureAwait(false);
+            if (hint is not null && hint.Version > targetVersion)
+                hint = null;
 
-            if (lastCheckpoint is not null && lastCheckpoint.Version <= targetVersion)
+            if (hint is null || !await TryBootstrapAsync(hint).ConfigureAwait(false))
+            {
+                var listed = await reader.FindLatestCheckpointAsync(
+                    targetVersion, cancellationToken).ConfigureAwait(false);
+
+                // Skip the re-read when listing just found the checkpoint that already failed.
+                if (listed is not null && listed.Version != hint?.Version)
+                    await TryBootstrapAsync(listed).ConfigureAwait(false);
+            }
+
+            async ValueTask<bool> TryBootstrapAsync(LastCheckpointInfo info)
             {
                 try
                 {
-                    var checkpointActions = await checkpointReader.ReadCheckpointAsync(
-                        lastCheckpoint, cancellationToken).ConfigureAwait(false);
-                    builder.ApplyCommit(lastCheckpoint.Version, checkpointActions);
-                    replayFrom = lastCheckpoint.Version + 1;
+                    var checkpointActions = await reader.ReadCheckpointAsync(
+                        info, cancellationToken).ConfigureAwait(false);
+                    builder.ApplyCommit(info.Version, checkpointActions);
+                    replayFrom = info.Version + 1;
+                    return true;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception)
                 {
-                    // If checkpoint reading fails, fall back to full replay
+                    // Discard whatever was applied before the failure — a half-read checkpoint is not a
+                    // valid starting state — and let the caller try the next candidate or full replay.
                     builder = new SnapshotBuilder();
                     replayFrom = 0;
+                    return false;
                 }
             }
         }
