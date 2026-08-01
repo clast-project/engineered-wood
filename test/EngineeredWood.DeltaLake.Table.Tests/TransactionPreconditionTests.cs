@@ -146,11 +146,21 @@ public class TransactionPreconditionTests : IDisposable
         await second.WriteAsync([Batch(2, 1)]);
         second.RequireAppTransaction("producer", version: 6, expectedPrevious: 4); // the table records 5
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await second.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await second.CommitAsync());
         Assert.IsNotType<DeltaConflictException>(ex);
         Assert.Contains("producer", ex.Message);
         Assert.Contains("expected the table to record version 4", ex.Message);
         Assert.Contains("records 5", ex.Message);
+
+        // Identifiable BY TYPE, and carrying the values a caller would otherwise have to parse the message
+        // for. Still an InvalidOperationException and still not a DeltaConflictException — both asserted
+        // above — so the retry contract this test exists for is unchanged; the type only makes the ONE case
+        // distinguishable from every other invalid-operation failure raised while committing.
+        var precondition = Assert.IsType<AppTransactionPreconditionException>(ex);
+        Assert.Equal("producer", precondition.AppId);
+        Assert.Equal(6, precondition.RequiredVersion);
+        Assert.Equal(4, precondition.ExpectedPrevious);
+        Assert.Equal(5, precondition.ActualPrevious);
 
         // Nothing landed: the data is not in the table and the recorded version is untouched.
         Assert.Equal(new long[] { 1 }, await ReadIdsFreshAsync());
@@ -167,8 +177,16 @@ public class TransactionPreconditionTests : IDisposable
         await txn.WriteAsync([Batch(2, 1)]);
         txn.RequireAppTransaction("never-seen", version: 2, expectedPrevious: 1);
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await txn.CommitAsync());
         Assert.Contains("no transaction at all", ex.Message);
+
+        // "No record" reaches the caller as NULL, not as a sentinel — the whole reason the properties are
+        // nullable. Asserted here because this is the only test that reaches the absent case, and a sentinel
+        // would read as a real recorded version to anyone branching on the value.
+        var precondition = Assert.IsType<AppTransactionPreconditionException>(ex);
+        Assert.Null(precondition.ActualPrevious);
+        Assert.Equal(1, precondition.ExpectedPrevious);
+        Assert.Equal("never-seen", precondition.AppId);
     }
 
     /// <summary>
@@ -201,7 +219,7 @@ public class TransactionPreconditionTests : IDisposable
             await racerTxn.CommitAsync();
         }
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await txn.CommitAsync());
         Assert.Contains("records 2", ex.Message);
 
         // The racer's work landed; ours did not.

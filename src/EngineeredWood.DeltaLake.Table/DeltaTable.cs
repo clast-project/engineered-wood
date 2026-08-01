@@ -2104,13 +2104,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             if (current != expected)
             {
-                throw new InvalidOperationException(
+                throw new AppTransactionPreconditionException(
                     $"App transaction precondition failed for '{r.AppId}': expected the table to record "
                     + $"version {expected}, but it records "
                     + (current is { } c ? c.ToString() : "no transaction at all")
                     + $". Version {r.Version} was NOT committed. This is not a conflict to retry — retrying "
                     + "cannot make an already-committed batch un-commit; re-read the recorded version and "
-                    + "decide whether this batch still needs writing.");
+                    + "decide whether this batch still needs writing.",
+                    r.AppId, r.Version, expected, current);
             }
         }
     }
