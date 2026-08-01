@@ -489,7 +489,7 @@ attempt created.
 - **The auto-committing paths other than `DeleteAsync` still leak on a failed commit.** `WriteAsync`,
   `UpdateAsync`, `DeleteRowsAsync` and `CompactAsync` write their files and commit them without a
   transaction to hang the cleanup on, so a conflict there leaves vacuum-able orphans as before. Drive the
-  work through a transaction if that matters to you.
+  work through a transaction if that matters to you. Tracked as issue #47.
 
 ## See also
 
