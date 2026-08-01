@@ -6252,12 +6252,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the selection does not name are not read. Batches come back in the selection's path order; a file
     /// contributing no matching row yields nothing.
     ///
-    /// <para>To pair the returned rows with what was asked for, ask for <paramref name="metadata"/>: batching
-    /// and deletion-vector filtering both break any positional correspondence, so a caller must match on a
-    /// KEY rather than on order. <see cref="DeltaRowMetadata.Locator"/> gives the same
-    /// <c>(add.path, absolute position)</c> pair the selection is built on;
-    /// <see cref="DeltaRowMetadata.RowAddress"/> gives it packed, for a host whose own rowid is one integer.</para>
+    /// <para>To pair the returned rows with what was asked for, ask for
+    /// <see cref="DeltaRowReadOptions.Metadata"/>: batching and deletion-vector filtering both break any
+    /// positional correspondence, so a caller must match on a KEY rather than on order.
+    /// <see cref="DeltaRowMetadata.Locator"/> gives the same <c>(add.path, absolute position)</c> pair the
+    /// selection is built on; <see cref="DeltaRowMetadata.RowAddress"/> gives it packed, for a host whose own
+    /// rowid is one integer.</para>
     /// </summary>
+    /// <param name="selection">The rows to read, by <c>add.path</c> and absolute in-file position.</param>
     /// <param name="sourceRowTrackingOut">When non-null, one entry per YIELDED batch (row-aligned): each matched
     /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
     /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
@@ -6266,40 +6268,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para><see cref="DeltaRowMetadata.RowTracking"/> yields the same values as columns; both are accepted,
     /// and asking for both is not an error.</para></param>
-    /// <param name="resolveAgainst">The snapshot to resolve the selection's paths against — ordinarily
-    /// <see cref="DeltaTransaction.Snapshot"/>, the same version the selection was built from. Defaults to
-    /// <see cref="CurrentSnapshot"/>, which is right for a one-shot read but wrong inside a transaction: a
-    /// concurrent rewrite would make the selection's paths look stale when they are exactly the ones the
-    /// transaction is still validating against. Named to match
-    /// <see cref="ComputeDeletionVectorActionsAsync"/>' parameter of the same purpose.</param>
-    /// <param name="metadata">Per-row metadata columns to append, exactly as
+    /// <param name="options">Metadata columns, their prefix, and the snapshot to resolve against. Null takes
+    /// every default: no metadata columns, and the selection resolved against <see cref="CurrentSnapshot"/>.
+    ///
+    /// <para><see cref="DeltaRowReadOptions.Metadata"/> is taken exactly as
     /// <see cref="ReadAsync(DeltaReadOptions, CancellationToken)"/> and
     /// <see cref="ReadChangesAsync(DeltaChangeReadOptions, CancellationToken)"/> take it — same flags, same
-    /// column names, same combinability, and <see cref="GetReadSchema"/> reports the result. This read was the
-    /// ONE that could not ask: it offered <paramref name="sourceRowTrackingOut"/> for the stable identity and
-    /// nothing at all for the address, which a caller cannot reconstruct from outside because the absolute
-    /// position is never surfaced. The enum's own argument applies here unchanged — asking for two kinds costs
-    /// ONE pass.</param>
-    /// <param name="metadataPrefix">Prefix for the <see cref="DeltaRowMetadata.Locator"/> and
-    /// <see cref="DeltaRowMetadata.RowTracking"/> column names, as on
-    /// <see cref="DeltaReadOptions.MetadataPrefix"/>. <see cref="DeltaRowMetadata.RowAddress"/> is not
-    /// prefixed.</param>
+    /// column names, same combinability. This read was the ONE that could not ask: it offered
+    /// <paramref name="sourceRowTrackingOut"/> for the stable identity and nothing at all for the address,
+    /// which a caller cannot reconstruct from outside because the absolute position is never
+    /// surfaced.</para></param>
+    /// <param name="cancellationToken">Cancels the read.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
         RowSelection selection,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default,
-        Snapshot.Snapshot? resolveAgainst = null,
-        DeltaRowMetadata metadata = DeltaRowMetadata.None,
-        string metadataPrefix = DeltaMetadataColumns.DefaultPrefix)
+        DeltaRowReadOptions? options = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
-        if (metadataPrefix is null)
-            throw new ArgumentNullException(nameof(metadataPrefix));
-        if (resolveAgainst is not null)
-            RequireSnapshotOfThisTable(resolveAgainst, nameof(resolveAgainst));
-        var snapshot = resolveAgainst ?? CurrentSnapshot;
+        options ??= new DeltaRowReadOptions();
+        if (options.MetadataPrefix is null)
+        {
+            throw new ArgumentException(
+                "DeltaRowReadOptions.MetadataPrefix cannot be null; leave it unset for the default.",
+                nameof(options));
+        }
+        var metadata = options.Metadata;
+        var metadataPrefix = options.MetadataPrefix;
+        if (options.ResolveAgainst is not null)
+            RequireSnapshotOfThisTable(options.ResolveAgainst, nameof(options));
+        var snapshot = options.ResolveAgainst ?? CurrentSnapshot;
         ValidateReadMetadata(snapshot, metadata, metadataPrefix);
         var byPath = ActiveFilesByPath(snapshot);
 

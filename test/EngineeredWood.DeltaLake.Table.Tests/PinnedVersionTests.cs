@@ -340,7 +340,8 @@ public class PinnedVersionTests : IDisposable
         // Pinned to the version the selection came from, the same rows read back.
         Assert.Equal(
             new long[] { 2, 3 },
-            await IdsOf(host.ReadRowsAsync(selection, resolveAgainst: pinned)));
+            await IdsOf(host.ReadRowsAsync(
+                selection, options: new DeltaRowReadOptions { ResolveAgainst = pinned })));
     }
 
     [Fact]
@@ -357,7 +358,8 @@ public class PinnedVersionTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(async () =>
         {
             await foreach (var _ in table.ReadRowsAsync(
-                selection, resolveAgainst: other.CurrentSnapshot))
+                selection,
+                options: new DeltaRowReadOptions { ResolveAgainst = other.CurrentSnapshot }))
             {
             }
         });

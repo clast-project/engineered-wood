@@ -225,7 +225,8 @@ public class HostRowIdentityTests : IDisposable
 
         var addresses = new List<long>();
         await foreach (var batch in table.ReadRowsAsync(
-            Sel(wanted), metadata: DeltaRowMetadata.RowAddress))
+            Sel(wanted),
+            options: new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             // Appended after the user columns, and NOT prefixed — the enum's stated contract.
             Assert.Equal(TransientRowAddress.ColumnName, batch.Schema.FieldsList[^1].Name);
@@ -264,7 +265,10 @@ public class HostRowIdentityTests : IDisposable
         int seen = 0;
         await foreach (var batch in table.ReadRowsAsync(
             Sel(at[3], at[5]),
-            metadata: DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator))
+            options: new DeltaRowReadOptions
+            {
+                Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator,
+            }))
         {
             // EVERY column is exactly as long as the batch. The metadata columns are built over the TAKEN
             // rows while the loop still has the SCANNED batch in hand, so sizing one from the wrong count
@@ -309,7 +313,7 @@ public class HostRowIdentityTests : IDisposable
         var viaColumn = new List<long?>();
         await foreach (var batch in table.ReadRowsAsync(
             Sel(at[2], at[4]), sourceRowTrackingOut: viaOutParam,
-            metadata: DeltaRowMetadata.RowTracking))
+            options: new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             var ids = (Int64Array)batch.Column(
                 DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIdSuffix);
