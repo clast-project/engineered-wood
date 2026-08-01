@@ -114,22 +114,12 @@ public sealed class TransactionLog
     /// checkpoint. So the newest of both kinds wins.
     /// </remarks>
     public async ValueTask<long> GetLatestVersionAsync(
-        CancellationToken cancellationToken = default)
-    {
-        long latest = -1;
+        CancellationToken cancellationToken = default) =>
+        (await LogListing.ReadAsync(_fs, cancellationToken).ConfigureAwait(false)).LatestVersion;
 
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
-            .ConfigureAwait(false))
-        {
-            string fileName = Path.GetFileName(file.Path);
-            if ((DeltaVersion.TryParseCommitVersion(fileName, out long version) ||
-                 DeltaVersion.TryParseCheckpointVersion(fileName, out version)) &&
-                version > latest)
-            {
-                latest = version;
-            }
-        }
-
-        return latest;
-    }
+    /// <summary>
+    /// One classified pass over <c>_delta_log</c>, for callers that need more than one view of it.
+    /// </summary>
+    internal ValueTask<LogListing> ReadListingAsync(CancellationToken cancellationToken = default) =>
+        LogListing.ReadAsync(_fs, cancellationToken);
 }

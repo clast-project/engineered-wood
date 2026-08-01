@@ -35,8 +35,12 @@ public sealed class SnapshotBuilder
     {
         var builder = new SnapshotBuilder();
 
-        long targetVersion = atVersion ??
-            await log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
+        // One classified pass over _delta_log answers everything below: the target version, the newest
+        // checkpoint, the compaction files, and the commits to replay. They used to be four separate
+        // walks of the same directory, which also let them disagree about a concurrent commit.
+        var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+
+        long targetVersion = atVersion ?? listing.LatestVersion;
 
         if (targetVersion < 0)
             throw new DeltaFormatException("Table has no commits.");
@@ -58,8 +62,7 @@ public sealed class SnapshotBuilder
 
             if (hint is null || !await TryBootstrapAsync(hint).ConfigureAwait(false))
             {
-                var listed = await reader.FindLatestCheckpointAsync(
-                    targetVersion, cancellationToken).ConfigureAwait(false);
+                var listed = CheckpointReader.SelectLatestCheckpoint(listing, targetVersion);
 
                 // Skip the re-read when listing just found the checkpoint that already failed.
                 if (listed is not null && listed.Version != hint?.Version)
@@ -99,25 +102,9 @@ public sealed class SnapshotBuilder
         long nextNeeded = replayFrom;
         long? firstMissing = null;
 
-        // Check for log compaction files that cover subranges
-        LogCompaction? logCompaction = null;
-        IReadOnlyList<(long Start, long End, string Path)> compactedFiles = [];
-
-        try
-        {
-            logCompaction = new LogCompaction(log.FileSystem, log);
-            compactedFiles = await logCompaction.ListCompactedFilesAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch
-        {
-            // If listing fails, fall back to reading individual commits
-            compactedFiles = [];
-        }
-
-        // Find the best compacted file covering [replayFrom..targetVersion]
+        // Find the best compaction file covering [replayFrom..targetVersion]
         (long Start, long End, string Path)? bestCompacted = null;
-        foreach (var cf in compactedFiles)
+        foreach (var cf in listing.CompactedRanges)
         {
             if (cf.Start >= replayFrom && cf.End <= targetVersion)
             {
@@ -128,7 +115,7 @@ public sealed class SnapshotBuilder
         }
 
         // Use compacted file if available
-        if (bestCompacted is not null && logCompaction is not null)
+        if (bestCompacted is not null)
         {
             // First, read any commits before the compacted range
             for (long v = replayFrom; v < bestCompacted.Value.Start; v++)
@@ -151,23 +138,16 @@ public sealed class SnapshotBuilder
             }
 
             // Apply the compacted file
-            var compactedActions = await logCompaction.ReadCompactedAsync(
-                bestCompacted.Value.Path, cancellationToken).ConfigureAwait(false);
+            var compactedActions = await new LogCompaction(log.FileSystem, log)
+                .ReadCompactedAsync(bestCompacted.Value.Path, cancellationToken)
+                .ConfigureAwait(false);
             builder.ApplyCommit(bestCompacted.Value.End, compactedActions);
             replayFrom = bestCompacted.Value.End + 1;
             nextNeeded = replayFrom;
         }
 
-        // Read remaining commits after the compacted range
-        var versions = new List<long>();
-        await foreach (long v in log.ListVersionsAsync(replayFrom, cancellationToken)
-            .ConfigureAwait(false))
-        {
-            if (v <= targetVersion)
-                versions.Add(v);
-        }
-
-        versions.Sort();
+        // Read remaining commits after the compacted range. Already ascending from the one listing.
+        var versions = listing.CommitsInRange(replayFrom, targetVersion).ToList();
 
         // Read commits concurrently for performance
         var commitTasks = versions.Select(v =>
@@ -218,23 +198,17 @@ public sealed class SnapshotBuilder
         TransactionLog log,
         CancellationToken cancellationToken = default)
     {
-        long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
-            .ConfigureAwait(false);
+        // One listing here too: the newest version and the commits to reach it came from two separate
+        // walks that a concurrent commit could land between.
+        var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+        long latestVersion = listing.LatestVersion;
 
         if (latestVersion <= current.Version)
             return current;
 
         var builder = SnapshotBuilder.FromSnapshot(current);
 
-        var versions = new List<long>();
-        await foreach (long v in log.ListVersionsAsync(current.Version + 1, cancellationToken)
-            .ConfigureAwait(false))
-        {
-            if (v <= latestVersion)
-                versions.Add(v);
-        }
-
-        versions.Sort();
+        var versions = listing.CommitsInRange(current.Version + 1, latestVersion).ToList();
 
         // Same rule as BuildAsync: an incremental update that skips a version produces a snapshot that
         // never existed. There is no checkpoint fallback here — this path only moves forward from one.
