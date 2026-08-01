@@ -175,6 +175,157 @@ public class HostRowIdentityTests : IDisposable
         Assert.Equal([4L], ids);
     }
 
+    // ── metadata columns: the read that could not ask ──
+
+    /// <summary>
+    /// None by default — the schema is the table's own, unchanged. Asking for the address costs a sort of the
+    /// whole active set for the ordinal, so a caller that does not need it must not pay for it.
+    /// </summary>
+    [Fact]
+    public async Task ReadRowsMetadata_IsOptional()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        int rows = 0;
+        await foreach (var batch in table.ReadRowsAsync(Sel(at[2])))
+        {
+            Assert.Equal(table.CurrentSnapshot.Schema.Fields.Count, batch.ColumnCount);
+            rows += batch.Length;
+        }
+        Assert.Equal(1, rows);
+    }
+
+    /// <summary>
+    /// A host whose row identifiers ARE the transient address needs it back to pair results with what it
+    /// asked for — batching and deletion-vector filtering both break any positional correspondence, and this
+    /// read surfaces no absolute position otherwise, so it cannot be reconstructed from outside.
+    ///
+    /// <para>The file ORDINAL half is what makes this more than bookkeeping: it is a position in the
+    /// snapshot's FULL path-sorted active set, not in the selection. So the rows are taken from the
+    /// LAST-SORTING file ONLY — an ordinal derived from the selection would then be 0 where the right answer
+    /// is 1, whereas a selection naming BOTH files makes the two numberings agree and every assertion below
+    /// pass under either.</para>
+    /// </summary>
+    [Fact]
+    public async Task ReadRowsMetadata_RowAddress_OrdinalsIndexTheFullActiveSet()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        await table.WriteAsync([Batch(11, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        // Data files are GUID-named, so which BATCH sorts last is not knowable up front.
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        Assert.Equal(2, ordered.Count);
+        var wanted = at.Values.Where(a => a.Path == ordered[^1]).Take(2).ToArray();
+        Assert.Equal(2, wanted.Length);
+
+        var addresses = new List<long>();
+        await foreach (var batch in table.ReadRowsAsync(
+            Sel(wanted),
+            options: new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
+        {
+            // Appended after the user columns, and NOT prefixed — the enum's stated contract.
+            Assert.Equal(TransientRowAddress.ColumnName, batch.Schema.FieldsList[^1].Name);
+            var addr = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
+            for (int i = 0; i < batch.Length; i++)
+                addresses.Add(addr.GetValue(i)!.Value);
+        }
+
+        var expected = wanted
+            .Select(w => TransientRowAddress.Pack(ordered.IndexOf(w.Path), w.Position))
+            .OrderBy(a => a).ToList();
+        Assert.Equal(expected, addresses.OrderBy(a => a).ToList());
+        Assert.All(addresses, a => Assert.Equal(1, TransientRowAddress.FileOrdinal(a)));
+    }
+
+    /// <summary>
+    /// COMBINABLE, which is the enum's own justification for existing — two kinds, one pass. Also pins that
+    /// the two describe the SAME rows: the locator pair must unpack to the packed address beside it, or a
+    /// caller correlating on one and rewriting by the other silently targets different rows.
+    /// </summary>
+    [Fact]
+    public async Task ReadRowsMetadata_AddressAndLocator_AgreeInOnePass()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        // A deletion vector first, so an ABSOLUTE position and a batch offset disagree — without it the two
+        // forms would agree for the wrong reason.
+        await table.DeleteAsync(Ex.Equal("id", 2L));
+
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+
+        int seen = 0;
+        await foreach (var batch in table.ReadRowsAsync(
+            Sel(at[3], at[5]),
+            options: new DeltaRowReadOptions
+            {
+                Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator,
+            }))
+        {
+            // EVERY column is exactly as long as the batch. The metadata columns are built over the TAKEN
+            // rows while the loop still has the SCANNED batch in hand, so sizing one from the wrong count
+            // yields a malformed batch whose surplus values are never read — invisible to any assertion about
+            // values, and a hazard once the batch crosses the Arrow C interface. (Mutation-testing this suite
+            // found the mutant SURVIVED without this.)
+            Assert.All(
+                Enumerable.Range(0, batch.ColumnCount),
+                c => Assert.Equal(batch.Length, batch.Column(c).Length));
+
+            var addr = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
+            var path = (StringArray)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix);
+            var index = (Int64Array)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                long packed = addr.GetValue(i)!.Value;
+                Assert.Equal(ordered.IndexOf(path.GetString(i)), TransientRowAddress.FileOrdinal(packed));
+                Assert.Equal(index.GetValue(i)!.Value, TransientRowAddress.Position(packed));
+                seen++;
+            }
+        }
+        Assert.Equal(2, seen);
+    }
+
+    /// <summary>
+    /// The RowTracking flag yields what <c>sourceRowTrackingOut</c> yields — the point being that a host need
+    /// not reach for the older shape to get the stable identity. Asking for both is legal and they must agree,
+    /// since a host migrating from one to the other would otherwise silently change which identity it carries
+    /// through a rewrite.
+    /// </summary>
+    [Fact]
+    public async Task ReadRowsMetadata_RowTracking_MatchesTheOutParam()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, BuildSchema(), enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        var viaOutParam = new List<(long?[] Ids, long?[] Versions)>();
+        var viaColumn = new List<long?>();
+        await foreach (var batch in table.ReadRowsAsync(
+            Sel(at[2], at[4]), sourceRowTrackingOut: viaOutParam,
+            options: new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
+        {
+            var ids = (Int64Array)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIdSuffix);
+            for (int i = 0; i < batch.Length; i++)
+                viaColumn.Add(ids.IsNull(i) ? null : ids.GetValue(i));
+        }
+
+        Assert.Equal(2, viaColumn.Count);
+        Assert.Equal(viaOutParam.SelectMany(t => t.Ids).ToList(), viaColumn);
+        Assert.All(viaColumn, id => Assert.NotNull(id));
+    }
+
     // ── sourceRowTrackingOut: the spec derivation, not just materialized values ──
 
     [Fact]

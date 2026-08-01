@@ -179,18 +179,31 @@ not part of the format. This is a *codec*, not the DML key: unpack it into a `Ro
 > number, reported by `sourceRowTrackingOut` below. The two columns had the same name until recently, which
 > read as a promise of durability the address cannot keep.
 
-`ReadRowsAsync(selection, resolveAgainst: txn.Snapshot, sourceRowTrackingOut:)` reads exactly the selected
-rows. Pass `resolveAgainst` inside a transaction: without it the read follows `CurrentSnapshot`, where a
-concurrent rewrite makes the selection's paths look stale when they are exactly the ones the transaction is
-still validating against.
+`ReadRowsAsync(selection, sourceRowTrackingOut:, options:)` reads exactly the selected rows. Its options are
+`DeltaRowReadOptions` — `Metadata` / `MetadataPrefix` / `ResolveAgainst`. Set `ResolveAgainst` inside a
+transaction: without it the read follows `CurrentSnapshot`, where a concurrent rewrite makes the selection's
+paths look stale when they are exactly the ones the transaction is still validating against.
 `sourceRowTrackingOut` reports, per yielded batch and row-aligned with it, each row's STABLE id and commit
 version: the materialized value where the file has one, otherwise the spec derivation `baseRowId + position`
 / `defaultRowCommitVersion`. Null only for a source that predates row tracking. This is the identity to carry
 through a rewrite.
 
-To pair returned rows with what you asked for, read with `DeltaRowMetadata.Locator` — batching and
-deletion-vector filtering both break any positional correspondence, and the locator pair is the same key the
-selection is built on.
+To pair returned rows with what you asked for, ask for metadata columns — batching and deletion-vector
+filtering both break any positional correspondence, so match on a KEY rather than on order:
+
+```csharp
+await foreach (var batch in table.ReadRowsAsync(
+    selection,
+    options: new DeltaRowReadOptions
+    {
+        Metadata = DeltaRowMetadata.Locator,   // or .RowAddress, packed; combinable, one pass
+        ResolveAgainst = txn.Snapshot,
+    }))
+```
+
+`Locator` gives back the same `(add.path, absolute position)` pair the selection is built on; `RowAddress`
+gives it packed, for a host whose own rowid is one `BIGINT`. `RowTracking` reports the same stable id as
+`sourceRowTrackingOut`, as columns.
 
 ### Preserving identity across your own rewrite
 
