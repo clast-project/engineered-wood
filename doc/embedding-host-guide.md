@@ -513,10 +513,12 @@ attempt created.
   one escape: generate the values yourself and pass `identityValuesPreGenerated`.
 - **A transaction is single-use and not thread-safe.** Many transactions may race across threads; drive each
   from one. A commit that throws ends it too — abort or dispose it and start a new one.
-- **The auto-committing paths other than `DeleteAsync` still leak on a failed commit.** `WriteAsync`,
-  `UpdateAsync`, `DeleteRowsAsync` and `CompactAsync` write their files and commit them without a
-  transaction to hang the cleanup on, so a conflict there leaves vacuum-able orphans as before. Drive the
-  work through a transaction if that matters to you. Tracked as issue #47.
+- **A failed commit leaves nothing behind, on any path.** The auto-committing operations — `WriteAsync`,
+  `UpdateAsync`, `DeleteRowsAsync`, `UpdateRowsAsync`, `CompactAsync` — have no transaction to hang cleanup
+  on, so each collects its own output when its commit does not land. Nothing to do for it, and nothing to
+  configure; it applies to the whole operation, so a rewrite that fails part way through its files takes back
+  the ones it had written. What it never collects is the same set a transaction's abort never collects: the
+  file a deletion vector masks, the files a rewrite would have replaced, and anything the host wrote itself.
 
 ## See also
 
