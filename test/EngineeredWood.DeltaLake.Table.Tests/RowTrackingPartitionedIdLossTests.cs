@@ -173,10 +173,9 @@ public class RowTrackingPartitionedIdLossTests : IDisposable
 
     /// <summary>
     /// The read path's own account of a row's stable id, on a partitioned table whose file carries materialized
-    /// ids. <c>ReadRowsAsync</c>' <c>sourceRowTrackingOut</c> is the public surface that reports the
-    /// RESOLVED id (materialized value where present, else <c>baseRowId + position</c>) — the same resolution a
-    /// read-side <c>_metadata.row_id</c> column would expose. It reports fresh ids rather than the row's real
-    /// ones, which is the defect stated without a second rewrite in the way.
+    /// ids. <c>ReadRowsAsync</c> with <c>DeltaRowMetadata.RowTracking</c> is the public surface that reports the
+    /// RESOLVED id (materialized value where present, else <c>baseRowId + position</c>). It reports fresh ids
+    /// rather than the row's real ones, which is the defect stated without a second rewrite in the way.
     /// </summary>
     [Fact]
     public async Task ResolvedStableIds_Partitioned_AfterRewrite_AreTheMaterializedIds()
@@ -197,16 +196,16 @@ public class RowTrackingPartitionedIdLossTests : IDisposable
         }
         Assert.Equal(3, addresses.Count);
 
-        var tracking = new List<(long?[] Ids, long?[] Versions)>();
         var byValue = new Dictionary<string, long?>(StringComparer.Ordinal);
-        int bi = 0;
         var selection = RowSelection.FromRowAddresses(addresses, table.CurrentSnapshot);
-        await foreach (var batch in table.ReadRowsAsync(selection, sourceRowTrackingOut: tracking))
+        await foreach (var batch in table.ReadRowsAsync(
+            selection, new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             var values = (StringArray)batch.Column("value");
+            var ids = (Int64Array)batch.Column(
+                DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIdSuffix);
             for (int i = 0; i < batch.Length; i++)
-                byValue[values.GetString(i)!] = tracking[bi].Ids[i];
-            bi++;
+                byValue[values.GetString(i)!] = ids.IsNull(i) ? null : ids.GetValue(i);
         }
 
         Assert.Equal(3, byValue.Count);

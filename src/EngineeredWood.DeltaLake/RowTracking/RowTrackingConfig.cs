@@ -15,10 +15,9 @@ public static class RowTrackingConfig
     /// <summary>
     /// The spec's virtual column for a row's STABLE row id — what Spark exposes as
     /// <c>_metadata.row_id</c>, resolved per row as the materialized value if the file has one, else
-    /// <c>add.baseRowId + position</c>. Emitted under this name by
-    /// a read with <c>DeltaRowMetadata.RowTracking</c>, and reported
-    /// out-of-band by <c>DeltaTable.ReadRowsAsync</c>' <c>sourceRowTrackingOut</c>. Measured equal to
-    /// Spark's resolution of the same rows.
+    /// <c>add.baseRowId + position</c>. Emitted under this name by any read asking for
+    /// <c>DeltaRowMetadata.RowTracking</c> — <c>ReadAsync</c>, <c>ReadChangesAsync</c> and
+    /// <c>ReadRowsAsync</c> alike. Measured equal to Spark's resolution of the same rows.
     /// <para>NOT the address <c>DeltaRowMetadata.RowAddress</c> emits — that is
     /// <c>TransientRowAddress.ColumnName</c>, a snapshot-scoped locator rather than an identity. The two were
     /// once the same string, which read as a promise of durability the address cannot keep.</para>

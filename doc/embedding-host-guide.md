@@ -178,17 +178,13 @@ not part of the format. This is a *codec*, not the DML key: unpack it into a `Ro
 > compare two from different snapshots.
 >
 > Delta's own stable id — Spark's `_metadata.row_id`, backed by row tracking's `baseRowId` — is a different
-> number, reported by `sourceRowTrackingOut` below. The two columns had the same name until recently, which
-> read as a promise of durability the address cannot keep.
+> number, read as `DeltaRowMetadata.RowTracking` below. The two columns had the same name until recently,
+> which read as a promise of durability the address cannot keep.
 
-`ReadRowsAsync(selection, sourceRowTrackingOut:, options:)` reads exactly the selected rows. Its options are
-`DeltaRowReadOptions` — `Metadata` / `MetadataPrefix` / `ResolveAgainst`. Set `ResolveAgainst` inside a
-transaction: without it the read follows `CurrentSnapshot`, where a concurrent rewrite makes the selection's
-paths look stale when they are exactly the ones the transaction is still validating against.
-`sourceRowTrackingOut` reports, per yielded batch and row-aligned with it, each row's STABLE id and commit
-version: the materialized value where the file has one, otherwise the spec derivation `baseRowId + position`
-/ `defaultRowCommitVersion`. Null only for a source that predates row tracking. This is the identity to carry
-through a rewrite.
+`ReadRowsAsync(selection, options:)` reads exactly the selected rows. Its options are `DeltaRowReadOptions` —
+`Metadata` / `MetadataPrefix` / `ResolveAgainst`, the §3 vocabulary applied to this read. Set `ResolveAgainst`
+inside a transaction: without it the read follows `CurrentSnapshot`, where a concurrent rewrite makes the
+selection's paths look stale when they are exactly the ones the transaction is still validating against.
 
 To pair returned rows with what you asked for, ask for metadata columns — batching and deletion-vector
 filtering both break any positional correspondence, so match on a KEY rather than on order:
@@ -196,16 +192,19 @@ filtering both break any positional correspondence, so match on a KEY rather tha
 ```csharp
 await foreach (var batch in table.ReadRowsAsync(
     selection,
-    options: new DeltaRowReadOptions
+    new DeltaRowReadOptions
     {
-        Metadata = DeltaRowMetadata.Locator,   // or .RowAddress, packed; combinable, one pass
+        Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,   // combinable, one pass
         ResolveAgainst = txn.Snapshot,
     }))
 ```
 
 `Locator` gives back the same `(add.path, absolute position)` pair the selection is built on; `RowAddress`
-gives it packed, for a host whose own rowid is one `BIGINT`. `RowTracking` reports the same stable id as
-`sourceRowTrackingOut`, as columns.
+gives it packed, for a host whose own rowid is one `BIGINT`. `RowTracking` gives each row's STABLE id and
+commit version — the materialized value where the file has one, otherwise the spec derivation
+`baseRowId + position` / `defaultRowCommitVersion`. Null only for a file that predates row tracking on the
+table; on a table with no row tracking at all the ASK is refused, naming `Locator` / `RowAddress` instead,
+rather than handing back a column of nulls that cannot be told apart from "not assigned yet".
 
 ### Preserving identity across your own rewrite
 
@@ -213,13 +212,21 @@ A host-side UPDATE moves rows to a new file, so their ids can no longer be deriv
 stable ids, then hand them back when writing the post-image:
 
 ```csharp
-var tracking = new List<(long?[] Ids, long?[] Versions)>();
+var originalIds = new List<long?>();
 var postImages = new List<RecordBatch>();
-await foreach (var batch in table.ReadRowsAsync(selection, sourceRowTrackingOut: tracking))
-    postImages.Add(YourEngine.Apply(batch));
+await foreach (var batch in table.ReadRowsAsync(
+    selection,
+    new DeltaRowReadOptions { Metadata = DeltaRowMetadata.RowTracking, ResolveAgainst = txn.Snapshot }))
+{
+    var ids = (Int64Array)batch.Column(RowTrackingConfig.RowIdColumnName);
+    for (int i = 0; i < batch.Length; i++)
+        originalIds.Add(ids.IsNull(i) ? null : ids.GetValue(i));
 
-var files = await table.WriteDataFilesAsync(
-    postImages, materializedRowIds: tracking.SelectMany(t => t.Ids).ToList());
+    // Your engine's output, built to the TABLE's schema.
+    postImages.Add(YourEngine.Apply(batch));
+}
+
+var files = await table.WriteDataFilesAsync(postImages, materializedRowIds: originalIds);
 ```
 
 The ids are written into the table's declared materialized row-id column, which a spec reader honors over the
@@ -227,6 +234,12 @@ add's `baseRowId`. They ride the partition split with their rows and stay out of
 statistics. The commit *version* is deliberately not materialized — it should advance to the rewriting
 commit, which the add's `defaultRowCommitVersion` already says. Requires the table to declare
 `delta.rowTracking.materializedRowIdColumnName`.
+
+**The post-image must not carry the metadata columns.** They are an input to your engine, not part of its
+output: `WriteDataFilesAsync` writes whatever columns the batch has, so forwarding the read's batch verbatim
+puts `_metadata.row_id` into the data file as a column of its own. A Delta reader projects by the table
+schema and never shows it — measured — so this costs bytes silently rather than failing. Build the
+post-image to the table's schema, as your engine would anyway.
 
 ## 5. Swap in your own codec
 
