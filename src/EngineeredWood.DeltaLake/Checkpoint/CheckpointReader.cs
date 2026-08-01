@@ -24,8 +24,32 @@ public sealed class CheckpointReader
 
     /// <summary>
     /// Reads the <c>_last_checkpoint</c> file.
-    /// Returns null if the file does not exist.
+    /// Returns null if the file does not exist, is empty, or cannot be parsed.
     /// </summary>
+    /// <remarks>
+    /// <para><c>_last_checkpoint</c> is an OPTIMIZATION HINT, not a source of truth: it only saves the reader
+    /// from listing <c>_delta_log</c> to find the newest checkpoint. The Delta protocol therefore requires
+    /// readers to cope with it being absent OR unreadable by falling back to that listing, and every other
+    /// implementation (Spark, delta-rs, delta-kernel) does. Returning null here IS that fallback — callers
+    /// treat null as "no checkpoint hint" and replay from the log.</para>
+    /// <para><b>Why tolerating a CORRUPT read matters, with a measurement.</b> The file is updated by
+    /// OVERWRITE (<see cref="CheckpointWriter"/> → <c>WriteAllBytesAsync</c>), and on object stores /
+    /// ADLS-style filesystems that is not atomic — there is a window in which the file EXISTS with ZERO
+    /// bytes. A concurrent writer opening the table in that window used to hit
+    /// <c>JsonDocument.Parse(empty)</c> and die with "The input does not contain any JSON tokens", which
+    /// surfaced to the user as a failed COMMIT with no hint that a harmless hint file was to blame.
+    /// Reproduced live on Fabric OneLake, 2026-07-31: 8 concurrent writers × 12 commits (checkpoint
+    /// interval 10) failed 2 of 8 writers this way. Single-writer runs can never hit it, which is why it
+    /// survived so long.</para>
+    /// <para><b>Making the WRITE atomic would not remove the need for this.</b> A write-temp-then-rename
+    /// would narrow the partial-content window only on backends that have an atomic replacing rename, and
+    /// <see cref="ITableFileSystem.RenameAsync"/> is create-if-absent by contract (it returns false when
+    /// the target exists) so replacing this file would need a new primitive on every backend. It would also
+    /// leave the other two failure modes untouched: a read can still fail because the object was replaced
+    /// under it however the replacement happened, and a perfectly written hint can still point at a
+    /// checkpoint that log cleanup has since removed. The hint is advisory by design, so the reader has to
+    /// cope regardless — which is exactly what the protocol asks for.</para>
+    /// </remarks>
     public async ValueTask<LastCheckpointInfo?> ReadLastCheckpointAsync(
         CancellationToken cancellationToken = default)
     {
@@ -33,11 +57,58 @@ public sealed class CheckpointReader
             .ConfigureAwait(false))
             return null;
 
-        byte[] data = await _fs.ReadAllBytesAsync(
-            DeltaVersion.LastCheckpointPath, cancellationToken).ConfigureAwait(false);
+        byte[] data;
+        try
+        {
+            data = await _fs.ReadAllBytesAsync(
+                DeltaVersion.LastCheckpointPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // a cancel is the caller's intent, not a missing hint
+        }
+        catch (Exception)
+        {
+            // The READ itself failed — the file exists but could not be fetched. Since the hint carries no
+            // truth, that is still just "no hint": fall back to listing rather than failing the caller's
+            // commit. Deliberately broad because the failure is filesystem-specific and this layer must not
+            // know those types: on ADLS a concurrent in-place overwrite tore a ranged read and surfaced as
+            // 412 ConditionNotMet (measured — 2 of 10 concurrent writers; the filesystem now reads small
+            // files in one request, and this is the belt to that braces, covering any store that can tear).
+            return null;
+        }
 
-        var doc = JsonDocument.Parse(data);
+        // Empty = caught mid-overwrite (see remarks), which is the shape actually measured in production.
+        // This check is a deliberate FAST PATH, not the thing that makes empty safe: the catch below
+        // already covers it, since Parse("") throws JsonException ("The input does not contain any JSON
+        // tokens") — that exact message is what the failing commits reported. Mutation-testing confirms
+        // the asymmetry: removing this check alone changes no test outcome, while removing the catch
+        // fails both the empty and the truncated case. Kept because opening a table is common and the
+        // empty window is the expected concurrent observation, so paying a throw for it is wasteful.
+        if (data.Length == 0)
+            return null;
+
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(data);
+        }
+        catch (JsonException)
+        {
+            // Truncated/partial content — same window, just a longer prefix landed.
+            return null;
+        }
+        // Dispose the parsed document (it rents pooled buffers); every value below is copied out before then.
+        using var docScope = doc;
         var root = doc.RootElement;
+        // A partial write can also yield VALID JSON that is not the object we expect, or is that object
+        // without its required fields. Both are unusable, and reaching for a property would THROW rather
+        // than fall back: GetProperty on a missing name, and TryGetProperty itself (InvalidOperationException,
+        // "requires an element of type 'Object'") when the root is any other kind. So check the kind first.
+        if (root.ValueKind != JsonValueKind.Object)
+            return null;
+        if (!root.TryGetProperty("version", out _) || !root.TryGetProperty("size", out _))
+            return null;
 
         string? v2Path = null;
         if (root.TryGetProperty("v2Checkpoint", out var v2))
