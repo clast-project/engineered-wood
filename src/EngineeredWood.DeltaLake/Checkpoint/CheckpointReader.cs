@@ -95,59 +95,26 @@ public sealed class CheckpointReader
     /// informational and nothing on the read path consumes it.
     /// </remarks>
     public async ValueTask<LastCheckpointInfo?> FindLatestCheckpointAsync(
-        long maxVersion, CancellationToken cancellationToken = default)
+        long maxVersion, CancellationToken cancellationToken = default) =>
+        SelectLatestCheckpoint(
+            await Log.LogListing.ReadAsync(_fs, cancellationToken).ConfigureAwait(false), maxVersion);
+
+    /// <summary>
+    /// The selection half of <see cref="FindLatestCheckpointAsync"/>, over a listing the caller already
+    /// has. A snapshot build reads <c>_delta_log</c> once and answers this from the same pass.
+    /// </summary>
+    internal static LastCheckpointInfo? SelectLatestCheckpoint(Log.LogListing listing, long maxVersion)
     {
-        const string Marker = ".checkpoint.";
-
-        var classic = new HashSet<long>();
-        var v2 = new Dictionary<long, string>();
-        // version -> declared part count -> the part numbers actually seen
-        var multiPart = new Dictionary<long, Dictionary<int, HashSet<int>>>();
-
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
-            .ConfigureAwait(false))
+        foreach (long version in listing.CheckpointVersionsDescending())
         {
-            string name = Path.GetFileName(file.Path);
-            if (!DeltaVersion.TryParseCheckpointVersion(name, out long version) || version > maxVersion)
+            if (version > maxVersion)
                 continue;
 
-            string[] suffix = name[(name.IndexOf(Marker, StringComparison.OrdinalIgnoreCase)
-                + Marker.Length)..].Split('.');
-
-            // <version>.checkpoint.parquet
-            if (suffix is ["parquet"])
-            {
-                classic.Add(version);
-            }
-            // <version>.checkpoint.<part>.<total>.parquet
-            else if (suffix is [var p, var t, "parquet"] &&
-                     int.TryParse(p, out int part) && int.TryParse(t, out int total) && total > 0)
-            {
-                if (!multiPart.TryGetValue(version, out var byTotal))
-                    multiPart[version] = byTotal = [];
-                if (!byTotal.TryGetValue(total, out var seen))
-                    byTotal[total] = seen = [];
-                seen.Add(part);
-            }
-            // <version>.checkpoint.<uuid>.json. The parquet-bodied V2 form is deliberately not claimed:
-            // ReadV2CheckpointAsync only decodes NDJSON, so claiming it would just fail the read.
-            else if (suffix is [_, "json"])
-            {
-                v2[version] = DeltaVersion.LogPrefix + name;
-            }
-        }
-
-        var versions = new SortedSet<long>(classic);
-        versions.UnionWith(v2.Keys);
-        versions.UnionWith(multiPart.Keys);
-
-        foreach (long version in versions.Reverse())
-        {
             // Classic first: it is the one form every reader here handles without further lookups.
-            if (classic.Contains(version))
+            if (listing.ClassicCheckpoints.Contains(version))
                 return new LastCheckpointInfo { Version = version, Size = 0 };
 
-            if (multiPart.TryGetValue(version, out var byTotal))
+            if (listing.MultiPartCheckpoints.TryGetValue(version, out var byTotal))
             {
                 foreach (var (total, seen) in byTotal)
                 {
@@ -156,7 +123,7 @@ public sealed class CheckpointReader
                 }
             }
 
-            if (v2.TryGetValue(version, out string? path))
+            if (listing.V2Checkpoints.TryGetValue(version, out string? path))
                 return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
         }
 
