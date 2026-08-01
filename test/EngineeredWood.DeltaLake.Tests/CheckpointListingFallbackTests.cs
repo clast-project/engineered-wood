@@ -80,9 +80,9 @@ public class CheckpointListingFallbackTests : IDisposable
     private void DeleteHint() => File.Delete(LogPath("_last_checkpoint"));
 
     /// <summary>
-    /// What Delta's metadata cleanup does: drop the commits a checkpoint has subsumed. It stops below the
-    /// checkpoint — this reader derives the latest version from commit files alone, so removing the newest
-    /// one would make the table unreadable for an unrelated reason.
+    /// What Delta's metadata cleanup does: drop the commits a checkpoint has subsumed. Stopping below the
+    /// checkpoint keeps these tests aimed at the checkpoint LOOKUP; cleaning through it as well is covered
+    /// by <see cref="CleanedLogVersionTests"/>.
     /// </summary>
     private void DeleteCommitsBefore(long version)
     {

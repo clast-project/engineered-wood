@@ -106,16 +106,28 @@ public sealed class TransactionLog
     /// <summary>
     /// Gets the latest version number, or <c>-1</c> if the table does not exist.
     /// </summary>
+    /// <remarks>
+    /// A CHECKPOINT names a version just as a commit does, and metadata cleanup deletes commit files
+    /// while keeping the checkpoint that subsumes them. On a table left idle longer than
+    /// <c>delta.logRetentionDuration</c> that can remove every commit file, and reading only those would
+    /// report a table with no versions at all — for a table that is perfectly readable from its
+    /// checkpoint. So the newest of both kinds wins.
+    /// </remarks>
     public async ValueTask<long> GetLatestVersionAsync(
         CancellationToken cancellationToken = default)
     {
         long latest = -1;
 
-        await foreach (long version in ListVersionsAsync(0, cancellationToken)
+        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
             .ConfigureAwait(false))
         {
-            if (version > latest)
+            string fileName = Path.GetFileName(file.Path);
+            if ((DeltaVersion.TryParseCommitVersion(fileName, out long version) ||
+                 DeltaVersion.TryParseCheckpointVersion(fileName, out version)) &&
+                version > latest)
+            {
                 latest = version;
+            }
         }
 
         return latest;
