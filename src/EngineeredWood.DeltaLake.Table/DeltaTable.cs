@@ -2084,6 +2084,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// while reporting success. A token cancelled while the loop RUNS does still stop the rest: that is a live
     /// instruction rather than a stale one.</para>
     /// </summary>
+    /// <summary>
+    /// Runs an AUTO-COMMITTING operation — one with no <see cref="DeltaTransaction"/> for a host to abort —
+    /// and deletes the files it wrote if it does not reach a committed version. The auto-committing
+    /// counterpart of <see cref="DeltaTransaction.AbortAsync"/>, and the reason a conflicting
+    /// <c>UpdateAsync</c> or <c>CompactAsync</c> no longer leaves its output behind for VACUUM.
+    ///
+    /// <para>The ledger is emptied the instant a commit becomes durable (see
+    /// <see cref="CommitOccAsync"/>), so whatever is still in it when the operation throws is uncommitted BY
+    /// CONSTRUCTION — including when the throw came from post-commit work rather than from the commit. That
+    /// is what makes catching everything safe here: this can never delete a file a committed <c>add</c>
+    /// references.</para>
+    ///
+    /// <para>Covers the whole operation, not just its commit: a rewrite that fails half way through its files
+    /// has written some of them, and those are as orphaned as a full set the commit refused.</para>
+    /// </summary>
+    private async ValueTask<T> CollectOnFailureAsync<T>(
+        Func<WrittenFileLedger, ValueTask<T>> operation, CancellationToken cancellationToken)
+    {
+        var written = new WrittenFileLedger();
+        try
+        {
+            return await operation(written).ConfigureAwait(false);
+        }
+        catch
+        {
+            await DeleteWrittenFilesAsync(written, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     internal async ValueTask DeleteWrittenFilesAsync(
         WrittenFileLedger written, CancellationToken cancellationToken)
     {
@@ -2247,6 +2277,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
                     .ConfigureAwait(false);
+
+                // THE INSTANT the commit is durable, the files it names stop being this operation's to
+                // collect: they are the table's data, and a version that references them is readable by
+                // everyone. Cleared HERE rather than where the commit call returns, because what follows can
+                // still throw — the snapshot refresh reads the log, and a token cancelled between the two
+                // lines is enough. The caller would then see a failed commit, still holding a ledger naming
+                // LIVE files, and its cleanup would delete data a committed add points at.
+                written?.Clear();
+
                 _currentSnapshot = await SnapshotBuilder.UpdateAsync(
                     CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
                 return attemptVersion;
@@ -3041,22 +3080,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = CurrentSnapshot;
         ValidateWritable(snapshot, isAppend: false); // UPDATE is a data change
 
-        var plan = await ComputeUpdateActionsAsync(
-            snapshot, predicate, updater, cancellationToken, prunePredicate).ConfigureAwait(false);
+        // The rewrite's post-image files are written before the commit is attempted, and there is no
+        // transaction here for a host to abort — so a conflict takes them back rather than orphaning them.
+        return await CollectOnFailureAsync(async written =>
+        {
+            var plan = await ComputeUpdateActionsAsync(
+                snapshot, predicate, updater, cancellationToken, prunePredicate, written: written)
+                .ConfigureAwait(false);
 
-        // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
-        // read-set (concurrentDeleteRead) and its planned removes (delete/delete). The analyzable overload
-        // additionally records its read predicate so a concurrent add that matches it conflicts. Route it
-        // through the OCC loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit
-        // instead of throwing — its copy-on-write post-image add's row-tracking baseRowId is re-derived on
-        // rebase (a conflict on any file it rewrote aborts first, so the survivors' ids stay valid).
-        long committed = await CommitOccAsync(
-            snapshot, plan.Actions,
-            new Concurrency.ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
-            plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
-            rebaseSafe: true, cancellationToken).ConfigureAwait(false);
+            // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
+            // read-set (concurrentDeleteRead) and its planned removes (delete/delete). The analyzable overload
+            // additionally records its read predicate so a concurrent add that matches it conflicts. Route it
+            // through the OCC loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit
+            // instead of throwing — its copy-on-write post-image add's row-tracking baseRowId is re-derived on
+            // rebase (a conflict on any file it rewrote aborts first, so the survivors' ids stay valid).
+            long committed = await CommitOccAsync(
+                snapshot, plan.Actions,
+                new Concurrency.ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
+                plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
+                rebaseSafe: true, cancellationToken, written: written).ConfigureAwait(false);
 
-        return (plan.TotalUpdated, committed);
+            return (plan.TotalUpdated, committed);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
@@ -4150,16 +4195,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         ValidateWritable(snapshot, isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
 
-        var (actions, _) = await ComputeWriteActionsAsync(
-            snapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
-            cancellationToken).ConfigureAwait(false);
+        // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
+        // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
+        // back the parquet it just wrote instead of leaving it for VACUUM.
+        return await CollectOnFailureAsync(async written =>
+        {
+            var (actions, _) = await ComputeWriteActionsAsync(
+                snapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
+                cancellationToken, written: written).ConfigureAwait(false);
 
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-        long newVersion = snapshot.Version + 1;
-        return await CommitWriteAsync(
-            snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
-            cancellationToken).ConfigureAwait(false);
+            long newVersion = snapshot.Version + 1;
+            return await CommitWriteAsync(
+                snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
+                cancellationToken, written).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -4529,7 +4578,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaWriteMode mode,
         bool dynamicPartitionOverwrite,
         long newVersion,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written = null)
     {
         long committedVersion;
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
@@ -4538,7 +4588,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             committedVersion = await CommitOccAsync(
                 snapshot, actions, Concurrency.ReadSet.Blind, NoRemovedPaths,
                 IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, written: written).ConfigureAwait(false);
         }
         else
         {
@@ -4547,6 +4597,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 actions, snapshot.Metadata.Configuration, "WRITE");
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
+            // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
+            // the OCC loop's own clear — see CommitOccAsync.
+            written?.Clear();
             _currentSnapshot = await SnapshotBuilder.UpdateAsync(
                 snapshot, _log, cancellationToken).ConfigureAwait(false);
             committedVersion = newVersion;
@@ -5620,11 +5673,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 + "its files, and a rewrite's fresh add cannot be replayed verbatim onto a newer version.",
                 nameof(rowLevelRetry));
 
+        // Both modes write files (vectors, change files, or a whole rewritten parquet) before attempting the
+        // commit, and neither has a transaction the caller could abort — so the operation collects its own
+        // output when the commit does not land. CopyOnWrite is rebaseSafe:false, which makes that ANY
+        // concurrent commit rather than only a conflicting one.
         return mode switch
         {
-            RowDeleteMode.DeletionVector => DeleteRowsViaVectorsAsync(
-                selection, rowLevelRetry, cancellationToken),
-            RowDeleteMode.CopyOnWrite => DeleteRowsCopyOnWriteAsync(selection, cancellationToken),
+            RowDeleteMode.DeletionVector => CollectOnFailureAsync(
+                written => DeleteRowsViaVectorsAsync(
+                    selection, rowLevelRetry, written, cancellationToken),
+                cancellationToken),
+            RowDeleteMode.CopyOnWrite => CollectOnFailureAsync(
+                written => DeleteRowsCopyOnWriteAsync(selection, written, cancellationToken),
+                cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown row delete mode."),
         };
     }
@@ -5638,6 +5699,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsViaVectorsAsync(
         RowSelection selection,
         bool rowLevelRetry,
+        WrittenFileLedger written,
         CancellationToken cancellationToken)
     {
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5680,6 +5742,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
                 .ConfigureAwait(false);
+            // The vector is ours; the file it masks is not — the re-add below names live table data.
+            written.RecordDeletionVector(newDv);
 
             actions.Add(new RemoveFile
             {
@@ -5735,7 +5799,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                             addFile.PartitionValues, _options.ParquetWriteOptions,
                             cancellationToken,
                             batchIds is not null ? TakeIds(batchIds, delRows) : null,
-                            batchVers is not null ? TakeIds(batchVers, delRows) : null).ConfigureAwait(false);
+                            batchVers is not null ? TakeIds(batchVers, delRows) : null,
+                            written).ConfigureAwait(false);
                         actions.Add(cdc);
                     }
                 }
@@ -5749,7 +5814,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
-            rowLevelDeletes: rowLevelRetry ? dvEdits : null).ConfigureAwait(false);
+            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written).ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -5762,6 +5827,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsCopyOnWriteAsync(
         RowSelection selection,
+        WrittenFileLedger written,
         CancellationToken cancellationToken)
     {
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5864,7 +5930,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
                 snapshot, addFile, mappingMode, outputBatches, outTracking, materializeIds,
                 matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, written).ConfigureAwait(false);
             actions.Add(remove);
             removedPaths.Add(addFile.Path);
             if (add is not null)
@@ -5885,7 +5951,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken, trk.Ids, trk.Vers).ConfigureAwait(false));
+                        cancellationToken, trk.Ids, trk.Vers, written).ConfigureAwait(false));
                 }
             }
         }
@@ -5903,7 +5969,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long version = await CommitOccAsync(
             snapshot, actions,
             new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
-            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken)
+            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
+            written: written)
             .ConfigureAwait(false);
         return (totalDeleted, version);
     }
@@ -5936,7 +6003,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<(Int64Array Ids, Int64Array Vers)?>? outTracking,
         bool materializeIds, string? matRowIdName, string? matRowVerName,
         bool rowTrackingEnabled, long baseRowId, long newVersion,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written = null)
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var remove = new RemoveFile
@@ -5965,6 +6033,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             encodedDir = source.Path.Substring(0, dirSlash + 1);
         string baseName = $"{Guid.NewGuid():N}.parquet";
         string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
+        // Recorded before the write. The SOURCE file is deliberately not recorded: it stays the table's data
+        // until the commit that replaces it lands.
+        written?.Record(newFileName);
 
         // Read rows carry the partition columns the read path materializes; a data file never stores them (the
         // values live in add.partitionValues). Dropping them here keeps the rewrite's layout and statistics
@@ -6051,7 +6122,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             throw new ArgumentNullException(nameof(selection));
         if (rewriteFile is null)
             throw new ArgumentNullException(nameof(rewriteFile));
-        return UpdateRowsCoreAsync(selection, rewriteFile, cancellationToken);
+        // The rewrite's output is written before the commit is attempted, and rebaseSafe:false means ANY
+        // concurrent commit aborts it — so it collects its own files rather than orphaning a full rewrite.
+        return CollectOnFailureAsync(
+            written => UpdateRowsCoreAsync(selection, rewriteFile, written, cancellationToken),
+            cancellationToken);
     }
 
     /// <summary>
@@ -6110,10 +6185,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (c != pathIdx && c != indexIdx)
                 setColumns.Add((updates.Schema.FieldsList[c].Name, updates.Column(c)));
 
-        return UpdateRowsCoreAsync(
-            RowSelection.ByPath(positionsByPath),
-            (path, sourceBatches, positionsPerBatch) =>
-                ApplyLocatorKeyedUpdates(path, sourceBatches, positionsPerBatch, updIndexByLocator, setColumns),
+        return CollectOnFailureAsync(
+            written => UpdateRowsCoreAsync(
+                RowSelection.ByPath(positionsByPath),
+                (path, sourceBatches, positionsPerBatch) =>
+                    ApplyLocatorKeyedUpdates(path, sourceBatches, positionsPerBatch, updIndexByLocator, setColumns),
+                written,
+                cancellationToken),
             cancellationToken);
     }
 
@@ -6175,6 +6253,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private async ValueTask<long> UpdateRowsCoreAsync(
         RowSelection selection,
         Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
+        WrittenFileLedger written,
         CancellationToken cancellationToken = default)
     {
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -6300,7 +6379,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
                 snapshot, addFile, mappingMode, rewritten, outTracking, materializeIds,
                 matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, written).ConfigureAwait(false);
             actions.Add(remove);
             removedPaths.Add(addFile.Path);
             if (add is not null)
@@ -6320,12 +6399,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken, ids, preVers).ConfigureAwait(false));
+                        cancellationToken, ids, preVers, written).ConfigureAwait(false));
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken,
-                        ids, ids is not null ? ConstInt64(newVersion, ids.Length) : null).ConfigureAwait(false));
+                        ids, ids is not null ? ConstInt64(newVersion, ids.Length) : null,
+                        written).ConfigureAwait(false));
                 }
             }
         }
@@ -6339,7 +6419,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await CommitOccAsync(
             snapshot, actions,
             new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
-            IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken)
+            IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
+            written: written)
             .ConfigureAwait(false);
     }
 
@@ -6918,11 +6999,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         RejectRowTrackingWrite(CurrentSnapshot); // refused only if a row-tracking table lacks materialized names
 
         options ??= CompactionOptions.Default;
-        var result = await Compaction.CompactionExecutor.ExecuteAsync(
-            _fs, _log, CurrentSnapshot, options,
-            _options.ParquetWriteOptions, _dataFileReadOptions,
-            cancellationToken, _options.DataFileWriter, _options.DataFileReader)
-            .ConfigureAwait(false);
+
+        // The path with the most to lose: OPTIMIZE rewrites its whole candidate set and then makes ONE commit
+        // attempt at the read version + 1, so a single concurrent commit used to orphan every file it wrote.
+        var result = await CollectOnFailureAsync(
+            written => Compaction.CompactionExecutor.ExecuteAsync(
+                _fs, _log, CurrentSnapshot, options,
+                _options.ParquetWriteOptions, _dataFileReadOptions,
+                cancellationToken, _options.DataFileWriter, _options.DataFileReader, written),
+            cancellationToken).ConfigureAwait(false);
 
         if (result.HasValue)
         {

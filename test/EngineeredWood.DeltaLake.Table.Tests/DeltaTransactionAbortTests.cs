@@ -406,6 +406,34 @@ public class DeltaTransactionAbortTests : IDisposable
     }
 
     /// <summary>
+    /// The window a commit cannot retry out of: the version JSON is durable, and the writer's own post-commit
+    /// work then fails. `CommitAsync` throws on a commit that LANDED — so a cleanup keyed to "the commit
+    /// failed" would be holding files a committed <c>add</c> references, and disposing the transaction would
+    /// delete live data. Cancellation reaches the same state with no fault injection: a token cancelled
+    /// between the commit write and the snapshot refresh.
+    /// </summary>
+    [Fact]
+    public async Task DisposeAsync_AfterACommitThatLandedButThrew_DeletesNothing()
+    {
+        var fs = new FailAfterCommitFileSystem(new LocalTableFileSystem(_tempDir));
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        fs.Armed = true; // CreateAsync commits version 0 and reads the log the same way — arm after it
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+        {
+            await using var txn = table.StartTransaction();
+            await txn.WriteAsync([Batch(1, 2)]);
+            await txn.CommitAsync(); // the commit lands; the snapshot refresh that follows does not
+        });
+        Assert.True(fs.Committed, "the test needs the commit to have actually landed");
+
+        // Reopened on a healthy filesystem: the version is there, and so are the rows it names.
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Single(DataFiles());
+        Assert.Equal([1L, 2L], await ReadIds(reopened));
+    }
+
+    /// <summary>
     /// A host aborting on a cancellation path naturally passes the token that was just cancelled. Honouring it
     /// would make every delete fail — and they are swallowed, and the ledger emptied — so the abort would
     /// collect nothing while reporting success. An already-cancelled token cleans up anyway.

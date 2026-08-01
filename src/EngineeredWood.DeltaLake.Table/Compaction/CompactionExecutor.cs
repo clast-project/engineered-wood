@@ -51,7 +51,8 @@ internal static class CompactionExecutor
         ParquetReadOptions parquetReadOptions,
         CancellationToken cancellationToken,
         IDataFileWriter? dataFileWriter = null,
-        IDataFileReader? dataFileReader = null)
+        IDataFileReader? dataFileReader = null,
+        WrittenFileLedger? written = null)
     {
         // Select small files as compaction candidates and group them BY PARTITION: a data file belongs to
         // exactly ONE partition (its add.partitionValues), so each group must compact independently. Mixing
@@ -125,7 +126,7 @@ internal static class CompactionExecutor
             (bool compacted, nextRowId) = await CompactGroupAsync(
                 fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
                 dvReader, actions, now, rowTrackingEnabled, nextRowId, materialize, matRowIdName, matRowVerName,
-                dataFileWriter, dataFileReader, cancellationToken).ConfigureAwait(false);
+                dataFileWriter, dataFileReader, cancellationToken, written).ConfigureAwait(false);
             anyAdds |= compacted;
         }
 
@@ -146,6 +147,9 @@ internal static class CompactionExecutor
             actions, snapshot.Metadata.Configuration, "OPTIMIZE");
         await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
             .ConfigureAwait(false);
+        // Durable: the compacted files are the table's data now, so nothing may collect them. Cleared here
+        // rather than at the caller for the same reason the OCC loop does it — see DeltaTable.CommitOccAsync.
+        written?.Clear();
 
         return newVersion;
     }
@@ -175,7 +179,8 @@ internal static class CompactionExecutor
         string? matRowVerName,
         IDataFileWriter? dataFileWriter,
         IDataFileReader? dataFileReader,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written)
     {
         // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
         // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
@@ -375,6 +380,9 @@ internal static class CompactionExecutor
             {
                 string baseName = $"{Guid.NewGuid():N}.parquet";
                 string fileName = physicalDir + baseName;
+                // Recorded before the write: a compaction that fails — including on its single commit
+                // attempt, which ANY concurrent commit defeats — takes its whole rewritten output back.
+                written?.Record(fileName);
                 long fileSize;
                 long fileBaseRowId = nextRowId;
 
