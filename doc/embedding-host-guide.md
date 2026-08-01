@@ -236,10 +236,11 @@ commit, which the add's `defaultRowCommitVersion` already says. Requires the tab
 `delta.rowTracking.materializedRowIdColumnName`.
 
 **The post-image must not carry the metadata columns.** They are an input to your engine, not part of its
-output: `WriteDataFilesAsync` writes whatever columns the batch has, so forwarding the read's batch verbatim
-puts `_metadata.row_id` into the data file as a column of its own. A Delta reader projects by the table
-schema and never shows it — measured — so this costs bytes silently rather than failing. Build the
-post-image to the table's schema, as your engine would anyway.
+output — so build the post-image to the table's schema, as your engine would anyway. Forwarding the read's
+batch verbatim is **refused**, naming the column: both write paths reject a batch carrying a column the table
+does not declare, because the parquet file would carry it while every Delta read projected it away, costing
+bytes in every file with nothing reporting it. A batch with *fewer* columns than the table stays legal — an
+absent column reads as null, which is a choice rather than a mistake.
 
 ## 5. Swap in your own codec
 
