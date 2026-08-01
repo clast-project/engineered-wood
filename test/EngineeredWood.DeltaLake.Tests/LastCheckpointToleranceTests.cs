@@ -10,15 +10,11 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Tests;
 
 /// <summary>
-/// <c>_last_checkpoint</c> is an OPTIMIZATION HINT, so every way of failing to read it must mean the same
-/// thing as the file being absent: no hint, replay from the log. It carries no truth that a reader cannot
-/// recover by listing <c>_delta_log</c>, so failing the CALLER over it turns a harmless file into a failed
-/// commit.
-///
-/// These shapes are not hypothetical. The file is updated by OVERWRITE, and on object stores / ADLS that
-/// is not atomic, so a concurrent reader can observe it at zero bytes, truncated mid-object, or — if the
-/// store serves it in ranges — fail the read outright. Measured on live Fabric OneLake (2026-07-31): with
-/// 8 concurrent writers x 12 commits, the empty-content shape killed 2 of 8 writers.
+/// <c>_last_checkpoint</c> is an advisory HINT, so every way of failing to read it must mean what absence
+/// means: no hint, replay from the log. Failing the CALLER over it turns a hint file into a failed commit.
+/// Not hypothetical — a filesystem that updates the file non-atomically lets a concurrent reader see it
+/// empty, truncated, or fail the read (measured on Fabric OneLake, 2026-07-31: the empty shape killed 2 of
+/// 8 concurrent writers).
 /// </summary>
 public class LastCheckpointToleranceTests : IDisposable
 {
@@ -44,9 +40,8 @@ public class LastCheckpointToleranceTests : IDisposable
             Encoding.UTF8.GetBytes(content));
 
     /// <summary>
-    /// POSITIVE CONTROL, and the reason the null-returning tests below mean anything: a well-formed hint
-    /// IS read and returned. Without this, a guard broad enough to swallow every input would pass the
-    /// whole rest of this class while silently disabling the optimization for everyone.
+    /// POSITIVE CONTROL, and the reason the null-returning tests below mean anything: without it, a guard
+    /// broad enough to swallow every input would pass the whole class while disabling the optimization.
     /// </summary>
     [Fact]
     public async Task WellFormedHint_IsRead()
@@ -71,9 +66,7 @@ public class LastCheckpointToleranceTests : IDisposable
     }
 
     /// <summary>
-    /// The shape actually measured on OneLake: the overwrite has created the file but not yet written to
-    /// it. <c>JsonDocument.Parse</c> threw "The input does not contain any JSON tokens", which reached the
-    /// user as a failed commit.
+    /// The shape measured on OneLake: the overwrite created the file but has not written to it yet.
     /// </summary>
     [Fact]
     public async Task EmptyHint_IsNull()
@@ -104,14 +97,20 @@ public class LastCheckpointToleranceTests : IDisposable
     }
 
     /// <summary>
-    /// A partial write can also land as VALID JSON that happens to be missing a required field. Both
-    /// fields are mandatory, and reading them with <c>GetProperty</c> would throw rather than fall back.
+    /// Valid JSON of the right shape, but a required field is missing or is not a number. Every one of
+    /// these throws out of the decode (<c>KeyNotFound</c>, <c>InvalidOperation</c>, <c>Format</c>) rather
+    /// than falling back, so only a guard around the whole decode catches them.
     /// </summary>
     [Theory]
-    [InlineData("""{"size":42}""")]      // no version
-    [InlineData("""{"version":7}""")]    // no size
-    [InlineData("{}")]                   // neither
-    public async Task HintMissingRequiredField_IsNull(string content)
+    [InlineData("""{"size":42}""")]                 // no version
+    [InlineData("""{"version":7}""")]               // no size
+    [InlineData("{}")]                              // neither
+    [InlineData("""{"version":"7","size":42}""")]   // version is a string
+    [InlineData("""{"version":null,"size":42}""")]  // version is null
+    [InlineData("""{"version":7.5,"size":42}""")]   // version is not an integer
+    [InlineData("""{"version":7,"size":42,"parts":"3"}""")]        // optional field, wrong type
+    [InlineData("""{"version":7,"size":42,"sizeInBytes":null}""")] // optional field, null
+    public async Task HintWithUnusableField_IsNull(string content)
     {
         WriteHint(content);
 
@@ -122,9 +121,25 @@ public class LastCheckpointToleranceTests : IDisposable
     }
 
     /// <summary>
-    /// The file exists but the READ fails. On ADLS a ranged read torn by a concurrent in-place overwrite
-    /// surfaces as 412 ConditionNotMet — a store-specific type this layer must not have to know, hence a
-    /// broad guard rather than a list of exception types.
+    /// <c>v2Checkpoint</c> present but not an object: <c>TryGetProperty</c> on it throws
+    /// (InvalidOperationException, "requires an element of type 'Object'") — the same trap the root has.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"version":7,"size":42,"v2Checkpoint":"oops"}""")]
+    [InlineData("""{"version":7,"size":42,"v2Checkpoint":[1]}""")]
+    public async Task HintWithNonObjectV2Checkpoint_IsNull(string content)
+    {
+        WriteHint(content);
+
+        var info = await new CheckpointReader(new LocalTableFileSystem(_tempDir))
+            .ReadLastCheckpointAsync();
+
+        Assert.Null(info);
+    }
+
+    /// <summary>
+    /// The file exists but the READ fails. On ADLS a ranged read torn by a concurrent overwrite surfaces
+    /// as 412 ConditionNotMet — a store-specific type this layer must not have to know.
     /// </summary>
     [Fact]
     public async Task ReadFailure_IsNull()
@@ -147,12 +162,32 @@ public class LastCheckpointToleranceTests : IDisposable
     public async Task Cancellation_Propagates()
     {
         WriteHint("""{"version":7,"size":42}""");
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
         var fs = new ThrowingReadFileSystem(
             new LocalTableFileSystem(_tempDir),
-            () => new OperationCanceledException());
+            () => new OperationCanceledException(cts.Token));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            async () => await new CheckpointReader(fs).ReadLastCheckpointAsync());
+            async () => await new CheckpointReader(fs).ReadLastCheckpointAsync(cts.Token));
+    }
+
+    /// <summary>
+    /// The other half of that: a store's request timeout also arrives as <c>TaskCanceledException</c> while
+    /// the caller's token is untouched. That is the store failing to serve a hint, not the caller giving
+    /// up, so it must fall back like any other read failure.
+    /// </summary>
+    [Fact]
+    public async Task StoreTimeout_IsNull()
+    {
+        WriteHint("""{"version":7,"size":42}""");
+        var fs = new ThrowingReadFileSystem(
+            new LocalTableFileSystem(_tempDir),
+            () => new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout"));
+
+        var info = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+
+        Assert.Null(info);
     }
 
     /// <summary>Passes everything through except <see cref="ReadAllBytesAsync"/>, which throws.</summary>
