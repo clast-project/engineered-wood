@@ -2067,10 +2067,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// that landed since. Run once before the first attempt and again before every retry — a precondition is
     /// a fact about the table, not staged output, so it has to be re-asked each time the table moves.
     ///
-    /// <para>Throws <see cref="InvalidOperationException"/>, deliberately NOT
+    /// <para>Throws <see cref="AppTransactionPreconditionException"/> — an
+    /// <see cref="InvalidOperationException"/>, deliberately NOT a
     /// <see cref="DeltaConflictException"/>: the commit loop retries the latter, and no amount of retrying
     /// makes an already-committed batch un-commit. A producer told "conflict" would keep trying to write a
     /// batch the table already holds.</para>
+    ///
+    /// <para>Each requirement is judged on its own and the first failure aborts the whole commit. That is the
+    /// only available answer when a transaction names several appIds whose preconditions disagree: a commit is
+    /// atomic, so it cannot apply the ones that hold — and committing anyway would REGRESS the recorded
+    /// version of an appId that had already advanced, since a snapshot reconciles <c>txn</c> actions
+    /// last-wins rather than by maximum.</para>
     /// </summary>
     private static void ValidateAppTransactions(
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement> required,
@@ -2079,7 +2086,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         foreach (var r in required)
         {
-            if (r.ExpectedPrevious is not { } expected)
+            if (r.Precondition.Kind == AppTransactionPreconditionKind.None)
                 continue; // no precondition — write unconditionally
 
             // The base version's record, overridden by any concurrent commit that moved it. Reading the
@@ -2102,15 +2109,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
 
-            if (current != expected)
+            // One rule per kind, defined on the precondition itself so this check and the pre-commit
+            // DeltaTransaction.IsAppTransactionApplied cannot answer differently.
+            if (!r.Precondition.Holds(current, r.Version))
             {
-                throw new InvalidOperationException(
+                throw new AppTransactionPreconditionException(
                     $"App transaction precondition failed for '{r.AppId}': expected the table to record "
-                    + $"version {expected}, but it records "
+                    + r.Precondition.Describe()
+                    + ", but it records "
                     + (current is { } c ? c.ToString() : "no transaction at all")
                     + $". Version {r.Version} was NOT committed. This is not a conflict to retry — retrying "
                     + "cannot make an already-committed batch un-commit; re-read the recorded version and "
-                    + "decide whether this batch still needs writing.");
+                    + "decide whether this batch still needs writing.",
+                    r.AppId, r.Version, r.Precondition, current);
             }
         }
     }

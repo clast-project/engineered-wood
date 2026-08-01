@@ -2453,6 +2453,115 @@ public class SparkInteropTests : IDisposable
         result.GetProperty("detail").GetProperty("table_features")
             .EnumerateArray().Select(f => f.GetString()).ToList();
 
+    // ── What Spark's own idempotent-write rule IS ──
+
+    /// <summary>
+    /// Pins the behaviour <see cref="AppTransactionPrecondition.NotApplied"/> was defined to match, because
+    /// the definition rests on a MEASUREMENT of Spark rather than on anything the protocol states — the spec
+    /// describes the <c>txn</c> action's shape and leaves the policy to the engine, and delta-rs 1.6.2
+    /// implements no deduplication at all. If a future Spark changes this, that must surface here rather than
+    /// silently make our documentation wrong.
+    ///
+    /// <para>Three things at once, since a Spark session costs 15-20s: an already-recorded version is skipped
+    /// SILENTLY (no exception, and no new table version — the skip is total), a GAP is applied, and the skip
+    /// is by <c>&gt;=</c> rather than by equality, so an older batch is skipped too.</para>
+    /// </summary>
+    [Fact]
+    public void Spark_IdempotentWrite_SkipsAtOrBelowTheRecordedVersion_AndToleratesAGap()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        // Records version 5 for the producer.
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            rows = new[] { new object[] { 1L } },
+            schema = "id long",
+            mode = "overwrite",
+            options = new Dictionary<string, object> { ["txnAppId"] = AppId, ["txnVersion"] = 5 },
+        });
+        Assert.Equal(5, RecordedTxnVersionOnDisk(AppId));
+
+        // Equal, then lower: both skipped, and skipped SILENTLY — the row count is the proof, since a
+        // refusal would have surfaced as an error from the driver rather than as a quiet no-op.
+        foreach (int replayed in new[] { 5, 4 })
+        {
+            var result = SparkIdempotentAppend(id: 90 + replayed, version: replayed);
+            Assert.Single(result.GetProperty("rows").EnumerateArray());
+            Assert.Equal(5, RecordedTxnVersionOnDisk(AppId));
+        }
+
+        // A GAP over 6 applies — which is why a host may use an externally-issued id rather than a dense
+        // counter, and why NotApplied does not require contiguity either.
+        var applied = SparkIdempotentAppend(id: 2, version: 7);
+        Assert.Equal(2, applied.GetProperty("rows").EnumerateArray().Count());
+        Assert.Equal(7, RecordedTxnVersionOnDisk(AppId));
+    }
+
+    /// <summary>
+    /// Spark REFUSES to write a negative <c>txnVersion</c>, though the protocol constrains no sign and both
+    /// EW and delta-rs permit one. Pinned because it is the fact that makes "the recorded version is the
+    /// application's own counter, so every long is legitimate" true of the FORMAT but false of the reference
+    /// implementation — and therefore the reason EW does not reserve a negative as a sentinel.
+    /// </summary>
+    [Fact]
+    public void Spark_IdempotentWrite_RefusesANegativeVersion()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var rejected = Spark.InvokeRaw("write", new
+        {
+            path = _tempDir,
+            rows = new[] { new object[] { 1L } },
+            schema = "id long",
+            mode = "overwrite",
+            options = new Dictionary<string, object> { ["txnAppId"] = AppId, ["txnVersion"] = -1 },
+        });
+
+        Assert.False(rejected.GetProperty("ok").GetBoolean());
+        string error = rejected.GetProperty("error").GetString()!;
+        Assert.Contains("txnVersion", error);
+        Assert.Contains("non-negative", error);
+    }
+
+    private const string AppId = "ew-probe-producer";
+
+    private JsonElement SparkIdempotentAppend(long id, int version) => Spark.Invoke("write", new
+    {
+        path = _tempDir,
+        rows = new[] { new object[] { id } },
+        schema = "id long",
+        mode = "append",
+        options = new Dictionary<string, object> { ["txnAppId"] = AppId, ["txnVersion"] = version },
+    });
+
+    /// <summary>
+    /// The version the log records for <paramref name="appId"/>, read straight off disk — last-wins across
+    /// commits, which is how a snapshot reconciles <c>txn</c> actions.
+    /// </summary>
+    private long? RecordedTxnVersionOnDisk(string appId)
+    {
+        long? recorded = null;
+        foreach (string file in Directory
+            .GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.json")
+            .OrderBy(f => f, StringComparer.Ordinal))
+        {
+            foreach (string line in File.ReadAllLines(file))
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("txn", out var txn)
+                    && txn.GetProperty("appId").GetString() == appId)
+                {
+                    recorded = txn.GetProperty("version").GetInt64();
+                }
+            }
+        }
+
+        return recorded;
+    }
+
     /// <summary>
     /// The raw <c>commitInfo</c> action of one version, straight off disk. Needed wherever the question is
     /// which KEYS a commit carries — every accessor in the library normalizes that away.
