@@ -406,8 +406,33 @@ public class DeltaTransactionAbortTests : IDisposable
     }
 
     /// <summary>
-    /// A commit that THROWS closes the transaction too: its staged work was validated against the table and
-    /// refused, so re-committing it is not on offer. The error says so rather than claiming it committed.
+    /// A host aborting on a cancellation path naturally passes the token that was just cancelled. Honouring it
+    /// would make every delete fail — and they are swallowed, and the ledger emptied — so the abort would
+    /// collect nothing while reporting success. An already-cancelled token cleans up anyway.
+    /// </summary>
+    [Fact]
+    public async Task AbortAsync_WithAnAlreadyCancelledToken_StillCleansUp()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await table.WriteAsync([Batch(1)]);
+        string[] before = DataFiles();
+
+        var txn = table.StartTransaction();
+        await txn.WriteAsync([Batch(2)]);
+        Assert.Equal(before.Length + 1, DataFiles().Length);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await txn.AbortAsync(cts.Token);
+
+        Assert.Equal(before, DataFiles());
+    }
+
+    /// <summary>
+    /// A commit that THROWS closes the transaction too: a transaction is committed at most once. The error
+    /// says that rather than naming a failure mode — a conflict, a refused precondition, an I/O error and a
+    /// cancellation all end up here.
     /// </summary>
     [Fact]
     public async Task AfterAFailedCommit_ReCommittingThrowsAndSaysWhy()

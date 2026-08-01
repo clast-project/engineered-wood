@@ -763,9 +763,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// unchanged when nothing was staged. Throws <see cref="DeltaConflictException"/> if a concurrent
     /// commit invalidated this transaction's reads.
     ///
-    /// <para>A commit that THROWS ends the transaction too — its staged work has been rebased and refused, and
-    /// there is nothing to re-attempt. The files it wrote are still on storage at that point: abort or dispose
-    /// the transaction to take them back.</para>
+    /// <para>A commit that THROWS ends the transaction too, whatever it threw: a transaction is committed at
+    /// most once. A conflict and a refused precondition are answers, not transient failures — and after an I/O
+    /// failure or a cancellation the commit may have reached storage even though the caller never learned so,
+    /// which is precisely when a blind second attempt would duplicate it. The files it wrote are still on
+    /// storage at that point: abort or dispose the transaction to take them back.</para>
     /// </summary>
     public async ValueTask<long> CommitAsync(CancellationToken cancellationToken = default)
     {
@@ -801,6 +803,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <para>Idempotent, and a NO-OP after a successful <see cref="CommitAsync"/>: those files are the table's
     /// now. That is what makes <c>await using var txn = table.StartTransaction();</c> safe to write
     /// unconditionally — see <see cref="DisposeAsync"/>.</para>
+    ///
+    /// <para><paramref name="cancellationToken"/> bounds a cleanup that is running, but an ALREADY-cancelled
+    /// one does not skip it: a host aborting on a cancellation path naturally passes the token that was just
+    /// cancelled, and honouring it would make every delete fail, be swallowed, and leave an abort that
+    /// collected nothing while reporting success.</para>
     /// </summary>
     public async ValueTask AbortAsync(CancellationToken cancellationToken = default)
     {
@@ -809,6 +816,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
         _aborted = true;
         _completed = true;
+        // An already-cancelled token still cleans up — the guard lives in DeleteWrittenFilesAsync, since every
+        // caller of it reaches it from a failure path and can arrive holding one.
         await _table.DeleteWrittenFilesAsync(_written, cancellationToken).ConfigureAwait(false);
     }
 
@@ -840,10 +849,14 @@ public sealed class DeltaTransaction : IAsyncDisposable
             throw new InvalidOperationException("This transaction has already been committed.");
         if (_completed)
         {
+            // Deliberately says nothing about WHY. _completed is set before the commit runs, so a conflict, a
+            // refused precondition, an I/O failure and a cancellation all land here — and after an I/O failure
+            // or a cancellation the commit may even have reached storage, which is the other reason a second
+            // attempt is not on offer.
             throw new InvalidOperationException(
-                "This transaction's commit has already run and did not succeed. Its staged work was validated "
-                + "against the table and refused, so it cannot be added to or re-committed; abort or dispose it "
-                + "to take back the files it wrote, then start a new transaction.");
+                "This transaction's commit has already run and did not succeed. A transaction is committed at "
+                + "most once, so it cannot be added to or re-committed; abort or dispose it to take back the "
+                + "files it wrote, then start a new transaction.");
         }
     }
 

@@ -2077,15 +2077,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Deliberately does NOT <see cref="ThrowIfDisposed"/>: a host may dispose the table before the
     /// transaction, and refusing to clean up then would strand exactly the files this exists to collect. The
     /// filesystem handle outlives the disposed flag.</para>
+    ///
+    /// <para>An ALREADY-cancelled <paramref name="cancellationToken"/> does not skip the cleanup. Every caller
+    /// arrives here from a failure path and can naturally be holding the token that just failed — and since a
+    /// cancelled token makes each delete throw, which is then swallowed, honouring it would collect nothing
+    /// while reporting success. A token cancelled while the loop RUNS does still stop the rest: that is a live
+    /// instruction rather than a stale one.</para>
     /// </summary>
     internal async ValueTask DeleteWrittenFilesAsync(
         WrittenFileLedger written, CancellationToken cancellationToken)
     {
+        var token = cancellationToken.IsCancellationRequested ? CancellationToken.None : cancellationToken;
+
         foreach (string path in written.Paths)
         {
             try
             {
-                await _fs.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
+                await _fs.DeleteAsync(path, token).ConfigureAwait(false);
             }
             catch (Exception)
             {
