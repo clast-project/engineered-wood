@@ -6269,30 +6269,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="DeltaRowMetadata.Locator"/> gives the same <c>(add.path, absolute position)</c> pair the
     /// selection is built on; <see cref="DeltaRowMetadata.RowAddress"/> gives it packed, for a host whose own
     /// rowid is one integer.</para>
+    ///
+    /// <para>The STABLE identity to carry through a rewrite is
+    /// <see cref="DeltaRowMetadata.RowTracking"/>, resolved per row as the source file's materialized value
+    /// where it has one — a rewritten file — else <c>baseRowId + absolute position</c>. That is a different
+    /// number from the snapshot-scoped address the selection is built from, and it is the one to hand back to
+    /// <see cref="WriteDataFilesAsync"/>' <c>materializedRowIds</c>.</para>
     /// </summary>
     /// <param name="selection">The rows to read, by <c>add.path</c> and absolute in-file position.</param>
-    /// <param name="sourceRowTrackingOut">When non-null, one entry per YIELDED batch (row-aligned): each matched
-    /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
-    /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
-    /// manage. This is the STABLE identity to carry through a rewrite, as distinct from the snapshot-scoped
-    /// address the selection is built from.
-    ///
-    /// <para><see cref="DeltaRowMetadata.RowTracking"/> yields the same values as columns; both are accepted,
-    /// and asking for both is not an error.</para></param>
     /// <param name="options">Metadata columns, their prefix, and the snapshot to resolve against. Null takes
     /// every default: no metadata columns, and the selection resolved against <see cref="CurrentSnapshot"/>.
     ///
     /// <para><see cref="DeltaRowReadOptions.Metadata"/> is taken exactly as
     /// <see cref="ReadAsync(DeltaReadOptions, CancellationToken)"/> and
     /// <see cref="ReadChangesAsync(DeltaChangeReadOptions, CancellationToken)"/> take it — same flags, same
-    /// column names, same combinability. This read was the ONE that could not ask: it offered
-    /// <paramref name="sourceRowTrackingOut"/> for the stable identity and nothing at all for the address,
-    /// which a caller cannot reconstruct from outside because the absolute position is never
-    /// surfaced.</para></param>
+    /// column names, same combinability.</para></param>
     /// <param name="cancellationToken">Cancels the read.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
         RowSelection selection,
-        List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
         DeltaRowReadOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -6339,13 +6333,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             byte[]? pathBytes = wantLocator
                 ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
 
-            // Master's read path surfaces each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
-            // RESOLVED stable id/version via out-params (materialized ids stripped from the emitted user batch),
-            // instead of appending a trailing row-id column — so match on the absolute position out-param.
+            // The per-file read reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
+            // RESOLVED stable id/version out-of-band, having stripped the materialized id columns from the
+            // emitted batch — so the position to match on, and the identity to report, both come from here
+            // rather than from a column of `batch`.
             var absOut = new List<Int64Array?>();
-            bool needTracking = sourceRowTrackingOut is not null || wantTracking;
-            var idsOut = needTracking ? new List<Int64Array?>() : null;
-            var versOut = needTracking ? new List<Int64Array?>() : null;
+            var idsOut = wantTracking ? new List<Int64Array?>() : null;
+            var versOut = wantTracking ? new List<Int64Array?>() : null;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
                                                       strippedRowIdsOut: idsOut,
@@ -6362,21 +6356,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         rows.Add(i);
                 if (rows.Count == 0)
                     continue;
-
-                if (sourceRowTrackingOut is not null)
-                {
-                    var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                    var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
-                    var ids = new long?[rows.Count];
-                    var vers = new long?[rows.Count];
-                    for (int k = 0; k < rows.Count; k++)
-                    {
-                        int i = rows[k];
-                        ids[k] = matI is not null && !matI.IsNull(i) ? matI.GetValue(i) : null;
-                        vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
-                    }
-                    sourceRowTrackingOut.Add((ids, vers));
-                }
 
                 var taken = TakeRowsFromBatch(batch, rows);
                 if (metadataFields.Count == 0)
