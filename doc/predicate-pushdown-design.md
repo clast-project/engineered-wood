@@ -28,7 +28,19 @@ filters) and Delta Lake (partition + stats in one unified pass), Iceberg
 migrated onto the shared library, and the Arrow-based row evaluator in
 `EngineeredWood.Expressions.Arrow`. Phases 9–14 (SparkSql parser, Delta
 CHECK/generated-column wiring, Parquet column/offset index, ORC stripe pruning)
-are not yet started. See the phase table at the bottom for per-phase status.
+are not built. See the phase table at the bottom for scope; the issue tracker,
+not this document, is authoritative for what is in flight.
+
+**The wiring gap, which matters more than any unbuilt phase.** Nothing in `src/`
+sets `ParquetReadOptions.Filter`. Row-group pruning and bloom probing are built
+and tested, and unreachable from any table layer: `DeltaReadOptions.Filter`
+prunes files and stops, Iceberg has no data-file read path at all. The cause is
+that `Filter` is fixed when the `ParquetFileReader` is constructed, and Delta
+holds one options record shared by the scan, CDF, DML and compaction paths — so
+setting it there would prune row groups during OPTIMIZE's rewrite, which is data
+loss. Tracked as
+[#55](https://github.com/clast-project/engineered-wood/issues/55), and it blocks
+the payoff of most of the rest of this document.
 
 **Reading this document.** It was written before any of it existed, and the body
 still describes the destination rather than the current tree — the code samples
@@ -620,6 +632,109 @@ Minimum viable set for CHECK constraints and generated columns:
 - Arithmetic: `+`, `-`, `*`, `/`, `%`
 - IS predicates: `IS NULL`, `IS NOT NULL`, `IS TRUE`, `IS FALSE`
 
+## What the ecosystem actually does
+
+Measured 2026-08-02, because the prioritisation above depends on which auxiliary
+structures real files actually carry, and the intuitive answers are wrong in
+several places.
+
+### Page index: common in files, because parquet-mr writes it by default
+
+Scanning `parquet-testing/data/` (63 readable files), 21 carry a page index and
+the split is almost perfectly by writer and era:
+
+| Writer | Page index |
+|---|---|
+| parquet-mr ≥ 1.11.1 (1.11, 1.12, 1.13, 1.14) | yes, every file |
+| parquet-mr ≤ 1.10.1, 1.8.x | no |
+| arrow-rs / parquet-rs 49, 53, 55 | yes |
+| parquet-rs 0.3, 9.0 | no |
+| parquet-cpp-arrow 11 → 20 | **no, every file** |
+
+parquet-mr has written ColumnIndex/OffsetIndex by default since 1.11.0 (2019), so
+essentially all Spark-, Hive- and Trino-written Parquet from the last six years
+has one. Arrow C++/PyArrow is the holdout: verified directly on pyarrow 24.0.0,
+`write_page_index` defaults to false.
+
+Read-side exploitation is patchier: Impala drove the feature, Trino defaults
+`parquet.use-column-index` to true, parquet-mr applies column-index filtering
+when a predicate is pushed down, and DataFusion supports it behind
+`with_page_index`.
+
+**The caveat that decides whether it is worth building.** Page skipping only pays
+when the data is clustered on the predicate column. Row-group statistics already
+catch the coarse case; the page index buys granularity *inside* a surviving
+row group. On a randomly distributed column every page's min/max spans the domain,
+nothing is skipped, and the extra metadata read is pure cost.
+
+Note that writing the index is much cheaper work than using it — it is mostly
+serialising per-page statistics the `StatisticsCollector` already computes,
+whereas reading requires a row-range-aware decode path in `ColumnChunkReader`.
+The dependency in the phase table (13 after 11) is not a real one.
+
+### Bloom filters: opt-in everywhere except DuckDB
+
+| Writer | Default | Knob |
+|---|---|---|
+| parquet-mr (Spark, Hive, Trino) | off | `parquet.bloom.filter.enabled`, per column |
+| Spark SQL | off | `spark.sql.parquet.bloomFilter.enabled` |
+| arrow-rs | off | `set_bloom_filter_enabled` |
+| Arrow C++ / PyArrow | off (verified, pyarrow 24.0.0: `bloom_filter_options` defaults to `None`) | `bloom_filter_options` |
+| **DuckDB** | **on** | automatic, see below |
+| EngineeredWood | off | `BloomFilterColumns` |
+
+Consistent with that, only 2 of the 63 corpus files carry bloom filters, both
+parquet-mr files written to exercise the feature.
+
+DuckDB is the interesting case, because it answers "is there a heuristic good
+enough to default to?" with a shipped yes. From
+`extension/parquet/include/writer/templated_column_writer.hpp`, inside
+`FlushDictionary` — called only for dictionary-encoded columns:
+
+```cpp
+if (writer.EnableBloomFilters()) {
+  auto bloom_filter_entries = state.dictionary.GetSize() *
+      OP::template BloomFilterEntriesPerValue<SRC, TGT>();
+  state.bloom_filter = make_uniq<ParquetBloomFilter>(
+      bloom_filter_entries, writer.BloomFilterFalsePositiveRatio());
+}
+```
+
+A filter is written exactly when the column dictionary-encodes, sized from the
+*exact* distinct count, populated by iterating the dictionary rather than the
+rows, at a default FPP of 0.01. `dictionary_size_limit` bounds the dictionary and
+therefore the filter.
+
+**Why dictionary-encoded is the right trigger, when the opposite is intuitive.**
+The tempting rule is to bloom the columns where the dictionary *failed*: high
+cardinality is where min/max statistics are useless and point lookups hurt most.
+It is wrong on three counts — on fallback the distinct count is unknown (we
+substitute the row count, which overshoots and pins at `BloomFilterMaxBytes`),
+the build is O(rows), and the filter is at its largest. The dictionary case is the
+one that can be sized exactly, built cheaply, and bounded. The counter-argument
+that a dictionary already provides exact membership so a bloom is redundant does
+not hold either: probing a bloom is a small read at a known offset plus one hash,
+where using the dictionary means locating and decompressing that chunk's
+dictionary page.
+
+Tracked as [#56](https://github.com/clast-project/engineered-wood/issues/56).
+
+### Dictionary pruning: free, exact, and unused by us
+
+parquet-mr has pruned row groups from dictionary contents for years behind
+`parquet.filter.dictionary.enabled` (default on). For a *fully* dictionary-encoded
+chunk the dictionary is the exact set of values present, so `col = v` is decidable
+with no false positives.
+
+This is plausibly better value than either of the above: it needs no cooperation
+from the writer (dictionary pages are in nearly every real file), it is exact
+rather than probabilistic, and `DictionaryPageOffset` is already parsed onto
+`ColumnMetaData`. Our reader uses the dictionary only to decode. The trap is that
+a chunk which fell back to PLAIN holds values absent from its dictionary, so the
+chunk's encodings must be checked before trusting absence.
+
+Tracked as [#57](https://github.com/clast-project/engineered-wood/issues/57).
+
 ## Future: Page-Level Pushdown via Column/Offset Index
 
 | Index | Content | Enables |
@@ -638,35 +753,68 @@ indexes in `ColumnChunkWriter`.
 
 ## Implementation Phases
 
-| Phase | Scope | Project | Depends On | Status |
-|---|---|---|---|---|
-| **Phase 1** | `EngineeredWood.Expressions` core: tree, `LiteralValue`, factories | new project | nothing | Done |
-| **Phase 2** | `IStatisticsAccessor<TStats>`, `StatisticsEvaluator` | Expressions | Phase 1 | Done |
-| **Phase 3** | `ExpressionBinder`, schema binding | Expressions | Phase 1 | Done |
-| **Phase 4** | Migrate Iceberg expressions to consume the shared library | Iceberg | Phases 1-3 | Done |
-| **Phase 5** | `ParquetStatisticsAccessor`; `ParquetReadOptions.Filter`; row group pruning | Parquet | Phase 2 | Done |
-| **Phase 6** | Bloom filter probing in Parquet | Parquet | Phase 5 | Done |
-| **Phase 7** | Delta Lake stats-based file pruning + partition pruning | DeltaLake.Table | Phase 2 | Done |
-| **Phase 8** | `EngineeredWood.Expressions.Arrow`: `ArrowRowEvaluator`, `IFunctionRegistry` | new project | Phase 1 | Done |
-| **Phase 9** | `EngineeredWood.SparkSql`: subsetting tool, ANTLR grammar, parser, function registry | new project | Phases 1, 8 | Not started |
-| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes | DeltaLake.Table | Phases 8, 9 | Not started |
-| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | Phase 2 | Not started |
-| **Phase 12** | Page-level pushdown using column index | Parquet | Phases 5, 11 | Not started |
-| **Phase 13** | Column/offset index writing | Parquet | Phase 11 | Not started |
-| **Phase 14** | ORC stripe pruning | Orc | Phase 2 | Not started |
+### Shipped
+
+History, not status — these are done and stay done.
+
+| Phase | Scope | Project |
+|---|---|---|
+| **Phase 1** | `EngineeredWood.Expressions` core: tree, `LiteralValue`, factories | Expressions |
+| **Phase 2** | `IStatisticsAccessor<TStats>`, `StatisticsEvaluator` | Expressions |
+| **Phase 3** | `ExpressionBinder`, schema binding | Expressions |
+| **Phase 4** | Migrate Iceberg expressions to consume the shared library | Iceberg |
+| **Phase 5** | `ParquetStatisticsAccessor`; `ParquetReadOptions.Filter`; row group pruning | Parquet |
+| **Phase 6** | Bloom filter probing in Parquet | Parquet |
+| **Phase 7** | Delta Lake stats-based file pruning + partition pruning | DeltaLake.Table |
+| **Phase 8** | `EngineeredWood.Expressions.Arrow`: `ArrowRowEvaluator`, `IFunctionRegistry` | new project |
+
+### Designed, not built
+
+**No status column on purpose.** This table describes scope; the issue tracker is
+the only place that knows what is in flight. Rows marked *unfiled* have no issue
+because nobody has committed to them — that is a deliberate state, not an
+oversight.
+
+| Phase | Scope | Project | Tracked as |
+|---|---|---|---|
+| — | Per-read filter on the Parquet reader; Delta forwarding, with logical→physical rewriting under column mapping | Parquet + DeltaLake.Table | [#55](https://github.com/clast-project/engineered-wood/issues/55) |
+| — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
+| — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
+| **Phase 9** | `EngineeredWood.SparkSql`: subsetting tool, ANTLR grammar, parser, function registry | new project | unfiled |
+| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes (needs Phase 9) | DeltaLake.Table | unfiled |
+| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled |
+| **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled |
+| **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering | Parquet | unfiled |
+| **Phase 14** | ORC stripe pruning | Orc | unfiled |
 
 ### Ordering rationale
 
-Phases 1-7 are the natural progression of "build the core, prove it on the two
+Phases 1-7 were the natural progression of "build the core, prove it on the two
 formats with concrete needs (Parquet pruning, Delta pruning), and migrate
-Iceberg to consume it." Each phase is independently testable and shippable.
+Iceberg to consume it." Each phase was independently testable and shippable.
 
 Phases 8-10 extend the architecture to row-level evaluation, unblocking CHECK
 constraints and generated columns. The Spark parser is pure leaf work and can
 proceed in parallel with anything earlier.
 
-Phases 11-14 are advanced optimization (page-level pruning) and additional
-format support (ORC). Defer until the simpler wins land.
+**What the original ordering got wrong.** It assumed the next win was more
+pruning machinery. It is not: every mechanism phases 5-7 built is already
+unreachable from the table layer, so #55 comes before all of it — more pruning
+that nothing can invoke adds nothing. After that, #57 (dictionary pruning) is
+plausibly the best value of the remaining work, because unlike bloom filters and
+page indexes it needs no cooperation from whoever wrote the file, and it is exact
+rather than probabilistic. Page-level pushdown (11-12) is the largest of these by
+some margin, since it needs a row-range-aware decode path and not just metadata
+parsing; index *writing* (13) is much cheaper and has interop value on its own.
+
+Row-level filtering — the "post-filter" listed as future in the row evaluator
+section — has working prior art in-repo: `LanceTable.ReadAsync(columns, filter, ct)`
+evaluates per row and, in `ExtendProjectionForFilter`, reads the columns a
+predicate references even when the caller did not project them, then drops them
+before yielding. That is the non-obvious half, and it is already written. Delta
+would additionally have to apply the same mask to the row-metadata columns
+(`_ew_row_address`, row tracking), which `ReadCoreAsync` builds positionally per
+batch — mask them out of step and row identities silently detach from their rows.
 
 ### Testing strategy
 
