@@ -56,4 +56,30 @@ internal sealed class WrittenFileLedger
     /// the ledger must no longer name any of them — and after an abort has deleted them.
     /// </summary>
     public void Clear() => _paths.Clear();
+
+    /// <summary>
+    /// Removes and returns whichever of <paramref name="paths"/> this ledger holds — for a caller that has
+    /// worked out some of its own files are superseded and wants to collect them EARLY, before the operation
+    /// as a whole finishes.
+    ///
+    /// <para>Membership is the safety gate, and the reason this returns a subset rather than deleting what it
+    /// was asked to. A caller that derives paths from ACTIONS rather than from its own writes can be handed a
+    /// vector belonging to a concurrent writer, or one this operation has since committed — and the ledger
+    /// names neither: it holds only what this operation's own writers created, and it is emptied the instant a
+    /// commit becomes durable. So a path that survives this filter is, by construction, ours and uncommitted.
+    /// </para>
+    /// </summary>
+    public List<string> TakeRecorded(IEnumerable<string> paths)
+    {
+        var taken = new List<string>();
+        foreach (string path in paths)
+        {
+            int at = _paths.IndexOf(path); // List<string> compares ordinally
+            if (at < 0)
+                continue;
+            _paths.RemoveAt(at);
+            taken.Add(path);
+        }
+        return taken;
+    }
 }

@@ -2266,6 +2266,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Always sourced from the original `dataActions` (or the row-level resolution of them), never from a
         // prior rebase, so each retry rebases the STABLE staged work onto whatever the newest snapshot holds.
         var currentActions = dataActions;
+        // The files the PREVIOUS retry's row-level resolution re-touched. Only the remap arm produces paths
+        // this delete's own edit list does not already name, so this is how those stay recognisable as ours
+        // one retry later — see CollectSupersededVectorsAsync.
+        ISet<string>? priorResolvedPaths = null;
 
         long attemptVersion = baseSnapshot.Version + 1;
         const int maxAttempts = 100;
@@ -2322,6 +2326,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ISet<string>? resolvedPaths = null;
                 if (rowLevel)
                 {
+                    // The vectors `currentActions` names for the files this delete touches are about to be
+                    // replaced by the resolution below, so this is the moment they become garbage — and the
+                    // only moment anything knows it. Collect them now; a commit that eventually SUCCEEDS
+                    // clears the ledger wholesale and would otherwise forget every losing attempt's.
+                    await CollectSupersededVectorsAsync(
+                        currentActions, rowLevelDeletes!, priorResolvedPaths, written, cancellationToken)
+                        .ConfigureAwait(false);
+
                     var resolution = await ResolveRowLevelDeletesAsync(
                         baseSnapshot, latestSnapshot!, dataActions, rowLevelDeletes!, cancellationToken,
                         written)
@@ -2334,6 +2346,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                     currentActions = resolution.Value.Actions;
                     resolvedPaths = resolution.Value.ResolvedPaths;
+                    // Carried to the NEXT retry: a remap writes vectors on files that are not in this delete's
+                    // own edit list (the concurrent rewrite's output), so without this the next supersede pass
+                    // would not recognise them as ours.
+                    priorResolvedPaths = resolvedPaths;
 
                     // Under Serializable, commit order IS the logical order: a concurrent commit that CHANGED
                     // DATA in a file this delete read may not be reconciled away, however disjoint the rows —
@@ -2380,6 +2396,72 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
         }
+    }
+
+    /// <summary>
+    /// Deletes the deletion vectors a rebase is about to make garbage: the ones
+    /// <paramref name="supersededActions"/> names for the files this delete touched, which the resolution
+    /// that follows replaces with vectors computed against the newer snapshot.
+    ///
+    /// <para>Without this they leak on SUCCESS specifically. A losing attempt's vectors stay in the ledger,
+    /// and the commit that eventually lands empties it wholesale — correctly, to protect the winning
+    /// attempt's files, and in doing so it forgets every earlier attempt's. (A run that ultimately FAILS
+    /// needs none of this: the ledger still holds them and the abort collects them.)</para>
+    ///
+    /// <para><b>Why this is the delicate one.</b> Every other cleanup in the library deletes by provenance —
+    /// what its own writers just created. This one reads paths out of ACTIONS, and it does so standing next to
+    /// vectors that are emphatically live: the union arm builds its replacement from
+    /// <c>latestAdd.DeletionVector</c>, the CONCURRENT writer's committed vector, and a remap's targets are
+    /// files someone else just wrote. Two filters keep it honest, and both are necessary:</para>
+    /// <list type="number">
+    /// <item>only adds whose PATH this operation reconciled — its own <see cref="DeleteDvEdit"/> paths, plus
+    /// the previous resolution's <paramref name="priorResolvedPaths"/> for the remap arm. This is what keeps a
+    /// staged append's born-deleted vector out: that file is not in the base snapshot and not a remap target,
+    /// its add survives the resolution untouched, and the commit still needs it.</item>
+    /// <item>only paths the LEDGER still holds. The ledger names what this operation's own writers created and
+    /// is emptied the instant a commit becomes durable, so surviving that filter proves a vector is both ours
+    /// and uncommitted — including in the case where the commit landed and threw afterwards, which reaches
+    /// this code with an empty ledger and therefore deletes nothing.</item>
+    /// </list>
+    /// </summary>
+    private async ValueTask CollectSupersededVectorsAsync(
+        IReadOnlyList<DeltaAction> supersededActions,
+        IReadOnlyList<DeleteDvEdit> dvEdits,
+        ISet<string>? priorResolvedPaths,
+        WrittenFileLedger? written,
+        CancellationToken cancellationToken)
+    {
+        if (written is null)
+            return;
+
+        var reconciled = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var edit in dvEdits)
+            reconciled.Add(edit.Path);
+        if (priorResolvedPaths is not null)
+            reconciled.UnionWith(priorResolvedPaths);
+
+        var candidates = new List<string>();
+        foreach (var action in supersededActions)
+        {
+            if (action is AddFile add
+                && reconciled.Contains(add.Path)
+                && add.DeletionVector is { } dv
+                && DeletionVectors.DeletionVectorPath.GetRelativePath(dv) is { } path)
+            {
+                candidates.Add(path);
+            }
+        }
+
+        if (candidates.Count == 0)
+            return;
+
+        // TakeRecorded applies filter (2) and hands back only what was ours-and-uncommitted; routing the
+        // result through the shared deleter keeps the best-effort and cancelled-token semantics identical to
+        // every other cleanup path.
+        var superseded = new WrittenFileLedger();
+        foreach (string path in written.TakeRecorded(candidates))
+            superseded.Record(path);
+        await DeleteWrittenFilesAsync(superseded, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
