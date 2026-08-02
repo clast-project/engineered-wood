@@ -365,6 +365,40 @@ Two things an abort deliberately does **not** delete, because they are not the t
 Without an abort or a dispose, an abandoned transaction's files sit on storage until VACUUM's retention
 horizon passes — for a crash-looping producer, a whole batch per restart.
 
+### Abandoning a buffered write
+
+The buffered seam is the one case the library cannot clean up for you. `WriteDataFilesAsync` hands back a
+plain list and keeps no handle — deliberately, because those files are meant to outlive the call and may be
+committed by a later, unrelated one — so nothing in the library can tell an abandoned write from one whose
+commit has not happened *yet*. Only you know. Say it:
+
+```csharp
+var files = await table.WriteDataFilesAsync(batches);
+try
+{
+    // ... more statements, your own validation, the rest of the transaction ...
+    await table.CommitDataFilesAsync(files, extraActions: dml);
+}
+catch
+{
+    await table.DiscardDataFilesAsync(files);   // reclaim the bytes; not committing was already the rollback
+    throw;
+}
+```
+
+Two things to be clear about, because they are easy to conflate:
+
+- **Not committing IS the rollback**, and always was. A file no version references changes nothing a reader
+  can see, so correctness never depended on this call. `DiscardDataFilesAsync` is about reclaiming the
+  *bytes* — which otherwise wait out `delta.deletedFileRetentionDuration` before VACUUM collects them, and
+  on object storage are billed for the whole wait.
+- **It refuses to delete a file the table references.** You supply the list, so unlike every other cleanup
+  path in the library there is no provenance to go on — and a committed file passed by mistake would leave
+  an `add` naming nothing. The check reads the log rather than the handle's cached snapshot, because the
+  commit that made those files live may have come from another handle. Nothing is deleted when it refuses.
+
+Ignoring the method entirely stays valid; VACUUM still collects what it always did.
+
 ### Exactly-once producers
 
 `RequireAppTransaction` commits the `txn` action recording your progress **atomically with the data it
