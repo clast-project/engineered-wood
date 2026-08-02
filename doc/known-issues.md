@@ -614,7 +614,20 @@ actions, which never appear in the snapshot's active files — a keep-set
 built from `add` actions alone does not cover them, and sweeping the
 directory would destroy readable history. Building a proper CDF keep-set
 needs the snapshot to track `cdc` actions, which it does not yet. This
-under-deletes; it cannot lose data.
+under-deletes; it cannot lose data. Note this is a deliberate divergence from
+the reference implementations, which *do* sweep `_change_data/` — see
+[`vacuum-hidden-directories.md`](vacuum-hidden-directories.md).
+
+**Vacuum sweeps directories the reference implementations protect.**
+`VacuumExecutor.IsExcludedDirectory` names only `_delta_log/` and
+`_change_data/`; delta-io/delta and delta-rs instead protect every `.`- or
+`_`-prefixed directory, plus `metadata/` (UniForm's Iceberg output), and sweep
+three named exceptions. Any sidecar another engine writes under the table root
+is therefore collected once past retention. Not data loss — the affected
+artifacts are derived — but silent destruction of another engine's metadata.
+Spec, our divergences, and the reason `_delta_index/` is *correctly* swept are
+in [`vacuum-hidden-directories.md`](vacuum-hidden-directories.md); tracked as
+[#54](https://github.com/clast-project/engineered-wood/issues/54).
 
 **Vacuum refuses tables with absolute-path deletion vectors.** A
 `storageType: "p"` vector cannot be resolved against the table root from
@@ -823,3 +836,23 @@ generated columns.
 `FunctionCall` expressions throw at evaluation time unless the caller
 supplies a registry. A Spark function registry is planned alongside the
 SparkSql parser.
+
+**No table layer can push a predicate into the Parquet reader.** Row-group
+pruning and bloom probing are implemented and tested, but nothing in `src/` sets
+`ParquetReadOptions.Filter`: it is fixed when the `ParquetFileReader` is
+constructed, and Delta holds one options record shared by the scan, CDF, DML and
+compaction paths, so setting it there would prune row groups during OPTIMIZE's
+rewrite. `DeltaReadOptions.Filter` therefore prunes whole files and stops.
+Tracked as [#55](https://github.com/clast-project/engineered-wood/issues/55);
+see [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
+
+**No row-level post-filter on the Parquet or Delta read paths.** Both filters
+are superset-safe by design and documented as such — surviving batches still
+contain non-matching rows. `ArrowRowEvaluator` exists and is used by Delta
+predicate DELETE/UPDATE and by `LanceTable.ReadAsync`, but not by either
+reader.
+
+**Dictionary pages are used only to decode.** No dictionary-based row-group
+pruning, and the dictionary never reaches Arrow (dictionary-encoded columns are
+always materialised), so it cannot accelerate row-level filtering either.
+Tracked as [#57](https://github.com/clast-project/engineered-wood/issues/57).
