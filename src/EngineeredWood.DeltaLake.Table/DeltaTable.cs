@@ -4626,10 +4626,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
     //
-    // WriteDataFilesAsync writes append-shaped data files WITHOUT committing (invisible orphans until
+    // WriteDataFilesAsync writes append-shaped data files WITHOUT committing (invisible until
     // referenced); CommitDataFilesAsync commits those files — optionally FUSED with a caller's extraActions
     // (DML deletion-vector remove/add pairs, a schema metaData change) — into ONE atomic Delta version. The
     // pair lets a host (or a multi-statement transaction) build a commit incrementally, then flush it atomically.
+    // DiscardDataFilesAsync is the third verb: reclaim the bytes of a write the host has decided not to commit.
 
     /// <summary>True when the table declares IcebergCompat (requires engineered-wood's committing write path).</summary>
     public bool IsIcebergCompat =>
@@ -4856,8 +4857,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// commit assigns it, exactly like the streaming writer). Identity columns and IcebergCompat need write-time
     /// per-row processing tied to the commit — callers must check <see cref="SupportsExternalDataFileCommit"/>
     /// first (or pass <paramref name="identityValuesPreGenerated"/> for a table whose identity values were
-    /// generated up front via <c>GenerateIdentityValues</c>). The written files are invisible orphans until
-    /// committed (rollback = never reference them; vacuum cleans).
+    /// generated up front via <c>GenerateIdentityValues</c>). The written files are invisible until committed:
+    /// not referencing them IS the rollback, and it is atomic and free. To reclaim the BYTES of a write that
+    /// will never be committed, call <see cref="DiscardDataFilesAsync"/> — otherwise they wait for VACUUM.
     ///
     /// <para>A batch carrying a column the write schema does not declare is REFUSED, naming it: the file would
     /// carry the column while every Delta read projected it away. Fewer columns than the table is still legal
@@ -5033,6 +5035,73 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return files;
+    }
+
+    /// <summary>
+    /// Deletes files written for a commit that will NEVER be made — the explicit counterpart of
+    /// <see cref="CommitDataFilesAsync"/>, for a host abandoning a buffered transaction.
+    ///
+    /// <para>Not committing IS the rollback, and always was: a file no version references changes nothing a
+    /// reader can see. This is only about reclaiming the bytes. Without it the sole reclamation path is
+    /// VACUUM, which waits out <c>delta.deletedFileRetentionDuration</c> — so a host that KNOWS immediately
+    /// (a validation failure downstream, a user cancelling a multi-statement transaction, a crash-loop that
+    /// re-writes the batch on every restart) had no way to say so, though it holds the paths.</para>
+    ///
+    /// <para>Best-effort and quiet, like <see cref="DeltaTransaction.AbortAsync"/>: a delete that fails is
+    /// swallowed rather than allowed to mask whatever prompted the discard, and a file already gone is not an
+    /// error. Ignoring this method entirely stays valid — VACUUM still collects what it always did.</para>
+    ///
+    /// <para><b>The library cannot infer abandonment here</b>, which is why this is a verb rather than
+    /// automatic. <see cref="WriteDataFilesAsync"/> hands back a plain list and keeps no handle, deliberately:
+    /// the files are meant to outlive the call and may be committed by a later, unrelated one. Only the host
+    /// knows the commit is not coming.</para>
+    /// </summary>
+    /// <param name="files">The files to delete, as <see cref="WriteDataFilesAsync"/> returned them (or as the
+    /// host's own writer describes what it wrote). Only <see cref="WrittenDataFile.RelativePath"/> is read.</param>
+    /// <exception cref="ArgumentException">One of the files is REFERENCED by the table's current version — it
+    /// is live data, and deleting it would leave an <c>add</c> pointing at nothing. Checked against a freshly
+    /// read version, not this handle's cached one, because the commit that referenced them may have come from
+    /// another handle. Nothing is deleted when this throws: validate-then-apply, so a list containing one
+    /// committed file does not half-delete the rest.</exception>
+    public async ValueTask DiscardDataFilesAsync(
+        IReadOnlyList<WrittenDataFile> files, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (files is null)
+            throw new ArgumentNullException(nameof(files));
+        if (files.Count == 0)
+            return;
+
+        // The guard this method exists to be safe without. Every other cleanup path in the library deletes by
+        // PROVENANCE — it deletes what its own writers just created — but here the caller supplies the list,
+        // and a host that passes a committed file would destroy live data with one call. So the paths are
+        // checked against the log instead. Read fresh rather than trusting CurrentSnapshot: these files are
+        // uncommitted precisely until someone commits them, and that someone may be another handle.
+        var latest = await SnapshotBuilder.UpdateAsync(CurrentSnapshot, _log, cancellationToken)
+            .ConfigureAwait(false);
+        // Deliberately NOT assigned to _currentSnapshot: discarding files is not a reason to move a snapshot
+        // the caller may be planning against.
+        var active = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var add in latest.ActiveFiles.Values)
+            active.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path)); // add.path is URL-encoded
+
+        var ledger = new WrittenFileLedger();
+        foreach (var f in files)
+        {
+            if (active.Contains(f.RelativePath))
+            {
+                throw new ArgumentException(
+                    $"'{f.RelativePath}' is an active file at version {latest.Version} — it has been "
+                    + "committed, so it is the table's data and not a discardable buffered write. Deleting it "
+                    + "would leave an add action naming a file that does not exist. Nothing was deleted.",
+                    nameof(files));
+            }
+            // WrittenDataFile.RelativePath is the DECODED on-disk path (add.path is the encoded form of it),
+            // which is exactly what the filesystem takes — so it is recorded as-is, not via RecordEncoded.
+            ledger.Record(f.RelativePath);
+        }
+
+        await DeleteWrittenFilesAsync(ledger, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
