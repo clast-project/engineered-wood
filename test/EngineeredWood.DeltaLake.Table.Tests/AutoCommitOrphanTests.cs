@@ -274,6 +274,41 @@ public class AutoCommitOrphanTests : IDisposable
         Assert.Equal(before.Length + 1, DataFiles().Length);
     }
 
+    /// <summary>
+    /// The case where the operation SUCCEEDS and still leaves garbage. A row-level delete that loses a race
+    /// rebases its vectors onto the winner and retries — writing a fresh <c>.bin</c> per attempt, of which
+    /// only the last is ever referenced. The commit that lands empties the ledger wholesale (rightly, to
+    /// protect its own files), so the losing attempts' vectors have to be collected at the rebase, which is
+    /// the only moment anything knows they are superseded.
+    /// </summary>
+    [Fact]
+    public async Task DeleteRows_ThatRebasesAndLands_LeavesNoSupersededVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var stale = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await stale.WriteAsync([Range(1, 1000)]);
+        // Enough rows that each attempt's bitmap exceeds the inline threshold and becomes a file.
+        var doomed = RowSelection.FromRowAddresses(
+            await RowAddressesOfAsync(stale, [.. Enumerable.Range(1, 800).Select(i => (long)i)]),
+            stale.CurrentSnapshot);
+
+        // A concurrent delete of a DIFFERENT row: reconcilable row by row, so ours rebases and LANDS rather
+        // than aborting — which is what makes this the succeeded-with-garbage case.
+        await using (var other = OpenSecondHandle())
+            await other.DeleteAsync(IdEquals(1000));
+
+        var (deleted, _) = await stale.DeleteRowsAsync(
+            doomed, RowDeleteMode.DeletionVector, rowLevelRetry: true);
+        Assert.Equal(800, deleted);
+
+        // Exactly one on-disk vector: the union the committed version names. (The concurrent delete's single
+        // row fits inline, so it contributes no file of its own.)
+        Assert.Single(DeletionVectorFiles());
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal(199, (await ReadIds(reopened)).Count); // 801..999
+    }
+
     // ── Compaction: the one with the most to lose ──
 
     /// <summary>

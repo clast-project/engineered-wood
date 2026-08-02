@@ -228,6 +228,48 @@ public class DeltaTransactionAbortTests : IDisposable
         Assert.Equal([1L], await ReadIds(table)); // still uncommitted, as the abort intends
     }
 
+    /// <summary>
+    /// The hazard in collecting superseded vectors at a rebase: a transaction can hold a vector that is NOT
+    /// superseded. A born-deleted vector belongs to a staged append's add, which the row-level resolution
+    /// preserves untouched — so it is still needed by the very commit that lands, even though it was written
+    /// by the same transaction whose OTHER vector is being replaced. Deleting it would leave a committed add
+    /// naming a vector that does not exist, and every row it hides would come back.
+    /// </summary>
+    [Fact]
+    public async Task ARebasedDelete_KeepsACoStagedBornDeletedVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([Range(1, 1000)]); // the file the delete below rebases on
+        Assert.Empty(DeletionVectorFiles());
+
+        var txn = table.StartTransaction();
+
+        // (a) a host-written append whose rows are born deleted — enough of them to need a vector FILE.
+        var appended = await table.WriteDataFilesAsync([Range(2001, 3000)]);
+        var bornDeleted = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [appended[0].RelativePath] = [.. Enumerable.Range(0, 600).Select(i => (long)i)],
+        });
+        await txn.StageDataFilesAsync(appended, bornDeleted);
+
+        // (b) a row-level delete on the existing file, which the concurrent commit below forces to rebase.
+        await txn.DeleteAsync(IdAtMost(800));
+        Assert.Equal(2, DeletionVectorFiles().Length); // born-deleted + the delete's first attempt
+
+        await using (var other = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+            await other.DeleteAsync(IdEquals(1000)); // a different row — reconciles, so our commit LANDS
+
+        await txn.CommitAsync();
+
+        // The delete's superseded vector went; the born-deleted one — which the commit still names — did not.
+        Assert.Equal(2, DeletionVectorFiles().Length); // born-deleted + the union
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var ids = await ReadIds(reopened);
+        Assert.Equal(199, ids.Count(i => i <= 1000));   // 801..999 survive the delete
+        Assert.Equal(400, ids.Count(i => i >= 2001));   // 600 of the 1000 appended were born deleted
+    }
+
     // ── The paths that reach an abort in practice ──
 
     /// <summary>
