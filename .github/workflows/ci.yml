@@ -1,5 +1,10 @@
 name: CI
 
+# NOTE: do NOT add `paths-ignore` here to skip documentation changes.
+# `build` is a REQUIRED status check on main. A workflow skipped by path
+# filtering never reports its checks — they stay Pending forever and the PR
+# can never merge. The job below therefore always runs and always reports;
+# it decides internally whether there is anything worth compiling.
 on:
   push:
     branches: [main]
@@ -19,9 +24,46 @@ jobs:
           # parquet-testing is a git submodule that the Parquet compatibility
           # tests read their fixtures from.
           submodules: recursive
+          # Full history so the change detection below can diff against the
+          # base commit.
           fetch-depth: 0
 
+      - name: Detect non-documentation changes
+        id: changes
+        shell: bash
+        run: |
+          # Fails safe: anything this cannot classify with confidence runs the
+          # full build. Skipping CI by accident is far worse than running it.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+
+          if [ -z "$base" ] \
+             || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "Base commit unavailable — running the full build."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+          echo "Changed files:"
+          echo "$changed"
+
+          # Documentation is doc/** and top-level *.md. Everything else —
+          # including .github/** — counts as code. An empty diff also counts as
+          # code, so the full build runs.
+          if printf '%s\n' "$changed" | grep -qvE '^(doc/|[^/]*\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Documentation-only change — skipping restore, build, test and pack."
+          fi
+
       - name: Setup .NET
+        if: steps.changes.outputs.code == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: |
@@ -29,30 +71,35 @@ jobs:
             10.0.x
 
       - name: Restore
+        if: steps.changes.outputs.code == 'true'
         run: dotnet restore engineered-wood.slnx
 
       - name: Build
+        if: steps.changes.outputs.code == 'true'
         run: dotnet build engineered-wood.slnx --no-restore --configuration Release
 
       - name: Test
+        if: steps.changes.outputs.code == 'true'
         # The delta-rs / Spark interop tests are gated behind EW_REQUIRE_* and
         # skip here; the Rust / pyarrow / pylance cross-validation tests
         # soft-skip when those toolchains aren't installed on the runner.
         run: dotnet test engineered-wood.slnx --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
 
       - name: Pack
+        if: steps.changes.outputs.code == 'true'
         # test/ and benchmark projects opt out of packing (test/Directory.Build.props),
         # so this produces only the 15 src/ libraries.
         run: dotnet pack engineered-wood.slnx --no-build --configuration Release --output artifacts
 
       - name: Upload test results
-        if: always()
+        if: always() && steps.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: '**/*.trx'
 
       - name: Upload packages
+        if: steps.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: packages
