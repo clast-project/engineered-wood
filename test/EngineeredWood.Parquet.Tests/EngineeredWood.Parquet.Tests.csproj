@@ -35,6 +35,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Update="TestData\**\*.parquet" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Gcs\EngineeredWood.Gcs.csproj" />
