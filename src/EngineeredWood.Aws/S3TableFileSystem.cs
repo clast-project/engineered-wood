@@ -197,27 +197,49 @@ public sealed class S3TableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        using Stream stream = CreateReadStream(data);
+        const int maxConflictRetries = 3;
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await _client.PutObjectAsync(
+                    new PutObjectRequest
+                    {
+                        BucketName = _bucket,
+                        Key = Resolve(path),
+                        InputStream = stream,
+                        AutoCloseStream = false,
+                        IfNoneMatch = "*",
+                    },
+                    cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (AmazonS3Exception exception) when (
+                exception.StatusCode == HttpStatusCode.PreconditionFailed)
+            {
+                return false;
+            }
+            catch (AmazonS3Exception exception) when (
+                exception.StatusCode == HttpStatusCode.Conflict &&
+                attempt < maxConflictRetries)
+            {
+                stream.Position = 0;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public async ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)
     {
-        byte[] array;
-        int offset, count;
-        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
-        {
-            array = segment.Array!;
-            offset = segment.Offset;
-            count = segment.Count;
-        }
-        else
-        {
-            array = data.ToArray();
-            offset = 0;
-            count = array.Length;
-        }
-
         // A single PutObject is atomic: the object becomes visible only once fully written.
-        using var stream = new MemoryStream(array, offset, count, writable: false);
+        using Stream stream = CreateReadStream(data);
         await _client.PutObjectAsync(
             new PutObjectRequest
             {
@@ -227,6 +249,17 @@ public sealed class S3TableFileSystem : ITableFileSystem
                 AutoCloseStream = false,
             },
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static Stream CreateReadStream(ReadOnlyMemory<byte> data)
+    {
+        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
+        {
+            return new MemoryStream(
+                segment.Array!, segment.Offset, segment.Count, writable: false);
+        }
+
+        return new MemoryStream(data.ToArray(), writable: false);
     }
 
     private async ValueTask<bool> ObjectExistsAsync(string key, CancellationToken cancellationToken)

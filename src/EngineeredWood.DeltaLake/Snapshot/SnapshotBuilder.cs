@@ -235,7 +235,7 @@ public sealed class SnapshotBuilder
     /// <summary>
     /// Creates a builder pre-populated from an existing snapshot.
     /// </summary>
-    private static SnapshotBuilder FromSnapshot(Snapshot snapshot)
+    internal static SnapshotBuilder FromSnapshot(Snapshot snapshot)
     {
         var builder = new SnapshotBuilder
         {

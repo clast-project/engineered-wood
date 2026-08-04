@@ -215,6 +215,9 @@ public class LastCheckpointToleranceTests : IDisposable
         public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
             => inner.ExistsAsync(path, cancellationToken);
 
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+
         public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
             => inner.WriteAllBytesAsync(path, data, cancellationToken);
     }

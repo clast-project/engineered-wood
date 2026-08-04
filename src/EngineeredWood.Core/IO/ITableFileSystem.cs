@@ -34,8 +34,8 @@ public interface ITableFileSystem
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Atomically renames a file. Used for conflict-free commit writes
-    /// (write to temp, rename to target). Returns false if the target already exists.
+    /// Atomically renames a file without replacing an existing target.
+    /// Returns false if the target already exists.
     /// Not all backends support true atomic rename; implementations document their guarantees.
     /// </summary>
     ValueTask<bool> RenameAsync(
@@ -60,6 +60,15 @@ public interface ITableFileSystem
     /// </summary>
     ValueTask<byte[]> ReadAllBytesAsync(
         string path, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Atomically writes the entire contents of a small file only if the file does not
+    /// already exist. Returns <see langword="true"/> when the file was created, or
+    /// <see langword="false"/> when an existing file was left unchanged.
+    /// </summary>
+    ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Writes the entire contents of a small file atomically where possible.

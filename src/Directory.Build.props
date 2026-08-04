@@ -99,7 +99,7 @@
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake'">A low-level Delta Lake transaction-log API for .NET — actions, checkpoints, and statistics for metadata consumers. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake.Table'">A high-level Delta Lake table API (Reader v3 / Writer v7) with Arrow read/write, deletion vectors, column mapping, and predicate pushdown. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Iceberg'">Apache Iceberg metadata (v1/v2/v3), manifest read/write, and predicate-aware scan planning for .NET (metadata-only). $(_PreRelease)</Description>
-    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Azure'">Azure Blob Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Azure'">Azure Blob and Data Lake Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Gcs'">Google Cloud Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Aws'">Amazon S3 I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>
   </PropertyGroup>

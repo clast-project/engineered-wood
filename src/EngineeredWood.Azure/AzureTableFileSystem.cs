@@ -176,6 +176,30 @@ public sealed class AzureTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _container.GetBlobClient(Resolve(path))
+                .UploadAsync(
+                    new BinaryData(data),
+                    new BlobUploadOptions
+                    {
+                        Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All },
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (RequestFailedException exception) when (exception.Status is 409 or 412)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc/>
     public async ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)

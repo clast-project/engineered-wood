@@ -27,8 +27,8 @@ internal sealed class FailAfterCommitFileSystem(ITableFileSystem inner) : ITable
     /// </summary>
     public bool Armed { get; set; }
 
-    /// <summary>True once an ARMED commit's version JSON has been renamed into place — i.e. once the commit
-    /// under test is durable.</summary>
+    /// <summary>True once an ARMED commit's version JSON has been created — i.e. once the commit under test
+    /// is durable.</summary>
     public bool Committed { get; private set; }
 
     private static bool IsCommitJson(string path) =>
@@ -71,6 +71,18 @@ internal sealed class FailAfterCommitFileSystem(ITableFileSystem inner) : ITable
     public ValueTask<byte[]> ReadAllBytesAsync(
         string path, CancellationToken cancellationToken = default) =>
         _inner.ReadAllBytesAsync(path, cancellationToken);
+
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        bool written = await _inner.TryWriteAllBytesAsync(path, data, cancellationToken)
+            .ConfigureAwait(false);
+        if (written && Armed && IsCommitJson(path))
+        {
+            Committed = true;
+        }
+        return written;
+    }
 
     public ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>

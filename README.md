@@ -17,7 +17,7 @@ A .NET library for reading and writing columnar file formats — **Apache Parque
 - **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
 - **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, predicate-based delete/update on Lance datasets, and zone-stats pruning on Vortex — one predicate type works against any of them.
 - **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 table metadata with statistics-based scan planning — experimental, and not yet a conformant Iceberg writer.
-- **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
+- **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob or Data Lake Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
 - **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
 - **Strongly named.** Every assembly is signed with the shared clast-project key, public key token `0b0eddb1936076d9`, so the libraries can be referenced from strongly-named projects.
@@ -46,7 +46,7 @@ src/
   EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
   EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
   EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
-  EngineeredWood.Azure/                  Azure Blob Storage I/O backends
+  EngineeredWood.Azure/                  Azure Blob and Data Lake Storage I/O backends
   EngineeredWood.Gcs/                    Google Cloud Storage I/O backends
   EngineeredWood.Aws/                    Amazon S3 I/O backends
 test/                                    xUnit tests, BenchmarkDotNet suites, and a 92-file
@@ -482,7 +482,8 @@ table requiring one it does not implement is rejected rather than mis-read.
 
 ### Writing
 
-- Append and overwrite; partitioned writes; identity column generation
+- Single-commit `CreateOrReplaceAsync` (protocol + metadata + initial files), append and overwrite;
+  partitioned writes; identity column generation
 - Auto-checkpoint (V1 Parquet and V2 JSON+sidecar formats)
 - Compaction and vacuum; log compaction
 - Change data feed (insert / delete / update pre/post-image)
@@ -575,12 +576,13 @@ shared cursor, batched range requests, and pooled buffers.
 |---|---|---|---|
 | Local files | `LocalRandomAccessFile` | `LocalSequentialFile` | `LocalTableFileSystem` |
 | Azure Blob Storage | `AzureBlobRandomAccessFile` | `AzureBlobSequentialFile` | `AzureTableFileSystem` |
+| Azure Data Lake Storage Gen2 | `AzureDataLakeRandomAccessFile` | `AzureDataLakeSequentialFile` | `AzureDataLakeTableFileSystem` |
 | Google Cloud Storage | `GcsRandomAccessFile` | `GcsSequentialFile` | `GcsTableFileSystem` |
 | Amazon S3 | `S3RandomAccessFile` | `S3SequentialFile` | `S3TableFileSystem` |
 
-The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
+The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs` and `Azure.Storage.Files.DataLake`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
 
-Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / rename / delete / exists); its `RenameAsync` uses each backend's atomic create-if-absent precondition, giving Delta Lake and Iceberg the conflict-free commit guarantee they rely on.
+Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, DFS append/flush, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / rename / delete / exists). The DFS backend uses native conditional rename; object-store backends conditionally create the destination, giving Delta Lake and Iceberg the conflict-free commit guarantee they rely on.
 
 `CoalescingFileReader` is a decorator that merges nearby byte ranges to reduce I/O round trips — particularly useful on cloud storage.
 

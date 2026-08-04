@@ -144,6 +144,42 @@ public sealed class LocalTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
+    public ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        string fullPath = ResolvePath(path);
+        string? directory = Path.GetDirectoryName(fullPath);
+        if (directory is not null)
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        string tempPath = fullPath + ".tmp." + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllBytes(tempPath, data.ToArray());
+            try
+            {
+                File.Move(tempPath, fullPath);
+                return new ValueTask<bool>(true);
+            }
+            catch (IOException) when (File.Exists(fullPath))
+            {
+                return new ValueTask<bool>(false);
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)

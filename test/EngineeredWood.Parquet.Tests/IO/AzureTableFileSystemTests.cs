@@ -66,6 +66,20 @@ public class AzureTableFileSystemTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task TryWriteAllBytes_CreatesOnce_AndPreservesExistingContent()
+    {
+        if (!_azuriteAvailable) return;
+        var fs = NewFs();
+
+        Assert.True(await fs.TryWriteAllBytesAsync("commit.json", Bytes("winner")));
+        Assert.False(await fs.TryWriteAllBytesAsync("commit.json", Bytes("loser")));
+
+        Assert.Equal(
+            "winner",
+            Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("commit.json")));
+    }
+
+    [Fact]
     public async Task Exists_ReflectsPresence()
     {
         if (!_azuriteAvailable) return;

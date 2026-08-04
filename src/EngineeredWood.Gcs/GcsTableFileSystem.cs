@@ -171,30 +171,50 @@ public sealed class GcsTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        using Stream stream = CreateReadStream(data);
+        try
+        {
+            await _client.UploadObjectAsync(
+                _bucket,
+                Resolve(path),
+                contentType: null,
+                stream,
+                new UploadObjectOptions { IfGenerationMatch = 0 },
+                cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (GoogleApiException exception) when (
+            exception.HttpStatusCode == HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc/>
     public async ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)
     {
-        byte[] array;
-        int offset, count;
-        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
-        {
-            array = segment.Array!;
-            offset = segment.Offset;
-            count = segment.Count;
-        }
-        else
-        {
-            array = data.ToArray();
-            offset = 0;
-            count = array.Length;
-        }
-
         // A single GCS upload is atomic: the object becomes visible only once fully written.
-        using var stream = new MemoryStream(array, offset, count, writable: false);
+        using Stream stream = CreateReadStream(data);
         await _client.UploadObjectAsync(
             _bucket, Resolve(path), contentType: null, stream, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private static Stream CreateReadStream(ReadOnlyMemory<byte> data)
+    {
+        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
+        {
+            return new MemoryStream(
+                segment.Array!, segment.Offset, segment.Count, writable: false);
+        }
+
+        return new MemoryStream(data.ToArray(), writable: false);
     }
 
     private async ValueTask<bool> ObjectExistsAsync(string objectName, CancellationToken cancellationToken)
