@@ -214,7 +214,7 @@ Replaces `Stream` with two interfaces designed for columnar access patterns.
 
 **Writing: `ISequentialFile`** — Append-only: `WriteAsync(ReadOnlyMemory<byte>)` + `FlushAsync()` + `Position`. `LocalSequentialFile` writes to disk; the cloud writers stream with bounded memory using each backend's native chunked upload rather than buffering the whole object — Azure block blobs (`AzureBlobSequentialFile`), GCS resumable uploads (`GcsSequentialFile`, fed through a bounded `System.Threading.Channels` pipe by a background upload task), and S3 multipart uploads (`S3SequentialFile`, which drives the part loop directly).
 
-**Directory / table operations: `ITableFileSystem`** — Table formats (Delta Lake, Iceberg, Lance datasets) manage many files under a root and need list / open-read / create / rename / delete / exists / read-all / write-all. `LocalTableFileSystem` backs the local filesystem; `AzureTableFileSystem`, `GcsTableFileSystem`, and `S3TableFileSystem` back the three clouds. `RenameAsync` is the load-bearing operation: commit protocols write a temp object and rename it onto the target, which must fail if the target already exists. None of the clouds offer a true atomic rename, so each implements it as a copy + delete-source where the copy carries the backend's atomic "create only if absent" precondition — `IfGenerationMatch = 0` (GCS), `If-None-Match: *` (Azure and S3). A lost commit race therefore returns `false` instead of clobbering the winner.
+**Directory / table operations: `ITableFileSystem`** — Table formats (Delta Lake, Iceberg, Lance datasets) manage many files under a root and need list / open-read / create / delete / exists / read-all / write-all / try-write-all. `LocalTableFileSystem` backs the local filesystem; `AzureTableFileSystem`, `GcsTableFileSystem`, and `S3TableFileSystem` back the three clouds. `TryWriteAllBytesAsync` is the load-bearing operation: it publishes a file's complete contents only if that path does not already exist, which is exactly the claim a commit protocol makes about version N. The object stores satisfy it in a single conditional request — `IfGenerationMatch = 0` (GCS), `If-None-Match: *` (Azure and S3) — so a whole commit is one round trip. A backend without a conditional single-shot upload emulates it: the local filesystem writes a sibling temp file and `File.Move`s it, which fails rather than replacing. A lost race returns `false` instead of clobbering the winner, and `TransactionLog.WriteCommitAsync` turns that into `DeltaConflictException`.
 
 **Buffer management** — `BufferAllocator` is an abstract factory for `IMemoryOwner<byte>`. The concrete `PooledBufferAllocator` wraps `ArrayPool<byte>.Shared` and slices rented arrays to exact size, reducing GC pressure.
 
@@ -848,7 +848,7 @@ DeltaTable.WriteAsync(batches)
   │    └─ ParquetFileWriter.WriteRowGroupAsync
   ├─ Build AddFile actions (Stats, BaseRowId, DefaultRowCommitVersion, etc.)
   ├─ CommitOccAsync — the optimistic-concurrency loop
-  │    ├─ TransactionLog.WriteCommitAsync (NDJSON, atomic temp + rename)
+  │    ├─ TransactionLog.WriteCommitAsync (NDJSON, atomic create-if-absent)
   │    └─ on collision: read readVersion+1..latest, run ConflictChecker,
   │       rebase and retry if nothing we read was invalidated, else abort
   └─ Auto-checkpoint at CheckpointInterval

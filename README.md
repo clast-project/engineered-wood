@@ -482,7 +482,8 @@ table requiring one it does not implement is rejected rather than mis-read.
 
 ### Writing
 
-- Append and overwrite; partitioned writes; identity column generation
+- Single-commit `CreateOrReplaceAsync` (protocol + metadata + initial files), append and overwrite;
+  partitioned writes; identity column generation
 - Auto-checkpoint (V1 Parquet and V2 JSON+sidecar formats)
 - Compaction and vacuum; log compaction
 - Change data feed (insert / delete / update pre/post-image)
@@ -580,7 +581,7 @@ shared cursor, batched range requests, and pooled buffers.
 
 The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
 
-Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / rename / delete / exists); its `RenameAsync` uses each backend's atomic create-if-absent precondition, giving Delta Lake and Iceberg the conflict-free commit guarantee they rely on.
+Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / delete / exists). Its `TryWriteAllBytesAsync` is the create-only primitive Delta Lake and Iceberg commit protocols rely on: a single conditional request on every cloud backend (`If-None-Match: *` on Azure and S3, `IfGenerationMatch = 0` on GCS), so a whole commit is one round trip.
 
 `CoalescingFileReader` is a decorator that merges nearby byte ranges to reduce I/O round trips — particularly useful on cloud storage.
 

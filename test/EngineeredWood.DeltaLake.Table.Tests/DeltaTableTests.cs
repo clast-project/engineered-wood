@@ -3,6 +3,9 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
 
@@ -47,6 +50,241 @@ public class DeltaTableTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateOrReplace_NewTable_PublishesDataInVersionZero()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        var batch = new RecordBatch(
+            schema, [new Int64Array.Builder().Append(1).Append(2).Build()], 2);
+
+        await using var table = await DeltaTable.CreateOrReplaceAsync(fs, schema, [batch]);
+
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        Assert.Single(Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.json"));
+
+        IReadOnlyList<DeltaAction> actions = await new TransactionLog(fs).ReadCommitAsync(0);
+        Assert.Contains(actions, static action => action is ProtocolAction);
+        Assert.Contains(actions, static action => action is MetadataAction);
+        Assert.Contains(actions, static action => action is AddFile);
+        CommitInfo commitInfo = Assert.Single(actions.OfType<CommitInfo>());
+        Assert.Equal("CREATE TABLE AS SELECT", commitInfo.GetValue("operation")?.GetString());
+
+        long[] ids = await ReadIdsAsync(table);
+        Assert.Equal(new long[] { 1, 2 }, ids);
+    }
+
+    [Fact]
+    public async Task CreateOrReplace_ExistingTable_AtomicallyReplacesDataAndPreservesHistory()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        var originalBatch = new RecordBatch(
+            schema, [new Int64Array.Builder().Append(1).Append(2).Build()], 2);
+
+        string originalTableId;
+        string originalPath;
+        await using (var original = await DeltaTable.CreateOrReplaceAsync(
+            fs, schema, [originalBatch], enableDeletionVectors: true))
+        {
+            originalTableId = original.CurrentSnapshot.Metadata.Id;
+            originalPath = Assert.Single(original.CurrentSnapshot.ActiveFiles.Values).Path;
+        }
+
+        var replacementBatch = new RecordBatch(
+            schema, [new Int64Array.Builder().Append(9).Build()], 1);
+        await using var replacement = await DeltaTable.CreateOrReplaceAsync(
+            fs, schema, [replacementBatch]);
+
+        Assert.Equal(1, replacement.CurrentSnapshot.Version);
+        Assert.NotEqual(originalTableId, replacement.CurrentSnapshot.Metadata.Id);
+        Assert.DoesNotContain(
+            replacement.CurrentSnapshot.ActiveFiles.Values,
+            add => string.Equals(add.Path, originalPath, StringComparison.Ordinal));
+        long[] currentIds = await ReadIdsAsync(replacement);
+        long[] originalIds = await ReadIdsAsync(replacement, version: 0);
+        Assert.Equal(new long[] { 9 }, currentIds);
+        Assert.Equal(new long[] { 1, 2 }, originalIds);
+
+        Assert.Contains(
+            "deletionVectors",
+            replacement.CurrentSnapshot.Protocol.WriterFeatures ?? []);
+        Assert.DoesNotContain(
+            "columnMapping",
+            replacement.CurrentSnapshot.Protocol.ReaderFeatures ?? []);
+        Assert.DoesNotContain(
+            "columnMapping",
+            replacement.CurrentSnapshot.Protocol.WriterFeatures ?? []);
+        Assert.DoesNotContain(
+            "changeDataFeed",
+            replacement.CurrentSnapshot.Protocol.WriterFeatures ?? []);
+        Assert.DoesNotContain(
+            "identityColumns",
+            replacement.CurrentSnapshot.Protocol.WriterFeatures ?? []);
+
+        IReadOnlyList<DeltaAction> actions = await new TransactionLog(fs).ReadCommitAsync(1);
+        Assert.Contains(actions, static action => action is MetadataAction);
+        Assert.Contains(actions, static action => action is RemoveFile);
+        Assert.Contains(actions, static action => action is AddFile);
+        CommitInfo commitInfo = Assert.Single(actions.OfType<CommitInfo>());
+        Assert.Equal(
+            "CREATE OR REPLACE TABLE AS SELECT",
+            commitInfo.GetValue("operation")?.GetString());
+    }
+
+    [Fact]
+    public async Task CreateOrReplace_ColumnMappingIdsContinuePastPreviousHighWaterMark()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        int originalMax;
+        await using (var original = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(
+                schema, [new Int64Array.Builder().Append(1).Build()], 1)],
+            columnMappingMode: ColumnMappingMode.Name))
+        {
+            originalMax = int.Parse(
+                original.CurrentSnapshot.Metadata.Configuration![
+                    EngineeredWood.DeltaLake.Schema.ColumnMapping.MaxColumnIdKey]);
+        }
+
+        await using var replacement = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(
+                schema, [new Int64Array.Builder().Append(2).Build()], 1)],
+            columnMappingMode: ColumnMappingMode.Name);
+
+        int replacementId = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetFieldId(
+            replacement.CurrentSnapshot.Schema.Fields[0])!.Value;
+        Assert.True(replacementId > originalMax);
+        long[] replacementIds = await ReadIdsAsync(replacement);
+        Assert.Equal(new long[] { 2 }, replacementIds);
+    }
+
+    [Fact]
+    public async Task CreateOrReplace_AppendOnlyTable_RejectsReplacement()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        var configuration = new Dictionary<string, string>
+        {
+            ["delta.appendOnly"] = "true",
+        };
+
+        await using (var original = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(
+                schema, [new Int64Array.Builder().Append(1).Build()], 1)],
+            configuration: configuration))
+        {
+        }
+
+        await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await DeltaTable.CreateOrReplaceAsync(
+                fs,
+                schema,
+                [new RecordBatch(
+                    schema, [new Int64Array.Builder().Append(2).Build()], 1)]));
+
+        await using var reopened = await DeltaTable.OpenAsync(fs);
+        Assert.Equal(0, reopened.CurrentSnapshot.Version);
+        long[] reopenedIds = await ReadIdsAsync(reopened);
+        Assert.Equal(new long[] { 1 }, reopenedIds);
+    }
+
+    /// <summary>
+    /// The replacement protocol is the MERGE of what the table already supports and what the replacement
+    /// asks for, and either side can arrive below the table-features threshold (reader 3 / writer 7)
+    /// carrying capabilities its legacy version merely IMPLIED. At v3/v7 nothing is implied any more, so
+    /// every one of those has to be enumerated or the protocol contradicts the metadata — the mismatch
+    /// Spark rejects outright and this library, which drives column mapping off the metadata, would read
+    /// straight past. The matrix crosses a legacy and a modern table with a legacy and a modern
+    /// replacement; the columnMapping row is the one that regressed, because a column-mapping-only create
+    /// emits the legacy (2, 5) pair with no feature lists at all.
+    /// </summary>
+    [Theory]
+    // existing DV (3,7) x replacement column mapping (2,5): columnMapping must survive the merge.
+    [InlineData(true, false, false, true, new[] { "columnMapping" }, new[] { "columnMapping", "deletionVectors" })]
+    // existing column mapping (2,5) x replacement DV (3,7): the same case with the sides swapped.
+    [InlineData(false, true, true, false, new[] { "columnMapping" }, new[] { "columnMapping", "deletionVectors" })]
+    // existing plain (1,2) x replacement DV (3,7): writer 2's implied pair must be enumerated.
+    [InlineData(false, false, true, false, new string[0], new[] { "appendOnly", "deletionVectors", "invariants" })]
+    // existing DV (3,7) x replacement plain (1,2): nothing legacy is added on the reader side.
+    [InlineData(true, false, false, false, new string[0], new[] { "appendOnly", "deletionVectors", "invariants" })]
+    public async Task CreateOrReplace_MergedProtocolEnumeratesLegacyFeaturesFromBothSides(
+        bool existingDeletionVectors,
+        bool existingColumnMapping,
+        bool replacementDeletionVectors,
+        bool replacementColumnMapping,
+        string[] expectedReaderFeatures,
+        string[] expectedWriterFeatures)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        await using (var original = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build()], 1)],
+            columnMappingMode: existingColumnMapping
+                ? ColumnMappingMode.Name
+                : ColumnMappingMode.None,
+            enableDeletionVectors: existingDeletionVectors))
+        {
+        }
+
+        await using var replacement = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(schema, [new Int64Array.Builder().Append(2).Build()], 1)],
+            columnMappingMode: replacementColumnMapping
+                ? ColumnMappingMode.Name
+                : ColumnMappingMode.None,
+            enableDeletionVectors: replacementDeletionVectors);
+
+        ProtocolAction protocol = replacement.CurrentSnapshot.Protocol;
+
+        // Every feature the merge is obliged to carry is present. Exact-set assertions would pin the
+        // unrelated features an unrelated change may legitimately add, so this checks the obligation.
+        foreach (string feature in expectedReaderFeatures)
+            Assert.Contains(feature, protocol.ReaderFeatures ?? []);
+        foreach (string feature in expectedWriterFeatures)
+            Assert.Contains(feature, protocol.WriterFeatures ?? []);
+
+        // A v7 protocol that names no features at all is the failure this guards; so is a metadata
+        // capability with no matching protocol entry.
+        if (protocol.MinWriterVersion >= 7)
+            Assert.NotEmpty(protocol.WriterFeatures ?? []);
+
+        bool mappingEnabled = replacement.CurrentSnapshot.Metadata.Configuration is not null &&
+            replacement.CurrentSnapshot.Metadata.Configuration.TryGetValue(
+                "delta.columnMapping.mode", out string? mode) &&
+            !string.Equals(mode, "none", StringComparison.Ordinal);
+        if (mappingEnabled && protocol.MinReaderVersion >= 3)
+            Assert.Contains("columnMapping", protocol.ReaderFeatures ?? []);
+        if (mappingEnabled && protocol.MinWriterVersion >= 7)
+            Assert.Contains("columnMapping", protocol.WriterFeatures ?? []);
+
+        // The replacement's data is still what the table returns.
+        Assert.Equal(new long[] { 2 }, await ReadIdsAsync(replacement));
+    }
+
+    [Fact]
     public async Task WriteAndReadBack_SimpleData()
     {
         var fs = new LocalTableFileSystem(_tempDir);
@@ -75,6 +313,21 @@ public class DeltaTableTests : IDisposable
 
         Assert.Single(batches);
         Assert.Equal(3, batches[0].Length);
+    }
+
+    private static async Task<long[]> ReadIdsAsync(DeltaTable table, long? version = null)
+    {
+        var values = new List<long>();
+        IAsyncEnumerable<RecordBatch> batches = version is long atVersion
+            ? table.ReadAtVersionAsync(atVersion)
+            : table.ReadAllAsync();
+        await foreach (RecordBatch batch in batches)
+        {
+            var ids = (Int64Array)batch.Column(0);
+            for (int i = 0; i < ids.Length; i++)
+                values.Add(ids.GetValue(i)!.Value);
+        }
+        return values.ToArray();
     }
 
     [Fact]

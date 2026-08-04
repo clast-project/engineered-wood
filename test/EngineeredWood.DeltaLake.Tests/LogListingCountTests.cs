@@ -146,14 +146,14 @@ public class LogListingCountTests : IDisposable
         public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
             => inner.CreateAsync(path, overwrite, cancellationToken);
 
-        public ValueTask<bool> RenameAsync(string sourcePath, string targetPath, CancellationToken cancellationToken = default)
-            => inner.RenameAsync(sourcePath, targetPath, cancellationToken);
-
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
             => inner.DeleteAsync(path, cancellationToken);
 
         public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
             => inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
 
         public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
             => inner.WriteAllBytesAsync(path, data, cancellationToken);

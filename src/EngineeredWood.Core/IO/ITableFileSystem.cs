@@ -34,15 +34,6 @@ public interface ITableFileSystem
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Atomically renames a file. Used for conflict-free commit writes
-    /// (write to temp, rename to target). Returns false if the target already exists.
-    /// Not all backends support true atomic rename; implementations document their guarantees.
-    /// </summary>
-    ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
     /// Deletes a file. Does not throw if the file does not exist.
     /// </summary>
     ValueTask DeleteAsync(
@@ -60,6 +51,27 @@ public interface ITableFileSystem
     /// </summary>
     ValueTask<byte[]> ReadAllBytesAsync(
         string path, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// <para>
+    /// Atomically writes the entire contents of a small file only if the file does not
+    /// already exist. Returns <see langword="true"/> when the file was created, or
+    /// <see langword="false"/> when an existing file was left unchanged.
+    /// </para>
+    /// <para>
+    /// The atomicity is LOAD-BEARING, not a quality-of-implementation detail: this is the primitive
+    /// table-format commit protocols are built on, and a Delta or Iceberg commit is exactly the claim
+    /// that this writer — and no other — created version N. An implementation that writes
+    /// unconditionally, or that checks existence and then writes, lets two concurrent writers both
+    /// believe they won; the loser's commit silently overwrites the winner's and the table loses
+    /// whatever that version recorded. There is no error path for this. Backends that cannot create a
+    /// file exclusively in one atomic step should emulate it (write elsewhere, then move under a
+    /// destination-does-not-exist precondition) rather than approximate it.
+    /// </para>
+    /// </summary>
+    ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Writes the entire contents of a small file atomically where possible.

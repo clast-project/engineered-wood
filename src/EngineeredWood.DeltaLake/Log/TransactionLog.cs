@@ -40,7 +40,7 @@ public sealed class TransactionLog
     }
 
     /// <summary>
-    /// Writes a commit file atomically using write-to-temp-then-rename.
+    /// Atomically creates a commit file with its complete contents.
     /// Throws <see cref="DeltaConflictException"/> if the version already exists.
     /// </summary>
     public async ValueTask WriteCommitAsync(
@@ -48,26 +48,12 @@ public sealed class TransactionLog
         CancellationToken cancellationToken = default)
     {
         string targetPath = DeltaVersion.CommitPath(version);
-
-        // Check if target already exists
-        if (await _fs.ExistsAsync(targetPath, cancellationToken).ConfigureAwait(false))
-            throw new DeltaConflictException(version);
-
         byte[] data = ActionSerializer.Serialize(actions);
 
-        // Write to a temporary file first, then rename for atomicity
-        string tempPath = $"_delta_log/.tmp.{Guid.NewGuid():N}.json";
-
-        await _fs.WriteAllBytesAsync(tempPath, data, cancellationToken)
+        bool written = await _fs.TryWriteAllBytesAsync(targetPath, data, cancellationToken)
             .ConfigureAwait(false);
-
-        bool renamed = await _fs.RenameAsync(tempPath, targetPath, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (!renamed)
+        if (!written)
         {
-            // Clean up temp file — another writer got there first
-            await _fs.DeleteAsync(tempPath, cancellationToken).ConfigureAwait(false);
             throw new DeltaConflictException(version);
         }
     }

@@ -142,7 +142,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para><paramref name="schema"/> is ignored when this is supplied. Under column mapping the schema must
     /// already carry ids; the metadata's max-column-id is derived from it rather than reassigned.</para>
     /// </param>
-    public static async ValueTask<DeltaTable> CreateAsync(
+    public static ValueTask<DeltaTable> CreateAsync(
         ITableFileSystem fileSystem,
         Apache.Arrow.Schema schema,
         DeltaTableOptions? options = null,
@@ -154,6 +154,88 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<string, string>? configuration = null,
         CancellationToken cancellationToken = default,
         Schema.StructType? preAssignedSchema = null)
+        => CreateCoreAsync(
+            fileSystem,
+            schema,
+            initialBatches: null,
+            replaceExisting: false,
+            options,
+            partitionColumns,
+            columnMappingMode,
+            clusteringColumns,
+            enableDeletionVectors,
+            enableRowTracking,
+            configuration,
+            cancellationToken,
+            preAssignedSchema);
+
+    /// <summary>
+    /// Creates a Delta table with initial data, or atomically replaces an existing table and its active
+    /// data. Protocol, metadata, removes, and initial adds are published in one commit: version 0 for a new
+    /// table, or the next version for a replacement. Existing history is preserved.
+    /// </summary>
+    /// <param name="fileSystem">The filesystem rooted at the table directory.</param>
+    /// <param name="schema">The Arrow schema for the replacement table.</param>
+    /// <param name="initialBatches">The data made visible by the create-or-replace commit.</param>
+    /// <param name="options">Table options.</param>
+    /// <param name="partitionColumns">Ordered list of partition column names.</param>
+    /// <param name="columnMappingMode">Column mapping mode for the replacement metadata.</param>
+    /// <param name="clusteringColumns">Liquid-clustering columns for the replacement metadata.</param>
+    /// <param name="enableDeletionVectors">Whether deletion vectors are enabled.</param>
+    /// <param name="enableRowTracking">Whether row tracking is enabled.</param>
+    /// <param name="configuration">Replacement table properties.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="preAssignedSchema">
+    /// A Delta schema with preassigned column-mapping ids and physical names. See
+    /// <see cref="CreateAsync"/>.
+    /// </param>
+    public static ValueTask<DeltaTable> CreateOrReplaceAsync(
+        ITableFileSystem fileSystem,
+        Apache.Arrow.Schema schema,
+        IReadOnlyList<RecordBatch> initialBatches,
+        DeltaTableOptions? options = null,
+        IReadOnlyList<string>? partitionColumns = null,
+        ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
+        IReadOnlyList<string>? clusteringColumns = null,
+        bool enableDeletionVectors = false,
+        bool enableRowTracking = false,
+        IReadOnlyDictionary<string, string>? configuration = null,
+        CancellationToken cancellationToken = default,
+        Schema.StructType? preAssignedSchema = null)
+    {
+        if (initialBatches is null)
+            throw new ArgumentNullException(nameof(initialBatches));
+
+        return CreateCoreAsync(
+            fileSystem,
+            schema,
+            initialBatches,
+            replaceExisting: true,
+            options,
+            partitionColumns,
+            columnMappingMode,
+            clusteringColumns,
+            enableDeletionVectors,
+            enableRowTracking,
+            configuration,
+            cancellationToken,
+            preAssignedSchema);
+    }
+
+    private static async ValueTask<DeltaTable> CreateCoreAsync(
+        ITableFileSystem fileSystem,
+        Apache.Arrow.Schema schema,
+        IReadOnlyList<RecordBatch>? initialBatches,
+        bool replaceExisting,
+        DeltaTableOptions? options,
+        IReadOnlyList<string>? partitionColumns,
+        ColumnMappingMode columnMappingMode,
+        IReadOnlyList<string>? clusteringColumns,
+        bool enableDeletionVectors,
+        bool enableRowTracking,
+        IReadOnlyDictionary<string, string>? configuration,
+        CancellationToken cancellationToken,
+        Schema.StructType? preAssignedSchema)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
@@ -173,8 +255,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        if (latestVersion >= 0)
+        if (latestVersion >= 0 && !replaceExisting)
             throw new InvalidOperationException("Delta table already exists.");
+
+        Snapshot.Snapshot? previousSnapshot = null;
+        if (latestVersion >= 0)
+        {
+            previousSnapshot = await SnapshotBuilder.BuildAsync(
+                log, new CheckpointReader(fileSystem), latestVersion, cancellationToken)
+                .ConfigureAwait(false);
+            ProtocolVersions.ValidateWriteSupport(previousSnapshot.Protocol);
+        }
 
         // Convert Arrow schema to Delta schema — unless the caller assigned one ALREADY (see the parameter
         // doc: a CTAS whose data files were written before commit 0 exists).
@@ -230,11 +321,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
                         + "writing the data files, or create without column mapping.");
                 }
+                if (previousSnapshot is not null)
+                {
+                    int previousMaxId = GetColumnMappingHighWaterMark(previousSnapshot);
+                    ValidateReplacementColumnMappingIds(deltaSchema, previousMaxId);
+                }
             }
             else
             {
                 // Assign column mapping IDs and physical names
-                var (mappedSchema, assignedMaxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
+                int startId = previousSnapshot is null
+                    ? 0
+                    : GetColumnMappingHighWaterMark(previousSnapshot);
+                var (mappedSchema, assignedMaxId) =
+                    ColumnMapping.AssignColumnMapping(deltaSchema, startId);
                 deltaSchema = mappedSchema;
                 maxId = assignedMaxId;
             }
@@ -443,13 +543,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         string schemaString = DeltaSchemaSerializer.Serialize(deltaSchema);
 
-        var protocolAction = new ProtocolAction
+        ProtocolAction protocolAction = new ProtocolAction
         {
             MinReaderVersion = minReaderVersion,
             MinWriterVersion = minWriterVersion,
             ReaderFeatures = readerFeatures.Count > 0 ? readerFeatures : null,
             WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
         };
+
+        if (previousSnapshot is not null)
+            protocolAction = MergeReplacementProtocol(previousSnapshot.Protocol, protocolAction);
 
         var metadataAction = new MetadataAction
         {
@@ -474,17 +577,250 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(BuildClusteringDomain(deltaSchema, clusteringColumns, mappingMode));
         }
 
-        // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
-        // the history (and resolvable by timestamp time travel) rather than being the one silent version.
-        var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, configurationBuilder, "CREATE TABLE");
-        await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
+        if (previousSnapshot is not null)
+        {
+            var replacementDomains = new HashSet<string>(
+                actions.OfType<DomainMetadata>().Select(static action => action.Domain),
+                StringComparer.Ordinal);
+            if (rowTrackingEnabled)
+                replacementDomains.Add(DeltaLake.RowTracking.RowTrackingConfig.DomainName);
 
-        var snapshot = await SnapshotBuilder.BuildAsync(
-            log, checkpointReader: null, atVersion: 0, cancellationToken)
-            .ConfigureAwait(false);
+            foreach (string domain in previousSnapshot.DomainMetadata.Keys)
+            {
+                if (!replacementDomains.Contains(domain))
+                {
+                    actions.Add(new DomainMetadata
+                    {
+                        Domain = domain,
+                        Configuration = "{}",
+                        Removed = true,
+                    });
+                }
+            }
+        }
 
-        return new DeltaTable(fileSystem, options, snapshot);
+        if (initialBatches is null)
+        {
+            // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named
+            // in history. Build the snapshot from the actions already in memory instead of listing and reading
+            // back the commit we just wrote.
+            var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                actions, configurationBuilder, "CREATE TABLE");
+            await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
+
+            var builder = new SnapshotBuilder();
+            builder.ApplyCommit(0, createActions);
+            return new DeltaTable(fileSystem, options, builder.Build());
+        }
+
+        var provisionalBuilder = previousSnapshot is null
+            ? new SnapshotBuilder()
+            : SnapshotBuilder.FromSnapshot(previousSnapshot);
+        provisionalBuilder.ApplyCommit(latestVersion, actions);
+        Snapshot.Snapshot provisionalSnapshot = provisionalBuilder.Build();
+        var provisionalTable = new DeltaTable(fileSystem, options, provisionalSnapshot);
+
+        // Same single-attempt cleanup contract as the overwrite family (see WriteCoreAsync): there is no
+        // transaction for a host to abort, so an operation that does not reach a committed version takes
+        // back the parquet it wrote. Routed through the shared helper rather than hand-rolled, because the
+        // ledger's invariant — cleared the instant the commit is durable, so anything left is uncommitted
+        // BY CONSTRUCTION — is what makes catching everything safe, and a second copy of that reasoning is
+        // a second place for it to drift.
+        return await provisionalTable.CollectOnFailureAsync(async written =>
+        {
+            if (previousSnapshot is not null)
+                provisionalTable.ValidateWritable(previousSnapshot, isAppend: false);
+            provisionalTable.ValidateWritable(provisionalSnapshot, isAppend: true);
+            var (writeActions, _) = await provisionalTable.ComputeWriteActionsAsync(
+                provisionalSnapshot,
+                initialBatches,
+                DeltaWriteMode.Overwrite,
+                overwritePartitions: null,
+                dynamicPartitionOverwrite: false,
+                repartitionTo: null,
+                cancellationToken,
+                written: written).ConfigureAwait(false);
+
+            foreach (DeltaAction action in writeActions)
+                AddOrReplaceCreateAction(actions, action);
+
+            string operation = previousSnapshot is null
+                ? "CREATE TABLE AS SELECT"
+                : "CREATE OR REPLACE TABLE AS SELECT";
+            var commitActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                actions, configurationBuilder, operation);
+            long version = latestVersion + 1;
+
+            await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
+            written.Clear();
+
+            var committedBuilder = previousSnapshot is null
+                ? new SnapshotBuilder()
+                : SnapshotBuilder.FromSnapshot(previousSnapshot);
+            committedBuilder.ApplyCommit(version, commitActions);
+            return new DeltaTable(fileSystem, options, committedBuilder.Build());
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void AddOrReplaceCreateAction(List<DeltaAction> actions, DeltaAction action)
+    {
+        int existingIndex = action switch
+        {
+            MetadataAction => actions.FindIndex(static candidate => candidate is MetadataAction),
+            ProtocolAction => actions.FindIndex(static candidate => candidate is ProtocolAction),
+            DomainMetadata domain => actions.FindIndex(
+                candidate => candidate is DomainMetadata existing &&
+                    string.Equals(existing.Domain, domain.Domain, StringComparison.Ordinal)),
+            _ => -1,
+        };
+
+        if (existingIndex >= 0)
+            actions[existingIndex] = action;
+        else
+            actions.Add(action);
+    }
+
+    private static ProtocolAction MergeReplacementProtocol(
+        ProtocolAction existing, ProtocolAction replacement)
+    {
+        int minReaderVersion = Math.Max(existing.MinReaderVersion, replacement.MinReaderVersion);
+        int minWriterVersion = Math.Max(existing.MinWriterVersion, replacement.MinWriterVersion);
+
+        List<string>? readerFeatures = MergeFeatures(
+            existing.ReaderFeatures, replacement.ReaderFeatures);
+        List<string>? writerFeatures = MergeFeatures(
+            existing.WriterFeatures, replacement.WriterFeatures);
+
+        // Table-features mode is all-or-nothing, and BOTH inputs can arrive below the threshold carrying
+        // capabilities only their legacy version implied. Expanding just one side loses the other's: a
+        // replacement that asks for column mapping alone is the legacy (2, 5) pair with no feature lists,
+        // so replacing a table already at reader 3 / writer 7 used to produce a v7 protocol with NO
+        // columnMapping entry while the metadata still said delta.columnMapping.mode=name. That reads as
+        // "column mapping not supported" — Spark rejects it with DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH
+        // — and this library read it anyway, because it drives mapping off the metadata rather than the
+        // protocol. Each side is expanded from its OWN version; a side already at the threshold has
+        // nothing implied left to expand and enumerated its features when it was written.
+        if (minReaderVersion >= 3)
+        {
+            foreach (int legacyReaderVersion in
+                new[] { existing.MinReaderVersion, replacement.MinReaderVersion })
+            {
+                if (legacyReaderVersion >= 3)
+                    continue;
+
+                readerFeatures ??= [];
+                foreach (string feature in LegacyReaderFeatures(legacyReaderVersion))
+                {
+                    if (!readerFeatures.Contains(feature))
+                        readerFeatures.Add(feature);
+                }
+            }
+        }
+
+        if (minWriterVersion >= 7)
+        {
+            foreach (int legacyWriterVersion in
+                new[] { existing.MinWriterVersion, replacement.MinWriterVersion })
+            {
+                if (legacyWriterVersion >= 7)
+                    continue;
+
+                writerFeatures ??= [];
+                foreach (string feature in LegacyWriterFeatures(legacyWriterVersion))
+                {
+                    if (!writerFeatures.Contains(feature))
+                        writerFeatures.Add(feature);
+                }
+            }
+        }
+
+        return new ProtocolAction
+        {
+            MinReaderVersion = minReaderVersion,
+            MinWriterVersion = minWriterVersion,
+            ReaderFeatures = readerFeatures is { Count: > 0 } ? readerFeatures : null,
+            WriterFeatures = writerFeatures is { Count: > 0 } ? writerFeatures : null,
+        };
+    }
+
+    private static List<string>? MergeFeatures(
+        IReadOnlyList<string>? existing, IReadOnlyList<string>? replacement)
+    {
+        if (existing is null && replacement is null)
+            return null;
+
+        var merged = new List<string>();
+        if (existing is not null)
+        {
+            foreach (string feature in existing)
+            {
+                if (!merged.Contains(feature))
+                    merged.Add(feature);
+            }
+        }
+        if (replacement is not null)
+        {
+            foreach (string feature in replacement)
+            {
+                if (!merged.Contains(feature))
+                    merged.Add(feature);
+            }
+        }
+        return merged;
+    }
+
+    private static int GetColumnMappingHighWaterMark(Snapshot.Snapshot snapshot)
+    {
+        int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
+        if (snapshot.Metadata.Configuration is not null &&
+            snapshot.Metadata.Configuration.TryGetValue(
+                ColumnMapping.MaxColumnIdKey, out string? configured) &&
+            int.TryParse(configured, out int configuredMax))
+        {
+            maxId = Math.Max(maxId, configuredMax);
+        }
+        return maxId;
+    }
+
+    private static void ValidateReplacementColumnMappingIds(StructType schema, int previousMaxId)
+    {
+        foreach (StructField field in schema.Fields)
+            ValidateReplacementColumnMappingIds(field, previousMaxId);
+    }
+
+    private static void ValidateReplacementColumnMappingIds(
+        StructField field, int previousMaxId)
+    {
+        if (ColumnMapping.GetFieldId(field) is int id && id <= previousMaxId)
+        {
+            throw new DeltaFormatException(
+                $"preAssignedSchema reuses column-mapping id {id}; replacement ids must be greater "
+                + $"than the existing table's maxColumnId ({previousMaxId}).");
+        }
+
+        switch (field.Type)
+        {
+            case StructType structure:
+                foreach (StructField child in structure.Fields)
+                    ValidateReplacementColumnMappingIds(child, previousMaxId);
+                break;
+            case ArrayType array when array.ElementType is StructType element:
+                foreach (StructField child in element.Fields)
+                    ValidateReplacementColumnMappingIds(child, previousMaxId);
+                break;
+            case MapType map:
+                if (map.KeyType is StructType key)
+                {
+                    foreach (StructField child in key.Fields)
+                        ValidateReplacementColumnMappingIds(child, previousMaxId);
+                }
+                if (map.ValueType is StructType value)
+                {
+                    foreach (StructField child in value.Fields)
+                        ValidateReplacementColumnMappingIds(child, previousMaxId);
+                }
+                break;
+        }
     }
 
     /// <summary>

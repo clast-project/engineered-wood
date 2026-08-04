@@ -95,26 +95,6 @@ public sealed class LocalTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
-    public ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        string fullSource = ResolvePath(sourcePath);
-        string fullTarget = ResolvePath(targetPath);
-
-        if (File.Exists(fullTarget))
-            return new ValueTask<bool>(false);
-
-        string? directory = Path.GetDirectoryName(fullTarget);
-        if (directory is not null)
-            Directory.CreateDirectory(directory);
-
-        File.Move(fullSource, fullTarget);
-        return new ValueTask<bool>(true);
-    }
-
-    /// <inheritdoc/>
     public ValueTask DeleteAsync(
         string path, CancellationToken cancellationToken = default)
     {
@@ -141,6 +121,42 @@ public sealed class LocalTableFileSystem : ITableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         return new ValueTask<byte[]>(File.ReadAllBytes(ResolvePath(path)));
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        string fullPath = ResolvePath(path);
+        string? directory = Path.GetDirectoryName(fullPath);
+        if (directory is not null)
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        string tempPath = fullPath + ".tmp." + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllBytes(tempPath, data.ToArray());
+            try
+            {
+                File.Move(tempPath, fullPath);
+                return new ValueTask<bool>(true);
+            }
+            catch (IOException) when (File.Exists(fullPath))
+            {
+                return new ValueTask<bool>(false);
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
     }
 
     /// <inheritdoc/>

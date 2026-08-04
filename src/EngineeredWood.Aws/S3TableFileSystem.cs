@@ -3,7 +3,6 @@
 
 using System.Net;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Amazon.S3;
 using Amazon.S3.Model;
 
@@ -20,14 +19,19 @@ namespace EngineeredWood.IO.Aws;
 /// (S3 keys are flat strings).
 /// </para>
 /// <para>
-/// S3 has no native atomic rename. <see cref="RenameAsync"/> is implemented as a
-/// server-side <c>CopyObject</c> followed by deletion of the source, with an
-/// <c>If-None-Match: *</c> condition on the copy so the destination is written only if it
-/// does not already exist. S3 enforces that condition atomically (returning
-/// <c>412 Precondition Failed</c> otherwise), giving the conflict-free "create target only
-/// if absent" guarantee table-format commit protocols depend on; the copy+delete pair as a
-/// whole is not atomic. (Conditional writes require an S3 endpoint that supports them —
-/// AWS S3 since 2024, and most current S3-compatible stores.)
+/// <see cref="TryWriteAllBytesAsync"/> — the create-only primitive table-format commit protocols are
+/// built on — is a single <c>PutObject</c> carrying <c>If-None-Match: *</c> ("destination must not
+/// exist"). S3 enforces that condition atomically, returning <c>412 Precondition Failed</c> when the
+/// object is already there.
+/// </para>
+/// <para>
+/// This REQUIRES an endpoint that honors conditional writes: AWS S3 since November 2024, and current
+/// MinIO / Ceph / R2 builds. An older or partial S3-compatible implementation may accept the header
+/// and IGNORE it, in which case the PUT overwrites unconditionally and two writers racing for the
+/// same commit version both believe they won — silently, with the loser's commit destroying the
+/// winner's. Verify conditional-write support before pointing a table format at a non-AWS endpoint.
+/// (The same header was probed on CopyObject and found silently unguarded on MinIO, which is why the
+/// commit path uses PutObject rather than a copy.)
 /// </para>
 /// </remarks>
 public sealed class S3TableFileSystem : ITableFileSystem
@@ -116,50 +120,6 @@ public sealed class S3TableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        string source = Resolve(sourcePath);
-        string target = Resolve(targetPath);
-
-        // Conditional-write primitive: read the source and PUT the target with If-None-Match:"*"
-        // ("destination must not exist" — 412 Precondition Failed when it does). S3's documented
-        // conditional writes cover PutObject/CompleteMultipartUpload, NOT CopyObject: a CopyObject
-        // carrying IfNoneMatch is SILENTLY UNGUARDED on at least MinIO (probed — the copy succeeds over
-        // an existing target), so the previous copy-based form gave no commit safety. Rename targets
-        // here are small commit files, so read+put costs nothing.
-        using var got = await _client.GetObjectAsync(_bucket, source, cancellationToken)
-            .ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        await got.ResponseStream.CopyToAsync(buffer, 81920, cancellationToken).ConfigureAwait(false);
-        buffer.Position = 0;
-        try
-        {
-            await _client.PutObjectAsync(
-                new PutObjectRequest
-                {
-                    BucketName = _bucket,
-                    Key = target,
-                    InputStream = buffer,
-                    IfNoneMatch = "*",
-                },
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
-        {
-            return false;
-        }
-
-        // Copy succeeded; remove the source. A failure here leaves both copies, which is
-        // recoverable (the target — the committed state — exists).
-        await _client.DeleteObjectAsync(
-            new DeleteObjectRequest { BucketName = _bucket, Key = source },
-            cancellationToken).ConfigureAwait(false);
-        return true;
-    }
-
-    /// <inheritdoc/>
     public async ValueTask DeleteAsync(
         string path, CancellationToken cancellationToken = default)
     {
@@ -197,27 +157,80 @@ public sealed class S3TableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken = default)
+    {
+        using Stream stream = ReadOnlyMemoryStream.Create(data);
+        string key = Resolve(path);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await _client.PutObjectAsync(
+                    new PutObjectRequest
+                    {
+                        BucketName = _bucket,
+                        Key = key,
+                        InputStream = stream,
+                        AutoCloseStream = false,
+                        IfNoneMatch = "*",
+                    },
+                    cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (AmazonS3Exception exception) when (
+                exception.StatusCode == HttpStatusCode.PreconditionFailed)
+            {
+                // 412: the object is already there. This writer LOST the race — a definitive answer, not
+                // a transient one, so it is reported rather than retried.
+                return false;
+            }
+            catch (AmazonS3Exception exception) when (
+                exception.StatusCode == HttpStatusCode.Conflict &&
+                attempt < MaxConflictRetries)
+            {
+                // 409 ConditionalRequestConflict: a concurrent write to the SAME key was in flight, and S3
+                // could not evaluate the precondition. Retrying is safe — If-None-Match means at most one
+                // PUT can ever create the object, so a 409 provably did not create it.
+                //
+                // Backed off, not spun. 409 IS contention, and racing writers that all retry immediately
+                // just collide again on the next tick; the delay grows and is jittered so they spread out
+                // instead of resynchronizing.
+                stream.Position = 0;
+                await Task.Delay(ConflictRetryDelay(attempt), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private const int MaxConflictRetries = 3;
+
+    private static TimeSpan ConflictRetryDelay(int attempt)
+    {
+        // 25ms, 50ms, 100ms, each with up to 100% jitter added. Commit files are small and the window a
+        // conflicting write occupies is short, so the base stays well under the cost of the PUT itself.
+        double baseMilliseconds = 25 * Math.Pow(2, attempt);
+#if NET8_0_OR_GREATER
+        double jitter = Random.Shared.NextDouble();
+#else
+        double jitter = ThreadLocalRandom.Value!.NextDouble();
+#endif
+        return TimeSpan.FromMilliseconds(baseMilliseconds * (1 + jitter));
+    }
+
+#if !NET8_0_OR_GREATER
+    // Random is not thread-safe before .NET 6's Random.Shared.
+    private static readonly ThreadLocal<Random> ThreadLocalRandom =
+        new(static () => new Random(Guid.NewGuid().GetHashCode()));
+#endif
+
+    /// <inheritdoc/>
     public async ValueTask WriteAllBytesAsync(
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)
     {
-        byte[] array;
-        int offset, count;
-        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
-        {
-            array = segment.Array!;
-            offset = segment.Offset;
-            count = segment.Count;
-        }
-        else
-        {
-            array = data.ToArray();
-            offset = 0;
-            count = array.Length;
-        }
-
         // A single PutObject is atomic: the object becomes visible only once fully written.
-        using var stream = new MemoryStream(array, offset, count, writable: false);
+        using Stream stream = ReadOnlyMemoryStream.Create(data);
         await _client.PutObjectAsync(
             new PutObjectRequest
             {
