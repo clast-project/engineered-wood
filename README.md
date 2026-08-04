@@ -2,13 +2,17 @@
 
 A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, and **Vortex** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
-> **Status — preliminary (0.2.0).** EngineeredWood is pre-1.0 and under active
-> development. The published NuGet packages are versioned `0.2.0`, and
+> **Status — preliminary (0.3.0).** EngineeredWood is pre-1.0 and under active
+> development. The published NuGet packages are versioned `0.3.0`, and
 > **every public API is subject to change — without notice and without a
 > deprecation cycle — until 1.0.0.** If you depend on a package, pin an exact
 > version. Feedback on the API surface is welcome while it's still malleable.
 >
-> 0.2.0 is the first strongly-named release. The unsigned 0.1.0 packages remain on
+> **Breaking in 0.3.0:** `ITableFileSystem.RenameAsync` is gone, replaced by
+> `TryWriteAllBytesAsync` (create-only). A custom `ITableFileSystem` must
+> implement it — see the interface docs for why its atomicity is load-bearing.
+>
+> 0.2.0 was the first strongly-named release. The unsigned 0.1.0 packages remain on
 > nuget.org, but assembly identity changed, so upgrading from 0.1.0 requires a
 > rebuild rather than a drop-in binary swap.
 
