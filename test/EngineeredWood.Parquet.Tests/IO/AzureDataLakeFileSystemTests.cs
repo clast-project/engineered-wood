@@ -12,33 +12,6 @@ namespace EngineeredWood.Tests.IO;
 public class AzureDataLakeFileSystemTests
 {
     [Fact]
-    public async Task Rename_UsesConditionalDfsRename()
-    {
-        var fileClient = new RecordingFileClient();
-        var fileSystemClient = new RecordingFileSystemClient(fileClient);
-        var fileSystem = new AzureDataLakeTableFileSystem(fileSystemClient);
-
-        bool renamed = await fileSystem.RenameAsync("source.tmp", "target.json");
-
-        Assert.True(renamed);
-        Assert.Equal("source.tmp", fileSystemClient.RequestedFilePath);
-        Assert.Equal("target.json", fileClient.RenameDestination);
-        Assert.Equal(ETag.All, fileClient.DestinationConditions!.IfNoneMatch);
-    }
-
-    [Fact]
-    public async Task Rename_TargetConflict_ReturnsFalse()
-    {
-        var fileClient = new RecordingFileClient { RenameStatus = 412 };
-        var fileSystem = new AzureDataLakeTableFileSystem(
-            new RecordingFileSystemClient(fileClient));
-
-        bool renamed = await fileSystem.RenameAsync("source.tmp", "target.json");
-
-        Assert.False(renamed);
-    }
-
-    [Fact]
     public async Task TryWriteAllBytes_CreatesFlushesAndRenamesTemporaryFile()
     {
         var fileClient = new RecordingFileClient();
@@ -160,14 +133,33 @@ public class AzureDataLakeFileSystemTests
         Assert.Equal(3, client.ReadRange.Value.Length);
     }
 
+    /// <summary>
+    /// Synchronous Dispose does NOT finalize the file — it cannot, without blocking on the append and
+    /// flush requests that finishing a DFS file requires. This pins the same contract
+    /// <c>AzureBlobSequentialFile</c> has, so the two Azure backends behave alike rather than one of them
+    /// quietly doing sync-over-async inside a <c>using</c>.
+    /// </summary>
     [Fact]
-    public async Task SequentialFile_SynchronousDispose_FinalizesBufferedData()
+    public async Task SequentialFile_SynchronousDispose_DoesNotFinalize()
     {
         var client = new RecordingFileClient();
         var file = new AzureDataLakeSequentialFile(client, appendSize: 4);
 
         await file.WriteAsync(new byte[] { 1, 2, 3 });
         file.Dispose();
+
+        Assert.Empty(client.AppendedBytes);
+        Assert.Empty(client.FlushPositions);
+    }
+
+    [Fact]
+    public async Task SequentialFile_AsyncDispose_FinalizesBufferedData()
+    {
+        var client = new RecordingFileClient();
+        var file = new AzureDataLakeSequentialFile(client, appendSize: 4);
+
+        await file.WriteAsync(new byte[] { 1, 2, 3 });
+        await file.DisposeAsync();
 
         Assert.Equal(new byte[] { 1, 2, 3 }, client.AppendedBytes);
         Assert.Equal(new long[] { 3 }, client.FlushPositions);

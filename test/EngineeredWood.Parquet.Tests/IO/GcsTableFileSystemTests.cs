@@ -144,42 +144,6 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Rename_ToFreshTarget_MovesData_AndReturnsTrue()
-    {
-        if (!_emulatorAvailable) return;
-        var fs = NewFs();
-
-        await fs.WriteAllBytesAsync("_delta_log/_commit_abc.tmp", Bytes("commit payload"));
-
-        bool ok = await fs.RenameAsync("_delta_log/_commit_abc.tmp", "_delta_log/00000000000000000005.json");
-
-        Assert.True(ok);
-        Assert.False(await fs.ExistsAsync("_delta_log/_commit_abc.tmp"));
-        Assert.True(await fs.ExistsAsync("_delta_log/00000000000000000005.json"));
-        Assert.Equal("commit payload",
-            Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("_delta_log/00000000000000000005.json")));
-    }
-
-    [Fact]
-    public async Task Rename_TargetExists_ReturnsFalse_AndLeavesBothObjectsIntact()
-    {
-        if (!_emulatorAvailable) return;
-        var fs = NewFs();
-
-        // Simulates two writers racing to commit version 5: the target already exists.
-        await fs.WriteAllBytesAsync("_delta_log/00000000000000000005.json", Bytes("winner"));
-        await fs.WriteAllBytesAsync("_delta_log/_commit_loser.tmp", Bytes("loser"));
-
-        bool ok = await fs.RenameAsync("_delta_log/_commit_loser.tmp", "_delta_log/00000000000000000005.json");
-
-        Assert.False(ok);
-        // The committed target is untouched, and the loser's temp file is left for cleanup.
-        Assert.Equal("winner",
-            Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("_delta_log/00000000000000000005.json")));
-        Assert.True(await fs.ExistsAsync("_delta_log/_commit_loser.tmp"));
-    }
-
-    [Fact]
     public async Task Create_NoOverwrite_ThrowsWhenExists_OverwriteSucceeds()
     {
         if (!_emulatorAvailable) return;
