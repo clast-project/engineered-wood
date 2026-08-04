@@ -6,9 +6,15 @@ using System.Runtime.InteropServices;
 namespace EngineeredWood.IO;
 
 /// <summary>
-/// Wraps a <see cref="ReadOnlyMemory{T}"/> as a readable <see cref="Stream"/> for the cloud SDKs, which
-/// take payloads as streams.
+/// Wraps a <see cref="ReadOnlyMemory{T}"/> as a readable <see cref="Stream"/> for the upload APIs that
+/// take one: <c>AWSSDK.S3</c> (<c>PutObjectRequest.InputStream</c>) and <c>Google.Cloud.Storage</c>
+/// (<c>UploadObject</c>).
 /// </summary>
+/// <remarks>
+/// <c>Azure.Storage.Blobs</c> is deliberately absent. Its upload takes a <c>BinaryData</c>, which wraps a
+/// <see cref="ReadOnlyMemory{T}"/> directly with no stream and no copy, so that backend is better off not
+/// using this — it is not an inconsistency to tidy up.
+/// </remarks>
 public static class ReadOnlyMemoryStream
 {
     /// <summary>
