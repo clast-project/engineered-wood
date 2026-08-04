@@ -22,7 +22,7 @@
     <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
     <PackageReference Include="Clast.BloomFilter" Version="0.2.0" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
-    <PackageReference Include="Clast.Google.Cloud.Storage.V1" Version="0.2.0" />
+    <PackageReference Include="Clast.Google.Cloud.Storage.V1" Version="4.15.0" />
     <PackageReference Include="AWSSDK.S3" Version="4.*" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="ParquetSharp" Version="23.0.0.2" />
