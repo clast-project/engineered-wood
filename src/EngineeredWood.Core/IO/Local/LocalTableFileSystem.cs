@@ -95,26 +95,6 @@ public sealed class LocalTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
-    public ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        string fullSource = ResolvePath(sourcePath);
-        string fullTarget = ResolvePath(targetPath);
-
-        if (File.Exists(fullTarget))
-            return new ValueTask<bool>(false);
-
-        string? directory = Path.GetDirectoryName(fullTarget);
-        if (directory is not null)
-            Directory.CreateDirectory(directory);
-
-        File.Move(fullSource, fullTarget);
-        return new ValueTask<bool>(true);
-    }
-
-    /// <inheritdoc/>
     public ValueTask DeleteAsync(
         string path, CancellationToken cancellationToken = default)
     {

@@ -44,16 +44,6 @@ internal sealed class FailAfterCommitFileSystem(ITableFileSystem inner) : ITable
         return _inner.ListAsync(prefix, cancellationToken);
     }
 
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath, CancellationToken cancellationToken = default)
-    {
-        bool renamed = await _inner.RenameAsync(sourcePath, targetPath, cancellationToken)
-            .ConfigureAwait(false);
-        if (renamed && Armed && IsCommitJson(targetPath))
-            Committed = true;
-        return renamed;
-    }
-
     public ValueTask<IRandomAccessFile> OpenReadAsync(
         string path, CancellationToken cancellationToken = default) =>
         _inner.OpenReadAsync(path, cancellationToken);

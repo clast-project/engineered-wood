@@ -69,11 +69,6 @@ public sealed class TransactionLogWriteTests
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public ValueTask<bool> RenameAsync(
-            string sourcePath, string targetPath,
-            CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-
         public ValueTask DeleteAsync(
             string path, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();

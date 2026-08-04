@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Azure;
 using Azure.Storage.Files.DataLake;
 using Azure.Storage.Files.DataLake.Models;
@@ -14,8 +13,18 @@ namespace EngineeredWood.IO.Azure;
 /// rooted at a file system and optional directory.
 /// </summary>
 /// <remarks>
-/// <see cref="RenameAsync"/> uses the DFS endpoint's native rename operation with a
-/// destination condition, providing an atomic move that does not overwrite an existing path.
+/// <para>
+/// <see cref="TryWriteAllBytesAsync"/> — the create-only primitive table-format commit protocols are
+/// built on — writes a temporary file and then MOVES it onto the target under a
+/// destination-must-not-exist condition, using the DFS endpoint's native atomic rename.
+/// </para>
+/// <para>
+/// The detour is deliberate. DFS has no single-shot conditional upload: creating a file publishes a
+/// ZERO-LENGTH path immediately, and content only lands on the subsequent append/flush. A reader
+/// listing the log between those two calls would find version N present and empty — a commit with no
+/// actions, which replays as a version that silently recorded nothing. Renaming a fully written file
+/// into place makes the target appear whole or not at all, which is what the commit protocol needs.
+/// </para>
 /// </remarks>
 public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
 {
@@ -57,12 +66,23 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
             Recursive = true,
         };
 
+        // Collected and sorted rather than streamed, DELIBERATELY. ListAsync's contract is lexicographic
+        // order — the S3 and GCS backends lean on their services returning keys that way, and the log
+        // reader depends on it — but a DFS listing is a RECURSIVE directory walk, and whether that walk
+        // interleaves nested paths into full-path lexicographic order is not something the API documents.
+        // ('.' sorts before '/', so "a/b.json" precedes "a/b/c.json" lexicographically while a depth-first
+        // walk need not emit them that way.) Buffering costs memory proportional to the listing, which
+        // matters for a VACUUM over a large table; guessing at the order costs correctness. Until the
+        // ordering is confirmed against a real hierarchical-namespace account, this pays the memory.
         List<PathItem> paths = await GetPathsAsync(options, cancellationToken).ConfigureAwait(false);
         paths.Sort(static (left, right) => string.CompareOrdinal(left.Name, right.Name));
 
         foreach (PathItem item in paths)
         {
+            // GetPaths lists a DIRECTORY; ITableFileSystem lists a PREFIX. Anything the wider directory
+            // sweep picked up that the prefix does not cover is filtered here.
             if (item.IsDirectory == true ||
+                item.Name is null ||
                 !item.Name.StartsWith(fullPrefix, StringComparison.Ordinal))
             {
                 continue;
@@ -92,18 +112,20 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
         CancellationToken cancellationToken = default)
     {
         string fullPath = Resolve(path);
-        await EnsureParentDirectoriesAsync(fullPath, cancellationToken).ConfigureAwait(false);
-
         DataLakeFileClient file = _fileSystem.GetFileClient(fullPath);
+        var options = new DataLakePathCreateOptions
+        {
+            Conditions = overwrite
+                ? null
+                : new DataLakeRequestConditions { IfNoneMatch = ETag.All },
+        };
+
         try
         {
-            await file.CreateAsync(
-                new DataLakePathCreateOptions
-                {
-                    Conditions = overwrite
-                        ? null
-                        : new DataLakeRequestConditions { IfNoneMatch = ETag.All },
-                },
+            await WithParentDirectoriesAsync(
+                fullPath,
+                () => new ValueTask<Response<PathInfo>>(
+                    file.CreateAsync(options, cancellationToken)),
                 cancellationToken).ConfigureAwait(false);
         }
         catch (RequestFailedException exception) when (
@@ -115,35 +137,6 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
         return new AzureDataLakeSequentialFile(file);
     }
 
-    /// <inheritdoc/>
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath,
-        string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        string fullTargetPath = Resolve(targetPath);
-        await EnsureParentDirectoriesAsync(fullTargetPath, cancellationToken).ConfigureAwait(false);
-
-        try
-        {
-            await _fileSystem.GetFileClient(Resolve(sourcePath))
-                .RenameAsync(
-                    fullTargetPath,
-                    destinationFileSystem: null,
-                    sourceConditions: null,
-                    destinationConditions: new DataLakeRequestConditions
-                    {
-                        IfNoneMatch = ETag.All,
-                    },
-                    cancellationToken)
-                .ConfigureAwait(false);
-            return true;
-        }
-        catch (RequestFailedException exception) when (exception.Status is 409 or 412)
-        {
-            return false;
-        }
-    }
 
     /// <inheritdoc/>
     public async ValueTask DeleteAsync(
@@ -188,8 +181,6 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
         CancellationToken cancellationToken = default)
     {
         string targetPath = Resolve(path);
-        await EnsureParentDirectoriesAsync(targetPath, cancellationToken).ConfigureAwait(false);
-
         int separator = targetPath.LastIndexOf('/');
         string directoryPrefix = separator < 0
             ? string.Empty
@@ -200,11 +191,16 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
 
         try
         {
-            await tempFile.CreateAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            // The temp file is a sibling of the target, so creating IT is what discovers a missing parent.
+            await WithParentDirectoriesAsync(
+                tempPath,
+                () => new ValueTask<Response<PathInfo>>(
+                    tempFile.CreateAsync(cancellationToken: cancellationToken)),
+                cancellationToken).ConfigureAwait(false);
 
             if (!data.IsEmpty)
             {
-                using Stream content = CreateReadStream(data);
+                using Stream content = ReadOnlyMemoryStream.Create(data);
                 await tempFile.AppendAsync(
                     content,
                     0,
@@ -248,44 +244,64 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
         CancellationToken cancellationToken = default)
     {
         string fullPath = Resolve(path);
-        await EnsureParentDirectoriesAsync(fullPath, cancellationToken).ConfigureAwait(false);
+        DataLakeFileClient file = _fileSystem.GetFileClient(fullPath);
 
-        using Stream content = CreateReadStream(data);
-        await _fileSystem.GetFileClient(fullPath)
-            .UploadAsync(content, overwrite: true, cancellationToken).ConfigureAwait(false);
+        await WithParentDirectoriesAsync(
+            fullPath,
+            async () =>
+            {
+                using Stream content = ReadOnlyMemoryStream.Create(data);
+                return await file.UploadAsync(content, overwrite: true, cancellationToken)
+                    .ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask EnsureParentDirectoriesAsync(
+    /// <summary>
+    /// Runs <paramref name="operation"/>; if the DFS endpoint rejects it because the parent path does not
+    /// exist, creates the parent chain and runs it once more.
+    /// </summary>
+    /// <remarks>
+    /// Probing for the parent BEFORE every write costs a round trip on the overwhelmingly common path
+    /// where the directory is already there, which on a commit is a per-write tax on exactly the latency
+    /// this backend exists to cut. A table's directories are created once and then persist, so paying
+    /// only on the miss is strictly cheaper and no less correct — a concurrent creator racing us just
+    /// makes the second attempt succeed.
+    /// </remarks>
+    private async ValueTask<T> WithParentDirectoriesAsync<T>(
+        string fullPath,
+        Func<ValueTask<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await operation().ConfigureAwait(false);
+        }
+        catch (RequestFailedException exception) when (
+            exception.Status == 404 && fullPath.LastIndexOf('/') > 0)
+        {
+            await CreateParentDirectoriesAsync(fullPath, cancellationToken).ConfigureAwait(false);
+            return await operation().ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask CreateParentDirectoriesAsync(
         string path, CancellationToken cancellationToken)
     {
-        int separator = path.LastIndexOf('/');
-        if (separator <= 0)
+        int lastSeparator = path.LastIndexOf('/');
+        if (lastSeparator <= 0)
         {
             return;
         }
 
-        await EnsureDirectoryAsync(path.Substring(0, separator), cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    private async ValueTask EnsureDirectoryAsync(
-        string path, CancellationToken cancellationToken)
-    {
-        DataLakeDirectoryClient directory = _fileSystem.GetDirectoryClient(path);
-        if (await directory.ExistsAsync(cancellationToken).ConfigureAwait(false))
+        // Shallowest first: creating a DFS directory needs ITS parent to exist.
+        for (int separator = path.IndexOf('/');
+            separator >= 0 && separator <= lastSeparator;
+            separator = path.IndexOf('/', separator + 1))
         {
-            return;
+            await _fileSystem.GetDirectoryClient(path.Substring(0, separator))
+                .CreateIfNotExistsAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
         }
-
-        int separator = path.LastIndexOf('/');
-        if (separator > 0)
-        {
-            await EnsureDirectoryAsync(path.Substring(0, separator), cancellationToken)
-                .ConfigureAwait(false);
-        }
-
-        await directory.CreateIfNotExistsAsync(cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
     }
 
     private async ValueTask<List<PathItem>> GetPathsAsync(
@@ -303,7 +319,9 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
         }
         catch (RequestFailedException exception) when (exception.Status == 404)
         {
-            // A missing directory has the same listing semantics as an empty prefix.
+            // A missing directory has the same listing semantics as an empty prefix. The enumerable is
+            // built INSIDE the try because the failure can surface either from constructing it or from
+            // advancing it, depending on how the client batches the first page.
         }
 
         return paths;
@@ -331,16 +349,4 @@ public sealed class AzureDataLakeTableFileSystem : ITableFileSystem
     }
 
     private static string NormalizePath(string path) => path.Replace('\\', '/');
-
-    private static Stream CreateReadStream(ReadOnlyMemory<byte> data)
-    {
-        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment) &&
-            segment.Array is not null)
-        {
-            return new MemoryStream(
-                segment.Array, segment.Offset, segment.Count, writable: false, publiclyVisible: false);
-        }
-
-        return new MemoryStream(data.ToArray(), writable: false);
-    }
 }

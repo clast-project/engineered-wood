@@ -619,9 +619,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         provisionalBuilder.ApplyCommit(latestVersion, actions);
         Snapshot.Snapshot provisionalSnapshot = provisionalBuilder.Build();
         var provisionalTable = new DeltaTable(fileSystem, options, provisionalSnapshot);
-        var written = new WrittenFileLedger();
 
-        try
+        // Same single-attempt cleanup contract as the overwrite family (see WriteCoreAsync): there is no
+        // transaction for a host to abort, so an operation that does not reach a committed version takes
+        // back the parquet it wrote. Routed through the shared helper rather than hand-rolled, because the
+        // ledger's invariant — cleared the instant the commit is durable, so anything left is uncommitted
+        // BY CONSTRUCTION — is what makes catching everything safe, and a second copy of that reasoning is
+        // a second place for it to drift.
+        return await provisionalTable.CollectOnFailureAsync(async written =>
         {
             if (previousSnapshot is not null)
                 provisionalTable.ValidateWritable(previousSnapshot, isAppend: false);
@@ -654,12 +659,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 : SnapshotBuilder.FromSnapshot(previousSnapshot);
             committedBuilder.ApplyCommit(version, commitActions);
             return new DeltaTable(fileSystem, options, committedBuilder.Build());
-        }
-        catch
-        {
-            await provisionalTable.DeleteWrittenFilesAsync(written, cancellationToken).ConfigureAwait(false);
-            throw;
-        }
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private static void AddOrReplaceCreateAction(List<DeltaAction> actions, DeltaAction action)
@@ -691,23 +691,46 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         List<string>? writerFeatures = MergeFeatures(
             existing.WriterFeatures, replacement.WriterFeatures);
 
-        if (minReaderVersion >= 3 && existing.MinReaderVersion < 3)
+        // Table-features mode is all-or-nothing, and BOTH inputs can arrive below the threshold carrying
+        // capabilities only their legacy version implied. Expanding just one side loses the other's: a
+        // replacement that asks for column mapping alone is the legacy (2, 5) pair with no feature lists,
+        // so replacing a table already at reader 3 / writer 7 used to produce a v7 protocol with NO
+        // columnMapping entry while the metadata still said delta.columnMapping.mode=name. That reads as
+        // "column mapping not supported" — Spark rejects it with DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH
+        // — and this library read it anyway, because it drives mapping off the metadata rather than the
+        // protocol. Each side is expanded from its OWN version; a side already at the threshold has
+        // nothing implied left to expand and enumerated its features when it was written.
+        if (minReaderVersion >= 3)
         {
-            readerFeatures ??= [];
-            foreach (string feature in LegacyReaderFeatures(existing.MinReaderVersion))
+            foreach (int legacyReaderVersion in
+                new[] { existing.MinReaderVersion, replacement.MinReaderVersion })
             {
-                if (!readerFeatures.Contains(feature))
-                    readerFeatures.Add(feature);
+                if (legacyReaderVersion >= 3)
+                    continue;
+
+                readerFeatures ??= [];
+                foreach (string feature in LegacyReaderFeatures(legacyReaderVersion))
+                {
+                    if (!readerFeatures.Contains(feature))
+                        readerFeatures.Add(feature);
+                }
             }
         }
 
-        if (minWriterVersion >= 7 && existing.MinWriterVersion < 7)
+        if (minWriterVersion >= 7)
         {
-            writerFeatures ??= [];
-            foreach (string feature in LegacyWriterFeatures(existing.MinWriterVersion))
+            foreach (int legacyWriterVersion in
+                new[] { existing.MinWriterVersion, replacement.MinWriterVersion })
             {
-                if (!writerFeatures.Contains(feature))
-                    writerFeatures.Add(feature);
+                if (legacyWriterVersion >= 7)
+                    continue;
+
+                writerFeatures ??= [];
+                foreach (string feature in LegacyWriterFeatures(legacyWriterVersion))
+                {
+                    if (!writerFeatures.Contains(feature))
+                        writerFeatures.Add(feature);
+                }
             }
         }
 

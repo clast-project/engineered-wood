@@ -205,6 +205,85 @@ public class DeltaTableTests : IDisposable
         Assert.Equal(new long[] { 1 }, reopenedIds);
     }
 
+    /// <summary>
+    /// The replacement protocol is the MERGE of what the table already supports and what the replacement
+    /// asks for, and either side can arrive below the table-features threshold (reader 3 / writer 7)
+    /// carrying capabilities its legacy version merely IMPLIED. At v3/v7 nothing is implied any more, so
+    /// every one of those has to be enumerated or the protocol contradicts the metadata — the mismatch
+    /// Spark rejects outright and this library, which drives column mapping off the metadata, would read
+    /// straight past. The matrix crosses a legacy and a modern table with a legacy and a modern
+    /// replacement; the columnMapping row is the one that regressed, because a column-mapping-only create
+    /// emits the legacy (2, 5) pair with no feature lists at all.
+    /// </summary>
+    [Theory]
+    // existing DV (3,7) x replacement column mapping (2,5): columnMapping must survive the merge.
+    [InlineData(true, false, false, true, new[] { "columnMapping" }, new[] { "columnMapping", "deletionVectors" })]
+    // existing column mapping (2,5) x replacement DV (3,7): the same case with the sides swapped.
+    [InlineData(false, true, true, false, new[] { "columnMapping" }, new[] { "columnMapping", "deletionVectors" })]
+    // existing plain (1,2) x replacement DV (3,7): writer 2's implied pair must be enumerated.
+    [InlineData(false, false, true, false, new string[0], new[] { "appendOnly", "deletionVectors", "invariants" })]
+    // existing DV (3,7) x replacement plain (1,2): nothing legacy is added on the reader side.
+    [InlineData(true, false, false, false, new string[0], new[] { "appendOnly", "deletionVectors", "invariants" })]
+    public async Task CreateOrReplace_MergedProtocolEnumeratesLegacyFeaturesFromBothSides(
+        bool existingDeletionVectors,
+        bool existingColumnMapping,
+        bool replacementDeletionVectors,
+        bool replacementColumnMapping,
+        string[] expectedReaderFeatures,
+        string[] expectedWriterFeatures)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        await using (var original = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build()], 1)],
+            columnMappingMode: existingColumnMapping
+                ? ColumnMappingMode.Name
+                : ColumnMappingMode.None,
+            enableDeletionVectors: existingDeletionVectors))
+        {
+        }
+
+        await using var replacement = await DeltaTable.CreateOrReplaceAsync(
+            fs,
+            schema,
+            [new RecordBatch(schema, [new Int64Array.Builder().Append(2).Build()], 1)],
+            columnMappingMode: replacementColumnMapping
+                ? ColumnMappingMode.Name
+                : ColumnMappingMode.None,
+            enableDeletionVectors: replacementDeletionVectors);
+
+        ProtocolAction protocol = replacement.CurrentSnapshot.Protocol;
+
+        // Every feature the merge is obliged to carry is present. Exact-set assertions would pin the
+        // unrelated features an unrelated change may legitimately add, so this checks the obligation.
+        foreach (string feature in expectedReaderFeatures)
+            Assert.Contains(feature, protocol.ReaderFeatures ?? []);
+        foreach (string feature in expectedWriterFeatures)
+            Assert.Contains(feature, protocol.WriterFeatures ?? []);
+
+        // A v7 protocol that names no features at all is the failure this guards; so is a metadata
+        // capability with no matching protocol entry.
+        if (protocol.MinWriterVersion >= 7)
+            Assert.NotEmpty(protocol.WriterFeatures ?? []);
+
+        bool mappingEnabled = replacement.CurrentSnapshot.Metadata.Configuration is not null &&
+            replacement.CurrentSnapshot.Metadata.Configuration.TryGetValue(
+                "delta.columnMapping.mode", out string? mode) &&
+            !string.Equals(mode, "none", StringComparison.Ordinal);
+        if (mappingEnabled && protocol.MinReaderVersion >= 3)
+            Assert.Contains("columnMapping", protocol.ReaderFeatures ?? []);
+        if (mappingEnabled && protocol.MinWriterVersion >= 7)
+            Assert.Contains("columnMapping", protocol.WriterFeatures ?? []);
+
+        // The replacement's data is still what the table returns.
+        Assert.Equal(new long[] { 2 }, await ReadIdsAsync(replacement));
+    }
+
     [Fact]
     public async Task WriteAndReadBack_SimpleData()
     {

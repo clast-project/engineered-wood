@@ -118,22 +118,16 @@ public sealed class AzureDataLakeSequentialFile : ISequentialFile
 #endif
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Marks the file closed WITHOUT finalizing it. Buffered data that no <see cref="FlushAsync"/> has
+    /// pushed is discarded, matching <c>AzureBlobSequentialFile</c>: finishing a DFS file needs append and
+    /// flush requests, and blocking on them here would be sync-over-async on whatever thread happens to
+    /// run the <c>using</c> — the shape that starved the .NET Framework thread pool once already. Use
+    /// <see cref="DisposeAsync"/> (an <c>await using</c>) to close a file you have written to.
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed)
-        {
-            return;
-        }
-
-        try
-        {
-            Task.Run(() => FlushCoreAsync(CancellationToken.None).AsTask()).GetAwaiter().GetResult();
-        }
-        finally
-        {
-            _disposed = true;
-        }
+        _disposed = true;
     }
 
     /// <inheritdoc/>

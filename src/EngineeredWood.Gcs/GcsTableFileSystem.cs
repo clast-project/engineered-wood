@@ -3,7 +3,6 @@
 
 using System.Net;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Google;
 using Google.Cloud.Storage.V1;
 using Object = Google.Apis.Storage.v1.Data.Object;
@@ -21,12 +20,12 @@ namespace EngineeredWood.IO.Gcs;
 /// (GCS object names are flat strings).
 /// </para>
 /// <para>
-/// GCS has no native atomic rename. <see cref="RenameAsync"/> is implemented as a
-/// server-side copy followed by deletion of the source, with an <c>IfGenerationMatch = 0</c>
-/// precondition on the copy so the destination is written only if it does not already
-/// exist. That precondition is enforced atomically by GCS, giving the conflict-free
-/// "create target only if absent" guarantee table-format commit protocols depend on; the
-/// copy+delete pair as a whole is not atomic.
+/// <see cref="TryWriteAllBytesAsync"/> — the create-only primitive table-format commit protocols are
+/// built on — is a single upload carrying an <c>IfGenerationMatch = 0</c>
+/// precondition, so the destination is written only if it does not already
+/// exist. That precondition is enforced atomically by GCS (returning <c>412 Precondition Failed</c>
+/// otherwise), and an object never becomes visible part-written, so the commit file appears whole or
+/// not at all.
 /// </para>
 /// </remarks>
 public sealed class GcsTableFileSystem : ITableFileSystem
@@ -111,35 +110,6 @@ public sealed class GcsTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        string source = Resolve(sourcePath);
-        string target = Resolve(targetPath);
-
-        try
-        {
-            // IfGenerationMatch = 0 means "destination must not exist"; GCS enforces this
-            // atomically and fails with 412 Precondition Failed if the target is present.
-            await _client.CopyObjectAsync(
-                _bucket, source, _bucket, target,
-                new CopyObjectOptions { IfGenerationMatch = 0 },
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.PreconditionFailed)
-        {
-            return false;
-        }
-
-        // Copy succeeded; remove the source. A failure here leaves both copies, which is
-        // recoverable (the target — the committed state — exists).
-        await _client.DeleteObjectAsync(_bucket, source, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        return true;
-    }
-
-    /// <inheritdoc/>
     public async ValueTask DeleteAsync(
         string path, CancellationToken cancellationToken = default)
     {
@@ -175,7 +145,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem
         string path, ReadOnlyMemory<byte> data,
         CancellationToken cancellationToken = default)
     {
-        using Stream stream = CreateReadStream(data);
+        using Stream stream = ReadOnlyMemoryStream.Create(data);
         try
         {
             await _client.UploadObjectAsync(
@@ -200,21 +170,10 @@ public sealed class GcsTableFileSystem : ITableFileSystem
         CancellationToken cancellationToken = default)
     {
         // A single GCS upload is atomic: the object becomes visible only once fully written.
-        using Stream stream = CreateReadStream(data);
+        using Stream stream = ReadOnlyMemoryStream.Create(data);
         await _client.UploadObjectAsync(
             _bucket, Resolve(path), contentType: null, stream, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
-    }
-
-    private static Stream CreateReadStream(ReadOnlyMemory<byte> data)
-    {
-        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
-        {
-            return new MemoryStream(
-                segment.Array!, segment.Offset, segment.Count, writable: false);
-        }
-
-        return new MemoryStream(data.ToArray(), writable: false);
     }
 
     private async ValueTask<bool> ObjectExistsAsync(string objectName, CancellationToken cancellationToken)

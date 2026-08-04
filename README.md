@@ -582,7 +582,7 @@ shared cursor, batched range requests, and pooled buffers.
 
 The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs` and `Azure.Storage.Files.DataLake`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
 
-Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, DFS append/flush, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / rename / delete / exists). The DFS backend uses native conditional rename; object-store backends conditionally create the destination, giving Delta Lake and Iceberg the conflict-free commit guarantee they rely on.
+Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, DFS append/flush, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / delete / exists). Its `TryWriteAllBytesAsync` is the create-only primitive Delta Lake and Iceberg commit protocols rely on — a single conditional request on the object stores (`If-None-Match: *` on Azure and S3, `IfGenerationMatch = 0` on GCS), and a write-then-conditional-move on the DFS endpoint, whose create publishes a zero-length path before the content lands.
 
 `CoalescingFileReader` is a decorator that merges nearby byte ranges to reduce I/O round trips — particularly useful on cloud storage.
 

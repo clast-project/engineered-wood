@@ -20,13 +20,10 @@ namespace EngineeredWood.IO.Azure;
 /// (Azure blob names are flat strings).
 /// </para>
 /// <para>
-/// Azure Blob Storage has no native atomic rename. <see cref="RenameAsync"/> copies the
-/// source blob's content to the target and then deletes the source, uploading the target
-/// under an <c>If-None-Match: *</c> condition so it is written only if it does not already
-/// exist. That condition is enforced atomically by the service, giving the conflict-free
-/// "create target only if absent" guarantee table-format commit protocols depend on; the
-/// copy+delete pair as a whole is not atomic. The copy streams through the client rather
-/// than buffering the whole blob.
+/// <see cref="TryWriteAllBytesAsync"/> — the create-only primitive table-format commit protocols are
+/// built on — is a single upload carrying an <c>If-None-Match: *</c> condition, which the service
+/// enforces atomically. A blob never becomes visible part-written, so the commit file appears whole
+/// or not at all.
 /// </para>
 /// </remarks>
 public sealed class AzureTableFileSystem : ITableFileSystem
@@ -107,44 +104,6 @@ public sealed class AzureTableFileSystem : ITableFileSystem
         }
 
         return new AzureBlobSequentialFile(_container.GetBlockBlobClient(blobName));
-    }
-
-    /// <inheritdoc/>
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath,
-        CancellationToken cancellationToken = default)
-    {
-        BlobClient source = _container.GetBlobClient(Resolve(sourcePath));
-        BlobClient target = _container.GetBlobClient(Resolve(targetPath));
-
-        try
-        {
-            Response<BlobDownloadStreamingResult> download = await source
-                .DownloadStreamingAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
-
-#if NET8_0_OR_GREATER
-            await using Stream content = download.Value.Content;
-#else
-            using Stream content = download.Value.Content;
-#endif
-            // If-None-Match: * ⇒ "target must not exist"; the service enforces it atomically
-            // and fails the upload if the target is present.
-            await target.UploadAsync(
-                content,
-                new BlobUploadOptions { Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All } },
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (RequestFailedException ex) when (ex.Status is 409 or 412)
-        {
-            return false;
-        }
-
-        // Copy succeeded; remove the source. A failure here leaves both copies, which is
-        // recoverable (the target — the committed state — exists).
-        await source.DeleteIfExistsAsync(
-            DeleteSnapshotsOption.IncludeSnapshots, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        return true;
     }
 
     /// <inheritdoc/>
