@@ -246,9 +246,10 @@ public class LogVersionsTests : IDisposable
         string logDir = Path.Combine(_tempDir, "_delta_log");
 
         // Declare three parts and provide two. Contents do not matter — the listing decides on names.
-        await File.WriteAllTextAsync(
+        // Written synchronously: net472 has no File.WriteAllTextAsync, and these are one byte each.
+        File.WriteAllText(
             Path.Combine(logDir, $"{1:D20}.checkpoint.0000000001.0000000003.parquet"), "x");
-        await File.WriteAllTextAsync(
+        File.WriteAllText(
             Path.Combine(logDir, $"{1:D20}.checkpoint.0000000002.0000000003.parquet"), "x");
 
         var torn = await log.ReadVersionsAsync();
@@ -258,7 +259,7 @@ public class LogVersionsTests : IDisposable
         Assert.Equal([0L, 1L], torn.ReadableVersions);
 
         // The final part lands: now it counts.
-        await File.WriteAllTextAsync(
+        File.WriteAllText(
             Path.Combine(logDir, $"{1:D20}.checkpoint.0000000003.0000000003.parquet"), "x");
 
         var complete = await log.ReadVersionsAsync();
