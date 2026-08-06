@@ -181,6 +181,44 @@ def cmd_write(args):
             "rows": _rows(spark.read.format("delta").load(path))}
 
 
+def cmd_partition_paths(args):
+    """Write a partitioned table with Spark and report the RAW names it chose, uninterpreted.
+
+    This is the measurement that settles how the REFERENCE implementation encodes a partition
+    value, which is two distinct layers: the physical directory (Hive escaping) and the `add.path`
+    recorded in the log (a URL-encoding of that directory-relative path). Both are reported
+    verbatim -- nothing here decodes, normalises or compares them, because the whole point is to
+    capture what Spark actually wrote rather than what we believe it writes.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    df = spark.createDataFrame(args["rows"], args["schema"])
+    (df.write.format("delta")
+        .partitionBy(*args["partition_by"])
+        .mode(args.get("mode", "errorifexists"))
+        .save(path))
+
+    dirs = []
+    for root, dirnames, _ in os.walk(args["path"]):
+        for d in dirnames:
+            if d != "_delta_log":
+                dirs.append(
+                    os.path.relpath(os.path.join(root, d), args["path"]).replace("\\", "/"))
+
+    add_paths = []
+    for commit in sorted(glob.glob(os.path.join(args["path"], "_delta_log", "*.json"))):
+        with open(commit, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                action = json.loads(line)
+                if "add" in action:
+                    add_paths.append(action["add"]["path"])
+
+    return {"directories": sorted(dirs), "add_paths": sorted(add_paths)}
+
+
 def cmd_sql(args):
     """Run statements against an existing EW-written table, then report the result.
 
@@ -612,6 +650,7 @@ COMMANDS = {
     "write_variant": cmd_write_variant,
     "write_nested_variant": cmd_write_nested_variant,
     "write": cmd_write,
+    "partition_paths": cmd_partition_paths,
     "sql": cmd_sql,
     "scan": cmd_scan,
     "checkpoint_stats": cmd_checkpoint_stats,
