@@ -10,9 +10,13 @@ namespace EngineeredWood.DeltaLake.Checkpoint;
 /// <remarks>
 /// Both default to true, matching delta-spark: a checkpoint then carries the JSON <c>add.stats</c>
 /// string that every reader understands AND the typed <c>add.stats_parsed</c> struct. Turning JSON
-/// off makes the typed struct the only source of statistics — supported here so the shape can be
-/// produced and validated, but note that EW's own <see cref="CheckpointReader"/> reads only the JSON
-/// string, so a table it writes that way reads back (in EW) with no statistics and no file skipping.
+/// off makes the typed struct the only source of statistics, which
+/// <see cref="CheckpointReader"/> does read — it builds a <see cref="CheckpointStatsView"/> over the
+/// struct and points each <see cref="Actions.AddFile"/> at its row. Reach for those statistics
+/// through <see cref="Actions.AddFile.GetStatsJson"/> or
+/// <see cref="Actions.AddFile.GetNumRecords"/>, never <see cref="Actions.AddFile.Stats"/> directly:
+/// the JSON string really is absent in this mode, and a caller reading it would conclude the file
+/// has no statistics at all.
 /// </remarks>
 internal readonly record struct CheckpointStatsMode(bool WriteJson, bool WriteStruct)
 {
