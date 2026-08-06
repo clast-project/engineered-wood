@@ -31,7 +31,11 @@ public sealed record AddFile : DeltaAction
     public required bool DataChange { get; init; }
 
     /// <summary>
-    /// JSON-encoded column statistics. Parsed lazily into <see cref="ParsedStats"/>.
+    /// The JSON-encoded column statistics EXACTLY as the log carried them, or null when it carried
+    /// none. A checkpoint written with <c>delta.checkpoint.writeStatsAsJson=false</c> has no such
+    /// string even though it has full statistics, so this being null does not mean the file is
+    /// unpruneable — use <see cref="GetStatsJson"/> to get the statistics whichever copy holds them.
+    /// This property stays the literal field so that reading an action and writing it back is exact.
     /// </summary>
     public string? Stats { get; init; }
 
@@ -50,7 +54,14 @@ public sealed record AddFile : DeltaAction
     /// file read from a checkpoint with <c>writeStatsAsJson=false</c> silently loses its statistics
     /// the moment it moves.
     /// </summary>
-    internal string? GetStatsJson() =>
+    /// <remarks>
+    /// This is also what a host doing its own file pruning wants: <see cref="Stats"/> alone is null for
+    /// every file in a <c>stats_parsed</c>-only checkpoint, and a pruner reading it would silently
+    /// stop excluding anything — no exception, no empty result, just every file read.
+    /// Synthesising the JSON costs a serialisation per call, so callers in a loop should hold the
+    /// result rather than re-ask.
+    /// </remarks>
+    public string? GetStatsJson() =>
         Stats ?? (TypedStats is { } typed ? typed.View.BuildStatsJson(typed.Row) : null);
 
     /// <summary>
@@ -59,7 +70,7 @@ public sealed record AddFile : DeltaAction
     /// <c>delta.checkpoint.writeStatsAsJson=false</c> has no JSON string at all, and a row count
     /// silently read as zero from it would mis-assign row ids and mis-size compaction groups.
     /// </summary>
-    internal long? GetNumRecords()
+    public long? GetNumRecords()
     {
         if (TypedStats is { } typed && typed.View.GetNumRecords(typed.Row) is { } records)
             return records;
