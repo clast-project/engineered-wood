@@ -703,15 +703,41 @@ rebuilds sidecar paths as `_delta_log/_sidecars/{name}` by a slash
 check, which is fragile for paths that contain slashes in unexpected
 places.
 
-**Non-ASCII characters left literal in `add.path`.** `DeltaPath.Encode`
-escapes only `% space # ?` and control characters. Measured against
-delta-rs 1.6.2, the reference encoding is TWO layers: the on-disk Hive
-directory percent-encodes non-ASCII as UTF-8 bytes (`region=caf%C3%A9`),
-and `add.path` then percent-encodes that again (`region=caf%25C3%25A9`).
-EW's output diverges from both. Low severity in practice — delta-rs reads
-EW's literal form fine (`EwWritten_NonAsciiPartition_DeltaRsReadsSameRows`
-passes) — but it is a producer-side divergence from Spark. Ground truth is
-pinned by `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`.
+**Non-ASCII partition paths: Spark and delta-rs disagree, and we follow
+Spark.** Not an EW defect — recorded here because the ecosystem split is
+real and this entry previously got it backwards.
+
+Partition path encoding is TWO layers: the on-disk Hive directory, and
+`add.path` as a URL-encoding of that directory-relative path (so a `%` the
+first layer produced appears as `%25` in the log). The two reference
+implementations differ at layer 1 for non-ASCII:
+
+| value | Spark 4.0 / delta-spark 4.0.0 | delta-rs 1.6.2 |
+| --- | --- | --- |
+| directory | `region=café` | `region=caf%C3%A9` |
+| `add.path` | `region=café` | `region=caf%25C3%25A9` |
+
+Spark leaves non-ASCII literal at both layers, because
+`ExternalCatalogUtils.escapePathName` bounds its escape table at `c < 128`
+and so never escapes anything above ASCII. delta-rs percent-encodes it as
+UTF-8 bytes. Both are self-consistent: each engine's reader decodes what
+its writer produced.
+
+**EW is byte-identical to Spark**, at both layers, including the cases
+Spark does escape (`#`→`%23`, `?`→`%3F`, and space escaped at layer 2 only
+— `region=a b%23c%3Fd` on disk, `region=a%20b%2523c%253Fd` in the log).
+Measured, not assumed: `Spark_NonAsciiPartition_PathEncodingGroundTruth`
+pins Spark's output and `EwPartitionPaths_AreIdenticalToSparks` asserts
+equality against that same run rather than against literals.
+`DeltaRs_NonAsciiPartition_PathEncodingGroundTruth` pins delta-rs's
+different answer.
+
+Consequence to be aware of: a table written by BOTH Spark (or EW) and
+delta-rs gets two different directories for one logical partition value.
+That is an ecosystem wart, not something either engine can fix
+unilaterally. Reading is unaffected in every direction — partition values
+come from `add.partitionValues`, not from parsing the path — and delta-rs
+reads EW's form fine (`EwWritten_NonAsciiPartition_DeltaRsReadsSameRows`).
 
 **Column-mapping protocol shape differs from Spark's.** EW emits the
 legacy `minReader=2`/`minWriter=5` pair; Spark emits a hybrid

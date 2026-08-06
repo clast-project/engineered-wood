@@ -2578,4 +2578,128 @@ public class SparkInteropTests : IDisposable
 
         throw new InvalidOperationException($"version {version} has no commitInfo action");
     }
+
+    // ── Partition path encoding ──
+
+    private static readonly string[] AwkwardPartitionValues = ["café", "日本", "a b#c?d"];
+
+    /// <summary>Partition directories under a table root, relative and slash-normalised.</summary>
+    private static List<string> PartitionDirectories(string root) =>
+        Directory.GetDirectories(root)
+            .Select(d => Path.GetFileName(d)!)
+            .Where(d => d != "_delta_log")
+            .OrderBy(d => d, StringComparer.Ordinal)
+            .ToList();
+
+    /// <summary>
+    /// <para><b>The reference encoding for partition values, measured rather than assumed.</b> Two
+    /// distinct layers: the physical directory is Hive-escaped, and <c>add.path</c> is a URL-encoding
+    /// of that directory-relative path — so a <c>%</c> the first layer produced appears as <c>%25</c>
+    /// in the log.</para>
+    ///
+    /// <para>The finding that matters is what Spark does NOT escape. Non-ASCII stays literal at BOTH
+    /// layers: <c>region=café</c> on disk and <c>region=café</c> in the log. Spark's
+    /// <c>ExternalCatalogUtils.escapePathName</c> bounds its escape table at <c>c &lt; 128</c>, so no
+    /// character above ASCII is ever escaped, and space is absent from the table as well.</para>
+    ///
+    /// <para>This is worth pinning because delta-rs does something DIFFERENT — it percent-encodes
+    /// non-ASCII as UTF-8 bytes (<c>region=caf%C3%A9</c>), as
+    /// <c>DeltaRsInteropTests.DeltaRs_NonAsciiPartition_PathEncodingGroundTruth</c> records. Reading
+    /// only that measurement would suggest EW is the odd one out and should be "fixed" to match, which
+    /// would break parity with the reference implementation instead of achieving it.</para>
+    /// </summary>
+    [Fact]
+    public void Spark_NonAsciiPartition_PathEncodingGroundTruth()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var written = Spark.Invoke("partition_paths", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            partition_by = new[] { "region" },
+            rows = new object[]
+            {
+                new object[] { 1L, "café" },
+                new object[] { 2L, "日本" },
+                new object[] { 3L, "a b#c?d" },
+            },
+        });
+
+        var dirs = written.GetProperty("directories").EnumerateArray()
+            .Select(d => d.GetString()!).ToList();
+        var addPaths = written.GetProperty("add_paths").EnumerateArray()
+            .Select(p => p.GetString()!).ToList();
+
+        // Layer 1 — non-ASCII literal; '#' and '?' escaped; space left alone.
+        Assert.Contains("region=café", dirs);
+        Assert.Contains("region=日本", dirs);
+        Assert.Contains("region=a b%23c%3Fd", dirs);
+
+        // Layer 2 — non-ASCII still literal; space becomes %20; layer 1's '%' becomes %25.
+        Assert.Contains(addPaths, p => p.StartsWith("region=café/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith("region=日本/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith("region=a%20b%2523c%253Fd/", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// EW's partition paths are byte-identical to Spark's, for the same values, at both layers.
+    /// </summary>
+    /// <remarks>
+    /// Asserted against Spark's output captured in the same test run rather than against literals, so
+    /// the two can never drift apart silently — if delta-spark ever changes its escaping, this fails
+    /// rather than quietly pinning a stale expectation.
+    /// </remarks>
+    [Fact]
+    public async Task EwPartitionPaths_AreIdenticalToSparks()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        string sparkDir = Path.Combine(_tempDir, "spark");
+        string ewDir = Path.Combine(_tempDir, "ew");
+        Directory.CreateDirectory(sparkDir);
+        Directory.CreateDirectory(ewDir);
+
+        var written = Spark.Invoke("partition_paths", new
+        {
+            path = sparkDir,
+            schema = "id long, region string",
+            partition_by = new[] { "region" },
+            rows = new object[]
+            {
+                new object[] { 1L, AwkwardPartitionValues[0] },
+                new object[] { 2L, AwkwardPartitionValues[1] },
+                new object[] { 3L, AwkwardPartitionValues[2] },
+            },
+        });
+
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(ewDir), IdRegionSchema, partitionColumns: ["region"]))
+        {
+            await table.WriteAsync([IdRegionBatch([1, 2, 3], AwkwardPartitionValues)]);
+        }
+
+        // Layer 1: the directory names on disk.
+        var sparkDirs = written.GetProperty("directories").EnumerateArray()
+            .Select(d => d.GetString()!)
+            .Where(d => !d.StartsWith("_delta_log", StringComparison.Ordinal))
+            .OrderBy(d => d, StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(sparkDirs, PartitionDirectories(ewDir));
+
+        // Layer 2: the partition prefix of add.path, with the generated file name dropped.
+        static List<string> PartitionPrefixes(IEnumerable<string> paths) =>
+            paths.Select(p => p[..p.IndexOf('/')])
+                .OrderBy(p => p, StringComparer.Ordinal)
+                .ToList();
+
+        var sparkPrefixes = PartitionPrefixes(
+            written.GetProperty("add_paths").EnumerateArray().Select(p => p.GetString()!));
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(ewDir));
+        var ewPrefixes = PartitionPrefixes(
+            reopened.CurrentSnapshot.ActiveFiles.Values.Select(a => a.Path));
+
+        Assert.Equal(sparkPrefixes, ewPrefixes);
+    }
 }
