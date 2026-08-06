@@ -59,13 +59,24 @@ public sealed class TransactionLog
     }
 
     /// <summary>
-    /// Lists available commit versions in the log directory, starting from
-    /// <paramref name="startVersion"/>, in ASCENDING order. The underlying directory listing's order is
-    /// filesystem-dependent (Windows/S3/ADLS list sorted; Linux readdir returns inode-hash order), and the
-    /// callers depend on ascending replay — snapshot reconciliation's latest-wins metadata/protocol,
-    /// timestamp resolution's monotonic early-break, the history view — so the versions are materialized
-    /// and sorted here (the log directory is bounded by the checkpoint interval).
+    /// Lists versions with a COMMIT FILE in the log directory, starting from
+    /// <paramref name="startVersion"/>, in ASCENDING order.
     /// </summary>
+    /// <remarks>
+    /// <para>This is a statement about which <c>&lt;n&gt;.json</c> files exist, and it is NOT the set of
+    /// versions the table can be read at. A checkpoint names a version just as a commit does, and log
+    /// cleanup deletes commit files while keeping the checkpoint that subsumes them — so on a cleaned
+    /// table this omits versions that are perfectly readable, and includes versions that nothing can
+    /// reconstruct because their predecessors are gone. It can therefore disagree with
+    /// <see cref="GetLatestVersionAsync"/>, which counts checkpoints.</para>
+    /// <para>Use <see cref="ReadVersionsAsync"/> for the readable set. This method remains for callers
+    /// that specifically want the commit files.</para>
+    /// <para>The underlying directory listing's order is filesystem-dependent (Windows/S3/ADLS list
+    /// sorted; Linux readdir returns inode-hash order), and the callers depend on ascending replay —
+    /// snapshot reconciliation's latest-wins metadata/protocol, timestamp resolution's monotonic
+    /// early-break, the history view — so the versions are materialized and sorted here (the log
+    /// directory is bounded by the checkpoint interval).</para>
+    /// </remarks>
     public async IAsyncEnumerable<long> ListVersionsAsync(
         long startVersion = 0,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -102,6 +113,22 @@ public sealed class TransactionLog
     public async ValueTask<long> GetLatestVersionAsync(
         CancellationToken cancellationToken = default) =>
         (await LogListing.ReadAsync(_fs, cancellationToken).ConfigureAwait(false)).LatestVersion;
+
+    /// <summary>
+    /// What versions this log holds — commit files, usable checkpoints, and the versions a snapshot
+    /// can actually be built at — from ONE pass over <c>_delta_log</c>.
+    /// </summary>
+    /// <remarks>
+    /// This is the version question answered honestly, and the one to prefer over
+    /// <see cref="ListVersionsAsync"/>: a checkpoint names a version just as a commit does, so neither
+    /// the commit files nor the checkpoints alone describe what the table can be opened at. Answering
+    /// all three views from a single listing also keeps them consistent with each other — separate
+    /// listings could disagree about a commit that landed between them.
+    /// </remarks>
+    public async ValueTask<LogVersions> ReadVersionsAsync(
+        CancellationToken cancellationToken = default) =>
+        LogVersions.FromListing(
+            await LogListing.ReadAsync(_fs, cancellationToken).ConfigureAwait(false));
 
     /// <summary>
     /// One classified pass over <c>_delta_log</c>, for callers that need more than one view of it.

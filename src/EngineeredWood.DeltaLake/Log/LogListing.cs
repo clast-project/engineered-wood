@@ -122,11 +122,54 @@ internal sealed class LogListing
     }
 
     /// <summary>Every version that carries a checkpoint of any form, descending.</summary>
+    /// <remarks>
+    /// Includes multi-part versions whose parts are INCOMPLETE — callers that intend to read the
+    /// checkpoint must confirm with <see cref="CompleteMultiPartCount"/>. This exists as the candidate
+    /// order for <c>SelectLatestCheckpoint</c>, which does exactly that as it walks.
+    /// </remarks>
     public IEnumerable<long> CheckpointVersionsDescending()
     {
         var all = new SortedSet<long>(ClassicCheckpoints);
         all.UnionWith(V2Checkpoints.Keys);
         all.UnionWith(MultiPartCheckpoints.Keys);
         return all.Reverse();
+    }
+
+    /// <summary>
+    /// The part count of a COMPLETE multi-part checkpoint at this version, or null when there is none.
+    /// </summary>
+    /// <remarks>
+    /// A writer that died midway leaves a prefix of the parts, and bootstrapping from that would
+    /// silently drop the files in the missing ones — so a multi-part checkpoint counts only when every
+    /// part is present. One version can declare more than one part count (a re-checkpoint that split
+    /// differently); any complete one will do.
+    /// </remarks>
+    public int? CompleteMultiPartCount(long version)
+    {
+        if (!MultiPartCheckpoints.TryGetValue(version, out var byTotal))
+            return null;
+
+        foreach (var (total, seen) in byTotal)
+        {
+            if (seen.Count == total)
+                return total;
+        }
+
+        return null;
+    }
+
+    /// <summary>Every version carrying a checkpoint that can actually be read, ascending.</summary>
+    public IEnumerable<long> UsableCheckpointVersionsAscending()
+    {
+        var all = new SortedSet<long>(ClassicCheckpoints);
+        all.UnionWith(V2Checkpoints.Keys);
+
+        foreach (long version in MultiPartCheckpoints.Keys)
+        {
+            if (CompleteMultiPartCount(version) is not null)
+                all.Add(version);
+        }
+
+        return all;
     }
 }
