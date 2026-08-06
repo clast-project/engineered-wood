@@ -250,7 +250,8 @@ public class DeltaErrorCodeTests : IDisposable
                  i = text.IndexOf(marker, i + 1, StringComparison.Ordinal))
             {
                 string window = text.Substring(i, Math.Min(140, text.Length - i));
-                if (!window.Contains("DeltaErrorCodes.", StringComparison.Ordinal))
+                // IndexOf rather than Contains(string, StringComparison): the latter is not on net472.
+                if (window.IndexOf("DeltaErrorCodes.", StringComparison.Ordinal) < 0)
                 {
                     int line = text.Take(i).Count(c => c == '\n') + 1;
                     offenders.Add($"{Path.GetFileName(file)}:{line}");
