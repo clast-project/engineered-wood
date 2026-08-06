@@ -410,6 +410,23 @@ table's own column is refused rather than shadowed. Background:
 (`CheckpointReader.cs`); write always emits a single
 `.checkpoint.parquet` (`CheckpointWriter.cs`), regardless of table size.
 
+**V2 checkpoints are never written automatically.** `V2CheckpointWriter`
+is public and works, but nothing in the library calls it: the
+`delta.checkpointInterval` path in `DeltaTable` only ever runs
+`CheckpointWriter`, so a table EW maintains gets V1 checkpoints
+regardless of whether it has the `v2Checkpoint` feature. The writer also
+does not verify that the feature is enabled before producing a V2
+checkpoint, which the spec requires of a writer. A host that wants V2
+must call `V2CheckpointWriter` itself and check the protocol itself.
+
+**Parquet-bodied V2 checkpoints on read.** `n.checkpoint.{uuid}.parquet`
+is deliberately not claimed by `LogListing` — only the NDJSON body is
+decoded — while `v2Checkpoint` is listed as a supported *reader* feature
+in `ProtocolVersions`. A table whose newest checkpoint uses the Parquet
+body therefore passes protocol validation and then falls back to commit
+replay; if log cleanup has removed those commits it fails late with
+"Delta log is incomplete" rather than naming the real cause.
+
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
 checksum, sidecar counts) are ignored. Missing validation.

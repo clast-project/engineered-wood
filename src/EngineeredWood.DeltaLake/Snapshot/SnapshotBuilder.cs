@@ -149,21 +149,38 @@ public sealed class SnapshotBuilder
         // Read remaining commits after the compacted range. Already ascending from the one listing.
         var versions = listing.CommitsInRange(replayFrom, targetVersion).ToList();
 
-        // Read commits concurrently for performance
-        var commitTasks = versions.Select(v =>
-            new { Version = v, Task = log.ReadCommitAsync(v, cancellationToken) })
-            .ToList();
+        // Reads run ahead of application so a long tail is not one serial round-trip per commit — but the
+        // look-ahead is BOUNDED. Starting every read at once put one request per commit in flight
+        // simultaneously, which on a table whose log cleanup has not run is thousands against the object
+        // store (the throttling response to which is a 503, not faster reads), and held every commit's
+        // decoded actions in memory until the last one landed. A window makes both proportional to the
+        // window rather than to the tail. It never binds in the normal case: the tail is the commits since
+        // the last checkpoint, which delta.checkpointInterval keeps at ~10.
+        const int ReplayLookAhead = 32;
 
-        var commits = new (long Version, IReadOnlyList<DeltaAction> Actions)[commitTasks.Count];
-        for (int i = 0; i < commitTasks.Count; i++)
+        // AsTask because these are held in a queue rather than awaited where produced — a ValueTask is
+        // only valid to consume once, and storing one is exactly the pattern that makes that hard to see.
+        var inFlight = new Queue<(long Version, Task<IReadOnlyList<DeltaAction>> Read)>(ReplayLookAhead);
+        int nextToStart = 0;
+
+        void StartNext()
         {
-            commits[i] = (commitTasks[i].Version,
-                await commitTasks[i].Task.ConfigureAwait(false));
+            long v = versions[nextToStart++];
+            inFlight.Enqueue((v, log.ReadCommitAsync(v, cancellationToken).AsTask()));
         }
 
-        // Apply in version order
-        foreach (var (version, actions) in commits.OrderBy(c => c.Version))
+        while (nextToStart < versions.Count && inFlight.Count < ReplayLookAhead)
+            StartNext();
+
+        // Applied in dequeue order, which is `versions` order, which the one listing already sorted.
+        while (inFlight.Count > 0)
         {
+            var (version, read) = inFlight.Dequeue();
+            var actions = await read.ConfigureAwait(false);
+
+            if (nextToStart < versions.Count)
+                StartNext();
+
             if (version != nextNeeded)
                 firstMissing ??= nextNeeded;
             nextNeeded = version + 1;

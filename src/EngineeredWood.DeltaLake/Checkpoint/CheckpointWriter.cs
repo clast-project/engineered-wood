@@ -67,11 +67,44 @@ public sealed class CheckpointWriter
     }
 
     /// <summary>
-    /// Builds a checkpoint RecordBatch. Used by V2CheckpointWriter for sidecar files.
+    /// The FILE actions a checkpoint must carry: every active file, plus the remove tombstones still
+    /// inside the retention window.
     /// </summary>
-    internal static RecordBatch BuildCheckpointBatchPublic(
-        Snapshot.Snapshot snapshot, out long actionCount) =>
-        BuildCheckpointBatch(snapshot, out actionCount);
+    /// <remarks>
+    /// The spec requires remove tombstones within the retention window to be preserved in checkpoints (a
+    /// reader replaying only from the checkpoint would otherwise lose them and VACUUM safety / streaming
+    /// readers break). Expired tombstones are reconciled away here. Shared with
+    /// <see cref="V2CheckpointWriter"/>, which needs exactly this set and nothing else: PROTOCOL.md
+    /// restricts a sidecar to "only add file and remove file entries", and requires that ALL of a
+    /// checkpoint's file actions live in the sidecars or ALL of them inline — never split across both.
+    /// </remarks>
+    internal static List<DeltaAction> CollectFileActions(Snapshot.Snapshot snapshot)
+    {
+        var fileActions = new List<DeltaAction>(
+            snapshot.ActiveFiles.Count + snapshot.Tombstones.Count);
+
+        foreach (var add in snapshot.ActiveFiles.Values)
+            fileActions.Add(add);
+
+        long expiryCutoffMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            - (long)TombstoneRetention(snapshot.Metadata.Configuration).TotalMilliseconds;
+        foreach (var remove in snapshot.Tombstones.Values)
+        {
+            if (remove.DeletionTimestamp is null || remove.DeletionTimestamp.Value >= expiryCutoffMs)
+                fileActions.Add(remove);
+        }
+
+        return fileActions;
+    }
+
+    /// <summary>
+    /// Builds a checkpoint RecordBatch over an EXPLICIT action list, for a V2 sidecar — which carries
+    /// file actions only and so cannot go through the snapshot-wide collection below. The snapshot is
+    /// still needed for the schema and the statistics mode, which are table-wide.
+    /// </summary>
+    internal static RecordBatch BuildBatchForActions(
+        Snapshot.Snapshot snapshot, List<DeltaAction> actions, out long actionCount) =>
+        BuildBatch(snapshot, actions, out actionCount);
 
     private static RecordBatch BuildCheckpointBatch(
         Snapshot.Snapshot snapshot, out long actionCount)
@@ -81,19 +114,7 @@ public sealed class CheckpointWriter
         allActions.Add(snapshot.Protocol);
         allActions.Add(snapshot.Metadata);
 
-        foreach (var add in snapshot.ActiveFiles.Values)
-            allActions.Add(add);
-
-        // The spec requires remove tombstones within the retention window to be preserved in
-        // checkpoints (a reader replaying only from the checkpoint would otherwise lose them and
-        // VACUUM safety / streaming readers break). Expired tombstones are reconciled away here.
-        long expiryCutoffMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            - (long)TombstoneRetention(snapshot.Metadata.Configuration).TotalMilliseconds;
-        foreach (var remove in snapshot.Tombstones.Values)
-        {
-            if (remove.DeletionTimestamp is null || remove.DeletionTimestamp.Value >= expiryCutoffMs)
-                allActions.Add(remove);
-        }
+        allActions.AddRange(CollectFileActions(snapshot));
 
         foreach (var txn in snapshot.AppTransactions.Values)
             allActions.Add(txn);
@@ -101,6 +122,12 @@ public sealed class CheckpointWriter
         foreach (var dm in snapshot.DomainMetadata.Values)
             allActions.Add(dm);
 
+        return BuildBatch(snapshot, allActions, out actionCount);
+    }
+
+    private static RecordBatch BuildBatch(
+        Snapshot.Snapshot snapshot, List<DeltaAction> allActions, out long actionCount)
+    {
         actionCount = allActions.Count;
         int count = allActions.Count;
 
