@@ -307,4 +307,131 @@ public class V2CheckpointTests : IDisposable
         Assert.Contains("v0.parquet", snapshot1.ActiveFiles.Keys);
         Assert.Contains("v1.parquet", snapshot1.ActiveFiles.Keys);
     }
+
+    /// <summary>
+    /// Writes a table with one active file and one unexpired remove tombstone, and returns its snapshot.
+    /// </summary>
+    private async Task<(LocalTableFileSystem Fs, Snapshot.Snapshot Snapshot)> BuildTombstoneTableAsync(
+        string tableId)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = tableId,
+                Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+            },
+            new AddFile
+            {
+                Path = "kept.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 100, ModificationTime = 1000, DataChange = true,
+            },
+            new AddFile
+            {
+                Path = "doomed.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 200, ModificationTime = 2000, DataChange = true,
+            },
+        });
+
+        await log.WriteCommitAsync(1, new List<DeltaAction>
+        {
+            new RemoveFile
+            {
+                Path = "doomed.parquet",
+                DataChange = true,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), // unexpired
+            },
+        });
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        Assert.Single(snapshot.Tombstones);
+        return (fs, snapshot);
+    }
+
+    // A checkpoint that drops unexpired tombstones is not safely replayable: a reader bootstrapping from
+    // it alone cannot tell the file was deleted, and VACUUM loses the retention record protecting it.
+    // The V1 writer has always preserved them; the V2 writer used to emit snapshot.ActiveFiles only.
+    [Theory]
+    [InlineData(1000, false)] // threshold above the file count — actions inline
+    [InlineData(1, true)]     // threshold below the file count — actions in a sidecar
+    public async Task V2Checkpoint_PreservesUnexpiredTombstones(int sidecarThreshold, bool expectSidecar)
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync($"v2-tomb-{sidecarThreshold}");
+
+        var writer = new V2CheckpointWriter(fs) { SidecarThreshold = sidecarThreshold };
+        await writer.WriteCheckpointAsync(snapshot);
+
+        bool sawSidecar = false;
+        await foreach (var _ in fs.ListAsync("_delta_log/_sidecars/"))
+            sawSidecar = true;
+        Assert.Equal(expectSidecar, sawSidecar);
+
+        var reader = new CheckpointReader(fs);
+        var lastCkpt = await reader.ReadLastCheckpointAsync();
+        var actions = await reader.ReadCheckpointAsync(lastCkpt!);
+
+        var builder = new SnapshotBuilder();
+        builder.ApplyCommit(lastCkpt!.Version, actions);
+        var restored = builder.Build();
+
+        Assert.Equal("doomed.parquet", Assert.Single(restored.Tombstones).Value.Path);
+        Assert.Equal(1, restored.FileCount);
+        Assert.Contains("kept.parquet", restored.ActiveFiles.Keys);
+    }
+
+    // PROTOCOL.md: a sidecar "can have only add file and remove file entries", and the non-file actions
+    // "must be part of the v2 spec checkpoint itself". Building the sidecar body from a whole snapshot
+    // emitted a protocol and a metaData row into it as well, duplicating the checkpoint's own.
+    [Fact]
+    public async Task V2Checkpoint_Sidecar_CarriesFileActionsOnly()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-sidecar-contents");
+
+        var writer = new V2CheckpointWriter(fs) { SidecarThreshold = 1 };
+        await writer.WriteCheckpointAsync(snapshot);
+
+        var reader = new CheckpointReader(fs);
+        var lastCkpt = await reader.ReadLastCheckpointAsync();
+
+        // ReadCheckpointAsync concatenates the checkpoint file and its sidecars, so a duplicated
+        // protocol/metaData shows up as a second copy in the combined action list.
+        var actions = await reader.ReadCheckpointAsync(lastCkpt!);
+
+        Assert.Single(actions.OfType<ProtocolAction>());
+        Assert.Single(actions.OfType<MetadataAction>());
+        Assert.Equal("kept.parquet", Assert.Single(actions.OfType<AddFile>()).Path);
+        Assert.Equal("doomed.parquet", Assert.Single(actions.OfType<RemoveFile>()).Path);
+    }
+
+    // sidecar.sizeInBytes is required by the spec. It used to be measured by reading the whole sidecar
+    // back off storage — correct, but it doubled every sidecar's I/O and pulled the file into memory to
+    // take .Length. This pins the cheap measurement (the writer's own end position) to the same answer.
+    [Fact]
+    public async Task V2Checkpoint_Sidecar_ReportsTrueSizeInBytes()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-sidecar-size");
+
+        var writer = new V2CheckpointWriter(fs) { SidecarThreshold = 1 };
+        await writer.WriteCheckpointAsync(snapshot);
+
+        long onDisk = 0;
+        await foreach (var file in fs.ListAsync("_delta_log/_sidecars/"))
+            onDisk = file.Size;
+        Assert.True(onDisk > 0);
+
+        var reader = new CheckpointReader(fs);
+        var lastCkpt = await reader.ReadLastCheckpointAsync();
+        byte[] body = await fs.ReadAllBytesAsync(lastCkpt!.V2CheckpointPath!);
+        var sidecar = Assert.Single(ActionSerializer.Deserialize(body).OfType<SidecarFile>());
+
+        Assert.Equal(onDisk, sidecar.SizeInBytes);
+    }
 }

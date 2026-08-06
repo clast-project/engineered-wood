@@ -63,26 +63,23 @@ public sealed class V2CheckpointWriter
         foreach (var dm in snapshot.DomainMetadata.Values)
             actions.Add(dm);
 
-        // 5. File actions — embed inline or write to sidecar
-        int fileActionCount = snapshot.ActiveFiles.Count;
-        bool useSidecars = fileActionCount > SidecarThreshold;
+        // 5. File actions — embed inline or write to sidecar. Both arms take the SAME set: active files
+        // plus the unexpired remove tombstones. Dropping the tombstones (as this writer used to) makes a
+        // checkpoint a reader cannot replay safely — VACUUM can then delete a file a concurrent reader or
+        // a time-travel/CDF read still needs. The spec also forbids splitting file actions between the
+        // checkpoint and its sidecars, so the choice is all-inline or all-sidecar, never a mix.
+        var fileActions = CheckpointWriter.CollectFileActions(snapshot);
+        bool useSidecars = fileActions.Count > SidecarThreshold;
 
         if (useSidecars)
         {
-            // Write all add actions to a sidecar Parquet file
-            var sidecarActions = new List<DeltaAction>();
-            foreach (var add in snapshot.ActiveFiles.Values)
-                sidecarActions.Add(add);
-
             var sidecarInfo = await WriteSidecarAsync(
-                sidecarActions, snapshot, cancellationToken).ConfigureAwait(false);
+                fileActions, snapshot, cancellationToken).ConfigureAwait(false);
             actions.Add(sidecarInfo);
         }
         else
         {
-            // Embed file actions inline
-            foreach (var add in snapshot.ActiveFiles.Values)
-                actions.Add(add);
+            actions.AddRange(fileActions);
         }
 
         // Write the JSON checkpoint file
@@ -118,41 +115,34 @@ public sealed class V2CheckpointWriter
         string sidecarPath = $"_delta_log/_sidecars/{sidecarName}";
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        // Use the existing V1 checkpoint writer machinery to build the Parquet batch
-        // for the sidecar (it only needs add/remove columns)
-        var sidecarWriter = new CheckpointWriter(_fs, _parquetOptions);
-        var sidecarSnapshot = new Snapshot.Snapshot
-        {
-            Version = snapshot.Version,
-            Metadata = snapshot.Metadata,
-            Protocol = snapshot.Protocol,
-            Schema = snapshot.Schema,
-            ArrowSchema = snapshot.ArrowSchema,
-            ActiveFiles = snapshot.ActiveFiles,
-            AppTransactions = new Dictionary<string, TransactionId>(),
-            DomainMetadata = new Dictionary<string, DomainMetadata>(),
-            RowIdHighWaterMark = snapshot.RowIdHighWaterMark,
-        };
+        long sizeInBytes;
 
-        // Write sidecar using the V1 Parquet checkpoint format
-        // (which handles struct columns for add/remove)
+        // The sidecar body reuses the V1 Parquet checkpoint schema, but over the file actions ALONE:
+        // PROTOCOL.md allows a sidecar "only add file and remove file entries", so the batch cannot be
+        // built from a snapshot (which would emit a protocol and a metaData row too, duplicating the ones
+        // already in the checkpoint file itself).
         await using (var file = await _fs.CreateAsync(sidecarPath, cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
             // Declared before the writer so it is disposed last; its buffers are native memory.
-            using var batch = CheckpointWriter.BuildCheckpointBatchPublic(sidecarSnapshot, out _);
-            await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
-            await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-        }
+            using var batch = CheckpointWriter.BuildBatchForActions(snapshot, fileActions, out _);
 
-        // Get file size
-        byte[] sidecarBytes = await _fs.ReadAllBytesAsync(sidecarPath, cancellationToken)
-            .ConfigureAwait(false);
+            // Scoped so the writer's footer lands before Position is read.
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions))
+            {
+                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            }
+
+            // sidecar.sizeInBytes is required by the spec, and the write already knows it: Position is
+            // the total written. Reading the file back to measure it doubled the I/O of every sidecar
+            // and pulled a potentially multi-hundred-megabyte Parquet file into memory to take .Length.
+            sizeInBytes = file.Position;
+        }
 
         return new SidecarFile
         {
             Path = sidecarName,
-            SizeInBytes = sidecarBytes.Length,
+            SizeInBytes = sizeInBytes,
             ModificationTime = now,
         };
     }
