@@ -114,14 +114,8 @@ public sealed class CheckpointReader
             if (listing.ClassicCheckpoints.Contains(version))
                 return new LastCheckpointInfo { Version = version, Size = 0 };
 
-            if (listing.MultiPartCheckpoints.TryGetValue(version, out var byTotal))
-            {
-                foreach (var (total, seen) in byTotal)
-                {
-                    if (seen.Count == total)
-                        return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
-                }
-            }
+            if (listing.CompleteMultiPartCount(version) is int total)
+                return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
 
             if (listing.V2Checkpoints.TryGetValue(version, out string? path))
                 return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
