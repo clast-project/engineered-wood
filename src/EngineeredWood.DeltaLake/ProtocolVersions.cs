@@ -106,6 +106,7 @@ public static class ProtocolVersions
         if (protocol.MinReaderVersion > MaxReaderVersion)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidProtocolVersion,
                 $"This table requires reader version {protocol.MinReaderVersion}, " +
                 $"but this implementation only supports up to reader version {MaxReaderVersion}.");
         }
@@ -120,6 +121,7 @@ public static class ProtocolVersions
             if (unsupported.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedFeaturesForRead,
                     $"This table requires unsupported reader features: [{string.Join(", ", unsupported)}].");
             }
         }
@@ -137,6 +139,7 @@ public static class ProtocolVersions
         if (protocol.MinWriterVersion > MaxWriterVersion)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidProtocolVersion,
                 $"This table requires writer version {protocol.MinWriterVersion}, " +
                 $"but this implementation only supports up to writer version {MaxWriterVersion}.");
         }
@@ -151,6 +154,7 @@ public static class ProtocolVersions
             if (unsupported.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedFeaturesForWrite,
                     $"This table requires unsupported writer features: [{string.Join(", ", unsupported)}].");
             }
         }

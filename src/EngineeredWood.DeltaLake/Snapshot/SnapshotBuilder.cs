@@ -43,7 +43,7 @@ public sealed class SnapshotBuilder
         long targetVersion = atVersion ?? listing.LatestVersion;
 
         if (targetVersion < 0)
-            throw new DeltaFormatException("Table has no commits.");
+            throw new DeltaTableNotFoundException("Table has no commits.");
 
         // Try to bootstrap from a checkpoint
         long replayFrom = 0;
@@ -202,7 +202,8 @@ public sealed class SnapshotBuilder
     /// table whose log has been cleaned it points at the checkpoint that should have been found.
     /// </summary>
     private static DeltaFormatException IncompleteLog(long missing, long from, long through) =>
-        new($"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
+        new(DeltaErrorCodes.TruncatedTransactionLog,
+            $"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
             $"covers it. Building a snapshot at version {through} requires every version in " +
             $"[{from}..{through}].");
 
@@ -331,9 +332,11 @@ public sealed class SnapshotBuilder
     public Snapshot Build()
     {
         if (_metadata is null)
-            throw new DeltaFormatException("Table has no metadata action.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError, "Table has no metadata action.");
         if (_protocol is null)
-            throw new DeltaFormatException("Table has no protocol action.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError, "Table has no protocol action.");
 
         var deltaSchema = DeltaSchemaSerializer.Parse(_metadata.SchemaString);
         var arrowSchema = SchemaConverter.ToArrowSchema(deltaSchema);

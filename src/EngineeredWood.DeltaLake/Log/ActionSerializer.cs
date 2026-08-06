@@ -102,11 +102,13 @@ internal static class ActionSerializer
             ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
         {
             if (reader.TokenType != JsonTokenType.StartObject)
-                throw new DeltaFormatException("Expected JSON object for action.");
+                throw new DeltaFormatException(
+                    DeltaErrorCodes.InvalidLogJson, "Expected JSON object for action.");
 
             reader.Read(); // Move to property name
             if (reader.TokenType != JsonTokenType.PropertyName)
-                throw new DeltaFormatException("Expected action type property name.");
+                throw new DeltaFormatException(
+                    DeltaErrorCodes.InvalidLogJson, "Expected action type property name.");
 
             string actionType = reader.GetString()!;
             reader.Read(); // Move to the action value
@@ -179,6 +181,7 @@ internal static class ActionSerializer
                     break;
                 default:
                     throw new DeltaFormatException(
+                        DeltaErrorCodes.UnsupportedActionType,
                         $"Unknown action type: {value.GetType().Name}");
             }
 
@@ -223,7 +226,8 @@ internal static class ActionSerializer
 
             return new AddFile
             {
-                Path = path ?? throw new DeltaFormatException("add.path is required"),
+                Path = path ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "add.path is required"),
                 PartitionValues = partitionValues ?? new Dictionary<string, string>(),
                 Size = size,
                 ModificationTime = modificationTime,
@@ -271,7 +275,8 @@ internal static class ActionSerializer
 
             return new RemoveFile
             {
-                Path = path ?? throw new DeltaFormatException("remove.path is required"),
+                Path = path ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "remove.path is required"),
                 DeletionTimestamp = deletionTimestamp,
                 DataChange = dataChange,
                 ExtendedFileMetadata = extendedFileMetadata,
@@ -314,11 +319,13 @@ internal static class ActionSerializer
 
             return new MetadataAction
             {
-                Id = id ?? throw new DeltaFormatException("metaData.id is required"),
+                Id = id ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "metaData.id is required"),
                 Name = name,
                 Description = description,
                 Format = format ?? Format.Parquet,
-                SchemaString = schemaString ?? throw new DeltaFormatException("metaData.schemaString is required"),
+                SchemaString = schemaString ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "metaData.schemaString is required"),
                 PartitionColumns = partitionColumns ?? [],
                 Configuration = configuration,
                 CreatedTime = createdTime,
@@ -408,7 +415,8 @@ internal static class ActionSerializer
 
             return new TransactionId
             {
-                AppId = appId ?? throw new DeltaFormatException("txn.appId is required"),
+                AppId = appId ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "txn.appId is required"),
                 Version = version,
                 LastUpdated = lastUpdated,
             };
@@ -438,7 +446,8 @@ internal static class ActionSerializer
 
             return new CdcFile
             {
-                Path = path ?? throw new DeltaFormatException("cdc.path is required"),
+                Path = path ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "cdc.path is required"),
                 PartitionValues = partitionValues ?? new Dictionary<string, string>(),
                 Size = size,
                 DataChange = dataChange,
@@ -466,7 +475,8 @@ internal static class ActionSerializer
 
             return new DomainMetadata
             {
-                Domain = domain ?? throw new DeltaFormatException("domainMetadata.domain is required"),
+                Domain = domain ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "domainMetadata.domain is required"),
                 Configuration = configuration ?? "",
                 Removed = removed,
             };
@@ -516,7 +526,8 @@ internal static class ActionSerializer
 
             return new SidecarFile
             {
-                Path = path ?? throw new DeltaFormatException("sidecar.path is required"),
+                Path = path ?? throw new DeltaFormatException(
+                    DeltaErrorCodes.MissingRequiredField, "sidecar.path is required"),
                 SizeInBytes = sizeInBytes,
                 ModificationTime = modificationTime,
                 Tags = tags,
@@ -719,7 +730,7 @@ internal static class ActionSerializer
         private static void ReadObject(ref Utf8JsonReader reader, PropertyReader handler)
         {
             if (reader.TokenType != JsonTokenType.StartObject)
-                throw new DeltaFormatException("Expected JSON object.");
+                throw new DeltaFormatException(DeltaErrorCodes.InvalidLogJson, "Expected JSON object.");
 
             while (reader.Read())
             {
@@ -727,7 +738,7 @@ internal static class ActionSerializer
                     return;
 
                 if (reader.TokenType != JsonTokenType.PropertyName)
-                    throw new DeltaFormatException("Expected property name.");
+                    throw new DeltaFormatException(DeltaErrorCodes.InvalidLogJson, "Expected property name.");
 
                 string propName = reader.GetString()!;
                 reader.Read();

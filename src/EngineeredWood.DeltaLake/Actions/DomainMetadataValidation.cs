@@ -43,6 +43,7 @@ public static class DomainMetadataValidation
         if (IsSystemDomain(domain) && !IsKnownSystemDomain(domain))
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.SystemDomainModification,
                 $"Cannot modify system-controlled domain '{domain}'. " +
                 $"System domains (starting with '{SystemDomainPrefix}') can only be " +
                 $"modified by implementations that understand them.");

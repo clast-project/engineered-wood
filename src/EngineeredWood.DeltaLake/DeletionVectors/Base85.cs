@@ -36,6 +36,7 @@ public static class Base85
     {
         if (encoded.Length % 5 != 0)
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
                 $"Invalid Z85 string length {encoded.Length} (must be multiple of 5).");
 
         int outputLen = encoded.Length * 4 / 5;
@@ -49,7 +50,8 @@ public static class Base85
             {
                 char c = encoded[i + j];
                 if (c >= 128 || s_decodeTable[c] == 0xFF)
-                    throw new DeltaFormatException($"Invalid Z85 character: '{c}'");
+                    throw new DeltaFormatException(
+                        DeltaErrorCodes.InvalidDeletionVector, $"Invalid Z85 character: '{c}'");
                 value = value * 85 + s_decodeTable[c];
             }
 
