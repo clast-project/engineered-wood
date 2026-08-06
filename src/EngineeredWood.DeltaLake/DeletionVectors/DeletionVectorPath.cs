@@ -56,11 +56,14 @@ internal static class DeletionVectorPath
     {
         // Z85-encoded 16 bytes = 20 characters; anything before that is the directory prefix.
         if (encodedPath.Length < 20)
-            throw new DeltaFormatException($"UUID path too short: '{encodedPath}'");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector, $"UUID path too short: '{encodedPath}'");
 
         byte[] uuidBytes = Base85.Decode(encodedPath.Substring(encodedPath.Length - 20));
         if (uuidBytes.Length != 16)
-            throw new DeltaFormatException($"Expected 16-byte UUID, got {uuidBytes.Length} bytes.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Expected 16-byte UUID, got {uuidBytes.Length} bytes.");
 
         // The file-name UUID is the canonical (BIG-ENDIAN / Java) rendering of the 16 bytes. .NET's
         // Guid(byte[]) shuffles the first three groups little-endian — format by hand instead.

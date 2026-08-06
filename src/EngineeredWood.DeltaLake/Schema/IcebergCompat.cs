@@ -108,6 +108,7 @@ public static class IcebergCompat
         if (mode == ColumnMappingMode.None)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.IcebergCompatViolation,
                 "Iceberg compatibility requires column mapping to be enabled " +
                 "in 'name' or 'id' mode.");
         }
@@ -131,16 +132,19 @@ public static class IcebergCompat
         {
             case ArrayType a when version == IcebergCompatVersion.V1:
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.IcebergCompatViolation,
                     $"IcebergCompatV1 does not allow array types. " +
                     $"Field '{field.Name}' has type array.");
 
             case MapType m when version == IcebergCompatVersion.V1:
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.IcebergCompatViolation,
                     $"IcebergCompatV1 does not allow map types. " +
                     $"Field '{field.Name}' has type map.");
 
             case PrimitiveType p when p.TypeName == "void":
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.IcebergCompatViolation,
                     $"Iceberg compatibility does not allow void types. " +
                     $"Field '{field.Name}' has type void.");
 
@@ -166,6 +170,7 @@ public static class IcebergCompat
         {
             case PrimitiveType p when p.TypeName == "void":
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.IcebergCompatViolation,
                     $"Iceberg compatibility does not allow void types at '{path}'.");
 
             case StructType s:
@@ -194,6 +199,7 @@ public static class IcebergCompat
         if (hasDeletionVectors)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.IcebergCompatViolation,
                 "IcebergCompatV1 requires that deletion vectors are not enabled. " +
                 "The 'deletionVectors' feature must be removed from the protocol.");
         }
