@@ -2,13 +2,12 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Concurrency;
 using EngineeredWood.DeltaLake.Schema;
-using EngineeredWood.DeltaLake.Table;
-using EngineeredWood.DeltaLake.Table.Concurrency;
 using EngineeredWood.Expressions;
 using Ex = EngineeredWood.Expressions.Expressions;
 
-namespace EngineeredWood.DeltaLake.Table.Tests;
+namespace EngineeredWood.DeltaLake.Tests;
 
 /// <summary>
 /// Verdict tests for <see cref="ConflictChecker"/> — the optimistic-concurrency core. Each pins one of

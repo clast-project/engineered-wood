@@ -78,4 +78,29 @@ public static class DeltaPath
     /// <summary>Decodes an <c>add.path</c> log value into the on-disk relative path.</summary>
     public static string Decode(string logPath) =>
         logPath.IndexOf('%') < 0 ? logPath : Uri.UnescapeDataString(logPath);
+
+    /// <summary>
+    /// Builds the Hive-style partition directory a file with these partition values belongs under
+    /// (<c>date=2024-01-01/region=us</c>), each component escaped by <see cref="EscapePathName"/> — layer 1.
+    /// The result is an ON-DISK relative path fragment; <see cref="Encode"/> it before writing it into
+    /// <c>add.path</c>.
+    ///
+    /// <para>A null value becomes Hive's <c>__HIVE_DEFAULT_PARTITION__</c> sentinel, which is how the Delta
+    /// spec and Spark both spell "this partition column is null" in a directory name.</para>
+    ///
+    /// <para>Components come out in the ENUMERATION order of
+    /// <paramref name="partitionValues"/>, so a caller that needs them in the table's declared partition
+    /// order must supply a dictionary built in that order.</para>
+    /// </summary>
+    /// <returns>The directory fragment without a trailing separator, or the empty string when there are no
+    /// partition values.</returns>
+    public static string BuildPartitionPath(IReadOnlyDictionary<string, string> partitionValues)
+    {
+        if (partitionValues.Count == 0)
+            return "";
+
+        return string.Join("/",
+            partitionValues.Select(kv =>
+                $"{EscapePathName(kv.Key)}={(kv.Value is null ? "__HIVE_DEFAULT_PARTITION__" : EscapePathName(kv.Value))}"));
+    }
 }

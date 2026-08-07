@@ -612,13 +612,6 @@ and a `TransactionId` can be fused into a commit via `CommitDataFilesAsync`'
 …)` overload that packages the idempotency check + `txn` action for a streaming
 writer, so today the caller must wire those primitives together by hand.
 
-**File pruning is not reachable by an embedding host.** `DeltaFilePruner` —
-the unified partition + stats pruner — is `internal`. A host that owns its
-own execution engine can get a pruned file list from `PlanFiles`, but
-cannot apply EW's pruning to a candidate set it assembled itself. Making the
-type public is the whole change; the constraint is API surface, not
-capability.
-
 **High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
 feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /

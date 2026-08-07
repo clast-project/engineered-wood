@@ -72,18 +72,31 @@ pinned by `StagedRowDelete_DoesNotExemptTheTransactionsReadPredicates`.
 
 ## Entry points
 
+All of the OCC core lives in **`EngineeredWood.DeltaLake`** (the log layer), and is public: a host with
+its own data plane can commit with real optimistic concurrency without taking the table layer.
+
 - `Concurrency/ConflictChecker.cs` — pure, no I/O. Rules in order: metadata change, protocol change,
   delete/delete, concurrentDeleteRead (`dataChange=false` compaction exempt), concurrentAppend (blind
   append exempt under WriteSerializable). Modeled on Spark's `ConflictChecker`.
 - `IsolationLevel.cs` — public enum, `WriteSerializable` (default) / `Serializable`. The two differ in
   exactly two places: whether a concurrent blind append matching read predicates conflicts, and the
   row-level reconciliation narrowing above.
+- `Log/LogCommitter.cs` — the loop itself. Protocol gate, attempt, read `readVersion+1..latest` on a
+  collision, rebase hook, conflict verdict, retry, post-commit snapshot refresh, checkpoint on
+  interval. It never inspects the actions beyond handing them to the log.
+- `Log/ICommitRebaseHandler.cs` — the seam for actions whose CONTENT is coupled to the version they
+  land at. `RecomputeRebaseHandler` covers the common shape (re-derive from the newest snapshot); the
+  table layer's `DeltaTable.OccRebaseHandler` implements the two hard ones, DV union/remap and
+  row-tracking id re-derivation.
+
+In **`EngineeredWood.DeltaLake.Table`**:
+
 - `DeltaTransaction.cs` — public; a thin recorder of staged actions plus the read-set. Several
   operations can be staged on one transaction; the accumulated `_operations` drives the commitInfo
   label (single-op → that op, mixed → `WRITE`).
-- `DeltaTable.cs` — `StartTransaction()`, `CommitTransactionAsync` → `CommitOccAsync` (the OCC loop),
-  and the compute halves each shared by an auto-committer and the transaction:
-  `ComputeDeleteActionsAsync`, `ComputeWriteActionsAsync`, `ComputeUpdateActionsAsync`.
+- `DeltaTable.cs` — `StartTransaction()`, `CommitTransactionAsync` → `CommitOccAsync` (which builds the
+  request and hands it to `LogCommitter`), and the compute halves each shared by an auto-committer and
+  the transaction: `ComputeDeleteActionsAsync`, `ComputeWriteActionsAsync`, `ComputeUpdateActionsAsync`.
   `ValidateWritable(snapshot, isAppend)` is the shared write-precondition gate.
 
 ## Design facts worth keeping
@@ -136,7 +149,8 @@ rule, which lives in the checker.
 ## Running the tests
 
 - The concurrency unit and integration tests are pure and local — no external toolchain:
-  `dotnet test test/EngineeredWood.DeltaLake.Table.Tests -f net10.0 --filter "FullyQualifiedName~ConflictCheckerTests|FullyQualifiedName~DeltaTransactionTests"`
+  `dotnet test test/EngineeredWood.DeltaLake.Tests -f net10.0 --filter "FullyQualifiedName~ConflictCheckerTests|FullyQualifiedName~LogCommitterTests"` (the verdicts and the loop, both log-layer)
+  and `dotnet test test/EngineeredWood.DeltaLake.Table.Tests -f net10.0 --filter "FullyQualifiedName~DeltaTransactionTests"`
 - Full validation uses the Delta interop tiers (delta-rs + PySpark). Setup and the
   `EW_REQUIRE_DELTA_INTEROP` / `EW_REQUIRE_SPARK_INTEROP` flags are in [`running-tests.md`](running-tests.md).
   Tier 3 needs `JAVA_HOME` (JDK 17+) and, on Windows, `HADOOP_HOME` with winutils on `PATH`.
