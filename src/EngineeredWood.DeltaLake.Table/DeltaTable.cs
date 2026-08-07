@@ -95,7 +95,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
 
         if (latestVersion < 0)
-            throw new DeltaFormatException("No Delta table found (no commits in _delta_log/).");
+            throw new DeltaTableNotFoundException("No Delta table found (no commits in _delta_log/).");
 
         var checkpointReader = new CheckpointReader(fileSystem);
         var snapshot = await SnapshotBuilder.BuildAsync(
@@ -247,6 +247,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (clusteringColumns is { Count: > 0 } && partitionColumns is { Count: > 0 })
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.ClusteringWithPartitioning,
                 "Liquid clustering and partitioning are mutually exclusive — a partitioned table cannot "
                 + "declare clustering columns.");
         }
@@ -317,6 +318,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (maxId == 0)
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.InvalidPreAssignedSchema,
                         "preAssignedSchema declares no column-mapping field ids, but the table is being "
                         + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
                         + "writing the data files, or create without column mapping.");
@@ -794,6 +796,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (ColumnMapping.GetFieldId(field) is int id && id <= previousMaxId)
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.InvalidPreAssignedSchema,
                 $"preAssignedSchema reuses column-mapping id {id}; replacement ids must be greater "
                 + $"than the existing table's maxColumnId ({previousMaxId}).");
         }
@@ -1774,6 +1777,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (snapshot.Metadata.PartitionColumns.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ClusteringWithPartitioning,
                     "Liquid clustering and partitioning are mutually exclusive — a partitioned table "
                     + "cannot declare clustering columns.");
             }
@@ -1833,6 +1837,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (field is null)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ColumnNotFound,
                     $"Clustering column '{clusteringColumns[i]}' is not a column of the table.");
             }
             string physical = ColumnMapping.GetPhysicalName(field, mode);
@@ -2166,6 +2171,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         if (bestVersion is null)
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.NoCommitAtTimestamp,
                 "No commit found at or before the specified timestamp. " +
                 "Ensure the table has in-commit timestamps enabled.");
 
@@ -4528,6 +4534,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.CannotModifyAppendOnly,
                     "Table is append-only (delta.appendOnly=true): overwrite/delete/update are not permitted.");
             }
             foreach (var key in cfg.Keys)
@@ -4535,6 +4542,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.UnevaluableTableExpression,
                         $"Table declares CHECK constraint '{key}' which this writer cannot evaluate; write rejected.");
                 }
             }
@@ -4544,11 +4552,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.UnevaluableTableExpression,
                     $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
             }
             if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.UnevaluableTableExpression,
                     $"Column '{field.Name}' declares a generation expression this writer cannot evaluate; write rejected.");
             }
         }
@@ -4675,6 +4685,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (mode != DeltaWriteMode.Overwrite || overwritePartitions is { Count: > 0 } || dynamicPartitionOverwrite)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Repartitioning requires a FULL overwrite (the new partition schema is only valid when "
                     + "every active file is replaced in the same commit).");
             }
@@ -4683,6 +4694,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (!snapshot.Schema.Fields.Any(f => f.Name == col))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.ColumnNotFound,
                         $"Repartition: '{col}' is not a column of the table.");
                 }
             }
@@ -4692,6 +4704,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (dynamicPartitionOverwrite && snapshot.Metadata.PartitionColumns.Count == 0)
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.InvalidWriteMode,
                 "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
         }
 
@@ -4704,6 +4717,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (!snapshot.Metadata.PartitionColumns.Contains(key))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.InvalidPartitionColumn,
                         $"OverwritePartitions: '{key}' is not a partition column of the table " +
                         $"(partition columns: {string.Join(", ", snapshot.Metadata.PartitionColumns)}).");
                 }
@@ -4806,6 +4820,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (overwritePartitions is { Count: > 0 } && !PartitionValuesMatch(partValues, overwritePartitions))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.DataOutsideTargetPartitions,
                         "OverwritePartitions: input data falls outside the target partition(s) " +
                         $"({string.Join(", ", overwritePartitions.Select(kv => kv.Key + "=" + kv.Value))}).");
                 }
@@ -5570,9 +5585,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             if (mode != DeltaWriteMode.Append)
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Dynamic partition overwrite is append-shaped (a full Overwrite already removes everything).");
             if (CurrentSnapshot.Metadata.PartitionColumns.Count == 0)
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
         }
 

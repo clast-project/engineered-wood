@@ -463,7 +463,15 @@ public class DeltaTableTests : IDisposable
     {
         var fs = new LocalTableFileSystem(_tempDir);
 
-        await Assert.ThrowsAsync<DeltaFormatException>(
+        // The specific type, not just DeltaFormatException: "there is no table here" is the one
+        // condition a caller routinely handles inline (create it) rather than reporting, so opening
+        // an empty directory must be distinguishable without inspecting an error code.
+        var ex = await Assert.ThrowsAsync<DeltaTableNotFoundException>(
             () => DeltaTable.OpenAsync(fs).AsTask());
+
+        Assert.Equal(DeltaErrorCodes.PathDoesNotExist, ex.ErrorCode);
+
+        // Still reaches a handler written before the type existed.
+        Assert.IsAssignableFrom<DeltaFormatException>(ex);
     }
 }
