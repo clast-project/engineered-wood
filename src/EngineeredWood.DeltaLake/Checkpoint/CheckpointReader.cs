@@ -52,7 +52,7 @@ public sealed class CheckpointReader
             if (root.TryGetProperty("v2Checkpoint", out var v2))
             {
                 if (v2.TryGetProperty("path", out var pathProp))
-                    v2Path = pathProp.GetString();
+                    v2Path = NormalizeLogPath(pathProp.GetString());
             }
 
             return new LastCheckpointInfo
@@ -81,6 +81,28 @@ public sealed class CheckpointReader
             // or one of the wrong type. Every one of them is a hint we cannot use.
             return null;
         }
+    }
+
+    /// <summary>
+    /// Resolves a checkpoint path taken from <c>_last_checkpoint</c> into a table-relative one.
+    /// </summary>
+    /// <remarks>
+    /// <para>delta-spark writes <c>v2Checkpoint.path</c> as a BARE FILE NAME —
+    /// <c>00000000000000000001.checkpoint.&lt;uuid&gt;.json</c>, measured against delta-spark 4.0.0 —
+    /// while this reader addresses everything from the table root. Using it verbatim looked for the
+    /// checkpoint beside the data directories instead of inside <c>_delta_log</c>, so every V2
+    /// checkpoint Spark wrote failed to load.</para>
+    /// <para>A UUID-named checkpoint always lives in <c>_delta_log</c>, so reducing whatever the hint
+    /// says to its file name and re-rooting it is both simpler and more robust than testing for a
+    /// separator: it accepts a bare name, an already-rooted path, and an absolute URI alike.</para>
+    /// </remarks>
+    private static string? NormalizeLogPath(string? path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return null;
+
+        string fileName = Path.GetFileName(path!.Replace('\\', '/'));
+        return string.IsNullOrEmpty(fileName) ? null : DeltaVersion.LogPrefix + fileName;
     }
 
     /// <summary>

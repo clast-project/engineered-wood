@@ -427,6 +427,13 @@ body therefore passes protocol validation and then falls back to commit
 replay; if log cleanup has removed those commits it fails late with
 "Delta log is incomplete" rather than naming the real cause.
 
+Measured 2026-08-06: delta-spark 4.0.0 with `delta.checkpointPolicy=v2`
+writes the **JSON** body (`<n>.checkpoint.<uuid>.json` plus a Parquet
+sidecar), which EW reads — see
+`SparkInteropTests.SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone`.
+So this is a compatibility ceiling for writers that choose the Parquet
+body, not a barrier to reading Spark's output.
+
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
 checksum, sidecar counts) are ignored. Missing validation.
