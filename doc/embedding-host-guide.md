@@ -564,6 +564,33 @@ Two things to get right:
 `DeltaFilePruner` is public at this layer too, so partition + statistics file skipping is available to a
 scan you planned yourself, not only through `PlanFiles`.
 
+### Handling a conflict
+
+`DeltaConflictException` is classified, so a retry loop does not have to guess:
+
+```csharp
+catch (DeltaConflictException e) when (e.Recovery == ConflictRecovery.Replay)
+{
+    // The actions are still valid; only the version they aimed at was taken. Re-attempt them.
+}
+catch (DeltaConflictException e)
+{
+    // Replan: the plan was built against a table state that no longer holds. Re-read, recompute,
+    // commit that. e.ErrorCode says what moved; e.ConflictingVersion says which commit did it.
+}
+```
+
+`Replay` is deliberately rare — `LogCommitter` already does it internally, so it escapes only when
+`MaxAttempts` runs out or when you drive `TransactionLog.WriteCommitAsync` yourself. Everything else is
+`Replan`, and that is the case worth getting right: replaying work whose premise has gone is the failure
+this classification exists to prevent.
+
+`ErrorCode` is a `DELTA_*` constant from `DeltaErrorCodes` (or `DeltaTableErrorCodes`), in the same flat
+namespace as every other Delta failure — so one `switch` on `ErrorCode` covers conflicts and format
+errors alike. Six of the conflict codes are delta-spark's own names for the same conditions, checked
+against its `error/delta-error-classes.json`, so a host bridging engines can treat them as equivalent.
+Match on the code, never on the message: the prose is free to change.
+
 What you give up is everything with a data plane in it: the Arrow read/write path, deletion-vector DML,
 compaction, vacuum, CDF writing, identity columns, and the row-level conflict reconciliation that needs to
 read vectors and remap rows. `DeltaTable` remains the recommended surface unless you are specifically

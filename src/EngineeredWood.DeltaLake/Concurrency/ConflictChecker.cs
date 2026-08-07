@@ -35,6 +35,30 @@ public sealed record ConflictResult(ConflictType Type, long ConflictingVersion, 
     public static readonly ConflictResult None = new(ConflictType.None, -1, null);
 
     public bool HasConflict => Type != ConflictType.None;
+
+    /// <summary>
+    /// The <c>DELTA_*</c> code for this verdict — the single point where the checker's closed
+    /// vocabulary becomes the open one <see cref="DeltaConflictException.ErrorCode"/> carries.
+    ///
+    /// <para>Keeping the two separate is deliberate. <see cref="ConflictType"/> is what
+    /// <see cref="ConflictChecker.Check"/> can conclude, and is closed because the rules are; the
+    /// error-code namespace is flat and open, shared with conditions the checker never sees (a lost
+    /// version slot, a failed row-level reconciliation) and extended independently by the table
+    /// layer.</para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException"><see cref="Type"/> is <see cref="ConflictType.None"/>,
+    /// which is not a conflict and has no code.</exception>
+    public string ErrorCode => Type switch
+    {
+        ConflictType.MetadataChanged => DeltaErrorCodes.MetadataChanged,
+        ConflictType.ProtocolChanged => DeltaErrorCodes.ProtocolChanged,
+        ConflictType.ConcurrentDeleteRead => DeltaErrorCodes.ConcurrentDeleteRead,
+        ConflictType.ConcurrentDeleteDelete => DeltaErrorCodes.ConcurrentDeleteDelete,
+        ConflictType.ConcurrentAppend => DeltaErrorCodes.ConcurrentAppend,
+        _ => throw new InvalidOperationException(
+            $"{nameof(ConflictType)}.{Type} is not a conflict and has no error code; "
+            + $"check {nameof(HasConflict)} first."),
+    };
 }
 
 /// <summary>

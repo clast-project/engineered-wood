@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
@@ -2724,6 +2724,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     _rowLevelDeletes!, cancellationToken, _written).ConfigureAwait(false);
                 if (resolution is null)
                     throw new DeltaConflictException(
+                        DeltaTableErrorCodes.RowLevelConflict,
                         "A concurrent commit deleted a row this delete also removed, or rewrote a file "
                         + "it targeted such that a row cannot be remapped; the delete conflicts at row "
                         + "level and must be retried.");
@@ -5642,6 +5643,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (expectedVersion is { } expected && CurrentSnapshot.Version != expected)
         {
             throw new DeltaConflictException(
+                DeltaTableErrorCodes.StaleTransactionSnapshot,
                 $"Transaction conflict: the table moved from version {expected} to {CurrentSnapshot.Version} "
                 + "while the transaction was open — the buffered changes were rolled back; retry the "
                 + "transaction.");
@@ -7247,11 +7249,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (!MetadataEquals(from.Metadata, to.Metadata))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.MetadataChanged,
                 "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
         }
         if (!ProtocolEquals(from.Protocol, to.Protocol))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.ProtocolChanged,
                 "concurrent protocol change — cannot rebase the transaction");
         }
 
@@ -7288,6 +7292,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (!rowTrackingEnabled)
             {
                 throw new DeltaConflictException(
+                    DeltaTableErrorCodes.RowLevelConflict,
                     $"concurrent rewrite/compaction of file '{kvp.Key}' this transaction modifies — cannot "
                     + "rebase the buffered transaction (row tracking is disabled, so its rows cannot be "
                     + "remapped by stable id); retry it");
@@ -7330,6 +7335,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     if (overlap > 0)
                     {
                         throw new DeltaConflictException(
+                            DeltaTableErrorCodes.RowLevelConflict,
                             $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
                             + "deletes/updates were concurrently deleted or updated — retry the transaction");
                     }
@@ -7393,6 +7399,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (remapped is null)
             {
                 throw new DeltaConflictException(
+                    DeltaTableErrorCodes.RowLevelConflict,
                     "row-level conflict remapping across a concurrent rewrite/compaction: a row this "
                     + "transaction deletes/updates was concurrently deleted or updated, or its stable id could "
                     + "not be resolved — retry the transaction");
@@ -7434,11 +7441,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (!MetadataEquals(baseSnapshot.Metadata, latest.Metadata))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.MetadataChanged,
                 "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
         }
         if (!ProtocolEquals(baseSnapshot.Protocol, latest.Protocol))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.ProtocolChanged,
                 "concurrent protocol change — cannot rebase the transaction");
         }
         // delete/delete: every file the transaction removes (DV remove+add pairs, rewrites) must still be active
@@ -7462,6 +7471,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 || !Equals(current.DeletionVector, remove.DeletionVector))
             {
                 throw new DeltaConflictException(
+                    DeltaErrorCodes.ConcurrentDeleteDelete,
                     $"concurrent delete/rewrite of file '{remove.Path}' this transaction also modifies — "
                     + "cannot rebase the transaction");
             }
@@ -7519,6 +7529,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         if (baseByPath.TryGetValue(removed.Path, out var readFile) && ReadsMatch(readFile))
                         {
                             throw new DeltaConflictException(
+                                DeltaErrorCodes.ConcurrentDeleteRead,
                                 $"concurrent delete/rewrite of file '{removed.Path}' this transaction read "
                                 + $"(commit v{v}) — cannot rebase the transaction");
                         }
@@ -7529,6 +7540,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         if (ReadsMatch(added))
                         {
                             throw new DeltaConflictException(
+                                DeltaErrorCodes.ConcurrentAppend,
                                 $"concurrent append of file '{added.Path}' matching this transaction's reads "
                                 + $"(commit v{v}) — cannot rebase the transaction");
                         }

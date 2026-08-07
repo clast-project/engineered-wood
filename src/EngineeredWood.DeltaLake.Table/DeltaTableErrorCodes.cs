@@ -131,4 +131,42 @@ public static class DeltaTableErrorCodes
     /// the name would send a reader looking for something that is not here.
     /// </remarks>
     public const string DataOutsideTargetPartitions = "DELTA_DATA_OUTSIDE_TARGET_PARTITIONS";
+
+    // ── Concurrency conditions only the table layer can raise ──
+    //
+    // Carried by DeltaConflictException, in the same flat namespace as DeltaErrorCodes' concurrency
+    // codes — a caller switches on ErrorCode once and does not care which layer named the condition.
+    // These two have no delta-spark equivalent because they are about mechanisms Spark does not have.
+
+    /// <summary>
+    /// Row-level reconciliation could not absorb a concurrent commit: the same ROW was concurrently
+    /// deleted or updated, or a row's file was rewritten away and its stable id could not be resolved
+    /// onto the replacement.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="DeltaErrorCodes.ConcurrentDeleteDelete"/>, and the distinction is
+    /// the point: delete/delete is a FILE-granularity verdict, raised because two transactions touched
+    /// the same file. This is raised only after row-granularity reconciliation was attempted and
+    /// failed, which means the two transactions genuinely touched the same rows. A host that treats the
+    /// two as one condition loses the ability to tell "we collided on a file" from "we collided on
+    /// data".</para>
+    /// <para>No delta-spark equivalent: deletion-vector union and stable-id remapping across a
+    /// concurrent rewrite are this library's own reconciliation, so Spark has no error class for
+    /// their failure.</para>
+    /// </remarks>
+    public const string RowLevelConflict = "DELTA_ROW_LEVEL_CONFLICT";
+
+    /// <summary>
+    /// A snapshot-coupled commit found the table had moved off the version it was pinned to. Its
+    /// actions were computed against that exact version — deletion-vector ordinals and row positions
+    /// resolve against a specific active-file set — so there is no other version at which they are
+    /// correct, and the commit aborts rather than rebasing.
+    /// </summary>
+    /// <remarks>
+    /// Raised by <see cref="DeltaTable.CommitDataFilesAsync"/> when <c>expectedVersion</c> is set. The
+    /// condition resembles delta-spark's <c>DELTA_CONCURRENT_WRITE</c>, which is deliberately not
+    /// reused: that one leaves the staged actions valid (<see cref="ConflictRecovery.Replay"/>) and
+    /// this one does not, so sharing a code would erase exactly the difference a caller needs.
+    /// </remarks>
+    public const string StaleTransactionSnapshot = "DELTA_STALE_TRANSACTION_SNAPSHOT";
 }

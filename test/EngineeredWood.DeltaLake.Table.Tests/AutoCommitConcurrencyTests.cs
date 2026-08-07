@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -128,7 +128,10 @@ public class AutoCommitConcurrencyTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<DeltaConflictException>(
             async () => await tableB.DeleteAsync(IdEquals(5))); // the same row A just removed
-        Assert.Contains("row level", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // The CODE rather than the prose: a row-level collision is not a file-granularity
+        // delete/delete, and matching on the message would freeze the wording as API.
+        Assert.Equal(DeltaTableErrorCodes.RowLevelConflict, ex.ErrorCode);
+        Assert.Equal(ConflictRecovery.Replan, ex.Recovery);
 
         // Only A's delete landed; the aborted delete left the table uncorrupted.
         Assert.Equal([7L], await ReadIdsFresh());
