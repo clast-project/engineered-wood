@@ -88,6 +88,13 @@ its own data plane can commit with real optimistic concurrency without taking th
   land at. `RecomputeRebaseHandler` covers the common shape (re-derive from the newest snapshot); the
   table layer's `DeltaTable.OccRebaseHandler` implements the two hard ones, DV union/remap and
   row-tracking id re-derivation.
+- `DeltaConflictException.cs` / `ConflictRecovery.cs` — what a conflict TELLS a caller.
+  `ErrorCode` names the condition as a `DELTA_*` constant (six of them delta-spark's own names, checked
+  against `error/delta-error-classes.json` in delta-spark 4.0.0); `Recovery` says whether the staged
+  actions survive (`Replay`, only the lost version slot) or the plan has to be rebuilt (`Replan`,
+  everything else); `ConflictingVersion` names the commit responsible, which the checker always knew
+  and used to discard. `ConflictType` stays the checker's own closed vocabulary and is mapped to a code
+  at one point, `ConflictResult.ErrorCode`.
 
 In **`EngineeredWood.DeltaLake.Table`**:
 

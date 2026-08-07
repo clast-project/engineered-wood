@@ -140,4 +140,80 @@ public static class DeltaErrorCodes
     /// </summary>
     public const string UnsupportedDeletionVectorStorageType =
         "DELTA_UNSUPPORTED_DELETION_VECTOR_STORAGE_TYPE";
+
+    // ── Optimistic concurrency ──
+    //
+    // Carried by DeltaConflictException rather than DeltaFormatException. Six of the seven are
+    // delta-spark's own names, checked against error/delta-error-classes.json in delta-spark 4.0.0
+    // (the version test/EngineeredWood.DeltaLake.Table.Tests/Interop pins) — not from memory, and not
+    // by resemblance. Each names the Spark exception class it corresponds to.
+
+    /// <summary>
+    /// Another writer created this version first. The commit never got as far as being validated —
+    /// the put-if-absent that reserves a version failed — so the staged actions are untouched and
+    /// <see cref="ConflictRecovery.Replay"/> applies.
+    /// </summary>
+    /// <remarks>
+    /// delta-spark: <c>DELTA_CONCURRENT_WRITE</c> / <c>ConcurrentWriteException</c> — "A concurrent
+    /// transaction has written new data since the current transaction read the table". Spark raises it
+    /// as a verdict where we raise it from the storage primitive, but the condition a caller sees is
+    /// the same one: somebody committed underneath us.
+    /// </remarks>
+    public const string ConcurrentWrite = "DELTA_CONCURRENT_WRITE";
+
+    /// <summary>
+    /// A concurrent commit changed the table metadata — schema, partitioning, or configuration.
+    /// Raised for ANY concurrent <c>metaData</c> action, including a benign one, so it does not mean
+    /// the table is now unusable; it means the plan was built against a description that has moved.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_METADATA_CHANGED</c> / <c>MetadataChangedException</c>.</remarks>
+    public const string MetadataChanged = "DELTA_METADATA_CHANGED";
+
+    /// <summary>
+    /// A concurrent commit changed the protocol. Whether the new protocol is one this library can
+    /// still write is NOT decided here — the protocol gate answers that on the next attempt, with a
+    /// <see cref="DeltaFormatException"/> carrying <see cref="UnsupportedFeaturesForWrite"/>.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_PROTOCOL_CHANGED</c> / <c>ProtocolChangedException</c>.</remarks>
+    public const string ProtocolChanged = "DELTA_PROTOCOL_CHANGED";
+
+    /// <summary>
+    /// A concurrent commit removed a file this transaction had read, with <c>dataChange=true</c>. The
+    /// decision this transaction made was based on data that is now gone.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONCURRENT_DELETE_READ</c> /
+    /// <c>ConcurrentDeleteReadException</c> — "This transaction attempted to read one or more files
+    /// that were deleted".</remarks>
+    public const string ConcurrentDeleteRead = "DELTA_CONCURRENT_DELETE_READ";
+
+    /// <summary>
+    /// A concurrent commit removed a file this transaction also plans to remove.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONCURRENT_DELETE_DELETE</c> /
+    /// <c>ConcurrentDeleteDeleteException</c> — "This transaction attempted to delete one or more
+    /// files that were deleted".</remarks>
+    public const string ConcurrentDeleteDelete = "DELTA_CONCURRENT_DELETE_DELETE";
+
+    /// <summary>
+    /// A concurrent commit added a file matching this transaction's read predicates — under a strict
+    /// serial order this transaction might have been required to read it.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONCURRENT_APPEND</c> / <c>ConcurrentAppendException</c> —
+    /// "Files were added to &lt;partition&gt; by a concurrent update".</remarks>
+    public const string ConcurrentAppend = "DELTA_CONCURRENT_APPEND";
+
+    /// <summary>
+    /// Nothing this commit read or removed was invalidated, but its actions cannot move to another
+    /// version: their CONTENT encodes the version they were planned for — row tracking's
+    /// <c>baseRowId</c> / <c>defaultRowCommitVersion</c>, or a deletion vector computed against a
+    /// specific file state — and no rebase handler re-derived them. Committing them where they landed
+    /// would be quietly wrong, so the commit aborts instead.
+    /// </summary>
+    /// <remarks>
+    /// No delta-spark equivalent, and the reason is structural: Spark's optimistic transaction always
+    /// owns the whole write, so it can always re-derive. This surfaces because
+    /// <see cref="Log.LogCommitter"/> accepts actions a caller built, and
+    /// <see cref="Log.LogCommitRequest.RebaseSafe"/> is how a caller says they are not portable.
+    /// </remarks>
+    public const string RebaseUnsafe = "DELTA_REBASE_UNSAFE";
 }

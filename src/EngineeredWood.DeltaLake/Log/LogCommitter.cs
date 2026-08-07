@@ -178,13 +178,26 @@ public sealed class LogCommitter
                     request.Reads, request.PlannedRemovePaths, pruner, request.Isolation,
                     concurrent, resolvedPaths);
                 if (verdict.HasConflict)
-                    throw new DeltaConflictException(verdict.Message!);
+                {
+                    throw new DeltaConflictException(
+                        verdict.ErrorCode, verdict.Message!, ConflictRecovery.Replan,
+                        conflictingVersion: verdict.ConflictingVersion,
+                        attemptedVersion: attemptVersion);
+                }
 
                 if (!request.RebaseSafe)
                 {
+                    // Replan rather than Replay, and the distinction is the whole reason this throws:
+                    // the checker found nothing wrong, so the WORK is fine — it is these particular
+                    // actions that cannot move version. Rebuilding them against the newer snapshot is
+                    // exactly what would fix it.
                     throw new DeltaConflictException(
+                        DeltaErrorCodes.RebaseUnsafe,
                         "A concurrent commit landed and this operation cannot be safely rebased onto it; "
-                        + "retry the operation.");
+                        + "retry the operation.",
+                        ConflictRecovery.Replan,
+                        conflictingVersion: latest,
+                        attemptedVersion: attemptVersion);
                 }
 
                 attemptVersion = latest + 1; // no conflict — rebase and retry
