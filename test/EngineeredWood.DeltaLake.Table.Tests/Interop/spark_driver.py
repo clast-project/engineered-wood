@@ -219,6 +219,54 @@ def cmd_partition_paths(args):
     return {"directories": sorted(dirs), "add_paths": sorted(add_paths)}
 
 
+def cmd_v2_checkpoint(args):
+    """Write a table whose checkpoints follow the V2 spec, and report the raw log layout.
+
+    `delta.checkpointPolicy=v2` selects the UUID-named checkpoint form and pulls in the
+    v2Checkpoint table feature; `delta.checkpointInterval=1` makes every commit checkpoint so the
+    scenario does not depend on how many commits it takes to trip the default interval.
+
+    The DELETE is deliberate: it leaves remove tombstones, which a checkpoint must carry and which
+    no file-set comparison would notice were missing.
+
+    Nothing here interprets the log -- the file names, the sidecar listing and the raw
+    `_last_checkpoint` bytes are reported as-is, because the point is to see what the reference
+    implementation actually wrote.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    df = spark.createDataFrame(args["rows"], args["schema"])
+    writer = (df.write.format("delta")
+              .option("delta.checkpointPolicy", "v2")
+              .option("delta.checkpointInterval", "1"))
+    if args.get("partition_by"):
+        writer = writer.partitionBy(*args["partition_by"])
+    writer.mode("errorifexists").save(path)
+
+    for stmt in args.get("sql") or []:
+        spark.sql(stmt.format(path=path))
+
+    log_dir = os.path.join(args["path"], "_delta_log")
+    log_files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(log_dir, "*"))
+                       if os.path.isfile(p))
+    sidecars = sorted(os.path.basename(p)
+                      for p in glob.glob(os.path.join(log_dir, "_sidecars", "*")))
+
+    last_checkpoint = None
+    lc_path = os.path.join(log_dir, "_last_checkpoint")
+    if os.path.exists(lc_path):
+        with open(lc_path, "r", encoding="utf-8") as handle:
+            last_checkpoint = handle.read()
+
+    return {
+        "log_files": log_files,
+        "sidecars": sidecars,
+        "last_checkpoint": last_checkpoint,
+        "detail": _detail(spark, args["path"]),
+        "rows": _rows(spark.read.format("delta").load(path)),
+    }
+
+
 def cmd_sql(args):
     """Run statements against an existing EW-written table, then report the result.
 
@@ -651,6 +699,7 @@ COMMANDS = {
     "write_nested_variant": cmd_write_nested_variant,
     "write": cmd_write,
     "partition_paths": cmd_partition_paths,
+    "v2_checkpoint": cmd_v2_checkpoint,
     "sql": cmd_sql,
     "scan": cmd_scan,
     "checkpoint_stats": cmd_checkpoint_stats,

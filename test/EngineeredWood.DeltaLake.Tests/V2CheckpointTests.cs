@@ -434,4 +434,123 @@ public class V2CheckpointTests : IDisposable
 
         Assert.Equal(onDisk, sidecar.SizeInBytes);
     }
+
+    /// <summary>Overwrites <c>_last_checkpoint</c> with a hint naming <paramref name="path"/>.</summary>
+    private async Task WriteLastCheckpointHintAsync(
+        LocalTableFileSystem fs, long version, string path)
+    {
+        // Built by concatenation rather than a raw literal: the JSON's own braces collide with
+        // interpolation delimiters and the escaping obscures what is being written.
+        string json =
+            "{\"version\":" + version + ",\"size\":1,\"v2Checkpoint\":{\"path\":\"" + path + "\"}}";
+        await fs.WriteAllBytesAsync(
+            DeltaVersion.LastCheckpointPath, System.Text.Encoding.UTF8.GetBytes(json));
+    }
+
+    /// <summary>
+    /// delta-spark writes <c>v2Checkpoint.path</c> in <c>_last_checkpoint</c> as a BARE FILE NAME,
+    /// not a table-relative one. Taking it verbatim looked for the checkpoint beside the data
+    /// directories rather than inside <c>_delta_log</c>, so every V2 checkpoint Spark wrote failed to
+    /// load — and the table failed to open at all once its commits had been cleaned away.
+    /// </summary>
+    /// <remarks>
+    /// Covered here as well as in <c>SparkInteropTests</c> because the interop tier only runs where a
+    /// Spark install is present, which is not where CI runs.
+    /// </remarks>
+    [Theory]
+    [InlineData(false)] // "_delta_log/<n>.checkpoint.<uuid>.json" — what EW itself writes
+    [InlineData(true)]  // "<n>.checkpoint.<uuid>.json"            — what delta-spark writes
+    public async Task V2Checkpoint_LastCheckpointHint_IsResolvedRelativeToTheLogDirectory(
+        bool bareFileName)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, CreateCommit("v2-hint"));
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        await new V2CheckpointWriter(fs).WriteCheckpointAsync(snapshot);
+
+        var reader = new CheckpointReader(fs);
+        string written = (await reader.ReadLastCheckpointAsync())!.V2CheckpointPath!;
+
+        if (bareFileName)
+        {
+            await WriteLastCheckpointHintAsync(fs, 1, Path.GetFileName(written));
+
+            // Pinned directly, not only through the snapshot: the hint must be RESOLVED into the log
+            // directory. Without this the theory would still pass via the listing fallback, which
+            // costs a failed read and would mask a regression in the resolution itself.
+            var reread = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+            Assert.StartsWith(DeltaVersion.LogPrefix, reread!.V2CheckpointPath!, StringComparison.Ordinal);
+        }
+
+        // Delete the commits the checkpoint subsumes, so the hint is the only way in.
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
+
+        var rebuilt = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(1, rebuilt.Version);
+        Assert.Equal("v2-hint", rebuilt.Metadata.Id);
+        Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
+    }
+
+    /// <summary>
+    /// A hint that names a checkpoint file which does not exist must fall through to the log listing,
+    /// which is the truth the hint only summarises.
+    /// </summary>
+    /// <remarks>
+    /// The fallback existed but was unreachable here: it was skipped whenever the listing's candidate
+    /// had the same VERSION as the failed hint, and a hint with a wrong path still names the right
+    /// version. Two candidates for one version are the same candidate only if they name the same
+    /// file.
+    /// </remarks>
+    [Fact]
+    public async Task V2Checkpoint_HintNamingAMissingFile_FallsBackToTheListing()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, CreateCommit("v2-stale-hint"));
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        await new V2CheckpointWriter(fs).WriteCheckpointAsync(snapshot);
+
+        // Same version, different (nonexistent) file — exactly the shape the version-only skip
+        // mistook for "the listing already found this one".
+        await WriteLastCheckpointHintAsync(
+            fs, 1, $"_delta_log/{1:D20}.checkpoint.{Guid.NewGuid()}.json");
+
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
+
+        var rebuilt = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(1, rebuilt.Version);
+        Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
+    }
+
+    private static List<DeltaAction> CreateCommit(string id) =>
+    [
+        new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+        new MetadataAction
+        {
+            Id = id,
+            Format = Format.Parquet,
+            SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+            PartitionColumns = [],
+        },
+    ];
+
+    private static AddFile Add(string path) => new()
+    {
+        Path = path,
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 100,
+        ModificationTime = 1000,
+        DataChange = true,
+    };
 }

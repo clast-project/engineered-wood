@@ -64,8 +64,11 @@ public sealed class SnapshotBuilder
             {
                 var listed = CheckpointReader.SelectLatestCheckpoint(listing, targetVersion);
 
-                // Skip the re-read when listing just found the checkpoint that already failed.
-                if (listed is not null && listed.Version != hint?.Version)
+                // Skip the re-read only when listing found the SAME checkpoint that already failed —
+                // same version AND same file. Comparing versions alone was too coarse: a hint whose
+                // path is wrong names the version correctly, so the listing's candidate (which has
+                // the right path) was discarded as a duplicate and the table failed to open at all.
+                if (listed is not null && !SameCandidate(listed, hint))
                     await TryBootstrapAsync(listed).ConfigureAwait(false);
             }
 
@@ -201,6 +204,16 @@ public sealed class SnapshotBuilder
     /// absent commits did. Naming the first uncovered version turns that into something diagnosable: on a
     /// table whose log has been cleaned it points at the checkpoint that should have been found.
     /// </summary>
+    /// <summary>
+    /// Whether two checkpoint candidates name the same file, so that retrying the second after the
+    /// first failed would only repeat the same read.
+    /// </summary>
+    private static bool SameCandidate(LastCheckpointInfo listed, LastCheckpointInfo? hint) =>
+        hint is not null
+        && listed.Version == hint.Version
+        && listed.Parts == hint.Parts
+        && string.Equals(listed.V2CheckpointPath, hint.V2CheckpointPath, StringComparison.Ordinal);
+
     private static DeltaFormatException IncompleteLog(long missing, long from, long through) =>
         new(DeltaErrorCodes.TruncatedTransactionLog,
             $"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +

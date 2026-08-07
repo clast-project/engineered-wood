@@ -2702,4 +2702,100 @@ public class SparkInteropTests : IDisposable
 
         Assert.Equal(sparkPrefixes, ewPrefixes);
     }
+
+    // ── V2 checkpoints written by the reference implementation ──
+
+    /// <summary>
+    /// <para>EW's V2 checkpoint reader had only ever been pointed at checkpoints EW itself wrote — a
+    /// round trip through one implementation validates that implementation's assumptions, not the
+    /// format. This is the first time a foreign-written V2 checkpoint reaches it.</para>
+    ///
+    /// <para>The commit files at or below the checkpoint version are DELETED before EW opens the
+    /// table, so a successful read proves the checkpoint carried the state. Without that, EW would
+    /// replay the commits and the V2 path would never be exercised at all.</para>
+    ///
+    /// <para>A <c>DELETE</c> runs first so the table has a remove tombstone. Tombstones are the part
+    /// no file-set comparison would notice were missing — a checkpoint that drops them still yields
+    /// the correct ACTIVE file set, and only VACUUM safety and streaming readers break. That is the
+    /// bug this repository shipped in its own V2 writer (#73), so the assertion is deliberate.</para>
+    /// </summary>
+    [Fact]
+    public async Task SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var written = Spark.Invoke("v2_checkpoint", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 1L, "us" },
+                new object[] { 2L, "eu" },
+                new object[] { 3L, "ap" },
+            },
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+        });
+
+        // The reference form: a UUID-named JSON body. delta-spark 4.0.0 writes this rather than the
+        // parquet-bodied variant EW declines (#70), which is why that gap is a compatibility ceiling
+        // rather than a blocker for reading Spark's output.
+        var logFiles = written.GetProperty("log_files").EnumerateArray()
+            .Select(f => f.GetString()!).ToList();
+        Assert.Contains(logFiles, f =>
+            f.Contains(".checkpoint.", StringComparison.Ordinal) &&
+            f.EndsWith(".json", StringComparison.Ordinal));
+
+        // File actions went to a sidecar, so the sidecar resolution path is exercised too.
+        Assert.NotEmpty(written.GetProperty("sidecars").EnumerateArray());
+
+        long checkpointVersion = ParseCheckpointVersion(logFiles);
+
+        // Hide everything the checkpoint subsumes. A read that still works came from the checkpoint.
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        foreach (string commit in Directory.GetFiles(logDir, "*.json"))
+        {
+            string name = Path.GetFileName(commit);
+            if (name.Contains(".checkpoint.", StringComparison.Ordinal)) continue;
+            if (long.TryParse(Path.GetFileNameWithoutExtension(name), out long v) &&
+                v <= checkpointVersion)
+            {
+                File.Delete(commit);
+            }
+        }
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var snapshot = table.CurrentSnapshot;
+
+        Assert.Equal(checkpointVersion, snapshot.Version);
+
+        // Protocol and metadata survived as non-file actions in the checkpoint body.
+        Assert.Contains("v2Checkpoint", snapshot.Protocol.ReaderFeatures ?? []);
+        Assert.NotEmpty(snapshot.Metadata.Id);
+
+        // The data: the DELETE removed id=2.
+        var rows = await ReadAllViaEw(table);
+        Assert.Equal([(1L, "us"), (3L, "ap")], rows);
+
+        // NOT just file-set parity. The DELETE rewrote a file, so the checkpoint must carry the
+        // remove tombstone for the file it replaced.
+        Assert.NotEmpty(snapshot.Tombstones);
+    }
+
+    /// <summary>The version of the UUID-named checkpoint in a log listing.</summary>
+    private static long ParseCheckpointVersion(IEnumerable<string> logFiles)
+    {
+        foreach (string f in logFiles)
+        {
+            int marker = f.IndexOf(".checkpoint.", StringComparison.Ordinal);
+            if (marker > 0 && f.EndsWith(".json", StringComparison.Ordinal) &&
+                long.TryParse(f[..marker], out long v))
+            {
+                return v;
+            }
+        }
+
+        throw new InvalidOperationException(
+            "no UUID-named checkpoint in the log: " + string.Join(", ", logFiles));
+    }
 }
