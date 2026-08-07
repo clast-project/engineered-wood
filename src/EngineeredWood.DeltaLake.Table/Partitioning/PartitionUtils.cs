@@ -125,20 +125,6 @@ internal static class PartitionUtils
     }
 
     /// <summary>
-    /// Builds a directory path for partition values (e.g., "date=2024-01-01/region=us").
-    /// Values are URI-encoded for safety.
-    /// </summary>
-    public static string BuildPartitionPath(Dictionary<string, string> partitionValues)
-    {
-        if (partitionValues.Count == 0)
-            return "";
-
-        return string.Join("/",
-            partitionValues.Select(kv =>
-                $"{DeltaPath.EscapePathName(kv.Key)}={(kv.Value is null ? "__HIVE_DEFAULT_PARTITION__" : DeltaPath.EscapePathName(kv.Value))}"));
-    }
-
-    /// <summary>
     /// Adds partition columns as constant-value arrays to a RecordBatch read from a data file.
     /// The partition columns are appended at the positions matching the full table schema.
     /// Under column mapping a file's <paramref name="partitionValues"/> are keyed by the PHYSICAL column name

@@ -4,12 +4,12 @@
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.Expressions;
 
-namespace EngineeredWood.DeltaLake.Table.Concurrency;
+namespace EngineeredWood.DeltaLake.Concurrency;
 
 /// <summary>
 /// The kind of conflict a validation found, or <see cref="None"/> when the transaction may proceed.
 /// </summary>
-internal enum ConflictType
+public enum ConflictType
 {
     None,
 
@@ -30,7 +30,7 @@ internal enum ConflictType
 }
 
 /// <summary>Result of a conflict check: the type, the version that caused it, and a human-readable reason.</summary>
-internal sealed record ConflictResult(ConflictType Type, long ConflictingVersion, string? Message)
+public sealed record ConflictResult(ConflictType Type, long ConflictingVersion, string? Message)
 {
     public static readonly ConflictResult None = new(ConflictType.None, -1, null);
 
@@ -51,7 +51,7 @@ internal sealed record ConflictResult(ConflictType Type, long ConflictingVersion
 /// concurrent add matches. A blind append (<see cref="Blind"/>) reads nothing, so only metadata,
 /// protocol, and delete/delete conflicts can touch it.</para>
 /// </summary>
-internal sealed record ReadSet
+public sealed record ReadSet
 {
     /// <summary>Read predicates; a concurrent add satisfying any of them conflicts (concurrentAppend).</summary>
     public IReadOnlyList<Predicate> Predicates { get; init; } = [];
@@ -91,7 +91,7 @@ internal sealed record ReadSet
 /// this transaction runs at <see cref="IsolationLevel.WriteSerializable"/>.</item>
 /// </list>
 /// </summary>
-internal static class ConflictChecker
+public static class ConflictChecker
 {
     /// <summary>
     /// Validates a transaction against the commits that landed since it started.
