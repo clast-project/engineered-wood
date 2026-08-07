@@ -420,12 +420,17 @@ checkpoint, which the spec requires of a writer. A host that wants V2
 must call `V2CheckpointWriter` itself and check the protocol itself.
 
 **Parquet-bodied V2 checkpoints on read.** `n.checkpoint.{uuid}.parquet`
-is deliberately not claimed by `LogListing` — only the NDJSON body is
-decoded — while `v2Checkpoint` is listed as a supported *reader* feature
-in `ProtocolVersions`. A table whose newest checkpoint uses the Parquet
-body therefore passes protocol validation and then falls back to commit
-replay; if log cleanup has removed those commits it fails late with
-"Delta log is incomplete" rather than naming the real cause.
+is not decoded — only the NDJSON body is. `v2Checkpoint` remains a
+supported *reader* feature, which is correct: the JSON form is read, and
+refusing the feature outright would reject tables that read perfectly.
+
+A table carrying the Parquet body is still read normally whenever
+anything else covers the range (its commits, or an older readable
+checkpoint). Only when that checkpoint is the sole route to the requested
+version does the read fail, and it now fails with
+`DELTA_UNSUPPORTED_CHECKPOINT_FORMAT` naming the checkpoint — previously
+it reported "Delta log is incomplete", sending the reader to look at
+retention settings for what is a limitation of this decoder.
 
 Measured 2026-08-06: delta-spark 4.0.0 with `delta.checkpointPolicy=v2`
 writes the **JSON** body (`<n>.checkpoint.<uuid>.json` plus a Parquet

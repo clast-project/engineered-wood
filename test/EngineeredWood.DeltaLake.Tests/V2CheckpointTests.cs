@@ -533,6 +533,107 @@ public class V2CheckpointTests : IDisposable
         Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
     }
 
+    /// <summary>
+    /// Writes a Parquet-bodied V2 checkpoint name at <paramref name="version"/>. The contents do not
+    /// matter: the listing decides what it can decode from the NAME, and this reader never opens it.
+    /// </summary>
+    private void PlaceParquetBodiedV2Checkpoint(long version) =>
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{version:D20}.checkpoint.{Guid.NewGuid()}.parquet"),
+            "not really parquet");
+
+    /// <summary>
+    /// A table whose only route to the requested version runs through a Parquet-bodied V2 checkpoint
+    /// must say so, rather than blaming the log.
+    /// </summary>
+    /// <remarks>
+    /// Both failures leave the same hole in the replay, so both used to surface as "Delta log is
+    /// incomplete: version N is missing" — which points a user at retention settings for what is
+    /// really a limitation of this reader. That confusion was not hypothetical: the same message was
+    /// what a perfectly readable Spark table produced for an unrelated reason (#74), and the two were
+    /// indistinguishable.
+    /// </remarks>
+    [Fact]
+    public async Task ParquetBodiedV2Checkpoint_IsNamedAsTheCause_NotTheLog()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-body"));
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        PlaceParquetBodiedV2Checkpoint(1);
+
+        // Cleanup removed what that checkpoint subsumes, so it is the only way to version 1.
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs)));
+
+        Assert.Equal(DeltaErrorCodes.UnsupportedCheckpointFormat, ex.ErrorCode);
+        Assert.NotEqual(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
+
+        // The message must not send anyone to look at log retention.
+        Assert.Contains("Parquet-bodied", ex.Message);
+        Assert.DoesNotContain("incomplete", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The case that must NOT change: a table carrying a Parquet-bodied V2 checkpoint is still read
+    /// normally when something else covers the range. Recognising the form must not become a reason
+    /// to refuse a table we can read.
+    /// </summary>
+    [Fact]
+    public async Task ParquetBodiedV2Checkpoint_DoesNotRefuseAnOtherwiseReadableTable()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-tolerated"));
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        // Present, unreadable, and entirely beside the point: the commits still cover [0..1].
+        PlaceParquetBodiedV2Checkpoint(1);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(1, snapshot.Version);
+        Assert.Contains("a.parquet", snapshot.ActiveFiles.Keys);
+    }
+
+    /// <summary>
+    /// And when an older readable checkpoint covers the gap, that is used — the unreadable one is not
+    /// allowed to poison checkpoint selection.
+    /// </summary>
+    [Fact]
+    public async Task ParquetBodiedV2Checkpoint_DoesNotDisplaceAReadableOlderCheckpoint()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-fallback"));
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        // A readable checkpoint at 1 …
+        var atOne = await SnapshotBuilder.BuildAsync(log);
+        await new CheckpointWriter(fs).WriteCheckpointAsync(atOne);
+
+        await log.WriteCommitAsync(2, [Add("b.parquet")]);
+
+        // … and an unreadable one at 2, which is newer and would otherwise be preferred.
+        PlaceParquetBodiedV2Checkpoint(2);
+
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(2, snapshot.Version);
+        Assert.Contains("a.parquet", snapshot.ActiveFiles.Keys);
+        Assert.Contains("b.parquet", snapshot.ActiveFiles.Keys);
+    }
+
     private static List<DeltaAction> CreateCommit(string id) =>
     [
         new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },

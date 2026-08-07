@@ -50,6 +50,19 @@ public static class DeltaErrorCodes
     public const string TruncatedTransactionLog = "DELTA_TRUNCATED_TRANSACTION_LOG";
 
     /// <summary>
+    /// A checkpoint the table depends on is in a form this implementation recognises but cannot
+    /// decode, and no other route to the requested version exists.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="TruncatedTransactionLog"/>, which it would otherwise be
+    /// mistaken for: nothing is missing from the log, and no amount of retention tuning will help.
+    /// The remedy is a newer version of this library, or a writer that emits a form it reads.</para>
+    /// <para>No delta-spark equivalent, and for the usual instructive reason: Spark decodes every
+    /// checkpoint form the spec defines, so the condition does not arise there.</para>
+    /// </remarks>
+    public const string UnsupportedCheckpointFormat = "DELTA_UNSUPPORTED_CHECKPOINT_FORMAT";
+
+    /// <summary>
     /// The log replayed to its end without yielding a protocol or a metadata action, so there is no
     /// table state to describe.
     /// </summary>
