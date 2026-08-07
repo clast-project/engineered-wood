@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
@@ -2634,11 +2634,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
-                // NOT checkpointed here, matching the behaviour this loop has always had: only the batch
-                // write path (CommitWriteAsync) and CommitDataFilesAsync auto-checkpoint, so a table written
-                // exclusively through DML never gets one. Worth revisiting — it is an accident of where the
-                // call happened to sit rather than a decision — but it is not this refactoring's to change.
-                WriteCheckpointOnInterval = false,
+                // Checkpoint here too. This line used to be `false`, with a comment calling it "an
+                // accident of where the call happened to sit rather than a decision" — see #86.
+                //
+                // CommitOccAsync has six callers: the transaction commit, the row-level DML, the
+                // copy-on-write rewrites, compaction, and the schema changes. Opting out here meant a table
+                // written through anything but a plain batch append never got a checkpoint, and so never
+                // published a `_last_checkpoint` either. Three consequences, compounding: every open
+                // replays the log from v0; foreign readers get no resume hint; and commits accumulate
+                // without bound, because log cleanup is defined in terms of what a checkpoint subsumes, so
+                // with no checkpoint nothing can ever be reclaimed.
+                //
+                // No new mechanism — the condition (interval reached, writer present) and the ordering
+                // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
+                // own, identical to the batch write path that already sets this. LogCommitRequest's default
+                // is already true; this stops opting out.
+                WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
                 // refreshing from it replays fewer versions for the same result.
                 RefreshFrom = CurrentSnapshot,
