@@ -8,9 +8,10 @@ namespace EngineeredWood.DeltaLake;
 /// <summary>
 /// Path escaping for Delta tables. Two DISTINCT layers exist (both matching Spark):
 /// <list type="number">
-/// <item><see cref="EscapePathName"/> — Hive-style escaping applied to a partition VALUE when building the
-/// partition directory name on disk (escapes <c>/</c>, <c>:</c>, <c>%</c>, … as <c>%XX</c>; a space is NOT
-/// escaped). This is what makes the physical directory name filesystem-safe.</item>
+/// <item><see cref="EscapePathName(string)"/> — Hive-style escaping applied to a partition VALUE when
+/// building the partition directory name on disk (escapes <c>/</c>, <c>:</c>, <c>%</c>, … as <c>%XX</c>).
+/// This is what makes the physical directory name filesystem-safe, and its escape set is
+/// PLATFORM-DEPENDENT — see the remarks there.</item>
 /// <item><see cref="Encode"/>/<see cref="Decode"/> — the <c>add.path</c> field in the transaction log is the
 /// URL-encoded (RFC 2396) form of the on-disk relative path, so a literal <c>%</c> from layer 1 becomes
 /// <c>%25</c> and a space becomes <c>%20</c>. Readers (Spark, delta-kernel, delta-rs) URL-DECODE
@@ -20,17 +21,66 @@ namespace EngineeredWood.DeltaLake;
 public static class DeltaPath
 {
     /// <summary>
-    /// Escapes a partition value for use as a directory name, matching Spark's
-    /// <c>ExternalCatalogUtils.escapePathName</c> (control chars and <c>"#%'*/:=?\{[]}^</c> become
-    /// <c>%XX</c>; a space stays literal).
+    /// True when <see cref="EscapePathName(string)"/> should apply Spark's Windows-only additions to the
+    /// escape table. Cached rather than re-tested because it gates a per-character branch.
     /// </summary>
-    public static string EscapePathName(string value)
+    private static readonly bool WindowsEscapeRules =
+#if NET5_0_OR_GREATER
+        OperatingSystem.IsWindows();
+#else
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+#endif
+
+    /// <summary>
+    /// Escapes a partition value for use as a directory name, matching Spark's
+    /// <c>ExternalCatalogUtils.escapePathName</c>: control characters and <c>"#%'*/:=?\{[]^</c> become
+    /// <c>%XX</c>, and on Windows also <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c> and <c>'|'</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The escape set is platform-dependent because Spark's is.</b> Spark's
+    /// <c>charToEscape</c> bit set is Hive's, plus — under <c>if (Shell.WINDOWS)</c> — <c>' '</c>,
+    /// <c>'&lt;'</c>, <c>'&gt;'</c> and <c>'|'</c>, which are exactly the characters Win32 rejects in a
+    /// path component that the Hive-inherited set leaves alone. The same value therefore yields
+    /// <c>region=a b</c> on Linux and <c>region=a%20b</c> on Windows, and matching the reference
+    /// implementation MEANS branching here rather than picking one set for every platform.
+    /// </para>
+    ///
+    /// <para>MEASURED against pyspark 4.0.1 / delta-spark 4.0.0 on Windows 11 by enumerating
+    /// <c>escapePathName</c> over the whole ASCII range. Hive's own <c>FileUtils.escapePathName</c>,
+    /// called from the SAME JVM, does not add the four — so the branch is Spark's own, not something
+    /// inherited from Hadoop. delta-rs escapes all four on every platform, so on Windows all three
+    /// implementations agree on the directory name.</para>
+    ///
+    /// <para>Escaping the four is also what makes a trailing space writable at all: Win32 silently strips
+    /// a trailing space from a path component, so <c>region=a b </c> creates <c>region=a b</c> and then
+    /// fails to open the file underneath it, leaving a stray directory behind. <c>region=a%20b%20</c> has
+    /// no such problem.</para>
+    ///
+    /// <para>The physical directory name is not a durable interop key in any case. MEASURED: Spark on
+    /// Windows reads a table whose partition directories were written on POSIX, and appends to it in a
+    /// SECOND directory beside the first — two physical names, one logical partition value, both read
+    /// back correctly. Readers resolve files through <c>add.path</c>, never by parsing directory names.</para>
+    ///
+    /// <para>Two deliberate one-character notes. <c>'}'</c> is NOT escaped: Spark's list is
+    /// <c>{ [ ] ^</c> with no closing brace, and EW escaped it until the enumeration above said
+    /// otherwise. <c>'\0'</c> IS escaped even though Spark's table starts at <c></c> — no filesystem
+    /// can hold a NUL in a name, so there is no Spark-written table to diverge from, and escaping keeps
+    /// such a value writable rather than fatal.</para>
+    /// </remarks>
+    public static string EscapePathName(string value) => EscapePathName(value, WindowsEscapeRules);
+
+    /// <summary>
+    /// <see cref="EscapePathName(string)"/> with the platform gate supplied explicitly, so tests can pin
+    /// BOTH escape sets whichever machine they happen to run on.
+    /// </summary>
+    internal static string EscapePathName(string value, bool windowsRules)
     {
         StringBuilder? sb = null;
         for (int i = 0; i < value.Length; i++)
         {
             char c = value[i];
-            if (NeedsPathEscaping(c))
+            if (NeedsPathEscaping(c, windowsRules))
             {
                 sb ??= new StringBuilder(value.Length + 8).Append(value, 0, i);
                 sb.Append('%').Append(((int)c).ToString("X2", System.Globalization.CultureInfo.InvariantCulture));
@@ -43,11 +93,12 @@ public static class DeltaPath
         return sb?.ToString() ?? value;
     }
 
-    private static bool NeedsPathEscaping(char c) => c switch
+    private static bool NeedsPathEscaping(char c, bool windowsRules) => c switch
     {
         < ' ' or '\u007f' => true,
         '"' or '#' or '%' or '\'' or '*' or '/' or ':' or '=' or '?' or '\\' => true,
-        '{' or '[' or ']' or '}' or '^' => true,
+        '{' or '[' or ']' or '^' => true,
+        ' ' or '<' or '>' or '|' => windowsRules,
         _ => false,
     };
 
@@ -65,23 +116,20 @@ public static class DeltaPath
     /// the <c>%</c> → <c>%25</c> double-encoding of whatever layer 1 already escaped.</para>
     ///
     /// <para><b>Under-escaping here is a correctness bug, and it fails the whole table rather than one
-    /// file.</b> This set held only <c>%</c>, space, <c>#</c> and <c>?</c>, which is enough for EW to
-    /// round-trip its OWN tables — every other character decodes to itself, so <see cref="Decode"/> still
-    /// recovers the right name, and <c>%</c>, the one character where under-escaping would silently
-    /// resolve to the WRONG file, was already covered. Spark is not so forgiving. MEASURED on pyspark
-    /// 4.0.1 / delta-spark 4.0.0: Delta passes <c>add.path</c> through <c>new URI(…)</c> inside its
-    /// <c>CanonicalPathFunction</c> UDF, so one literal URI-illegal character raises
-    /// <c>java.net.URISyntaxException: Illegal character in path</c> and the read of the ENTIRE TABLE
-    /// fails with <c>FAILED_READ_FILE</c> — no partial result, no skipped file.</para>
+    /// file.</b> It is invisible from inside EW: every character except <c>%</c> decodes to itself, so
+    /// <see cref="Decode"/> recovers the right name regardless, and <c>%</c> — the one character where
+    /// under-escaping resolves to the WRONG file — was covered even by the four-character set this
+    /// replaced. Spark is not so forgiving. MEASURED on pyspark 4.0.1 / delta-spark 4.0.0: Delta passes
+    /// <c>add.path</c> through <c>new URI(…)</c> inside its <c>CanonicalPathFunction</c> UDF, so one
+    /// literal URI-illegal character raises <c>java.net.URISyntaxException: Illegal character in path</c>
+    /// and the read of the ENTIRE TABLE fails with <c>FAILED_READ_FILE</c> — no partial result, no
+    /// skipped file.</para>
     ///
-    /// <para>Which characters actually reach here is decided by layer 1, and exactly four did:
-    /// <c>'&lt;'</c>, <c>'&gt;'</c>, <c>'|'</c> and <c>'`'</c> are in no layer-1 escape table, so they
-    /// arrived literally and this is the only place they are escaped. On Windows the first three cannot
-    /// reach a written table at all (Win32 rejects them in a path component — GitHub issue #84), so the
-    /// failure this fixes is a POSIX-written table read by Spark, plus the backtick on every platform.
-    /// The rest of the set is unreachable because <see cref="EscapePathName"/> escaped it first; it is
-    /// included anyway so that this function IS Spark's layer 2, rather than a subset that happens to
-    /// suffice for the values layer 1 lets through today.</para>
+    /// <para>Most of this set is unreachable from a partition directory because
+    /// <see cref="EscapePathName(string)"/> escaped it first — but <c>'}'</c> and <c>'`'</c> are NOT in
+    /// layer 1's table on any platform, and <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c>, <c>'|'</c> are not
+    /// in it on POSIX. Those six reach layer 2 literally, and are why this set is wider than the four
+    /// characters it used to hold.</para>
     ///
     /// <para>Two characters Hadoop treats specially are deliberately absent. It REJECTS a literal
     /// <c>':'</c> outright (it reads as a URI scheme) and rewrites <c>'\'</c> to <c>'/'</c> rather than

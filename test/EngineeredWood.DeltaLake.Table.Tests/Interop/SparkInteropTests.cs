@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -2581,7 +2582,15 @@ public class SparkInteropTests : IDisposable
 
     // ── Partition path encoding ──
 
-    private static readonly string[] AwkwardPartitionValues = ["café", "日本", "a b#c?d"];
+    /// <summary>
+    /// Partition values chosen to exercise every corner of Spark's escape table: non-ASCII (never
+    /// escaped), the always-escaped <c>#</c>/<c>?</c>, and the four characters Spark escapes ONLY on
+    /// Windows — <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c>, <c>'|'</c>. The trailing space is the case
+    /// that used to leave a stray stripped-name directory behind on Windows and then throw
+    /// (GitHub issue #84); <c>}</c> is here because EW escaped it and Spark never has.
+    /// </summary>
+    private static readonly string[] AwkwardPartitionValues =
+        ["café", "日本", "a b#c?d", "a<b>c|d", "a b ", "a}b"];
 
     /// <summary>Partition directories under a table root, relative and slash-normalised.</summary>
     private static List<string> PartitionDirectories(string root) =>
@@ -2600,13 +2609,24 @@ public class SparkInteropTests : IDisposable
     /// <para>The finding that matters is what Spark does NOT escape. Non-ASCII stays literal at BOTH
     /// layers: <c>region=café</c> on disk and <c>region=café</c> in the log. Spark's
     /// <c>ExternalCatalogUtils.escapePathName</c> bounds its escape table at <c>c &lt; 128</c>, so no
-    /// character above ASCII is ever escaped, and space is absent from the table as well.</para>
+    /// character above ASCII is ever escaped. <c>}</c> is absent from the table too, even though the
+    /// three other bracket characters are in it — layer 2 is where it finally gets escaped, which makes
+    /// it the one value here that the two layers treat differently.</para>
+    ///
+    /// <para><b>Space is the platform-dependent one, and the expectation below has to branch because
+    /// Spark does.</b> Spark's <c>charToEscape</c> adds <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c> and
+    /// <c>'|'</c> under <c>if (Shell.WINDOWS)</c>, so the SAME Spark build writes <c>region=a b…</c> on
+    /// macOS and <c>region=a%20b…</c> on Windows. Pinning either form unconditionally makes this test
+    /// fail on the other OS through no fault of EW's, which is exactly what it did until issue #85.</para>
     ///
     /// <para>This is worth pinning because delta-rs does something DIFFERENT — it percent-encodes
     /// non-ASCII as UTF-8 bytes (<c>region=caf%C3%A9</c>), as
     /// <c>DeltaRsInteropTests.DeltaRs_NonAsciiPartition_PathEncodingGroundTruth</c> records. Reading
     /// only that measurement would suggest EW is the odd one out and should be "fixed" to match, which
-    /// would break parity with the reference implementation instead of achieving it.</para>
+    /// would break parity with the reference implementation instead of achieving it. Note that on
+    /// Windows the two converge on the four characters above — delta-rs escapes them everywhere — so a
+    /// Windows-only measurement cannot tell the two encodings apart. It is still the non-ASCII case
+    /// that separates them, on every platform.</para>
     /// </summary>
     [Fact]
     public void Spark_NonAsciiPartition_PathEncodingGroundTruth()
@@ -2623,6 +2643,7 @@ public class SparkInteropTests : IDisposable
                 new object[] { 1L, "café" },
                 new object[] { 2L, "日本" },
                 new object[] { 3L, "a b#c?d" },
+                new object[] { 4L, "a}b" },
             },
         });
 
@@ -2631,24 +2652,40 @@ public class SparkInteropTests : IDisposable
         var addPaths = written.GetProperty("add_paths").EnumerateArray()
             .Select(p => p.GetString()!).ToList();
 
-        // Layer 1 — non-ASCII literal; '#' and '?' escaped; space left alone.
+        bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        // Layer 1 — non-ASCII literal; '#' and '?' escaped; '}' left alone; space only escaped on Windows.
         Assert.Contains("region=café", dirs);
         Assert.Contains("region=日本", dirs);
-        Assert.Contains("region=a b%23c%3Fd", dirs);
+        Assert.Contains("region=a}b", dirs);
+        Assert.Contains(windows ? "region=a%20b%23c%3Fd" : "region=a b%23c%3Fd", dirs);
 
-        // Layer 2 — non-ASCII still literal; space becomes %20; layer 1's '%' becomes %25.
+        // Layer 2 — non-ASCII STILL literal, because Spark's layer 2 is Java's URI quoting via
+        // Path.toUri().toString(), and toString() leaves non-ASCII alone (toASCIIString() would not).
+        // A space becomes %20 whether or not layer 1 escaped it, so layer 1's Windows '%20' shows up
+        // here as '%2520'. And '}' — untouched by layer 1 on every platform — IS escaped here, which is
+        // the only place in the two layers that it ever gets escaped.
         Assert.Contains(addPaths, p => p.StartsWith("region=café/", StringComparison.Ordinal));
         Assert.Contains(addPaths, p => p.StartsWith("region=日本/", StringComparison.Ordinal));
-        Assert.Contains(addPaths, p => p.StartsWith("region=a%20b%2523c%253Fd/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith("region=a%7Db/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith(
+            windows ? "region=a%2520b%2523c%253Fd/" : "region=a%20b%2523c%253Fd/", StringComparison.Ordinal));
     }
 
     /// <summary>
     /// EW's partition paths are byte-identical to Spark's, for the same values, at both layers.
     /// </summary>
     /// <remarks>
-    /// Asserted against Spark's output captured in the same test run rather than against literals, so
-    /// the two can never drift apart silently — if delta-spark ever changes its escaping, this fails
-    /// rather than quietly pinning a stale expectation.
+    /// <para>Asserted against Spark's output captured in the same test run rather than against literals,
+    /// so the two can never drift apart silently — if delta-spark ever changes its escaping, this fails
+    /// rather than quietly pinning a stale expectation. That property is what makes this test
+    /// platform-agnostic for free: Spark's escape table differs on Windows, and both sides of the
+    /// comparison move together.</para>
+    ///
+    /// <para>Three of <see cref="AwkwardPartitionValues"/> could not be written by EW on Windows at all
+    /// before issue #84 — <c>&lt;</c>, <c>&gt;</c> and <c>|</c> reached <c>CreateDirectory</c> literally
+    /// and Win32 rejected them, and a trailing space created a stripped-name directory and then threw.
+    /// So on Windows this test now also covers "EW can write these", not only "EW agrees with Spark".</para>
     /// </remarks>
     [Fact]
     public async Task EwPartitionPaths_AreIdenticalToSparks()
@@ -2660,23 +2697,20 @@ public class SparkInteropTests : IDisposable
         Directory.CreateDirectory(sparkDir);
         Directory.CreateDirectory(ewDir);
 
+        long[] ids = [.. Enumerable.Range(1, AwkwardPartitionValues.Length).Select(i => (long)i)];
+
         var written = Spark.Invoke("partition_paths", new
         {
             path = sparkDir,
             schema = "id long, region string",
             partition_by = new[] { "region" },
-            rows = new object[]
-            {
-                new object[] { 1L, AwkwardPartitionValues[0] },
-                new object[] { 2L, AwkwardPartitionValues[1] },
-                new object[] { 3L, AwkwardPartitionValues[2] },
-            },
+            rows = ids.Select(id => new object[] { id, AwkwardPartitionValues[id - 1] }).ToArray(),
         });
 
         await using (var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(ewDir), IdRegionSchema, partitionColumns: ["region"]))
         {
-            await table.WriteAsync([IdRegionBatch([1, 2, 3], AwkwardPartitionValues)]);
+            await table.WriteAsync([IdRegionBatch(ids, AwkwardPartitionValues)]);
         }
 
         // Layer 1: the directory names on disk.
