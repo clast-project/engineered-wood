@@ -29,6 +29,18 @@ internal sealed class LogListing
     /// <summary>Version to the path of its <c>&lt;version&gt;.checkpoint.&lt;uuid&gt;.json</c>.</summary>
     public Dictionary<long, string> V2Checkpoints { get; } = [];
 
+    /// <summary>
+    /// Version to the path of a checkpoint this reader RECOGNISES but cannot decode — currently the
+    /// Parquet-bodied V2 form, <c>&lt;version&gt;.checkpoint.&lt;uuid&gt;.parquet</c>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately kept out of <see cref="V2Checkpoints"/> and out of checkpoint SELECTION: a table
+    /// carrying one may still be perfectly readable from an older checkpoint or from its commits, and
+    /// refusing it would be wrong. Recorded only so that a replay which fails for want of the versions
+    /// this checkpoint covers can name the real cause instead of blaming the log.
+    /// </remarks>
+    public Dictionary<long, string> UnreadableCheckpoints { get; } = [];
+
     /// <summary>Version to declared part count to the part numbers actually present.</summary>
     public Dictionary<long, Dictionary<int, HashSet<int>>> MultiPartCheckpoints { get; } = [];
 
@@ -97,11 +109,19 @@ internal sealed class LogListing
                 byTotal[total] = seen = [];
             seen.Add(part);
         }
-        // <version>.checkpoint.<uuid>.json. The parquet-bodied V2 form is deliberately not claimed:
-        // CheckpointReader only decodes NDJSON, so claiming it would just fail the read.
+        // <version>.checkpoint.<uuid>.json — the V2 form this reader decodes.
         else if (suffix is [_, "json"])
         {
             V2Checkpoints[version] = DeltaVersion.LogPrefix + fileName;
+        }
+        // <version>.checkpoint.<uuid>.parquet — the Parquet-bodied V2 form, which CheckpointReader
+        // cannot decode. Recognised rather than ignored: claiming it would fail the read, but
+        // discarding it silently left a table whose only checkpoint took this form failing with
+        // "Delta log is incomplete", which blames log retention for a decoding limitation. A UUID
+        // name is the only 2-part parquet suffix — classic is 1 part, multi-part is 3.
+        else if (suffix is [_, "parquet"])
+        {
+            UnreadableCheckpoints[version] = DeltaVersion.LogPrefix + fileName;
         }
     }
 

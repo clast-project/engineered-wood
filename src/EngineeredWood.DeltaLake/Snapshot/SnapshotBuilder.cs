@@ -194,16 +194,11 @@ public sealed class SnapshotBuilder
             firstMissing ??= nextNeeded;
 
         if (firstMissing is long missing)
-            throw IncompleteLog(missing, firstNeeded, targetVersion);
+            throw ReplayGap(listing, missing, firstNeeded, targetVersion);
 
         return builder.Build();
     }
 
-    /// <summary>
-    /// A replay that cannot cover its whole range would silently return a snapshot missing whatever the
-    /// absent commits did. Naming the first uncovered version turns that into something diagnosable: on a
-    /// table whose log has been cleaned it points at the checkpoint that should have been found.
-    /// </summary>
     /// <summary>
     /// Whether two checkpoint candidates name the same file, so that retrying the second after the
     /// first failed would only repeat the same read.
@@ -214,6 +209,42 @@ public sealed class SnapshotBuilder
         && listed.Parts == hint.Parts
         && string.Equals(listed.V2CheckpointPath, hint.V2CheckpointPath, StringComparison.Ordinal);
 
+    /// <summary>
+    /// The exception for a replay that could not cover its whole range — which is two different
+    /// failures wearing the same symptom, and this decides which one it was.
+    /// </summary>
+    /// <remarks>
+    /// A checkpoint in a form we recognise but cannot decode leaves exactly the same hole in the
+    /// replay as a deleted commit. Reporting both as "the log is incomplete" sent a user to look at
+    /// retention settings for what is really a limitation of this reader, so a checkpoint that would
+    /// have covered the gap is named as the cause instead.
+    /// </remarks>
+    private static DeltaFormatException ReplayGap(
+        LogListing listing, long missing, long from, long through)
+    {
+        foreach (var (version, path) in listing.UnreadableCheckpoints)
+        {
+            // Only a checkpoint inside the hole is an explanation for it: one below `missing` was
+            // never needed, and one above `through` is not on the path to the requested version.
+            if (version >= missing && version <= through)
+            {
+                return new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedCheckpointFormat,
+                    $"Version {through} needs the checkpoint at version {version} ('{path}'), which " +
+                    "is a Parquet-bodied V2 checkpoint. This implementation decodes only the NDJSON " +
+                    "V2 body, so the versions it covers cannot be reconstructed. The log is intact — " +
+                    "this is a limitation of this reader, not missing history.");
+            }
+        }
+
+        return IncompleteLog(missing, from, through);
+    }
+
+    /// <summary>
+    /// A replay that cannot cover its whole range would silently return a snapshot missing whatever the
+    /// absent commits did. Naming the first uncovered version turns that into something diagnosable: on a
+    /// table whose log has been cleaned it points at the checkpoint that should have been found.
+    /// </summary>
     private static DeltaFormatException IncompleteLog(long missing, long from, long through) =>
         new(DeltaErrorCodes.TruncatedTransactionLog,
             $"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
