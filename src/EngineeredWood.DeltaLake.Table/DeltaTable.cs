@@ -5600,7 +5600,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool identityValuesPreGenerated = false,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
         bool dataChange = true,
-        string? clusteringProvider = null)
+        string? clusteringProvider = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5677,6 +5678,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // not before — the fix is a public opt-out on the request rather than a quiet revert here.
                 // That reopens a real hole, so it should be asked for rather than offered.
                 Reads = ReadSet.Blind,
+                // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
+                // Reads above: that is hardcoded Blind here because this method has no way to know, which
+                // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
+                IsBlindAppend = isBlindAppend,
             },
             cancellationToken).ConfigureAwait(false);
 
