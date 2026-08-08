@@ -52,16 +52,50 @@ public static class DeltaPath
     };
 
     /// <summary>
-    /// URL-encodes an on-disk relative path into the <c>add.path</c> log form: <c>%</c>, space, <c>#</c>,
-    /// <c>?</c> and control characters become <c>%XX</c>; <c>/</c> and everything else stay literal.
+    /// URL-encodes an on-disk relative path into the <c>add.path</c> log form: control characters and
+    /// <c>&#32;"#%&lt;&gt;?[]^`{|}</c> become <c>%XX</c>; <c>/</c>, non-ASCII and everything else stay
+    /// literal.
     /// </summary>
+    /// <remarks>
+    /// <para>MEASURED, not derived: Spark's layer 2 is <c>new Path(rel).toUri().toString()</c>, i.e. Java
+    /// URI quoting of the ASCII characters illegal in a URI path — and <c>toString()</c> rather than
+    /// <c>toASCIIString()</c>, which is why <c>café</c> and <c>日本</c> stay literal here while delta-rs
+    /// percent-encodes them as UTF-8 bytes. Enumerating <c>Path.toUri().toString()</c> over the ASCII
+    /// range on pyspark 4.0.1 reproduces every <c>add.path</c> observed from real Delta writes, including
+    /// the <c>%</c> → <c>%25</c> double-encoding of whatever layer 1 already escaped.</para>
+    ///
+    /// <para><b>Under-escaping here is a correctness bug, and it fails the whole table rather than one
+    /// file.</b> This set held only <c>%</c>, space, <c>#</c> and <c>?</c>, which is enough for EW to
+    /// round-trip its OWN tables — every other character decodes to itself, so <see cref="Decode"/> still
+    /// recovers the right name, and <c>%</c>, the one character where under-escaping would silently
+    /// resolve to the WRONG file, was already covered. Spark is not so forgiving. MEASURED on pyspark
+    /// 4.0.1 / delta-spark 4.0.0: Delta passes <c>add.path</c> through <c>new URI(…)</c> inside its
+    /// <c>CanonicalPathFunction</c> UDF, so one literal URI-illegal character raises
+    /// <c>java.net.URISyntaxException: Illegal character in path</c> and the read of the ENTIRE TABLE
+    /// fails with <c>FAILED_READ_FILE</c> — no partial result, no skipped file.</para>
+    ///
+    /// <para>Which characters actually reach here is decided by layer 1, and exactly four did:
+    /// <c>'&lt;'</c>, <c>'&gt;'</c>, <c>'|'</c> and <c>'`'</c> are in no layer-1 escape table, so they
+    /// arrived literally and this is the only place they are escaped. On Windows the first three cannot
+    /// reach a written table at all (Win32 rejects them in a path component — GitHub issue #84), so the
+    /// failure this fixes is a POSIX-written table read by Spark, plus the backtick on every platform.
+    /// The rest of the set is unreachable because <see cref="EscapePathName"/> escaped it first; it is
+    /// included anyway so that this function IS Spark's layer 2, rather than a subset that happens to
+    /// suffice for the values layer 1 lets through today.</para>
+    ///
+    /// <para>Two characters Hadoop treats specially are deliberately absent. It REJECTS a literal
+    /// <c>':'</c> outright (it reads as a URI scheme) and rewrites <c>'\'</c> to <c>'/'</c> rather than
+    /// escaping it, so there is no Spark encoding to match for either. Neither can arrive here in any
+    /// case: layer 1 escapes both, and EW composes relative paths with <c>'/'</c>.</para>
+    /// </remarks>
     public static string Encode(string fsRelativePath)
     {
         StringBuilder? sb = null;
         for (int i = 0; i < fsRelativePath.Length; i++)
         {
             char c = fsRelativePath[i];
-            bool escape = c is '%' or ' ' or '#' or '?' or < ' ' or '\u007f';
+            bool escape = c is ' ' or '"' or '#' or '%' or '<' or '>' or '?'
+                or '[' or ']' or '^' or '`' or '{' or '|' or '}' or < ' ' or '\u007f';
             if (escape)
             {
                 sb ??= new StringBuilder(fsRelativePath.Length + 8).Append(fsRelativePath, 0, i);
