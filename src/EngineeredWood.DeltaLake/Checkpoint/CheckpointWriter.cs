@@ -20,6 +20,7 @@ namespace EngineeredWood.DeltaLake.Checkpoint;
 public sealed class CheckpointWriter
 {
     private readonly ITableFileSystem _fs;
+    private readonly ParquetWriteOptions? _rawParquetOptions;
     private readonly ParquetWriteOptions? _parquetOptions;
 
     public CheckpointWriter(
@@ -27,17 +28,56 @@ public sealed class CheckpointWriter
         ParquetWriteOptions? parquetOptions = null)
     {
         _fs = fileSystem;
+        _rawParquetOptions = parquetOptions;
         _parquetOptions = CheckpointParquetOptions.For(parquetOptions);
     }
 
     /// <summary>
-    /// Writes a checkpoint Parquet file for the given snapshot,
-    /// then updates <c>_last_checkpoint</c>.
+    /// Which checkpoint spec to write. Defaults to <see cref="CheckpointFormat.Automatic"/>, which asks
+    /// the table.
+    /// </summary>
+    public CheckpointFormat Format { get; init; } = CheckpointFormat.Automatic;
+
+    /// <summary>
+    /// The writer used when a V2 checkpoint is called for, or null to construct one over the same
+    /// filesystem and parquet options. Supply one to control the sidecar policy or the body format.
+    /// </summary>
+    public V2CheckpointWriter? V2Writer { get; init; }
+
+    /// <summary>
+    /// Whether <paramref name="snapshot"/> gets a V2 checkpoint under <paramref name="format"/>.
+    /// </summary>
+    /// <remarks>
+    /// Only <see cref="CheckpointFormat.Automatic"/> consults the table. The two explicit values are the
+    /// caller overriding that, and neither is validated here — writing a V2 checkpoint to a table without
+    /// the feature is refused by <see cref="V2CheckpointWriter"/> itself, which is where the refusal
+    /// belongs, because a host driving that writer directly must hit the same gate.
+    /// </remarks>
+    internal static bool WritesV2(Snapshot.Snapshot snapshot, CheckpointFormat format) => format switch
+    {
+        CheckpointFormat.Classic => false,
+        CheckpointFormat.V2 => true,
+        _ => ProtocolVersions.SupportsV2Checkpoints(snapshot.Protocol) &&
+             CheckpointPolicy.WantsV2(snapshot.Metadata.Configuration),
+    };
+
+    /// <summary>
+    /// Writes a checkpoint for the given snapshot in whichever spec <see cref="Format"/> selects, then
+    /// updates <c>_last_checkpoint</c>.
     /// </summary>
     public async ValueTask WriteCheckpointAsync(
         Snapshot.Snapshot snapshot,
         CancellationToken cancellationToken = default)
     {
+        if (WritesV2(snapshot, Format))
+        {
+            // Constructed per checkpoint when the caller supplied none. Checkpoints are rare enough that
+            // the allocation does not matter, and it keeps this type free of the V2 writer's knobs.
+            var v2 = V2Writer ?? new V2CheckpointWriter(_fs, _rawParquetOptions);
+            await v2.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         string path = DeltaVersion.CheckpointPath(snapshot.Version);
 
         // Disposed once written: the batch's buffers are native memory, so releasing them here rather

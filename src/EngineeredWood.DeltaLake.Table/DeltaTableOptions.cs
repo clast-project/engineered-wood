@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Diagnostics.CodeAnalysis;
+using EngineeredWood.DeltaLake.Checkpoint;
 using EngineeredWood.Parquet;
 
 namespace EngineeredWood.DeltaLake.Table;
@@ -28,6 +29,21 @@ public sealed record DeltaTableOptions
     /// Set to 0 to disable automatic checkpointing. Default: 10.
     /// </summary>
     public int CheckpointInterval { get; init; } = 10;
+
+    /// <summary>
+    /// Which checkpoint spec automatic checkpointing writes. Default:
+    /// <see cref="CheckpointFormat.Automatic"/> — a UUID-named V2 checkpoint on a table whose
+    /// <c>delta.checkpointPolicy</c> is <c>v2</c> and which has enabled the <c>v2Checkpoint</c> feature,
+    /// and a classic V1 checkpoint otherwise.
+    /// </summary>
+    /// <remarks>
+    /// The default is what delta-spark would do with the same table, which is the point: a table created
+    /// by another engine keeps the checkpoint form its own configuration asks for when EW maintains it.
+    /// Override to pin one form regardless — see <see cref="CheckpointFormat"/> for when either is worth
+    /// pinning. For the V2 writer's own settings (sidecar policy, body format), supply a configured
+    /// writer through <see cref="Checkpoint.CheckpointWriter.V2Writer"/>.
+    /// </remarks>
+    public CheckpointFormat CheckpointFormat { get; init; } = CheckpointFormat.Automatic;
 
     /// <summary>
     /// Default retention period for vacuum operations. Default: 7 days.

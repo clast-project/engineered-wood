@@ -284,6 +284,94 @@ def cmd_v2_checkpoint(args):
     }
 
 
+def cmd_checkpoint_only_read(args):
+    """Read an EW-written table with the commits its checkpoint subsumes moved out of the way.
+
+    The mirror of the EW-reads-Spark direction. A round trip through one implementation validates
+    that implementation's assumptions, not the format, so this is the only thing that says a
+    checkpoint EW wrote is one the reference implementation can actually rebuild state from.
+
+    Two things make it a real test rather than a shape check:
+
+    1. The commits at or below the checkpoint version are RENAMED away first, so a successful read
+       came from the checkpoint. Names containing `.checkpoint.` are skipped -- a UUID-named V2
+       checkpoint is itself a `.json` file in the log directory whose name starts with the version,
+       so without that guard this hides the very file it is trying to test.
+
+    2. Spark's own reconstructed TOMBSTONES are reported, twice -- once against the full log, once
+       from the checkpoint -- via `DeltaLog.unsafeVolatileSnapshot.tombstones`. Rows alone cannot
+       catch a checkpoint that dropped its unexpired removes: the ACTIVE file set is identical
+       either way, and what breaks is VACUUM retention safety and streaming/CDF removal detection.
+       Comparing the two lists is what makes the loss visible.
+
+       (VACUUM ... DRY RUN was tried first and is NOT a discriminator: MEASURED 2026-08-08, Spark
+       lists a file whose only reference is an unexpired tombstone as vacuumable even with the whole
+       log present, so the tombstone changes nothing about that answer.)
+
+    CALLER REQUIREMENT: at least one commit must exist ABOVE the checkpoint version. Spark builds a
+    log segment as "a checkpoint plus the commits after it" and fails with "Could not find any delta
+    files for version N" when the newest version is the checkpoint's own and its commit is gone. So a
+    table meant for this command should be checkpointed and then committed to once more -- which also
+    makes the test sharper, since everything at or below the checkpoint can then only have come from
+    the checkpoint.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    log_dir = os.path.join(args["path"], "_delta_log")
+
+    checkpoints = sorted(p for p in glob.glob(os.path.join(log_dir, "*.checkpoint.*"))
+                         if os.path.isfile(p))
+    if not checkpoints:
+        return {"ok": False, "error": "no checkpoint file was written"}
+    newest = os.path.basename(checkpoints[-1])
+    cp_version = int(newest.split(".")[0])
+
+    def tombstones():
+        # Spark caches a DeltaLog per path, so without clearing it the second call would report the
+        # first snapshot -- built from a log segment that no longer exists on disk.
+        jvm = spark._jvm
+        jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+        log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, path)
+        # `update()` takes Scala default arguments, which py4j cannot supply; forTable has just
+        # loaded a fresh snapshot, so the volatile one IS the current one. Collected as RemoveFile
+        # case classes and read through the `path()` accessor -- `select("path")` is varargs in
+        # Scala, which py4j cannot call with a single argument.
+        removes = log.unsafeVolatileSnapshot().tombstones().collect()
+        return sorted(r.path() for r in removes)
+
+    # The control, taken while every commit is still present.
+    with_commits = tombstones()
+
+    hidden = []
+    for f in sorted(glob.glob(os.path.join(log_dir, "*.json"))):
+        base = os.path.basename(f)
+        if ".checkpoint." in base:
+            continue
+        if base[0].isdigit() and int(base.split(".")[0]) <= cp_version:
+            os.rename(f, f + ".hidden")
+            hidden.append(base)
+
+    spark._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+    df = spark.read.format("delta").load(path)
+    rows = _rows(df)
+
+    from_checkpoint = tombstones()
+
+    return {
+        "checkpoint_file": newest,
+        "checkpoint_version": cp_version,
+        "sidecars": sorted(os.path.basename(p)
+                           for p in glob.glob(os.path.join(log_dir, "_sidecars", "*"))),
+        "hidden_commits": hidden,
+        "row_count": len(rows),
+        "rows": rows,
+        # Equal lists mean the checkpoint reproduced the log's remove actions, not just its adds.
+        "tombstones_with_commits": with_commits,
+        "tombstones_from_checkpoint": from_checkpoint,
+        "detail": _detail(spark, args["path"]),
+    }
+
+
 def cmd_sql(args):
     """Run statements against an existing EW-written table, then report the result.
 
@@ -717,6 +805,7 @@ COMMANDS = {
     "write": cmd_write,
     "partition_paths": cmd_partition_paths,
     "v2_checkpoint": cmd_v2_checkpoint,
+    "checkpoint_only_read": cmd_checkpoint_only_read,
     "sql": cmd_sql,
     "scan": cmd_scan,
     "checkpoint_stats": cmd_checkpoint_stats,

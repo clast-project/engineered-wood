@@ -33,7 +33,7 @@ public class V2CheckpointTests : IDisposable
 
         await log.WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = "v2-inline",
@@ -93,7 +93,7 @@ public class V2CheckpointTests : IDisposable
 
         var initActions = new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = "v2-sidecar",
@@ -153,7 +153,7 @@ public class V2CheckpointTests : IDisposable
 
         await log.WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = "v2-txn",
@@ -188,7 +188,7 @@ public class V2CheckpointTests : IDisposable
 
         await log.WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = "v2-dm",
@@ -266,7 +266,7 @@ public class V2CheckpointTests : IDisposable
         // Version 0: create table
         await log.WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = "v2-boot",
@@ -319,7 +319,7 @@ public class V2CheckpointTests : IDisposable
 
         await log.WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            V2Protocol(),
             new MetadataAction
             {
                 Id = tableId,
@@ -774,9 +774,327 @@ public class V2CheckpointTests : IDisposable
         Assert.Contains("2 of its 3 parts", ex.Message);
     }
 
+    // ── Which checkpoint form a table gets ──
+
+    /// <summary>
+    /// Builds a table at version 1 with the given protocol and configuration, and returns its snapshot.
+    /// </summary>
+    private async Task<(LocalTableFileSystem Fs, Snapshot.Snapshot Snapshot)> BuildTableAsync(
+        ProtocolAction protocol, Dictionary<string, string>? configuration)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            protocol,
+            new MetadataAction
+            {
+                Id = "selection",
+                Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+                Configuration = configuration ?? [],
+            },
+        });
+        await log.WriteCommitAsync(1, [Add("a.parquet")]);
+
+        return (fs, await SnapshotBuilder.BuildAsync(log));
+    }
+
+    private static ProtocolAction ClassicProtocol() => new()
+    {
+        MinReaderVersion = 1,
+        MinWriterVersion = 2,
+    };
+
+    /// <summary>
+    /// <c>CheckpointFormat.Automatic</c> takes the table's word for it: the
+    /// <c>delta.checkpointPolicy</c> property decides, and the <c>v2Checkpoint</c> feature permits.
+    /// </summary>
+    /// <remarks>
+    /// The row that matters most is the third: a table that SUPPORTS V2 checkpoints but whose policy
+    /// still says classic gets a classic checkpoint, because that is what delta-spark writes for the same
+    /// table. Treating the feature as the trigger would silently move such a table to a checkpoint form
+    /// its own configured engine does not produce.
+    /// </remarks>
+    [Theory]
+    [InlineData(false, null, false)]      // no feature, no property
+    [InlineData(true, null, false)]       // feature present, property absent  → still classic
+    [InlineData(true, "classic", false)]  // feature present, policy classic   → classic
+    [InlineData(true, "v2", true)]        // feature present, policy v2        → V2
+    [InlineData(true, "V2", true)]        // the property value is not case-sensitive
+    [InlineData(false, "v2", false)]      // policy asks, protocol does not permit → classic, not a throw
+    public async Task Automatic_WritesV2_OnlyWhenTheTableBothAsksAndPermits(
+        bool featureEnabled, string? policy, bool expectV2)
+    {
+        var config = policy is null
+            ? null
+            : new Dictionary<string, string> { ["delta.checkpointPolicy"] = policy };
+
+        var (fs, snapshot) = await BuildTableAsync(
+            featureEnabled ? V2Protocol() : ClassicProtocol(), config);
+
+        await new CheckpointWriter(fs).WriteCheckpointAsync(snapshot);
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        bool wroteV2 = Directory.GetFiles(logDir, "*.checkpoint.*.json").Length > 0;
+        bool wroteClassic = File.Exists(Path.Combine(logDir, $"{snapshot.Version:D20}.checkpoint.parquet"));
+
+        Assert.Equal(expectV2, wroteV2);
+        Assert.Equal(!expectV2, wroteClassic);
+
+        // Whichever form it took, the table still reads back from the checkpoint alone.
+        DeleteCommitsThrough(snapshot.Version);
+        var rebuilt = await SnapshotBuilder.BuildAsync(new TransactionLog(fs), new CheckpointReader(fs));
+        Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
+    }
+
+    /// <summary>An explicit format overrides the table's policy in either direction.</summary>
+    [Theory]
+    [InlineData(CheckpointFormat.Classic, "v2", false)]
+    [InlineData(CheckpointFormat.V2, null, true)]
+    public async Task ExplicitFormat_OverridesTheTablePolicy(
+        CheckpointFormat format, string? policy, bool expectV2)
+    {
+        var config = policy is null
+            ? null
+            : new Dictionary<string, string> { ["delta.checkpointPolicy"] = policy };
+
+        var (fs, snapshot) = await BuildTableAsync(V2Protocol(), config);
+
+        await new CheckpointWriter(fs) { Format = format }.WriteCheckpointAsync(snapshot);
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        Assert.Equal(expectV2, Directory.GetFiles(logDir, "*.checkpoint.*.json").Length > 0);
+    }
+
+    /// <summary>
+    /// PROTOCOL.md: the V2 spec "can be used only when [the] v2 checkpoint table feature is enabled".
+    /// The writer never checked, so it produced checkpoints a conforming reader is entitled to reject,
+    /// on tables whose protocol gives that reader no warning the form might appear.
+    /// </summary>
+    /// <remarks>
+    /// The check lives on the writer rather than on its caller because a host driving
+    /// <c>V2CheckpointWriter</c> by hand — until now the only way to reach it at all — must hit the same
+    /// rule. Both routes are pinned here.
+    /// </remarks>
+    [Theory]
+    [InlineData(false)] // straight at the V2 writer
+    [InlineData(true)]  // through CheckpointWriter with the format forced
+    public async Task V2Checkpoint_OnATableWithoutTheFeature_IsRefused(bool viaCheckpointWriter)
+    {
+        var (fs, snapshot) = await BuildTableAsync(ClassicProtocol(), null);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+        {
+            if (viaCheckpointWriter)
+            {
+                await new CheckpointWriter(fs) { Format = CheckpointFormat.V2 }
+                    .WriteCheckpointAsync(snapshot);
+            }
+            else
+            {
+                await new V2CheckpointWriter(fs).WriteCheckpointAsync(snapshot);
+            }
+        });
+
+        Assert.Equal(DeltaErrorCodes.FeatureNotEnabled, ex.ErrorCode);
+        Assert.Contains("v2Checkpoint", ex.Message, StringComparison.Ordinal);
+
+        // And nothing was left behind — a refused checkpoint must not half-write one.
+        Assert.Empty(Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.checkpoint.*"));
+    }
+
+    /// <summary>
+    /// The feature must be in BOTH <c>readerFeatures</c> and <c>writerFeatures</c>. A table listing it in
+    /// only one is not a table that has enabled it.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task V2Checkpoint_NeedsTheFeatureInBothFeatureLists(bool inReader, bool inWriter)
+    {
+        var (fs, snapshot) = await BuildTableAsync(
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = inReader ? ["v2Checkpoint"] : [],
+                WriterFeatures = inWriter ? ["v2Checkpoint"] : [],
+            },
+            null);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await new V2CheckpointWriter(fs).WriteCheckpointAsync(snapshot));
+
+        Assert.Equal(DeltaErrorCodes.FeatureNotEnabled, ex.ErrorCode);
+    }
+
+    // ── Sidecars ──
+
+    /// <summary>
+    /// A V2 checkpoint "could reference zero or MORE sidecar file actions". The writer produced exactly
+    /// one however far above <see cref="V2CheckpointWriter.SidecarThreshold"/> the file count went, which
+    /// gives up the very thing sidecars exist for on a table with millions of files — and leaves the
+    /// whole sidecar body to be assembled as one in-memory Arrow batch.
+    /// </summary>
+    [Fact]
+    public async Task V2Checkpoint_SplitsFileActionsAcrossSidecars()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        var actions = new List<DeltaAction> { V2Protocol(), Metadata("v2-split") };
+        for (int i = 0; i < 10; i++)
+            actions.Add(Add($"part-{i:D5}.parquet"));
+
+        await log.WriteCommitAsync(0, actions);
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+
+        await new V2CheckpointWriter(fs)
+        {
+            SidecarThreshold = 1,
+            MaxActionsPerSidecar = 3, // 10 file actions → 4 sidecars (3, 3, 3, 1)
+        }.WriteCheckpointAsync(snapshot);
+
+        var sidecarFiles = Directory.GetFiles(Path.Combine(_tempDir, "_delta_log", "_sidecars"));
+        Assert.Equal(4, sidecarFiles.Length);
+
+        // Every action must survive the split — and land exactly once.
+        DeleteCommitsThrough(snapshot.Version);
+        var rebuilt = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(10, rebuilt.FileCount);
+        for (int i = 0; i < 10; i++)
+            Assert.Contains($"part-{i:D5}.parquet", rebuilt.ActiveFiles.Keys);
+    }
+
+    // ── What the checkpoint says about itself ──
+
+    /// <summary>
+    /// The <c>checkpointMetadata</c> tags PROTOCOL.md names. All optional, but every number is already
+    /// known at write time, and <c>sidecarFileSchema</c> in particular saves a reader the Parquet footer
+    /// of every sidecar.
+    /// </summary>
+    [Fact]
+    public async Task V2Checkpoint_CheckpointMetadata_CarriesTheSpecTags()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-tags");
+
+        await new V2CheckpointWriter(fs) { SidecarThreshold = 1 }.WriteCheckpointAsync(snapshot);
+
+        var hint = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+        byte[] body = await fs.ReadAllBytesAsync(hint!.V2CheckpointPath!);
+        var cm = Assert.Single(ActionSerializer.Deserialize(body).OfType<CheckpointMetadata>());
+        var sidecar = Assert.Single(ActionSerializer.Deserialize(body).OfType<SidecarFile>());
+
+        Assert.Equal(snapshot.Version, cm.Version);
+        Assert.NotNull(cm.Tags);
+
+        // One active file + one unexpired tombstone went into the sidecar; one of them is an add.
+        Assert.Equal("2", cm.Tags!["sidecarNumActions"]);
+        Assert.Equal("1", cm.Tags["numOfAddFiles"]);
+        Assert.Equal(
+            sidecar.SizeInBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            cm.Tags["sidecarSizeInBytes"]);
+
+        // The schema tag must describe the sidecar that was actually written, not an idealised one — so
+        // it is parsed back as a Delta StructType rather than string-matched, and checked for the two
+        // action columns a sidecar carries and against the two it must not.
+        var sidecarSchema = Schema.DeltaSchemaSerializer.Parse(cm.Tags["sidecarFileSchema"]);
+        var columns = sidecarSchema.Fields.Select(f => f.Name).ToList();
+        Assert.Contains("add", columns);
+        Assert.Contains("remove", columns);
+        Assert.DoesNotContain("sidecar", columns);
+        Assert.DoesNotContain("checkpointMetadata", columns);
+    }
+
+    /// <summary>An inline checkpoint reports no sidecars rather than omitting the counts.</summary>
+    [Fact]
+    public async Task V2Checkpoint_Inline_ReportsZeroSidecarActions()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-tags-inline");
+
+        await new V2CheckpointWriter(fs) { SidecarThreshold = 1000 }.WriteCheckpointAsync(snapshot);
+
+        var hint = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+        byte[] body = await fs.ReadAllBytesAsync(hint!.V2CheckpointPath!);
+        var cm = Assert.Single(ActionSerializer.Deserialize(body).OfType<CheckpointMetadata>());
+
+        Assert.Equal("0", cm.Tags!["sidecarNumActions"]);
+        Assert.Equal("0", cm.Tags["sidecarSizeInBytes"]);
+        Assert.Equal("1", cm.Tags["numOfAddFiles"]);
+        Assert.False(cm.Tags.ContainsKey("sidecarFileSchema")); // nothing to describe
+    }
+
+    /// <summary>
+    /// <c>_last_checkpoint</c>'s <c>v2Checkpoint.sidecarFiles</c> used to be an integer 0-or-1. That is
+    /// delta-spark's field NAME with delta-spark's MEANING replaced — it writes an array of sidecar
+    /// objects — so anything that read the field got a wrong answer confidently. MEASURED against
+    /// delta-spark 4.0.0, 2026-08-08.
+    /// </summary>
+    [Fact]
+    public async Task V2Checkpoint_LastCheckpoint_MatchesTheReferenceShape()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-hint-shape");
+
+        await new V2CheckpointWriter(fs) { SidecarThreshold = 1 }.WriteCheckpointAsync(snapshot);
+
+        using var doc = System.Text.Json.JsonDocument.Parse(
+            await fs.ReadAllBytesAsync(DeltaVersion.LastCheckpointPath));
+        var root = doc.RootElement;
+
+        Assert.Equal(snapshot.Version, root.GetProperty("version").GetInt64());
+        Assert.True(root.GetProperty("sizeInBytes").GetInt64() > 0);
+        Assert.Equal(1, root.GetProperty("numOfAddFiles").GetInt32());
+
+        // The checkpoint's own rows, with the sidecar references swapped for what they point at:
+        // checkpointMetadata + protocol + metaData + add + remove.
+        Assert.Equal(5, root.GetProperty("size").GetInt64());
+
+        var v2 = root.GetProperty("v2Checkpoint");
+
+        // A bare file name, as delta-spark writes it — a UUID-named checkpoint always lives in
+        // _delta_log, so the directory carries no information and re-rooting is the reader's job.
+        string path = v2.GetProperty("path").GetString()!;
+        Assert.DoesNotContain("/", path);
+        Assert.Contains(".checkpoint.", path);
+
+        var sidecars = v2.GetProperty("sidecarFiles");
+        Assert.Equal(System.Text.Json.JsonValueKind.Array, sidecars.ValueKind);
+        var only = Assert.Single(sidecars.EnumerateArray());
+        Assert.EndsWith(".parquet", only.GetProperty("path").GetString());
+        Assert.True(only.GetProperty("sizeInBytes").GetInt64() > 0);
+
+        // And the hint still resolves — the path change must not have broken this reader.
+        var hint = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+        Assert.StartsWith(DeltaVersion.LogPrefix, hint!.V2CheckpointPath!, StringComparison.Ordinal);
+    }
+
+    private static MetadataAction Metadata(string id) => new()
+    {
+        Id = id,
+        Format = Format.Parquet,
+        SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+        PartitionColumns = [],
+    };
+
+    /// <summary>
+    /// The protocol a table must carry before a V2 checkpoint may be written to it: reader 3, writer 7,
+    /// and <c>v2Checkpoint</c> in BOTH feature lists (PROTOCOL.md's V2 Checkpoint Table Feature).
+    /// </summary>
+    private static ProtocolAction V2Protocol() => new()
+    {
+        MinReaderVersion = 3,
+        MinWriterVersion = 7,
+        ReaderFeatures = ["v2Checkpoint"],
+        WriterFeatures = ["v2Checkpoint"],
+    };
+
     private static List<DeltaAction> CreateCommit(string id) =>
     [
-        new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+        V2Protocol(),
         new MetadataAction
         {
             Id = id,

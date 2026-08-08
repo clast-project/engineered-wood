@@ -51,7 +51,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
         _dvReader = new DeletionVectorReader(fileSystem);
-        _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions);
+        _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions)
+        {
+            Format = options.CheckpointFormat,
+        };
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
             CheckpointInterval = options.CheckpointInterval,
@@ -318,6 +321,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder);
         bool inCommitTimestampsEnabled = Log.InCommitTimestamp.IsEnabled(configurationBuilder);
         bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
+        bool v2CheckpointsEnabled = Checkpoint.CheckpointPolicy.WantsV2(configurationBuilder);
         var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
 
         if (mappingMode != ColumnMappingMode.None)
@@ -476,6 +480,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             minWriterVersion = 7;
             writerFeatures.Add("changeDataFeed");
+        }
+
+        // V2 checkpoints — a READER+WRITER feature ('v2Checkpoint', reader 3 / writer 7), enabled by the
+        // delta.checkpointPolicy=v2 table property exactly as delta-spark does it. Both lists, because a
+        // UUID-named checkpoint is a form readers must understand as well as writers. Declaring it here is
+        // what makes the property mean anything: CheckpointWriter writes V2 only when the policy asks AND
+        // the feature permits, so a table created with the property but without the feature would quietly
+        // keep getting classic checkpoints. Nothing else about the table changes — a V2-checkpointed table
+        // is read and written normally, and the spec's one further obligation (no multi-part checkpoints)
+        // is already met, since this writer never produces them.
+        if (v2CheckpointsEnabled)
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
+            writerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
         }
 
         // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'icebergCompatV2'); readers see
