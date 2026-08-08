@@ -136,6 +136,9 @@ def cmd_checkpoint_only_read(args):
     successful read proves the CHECKPOINT carried the state -- not the JSON commits.
     Renames rather than deletes so a failure leaves the table diagnosable.
 
+    Reports the reconstructed state (version, file list, add-action count) and, separately, the
+    materialized rows -- because those go through different layers with different limits. See below.
+
     Finds a checkpoint of ANY naming scheme. Globbing `*.checkpoint.parquet` matched only the
     classic name, which a `<n>.checkpoint.<uuid>.json` never does -- so every checkpoint assertion
     reached through here silently applied to V1 only, and a V2 table would have reported "no
@@ -167,17 +170,33 @@ def cmd_checkpoint_only_read(args):
             moved.append(base)
 
     dt = DeltaTable(path)
-    tbl = dt.to_pyarrow_table()
-    return {
+
+    # State reconstruction, which is the Rust engine (delta-kernel-rs) and works for every checkpoint
+    # form delta-rs understands.
+    result = {
         "checkpoint_version": cp_version,
         "checkpoint_file": newest,
         "sidecars": sorted(os.path.basename(p)
                            for p in glob.glob(os.path.join(logdir, "_sidecars", "*"))),
         "hidden_commits": moved,
         "version": dt.version(),
-        "row_count": tbl.num_rows,
-        "rows": _rows(tbl),
+        "file_names": sorted(u.replace("\\", "/").split("/")[-1] for u in dt.file_uris()),
+        "num_add_actions": dt.get_add_actions().num_rows,
     }
+
+    # Materializing the DATA is a separate matter: `to_pyarrow_dataset` carries its own reader-feature
+    # allowlist in the PYTHON layer -- `SUPPORTED_READER_FEATURES` in deltalake/table.py, which as of
+    # 1.6.2 is {timestampNtz, variantType, variantType-preview} and so excludes deletionVectors and
+    # columnMapping as well. Reported rather than raised, so a table it declines still yields the
+    # state-level answers above instead of failing the whole command.
+    try:
+        tbl = dt.to_pyarrow_table()
+        result["row_count"] = tbl.num_rows
+        result["rows"] = _rows(tbl)
+    except Exception as exc:  # noqa: BLE001 - the message is the finding
+        result["rows_error"] = "{0}: {1}".format(type(exc).__name__, exc)
+
+    return result
 
 
 def cmd_raw_log(args):

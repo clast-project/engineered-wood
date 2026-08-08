@@ -410,16 +410,35 @@ table's own column is refused rather than shadowed. Background:
 (`CheckpointReader.cs`); write always emits a single
 `.checkpoint.parquet` (`CheckpointWriter.cs`), regardless of table size.
 
-**A `v2Checkpoint` table is unreadable by delta-rs.** Not an EW gap, but
-the practical consequence of setting `delta.checkpointPolicy=v2`:
-deltalake 1.6.2 refuses to read the DATA of any table declaring the
-`v2Checkpoint` reader feature — "not yet supported by the deltalake
-reader" — with the commits fully intact and no checkpoint involved. A
-delta-spark-written V2 table is refused identically, so this is delta-rs's
-limit rather than anything about EW's output. Measured 2026-08-08;
-`DeltaRsInteropTests.EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature`
-is the tripwire for when it changes. Consequence: EW's V2 write path is
-validated against Spark only.
+**delta-rs materializes no data from a `v2Checkpoint` table.** Not an EW
+gap, but a consequence of setting `delta.checkpointPolicy=v2` worth
+knowing. deltalake 1.6.2 *reconstructs* such a table correctly — its Rust
+engine is delta-kernel-rs, which reads both V2 bodies and their sidecars,
+so `version()`, `file_uris()` and `get_add_actions()` all work from the
+checkpoint alone (measured against an EW-written and a delta-spark-written
+checkpoint, every commit hidden). What refuses is materializing rows:
+
+- `to_pyarrow_dataset` / `to_pandas` check `SUPPORTED_READER_FEATURES` in
+  deltalake's **Python** layer, which as of 1.6.2 is
+  `{timestampNtz, variantType, variantType-preview}` — it excludes
+  `deletionVectors` and `columnMapping` too, so it is a legacy-path
+  allowlist, not an engine capability.
+- The DataFusion `QueryBuilder` path fails separately in Rust with
+  "Unsupported table features required: [V2Checkpoint]".
+
+Measured 2026-08-08.
+`DeltaRsInteropTests.EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone`
+asserts the reconstruction and pins the materialization refusal, so
+widening either list is what makes it fail.
+
+**delta-kernel-rs is stricter than the spec about V1 checkpoints.** It
+carries `"Kernel does not support writing V1 checkpoints when the table
+supports v2Checkpoint"`, whereas PROTOCOL.md allows a `v2Checkpoint` table
+to use "classic checkpoints which can follow V1 or V2 spec". EW follows
+the spec and delta-spark here — feature enabled but
+`delta.checkpointPolicy` not `v2` gets a classic V1 checkpoint — which is
+readable by kernel either way, since the restriction is on writing.
+Observed in the delta-kernel-rs build bundled with deltalake 1.6.2.
 
 **`_last_checkpoint` `checksum` is not written.** The spec's optional MD5
 over a canonicalized form of the file. Readers "are encouraged to

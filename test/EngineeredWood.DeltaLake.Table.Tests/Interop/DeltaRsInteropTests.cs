@@ -312,23 +312,29 @@ public class DeltaRsInteropTests : IDisposable
     }
 
     /// <summary>
-    /// delta-rs declines to read ANY table that declares the <c>v2Checkpoint</c> reader feature — the
-    /// data, not just the checkpoint. So enabling <c>delta.checkpointPolicy=v2</c> puts a table out of
-    /// delta-rs's reach entirely, and that is worth a test of its own rather than an absence of one.
+    /// delta-rs rebuilding state from a V2 checkpoint EW wrote — a second, independent implementation
+    /// beside Spark, and one whose log replay is delta-kernel-rs.
     /// </summary>
     /// <remarks>
-    /// <para>MEASURED 2026-08-08 against deltalake 1.6.2, and it is delta-rs's own limit, not something
-    /// about what EW writes: a delta-spark-written V2 table is refused with the identical message, and
-    /// the refusal fires with the commits fully intact, so no checkpoint is ever involved. The table
-    /// object still constructs and reports its version; the refusal lands on the read.</para>
+    /// <para>Reconstruction and materialization go through different layers here, and only the second
+    /// has a limit. The Rust engine reads V2 checkpoints, sidecars included: with every commit hidden it
+    /// recovers the version, the file list and the add actions. What refuses is
+    /// <c>to_pyarrow_dataset</c>, whose reader-feature allowlist lives in deltalake's PYTHON layer
+    /// (<c>SUPPORTED_READER_FEATURES</c>, which as of 1.6.2 is
+    /// <c>{timestampNtz, variantType, variantType-preview}</c> — it excludes <c>deletionVectors</c> and
+    /// <c>columnMapping</c> too, so it is a legacy-path allowlist rather than an engine capability).</para>
     ///
-    /// <para>Consequence for this repository: the V2 write path's foreign validation rests entirely on
-    /// Spark — see <c>SparkInteropTests.EwWrittenV2Checkpoint_SparkReadsFromTheCheckpointAlone</c>. This
-    /// test is the tripwire for when delta-rs grows the feature, at which point the checkpoint-only
-    /// assertion can be mirrored here.</para>
+    /// <para>So this asserts the reconstruction, which is what a checkpoint is FOR, and pins the
+    /// materialization refusal separately as the thing that would change if delta-rs widened that list.
+    /// The tombstone-level assertion the checkpoint also needs lives on the Spark side, which exposes
+    /// its reconstructed removes — delta-rs has no tombstone API to ask.</para>
     /// </remarks>
-    [Fact]
-    public async Task EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature()
+    [Theory]
+    [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
+    [InlineData(1, 1)]      // threshold below → one sidecar
+    [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
+    public async Task EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone(
+        int sidecarThreshold, int expectedSidecars)
     {
         if (!DeltaRs.EnsureAvailable()) return;
 
@@ -336,24 +342,46 @@ public class DeltaRsInteropTests : IDisposable
 
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema,
             configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
-            options: new DeltaTableOptions { CheckpointInterval = 2 });
+            options: new DeltaTableOptions { CheckpointInterval = 0 });
 
-        for (long i = 1; i <= 4; i++)
+        for (long i = 1; i <= 6; i++)
             await table.WriteAsync([IdRegionBatch([i], [i % 2 == 0 ? "us" : "eu"])]);
 
-        // A V2 checkpoint is on disk, and every commit is still beside it.
-        Assert.NotEmpty(Directory.GetFiles(
-            Path.Combine(_tempDir, "_delta_log"), "*.checkpoint.*.json"));
+        await new EngineeredWood.DeltaLake.Checkpoint.CheckpointWriter(fs)
+        {
+            V2Writer = new EngineeredWood.DeltaLake.Checkpoint.V2CheckpointWriter(fs)
+            {
+                SidecarThreshold = sidecarThreshold,
+                MaxActionsPerSidecar = expectedSidecars > 1 ? 4 : int.MaxValue,
+            },
+        }.WriteCheckpointAsync(table.CurrentSnapshot);
 
-        var refused = Assert.Throws<InvalidOperationException>(
-            () => DeltaRs.Invoke("read", new { path = _tempDir }));
-        Assert.Contains("v2Checkpoint", refused.Message, StringComparison.Ordinal);
-        Assert.Contains("not yet supported", refused.Message, StringComparison.Ordinal);
+        var expectedFiles = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path.Split('/')[^1])
+            .OrderBy(p => p, StringComparer.Ordinal)
+            .ToList();
 
-        // The log itself is fine — delta-rs parses every action out of it without complaint. Only the
-        // feature declaration stops it, which is what makes this a delta-rs gap rather than a bad table.
-        var raw = DeltaRs.Invoke("raw_log", new { path = _tempDir });
-        Assert.NotEmpty(raw.GetProperty("actions").EnumerateArray());
+        var result = DeltaRs.Invoke("checkpoint_only_read", new { path = _tempDir });
+
+        // A UUID-named V2 checkpoint really was what delta-rs found, and the commits really are gone.
+        string checkpointFile = result.GetProperty("checkpoint_file").GetString()!;
+        Assert.Contains(".checkpoint.", checkpointFile, StringComparison.Ordinal);
+        Assert.EndsWith(".json", checkpointFile, StringComparison.Ordinal);
+        Assert.Equal(expectedSidecars, result.GetProperty("sidecars").GetArrayLength());
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+
+        // The reconstruction itself, from the checkpoint and its sidecars alone.
+        Assert.Equal(table.CurrentSnapshot.Version, result.GetProperty("version").GetInt64());
+        Assert.Equal(expectedFiles.Count, result.GetProperty("num_add_actions").GetInt32());
+        Assert.Equal(
+            expectedFiles,
+            result.GetProperty("file_names").EnumerateArray().Select(f => f.GetString()!).ToList());
+
+        // And the ceiling, pinned so that widening the Python allowlist is what makes this line fail.
+        Assert.False(result.TryGetProperty("rows", out _));
+        string rowsError = result.GetProperty("rows_error").GetString()!;
+        Assert.Contains("v2Checkpoint", rowsError, StringComparison.Ordinal);
+        Assert.Contains("not yet supported", rowsError, StringComparison.Ordinal);
     }
 
     // ── Statistics and pruning. ──

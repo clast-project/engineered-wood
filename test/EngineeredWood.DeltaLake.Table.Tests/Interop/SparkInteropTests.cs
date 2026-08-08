@@ -2845,9 +2845,11 @@ public class SparkInteropTests : IDisposable
     /// tombstone was lost is. That is the bug this repository shipped in its own V2 writer (#73), and it
     /// is the reason the DELETE is here.</para>
     ///
-    /// <para>delta-rs cannot stand in for this: it declines the <c>v2Checkpoint</c> reader feature
-    /// outright, on Spark-written tables as much as EW's — see
-    /// <c>DeltaRsInteropTests.EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature</c>.</para>
+    /// <para>delta-rs covers the same checkpoints from the other side, but only as far as the
+    /// reconstruction — it exposes no tombstone API, and deltalake's Python layer declines to
+    /// materialize rows from a <c>v2Checkpoint</c> table. So the tombstone half of this is Spark's
+    /// alone. See
+    /// <c>DeltaRsInteropTests.EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone</c>.</para>
     /// </remarks>
     [Theory]
     [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
