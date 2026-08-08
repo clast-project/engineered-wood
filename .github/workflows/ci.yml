@@ -95,11 +95,16 @@ jobs:
       # present on a dev box for the ORC cross-validation, which is exactly the kind
       # of undeclared dependency this job exists to surface. Declaring it also turns
       # ON the ORC PyArrow cross-validation tests, which had been soft-skipping here.
+      #
+      # tzdata likewise: CPython on Windows ships NO time-zone database, so
+      # `zoneinfo.ZoneInfo("UTC")` — which delta_rs_driver's read_epoch_micros needs —
+      # raises ZoneInfoNotFoundError on a clean runner. Linux has a system tz database
+      # and does not, which is why the nightly did not hit this.
       - name: Install interop oracles (delta-rs, DuckDB)
         if: steps.changes.outputs.code == 'true'
         run: >
           python -m pip install --disable-pip-version-check
-          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
+          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata
 
       - name: Restore
         if: steps.changes.outputs.code == 'true'
