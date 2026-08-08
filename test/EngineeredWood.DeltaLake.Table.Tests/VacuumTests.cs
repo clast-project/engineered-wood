@@ -330,6 +330,92 @@ public class VacuumTests : IDisposable
     }
 
     /// <summary>Canonical (big-endian) UUID rendering of a DV's Z85-encoded path, for locating its file.</summary>
+    /// <summary>
+    /// A name beginning <c>_</c> or <c>.</c> belongs to whoever wrote it, and vacuum cannot judge it against
+    /// this snapshot's active files — so it must be left alone, at any depth. Index sidecars are the case
+    /// that prompted this; the rule covers anything a co-operating engine keeps beside the data.
+    ///
+    /// <para>⚠ The assertion has to be on a file INSIDE such a directory, not on the directory itself: the
+    /// listing yields files, so a rule that only matched the first path component would still reach these by
+    /// their full path and collect them one level down.</para>
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_LeavesHiddenDirectories_AtAnyDepth()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build()], 1)]);
+        // An orphan: overwritten, so the first file is unreferenced and eligible.
+        await table.WriteAsync(
+            [new RecordBatch(schema, [new Int64Array.Builder().Append(2).Build()], 1)],
+            DeltaWriteMode.Overwrite);
+
+        string[] hidden =
+        [
+            Path.Combine("_delta_index", "bloom.parquet"),
+            Path.Combine("_someengine", "state", "deep.parquet"),
+            Path.Combine(".staging", "tmp.parquet"),
+        ];
+        foreach (var rel in hidden)
+        {
+            var full = Path.Combine(_tempDir, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+            File.WriteAllText(full, "x");
+            File.SetLastWriteTimeUtc(full, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        }
+
+        var result = await table.VacuumAsync(retentionPeriod: TimeSpan.Zero);
+
+        foreach (var rel in hidden)
+            Assert.True(File.Exists(Path.Combine(_tempDir, rel)), $"vacuum deleted {rel}");
+
+        // POSITIVE CONTROL: without it this passes equally if vacuum had simply stopped deleting anything,
+        // which is the failure this rule most plausibly causes.
+        Assert.True(result.FilesDeleted > 0);
+    }
+
+    /// <summary>
+    /// THE EXCEPTION THAT KEEPS THE RULE HONEST. A partition column may be named with a leading underscore,
+    /// so its directory is a hidden NAME holding live data — treating it as hidden would make every orphan
+    /// inside it immortal, silently, on exactly the tables where orphans accumulate.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_SweepsPartitionDirectories_EvenWhenTheColumnNameLooksHidden()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("_region", StringType.Default, true))
+            .Build();
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, partitionColumns: ["_region"]);
+        await table.WriteAsync(
+        [
+            new RecordBatch(schema,
+            [
+                new Int64Array.Builder().Append(1).Build(),
+                new StringArray.Builder().Append("eu").Build(),
+            ], 1),
+        ]);
+
+        // An orphan INSIDE the partition directory — the shape a compaction or a rolled-back write leaves.
+        var partitionDir = Directory.GetDirectories(_tempDir, "_region=*").Single();
+        var orphan = Path.Combine(partitionDir, "orphan.parquet");
+        File.WriteAllText(orphan, "x");
+        File.SetLastWriteTimeUtc(orphan, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        await table.VacuumAsync(retentionPeriod: TimeSpan.Zero);
+
+        Assert.False(File.Exists(orphan));
+        // The partition's REAL data file is untouched, so this is collection and not destruction.
+        Assert.NotEmpty(Directory.GetFiles(partitionDir, "*.parquet"));
+    }
+
     private static string DvUuid(DeletionVector dv)
     {
         byte[] bytes = Base85.Decode(dv.PathOrInlineDv.Substring(dv.PathOrInlineDv.Length - 20));

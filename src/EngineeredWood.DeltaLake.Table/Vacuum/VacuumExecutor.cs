@@ -78,7 +78,7 @@ internal static class VacuumExecutor
 
         await foreach (var file in fs.ListAsync("", cancellationToken).ConfigureAwait(false))
         {
-            if (IsExcludedDirectory(file.Path))
+            if (IsExcludedPath(file.Path, snapshot.Metadata.PartitionColumns))
                 continue;
 
             if (keep.Contains(file.Path) || file.LastModified >= cutoff)
@@ -161,23 +161,58 @@ internal static class VacuumExecutor
     }
 
     /// <summary>
-    /// Directories vacuum must never sweep.
+    /// Whether vacuum must leave <paramref name="path"/> alone — the HIDDEN-NAME rule, applied to every
+    /// component of the relative path.
     ///
-    /// <para><c>_delta_log/</c> is the log itself — its lifetime is governed by
-    /// <c>delta.logRetentionDuration</c> and log cleanup, not by vacuum.</para>
+    /// <para>A name beginning <c>_</c> or <c>.</c> is hidden by the Hadoop convention Delta inherits, and
+    /// belongs to whoever wrote it: <c>_delta_log/</c> (governed by log cleanup, not vacuum),
+    /// <c>_change_data/</c> (referenced by <c>cdc</c> actions, so never in <c>ActiveFiles</c> — sweeping it
+    /// deletes live history), and anything a co-operating engine keeps beside the data, such as an index
+    /// sidecar. None of them can be judged against this snapshot's active files, and a file vacuum cannot
+    /// judge is a file it must not delete.</para>
     ///
-    /// <para><c>_change_data/</c> holds change-data-feed files, which are referenced by <c>cdc</c>
-    /// actions rather than <c>add</c> actions and so never appear in the snapshot's active files.
-    /// Sweeping it would delete live CDF history — which the previous implementation did, since those
-    /// files are <c>.parquet</c> and absent from <c>ActiveFiles</c>. Excluding the directory
-    /// under-deletes (expired CDF is never collected) but cannot destroy readable history; building a
-    /// proper CDF keep-set needs the snapshot to track <c>cdc</c> actions, which it does not yet.</para>
+    /// <para><b>⚠ PARTITION DIRECTORIES ARE THE EXCEPTION, and without it this rule silently stops
+    /// collecting.</b> A partition column may be named with a leading underscore, so <c>_region=eu/</c> is a
+    /// hidden NAME and live data — excluding it would make every orphan inside it immortal. Matched against
+    /// the snapshot's declared partition columns rather than by looking for <c>=</c>, so an ordinary
+    /// directory that happens to contain one is not mistaken for a partition.</para>
+    ///
+    /// <para><b>⚠ Applied PER COMPONENT and to FILES as well as directories</b>, which is what Delta does
+    /// (<c>DeltaFileOperations.recursiveListDirs</c> filters on <c>getPath.getName</c> at every level, for
+    /// both) — a listing that recurses would otherwise reach a hidden directory's contents by their full
+    /// path and collect them one level down.</para>
+    ///
+    /// <para><b>Divergence from Delta, deliberately in the conservative direction:</b> Delta un-hides
+    /// <c>_delta_index</c> and <c>_change_data</c> so that both ARE collected. Neither is safe here —
+    /// there is no CDF keep-set (the snapshot does not track <c>cdc</c> actions), and an index this
+    /// library does not write is one it cannot know is dead. Under-deleting leaves storage behind;
+    /// over-deleting destroys another engine's data.</para>
     /// </summary>
-    private static bool IsExcludedDirectory(string path) =>
-        path.StartsWith("_delta_log/", StringComparison.Ordinal)
-        || path.StartsWith("_delta_log\\", StringComparison.Ordinal)
-        || path.StartsWith(CdfConfig.ChangeDataDir + "/", StringComparison.Ordinal)
-        || path.StartsWith(CdfConfig.ChangeDataDir + "\\", StringComparison.Ordinal);
+    private static bool IsExcludedPath(string path, IReadOnlyList<string> partitionColumns)
+    {
+        foreach (var component in path.Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (component.Length == 0)
+                continue;
+            if (component[0] != '_' && component[0] != '.')
+                continue;
+            // A partition directory is live data whatever it is called.
+            bool isPartitionDir = false;
+            foreach (var column in partitionColumns)
+            {
+                if (component.StartsWith(column + "=", StringComparison.Ordinal))
+                {
+                    isPartitionDir = true;
+                    break;
+                }
+            }
+            if (!isPartitionDir)
+                return true;
+        }
+        return false;
+    }
+
+    private static readonly char[] PathSeparators = ['/', '\\'];
 
     // Writes a commitInfo-only commit, retrying past versions a concurrent writer takes (the commit carries
     // no data actions, so re-attempting at the next version is always safe). Returns the committed version.
