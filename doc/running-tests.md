@@ -70,15 +70,24 @@ standing between a spec divergence and shipping it.
 
 | Tier | Install | Tests | Reaches |
 |---|---|---|---|
-| 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 21 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
+| 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 28 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
 | 2 — DuckDB | `pip install duckdb` (1.4+) | 2 | VARIANT parquet reads through an implementation that is not delta-kernel-rs. Sub-second. |
-| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 44 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~70s to run. |
+| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 68 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, V2 checkpoints, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~90s to run. |
 
 **The `[pyarrow]` extra is not optional.** `deltalake` 1.6 made pyarrow an extra,
 and the tier-1 driver reads through pyarrow — install the bare package and the
-tier does not skip, it FAILS, all 19 tests at once with
+tier does not skip, it FAILS, ~27 tests at once with
 `ImportError: Pyarrow is required, install deltalake[pyarrow]`. The availability
 probe only imports `deltalake`, which succeeds.
+
+This is not hypothetical: CI hit exactly it on the first run after the tiers
+were enabled there (PR #103), because `pip install deltalake` alone had been
+written into the workflow. `.github/workflows/ci.yml` now installs `pyarrow`
+explicitly, alongside `tzdata` — Windows CPython ships no time-zone database,
+so `zoneinfo.ZoneInfo("UTC")`, which the tier-1 driver's `read_epoch_micros`
+needs, raises `ZoneInfoNotFoundError` without it. Both are already in the
+Python prerequisites above; both were invisible on developer machines that
+had them installed for unrelated reasons.
 
 Tier 2 (DuckDB) was evaluated and **dropped as a Delta tier**: delta-rs embeds
 delta-kernel-rs, which is what DuckDB's delta extension is, so tier 1
@@ -271,8 +280,8 @@ dotnet test --filter "FullyQualifiedName~BatchedRead"
 
 ### Skipped tests
 
-Tests that depend on optional Python libraries show as "Skipped" with a
-reason:
+The ORC and Avro cross-validation tests show as "Skipped" with a reason
+when their Python package is missing:
 
 ```
 Skipped EngineeredWood.Orc.Tests.CrossValidationTests.CrossValidate_Integers [1 ms]
@@ -280,24 +289,76 @@ Skipped EngineeredWood.Orc.Tests.CrossValidationTests.CrossValidate_Integers [1 
 Passed!  - Failed: 0, Passed: 194, Skipped: 10, Total: 204
 ```
 
-If you see `Skipped: 0` for ORC/Avro, the Python tests **are running**
-(they passed). If you see `Skipped: 10` (ORC) or `Skipped: 7` (Avro),
-the Python packages are not installed.
+`Skipped: 0` for ORC/Avro means the Python tests **are running** (they
+passed); a non-zero count means the package is not installed.
+
+### The Delta interop tiers do NOT skip — they report Passed
+
+**This is the one number in the output you cannot take at face value.**
+The Delta interop tests are gated by `if (!Spark.EnsureAvailable()) return;`,
+which returns *normally* — so a test whose tier is unreachable is counted
+**Passed**, not Skipped. Measured on a machine with no JDK:
+
+```
+dotnet test --filter "FullyQualifiedName~SparkInteropTests"
+Passed!  - Failed: 0, Passed: 54, Skipped: 0, Total: 54, Duration: 94 ms
+```
+
+54 green tests in 94 milliseconds, having validated nothing. Nothing in
+that line distinguishes it from real coverage, and a whole tier can go dark
+without anyone noticing.
+
+Two defences, and you want both:
+
+- **Set the `EW_REQUIRE_*` variables** (below). They turn an unreachable
+  tier into a loud failure, which is the only way a green run *proves* the
+  tier ran.
+- **Watch the duration.** The Spark tier cannot complete in under a second;
+  if `SparkInteropTests` finishes instantly, it did nothing.
+
+CI does this for you now: the delta-rs and DuckDB tiers run on every commit
+with their require-variables set, and the full matrix including Spark runs
+in the nightly `Interop` workflow. So a tier going dark locally no longer
+means it is dark everywhere — but it does mean *your* run proved less than
+it looked like it did.
+
+(Reporting these as genuine skips would be better. It needs xunit.v3 or
+`SkippableFact` — xUnit 2.9.3 has no `Assert.Skip` — so it has not been
+done.)
 
 ### Expected test counts
 
-| Suite | Total | Always run | Tool-dependent |
-|---|---|---|---|
-| **Parquet** | 590 | 590 | 0 |
-| **ORC** | 204 | 194 | 10 (PyArrow) |
-| **Avro** | 272 | 265 | 7 (fastavro) |
-| **DeltaLake** | 199 | 199 | 0 |
-| **DeltaLake.Table** | 290 | 242 | 21 interop (9 delta-rs + 12 PySpark) |
+Measured on net10.0, 2026-08-08, with every optional toolchain present:
 
-`DeltaLake.Table` also reports 27 **skipped** tests unconditionally — those
-are `PendingCoverageTests`, which pin behaviour from PR #4 that has not
-landed yet. Each names the exact API it is waiting on. They are skipped
-rather than failing so that a red suite still means a real regression.
+| Suite | Total |
+|---|---|
+| **Parquet** | 807 |
+| **Core** | 452 |
+| **DeltaLake.Table** | 842 (98 of them interop) |
+| **DeltaLake** | 484 |
+| **Vortex** | 322 |
+| **Avro** | 301 |
+| **Iceberg** | 243 |
+| **ORC** | 237 |
+| **Lance** | 209 |
+| **Expressions** | 139 |
+| **Lance.Table** | 96 |
+| **Expressions.Arrow** | 38 |
+
+Counts move with every feature, so treat these as an order-of-magnitude
+check rather than a target — the useful signal is `Failed: 0` and, for the
+suites above that have optional tiers, `Skipped: 0`.
+
+Of `DeltaLake.Table`'s 98 interop tests, **68 need PySpark** and **2 need
+DuckDB**; the remaining 28 need delta-rs. Measured by making each tier
+unreachable with its `EW_REQUIRE_*` set and counting the failures, which is
+also a quick way to re-derive these after adding tests.
+
+To regenerate the whole table:
+
+```
+dotnet test engineered-wood.slnx -f net10.0 --configuration Release
+```
 
 ## Parquet Compatibility Tool
 
