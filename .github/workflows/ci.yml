@@ -100,11 +100,16 @@ jobs:
       # `zoneinfo.ZoneInfo("UTC")` — which delta_rs_driver's read_epoch_micros needs —
       # raises ZoneInfoNotFoundError on a clean runner. Linux has a system tz database
       # and does not, which is why the nightly did not hit this.
+      #
+      # tzdata is pinned like the rest despite being a data package whose drift cannot
+      # affect anything here (only UTC is looked up, and UTC does not move). A rule with
+      # one unexplained exception stops being a rule; if a future release ever needs to
+      # float, that should be a stated decision rather than the absence of a version.
       - name: Install interop oracles (delta-rs, DuckDB)
         if: steps.changes.outputs.code == 'true'
         run: >
           python -m pip install --disable-pip-version-check
-          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata
+          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata==2026.3
 
       - name: Restore
         if: steps.changes.outputs.code == 'true'
