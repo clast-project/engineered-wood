@@ -2824,6 +2824,110 @@ public class SparkInteropTests : IDisposable
         Assert.NotEmpty(snapshot.Tombstones);
     }
 
+    // ── V2 checkpoints written by EW, read by the reference implementation ──
+
+    /// <summary>
+    /// The direction that had no coverage at all: Spark rebuilding a table's state from a V2 checkpoint
+    /// EW wrote. Run in both arms — file actions inline, and file actions in sidecars.
+    /// </summary>
+    /// <remarks>
+    /// <para>Before this, no V2 checkpoint EW produced had ever been read by anything but EW, and not by
+    /// oversight: both interop drivers located a checkpoint by globbing the classic name, which a
+    /// <c>&lt;n&gt;.checkpoint.&lt;uuid&gt;.json</c> never matches. Every checkpoint assertion in this
+    /// suite silently applied to V1 only, so switching a table to V2 would have moved it OUT of coverage
+    /// rather than into it.</para>
+    ///
+    /// <para><b>The VACUUM assertion is the part that can actually fail.</b> Reading rows back proves the
+    /// add actions survived, which a file-set comparison would also show — but a checkpoint that drops
+    /// its unexpired REMOVE tombstones yields exactly the same rows, and only VACUUM retention safety
+    /// breaks. Spark's <c>VacuumCommand</c> builds its reachable set from the snapshot's add AND remove
+    /// actions, so a data file named by a surviving tombstone is not listed as vacuumable and one whose
+    /// tombstone was lost is. That is the bug this repository shipped in its own V2 writer (#73), and it
+    /// is the reason the DELETE is here.</para>
+    ///
+    /// <para>delta-rs cannot stand in for this: it declines the <c>v2Checkpoint</c> reader feature
+    /// outright, on Spark-written tables as much as EW's — see
+    /// <c>DeltaRsInteropTests.EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature</c>.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
+    [InlineData(1, 1)]      // threshold below → one sidecar
+    [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
+    public async Task EwWrittenV2Checkpoint_SparkReadsFromTheCheckpointAlone(
+        int sidecarThreshold, int expectedSidecars)
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
+            // Checkpointed explicitly below, so the version it lands on is not left to an interval.
+            options: new DeltaTableOptions { CheckpointInterval = 0 });
+
+        for (long i = 1; i <= 6; i++)
+            await table.WriteAsync([IdRegionBatch([i], [i % 2 == 0 ? "us" : "eu"])]);
+
+        // Copy-on-write: the file holding id=3 is rewritten without it, leaving a remove tombstone and
+        // an unreferenced data file on disk — which is what the VACUUM assertion turns on.
+        await table.DeleteAsync(b =>
+        {
+            var ids = (Int64Array)b.Column(0);
+            var doomed = new BooleanArray.Builder();
+            for (int i = 0; i < b.Length; i++)
+                doomed.Append(ids.GetValue(i) == 3);
+            return doomed.Build();
+        });
+
+        Assert.NotEmpty(table.CurrentSnapshot.Tombstones);
+
+        await new EngineeredWood.DeltaLake.Checkpoint.CheckpointWriter(fs)
+        {
+            V2Writer = new EngineeredWood.DeltaLake.Checkpoint.V2CheckpointWriter(fs)
+            {
+                SidecarThreshold = sidecarThreshold,
+                // 6 adds + 1 tombstone: a cap of 4 splits them in two.
+                MaxActionsPerSidecar = expectedSidecars > 1 ? 4 : int.MaxValue,
+            },
+        }.WriteCheckpointAsync(table.CurrentSnapshot);
+
+        // One commit ABOVE the checkpoint. Spark's log segment is "a checkpoint plus the commits after
+        // it" and it refuses a table whose newest version is a checkpoint with no commit file — but the
+        // requirement is welcome here anyway: it means the checkpoint version and everything below it
+        // are hidden outright, so the tombstone asserted on below has nowhere to come from except the
+        // checkpoint.
+        await table.WriteAsync([IdRegionBatch([7], ["us"])]);
+
+        var result = Spark.Invoke("checkpoint_only_read", new { path = _tempDir });
+
+        // It really was a UUID-named V2 checkpoint Spark read — otherwise this is a V1 test in disguise.
+        string checkpointFile = result.GetProperty("checkpoint_file").GetString()!;
+        Assert.Contains(".checkpoint.", checkpointFile, StringComparison.Ordinal);
+        Assert.EndsWith(".json", checkpointFile, StringComparison.Ordinal);
+        Assert.Equal(expectedSidecars, result.GetProperty("sidecars").GetArrayLength());
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+
+        // Spark declares it understands the feature, and reconstructed the same rows EW sees.
+        Assert.Contains("v2Checkpoint",
+            result.GetProperty("detail").GetProperty("table_features").EnumerateArray()
+                .Select(f => f.GetString()));
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+
+        // NOT file-set equality, and the assertion that can actually fail. Spark's own reconstructed
+        // tombstones, taken twice — once from the full log, once from the checkpoint alone — must agree.
+        // A checkpoint that dropped its unexpired removes yields identical ROWS, so nothing above would
+        // notice; this is where it shows up.
+        static List<string> Paths(JsonElement e) =>
+            e.EnumerateArray().Select(f => f.GetString()!).ToList();
+
+        var fromLog = Paths(result.GetProperty("tombstones_with_commits"));
+        var fromCheckpoint = Paths(result.GetProperty("tombstones_from_checkpoint"));
+
+        // Non-empty first: equal-but-empty would pass while asserting nothing.
+        Assert.NotEmpty(fromLog);
+        Assert.Equal(fromLog, fromCheckpoint);
+    }
+
     /// <summary>The version of the UUID-named checkpoint with the given body in a log listing.</summary>
     private static long ParseCheckpointVersion(IEnumerable<string> logFiles, string body)
     {

@@ -135,19 +135,33 @@ def cmd_checkpoint_only_read(args):
     Moves every commit JSON at or below the checkpoint version out of the way, so a
     successful read proves the CHECKPOINT carried the state -- not the JSON commits.
     Renames rather than deletes so a failure leaves the table diagnosable.
+
+    Finds a checkpoint of ANY naming scheme. Globbing `*.checkpoint.parquet` matched only the
+    classic name, which a `<n>.checkpoint.<uuid>.json` never does -- so every checkpoint assertion
+    reached through here silently applied to V1 only, and a V2 table would have reported "no
+    checkpoint file was written" rather than testing anything.
+
+    The `.checkpoint.` guard in the hide loop is not cosmetic either: a UUID-named V2 checkpoint IS
+    a `.json` file in the log directory whose name starts with the version, so without it the loop
+    hides the very checkpoint the test is trying to read from.
     """
     from deltalake import DeltaTable
     path = args["path"]
     logdir = os.path.join(path, "_delta_log")
 
-    checkpoints = sorted(glob.glob(os.path.join(logdir, "*.checkpoint.parquet")))
+    checkpoints = sorted(
+        p for p in glob.glob(os.path.join(logdir, "*.checkpoint.*"))
+        if os.path.isfile(p))
     if not checkpoints:
         return {"ok": False, "error": "no checkpoint file was written"}
-    cp_version = int(os.path.basename(checkpoints[-1]).split(".")[0])
+    newest = os.path.basename(checkpoints[-1])
+    cp_version = int(newest.split(".")[0])
 
     moved = []
     for f in sorted(glob.glob(os.path.join(logdir, "*.json"))):
         base = os.path.basename(f)
+        if ".checkpoint." in base:
+            continue
         if base[0].isdigit() and int(base.split(".")[0]) <= cp_version:
             os.rename(f, f + ".hidden")
             moved.append(base)
@@ -156,6 +170,9 @@ def cmd_checkpoint_only_read(args):
     tbl = dt.to_pyarrow_table()
     return {
         "checkpoint_version": cp_version,
+        "checkpoint_file": newest,
+        "sidecars": sorted(os.path.basename(p)
+                           for p in glob.glob(os.path.join(logdir, "_sidecars", "*"))),
         "hidden_commits": moved,
         "version": dt.version(),
         "row_count": tbl.num_rows,

@@ -20,3 +20,4 @@ tmp/
 
 ## Claude Code session state
 .claude/
+__pycache__/

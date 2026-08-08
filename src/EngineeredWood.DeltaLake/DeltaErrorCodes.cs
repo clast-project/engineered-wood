@@ -88,6 +88,15 @@ public static class DeltaErrorCodes
     /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_FEATURES_FOR_WRITE</c>.</remarks>
     public const string UnsupportedFeaturesForWrite = "DELTA_UNSUPPORTED_FEATURES_FOR_WRITE";
 
+    /// <summary>
+    /// The operation requires a table feature the table has not enabled. Not a limitation of this
+    /// implementation — the inverse of <see cref="UnsupportedFeaturesForWrite"/>, which is.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_FEATURE_REQUIRES_MANUAL_ENABLEMENT</c>, raised for the same
+    /// shape of condition — the writer can do the thing, the table has not been told to allow it.
+    /// </remarks>
+    public const string FeatureNotEnabled = "DELTA_FEATURE_REQUIRES_MANUAL_ENABLEMENT";
+
     // ── Table configuration ──
 
     /// <summary>The table's schema or configuration violates the IcebergCompat rules it declares.</summary>

@@ -569,4 +569,86 @@ public class CreateTimeFeatureEnablementTests : IDisposable
         Assert.DoesNotContain("custom.ignored", opened.CurrentSnapshot.Metadata.Configuration!.Keys);
         Assert.Contains("changeDataFeed", opened.CurrentSnapshot.Protocol.WriterFeatures!);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // delta.checkpointPolicy
+    // ---------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// The end-to-end that <c>V2CheckpointWriter</c> never had: a table asks for V2 checkpoints in its
+    /// own configuration, and ORDINARY WRITES produce them. Until now the type was public, worked, had
+    /// tests — and nothing in the library ever called it, so a table EW maintained got classic V1
+    /// checkpoints whether or not it had asked for anything else.
+    /// </summary>
+    /// <remarks>
+    /// Both halves have to hold together. The property alone would leave a table whose protocol never
+    /// declares <c>v2Checkpoint</c>, and writing a V2 checkpoint to that table produces something a
+    /// conforming reader may reject; the feature alone would leave the property inert. So this asserts
+    /// the declaration, the checkpoint's NAME, and that the table still reads back from the checkpoint
+    /// once the commits it subsumes are gone.
+    /// </remarks>
+    [Fact]
+    public async Task CheckpointPolicyV2_DeclaresFeatureAndAutoCheckpointsAreV2()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdValueSchema();
+
+        // Interval 2, so the second write checkpoints without needing ten of them.
+        var options = new DeltaTableOptions { CheckpointInterval = 2 };
+
+        await using (var created = await DeltaTable.CreateAsync(fs, schema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
+            options: options))
+        {
+            var protocol = created.CurrentSnapshot.Protocol;
+            Assert.Equal(3, protocol.MinReaderVersion);
+            Assert.Equal(7, protocol.MinWriterVersion);
+            // Reader AND writer: a UUID-named checkpoint is a form readers must understand too.
+            Assert.Contains("v2Checkpoint", protocol.ReaderFeatures!);
+            Assert.Contains("v2Checkpoint", protocol.WriterFeatures!);
+
+            await created.WriteAsync([IdValueBatch(schema, (1, "a"))]); // version 1
+            await created.WriteAsync([IdValueBatch(schema, (2, "b"))]); // version 2 → checkpoint
+        }
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        Assert.NotEmpty(Directory.GetFiles(logDir, "*.checkpoint.*.json"));
+        Assert.Empty(Directory.GetFiles(logDir, "*.checkpoint.parquet"));
+
+        // The checkpoint has to actually carry the table: delete what it subsumes and reopen.
+        foreach (string commit in Directory.GetFiles(logDir, "*.json"))
+        {
+            string name = Path.GetFileName(commit);
+            if (name.Contains(".checkpoint.", StringComparison.Ordinal)) continue;
+            if (long.TryParse(Path.GetFileNameWithoutExtension(name), out long v) && v <= 2)
+                File.Delete(commit);
+        }
+
+        await using var reopened = await DeltaTable.OpenAsync(fs, options);
+        Assert.Equal(2, reopened.CurrentSnapshot.Version);
+        Assert.Equal(2, reopened.CurrentSnapshot.FileCount);
+    }
+
+    /// <summary>
+    /// A table that says nothing about checkpoints keeps getting classic V1 ones. The default must not
+    /// have moved: V1 is the form every Delta reader handles, and nothing here asked for otherwise.
+    /// </summary>
+    [Fact]
+    public async Task NoCheckpointPolicy_StillWritesClassicCheckpoints()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdValueSchema();
+        var options = new DeltaTableOptions { CheckpointInterval = 2 };
+
+        await using (var created = await DeltaTable.CreateAsync(fs, schema, options: options))
+        {
+            Assert.DoesNotContain("v2Checkpoint", created.CurrentSnapshot.Protocol.ReaderFeatures ?? []);
+            await created.WriteAsync([IdValueBatch(schema, (1, "a"))]);
+            await created.WriteAsync([IdValueBatch(schema, (2, "b"))]);
+        }
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        Assert.NotEmpty(Directory.GetFiles(logDir, "*.checkpoint.parquet"));
+        Assert.Empty(Directory.GetFiles(logDir, "*.checkpoint.*.json"));
+    }
 }

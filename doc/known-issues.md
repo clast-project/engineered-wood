@@ -410,14 +410,22 @@ table's own column is refused rather than shadowed. Background:
 (`CheckpointReader.cs`); write always emits a single
 `.checkpoint.parquet` (`CheckpointWriter.cs`), regardless of table size.
 
-**V2 checkpoints are never written automatically.** `V2CheckpointWriter`
-is public and works, but nothing in the library calls it: the
-`delta.checkpointInterval` path in `DeltaTable` only ever runs
-`CheckpointWriter`, so a table EW maintains gets V1 checkpoints
-regardless of whether it has the `v2Checkpoint` feature. The writer also
-does not verify that the feature is enabled before producing a V2
-checkpoint, which the spec requires of a writer. A host that wants V2
-must call `V2CheckpointWriter` itself and check the protocol itself.
+**A `v2Checkpoint` table is unreadable by delta-rs.** Not an EW gap, but
+the practical consequence of setting `delta.checkpointPolicy=v2`:
+deltalake 1.6.2 refuses to read the DATA of any table declaring the
+`v2Checkpoint` reader feature — "not yet supported by the deltalake
+reader" — with the commits fully intact and no checkpoint involved. A
+delta-spark-written V2 table is refused identically, so this is delta-rs's
+limit rather than anything about EW's output. Measured 2026-08-08;
+`DeltaRsInteropTests.EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature`
+is the tripwire for when it changes. Consequence: EW's V2 write path is
+validated against Spark only.
+
+**`_last_checkpoint` `checksum` is not written.** The spec's optional MD5
+over a canonicalized form of the file. Readers "are encouraged to
+validate the checksum, if present", and a wrong one is worse than an
+absent one — a reader that validates would reject a good hint — so it is
+omitted rather than approximated. delta-spark writes it.
 
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,

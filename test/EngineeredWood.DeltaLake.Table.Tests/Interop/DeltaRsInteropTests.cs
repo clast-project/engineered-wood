@@ -311,6 +311,51 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
     }
 
+    /// <summary>
+    /// delta-rs declines to read ANY table that declares the <c>v2Checkpoint</c> reader feature — the
+    /// data, not just the checkpoint. So enabling <c>delta.checkpointPolicy=v2</c> puts a table out of
+    /// delta-rs's reach entirely, and that is worth a test of its own rather than an absence of one.
+    /// </summary>
+    /// <remarks>
+    /// <para>MEASURED 2026-08-08 against deltalake 1.6.2, and it is delta-rs's own limit, not something
+    /// about what EW writes: a delta-spark-written V2 table is refused with the identical message, and
+    /// the refusal fires with the commits fully intact, so no checkpoint is ever involved. The table
+    /// object still constructs and reports its version; the refusal lands on the read.</para>
+    ///
+    /// <para>Consequence for this repository: the V2 write path's foreign validation rests entirely on
+    /// Spark — see <c>SparkInteropTests.EwWrittenV2Checkpoint_SparkReadsFromTheCheckpointAlone</c>. This
+    /// test is the tripwire for when delta-rs grows the feature, at which point the checkpoint-only
+    /// assertion can be mirrored here.</para>
+    /// </remarks>
+    [Fact]
+    public async Task EwWrittenV2Table_IsRefusedByDeltaRs_WhichDoesNotImplementTheFeature()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
+            options: new DeltaTableOptions { CheckpointInterval = 2 });
+
+        for (long i = 1; i <= 4; i++)
+            await table.WriteAsync([IdRegionBatch([i], [i % 2 == 0 ? "us" : "eu"])]);
+
+        // A V2 checkpoint is on disk, and every commit is still beside it.
+        Assert.NotEmpty(Directory.GetFiles(
+            Path.Combine(_tempDir, "_delta_log"), "*.checkpoint.*.json"));
+
+        var refused = Assert.Throws<InvalidOperationException>(
+            () => DeltaRs.Invoke("read", new { path = _tempDir }));
+        Assert.Contains("v2Checkpoint", refused.Message, StringComparison.Ordinal);
+        Assert.Contains("not yet supported", refused.Message, StringComparison.Ordinal);
+
+        // The log itself is fine — delta-rs parses every action out of it without complaint. Only the
+        // feature declaration stops it, which is what makes this a delta-rs gap rather than a bad table.
+        var raw = DeltaRs.Invoke("raw_log", new { path = _tempDir });
+        Assert.NotEmpty(raw.GetProperty("actions").EnumerateArray());
+    }
+
     // ── Statistics and pruning. ──
 
     /// <summary>
