@@ -69,10 +69,15 @@ jobs:
       # a considered bump here rather than as a nightly that turned red on its own.
       #
       # delta-spark's major version must match pyspark's: 4.x pairs with Spark 4.0.
+      #
+      # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
+      # without it every delta-rs read raises "Pyarrow is required" — invisible on a
+      # dev box, which has pyarrow for the ORC cross-validation.
       - name: Install interop oracles (Spark, delta-rs, DuckDB)
         run: |
           python -m pip install --disable-pip-version-check \
-            pyspark==4.0.1 delta-spark==4.0.0 deltalake==1.6.2 duckdb==1.5.5
+            pyspark==4.0.1 delta-spark==4.0.0 \
+            deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
 
       # Warms the Ivy cache so the first test does not pay jar resolution inside its
       # own timeout, and fails here — with a readable error — rather than deep inside

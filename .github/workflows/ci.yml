@@ -87,9 +87,19 @@ jobs:
       # Versions are pinned because these tiers are ORACLES: an upgrade that changes
       # behaviour must show up as a deliberate bump in this file, not as a build that
       # started failing overnight for reasons nobody chose.
+      #
+      # pyarrow is listed EXPLICITLY. deltalake 1.6.2 no longer depends on it — it is
+      # an optional extra (`deltalake[pyarrow]`) — so `deltalake` alone installs a
+      # package whose read paths raise "Pyarrow is required" the moment a driver
+      # command touches data. That went unnoticed locally because pyarrow is already
+      # present on a dev box for the ORC cross-validation, which is exactly the kind
+      # of undeclared dependency this job exists to surface. Declaring it also turns
+      # ON the ORC PyArrow cross-validation tests, which had been soft-skipping here.
       - name: Install interop oracles (delta-rs, DuckDB)
         if: steps.changes.outputs.code == 'true'
-        run: python -m pip install --disable-pip-version-check deltalake==1.6.2 duckdb==1.5.5
+        run: >
+          python -m pip install --disable-pip-version-check
+          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
 
       - name: Restore
         if: steps.changes.outputs.code == 'true'
