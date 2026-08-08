@@ -122,6 +122,19 @@ public sealed class LogCommitter
                 {
                     await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken)
                         .ConfigureAwait(false);
+
+                    // Cleanup runs ONLY here, immediately after a checkpoint, for two reasons that both
+                    // matter: this is the moment older commits become redundant, so it is the earliest
+                    // point the work is legitimate; and it bounds the cost, since a listing per COMMIT
+                    // would put an O(log) scan on the hot path for something that can only change every
+                    // CheckpointInterval versions. Delta triggers it the same way.
+                    //
+                    // Ordering is not incidental either — the checkpoint must be DURABLE before anything
+                    // is deleted, or a failure between the two leaves commits removed with nothing
+                    // covering them.
+                    await LogCleanup.RunAsync(
+                        _log, snapshot.Metadata.Configuration, attemptVersion,
+                        DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
                 }
 
                 return new LogCommitResult(attemptVersion, snapshot, Committed: true);
