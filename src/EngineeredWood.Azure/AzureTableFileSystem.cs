@@ -56,6 +56,16 @@ public sealed class AzureTableFileSystem : ITableFileSystem
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
     }
 
+    /// <summary>
+    /// Azure Blob's documented blob-name rules. It accepts far more than Win32 does — MEASURED against
+    /// Azurite, <c>&lt; &gt; |</c> and a trailing space all round-trip byte-identically — but it is NOT
+    /// unconstrained: the naming rules bar control characters, and state that "no path segments should end
+    /// with a dot", which Azurite happily accepts and so cannot be probed for locally. Taken from the
+    /// vendor docs rather than from the emulator, because the emulator is the more permissive of the two.
+    /// </summary>
+    public PathNameConstraints PathConstraints =>
+        PathNameConstraints.NoControlCharacters | PathNameConstraints.NoTrailingDot;
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix,

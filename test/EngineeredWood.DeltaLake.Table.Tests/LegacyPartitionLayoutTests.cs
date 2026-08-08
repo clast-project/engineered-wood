@@ -11,10 +11,12 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <para>The upgrade path for GitHub issue #84. Making <see cref="DeltaPath.EscapePathName(string)"/>
-/// platform-dependent — as Spark's is — changed the directory EW builds on Windows for a partition
-/// value containing a space: <c>region=a b</c> before, <c>region=a%20b</c> after. Tables written by an
-/// older EW on Windows, and tables written by ANY Delta writer on POSIX, carry the old spelling.</para>
+/// <para>The upgrade path for GitHub issue #84. Making <see cref="DeltaPath.EscapePathName"/> depend on
+/// what the target storage can hold — as Spark's depends on <c>Shell.WINDOWS</c> — changed the directory
+/// EW builds on a Win32 volume for a partition value containing a space: <c>region=a b</c> before,
+/// <c>region=a%20b</c> after. Tables written by an older EW on Windows, and tables written by ANY Delta
+/// writer to unrestricted storage, carry the old spelling. Choosing
+/// <see cref="PartitionPathSpelling.Portable"/> changes it again, for more values.</para>
 ///
 /// <para>Both must still read, and an append must still work against them. That holds because a reader
 /// resolves files through <c>add.path</c> and never by parsing directory names — so the old directory

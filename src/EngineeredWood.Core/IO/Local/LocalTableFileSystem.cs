@@ -25,6 +25,28 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         _allocator = allocator;
     }
 
+    /// <summary>
+    /// <para>The naming rules of the VOLUME this instance is rooted on, which is the only place in the
+    /// codebase where the host operating system is the right thing to ask about.</para>
+    ///
+    /// <para>Windows is reported as the full <see cref="PathNameConstraints.Win32"/> set. On other
+    /// platforms this reports <see cref="PathNameConstraints.None"/>, which is a KNOWN
+    /// UNDER-REPORT — reasoned, not measured: a POSIX process can have an NTFS, exFAT or SMB volume
+    /// mounted, the constraints belong to that volume rather than to the kernel reaching it, and .NET
+    /// exposes no portable way to ask which filesystem backs a path. A caller that needs a name safe on
+    /// a volume it cannot interrogate should ask for a portable spelling explicitly rather than trust
+    /// this property to know.</para>
+    /// </summary>
+    public PathNameConstraints PathConstraints =>
+#if NET5_0_OR_GREATER
+        OperatingSystem.IsWindows()
+#else
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows)
+#endif
+            ? PathNameConstraints.Win32
+            : PathNameConstraints.None;
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix,

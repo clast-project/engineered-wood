@@ -3900,6 +3900,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return count;
     }
 
+    // The Hive-style directory a file with these partition values belongs under. Spelled per this table's
+    // configured PartitionPathSpelling, with the escape decision that Spark makes from Shell.WINDOWS taken
+    // from what THIS table's storage declares it cannot hold — see PartitionPathSpelling for why the
+    // storage rather than the writing process. Funnelled through one helper so the write paths cannot
+    // drift apart: two sites spelling one partition differently would scatter a partition across two
+    // directories, which readers tolerate but nobody wants to debug.
+    private string BuildPartitionPath(IReadOnlyDictionary<string, string> partitionValues) =>
+        DeltaPath.BuildPartitionPath(
+            partitionValues, _options.PartitionPathSpelling, _fs.PathConstraints);
+
     // The canonical identity of ONE partition (for dynamic partition overwrite set membership): the
     // sorted "key=value" pairs joined with U+0001, with every key translated to its PHYSICAL name when the
     // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
@@ -4895,7 +4905,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, logicalToPhysical));
 
                 // Build file path: partition subdirectory + UUID filename
-                string partDir = DeltaPath.BuildPartitionPath(trackedPartValues);
+                string partDir = BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
                     ? $"{Guid.NewGuid():N}.parquet"
                     : $"{partDir}/{Guid.NewGuid():N}.parquet";
@@ -5444,7 +5454,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                string partDir = DeltaPath.BuildPartitionPath(trackedPartValues);
+                string partDir = BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
                     ? $"{Guid.NewGuid():N}.parquet"
                     : $"{partDir}/{Guid.NewGuid():N}.parquet";
