@@ -870,6 +870,44 @@ public class V2CheckpointTests : IDisposable
     }
 
     /// <summary>
+    /// <see cref="CheckpointFormat.V2WhenSupported"/> is delta-kernel-rs's rule: never a V1 checkpoint
+    /// on a table that supports V2. It reads the PROTOCOL only, so it diverges from
+    /// <see cref="CheckpointFormat.Automatic"/> in exactly the two rows where the policy is what would
+    /// otherwise decide — and unlike <see cref="CheckpointFormat.V2"/> it degrades to a classic
+    /// checkpoint on a table without the feature rather than throwing.
+    /// </summary>
+    [Theory]
+    [InlineData(true, null, true)]       // feature, no policy    → V2 (Automatic would write classic)
+    [InlineData(true, "classic", true)]  // feature, policy says classic → V2, overriding it
+    [InlineData(true, "v2", true)]       // feature + policy      → V2, same as Automatic
+    [InlineData(false, null, false)]     // no feature            → classic, and NOT a throw
+    [InlineData(false, "v2", false)]     // no feature            → classic, whatever the policy asks
+    public async Task V2WhenSupported_AsksTheProtocolOnly(
+        bool featureEnabled, string? policy, bool expectV2)
+    {
+        var config = policy is null
+            ? null
+            : new Dictionary<string, string> { ["delta.checkpointPolicy"] = policy };
+
+        var (fs, snapshot) = await BuildTableAsync(
+            featureEnabled ? V2Protocol() : ClassicProtocol(), config);
+
+        await new CheckpointWriter(fs) { Format = CheckpointFormat.V2WhenSupported }
+            .WriteCheckpointAsync(snapshot);
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        Assert.Equal(expectV2, Directory.GetFiles(logDir, "*.checkpoint.*.json").Length > 0);
+        Assert.Equal(
+            !expectV2,
+            File.Exists(Path.Combine(logDir, $"{snapshot.Version:D20}.checkpoint.parquet")));
+
+        // Whichever form it took, the table still reads back from the checkpoint alone.
+        DeleteCommitsThrough(snapshot.Version);
+        var rebuilt = await SnapshotBuilder.BuildAsync(new TransactionLog(fs), new CheckpointReader(fs));
+        Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
+    }
+
+    /// <summary>
     /// PROTOCOL.md: the V2 spec "can be used only when [the] v2 checkpoint table feature is enabled".
     /// The writer never checked, so it produced checkpoints a conforming reader is entitled to reject,
     /// on tables whose protocol gives that reader no warning the form might appear.

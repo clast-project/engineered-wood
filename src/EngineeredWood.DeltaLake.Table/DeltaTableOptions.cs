@@ -39,9 +39,11 @@ public sealed record DeltaTableOptions
     /// <remarks>
     /// The default is what delta-spark would do with the same table, which is the point: a table created
     /// by another engine keeps the checkpoint form its own configuration asks for when EW maintains it.
-    /// Override to pin one form regardless — see <see cref="CheckpointFormat"/> for when either is worth
-    /// pinning. For the V2 writer's own settings (sidecar policy, body format), supply a configured
-    /// writer through <see cref="Checkpoint.CheckpointWriter.V2Writer"/>.
+    /// <see cref="CheckpointFormat.Classic"/> and <see cref="CheckpointFormat.V2"/> pin one form
+    /// regardless; <see cref="CheckpointFormat.V2WhenSupported"/> takes delta-kernel-rs's rule instead of
+    /// delta-spark's. See <see cref="CheckpointFormat"/> for when each is worth choosing. For the V2
+    /// writer's own settings (sidecar policy, body format), supply a configured writer through
+    /// <see cref="Checkpoint.CheckpointWriter.V2Writer"/>.
     /// </remarks>
     public CheckpointFormat CheckpointFormat { get; init; } = CheckpointFormat.Automatic;
 

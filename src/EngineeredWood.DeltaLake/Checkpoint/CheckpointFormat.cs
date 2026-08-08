@@ -44,4 +44,28 @@ public enum CheckpointFormat
     /// feature, since the spec permits the form only then.
     /// </summary>
     V2 = 2,
+
+    /// <summary>
+    /// V2 whenever the table's protocol permits it, ignoring <c>delta.checkpointPolicy</c> — and a
+    /// classic V1 checkpoint on a table that has not enabled the feature. Never throws.
+    /// </summary>
+    /// <remarks>
+    /// <para>delta-kernel-rs's rule, adopted here as an opt-in rather than as the default: it carries
+    /// <c>"Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint"</c> and
+    /// so declines the combination <see cref="Automatic"/> produces for a table whose policy still says
+    /// classic. The reasoning is defensible — once a table has taken on the reader-side cost of the
+    /// feature, there is little left to gain from the older form.</para>
+    ///
+    /// <para>Kept out of <see cref="Automatic"/> because it is not strictly-more-correct, and the
+    /// trade runs in both directions. PROTOCOL.md permits what it forbids: a <c>v2Checkpoint</c> table
+    /// "could use classic checkpoints which can follow V1 or V2 spec". delta-spark writes exactly that
+    /// classic checkpoint when the policy says classic, so this setting makes EW disagree with the
+    /// reference implementation on a table both are maintaining — and it overrides an explicit
+    /// <c>delta.checkpointPolicy=classic</c>, which someone set on purpose.</para>
+    ///
+    /// <para>Worth choosing when the readers of these tables are kernel-based and the policy property
+    /// is not something the deployment manages; not worth choosing to be "safer", because kernel READS
+    /// a classic V1 checkpoint on such a table without complaint — its restriction is on writing.</para>
+    /// </remarks>
+    V2WhenSupported = 3,
 }
