@@ -522,7 +522,9 @@ public IAsyncEnumerable<RecordBatch> ReadAllAsync(
 
 ### CHECK constraints
 
-> **Not implemented** (phase 10, blocked on phase 9). What ships today is the
+> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102),
+> blocked on phase 9 / [#101](https://github.com/clast-project/engineered-wood/issues/101)).
+> What ships today is the
 > fail-closed guard: `DeltaTable.HonorWriterFeatures` detects an active
 > `delta.constraints.*` and rejects the write rather than committing rows it
 > cannot validate. The design below is the intended replacement, and
@@ -562,8 +564,9 @@ public sealed record DeltaTableOptions
 
 ### Generated columns
 
-> **Not implemented** (phase 10, blocked on phase 9), and refused on write the
-> same way CHECK constraints are.
+> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102),
+> blocked on phase 9 / [#101](https://github.com/clast-project/engineered-wood/issues/101)), and
+> refused on write the same way CHECK constraints are.
 
 On write, parse `delta.generationExpression` from each generated column's
 metadata. For each batch:
@@ -576,6 +579,33 @@ metadata. For each batch:
 Same parser injection as CHECK constraints.
 
 ## `EngineeredWood.SparkSql` — ANTLR-Based Parser
+
+> **Approach reopened** ([#101](https://github.com/clast-project/engineered-wood/issues/101)).
+> What follows is the incumbent design, not a settled decision. Two inputs
+> arrived after it was written.
+>
+> **The AOT gate.** `src/Directory.Build.props` now sets `IsAotCompatible=true`
+> and `TreatWarningsAsErrors=true` for the net10.0 build of every library under
+> `src/`, which a new package inherits. This design mentions neither AOT nor
+> trimming anywhere. Opting a leaf package out is one MSBuild line, but it is a
+> decision to make deliberately rather than discover mid-implementation, and it
+> weighs against a package carrying a code-generation runtime.
+>
+> **A third option the rejection list below does not cover.** delta-kernel-rs hit
+> this exact problem — parsing `checkConstraints` expressions — and wrote a
+> hand-rolled tokenizer and parser in-tree (`kernel/src/expressions/sql/`), with
+> no `sqlparser` dependency and no grammar toolchain, behind a
+> `check-constraints-in-dev` feature flag. Its token set is deliberately tiny:
+> comparisons including `<=>`, `+` / `-`, `AND` / `OR` / `NOT` / `IS`, quoted
+> strings, numbers with exponents, `X'…'` binary, booleans and null, typed
+> `DATE` / `TIMESTAMP` literals, and backtick-quoted or dotted identifiers — no
+> parentheses, no `*` or `/`, no wildcards. That is neither a maintained fork nor
+> a third-party dependency, so the reasoning below does not rule it out.
+>
+> #101 proposes measuring the real corpus of `delta.constraints.*` and
+> `delta.generationExpression` strings before choosing: kernel's scope is a
+> testable claim about what constraint expressions actually contain, and the
+> Spark interop rig can settle it.
 
 A separate, optional package. Consumers who don't need CHECK constraints or
 generated columns never reference it.
@@ -780,8 +810,8 @@ oversight.
 | — | Per-read filter on the Parquet reader; Delta forwarding, with logical→physical rewriting under column mapping | Parquet + DeltaLake.Table | [#55](https://github.com/clast-project/engineered-wood/issues/55) |
 | — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
-| **Phase 9** | `EngineeredWood.SparkSql`: subsetting tool, ANTLR grammar, parser, function registry | new project | unfiled |
-| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes (needs Phase 9) | DeltaLake.Table | unfiled |
+| **Phase 9** | A parser from Spark SQL expression strings to `Expression` / `Predicate`, plus a function registry. Approach reopened — see the note below | new project, or inside Expressions | [#101](https://github.com/clast-project/engineered-wood/issues/101) |
+| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes (needs Phase 9) | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
 | **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled |
 | **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled |
 | **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering | Parquet | unfiled |
