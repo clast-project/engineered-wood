@@ -48,15 +48,19 @@ public sealed class CheckpointWriter
     /// Whether <paramref name="snapshot"/> gets a V2 checkpoint under <paramref name="format"/>.
     /// </summary>
     /// <remarks>
-    /// Only <see cref="CheckpointFormat.Automatic"/> consults the table. The two explicit values are the
-    /// caller overriding that, and neither is validated here — writing a V2 checkpoint to a table without
-    /// the feature is refused by <see cref="V2CheckpointWriter"/> itself, which is where the refusal
-    /// belongs, because a host driving that writer directly must hit the same gate.
+    /// Three of the four consult the table, and differ only in how much of it they read:
+    /// <see cref="CheckpointFormat.Automatic"/> requires the protocol to permit V2 AND the policy to ask
+    /// for it, <see cref="CheckpointFormat.V2WhenSupported"/> requires only the protocol, and
+    /// <see cref="CheckpointFormat.Classic"/> reads neither. Only <see cref="CheckpointFormat.V2"/> can
+    /// name a form the table does not permit, and it is deliberately not validated here — that refusal
+    /// belongs to <see cref="V2CheckpointWriter"/>, because a host driving that writer directly must hit
+    /// the same gate.
     /// </remarks>
     internal static bool WritesV2(Snapshot.Snapshot snapshot, CheckpointFormat format) => format switch
     {
         CheckpointFormat.Classic => false,
         CheckpointFormat.V2 => true,
+        CheckpointFormat.V2WhenSupported => ProtocolVersions.SupportsV2Checkpoints(snapshot.Protocol),
         _ => ProtocolVersions.SupportsV2Checkpoints(snapshot.Protocol) &&
              CheckpointPolicy.WantsV2(snapshot.Metadata.Configuration),
     };

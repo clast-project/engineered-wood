@@ -434,11 +434,17 @@ widening either list is what makes it fail.
 **delta-kernel-rs is stricter than the spec about V1 checkpoints.** It
 carries `"Kernel does not support writing V1 checkpoints when the table
 supports v2Checkpoint"`, whereas PROTOCOL.md allows a `v2Checkpoint` table
-to use "classic checkpoints which can follow V1 or V2 spec". EW follows
-the spec and delta-spark here — feature enabled but
-`delta.checkpointPolicy` not `v2` gets a classic V1 checkpoint — which is
-readable by kernel either way, since the restriction is on writing.
-Observed in the delta-kernel-rs build bundled with deltalake 1.6.2.
+to use "classic checkpoints which can follow V1 or V2 spec". Observed in
+the delta-kernel-rs build bundled with deltalake 1.6.2.
+
+EW's default (`CheckpointFormat.Automatic`) follows the spec and
+delta-spark — feature enabled but `delta.checkpointPolicy` not `v2` gets a
+classic V1 checkpoint. Kernel READS that without complaint; its
+restriction is on writing, so this is not a compatibility gap.
+`CheckpointFormat.V2WhenSupported` adopts kernel's rule for hosts that
+want it. It is opt-in rather than the default because the trade runs both
+ways: it makes EW disagree with delta-spark on a table both maintain, and
+it overrides an explicit `delta.checkpointPolicy=classic`.
 
 **`_last_checkpoint` `checksum` is not written.** The spec's optional MD5
 over a canonicalized form of the file. Readers "are encouraged to
