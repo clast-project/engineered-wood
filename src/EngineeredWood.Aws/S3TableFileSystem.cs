@@ -68,6 +68,15 @@ public sealed class S3TableFileSystem : ITableFileSystem
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
     }
 
+    /// <summary>
+    /// S3 constrains object keys the least of the three. Its naming guidance lists
+    /// <c>&lt; &gt; | { } ^ % ` [ ] ~ # "</c> and a backslash as "characters to avoid", but every one of
+    /// them is legal — MEASURED against gofakes3 with an in-memory backend, all round-trip
+    /// byte-identically with correct content. Avoid-lists are not constraints, so this reports
+    /// <see cref="PathNameConstraints.None"/>.
+    /// </summary>
+    public PathNameConstraints PathConstraints => PathNameConstraints.None;
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix,

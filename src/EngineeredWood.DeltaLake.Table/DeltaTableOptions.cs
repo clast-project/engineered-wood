@@ -38,6 +38,26 @@ public sealed record DeltaTableOptions
     public bool CollectStats { get; init; } = true;
 
     /// <summary>
+    /// <para>How Hive-style partition DIRECTORY NAMES are spelled. Default:
+    /// <see cref="PartitionPathSpelling.SparkCompatible"/> — byte-identical to what Spark would write for
+    /// the storage this table lives on.</para>
+    ///
+    /// <para>Set <see cref="PartitionPathSpelling.Portable"/> when the directory tree itself has to be
+    /// movable — copied onto a Win32 volume, or written by a mixed fleet over a share that constrains
+    /// names — at the cost of directory names that no longer match Spark's for ordinary values like
+    /// <c>a b</c> or <c>a+b</c>.</para>
+    ///
+    /// <para><b>This is cosmetic and per-writer, not a table-level invariant.</b> Delta defines no
+    /// property for it, so nothing is persisted and nothing stops the next writer choosing differently.
+    /// That is safe: MEASURED, no reader recovers a partition value from a directory name — values come
+    /// from <c>add.partitionValues</c> and files are located through <c>add.path</c> — and Spark itself,
+    /// pointed at a table written under the other spelling, reads it correctly and appends into a second
+    /// directory beside the first. Changing this setting on an existing table is therefore allowed and
+    /// merely untidy; it never orphans or rewrites existing data.</para>
+    /// </summary>
+    public PartitionPathSpelling PartitionPathSpelling { get; init; } = PartitionPathSpelling.SparkCompatible;
+
+    /// <summary>
     /// Whether file pruning reads a checkpoint's typed <c>add.stats_parsed</c> columns in preference
     /// to its JSON <c>stats</c> string when the checkpoint carries both. Default: true.
     /// </summary>

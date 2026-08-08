@@ -21,6 +21,8 @@ internal sealed class FailAfterCommitFileSystem(ITableFileSystem inner) : ITable
 {
     private readonly ITableFileSystem _inner = inner;
 
+    public PathNameConstraints PathConstraints => _inner.PathConstraints;
+
     /// <summary>
     /// Set this once the table is set up, so the fault applies to the commit under test rather than to
     /// <c>CreateAsync</c>'s own version 0 (which commits and then reads the log exactly the same way).

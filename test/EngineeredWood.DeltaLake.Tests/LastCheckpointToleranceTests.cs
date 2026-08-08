@@ -194,6 +194,8 @@ public class LastCheckpointToleranceTests : IDisposable
     private sealed class ThrowingReadFileSystem(ITableFileSystem inner, Func<Exception> error)
         : ITableFileSystem
     {
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
         public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
             => throw error();
 
