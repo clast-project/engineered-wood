@@ -229,22 +229,39 @@ def cmd_v2_checkpoint(args):
     The DELETE is deliberate: it leaves remove tombstones, which a checkpoint must carry and which
     no file-set comparison would notice were missing.
 
+    `top_level_file_format` selects the checkpoint's BODY. PROTOCOL.md defines two --
+    `n.checkpoint.u.{json/parquet}` -- and this is a session config rather than anything Spark
+    derives from the table, so it is the only way to make the reference implementation emit the
+    parquet-bodied form. Default (unset) is json, which is what makes that the form seen in practice.
+
     Nothing here interprets the log -- the file names, the sidecar listing and the raw
     `_last_checkpoint` bytes are reported as-is, because the point is to see what the reference
     implementation actually wrote.
     """
     spark = _spark()
     path = _uri(args["path"])
-    df = spark.createDataFrame(args["rows"], args["schema"])
-    writer = (df.write.format("delta")
-              .option("delta.checkpointPolicy", "v2")
-              .option("delta.checkpointInterval", "1"))
-    if args.get("partition_by"):
-        writer = writer.partitionBy(*args["partition_by"])
-    writer.mode("errorifexists").save(path)
 
-    for stmt in args.get("sql") or []:
-        spark.sql(stmt.format(path=path))
+    # The session outlives this command -- one JVM serves the whole test run -- so a conf set here
+    # would silently change the checkpoint body for every later case. Restored in a finally.
+    body_conf = "spark.databricks.delta.checkpointV2.topLevelFileFormat"
+    body = args.get("top_level_file_format")
+    try:
+        if body:
+            spark.conf.set(body_conf, body)
+
+        df = spark.createDataFrame(args["rows"], args["schema"])
+        writer = (df.write.format("delta")
+                  .option("delta.checkpointPolicy", "v2")
+                  .option("delta.checkpointInterval", "1"))
+        if args.get("partition_by"):
+            writer = writer.partitionBy(*args["partition_by"])
+        writer.mode("errorifexists").save(path)
+
+        for stmt in args.get("sql") or []:
+            spark.sql(stmt.format(path=path))
+    finally:
+        if body:
+            spark.conf.unset(body_conf)
 
     log_dir = os.path.join(args["path"], "_delta_log")
     log_files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(log_dir, "*"))

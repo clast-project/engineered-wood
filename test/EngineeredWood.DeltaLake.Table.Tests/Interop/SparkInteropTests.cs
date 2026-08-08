@@ -2752,9 +2752,17 @@ public class SparkInteropTests : IDisposable
     /// no file-set comparison would notice were missing — a checkpoint that drops them still yields
     /// the correct ACTIVE file set, and only VACUUM safety and streaming readers break. That is the
     /// bug this repository shipped in its own V2 writer (#73), so the assertion is deliberate.</para>
+    ///
+    /// <para>Run against BOTH bodies the spec defines. Which one a V2 checkpoint gets is a Spark
+    /// session config, not something derived from the table, so a reader meets whichever the producer
+    /// happened to be configured for. The default is JSON, which is why the parquet arm went
+    /// unexercised for so long — and why "EW reads Spark's V2 output" was true of only half the
+    /// format.</para>
     /// </summary>
-    [Fact]
-    public async Task SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone()
+    [Theory]
+    [InlineData("json")]
+    [InlineData("parquet")]
+    public async Task SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone(string body)
     {
         if (!Spark.EnsureAvailable()) return;
 
@@ -2769,21 +2777,21 @@ public class SparkInteropTests : IDisposable
                 new object[] { 3L, "ap" },
             },
             sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+            top_level_file_format = body,
         });
 
-        // The reference form: a UUID-named JSON body. delta-spark 4.0.0 writes this rather than the
-        // parquet-bodied variant EW declines (#70), which is why that gap is a compatibility ceiling
-        // rather than a blocker for reading Spark's output.
+        // Spark actually emitted the body that was asked for — without this the parquet arm could
+        // silently be a second run of the json one.
         var logFiles = written.GetProperty("log_files").EnumerateArray()
             .Select(f => f.GetString()!).ToList();
         Assert.Contains(logFiles, f =>
             f.Contains(".checkpoint.", StringComparison.Ordinal) &&
-            f.EndsWith(".json", StringComparison.Ordinal));
+            f.EndsWith("." + body, StringComparison.Ordinal));
 
         // File actions went to a sidecar, so the sidecar resolution path is exercised too.
         Assert.NotEmpty(written.GetProperty("sidecars").EnumerateArray());
 
-        long checkpointVersion = ParseCheckpointVersion(logFiles);
+        long checkpointVersion = ParseCheckpointVersion(logFiles, body);
 
         // Hide everything the checkpoint subsumes. A read that still works came from the checkpoint.
         string logDir = Path.Combine(_tempDir, "_delta_log");
@@ -2816,13 +2824,13 @@ public class SparkInteropTests : IDisposable
         Assert.NotEmpty(snapshot.Tombstones);
     }
 
-    /// <summary>The version of the UUID-named checkpoint in a log listing.</summary>
-    private static long ParseCheckpointVersion(IEnumerable<string> logFiles)
+    /// <summary>The version of the UUID-named checkpoint with the given body in a log listing.</summary>
+    private static long ParseCheckpointVersion(IEnumerable<string> logFiles, string body)
     {
         foreach (string f in logFiles)
         {
             int marker = f.IndexOf(".checkpoint.", StringComparison.Ordinal);
-            if (marker > 0 && f.EndsWith(".json", StringComparison.Ordinal) &&
+            if (marker > 0 && f.EndsWith("." + body, StringComparison.Ordinal) &&
                 long.TryParse(f[..marker], out long v))
             {
                 return v;
@@ -2830,6 +2838,6 @@ public class SparkInteropTests : IDisposable
         }
 
         throw new InvalidOperationException(
-            "no UUID-named checkpoint in the log: " + string.Join(", ", logFiles));
+            $"no UUID-named .{body} checkpoint in the log: " + string.Join(", ", logFiles));
     }
 }
