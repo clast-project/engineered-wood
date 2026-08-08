@@ -155,10 +155,16 @@ public sealed class CheckpointReader
     {
         var actions = new List<DeltaAction>();
 
+        // Collected across every body read below and resolved once at the end. Sidecar references are
+        // not restricted to the UUID-named forms: PROTOCOL.md lets a CLASSIC `<n>.checkpoint.parquet`
+        // follow the V2 spec too ("Could follow V2 spec … may or may not have sidecar files"), and a
+        // reader that ignored the `sidecar` rows there would replay a table with its protocol and
+        // metaData intact and NO FILES AT ALL, silently.
+        var sidecars = new List<SidecarFile>();
+
         if (info.IsV2)
         {
-            // V2 checkpoint: JSON NDJSON file, possibly with sidecars
-            await ReadV2CheckpointAsync(info.V2CheckpointPath!, actions, cancellationToken)
+            await ReadV2CheckpointAsync(info.V2CheckpointPath!, actions, sidecars, cancellationToken)
                 .ConfigureAwait(false);
         }
         else if (info.Parts.HasValue)
@@ -168,56 +174,79 @@ public sealed class CheckpointReader
             {
                 string path = DeltaVersion.CheckpointPartPath(
                     info.Version, i, info.Parts.Value);
-                await ReadCheckpointFileAsync(path, actions, cancellationToken)
+                await ReadParquetCheckpointBodyAsync(path, actions, sidecars, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
         else
         {
-            // Single-file V1 checkpoint (Parquet)
+            // Single-file classic checkpoint (Parquet), following either the V1 or the V2 spec.
             string path = DeltaVersion.CheckpointPath(info.Version);
-            await ReadCheckpointFileAsync(path, actions, cancellationToken)
+            await ReadParquetCheckpointBodyAsync(path, actions, sidecars, cancellationToken)
                 .ConfigureAwait(false);
+        }
+
+        foreach (var sidecar in sidecars)
+        {
+            // A sidecar carries add and remove entries ONLY, so it is read with nowhere to put a
+            // `sidecar` row — a sidecar that referenced another would otherwise be an unbounded read.
+            await ReadParquetCheckpointBodyAsync(
+                SidecarPath(sidecar), actions, sidecars: null, cancellationToken).ConfigureAwait(false);
         }
 
         return actions;
     }
 
     /// <summary>
-    /// Reads a V2 JSON checkpoint file (NDJSON) and resolves any sidecar references.
+    /// Where a <c>sidecar</c> action's file lives, relative to the table root.
     /// </summary>
-    private async ValueTask ReadV2CheckpointAsync(
-        string path, List<DeltaAction> actions,
+    /// <remarks>
+    /// The spec encourages writers to store the bare file name, "because sidecar files must always
+    /// reside in the table's own _delta_log/_sidecars directory" — but permits more, so a value that
+    /// already names a directory is taken as written.
+    /// </remarks>
+    private static string SidecarPath(SidecarFile sidecar) =>
+        sidecar.Path.Contains('/') ? sidecar.Path : $"_delta_log/_sidecars/{sidecar.Path}";
+
+    /// <summary>
+    /// Reads a UUID-named V2 checkpoint, whose body may be NDJSON or Parquet.
+    /// </summary>
+    /// <remarks>
+    /// PROTOCOL.md defines both — <c>n.checkpoint.u.{json/parquet}</c> — and delta-spark picks between
+    /// them with a session config rather than deriving it from the table, so which one a table carries
+    /// is not something a reader can predict. The extension is the only thing that distinguishes them.
+    /// </remarks>
+    private ValueTask ReadV2CheckpointAsync(
+        string path, List<DeltaAction> actions, List<SidecarFile> sidecars,
+        CancellationToken cancellationToken) =>
+        path.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+            ? ReadV2JsonCheckpointBodyAsync(path, actions, sidecars, cancellationToken)
+            : ReadParquetCheckpointBodyAsync(path, actions, sidecars, cancellationToken);
+
+    /// <summary>Reads the NDJSON body of a V2 checkpoint.</summary>
+    private async ValueTask ReadV2JsonCheckpointBodyAsync(
+        string path, List<DeltaAction> actions, List<SidecarFile> sidecars,
         CancellationToken cancellationToken)
     {
         byte[] data = await _fs.ReadAllBytesAsync(path, cancellationToken)
             .ConfigureAwait(false);
 
-        var parsedActions = Log.ActionSerializer.Deserialize(data);
-        var sidecarActions = new List<SidecarFile>();
-
-        foreach (var action in parsedActions)
+        foreach (var action in Log.ActionSerializer.Deserialize(data))
         {
             if (action is SidecarFile sidecar)
-                sidecarActions.Add(sidecar);
-            else if (action is not CheckpointMetadata) // Skip checkpointMetadata
+                sidecars.Add(sidecar);
+            else if (action is not CheckpointMetadata) // describes the checkpoint, not the table
                 actions.Add(action);
-        }
-
-        // Resolve sidecars: read each sidecar Parquet file for add/remove actions
-        foreach (var sidecar in sidecarActions)
-        {
-            string sidecarPath = sidecar.Path.Contains('/')
-                ? sidecar.Path
-                : $"_delta_log/_sidecars/{sidecar.Path}";
-
-            await ReadCheckpointFileAsync(sidecarPath, actions, cancellationToken)
-                .ConfigureAwait(false);
         }
     }
 
-    private async ValueTask ReadCheckpointFileAsync(
-        string path, List<DeltaAction> actions,
+    /// <summary>
+    /// Reads a Parquet checkpoint body: a classic checkpoint, one part of a multi-part one, the Parquet
+    /// body of a UUID-named V2 checkpoint, or a sidecar. They share the one checkpoint schema.
+    /// </summary>
+    /// <param name="sidecars">Where to put any <c>sidecar</c> rows, or null to REJECT them.</param>
+    private async ValueTask ReadParquetCheckpointBodyAsync(
+        string path, List<DeltaAction> actions, List<SidecarFile>? sidecars,
         CancellationToken cancellationToken)
     {
         await using var file = await _fs.OpenReadAsync(path, cancellationToken)
@@ -227,7 +256,7 @@ public sealed class CheckpointReader
         await foreach (var batch in reader.ReadAllAsync(cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
-            ConvertCheckpointBatch(batch, actions);
+            ConvertCheckpointBatch(batch, actions, sidecars, path);
         }
     }
 
@@ -235,7 +264,8 @@ public sealed class CheckpointReader
     /// Converts a Parquet RecordBatch from a checkpoint file into Delta actions.
     /// The checkpoint schema has top-level columns for each action type.
     /// </summary>
-    private static void ConvertCheckpointBatch(RecordBatch batch, List<DeltaAction> actions)
+    private static void ConvertCheckpointBatch(
+        RecordBatch batch, List<DeltaAction> actions, List<SidecarFile>? sidecars, string path)
     {
         // Checkpoint Parquet files have a flattened schema with columns like:
         // txn.appId, txn.version, txn.lastUpdated
@@ -256,6 +286,11 @@ public sealed class CheckpointReader
         int metaDataIdx = batch.Schema.GetFieldIndex("metaData");
         int protocolIdx = batch.Schema.GetFieldIndex("protocol");
         int domainMetadataIdx = batch.Schema.GetFieldIndex("domainMetadata");
+
+        // A V2-spec body carries `sidecar` rows as well. The column is absent from a V1 checkpoint,
+        // which is why every lookup here tolerates -1: "Any missing column should be treated as null."
+        // (The other V2-spec column, `checkpointMetadata`, is deliberately not looked up — see below.)
+        int sidecarIdx = batch.Schema.GetFieldIndex("sidecar");
 
         // Located once per batch, then shared by every add row in it.
         var statsView = addIdx >= 0
@@ -292,7 +327,42 @@ public sealed class CheckpointReader
             {
                 actions.Add(ExtractDomainMetadata(batch, domainMetadataIdx, row));
             }
+            else if (sidecarIdx >= 0 && HasStructValue(batch, sidecarIdx, "path", row))
+            {
+                if (sidecars is null)
+                {
+                    // Reached only from inside a sidecar. PROTOCOL.md: sidecars "can have only add file
+                    // and remove file entries as of now", and a sidecar that names another would be a
+                    // read this layer cannot bound. Refusing is the honest answer — following it would
+                    // either loop or silently depend on the cycle being short.
+                    throw new DeltaFormatException(
+                        DeltaErrorCodes.UnsupportedCheckpointFormat,
+                        $"The checkpoint sidecar '{path}' contains a 'sidecar' action. A sidecar may " +
+                        "carry only add and remove file actions; only the checkpoint itself may " +
+                        "reference sidecars.");
+                }
+
+                sidecars.Add(ExtractSidecar(batch, sidecarIdx, row));
+            }
+            // A `checkpointMetadata` row falls off the end of this chain, which is correct: it describes
+            // the CHECKPOINT (its version and some optional counts), not the table, and so takes no part
+            // in reconciliation. The NDJSON path drops it for the same reason.
         }
+    }
+
+    private static SidecarFile ExtractSidecar(RecordBatch batch, int colIdx, int row)
+    {
+        var structArray = (Apache.Arrow.StructArray)batch.Column(colIdx);
+
+        var tags = GetStringMapField(structArray, "tags", row);
+
+        return new SidecarFile
+        {
+            Path = GetStringField(structArray, "path", row) ?? "",
+            SizeInBytes = GetInt64Field(structArray, "sizeInBytes", row) ?? 0,
+            ModificationTime = GetInt64Field(structArray, "modificationTime", row) ?? 0,
+            Tags = tags.Count > 0 ? tags : null,
+        };
     }
 
     private static AddFile ExtractAdd(

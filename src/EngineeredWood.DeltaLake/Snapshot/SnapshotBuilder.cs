@@ -214,15 +214,16 @@ public sealed class SnapshotBuilder
     /// failures wearing the same symptom, and this decides which one it was.
     /// </summary>
     /// <remarks>
-    /// A checkpoint in a form we recognise but cannot decode leaves exactly the same hole in the
-    /// replay as a deleted commit. Reporting both as "the log is incomplete" sent a user to look at
-    /// retention settings for what is really a limitation of this reader, so a checkpoint that would
-    /// have covered the gap is named as the cause instead.
+    /// A checkpoint that would have covered the hole, but which this reader passed over, leaves exactly
+    /// the same hole in the replay as a deleted commit. Reporting both as "the log is incomplete" sent a
+    /// user to look at retention settings for what is really a property of the checkpoint, so the
+    /// checkpoint is named as the cause instead. Two shapes of that: a body this reader has no decoder
+    /// for, and a multi-part checkpoint whose parts did not all land.
     /// </remarks>
     private static DeltaFormatException ReplayGap(
         LogListing listing, long missing, long from, long through)
     {
-        foreach (var (version, path) in listing.UnreadableCheckpoints)
+        foreach (var (version, path) in listing.UndecodableCheckpoints)
         {
             // Only a checkpoint inside the hole is an explanation for it: one below `missing` was
             // never needed, and one above `through` is not on the path to the requested version.
@@ -230,11 +231,22 @@ public sealed class SnapshotBuilder
             {
                 return new DeltaFormatException(
                     DeltaErrorCodes.UnsupportedCheckpointFormat,
-                    $"Version {through} needs the checkpoint at version {version} ('{path}'), which " +
-                    "is a Parquet-bodied V2 checkpoint. This implementation decodes only the NDJSON " +
-                    "V2 body, so the versions it covers cannot be reconstructed. The log is intact — " +
+                    $"Version {through} needs the checkpoint at version {version} ('{path}'), whose " +
+                    "body is neither of the two forms a UUID-named V2 checkpoint may take (JSON or " +
+                    "Parquet), so the versions it covers cannot be reconstructed. The log is intact — " +
                     "this is a limitation of this reader, not missing history.");
             }
+        }
+
+        if (listing.TornMultiPartCheckpoint(missing, through) is var (torn, present, declared))
+        {
+            return new DeltaFormatException(
+                DeltaErrorCodes.TruncatedTransactionLog,
+                $"Delta log is incomplete: version {missing} is missing, and the multi-part checkpoint " +
+                $"at version {torn} that would have covered it has only {present} of its {declared} " +
+                "parts. A checkpoint write that did not finish leaves a prefix like this, and loading " +
+                "it would silently drop the files in the parts that never landed. Building a snapshot " +
+                $"at version {through} requires every version in [{from}..{through}].");
         }
 
         return IncompleteLog(missing, from, through);

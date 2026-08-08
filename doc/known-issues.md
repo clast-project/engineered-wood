@@ -419,29 +419,13 @@ does not verify that the feature is enabled before producing a V2
 checkpoint, which the spec requires of a writer. A host that wants V2
 must call `V2CheckpointWriter` itself and check the protocol itself.
 
-**Parquet-bodied V2 checkpoints on read.** `n.checkpoint.{uuid}.parquet`
-is not decoded — only the NDJSON body is. `v2Checkpoint` remains a
-supported *reader* feature, which is correct: the JSON form is read, and
-refusing the feature outright would reject tables that read perfectly.
-
-A table carrying the Parquet body is still read normally whenever
-anything else covers the range (its commits, or an older readable
-checkpoint). Only when that checkpoint is the sole route to the requested
-version does the read fail, and it now fails with
-`DELTA_UNSUPPORTED_CHECKPOINT_FORMAT` naming the checkpoint — previously
-it reported "Delta log is incomplete", sending the reader to look at
-retention settings for what is a limitation of this decoder.
-
-Measured 2026-08-06: delta-spark 4.0.0 with `delta.checkpointPolicy=v2`
-writes the **JSON** body (`<n>.checkpoint.<uuid>.json` plus a Parquet
-sidecar), which EW reads — see
-`SparkInteropTests.SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone`.
-So this is a compatibility ceiling for writers that choose the Parquet
-body, not a barrier to reading Spark's output.
-
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
-checksum, sidecar counts) are ignored. Missing validation.
+`checkpointSchema`, `checksum`, `v2Checkpoint.nonFileActions`,
+`v2Checkpoint.sidecarFiles`) are ignored. delta-spark writes all of them,
+and the last two exist precisely so a reader need not open the checkpoint
+at all — so this is left performance and validation on the table, not a
+correctness gap. Measured against delta-spark 4.0.0, 2026-08-08.
 
 **Absolute-path deletion vectors (storage type `p`).**
 `DeletionVectorWriter` emits only inline (`i`) and UUID-relative (`u`)

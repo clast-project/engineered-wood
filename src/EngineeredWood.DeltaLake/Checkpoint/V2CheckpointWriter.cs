@@ -25,6 +25,12 @@ public sealed class V2CheckpointWriter
     /// </summary>
     public int SidecarThreshold { get; init; } = 100;
 
+    /// <summary>
+    /// Which of the two spec-defined bodies to write. Defaults to
+    /// <see cref="V2CheckpointBody.Json"/>, matching delta-spark.
+    /// </summary>
+    public V2CheckpointBody Body { get; init; } = V2CheckpointBody.Json;
+
     public V2CheckpointWriter(
         ITableFileSystem fileSystem,
         ParquetWriteOptions? parquetOptions = null)
@@ -41,7 +47,9 @@ public sealed class V2CheckpointWriter
         CancellationToken cancellationToken = default)
     {
         string uuid = Guid.NewGuid().ToString();
-        string checkpointPath = $"_delta_log/{DeltaVersion.Format(snapshot.Version)}.checkpoint.{uuid}.json";
+        string extension = Body == V2CheckpointBody.Parquet ? "parquet" : "json";
+        string checkpointPath =
+            $"_delta_log/{DeltaVersion.Format(snapshot.Version)}.checkpoint.{uuid}.{extension}";
 
         var actions = new List<DeltaAction>();
 
@@ -82,10 +90,7 @@ public sealed class V2CheckpointWriter
             actions.AddRange(fileActions);
         }
 
-        // Write the JSON checkpoint file
-        byte[] ndjson = ActionSerializer.Serialize(actions);
-        await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
-            .ConfigureAwait(false);
+        await WriteBodyAsync(checkpointPath, actions, snapshot, cancellationToken).ConfigureAwait(false);
 
         // Update _last_checkpoint
         using var lastCheckpointStream = new MemoryStream();
@@ -104,6 +109,35 @@ public sealed class V2CheckpointWriter
 
         await _fs.WriteAllBytesAsync(
             DeltaVersion.LastCheckpointPath, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes the checkpoint's own body — every action it carries, in whichever of the two spec-defined
+    /// formats <see cref="Body"/> selects.
+    /// </summary>
+    private async ValueTask WriteBodyAsync(
+        string checkpointPath,
+        List<DeltaAction> actions,
+        Snapshot.Snapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        if (Body != V2CheckpointBody.Parquet)
+        {
+            await _fs.WriteAllBytesAsync(
+                checkpointPath, ActionSerializer.Serialize(actions), cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await using var file = await _fs.CreateAsync(checkpointPath, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+
+        // Declared before the writer so it is disposed last; its buffers are native memory.
+        using var batch = CheckpointWriter.BuildBatchForActions(
+            snapshot, actions, out _, v2Spec: true);
+
+        await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
+        await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask<SidecarFile> WriteSidecarAsync(

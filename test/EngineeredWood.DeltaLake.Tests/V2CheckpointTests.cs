@@ -533,68 +533,207 @@ public class V2CheckpointTests : IDisposable
         Assert.Contains("a.parquet", rebuilt.ActiveFiles.Keys);
     }
 
-    /// <summary>
-    /// Writes a Parquet-bodied V2 checkpoint name at <paramref name="version"/>. The contents do not
-    /// matter: the listing decides what it can decode from the NAME, and this reader never opens it.
-    /// </summary>
-    private void PlaceParquetBodiedV2Checkpoint(long version) =>
-        File.WriteAllText(
-            Path.Combine(_tempDir, "_delta_log", $"{version:D20}.checkpoint.{Guid.NewGuid()}.parquet"),
-            "not really parquet");
+    /// <summary>Deletes the commit files in <c>[0..through]</c>, as log cleanup eventually does.</summary>
+    /// <remarks>
+    /// The point of every test that calls this: with the commits gone, a successful read PROVES the
+    /// checkpoint carried the state. Without it the replay would supply the same answer from the log and
+    /// the checkpoint path would never be exercised at all.
+    /// </remarks>
+    private void DeleteCommitsThrough(long through)
+    {
+        for (long v = 0; v <= through; v++)
+            File.Delete(Path.Combine(_tempDir, "_delta_log", $"{v:D20}.json"));
+    }
 
     /// <summary>
-    /// A table whose only route to the requested version runs through a Parquet-bodied V2 checkpoint
-    /// must say so, rather than blaming the log.
+    /// PROTOCOL.md defines TWO bodies for a UUID-named V2 checkpoint — <c>n.checkpoint.u.{json/parquet}</c>
+    /// — and delta-spark picks between them with a session config rather than deriving it from the table,
+    /// so a reader cannot predict which one it will meet. Only the NDJSON body used to be decoded; a
+    /// table whose newest checkpoint took the other form failed to open once its commits were cleaned.
+    /// </summary>
+    [Theory]
+    [InlineData(V2CheckpointBody.Json, 1000)]    // inline: threshold above the file count
+    [InlineData(V2CheckpointBody.Json, 1)]       // sidecar
+    [InlineData(V2CheckpointBody.Parquet, 1000)] // inline
+    [InlineData(V2CheckpointBody.Parquet, 1)]    // sidecar
+    public async Task V2Checkpoint_IsReadBackFromTheCheckpointAlone_InEitherBody(
+        V2CheckpointBody body, int sidecarThreshold)
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync($"v2-body-{body}-{sidecarThreshold}");
+        var log = new TransactionLog(fs);
+
+        await new V2CheckpointWriter(fs)
+        {
+            Body = body,
+            SidecarThreshold = sidecarThreshold,
+        }.WriteCheckpointAsync(snapshot);
+
+        // The name records the body, and the listing keys off exactly that.
+        var reader = new CheckpointReader(fs);
+        string written = (await reader.ReadLastCheckpointAsync())!.V2CheckpointPath!;
+        Assert.EndsWith(body == V2CheckpointBody.Parquet ? ".parquet" : ".json", written);
+
+        DeleteCommitsThrough(snapshot.Version);
+
+        var rebuilt = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal(snapshot.Version, rebuilt.Version);
+        Assert.Equal($"v2-body-{body}-{sidecarThreshold}", rebuilt.Metadata.Id);
+        Assert.Equal(1, rebuilt.FileCount);
+        Assert.Contains("kept.parquet", rebuilt.ActiveFiles.Keys);
+
+        // NOT just the active file set. A checkpoint that dropped its unexpired tombstones would still
+        // produce the right ActiveFiles and break only VACUUM retention safety.
+        Assert.Equal("doomed.parquet", Assert.Single(rebuilt.Tombstones).Value.Path);
+    }
+
+    /// <summary>
+    /// The same, reached through the <c>_last_checkpoint</c> hint rather than the listing — the hint
+    /// carries the path verbatim, so it is the other way a Parquet body arrives at the reader.
+    /// </summary>
+    [Fact]
+    public async Task ParquetBodiedV2Checkpoint_IsReadFromTheLastCheckpointHint()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-parquet-hint");
+
+        await new V2CheckpointWriter(fs) { Body = V2CheckpointBody.Parquet }
+            .WriteCheckpointAsync(snapshot);
+
+        var hinted = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+        Assert.True(hinted!.IsV2);
+
+        // Read straight off the hint, with no listing involved at all.
+        var actions = await new CheckpointReader(fs).ReadCheckpointAsync(hinted);
+
+        var builder = new SnapshotBuilder();
+        builder.ApplyCommit(hinted.Version, actions);
+        var restored = builder.Build();
+
+        Assert.Equal("v2-parquet-hint", restored.Metadata.Id);
+        Assert.Contains("kept.parquet", restored.ActiveFiles.Keys);
+        Assert.Equal("doomed.parquet", Assert.Single(restored.Tombstones).Value.Path);
+
+        // And the checkpointMetadata row, which describes the checkpoint rather than the table, must not
+        // have been mistaken for one of the table's own actions.
+        Assert.Empty(actions.OfType<CheckpointMetadata>());
+    }
+
+    /// <summary>
+    /// A CLASSIC-named <c>n.checkpoint.parquet</c> is allowed to follow the V2 spec —
+    /// PROTOCOL.md: "Could follow V2 spec … may or may not have sidecar files". Its sidecar rows used to
+    /// be dropped on the floor along with every file action they pointed at, and the resulting snapshot
+    /// had a protocol, a metaData and NO FILES, reported as a success.
     /// </summary>
     /// <remarks>
-    /// Both failures leave the same hole in the replay, so both used to surface as "Delta log is
-    /// incomplete: version N is missing" — which points a user at retention settings for what is
-    /// really a limitation of this reader. That confusion was not hypothetical: the same message was
-    /// what a perfectly readable Spark table produced for an unrelated reason (#74), and the two were
-    /// indistinguishable.
+    /// Produced by writing a V2 checkpoint with a Parquet body and renaming it to the classic name, which
+    /// is exactly the artefact a writer choosing that combination emits — and, unlike hand-building the
+    /// Arrow batch, keeps the test honest about the schema a real one carries.
     /// </remarks>
     [Fact]
-    public async Task ParquetBodiedV2Checkpoint_IsNamedAsTheCause_NotTheLog()
+    public async Task ClassicNamedCheckpointFollowingV2Spec_ResolvesItsSidecars()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-classic-named");
+        var log = new TransactionLog(fs);
+
+        await new V2CheckpointWriter(fs)
+        {
+            Body = V2CheckpointBody.Parquet,
+            SidecarThreshold = 1, // force the file actions out into a sidecar
+        }.WriteCheckpointAsync(snapshot);
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        string uuidNamed = Directory.GetFiles(logDir, "*.checkpoint.*.parquet").Single();
+        File.Move(uuidNamed, Path.Combine(logDir, $"{snapshot.Version:D20}.checkpoint.parquet"));
+
+        // The hint still names the UUID file, which no longer exists; the listing is the fallback and
+        // finds the classic name. Deleting it is simpler and makes the listing the only route.
+        File.Delete(Path.Combine(logDir, "_last_checkpoint"));
+
+        DeleteCommitsThrough(snapshot.Version);
+
+        var rebuilt = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
+
+        Assert.Equal("v2-classic-named", rebuilt.Metadata.Id);
+        Assert.Equal(1, rebuilt.FileCount);
+        Assert.Contains("kept.parquet", rebuilt.ActiveFiles.Keys);
+        Assert.Equal("doomed.parquet", Assert.Single(rebuilt.Tombstones).Value.Path);
+    }
+
+    /// <summary>
+    /// A sidecar may carry add and remove entries only. One that references another sidecar is refused
+    /// rather than followed: the reader has no bound on where that ends, and a cycle would not terminate.
+    /// </summary>
+    [Fact]
+    public async Task Sidecar_ThatReferencesASidecar_IsRefused()
+    {
+        var (fs, snapshot) = await BuildTombstoneTableAsync("v2-sidecar-cycle");
+
+        await new V2CheckpointWriter(fs)
+        {
+            Body = V2CheckpointBody.Parquet,
+            SidecarThreshold = 1,
+        }.WriteCheckpointAsync(snapshot);
+
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        string checkpoint = Directory.GetFiles(logDir, "*.checkpoint.*.parquet").Single();
+        string sidecar = Directory.GetFiles(Path.Combine(logDir, "_sidecars"), "*.parquet").Single();
+
+        // The checkpoint body IS a valid sidecar body plus a sidecar row, so putting it in the sidecars
+        // directory under the sidecar's own name makes that sidecar point at itself.
+        File.Copy(checkpoint, sidecar, overwrite: true);
+
+        var hint = await new CheckpointReader(fs).ReadLastCheckpointAsync();
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await new CheckpointReader(fs).ReadCheckpointAsync(hint!));
+
+        Assert.Equal(DeltaErrorCodes.UnsupportedCheckpointFormat, ex.ErrorCode);
+        Assert.Contains("sidecar", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A UUID-named checkpoint whose body is neither of the two the spec defines is recognised as a
+    /// checkpoint and reported as the cause when it is the only route to the requested version — rather
+    /// than surfacing as "Delta log is incomplete", which sends a user to look at retention settings for
+    /// what is a limitation of this decoder.
+    /// </summary>
+    [Fact]
+    public async Task UndecodableV2CheckpointBody_IsNamedAsTheCause_NotTheLog()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var log = new TransactionLog(fs);
 
-        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-body"));
+        await log.WriteCommitAsync(0, CreateCommit("v2-unknown-body"));
         await log.WriteCommitAsync(1, [Add("a.parquet")]);
 
-        PlaceParquetBodiedV2Checkpoint(1);
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{1:D20}.checkpoint.{Guid.NewGuid()}.avro"),
+            "not a body this reader knows");
 
-        // Cleanup removed what that checkpoint subsumes, so it is the only way to version 1.
-        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
-        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
+        DeleteCommitsThrough(1);
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
             async () => await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs)));
 
         Assert.Equal(DeltaErrorCodes.UnsupportedCheckpointFormat, ex.ErrorCode);
-        Assert.NotEqual(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
-
-        // The message must not send anyone to look at log retention.
-        Assert.Contains("Parquet-bodied", ex.Message);
         Assert.DoesNotContain("incomplete", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
-    /// The case that must NOT change: a table carrying a Parquet-bodied V2 checkpoint is still read
-    /// normally when something else covers the range. Recognising the form must not become a reason
-    /// to refuse a table we can read.
+    /// The case that must NOT change: a checkpoint form this reader passes over is still no reason to
+    /// refuse a table something else covers.
     /// </summary>
     [Fact]
-    public async Task ParquetBodiedV2Checkpoint_DoesNotRefuseAnOtherwiseReadableTable()
+    public async Task UndecodableV2CheckpointBody_DoesNotRefuseAnOtherwiseReadableTable()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var log = new TransactionLog(fs);
 
-        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-tolerated"));
+        await log.WriteCommitAsync(0, CreateCommit("v2-unknown-tolerated"));
         await log.WriteCommitAsync(1, [Add("a.parquet")]);
 
-        // Present, unreadable, and entirely beside the point: the commits still cover [0..1].
-        PlaceParquetBodiedV2Checkpoint(1);
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{1:D20}.checkpoint.{Guid.NewGuid()}.avro"),
+            "not a body this reader knows");
 
         var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
 
@@ -603,35 +742,36 @@ public class V2CheckpointTests : IDisposable
     }
 
     /// <summary>
-    /// And when an older readable checkpoint covers the gap, that is used — the unreadable one is not
-    /// allowed to poison checkpoint selection.
+    /// The other way a replay ends up with a hole nothing accounts for: a multi-part checkpoint whose
+    /// parts did not all land. The history really is gone — so this stays a truncated log — but the torn
+    /// checkpoint is the cause, and "your retention is too aggressive" is the wrong thing to conclude
+    /// from a checkpoint write that did not finish.
     /// </summary>
     [Fact]
-    public async Task ParquetBodiedV2Checkpoint_DoesNotDisplaceAReadableOlderCheckpoint()
+    public async Task TornMultiPartCheckpoint_IsNamedAsTheCause()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var log = new TransactionLog(fs);
 
-        await log.WriteCommitAsync(0, CreateCommit("v2-parquet-fallback"));
+        await log.WriteCommitAsync(0, CreateCommit("torn-multipart"));
         await log.WriteCommitAsync(1, [Add("a.parquet")]);
 
-        // A readable checkpoint at 1 …
-        var atOne = await SnapshotBuilder.BuildAsync(log);
-        await new CheckpointWriter(fs).WriteCheckpointAsync(atOne);
+        // Two of a declared three parts — the prefix a writer that died midway leaves behind.
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        for (int part = 1; part <= 2; part++)
+        {
+            File.WriteAllText(
+                Path.Combine(logDir, $"{1:D20}.checkpoint.{part:D10}.{3:D10}.parquet"),
+                "a part that landed");
+        }
 
-        await log.WriteCommitAsync(2, [Add("b.parquet")]);
+        DeleteCommitsThrough(1);
 
-        // … and an unreadable one at 2, which is newer and would otherwise be preferred.
-        PlaceParquetBodiedV2Checkpoint(2);
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs)));
 
-        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{0:D20}.json"));
-        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{1:D20}.json"));
-
-        var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs));
-
-        Assert.Equal(2, snapshot.Version);
-        Assert.Contains("a.parquet", snapshot.ActiveFiles.Keys);
-        Assert.Contains("b.parquet", snapshot.ActiveFiles.Keys);
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
+        Assert.Contains("2 of its 3 parts", ex.Message);
     }
 
     private static List<DeltaAction> CreateCommit(string id) =>

@@ -98,13 +98,22 @@ public sealed class CheckpointWriter
     }
 
     /// <summary>
-    /// Builds a checkpoint RecordBatch over an EXPLICIT action list, for a V2 sidecar — which carries
-    /// file actions only and so cannot go through the snapshot-wide collection below. The snapshot is
-    /// still needed for the schema and the statistics mode, which are table-wide.
+    /// Builds a checkpoint RecordBatch over an EXPLICIT action list, for a V2 sidecar or for the Parquet
+    /// body of a V2 checkpoint — neither of which is the snapshot-wide collection below (a sidecar
+    /// carries file actions only; a V2 body carries everything plus two action types a V1 checkpoint has
+    /// no columns for). The snapshot is still needed for the schema and the statistics mode, which are
+    /// table-wide.
     /// </summary>
+    /// <param name="v2Spec">
+    /// Add the <c>checkpointMetadata</c> and <c>sidecar</c> columns. Off for a sidecar body and for
+    /// every classic V1 checkpoint: those two columns are legal only in a V2-spec checkpoint, so a V1
+    /// writer that emitted them (always null) would be putting the table's checkpoint schema outside
+    /// what its own protocol permits.
+    /// </param>
     internal static RecordBatch BuildBatchForActions(
-        Snapshot.Snapshot snapshot, List<DeltaAction> actions, out long actionCount) =>
-        BuildBatch(snapshot, actions, out actionCount);
+        Snapshot.Snapshot snapshot, List<DeltaAction> actions, out long actionCount,
+        bool v2Spec = false) =>
+        BuildBatch(snapshot, actions, out actionCount, v2Spec);
 
     private static RecordBatch BuildCheckpointBatch(
         Snapshot.Snapshot snapshot, out long actionCount)
@@ -122,11 +131,11 @@ public sealed class CheckpointWriter
         foreach (var dm in snapshot.DomainMetadata.Values)
             allActions.Add(dm);
 
-        return BuildBatch(snapshot, allActions, out actionCount);
+        return BuildBatch(snapshot, allActions, out actionCount, v2Spec: false);
     }
 
     private static RecordBatch BuildBatch(
-        Snapshot.Snapshot snapshot, List<DeltaAction> allActions, out long actionCount)
+        Snapshot.Snapshot snapshot, List<DeltaAction> allActions, out long actionCount, bool v2Spec)
     {
         actionCount = allActions.Count;
         int count = allActions.Count;
@@ -139,19 +148,26 @@ public sealed class CheckpointWriter
             : null;
 
         // Build the struct-based checkpoint schema
-        var schema = BuildCheckpointSchema(statsMode, statsParsedType);
+        var schema = BuildCheckpointSchema(statsMode, statsParsedType, v2Spec);
 
         // Build struct arrays for each action type
-        var protocolArray = BuildProtocolColumn(allActions, count);
-        var metadataArray = BuildMetadataColumn(allActions, count);
-        var addArray = BuildAddColumn(allActions, count, statsMode, snapshot.Schema, statsParsedType);
-        var removeArray = BuildRemoveColumn(allActions, count);
-        var txnArray = BuildTxnColumn(allActions, count);
-        var domainMetadataArray = BuildDomainMetadataColumn(allActions, count);
+        var columns = new List<IArrowArray>
+        {
+            BuildProtocolColumn(allActions, count),
+            BuildMetadataColumn(allActions, count),
+            BuildAddColumn(allActions, count, statsMode, snapshot.Schema, statsParsedType),
+            BuildRemoveColumn(allActions, count),
+            BuildTxnColumn(allActions, count),
+            BuildDomainMetadataColumn(allActions, count),
+        };
 
-        return new RecordBatch(schema,
-            [protocolArray, metadataArray, addArray, removeArray, txnArray, domainMetadataArray],
-            count);
+        if (v2Spec)
+        {
+            columns.Add(BuildCheckpointMetadataColumn(allActions, count));
+            columns.Add(BuildSidecarColumn(allActions, count));
+        }
+
+        return new RecordBatch(schema, columns, count);
     }
 
     #region Schema Definition
@@ -204,8 +220,13 @@ public sealed class CheckpointWriter
         return fields;
     }
 
+    /// <summary>The <c>tags</c> map carried by <c>sidecar</c> and <c>checkpointMetadata</c>.</summary>
+    private static ArrowMapType TagsMapType() => new(
+        new Field("key", StringType.Default, false),
+        new Field("value", StringType.Default, true));
+
     private static Apache.Arrow.Schema BuildCheckpointSchema(
-        CheckpointStatsMode statsMode, ArrowStructType? statsParsedType)
+        CheckpointStatsMode statsMode, ArrowStructType? statsParsedType, bool v2Spec)
     {
         // Protocol struct
         var protocolType = new ArrowStructType(new List<Field>
@@ -276,14 +297,35 @@ public sealed class CheckpointWriter
             new Field("removed", BooleanType.Default, true),
         });
 
-        return new Apache.Arrow.Schema.Builder()
+        var builder = new Apache.Arrow.Schema.Builder()
             .Field(new Field("protocol", protocolType, true))
             .Field(new Field("metaData", metadataType, true))
             .Field(new Field("add", addType, true))
             .Field(new Field("remove", removeType, true))
             .Field(new Field("txn", txnType, true))
-            .Field(new Field("domainMetadata", domainMetadataType, true))
-            .Build();
+            .Field(new Field("domainMetadata", domainMetadataType, true));
+
+        if (v2Spec)
+        {
+            // Only a V2-spec checkpoint may carry these two, so they are added only when one is being
+            // written — never to a classic V1 body, where their mere presence would misdescribe the
+            // checkpoint's spec to a reader inspecting the schema.
+            builder.Field(new Field("checkpointMetadata", new ArrowStructType(new List<Field>
+            {
+                new Field("version", Int64Type.Default, true),
+                new Field("tags", TagsMapType(), true),
+            }), true));
+
+            builder.Field(new Field("sidecar", new ArrowStructType(new List<Field>
+            {
+                new Field("path", StringType.Default, true),
+                new Field("sizeInBytes", Int64Type.Default, true),
+                new Field("modificationTime", Int64Type.Default, true),
+                new Field("tags", TagsMapType(), true),
+            }), true));
+        }
+
+        return builder.Build();
     }
 
     #endregion
@@ -907,6 +949,113 @@ public sealed class CheckpointWriter
         return new StructArray(
             new ArrowStructType(fields), count,
             [domainBuilder.Build(), configBuilder.Build(), removedBuilder.Build()],
+            validity, nullCount);
+    }
+
+    /// <summary>
+    /// A <c>tags</c> map column: the tags of the rows this action type occupies, and an empty map
+    /// everywhere else.
+    /// </summary>
+    private static MapArray BuildTagsColumn(
+        List<DeltaAction> actions, int count,
+        Func<DeltaAction, IReadOnlyDictionary<string, string>?> tagsOf)
+    {
+        var mapType = TagsMapType();
+        using var offsets = new OffsetsBuilder(count);
+        using var keys = new StringColumn(NestedChildCapacity);
+        using var values = new StringColumn(NestedChildCapacity);
+
+        for (int i = 0; i < count; i++)
+        {
+            int n = 0;
+            if (tagsOf(actions[i]) is { } tags)
+            {
+                foreach (var kvp in tags)
+                {
+                    keys.Append(kvp.Key);
+                    values.Append(kvp.Value);
+                    n++;
+                }
+            }
+            offsets.Append(n);
+        }
+
+        StringArray keysArray = keys.Build();
+        StringArray valuesArray = values.Build();
+        var entries = new StructArray(
+            new ArrowStructType(new List<Field> { mapType.KeyField, mapType.ValueField }),
+            keysArray.Length,
+            new IArrowArray[] { keysArray, valuesArray },
+            ArrowBuffer.Empty);
+
+        return new MapArray(mapType, count, offsets.Build(), entries, ArrowBuffer.Empty, 0);
+    }
+
+    private static StructArray BuildCheckpointMetadataColumn(List<DeltaAction> actions, int count)
+    {
+        using var versionBuilder = new FixedWidthColumn<long>(count);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (actions[i] is CheckpointMetadata cm)
+                versionBuilder.Append(cm.Version);
+            else
+                versionBuilder.AppendNull();
+        }
+
+        var tags = BuildTagsColumn(
+            actions, count, a => a is CheckpointMetadata cm ? cm.Tags : null);
+
+        var fields = new List<Field>
+        {
+            new Field("version", Int64Type.Default, true),
+            new Field("tags", TagsMapType(), true),
+        };
+
+        var (validity, nullCount) = BuildActionValidity<CheckpointMetadata>(actions, count);
+        return new StructArray(
+            new ArrowStructType(fields), count,
+            [versionBuilder.Build(Int64Type.Default), tags],
+            validity, nullCount);
+    }
+
+    private static StructArray BuildSidecarColumn(List<DeltaAction> actions, int count)
+    {
+        using var pathBuilder = new StringColumn(count, bytesPerValueHint: 0);
+        using var sizeBuilder = new FixedWidthColumn<long>(count);
+        using var modTimeBuilder = new FixedWidthColumn<long>(count);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (actions[i] is SidecarFile s)
+            {
+                pathBuilder.Append(s.Path);
+                sizeBuilder.Append(s.SizeInBytes);
+                modTimeBuilder.Append(s.ModificationTime);
+            }
+            else
+            {
+                pathBuilder.AppendNull();
+                sizeBuilder.AppendNull();
+                modTimeBuilder.AppendNull();
+            }
+        }
+
+        var tags = BuildTagsColumn(actions, count, a => a is SidecarFile s ? s.Tags : null);
+
+        var fields = new List<Field>
+        {
+            new Field("path", StringType.Default, true),
+            new Field("sizeInBytes", Int64Type.Default, true),
+            new Field("modificationTime", Int64Type.Default, true),
+            new Field("tags", TagsMapType(), true),
+        };
+
+        var (validity, nullCount) = BuildActionValidity<SidecarFile>(actions, count);
+        return new StructArray(
+            new ArrowStructType(fields), count,
+            [pathBuilder.Build(), sizeBuilder.Build(Int64Type.Default),
+             modTimeBuilder.Build(Int64Type.Default), tags],
             validity, nullCount);
     }
 
