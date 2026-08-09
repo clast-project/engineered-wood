@@ -26,7 +26,7 @@ the implementation phases to get there.
 `StatisticsEvaluator`), statistics-based pruning for Parquet (row groups + bloom
 filters) and Delta Lake (partition + stats in one unified pass), Iceberg
 migrated onto the shared library, and the Arrow-based row evaluator in
-`EngineeredWood.Expressions.Arrow`. Phases 9–14 (SparkSql parser, Delta
+`EngineeredWood.Expressions.Arrow`. Phases 9–14 (Spark SQL parser, Delta
 CHECK/generated-column wiring, Parquet column/offset index, ORC stripe pruning)
 are not built. See the phase table at the bottom for scope; the issue tracker,
 not this document, is authoritative for what is in flight.
@@ -91,18 +91,19 @@ EngineeredWood.Expressions.Arrow        (new — depends on Expressions + Apache
         ├── EngineeredWood.DeltaLake.Table    (CHECK constraints, generated columns, post-filter)
         └── EngineeredWood.Parquet            (post-pruning row filtering — future)
 
-EngineeredWood.SparkSql                 (new — ANTLR-based, optional)
+EngineeredWood.Expressions/Sql          (hand-written, inside Expressions)
     │
     └── Parses Spark SQL expression strings into Expression trees
         ↑
-        └── consumed only by Delta Lake clients that need CHECK / generated columns
+        └── used by Delta Lake for CHECK constraints / invariants / generated columns
 ```
 
-ANTLR sits at the leaves. Format libraries depend on the core expression library;
-they never see the parser. Delta Lake takes an optional
-`IExpressionParser` (or `Func<string, Expression>`) on table open. Consumers who
-don't need CHECK constraints or generated columns never reference the Spark
-parser package and never pull in ANTLR.
+The parser has no dependencies of its own — tokenizer and recursive-descent
+parser over `std`-equivalent BCL surface only — so it lives inside
+`EngineeredWood.Expressions` rather than in a separate package. Format libraries
+that never parse anything pay for a few types they don't reference, and nothing
+else. See [the decision record](#the-spark-sql-parser) below for why this is not
+the optional ANTLR package the earlier revision of this document specified.
 
 ### Why not one library per concern?
 
@@ -321,8 +322,8 @@ The default `ArrowRowEvaluator` handles all built-in predicates and operators
 (comparisons, AND/OR/NOT, IS NULL, IN, arithmetic, CAST). Format-specific
 function libraries are registered via `IFunctionRegistry` — Spark SQL functions
 like `YEAR`, `SUBSTRING`, `DATE_FORMAT` would come from the
-`EngineeredWood.SparkSql` package's function registry. No registry ships today,
-so a `FunctionCall` expression throws unless the caller supplies one.
+`SparkFunctionRegistry` of [phase 9](#the-spark-sql-parser). No registry ships
+today, so a `FunctionCall` expression throws unless the caller supplies one.
 
 **Column-type coverage is bounded**, which is a real constraint rather than a
 detail: `Boolean`, `Int8/16/32/64`, `UInt8/16/32/64`, `Float`, `Double`,
@@ -348,7 +349,7 @@ Shipping today:
   construct an `ArrowRowEvaluator` per operation and keep only the rows the
   predicate selects.
 
-Designed but not implemented (both blocked on the SparkSql parser, phases 9–10):
+Designed but not implemented (both blocked on the Spark SQL parser, phases 9–10):
 
 - **Delta Lake CHECK constraints**: evaluate the constraint predicate against
   every batch being written; if any row evaluates to false (or null), abort the
@@ -547,17 +548,23 @@ foreach (var batch in batches)
 ```
 
 The constraint expressions are stored as Spark SQL strings in
-`Metadata.Configuration`. Parsing requires the optional
-`EngineeredWood.SparkSql` package via an injected `IExpressionParser`:
+`Metadata.Configuration`. Since [the parser decision](#the-spark-sql-parser),
+parsing no longer needs a separate package: the parser lives in
+`EngineeredWood.Expressions`, which `DeltaLake.Table` already references through
+`Expressions.Arrow`, so the default parser is always present.
+
+`DeltaTableOptions.ExpressionParser` therefore becomes an optional *override*
+rather than the mandatory injection seam the earlier design needed — useful for
+tests and for a host that wants its own dialect, and null means "use the
+built-in parser" rather than "refuse the write":
 
 ```csharp
 public sealed record DeltaTableOptions
 {
     // ... existing ...
 
-    /// Parser for SQL expressions in CHECK constraints and generated columns.
-    /// If null and the table has CHECK constraints or generated columns, write
-    /// operations will throw.
+    /// Overrides the built-in Spark SQL parser used for CHECK constraints,
+    /// invariants, and generated columns. Null uses the built-in parser.
     public IExpressionParser? ExpressionParser { get; init; }
 }
 ```
@@ -578,77 +585,109 @@ metadata. For each batch:
 
 Same parser injection as CHECK constraints.
 
-## `EngineeredWood.SparkSql` — ANTLR-Based Parser
+## The Spark SQL parser
 
-> **Approach reopened** ([#101](https://github.com/clast-project/engineered-wood/issues/101)).
-> What follows is the incumbent design, not a settled decision. Two inputs
-> arrived after it was written.
->
-> **The AOT gate.** `src/Directory.Build.props` now sets `IsAotCompatible=true`
-> and `TreatWarningsAsErrors=true` for the net10.0 build of every library under
-> `src/`, which a new package inherits. This design mentions neither AOT nor
-> trimming anywhere. Opting a leaf package out is one MSBuild line, but it is a
-> decision to make deliberately rather than discover mid-implementation, and it
-> weighs against a package carrying a code-generation runtime.
->
-> **A third option the rejection list below does not cover.** delta-kernel-rs hit
-> this exact problem — parsing `checkConstraints` expressions — and wrote a
-> hand-rolled tokenizer and parser in-tree (`kernel/src/expressions/sql/`), with
-> no `sqlparser` dependency and no grammar toolchain, behind a
-> `check-constraints-in-dev` feature flag. Its token set is deliberately tiny:
-> comparisons including `<=>`, `+` / `-`, `AND` / `OR` / `NOT` / `IS`, quoted
-> strings, numbers with exponents, `X'…'` binary, booleans and null, typed
-> `DATE` / `TIMESTAMP` literals, and backtick-quoted or dotted identifiers — no
-> parentheses, no `*` or `/`, no wildcards. That is neither a maintained fork nor
-> a third-party dependency, so the reasoning below does not rule it out.
->
-> #101 proposes measuring the real corpus of `delta.constraints.*` and
-> `delta.generationExpression` strings before choosing: kernel's scope is a
-> testable claim about what constraint expressions actually contain, and the
-> Spark interop rig can settle it.
+> **Decided 2026-08-09** ([#101](https://github.com/clast-project/engineered-wood/issues/101)):
+> a hand-written tokenizer and recursive-descent parser inside
+> `EngineeredWood.Expressions`. No ANTLR, no grammar-subsetting tool, no new
+> package, no new dependency. The ANTLR design this section used to carry is
+> preserved under [rejected approaches](#rejected-approaches) below.
 
-A separate, optional package. Consumers who don't need CHECK constraints or
-generated columns never reference it.
+### Why hand-written
 
-### Approach
+**The subsetting tool did not buy what it was meant to buy.** The ANTLR design
+rejected hand-maintaining a grammar fork on drift grounds, and answered it with a
+program that walks `SqlBaseParser.g4` from the `expression` rule, emits a subset
+grammar, and is rerun against each Spark release. That program is itself a
+bespoke grammar-analysis tool that has to be maintained, and rerunning it per
+release *is* the drift-management work a fork requires — diff the output, repair
+the visitor where a rule changed shape. The real comparison was never "fork
+versus no fork"; it was "a parser" versus "a subsetting tool plus a generated
+grammar plus a CST visitor". The second stack is strictly larger.
 
-Apache Spark publishes its SQL grammar as `SqlBaseParser.g4` and
-`SqlBaseLexer.g4` under Apache 2.0. The full grammar is ~3,400 lines and covers
-DDL, DML, queries, and expressions. The expression subset we need is a small
-fraction:
+**The toolchain cost lands at the bottom of the build.** The ANTLR tool is a Java
+jar; the MSBuild integrations either require a JDK on the build machine or fetch
+one. `EngineeredWood.Expressions` targets `netstandard2.0` alongside net8.0 and
+net10.0, the repository must build `net472`, and `src/Directory.Build.props`
+applies `IsAotCompatible` and `TreatWarningsAsErrors` to every net10.0 library
+under `src/`. A hand-written parser has no exposure to any of it. Whether the
+ANTLR runtime trims and AOT-compiles cleanly under those settings is a question
+that would have to be answered empirically before committing — and that it is a
+question at all is most of the argument.
 
-- `expression` → `booleanExpression` → `predicated` → `valueExpression`
-- `valueExpression` → arithmetic, comparison
-- `primaryExpression` → literals, CAST, CASE, function calls, column refs
-- Supporting rules: `comparisonOperator`, `predicate`, `dataType`,
-  `identifier`, `qualifiedName`, `whenClause`, `constant`
+**Almost all the risk lives behind the parser.** Recognising
+`a > 0 AND b IS NOT NULL` is not the hard part of CHECK constraints and
+generated columns. Spark's semantics are: implicit type coercion, decimal
+precision promotion under arithmetic, ANSI versus legacy cast behaviour,
+timezone handling in `CAST(ts AS DATE)`, and the exact `<=>` behaviour that
+generated-column validation depends on. A generated grammar contributes nothing
+to any of it. This also weakens the original rejection of third-party parsers on
+"approximate Spark-dialect coverage" grounds: dialect gaps in the *syntax* are
+the cheap half.
 
-Total: roughly 200 lines of parser rules + 100 lines of lexer tokens.
+### Scope: larger than delta-kernel-rs, not equal to it
 
-### Subsetting tool
+delta-kernel-rs is the precedent for *how* — hand-written, no `sqlparser`
+dependency, in-tree — and deliberately not the precedent for *how much*.
 
-A small program parses the upstream `SqlBaseParser.g4` grammar, walks rule
-references starting from `expression`, and emits a self-contained subset
-grammar. Rerun the tool against each new Spark release to pick up additions.
+Its `kernel/src/expressions/sql/` parser sits behind the
+`check-constraints-in-dev` feature flag, which `kernel/Cargo.toml` describes as
+experimental and temporary: "the SQL predicate parser and, later,
+`checkConstraints` write enforcement. Remove once full check-constraints support
+ships." Its token set covers comparisons including `<=>`, `+` / `-`,
+`AND` / `OR` / `NOT` / `IS`, quoted strings, numbers with exponents, `X'…'`
+binary, booleans and null, typed `DATE` / `TIMESTAMP` literals, and
+backtick-quoted or dotted identifiers — but no parentheses, no `*` or `/`, no
+wildcards. That is a snapshot of unfinished work, not a finding about what real
+constraints contain, and shipping it as-is would reject expressions Spark writes
+routinely.
 
-This avoids:
-- Hand-maintaining a fork (drift over time)
-- Depending on a third-party SQL parser whose Spark-dialect coverage is
-  approximate (SqlParser-cs, etc.)
-- Pulling ANTLR into the bottom of the dependency stack — it lives only in this
-  optional leaf package.
+It is also check-constraints-only. Generated columns and invariants sit outside
+kernel's remit by design, because kernel's contract is that the engine supplies
+expressions. Phase 10 here covers constraints *and* invariants *and* generated
+columns, and generated columns are exactly where parentheses and function calls
+concentrate — `CAST(x AS DATE)`, `date_format`, `year`, `substring`.
 
-### Translation layer
+So the target is the full expression grammar from the start: parentheses,
+arithmetic, `CASE`, `CAST`, `IN` / `BETWEEN` / `LIKE`, function calls,
+comparison including `<=>`, `AND` / `OR` / `NOT`, and the `IS` predicates.
+Precedence climbing over that surface is on the order of 600–1,000 lines, which
+is smaller than the CST visitor alone would have been.
 
-A visitor walks ANTLR's CST and produces `EngineeredWood.Expressions`
-`Expression` nodes. Function calls become `FunctionCall(name, args)`; the
-`SparkFunctionRegistry` provides Arrow-backed implementations for the standard
-Spark functions used in Delta expressions (`CAST`, `YEAR`, `MONTH`, `DAY`,
-`HOUR`, `SUBSTRING`, `DATE_FORMAT`, `CONCAT`, `COALESCE`, `IF`, etc.).
+### How coverage gaps get reported
+
+Unsupported syntax throws a distinct, quotable error naming the construct that
+stopped the parse. `HonorWriterFeatures`' fail-closed refusal stays underneath
+it, so an unparseable constraint degrades to today's behaviour — the write is
+refused — rather than to a write committed without validation.
+
+That error *is* the tracking mechanism. It reports coverage gaps from real
+tables, with no watch on Spark's grammar and no watch on kernel's repository,
+neither of which would signal reliably: Spark's release notes conflate syntax
+additions with function additions, and kernel will never signal on generated
+columns at all. The one kernel event worth reading is the removal of the
+`check-constraints-in-dev` flag, at which point its shipped scope becomes a
+statement about the floor the ecosystem expects.
+
+### Translation layer and function registry
+
+The parser produces `EngineeredWood.Expressions` `Expression` nodes directly —
+there is no intermediate concrete syntax tree to visit. Function calls become
+`FunctionCall(name, args)`, and so does arithmetic, because the tree has no
+arithmetic node: `Expression` is `UnboundReference`, `BoundReference`,
+`LiteralExpression` and `FunctionCall`, plus the `Predicate` subtypes.
+
+That makes the function registry the larger and riskier half of this phase
+rather than a footnote to it. `ArrowRowEvaluator` already accepts an
+`IFunctionRegistry` and the library ships no implementations, so every coercion
+and promotion rule named above is registry work. A `SparkFunctionRegistry`
+provides Arrow-backed implementations for the functions Delta expressions
+actually use.
 
 ### Function set
 
-Minimum viable set for CHECK constraints and generated columns:
+Minimum viable set for CHECK constraints and generated columns. The syntactic
+rows are the parser's target scope; the rest is the registry's:
 
 - Type casting: `CAST`, `TRY_CAST`
 - Date/time: `YEAR`, `MONTH`, `DAY`, `HOUR`, `DATE_FORMAT`, `CURRENT_DATE`,
@@ -661,6 +700,20 @@ Minimum viable set for CHECK constraints and generated columns:
 - Logical: `AND`, `OR`, `NOT`
 - Arithmetic: `+`, `-`, `*`, `/`, `%`
 - IS predicates: `IS NULL`, `IS NOT NULL`, `IS TRUE`, `IS FALSE`
+
+### Rejected approaches
+
+- **ANTLR over a subset of Spark's `SqlBaseParser.g4`**, generated by a
+  subsetting tool that walks the grammar from the `expression` rule and is rerun
+  per Spark release (~200 lines of parser rules, ~100 lines of lexer tokens, plus
+  a CST visitor). Rejected for the three reasons above: the tool does not
+  eliminate the fork's maintenance, it puts a Java toolchain at the bottom of the
+  build, and it addresses the part of the problem that was never the risk.
+- **Hand-maintaining a grammar fork.** Drifts, and carries the toolchain cost
+  without the automation.
+- **A third-party SQL parser** (SqlParser-cs and similar). A dependency at the
+  bottom of the stack whose Spark-dialect fidelity has to be verified anyway,
+  bought for the cheap half of the problem.
 
 ## What the ecosystem actually does
 
@@ -810,7 +863,7 @@ oversight.
 | — | Per-read filter on the Parquet reader; Delta forwarding, with logical→physical rewriting under column mapping | Parquet + DeltaLake.Table | [#55](https://github.com/clast-project/engineered-wood/issues/55) |
 | — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
-| **Phase 9** | A parser from Spark SQL expression strings to `Expression` / `Predicate`, plus a function registry. Approach reopened — see the note below | new project, or inside Expressions | [#101](https://github.com/clast-project/engineered-wood/issues/101) |
+| **Phase 9** | A hand-written parser from Spark SQL expression strings to `Expression` / `Predicate`, plus a `SparkFunctionRegistry`. Approach decided — see [The Spark SQL parser](#the-spark-sql-parser) | inside Expressions (+ Expressions.Arrow for the registry) | [#101](https://github.com/clast-project/engineered-wood/issues/101) |
 | **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes (needs Phase 9) | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
 | **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled |
 | **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled |
@@ -824,8 +877,10 @@ formats with concrete needs (Parquet pruning, Delta pruning), and migrate
 Iceberg to consume it." Each phase was independently testable and shippable.
 
 Phases 8-10 extend the architecture to row-level evaluation, unblocking CHECK
-constraints and generated columns. The Spark parser is pure leaf work and can
-proceed in parallel with anything earlier.
+constraints and generated columns. The Spark parser depends on nothing but the
+expression tree and can proceed in parallel with anything earlier; the function
+registry it needs is the part with real sequencing risk, since it is where
+Spark's coercion semantics land.
 
 **What the original ordering got wrong.** It assumed the next win was more
 pruning machinery. It is not: every mechanism phases 5-7 built is already

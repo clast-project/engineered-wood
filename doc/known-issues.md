@@ -889,18 +889,26 @@ in Parquet, and no Iceberg-side schema bridge to Arrow or Parquet.
 
 ### Missing features
 
-**Spark SQL parser.** `EngineeredWood.SparkSql` (Phase 9 of the
-predicate-pushdown design) is not implemented. `Expression` /
-`Predicate` trees must be built in code via the `Expressions` static
-factory. This blocks any feature that needs to parse SQL expression
-strings from table metadata — notably Delta CHECK constraints and
-generated columns.
+**Spark SQL parser.** Phase 9 of the predicate-pushdown design is not
+implemented. `Expression` / `Predicate` trees must be built in code via
+the `Expressions` static factory. This blocks any feature that needs to
+parse SQL expression strings from table metadata — notably Delta CHECK
+constraints and generated columns.
+
+The approach is settled: a hand-written tokenizer and recursive-descent
+parser inside `EngineeredWood.Expressions`, not the separate
+ANTLR-based `EngineeredWood.SparkSql` package earlier revisions of the
+design specified. See
+[`predicate-pushdown-design.md`](predicate-pushdown-design.md#the-spark-sql-parser)
+and [#101](https://github.com/clast-project/engineered-wood/issues/101).
 
 **Built-in function registry.** `ArrowRowEvaluator` accepts an optional
 `IFunctionRegistry`, but the library ships no implementations.
 `FunctionCall` expressions throw at evaluation time unless the caller
-supplies a registry. A Spark function registry is planned alongside the
-SparkSql parser.
+supplies a registry. A `SparkFunctionRegistry` is planned alongside the
+parser, and is the larger half of that phase: the tree has no arithmetic
+node, so `a + b` lowers to `FunctionCall("+")` and every type-coercion
+rule is registry work.
 
 **No table layer can push a predicate into the Parquet reader.** Row-group
 pruning and bloom probing are implemented and tested, but nothing in `src/` sets
