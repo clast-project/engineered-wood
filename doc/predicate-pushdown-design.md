@@ -123,6 +123,36 @@ Modeled on Iceberg's existing implementation (which is already proven and shaped
 correctly). The tree distinguishes value-producing expressions from
 boolean-producing predicates, mirroring delta-kernel-rs:
 
+> **How far the kernel resemblance actually goes**, checked against kernel
+> `d1f7f52a` while sizing phase 9, because the answer bears on the parser and
+> the function registry both.
+>
+> The `Expression` / `Predicate` split is genuinely kernel's. Nothing below it
+> is. `FunctionCall` is Iceberg's `ApplyExpression` renamed — its predecessor's
+> doc comment reads "replaces the old Transform-in-expression pattern", because
+> the only computation Iceberg pruning ever needs is a partition transform
+> (`bucket(x, 16)`, `truncate`, `year`), and an n-ary apply node covers that
+> whole requirement. There was never a decision to route arithmetic through
+> function application; there was no arithmetic requirement, and the shape came
+> across wholesale.
+>
+> Kernel took the opposite approach. Its `Expression` is a closed set —
+> `Literal`, `Column`, `Predicate`, `Struct`, `StructPatch`, `Unary`, `Binary`,
+> `Variadic`, `Cast`, `Opaque`, `Unknown` — with **no generic function-call node
+> at all**. Arithmetic is a first-class node
+> (`BinaryExpressionOp { Plus, Minus, Multiply, Divide }`), `CAST` is its own
+> node carrying a `CastExpression`, `COALESCE` and `ARRAY` are variadic
+> operators, and engine-defined operations go through `Opaque` plus an
+> `OpaqueExpressionOp` trait rather than a string-keyed registry.
+>
+> So this tree has no arithmetic node, and `a + b` must lower to
+> `FunctionCall("+")` with every coercion rule living in registry code behind an
+> open-ended string contract. Whether to add a closed arithmetic node before
+> building the parser is [#101](https://github.com/clast-project/engineered-wood/issues/101)'s
+> first open question — it is a change to the public tree that Iceberg, Parquet,
+> Delta and Lance all consume, so it wants deciding before the parser, not
+> after.
+
 ```csharp
 public abstract record Expression;
 
@@ -318,12 +348,18 @@ public interface IFunctionRegistry
 }
 ```
 
-The default `ArrowRowEvaluator` handles all built-in predicates and operators
-(comparisons, AND/OR/NOT, IS NULL, IN, arithmetic, CAST). Format-specific
-function libraries are registered via `IFunctionRegistry` — Spark SQL functions
-like `YEAR`, `SUBSTRING`, `DATE_FORMAT` would come from the
-`SparkFunctionRegistry` of [phase 9](#the-spark-sql-parser). No registry ships
-today, so a `FunctionCall` expression throws unless the caller supplies one.
+The default `ArrowRowEvaluator` handles every built-in predicate: comparisons,
+AND/OR/NOT, IS NULL, and IN. Everything else — `CAST`, arithmetic, and named
+functions alike — is a `FunctionCall`, and the library ships no
+`IFunctionRegistry` implementation, so any of them throws unless the caller
+supplies one. Spark SQL functions like `YEAR`, `SUBSTRING` and `DATE_FORMAT`
+would come from the `SparkFunctionRegistry` of
+[phase 9](#the-spark-sql-parser).
+
+> Earlier revisions of this paragraph listed "arithmetic, CAST" among the
+> evaluator's built-in operators. It never implemented either, and with no
+> arithmetic node in the tree there is nothing for it to dispatch on — see the
+> note under [Expression tree](#expression-tree).
 
 **Column-type coverage is bounded**, which is a real constraint rather than a
 detail: `Boolean`, `Int8/16/32/64`, `UInt8/16/32/64`, `Float`, `Double`,
@@ -634,13 +670,25 @@ Its `kernel/src/expressions/sql/` parser sits behind the
 `check-constraints-in-dev` feature flag, which `kernel/Cargo.toml` describes as
 experimental and temporary: "the SQL predicate parser and, later,
 `checkConstraints` write enforcement. Remove once full check-constraints support
-ships." Its token set covers comparisons including `<=>`, `+` / `-`,
-`AND` / `OR` / `NOT` / `IS`, quoted strings, numbers with exponents, `X'…'`
-binary, booleans and null, typed `DATE` / `TIMESTAMP` literals, and
-backtick-quoted or dotted identifiers — but no parentheses, no `*` or `/`, no
-wildcards. That is a snapshot of unfinished work, not a finding about what real
-constraints contain, and shipping it as-is would reject expressions Spark writes
-routinely.
+ships."
+
+Read against kernel at `d1f7f52a`, that parser is earlier-stage than its token
+set suggests, and the two layers must not be conflated:
+
+- `token.rs` (449 lines) tokenizes comparison operators including `<=>`, `+` and
+  `-`, the keywords `AND` / `OR` / `NOT` / `IS`, quoted strings, numbers with
+  exponents, `X'…'` binary, booleans and null, typed `DATE` / `TIMESTAMP`
+  literals, and backtick-quoted or dotted identifiers.
+- `parser.rs` (291 lines) accepts **exactly one `operand <op> operand`
+  comparison**. Its own header records that "junctions (`AND`/`OR`/`NOT`),
+  parentheses, and `IS [NOT] NULL` are not yet supported and surface as errors",
+  and `parse_operand` treats `+` / `-` as literal signs only — "unary minus on a
+  column and binary arithmetic are out of grammar". Trailing tokens after the
+  single comparison are an error.
+
+So the keywords in the tokenizer are groundwork, not capability. This is a
+snapshot of unfinished work rather than a finding about what real constraints
+contain, and shipping its scope would reject nearly everything Spark writes.
 
 It is also check-constraints-only. Generated columns and invariants sit outside
 kernel's remit by design, because kernel's contract is that the engine supplies
@@ -651,8 +699,11 @@ concentrate — `CAST(x AS DATE)`, `date_format`, `year`, `substring`.
 So the target is the full expression grammar from the start: parentheses,
 arithmetic, `CASE`, `CAST`, `IN` / `BETWEEN` / `LIKE`, function calls,
 comparison including `<=>`, `AND` / `OR` / `NOT`, and the `IS` predicates.
-Precedence climbing over that surface is on the order of 600–1,000 lines, which
-is smaller than the CST visitor alone would have been.
+Sizing that against kernel is the honest anchor available: 740 lines buys it a
+tokenizer plus a single-comparison parser, so the full grammar should be
+budgeted well above that — on the order of 1,200–1,800 lines — and still below
+what a subsetting tool plus a generated grammar plus a CST visitor would have
+cost.
 
 ### How coverage gaps get reported
 
