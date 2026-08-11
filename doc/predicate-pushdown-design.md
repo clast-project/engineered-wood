@@ -145,21 +145,26 @@ boolean-producing predicates, mirroring delta-kernel-rs:
 > operators, and engine-defined operations go through `Opaque` plus an
 > `OpaqueExpressionOp` trait rather than a string-keyed registry.
 >
-> So this tree has no arithmetic node, and `a + b` must lower to
-> `FunctionCall("+")` with every coercion rule living in registry code behind an
-> open-ended string contract. Whether to add a closed arithmetic node before
-> building the parser is [#101](https://github.com/clast-project/engineered-wood/issues/101)'s
-> first open question — it is a change to the public tree that Iceberg, Parquet,
-> Delta and Lance all consume, so it wants deciding before the parser, not
-> after.
+> So this tree has no arithmetic node, and `a + b` lowers to `FunctionCall("+")`
+> with every coercion rule living in registry code behind an open-ended string
+> contract.
 >
-> Worth knowing before that is decided: **`FunctionCall` currently has no
-> producers.** It is built only by the two `Expressions.Call` factories and
-> Iceberg's compatibility shim, and every consumer treats it as
-> pass-through-or-throw. Iceberg partition transforms do not lower into it — they
-> stay in the closed `Transform` hierarchy. The Spark parser would be its first
-> real producer, so nothing yet depends on its openness. See
-> [open question 6](#open-questions).
+> **Decided 2026-08-11: it stays that way.** Arithmetic continues to route
+> through `FunctionCall` until there is strong evidence the shape is wrong —
+> which there is not today. The relevant evidence points the other way: the only
+> normative statement anyone makes about the expression language is Databricks'
+> — a CHECK constraint "can use any SQL functions in Spark that always return the
+> same result when given the same argument values", excluding UDFs, aggregates,
+> window functions and table functions. That is a large open set, and an
+> open-ended registry models it better than a closed operator enum would. Adding
+> a closed arithmetic node later remains possible; nothing here forecloses it.
+>
+> Also weighing in favour of leaving it alone: **`FunctionCall` has no producers
+> today.** It is built only by the two `Expressions.Call` factories and Iceberg's
+> compatibility shim, and every consumer treats it as pass-through-or-throw.
+> Iceberg partition transforms do not lower into it — they stay in the closed
+> `Transform` hierarchy. The Spark parser will be its first real producer, so the
+> shape can be judged against real use before it is changed on speculation.
 
 ```csharp
 public abstract record Expression;
@@ -756,6 +761,45 @@ and promotion rule named above is registry work. A `SparkFunctionRegistry`
 provides Arrow-backed implementations for the functions Delta expressions
 actually use.
 
+#### Where the dialect configuration lives
+
+Decided 2026-08-11. Spark's evaluation semantics — ANSI above all, since
+[Delta pins nothing](#what-delta-actually-does-with-a-constraint) and the same
+constraint can accept or reject the same row depending on it — are bound **when
+the registry is constructed**, not chosen by the parser and not threaded through
+evaluation:
+
+```csharp
+var registry = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = true });
+```
+
+The registry is already the dialect boundary: `IFunctionRegistry` exists so that
+format-specific semantics live somewhere pluggable, and it is the object that was
+always going to hold Spark's coercion rules. Giving it the configuration too
+keeps three other things clean:
+
+- **The parser stays syntax-only.** Text to tree, no semantics — which is also
+  what lets it be tested in isolation against the precedence oracle.
+- **The tree stays dialect-neutral.** `+` means `+`, so a `FunctionCall` built by
+  the `Expressions` factories means the same thing as one produced by the parser.
+  That matters because the parser is not the tree's only producer — predicate
+  `DeleteAsync`/`UpdateAsync`, Lance's `ReadAsync`, Iceberg and
+  `DeltaReadOptions.Filter` all build trees with no parser involved. It also
+  keeps the tree round-trippable back to SQL text, which an eventual
+  `AddConstraintsAsync` needs.
+- **The evaluator stays policy-free.** No policy object threaded through
+  evaluation and no per-row cost.
+
+The alternative considered was for the parser to resolve the dialect at lowering
+time, emitting distinct names such as `+_ansi` versus `+_legacy`. That is cheap
+— the registry dispatches on strings already — and would be sound if the parser
+were the only producer and parse-time config were always evaluation-time config.
+Neither holds: parsing happens once when a table is opened while evaluation
+happens per write, and Delta's own model attaches the configuration to the
+writing session rather than to the table or the expression text. Binding at
+registry construction keeps those two lifetimes separate without giving up the
+simplicity.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic
@@ -1088,7 +1132,9 @@ theoretical — the same table, the same constraint `a + b < 0`, and the same ro
 
 So a constraint does not have one behaviour to match. EngineeredWood has no
 session config to inherit, which means it must *choose* a policy and document it
-rather than claim Spark parity. The defensible choice is ANSI: Spark 4.0
+rather than claim Spark parity — bound at `SparkFunctionRegistry` construction,
+per [Where the dialect configuration lives](#where-the-dialect-configuration-lives).
+The defensible choice is ANSI: Spark 4.0
 defaults `spark.sql.ansi.enabled=true` and `spark.sql.storeAssignmentPolicy=ANSI`
 (both confirmed as the running defaults in the interop venv), so ANSI is what a
 current-generation writer produces. Any harvested corpus must record the config
@@ -1202,9 +1248,10 @@ One surprise worth recording for whoever writes the grammar: in Spark 4.0
    `ReadAllAsync` would use it. Defer until page-level pushdown exists.
 
 6. **Where do per-format expression semantics live — one shared tree, or a
-   dialect AST per format lowered into one?** Open, and deliberately undecided;
-   raised while sizing phase 9 because the parser is the first front end that
-   would exercise the answer. Sharing nothing is ruled out. The two live options
+   dialect AST per format lowered into one?** Resolved: one shared tree, dialect
+   bound at registry construction. Raised while sizing phase 9 because the parser
+   is the first front end that would exercise the answer. Sharing nothing was
+   ruled out at the outset. The two live options
    are (a) one shared tree both front ends emit into, dialect differences carried
    by an evaluation policy, which is the status quo — `23cfc4e` migrated Iceberg
    off its parallel expression types onto this library — and (b) a dialect AST
@@ -1232,19 +1279,30 @@ One surprise worth recording for whoever writes the grammar: in Spark 4.0
      over UTF-8 bytes. Divergence is concentrated in row-level evaluation, which
      is Delta-only today.
 
-   A useful way to sort the question when it is taken up: for each expected
-   semantic difference, ask whether it resolves at lowering time (Spark
-   `LIKE 'x%'` to `StartsWith`, `<>` to `Not(Equal)`), is pervasive and live
-   (decimal promotion, ANSI cast and overflow, division by zero), or is
-   localized and live (a named function one format has and the other does not).
-   Only a fourth kind — structural, with no representation in the shared tree and
-   no lowering into one — would actually require (b), and none has been found
-   for Iceberg. Pervasive differences argue against encoding dialect in node
-   identity, since there are already six consumers of this tree
-   (`ExpressionBinder`, `StatisticsEvaluator`, `ArrowRowEvaluator`, Lance's
-   `IndexPruner`, Vortex's `VortexZoneStatsAccessor`, Parquet's pruner) and each
-   would have to handle both arms of every dialect-split node.
+   A useful way to sort the question: for each expected semantic difference, ask
+   whether it resolves at lowering time (Spark `LIKE 'x%'` to `StartsWith`, `<>`
+   to `Not(Equal)`), is pervasive and live (decimal promotion, ANSI cast and
+   overflow, division by zero), or is localized and live (a named function one
+   format has and the other does not). Only a fourth kind — structural, with no
+   representation in the shared tree and no lowering into one — would actually
+   require (b), and none has been found for Iceberg.
 
-   Related and equally open, from [#101](https://github.com/clast-project/engineered-wood/issues/101):
-   whether the tree gains a closed arithmetic node at all — see the note under
-   [Expression tree](#expression-tree).
+   **Resolved 2026-08-11: (a), one shared tree.** No structural difference was
+   found, the symmetry (b) assumes is absent, and (a) is the status quo already
+   paid for. Dialect semantics are bound at `SparkFunctionRegistry` construction
+   — see [Where the dialect configuration lives](#where-the-dialect-configuration-lives),
+   which also records why that beats resolving the dialect in the parser.
+
+   One correction to the reasoning above, since it was used to reach this
+   answer and was partly wrong. The six-consumers argument was aimed at
+   dialect-split *node types* (`SparkAdd` versus `IcebergAdd`), which would
+   indeed force every consumer to handle both arms. It does not apply to
+   dialect-split *function names* (`+_ansi` versus `+_legacy`), which cost
+   nothing structurally because the registry dispatches on strings already. That
+   option was rejected on lifetime grounds instead — parse happens once per table
+   open, evaluation happens per write — not on consumer count.
+
+   Related and resolved the same day, from
+   [#101](https://github.com/clast-project/engineered-wood/issues/101):
+   arithmetic stays in `FunctionCall` rather than gaining a closed node — see the
+   note under [Expression tree](#expression-tree).
