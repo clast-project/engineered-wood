@@ -507,6 +507,86 @@ public class LogCleanupTests : IDisposable
     }
 
     /// <summary>
+    /// ⚠ THE AWKWARD HISTORY: sidecars exist and the SURVIVING checkpoint is classic. A table that used V2
+    /// checkpoints and later wrote a classic one — a <c>delta.checkpointPolicy</c> change, or another
+    /// engine — keeps its sidecar directory, so the sweep runs and has to ask a checkpoint with no
+    /// sidecar column what it references. The answer is none, every old sidecar is unreferenced, and all
+    /// of them go.
+    ///
+    /// <para>This is also the case that makes the projected read matter rather than being an optimisation:
+    /// a classic checkpoint carries every file action in its body, so answering by materialising it would
+    /// be the table's whole file list allocated to discover a null result, on a commit path. The body is
+    /// asked for its <c>sidecar</c> column, has none, and is not read.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_SweepsSidecars_WhenTheSurvivingCheckpointIsClassic()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        await WriteV2CheckpointWithSidecarsAsync();               // V2 checkpoint at v2, with sidecars
+        Assert.NotEmpty(SidecarNames());
+
+        for (long v = 3; v <= 5; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+
+        // Classic: the table declares the v2Checkpoint FEATURE but no checkpointPolicy, which is exactly
+        // the combination CheckpointFormat.Automatic resolves to a classic checkpoint.
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+        Assert.True(File.Exists(LogFile("00000000000000000005.checkpoint.parquet")));
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Empty(SidecarNames());
+
+        var rebuilt = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        Assert.Equal(5, rebuilt.Version);
+        Assert.Equal(5, rebuilt.FileCount);
+    }
+
+    /// <summary>
+    /// A V2 body may be Parquet as well as NDJSON — delta-spark picks between them with a session config,
+    /// so which one a table carries is not something a reader can predict. The Parquet path is the one
+    /// that projects a single column, so it needs its own case; the tests above all exercise NDJSON,
+    /// which is what this writer produces by default.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_ReadsSidecarReferences_FromAParquetV2Body()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        var snapshot = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.V2CheckpointWriter(_fs)
+        {
+            SidecarThreshold = 0,
+            Body = Checkpoint.V2CheckpointBody.Parquet,
+        }.WriteCheckpointAsync(snapshot);
+        string[] referenced = SidecarNames();
+        Assert.NotEmpty(referenced);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // An expired sidecar the surviving Parquet-bodied checkpoint does NOT reference.
+        string orphan = Path.Combine(SidecarDir, "dddddddd-orphan.parquet");
+        File.WriteAllBytes(orphan, [1]);
+        File.SetLastWriteTimeUtc(orphan, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 2, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.DoesNotContain("dddddddd-orphan.parquet", remaining);
+        foreach (string name in referenced)
+            Assert.Contains(name, remaining);
+    }
+
+    /// <summary>
     /// A classic-checkpoint table pays a listing and stops. Asserted because the sweep must not become a
     /// reason for the common case to start reading checkpoint bodies it has no use for.
     /// </summary>

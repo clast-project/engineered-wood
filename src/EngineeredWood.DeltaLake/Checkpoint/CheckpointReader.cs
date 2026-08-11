@@ -221,18 +221,64 @@ public sealed class CheckpointReader
     /// classic V1 one — returns empty, which is not the same as failing, and the caller must tell those
     /// apart because only one of them means "I could not determine what is referenced".</para>
     ///
-    /// <para>The body's non-sidecar actions are parsed and discarded rather than skipped. That is the cost
-    /// of reusing the one body reader, and it is bounded in the case this exists for: a checkpoint that
-    /// USES sidecars keeps its file actions in them, so its own body is small.</para>
+    /// <para><b>The file actions are not merely discarded, they are never read.</b> A Parquet body is
+    /// asked for its <c>sidecar</c> column ALONE, and a body with no such column — every classic V1
+    /// checkpoint — costs a footer read and nothing else. That matters because the case this has to
+    /// survive is the awkward one: a table that used sidecars and later wrote a classic checkpoint still
+    /// has a sidecar directory, so the sweep runs and asks a possibly enormous classic checkpoint what it
+    /// references. Materialising its actions to discover the answer is none would be megabytes of
+    /// allocation for a null result, on a commit path.</para>
+    ///
+    /// <para>An NDJSON body has no column to project, so it is parsed and filtered — bounded in practice
+    /// because a V2 checkpoint that uses sidecars keeps its file actions in them, leaving the body small,
+    /// but not bounded by construction the way the Parquet path is.</para>
     /// </remarks>
     internal async ValueTask<IReadOnlyList<string>> ReadSidecarPathsAsync(
         string checkpointPath, CancellationToken cancellationToken = default)
     {
-        var discarded = new List<DeltaAction>();
         var sidecars = new List<SidecarFile>();
 
-        await ReadV2CheckpointAsync(checkpointPath, discarded, sidecars, cancellationToken)
-            .ConfigureAwait(false);
+        if (checkpointPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+        {
+            byte[] data = await _fs.ReadAllBytesAsync(checkpointPath, cancellationToken)
+                .ConfigureAwait(false);
+            foreach (var action in Log.ActionSerializer.Deserialize(data))
+            {
+                if (action is SidecarFile sidecarAction)
+                    sidecars.Add(sidecarAction);
+            }
+        }
+        else
+        {
+            await using var file = await _fs.OpenReadAsync(checkpointPath, cancellationToken)
+                .ConfigureAwait(false);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+
+            var schema = await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            bool hasSidecarColumn = false;
+            foreach (var child in schema.Root.Children)
+            {
+                if (child.Name == SidecarColumn)
+                {
+                    hasSidecarColumn = true;
+                    break;
+                }
+            }
+
+            // "Any missing column should be treated as null" — so no column means no references, and
+            // there is nothing left to read.
+            if (!hasSidecarColumn)
+                return [];
+
+            // Stays empty: with only the sidecar column projected, every other branch of the converter
+            // sees a missing column and takes none of the rows.
+            var unreferenced = new List<DeltaAction>();
+            await foreach (var batch in reader
+                .ReadAllAsync([SidecarColumn], cancellationToken).ConfigureAwait(false))
+            {
+                ConvertCheckpointBatch(batch, unreferenced, sidecars, checkpointPath);
+            }
+        }
 
         if (sidecars.Count == 0)
             return [];
@@ -242,6 +288,9 @@ public sealed class CheckpointReader
             paths.Add(SidecarPath(sidecar));
         return paths;
     }
+
+    /// <summary>The checkpoint-schema column carrying <c>sidecar</c> actions.</summary>
+    private const string SidecarColumn = "sidecar";
 
     /// <summary>
     /// Reads a UUID-named V2 checkpoint, whose body may be NDJSON or Parquet.
