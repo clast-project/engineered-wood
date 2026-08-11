@@ -35,6 +35,12 @@ namespace EngineeredWood.DeltaLake.Log;
 /// owned by one, and a surviving checkpoint may name the same file. See
 /// <see cref="SweepUnreferencedSidecarsAsync"/> for the rule and for why its age condition is
 /// load-bearing rather than tidy.</para>
+///
+/// <para><b>Version-checksum files go too, though nothing here writes one.</b> delta-spark writes a
+/// <c>&lt;version&gt;.crc</c> beside every commit by default, so a table shared with it accumulates one
+/// per commit — and unrecognised they were the one class of file left growing without bound. See
+/// <see cref="SweepExpiredChecksumsAsync"/>, including why they are swept separately rather than walked
+/// with the commits.</para>
 /// </summary>
 internal static class LogCleanup
 {
@@ -87,6 +93,10 @@ internal static class LogCleanup
         // Ordered by version so the prefix rule can be applied by walking, and so the boundary check below
         // compares the right pair of files.
         var candidates = new List<(long Version, string Path, DateTimeOffset Modified)>();
+
+        // Version-checksum files are collected SEPARATELY rather than into `candidates`, and that is a
+        // decision rather than tidiness — see SweepExpiredChecksumsAsync.
+        var checksums = new List<(long Version, string Path, DateTimeOffset Modified)>();
         try
         {
             await foreach (var file in log.FileSystem.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
@@ -97,6 +107,8 @@ internal static class LogCleanup
                     candidates.Add((commitVersion, file.Path, file.LastModified));
                 else if (DeltaVersion.TryParseCheckpointVersion(name, out long ckptVersion))
                     candidates.Add((ckptVersion, file.Path, file.LastModified));
+                else if (DeltaVersion.TryParseChecksumVersion(name, out long crcVersion))
+                    checksums.Add((crcVersion, file.Path, file.LastModified));
             }
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
@@ -181,9 +193,81 @@ internal static class LogCleanup
         }
 
         // Deletion above is a strict prefix that stops at the first failure, so candidates[deleted..] is
-        // exactly what is still on the log — which is what the sweep has to mark against.
+        // exactly what is still on the log — which is what the sweeps below key off.
         deleted += await SweepUnreferencedSidecarsAsync(
             log, candidates, firstSurvivor: deleted, cutoff, cancellationToken).ConfigureAwait(false);
+
+        // long.MaxValue when nothing survived: every commit this log had is gone, so every checksum
+        // describes a version that is gone. Reachable only when the caller names a checkpoint version above
+        // anything on the log, but an index out of range here would throw out of a commit that has already
+        // succeeded, which this is documented never to do.
+        long firstSurvivingVersion = deleted < candidates.Count
+            ? candidates[deleted].Version
+            : long.MaxValue;
+
+        deleted += await SweepExpiredChecksumsAsync(
+            log, checksums, firstSurvivingVersion, cutoff, cancellationToken).ConfigureAwait(false);
+
+        return deleted;
+    }
+
+    /// <summary>
+    /// Deletes version-checksum files (<c>&lt;version&gt;.crc</c>) for versions whose commit has just been
+    /// removed. Returns how many were deleted.
+    /// </summary>
+    /// <remarks>
+    /// <para>This library writes none, but delta-spark writes one beside every commit by default, so any
+    /// table shared with it accumulates one per commit. Unrecognised, they were the one file class cleanup
+    /// left growing without bound — the exact condition it exists to end, surviving in a name it did not
+    /// parse. delta-spark deletes them alongside commits and checkpoints, filtering its own listing on
+    /// <c>isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f)</c>.</para>
+    ///
+    /// <para><b>⚠ Swept separately rather than folded into the prefix walk, so that a file outside the
+    /// replay chain cannot gate it.</b> That walk stops at the first file it may not delete, because a hole
+    /// in the COMMITS is corruption. A checksum file is not part of that chain — it is an optional
+    /// per-version summary, and every version without one already looks fine to a reader — so letting one
+    /// into the walk lets it stop the walk. delta-spark writes a checksum AFTER the commit it describes,
+    /// so a <c>.crc</c> can be newer than its own commit and newer than the horizon while the commits
+    /// around it are long expired; folded in, that one file would halt cleanup at its version and leave
+    /// every later commit behind. Separate, it halts nothing.</para>
+    ///
+    /// <para>The boundary is therefore taken from the decision the walk already made:
+    /// <paramref name="firstSurvivingVersion"/> is the oldest version still on the log, so a checksum
+    /// below it describes a commit that is gone. That is strictly more conservative than deleting by age
+    /// alone, and it means a checksum file can never outlive or predecease its own commit.</para>
+    ///
+    /// <para>Order does not matter here — a missing checksum reads as "no checksum", which is what every
+    /// version without one already looks like — so a file that will not delete is skipped rather than
+    /// ending the pass.</para>
+    /// </remarks>
+    private static async ValueTask<int> SweepExpiredChecksumsAsync(
+        TransactionLog log,
+        List<(long Version, string Path, DateTimeOffset Modified)> checksums,
+        long firstSurvivingVersion,
+        DateTimeOffset cutoff,
+        CancellationToken cancellationToken)
+    {
+        int deleted = 0;
+        foreach (var (version, path, modified) in checksums)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (version >= firstSurvivingVersion)
+                continue;
+            // Same reasoning as the commit pass: an age we cannot trust is not an age.
+            if (modified <= UnknownModifiedThreshold || modified >= cutoff)
+                continue;
+
+            try
+            {
+                await log.FileSystem.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
+                deleted++;
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                continue;
+            }
+        }
 
         return deleted;
     }

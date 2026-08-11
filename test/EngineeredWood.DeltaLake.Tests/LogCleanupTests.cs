@@ -534,4 +534,117 @@ public class LogCleanupTests : IDisposable
         foreach (string file in Directory.GetFiles(SidecarDir))
             File.SetLastWriteTimeUtc(file, stamp);
     }
+
+    // ── version checksum files ─────────────────────────────────────────────────────────────────────────
+    //
+    // This library writes none. delta-spark writes one beside every commit by default, so a table shared
+    // with it carries them, and a cleanup that does not recognise the name leaves one file per commit
+    // behind forever — the exact condition cleanup exists to end, surviving in a name it does not parse.
+
+    /// <summary>Writes a <c>&lt;version&gt;.crc</c> beside each of versions 0..<paramref name="through"/>.</summary>
+    private void WriteChecksumFiles(long through)
+    {
+        for (long v = 0; v <= through; v++)
+            File.WriteAllText(LogFile($"{DeltaVersion.Format(v)}.crc"), """{"tableSizeBytes":1,"numFiles":1}""");
+    }
+
+    private string[] ChecksumNames() =>
+        [.. Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.crc")
+            .Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal)!];
+
+    /// <summary>
+    /// A checksum file whose commit has just been deleted goes with it; the surviving version's stays.
+    /// The pairing is the assertion — a <c>.crc</c> must never outlive or predecease its own commit.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesChecksumFiles_ForTheCommitsItRemoved()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(10, deleted);                      // v0..v4 commits AND their five checksums
+        Assert.Equal(["00000000000000000005.crc"], ChecksumNames());
+        Assert.True(File.Exists(LogFile("00000000000000000005.json")));
+    }
+
+    /// <summary>
+    /// ⚠ THE REASON THEY ARE SWEPT SEPARATELY: a file outside the replay chain must not be able to gate
+    /// it. The prefix walk stops at the first file it may not delete, because a hole in the COMMITS is
+    /// corruption. A checksum file is not part of that chain, and delta-spark writes one AFTER the commit
+    /// it describes — so a single <c>.crc</c> can be newer than the horizon while every commit around it
+    /// is long expired. Folded into the walk it would halt cleanup at its own version and strand every
+    /// later commit; swept separately it halts nothing.
+    ///
+    /// <para>Here v1's checksum is minutes old and everything else is years old. The commits must still
+    /// go, and v1's checksum must survive on its own age.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_IsNotHaltedByARecentChecksum_AmongExpiredCommits()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(
+            LogFile($"{DeltaVersion.Format(1)}.crc"), Now.UtcDateTime.AddMinutes(-1));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        // Every expired commit goes, including the ones AFTER the recent checksum.
+        for (long v = 0; v <= 4; v++)
+        {
+            Assert.False(
+                File.Exists(LogFile($"{DeltaVersion.Format(v)}.json")),
+                $"v{v} outlived the horizon because a checksum file halted the walk");
+        }
+
+        // v1's checksum is younger than the horizon, so it stays on its own age — the same rule the
+        // sidecar sweep applies, and the reason the count is 9 rather than 10.
+        Assert.Equal(9, deleted);
+        Assert.Equal(
+            ["00000000000000000001.crc", "00000000000000000005.crc"], ChecksumNames());
+    }
+
+    /// <summary>
+    /// A checksum for a version whose commit SURVIVES is kept even when the file itself is long expired —
+    /// the boundary is the commit it describes, not its own age, which is what keeps the two in step.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_KeepsAChecksum_WhoseCommitSurvives()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // A checkpoint at v3 covers v0..v2 only, so v3, v4 and v5 keep their commits — and their checksums.
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 3, Now);
+
+        Assert.Equal(
+            [
+                "00000000000000000003.crc",
+                "00000000000000000004.crc",
+                "00000000000000000005.crc",
+            ],
+            ChecksumNames());
+    }
 }

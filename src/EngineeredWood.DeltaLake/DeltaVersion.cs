@@ -75,6 +75,27 @@ public static class DeltaVersion
     }
 
     /// <summary>
+    /// Attempts to parse a version number from a version-checksum file name
+    /// (e.g., <c>00000000000000000005.crc</c>).
+    /// </summary>
+    /// <remarks>
+    /// This library writes no checksum files, but delta-spark writes one beside every commit by default,
+    /// so any table shared with it carries them — which makes them something log cleanup has to recognise
+    /// even though nothing here produces them.
+    /// </remarks>
+    public static bool TryParseChecksumVersion(string fileName, out long version)
+    {
+        version = -1;
+
+        if (!fileName.EndsWith(".crc", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string stem = Path.GetFileNameWithoutExtension(fileName);
+        return stem.Length == VersionDigits &&
+               long.TryParse(stem, NumberStyles.None, CultureInfo.InvariantCulture, out version);
+    }
+
+    /// <summary>
     /// Gets the log compaction file path for a version range [startVersion, endVersion].
     /// </summary>
     public static string CompactedPath(long startVersion, long endVersion) =>
