@@ -128,10 +128,18 @@ public static class InCommitTimestamp
     /// history (the snapshots/versions view) even on a plain writer-v2 table. The opt-in <c>inCommitTimestamp</c>
     /// field is added only when the table has in-commit timestamps enabled. No-op if a commitInfo is already present.
     /// </summary>
+    /// <param name="isBlindAppend">The transaction's own claim about whether it READ anything — Delta's
+    /// <c>commitInfo.isBlindAppend</c>. <c>null</c> writes NO field, which is not the same as <c>false</c>,
+    /// and which readers do not all resolve the same way: delta-spark takes an absent flag as "not blind"
+    /// and examines the commit, while this library's own <see cref="Concurrency.ConflictChecker"/> falls
+    /// back to inferring from the commit's shape and reads an adds-only commit as blind. So silence is the
+    /// honest answer for a caller that does not track its reads, but a caller that KNOWS it read should
+    /// pass <c>false</c> — see <see cref="LogCommitRequest.IsBlindAppend"/>.</param>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<string, string>? configuration,
-        string operation = "WRITE")
+        string operation = "WRITE",
+        bool? isBlindAppend = null)
     {
         // Already has a commitInfo (any kind) — leave it.
         foreach (var action in actions)
@@ -140,10 +148,19 @@ public static class InCommitTimestamp
                 return actions;
         }
 
+        Dictionary<string, JsonElement>? extra = null;
+        if (isBlindAppend is { } blind)
+        {
+            extra = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+            {
+                ["isBlindAppend"] = JsonDocument.Parse(blind ? "true" : "false").RootElement.Clone(),
+            };
+        }
+
         var result = new List<DeltaAction>(actions.Count + 1);
         result.Add(CreateCommitInfo(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
-            additionalValues: null, includeInCommitTimestamp: IsEnabled(configuration)));
+            additionalValues: extra, includeInCommitTimestamp: IsEnabled(configuration)));
         result.AddRange(actions);
         return result;
     }

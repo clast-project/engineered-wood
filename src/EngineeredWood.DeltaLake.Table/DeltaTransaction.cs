@@ -174,6 +174,55 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal string EffectiveOperation =>
         _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
 
+    /// <summary>
+    /// This transaction's own claim about whether it READ anything, recorded as
+    /// <c>commitInfo.isBlindAppend</c> for later writers to consult. Null — the default — records NOTHING.
+    ///
+    /// <para>A property rather than a per-call argument for the same reason as <see cref="Operation"/>: it
+    /// describes the TRANSACTION, and several staging calls cannot each answer for the commit.</para>
+    ///
+    /// <para><b>⚠ Null is not false, and the difference is not uniform across readers.</b> delta-spark
+    /// takes an absent flag as "not blind" and examines the commit, so against it silence costs only
+    /// spurious conflicts. This library's own <see cref="Concurrency.ConflictChecker"/> instead infers from
+    /// the commit's shape when the flag is absent, and an adds-only commit infers as BLIND — so against a
+    /// later EW reader, silence on a staged append is read as a claim this transaction never made. <b>A
+    /// host that knows it read should set <c>false</c> rather than leave this null</b>; null is for a host
+    /// that genuinely does not know.</para>
+    ///
+    /// <para>Claiming <c>true</c> wrongly is the UNSAFE direction whichever reader sees it: the concurrent-
+    /// append check is skipped and the conflict that was owed silently does not happen. Declare
+    /// <c>true</c> only where the transaction genuinely read nothing.</para>
+    ///
+    /// <para>This library cannot derive it for a host with its own data plane. A transaction records the
+    /// reads made THROUGH it, but a host that scanned the table itself and then staged the result has made
+    /// a read this library never saw — which is exactly the case the claim exists for.</para>
+    /// </summary>
+    public bool? IsBlindAppend { get; set; }
+
+    /// <summary>
+    /// What the commit records: the host's claim if it made one, else <c>false</c> when this transaction
+    /// itself recorded a read, else nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The derivation runs in ONE direction only, and that asymmetry is the whole design.</b> A
+    /// read recorded through this transaction — a staged DELETE or UPDATE, a declared whole-table read, a
+    /// read predicate — proves the transaction was not blind, so <c>false</c> is a fact rather than a
+    /// guess. The converse does not hold: having recorded no read proves only that none came through THIS
+    /// object, and a host that scanned the table itself and staged the result read something we never saw.
+    /// So the absence of recorded reads stays silent rather than becoming <c>true</c>.</para>
+    ///
+    /// <para>Which is what makes the autocommit DML surface honest for free: <c>DeleteAsync</c> and
+    /// <c>UpdateAsync</c> stage their work through a transaction, so their commits declare <c>false</c>
+    /// without anyone passing anything, while a bare staged append — where only the host knows — declares
+    /// nothing until the host says otherwise.</para>
+    /// </remarks>
+    internal bool? EffectiveIsBlindAppend =>
+        IsBlindAppend
+        ?? (_declaredWholeTableRead || _removedPaths.Count > 0 || _dvEdits.Count > 0
+                || _readPredicates.Count > 0
+            ? false
+            : null);
+
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
 

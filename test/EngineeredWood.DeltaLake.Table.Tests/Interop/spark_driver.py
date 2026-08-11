@@ -887,6 +887,111 @@ def cmd_expr_oracle(args):
     return {"conf": applied, "results": results}
 
 
+def cmd_blind_append_ground_truth(args):
+    """What delta-spark actually records in `commitInfo.isBlindAppend`, per operation shape.
+
+    EW infers blind-append from a commit's ACTIONS -- at least one add and no remove/metaData/protocol.
+    Delta does not infer: it records `readPredicates.isEmpty && readFiles.isEmpty` at commit time and
+    reads the recorded answer back. The claim in issue #88 is that those two disagree on a real and
+    common shape, and that the disagreement is in the UNSAFE direction: a statement that READ the table
+    and emitted nothing but adds looks blind to EW and is not.
+
+    This measures the disagreement instead of arguing it. Five commits, each a different shape:
+
+      seed                 INSERT INTO ... VALUES        -- writes nothing it read
+      append               DataFrame append              -- the genuine blind append
+      merge_insert_only    MERGE ... WHEN NOT MATCHED    -- reads the target to decide what to insert
+      insert_select_self   INSERT INTO t SELECT FROM t   -- the dedupe anti-join
+      delete               DELETE FROM                   -- reads and removes
+
+    For each it reports what Spark recorded AND whether the commit's file actions are adds only, which
+    is what EW's inference would conclude. A row where `only_adds` is true and `is_blind_append` is
+    false is a commit EW would exempt and Spark would not.
+
+    Read from the raw commit JSON rather than from DESCRIBE HISTORY: the field this is about is the one
+    on disk, and a reader consuming it sees the JSON. The history view is reported alongside so the two
+    can be compared if they ever disagree.
+    """
+    spark = _spark()
+    base = args["path"]
+    uri = _uri(os.path.join(base, "blind_append"))
+    local = os.path.join(base, "blind_append")
+
+    spark.sql(f"CREATE TABLE delta.`{uri}` (id BIGINT, v STRING) USING DELTA")
+
+    labels = {}
+
+    def label(name):
+        labels[_latest_version(local)] = name
+
+    spark.sql(f"INSERT INTO delta.`{uri}` VALUES (1, 'a'), (2, 'b')")
+    label("seed")
+
+    spark.createDataFrame([(10, "x"), (11, "y")], "id BIGINT, v STRING")         .write.format("delta").mode("append").save(uri)
+    label("append")
+
+    # Insert-only MERGE: reads the target to decide what is missing. The canonical case in #88.
+    spark.createDataFrame([(2, "b2"), (3, "c")], "id BIGINT, v STRING").createOrReplaceTempView("src")
+    spark.sql(
+        f"MERGE INTO delta.`{uri}` t USING src s ON t.id = s.id "
+        f"WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)")
+    label("merge_insert_only")
+
+    # The dedupe anti-join, in plain SQL: reads the table it appends to.
+    spark.sql(
+        f"INSERT INTO delta.`{uri}` SELECT id + 1000, v FROM delta.`{uri}` WHERE id < 3")
+    label("insert_select_self")
+
+    spark.sql(f"DELETE FROM delta.`{uri}` WHERE id = 1")
+    label("delete")
+
+    scenarios = []
+    for version, name in sorted(labels.items()):
+        commit = os.path.join(local, "_delta_log", "%020d.json" % version)
+        info, kinds = None, []
+        with open(commit, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                action = json.loads(line)
+                for key in action:
+                    kinds.append(key)
+                    if key == "commitInfo":
+                        info = action[key]
+        file_kinds = [k for k in kinds if k in ("add", "remove", "cdc")]
+        scenarios.append({
+            "name": name,
+            "version": version,
+            "operation": (info or {}).get("operation"),
+            "field_present": info is not None and "isBlindAppend" in info,
+            "is_blind_append": (info or {}).get("isBlindAppend"),
+            "action_kinds": sorted(set(kinds)),
+            # What EW's reader-side inference concludes from the shape alone.
+            "only_adds": len(file_kinds) > 0 and set(file_kinds) == {"add"},
+        })
+
+    history = [
+        {"version": row["version"], "operation": row["operation"],
+         "isBlindAppend": row["isBlindAppend"]}
+        for row in (r.asDict() for r in spark.sql(
+            f"DESCRIBE HISTORY delta.`{uri}`").select(
+                "version", "operation", "isBlindAppend").collect())
+    ]
+
+    return {"scenarios": scenarios, "history": sorted(history, key=lambda r: r["version"])}
+
+
+def _latest_version(local_path):
+    """The newest committed version, from the log directory."""
+    versions = []
+    for entry in glob.glob(os.path.join(local_path, "_delta_log", "*.json")):
+        stem = os.path.basename(entry)[:-len(".json")]
+        if stem.isdigit():
+            versions.append(int(stem))
+    return max(versions)
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "expr_oracle": cmd_expr_oracle,
@@ -907,6 +1012,7 @@ COMMANDS = {
     "reference_checkpoint_schema": cmd_reference_checkpoint_schema,
     "create": cmd_create,
     "conflict_semantics": cmd_conflict_semantics,
+    "blind_append_ground_truth": cmd_blind_append_ground_truth,
 }
 
 

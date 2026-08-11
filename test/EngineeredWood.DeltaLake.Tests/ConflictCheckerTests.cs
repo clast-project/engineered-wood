@@ -1,9 +1,12 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Concurrency;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
+using EngineeredWood.IO.Local;
 using EngineeredWood.Expressions;
 using Ex = EngineeredWood.Expressions.Expressions;
 
@@ -61,6 +64,17 @@ public class ConflictCheckerTests
 
     private static readonly ISet<string> NoRemoves = new HashSet<string>();
 
+    /// <summary>A commitInfo action from raw JSON. Values are cloned so they outlive the parsed document.</summary>
+    private static CommitInfo Info(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        return new CommitInfo
+        {
+            Values = doc.RootElement.EnumerateObject()
+                .ToDictionary(p => p.Name, p => p.Value.Clone()),
+        };
+    }
+
     // ── concurrentAppend + isolation: the blind-append cases ──
 
     /// <summary>A concurrent blind append whose file matches our read predicate conflicts under Serializable.</summary>
@@ -100,6 +114,149 @@ public class ConflictCheckerTests
         var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
 
         Assert.False(result.HasConflict);
+    }
+
+    // ── the DECLARED flag: commitInfo.isBlindAppend outranks the inference above ──
+    //
+    // Blind-append is a property of the WRITER's transaction, not of the actions it emitted, so only the
+    // writer knows it. The three tests above pin the INFERENCE; these pin that a declaration wins, in both
+    // directions, and that an absent or unreadable one still falls back.
+
+    /// <summary>
+    /// THE UNSAFE DIRECTION, and the reason this group exists. A commit that contains only adds but whose
+    /// writer says it was NOT blind — the shape an <c>INSERT INTO t SELECT ... FROM t</c> produces, i.e. the
+    /// standard incremental/dedupe anti-join — must be examined even under WriteSerializable. Inference
+    /// alone calls it blind and skips a check that is owed, so this case passed before the declaration was
+    /// consulted.
+    /// </summary>
+    [Fact]
+    public void DeclaredNotBlind_OnAddsOnlyCommit_Conflicts_WriteSerializable()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":false}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+        Assert.Equal(6, result.ConflictingVersion);
+    }
+
+    /// <summary>A declared blind append behaves exactly as the inferred one did — the common case is unchanged.</summary>
+    [Fact]
+    public void DeclaredBlind_Passes_WriteSerializable()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// The declaration also outranks the inference in the PERMISSIVE direction: a remove in the commit makes
+    /// the inference say "not blind", but the writer's own true wins and the matching add stays exempt. (The
+    /// remove here is of a file we neither read nor plan to remove, so it raises no conflict of its own —
+    /// otherwise this would be testing the remove rules instead.)
+    /// </summary>
+    [Fact]
+    public void DeclaredBlind_OutranksInference_WhenCommitAlsoRemoves()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Remove("part-unrelated.parquet"),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>Serializable examines every add, so a declared blind append conflicts there regardless.</summary>
+    [Fact]
+    public void DeclaredBlind_StillConflicts_Serializable()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+    }
+
+    /// <summary>
+    /// A commitInfo with no isBlindAppend — the overwhelmingly common case, since most writers (this library
+    /// included, so far) never emit it — must still fall back to the inference rather than default to
+    /// "not blind" and start conflicting on every concurrent append.
+    /// </summary>
+    [Fact]
+    public void AbsentFlag_FallsBackToInference()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"operation":"WRITE","engineInfo":"some-other-engine"}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict); // inferred blind: adds only
+    }
+
+    /// <summary>A non-boolean flag is malformed, and an unreadable declaration is no better than an absent one.</summary>
+    [Fact]
+    public void MalformedFlag_FallsBackToInference()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":"yes"}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict); // inferred blind: adds only
+    }
+
+    /// <summary>
+    /// The tests above hand <see cref="ConflictChecker"/> a <see cref="CommitInfo"/> directly, which proves
+    /// the DECISION but not that a real caller ever sees one: the checker reads the concurrent commits
+    /// through <c>TransactionLog.ReadCommitAsync</c>, and if that dropped or flattened commitInfo the
+    /// declaration would be unreachable and every test above would be verifying dead code. So round-trip a
+    /// commit through the log and assert the flag survives, readable exactly the way the checker reads it.
+    /// </summary>
+    [Fact]
+    public async Task IsBlindAppend_SurvivesTheLogRoundTrip()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"delta_blindappend_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var log = new TransactionLog(new LocalTableFileSystem(dir));
+            await log.WriteCommitAsync(0, new List<DeltaAction>
+            {
+                Info("""{"operation":"WRITE","isBlindAppend":false}"""),
+                Add("part-0.parquet", minId: 1, maxId: 10),
+            });
+
+            var actions = await log.ReadCommitAsync(0);
+
+            var info = Assert.Single(actions.OfType<CommitInfo>());
+            var flag = info.GetValue("isBlindAppend");
+            Assert.NotNull(flag);
+            Assert.Equal(JsonValueKind.False, flag!.Value.ValueKind);
+            Assert.False(flag.Value.GetBoolean());
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
     }
 
     // ── concurrentDeleteRead + delete/delete ──

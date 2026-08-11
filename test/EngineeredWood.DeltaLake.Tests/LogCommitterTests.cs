@@ -569,6 +569,71 @@ public class LogCommitterTests : IDisposable
         Assert.Equal(0, durable);
     }
 
+    // ── the blind-append declaration ───────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A transaction that declares it read nothing gets <c>commitInfo.isBlindAppend: true</c>, which a LATER
+    /// writer consults to exclude these files from its own predicate check.
+    /// </summary>
+    [Fact]
+    public async Task Commit_WritesTheBlindAppendDeclaration_WhenTheCallerMakesIt()
+    {
+        var snapshot = await CreateTableAsync();
+
+        await Committer().CommitAsync(new LogCommitRequest
+        {
+            BaseSnapshot = snapshot,
+            Actions = [Add("a.parquet")],
+            IsBlindAppend = true,
+        });
+
+        var info = Assert.Single((await _log.ReadCommitAsync(1)).OfType<CommitInfo>());
+        Assert.True(info.Values["isBlindAppend"].GetBoolean());
+    }
+
+    /// <summary>
+    /// A caller that read the table says so, and the field records the claim rather than being inferred from
+    /// the action shape — these actions are adds only, which is exactly the case Delta refuses to treat as
+    /// blind on its own (<c>onlyAddFiles</c> is computed and pointedly not used alone).
+    /// </summary>
+    [Fact]
+    public async Task Commit_WritesFalse_WhenTheCallerDeclaresItRead()
+    {
+        var snapshot = await CreateTableAsync();
+
+        await Committer().CommitAsync(new LogCommitRequest
+        {
+            BaseSnapshot = snapshot,
+            Actions = [Add("a.parquet")],
+            IsBlindAppend = false,
+        });
+
+        var info = Assert.Single((await _log.ReadCommitAsync(1)).OfType<CommitInfo>());
+        Assert.False(info.Values["isBlindAppend"].GetBoolean());
+    }
+
+    /// <summary>
+    /// ⚠ THE DEFAULT WRITES NO FIELD AT ALL, and this is the load-bearing one. <see cref="ReadSet.Blind"/> is
+    /// the default read set, so a request that says nothing about its reads must not be reported as DECLARING
+    /// it read nothing — that would turn every silent caller into an assertive one, and a wrongly-claimed
+    /// `true` makes another engine skip a check it owes. Absent costs only spurious conflicts.
+    /// </summary>
+    [Fact]
+    public async Task Commit_WritesNoDeclaration_WhenTheCallerMakesNone()
+    {
+        var snapshot = await CreateTableAsync();
+
+        await Committer().CommitAsync(new LogCommitRequest
+        {
+            BaseSnapshot = snapshot,
+            Actions = [Add("a.parquet")],
+            Reads = ReadSet.Blind, // the DEFAULT — explicitly, because that is the trap
+        });
+
+        var info = Assert.Single((await _log.ReadCommitAsync(1)).OfType<CommitInfo>());
+        Assert.False(info.Values.ContainsKey("isBlindAppend"));
+    }
+
     // ── checkpointing ──────────────────────────────────────────────────────────────────────────────────
 
     [Fact]

@@ -113,6 +113,37 @@ public sealed record LogCommitRequest
     public Action? OnCommitDurable { get; init; }
 
     /// <summary>
+    /// This transaction's own claim about whether it READ anything, written to
+    /// <c>commitInfo.isBlindAppend</c>. A LATER writer consults it: under
+    /// <see cref="IsolationLevel.WriteSerializable"/> a declared-blind commit's added files are excluded
+    /// from the predicate check, because a transaction that looked at nothing cannot have depended on
+    /// anything the other one changed.
+    ///
+    /// <para><b>⚠ Three states, and <c>null</c> is the default for a reason.</b> <c>null</c> writes NO
+    /// field, which is the honest answer for a caller that does not track its reads. Claiming <c>true</c>
+    /// wrongly is the UNSAFE direction — another engine then SKIPS a check it owes.</para>
+    ///
+    /// <para><b>⚠ But absent does not mean the same thing to every reader, so silence is not uniformly
+    /// safe.</b> delta-spark reads <c>isBlindAppendOption.getOrElse(false)</c> and examines the commit, so
+    /// against it silence costs only spurious conflicts. This library's own
+    /// <see cref="Concurrency.ConflictChecker"/> instead falls back to inferring from the commit's shape,
+    /// and an adds-only commit infers as BLIND — so against a later EW reader, silence on an adds-only
+    /// commit is read as a blind-append claim we never made. <b>A caller that knows it read should say
+    /// <c>false</c> rather than say nothing.</b> Silence is for a caller that genuinely does not know.</para>
+    ///
+    /// <para><b>⚠ It is NOT derived from <see cref="Reads"/>, deliberately.</b> <see cref="ReadSet.Blind"/>
+    /// is the DEFAULT, so it means "this caller said nothing about its reads" — not "this caller declares
+    /// it read nothing". Sourcing a spec field off a defaulted value would turn every silent caller into
+    /// an assertive one, and the callers most likely to be silent are exactly the hosts with their own
+    /// data plane, whose reads this library never sees. The claim has to be made, not inferred.</para>
+    ///
+    /// <para>Delta's own definition is <c>onlyAddFiles &amp;&amp; !dependsOnFiles</c> — note it is
+    /// conjunctive, so a commit that adds files AND read the table is not blind. Delta computes
+    /// <c>onlyAddFiles</c> separately and pointedly does not use it alone.</para>
+    /// </summary>
+    public bool? IsBlindAppend { get; init; }
+
+    /// <summary>
     /// Prunes a concurrent add against <see cref="Reads"/>'s predicates. Null builds one from the base
     /// snapshot's schema on the first collision — correct for any commit planned against that schema, so
     /// supply one only to reuse a pruner across commits or to change how it reads statistics.

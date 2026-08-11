@@ -2492,7 +2492,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             appTransactions: required,
             // Keep recording through the commit: a rebase attempt writes deletion vectors of its own, and an
             // attempt that then loses the conflict check leaves them behind exactly as a staging call would.
-            written: transaction.Written);
+            written: transaction.Written,
+            // The host's claim, passed through verbatim. NOT derived from `reads` above: a transaction
+            // records the reads made THROUGH it, and a host that scanned the table itself and staged the
+            // result made one this library never saw.
+            isBlindAppend: transaction.EffectiveIsBlindAppend);
     }
 
     /// <summary>
@@ -2677,7 +2681,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
 
@@ -2705,6 +2710,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
+                IsBlindAppend = isBlindAppend,
                 // Checkpoint here too. This line used to be `false`, with a comment calling it "an
                 // accident of where the call happened to sit rather than a decision" — see #86.
                 //
@@ -3632,7 +3638,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 snapshot, plan.Actions,
                 new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
                 plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
-                rebaseSafe: true, cancellationToken, written: written).ConfigureAwait(false);
+                rebaseSafe: true, cancellationToken, written: written,
+                isBlindAppend: false).ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
         }, cancellationToken).ConfigureAwait(false);
@@ -5181,16 +5188,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)
         {
+            // Declared, not inferred — and we are entitled to declare here because we KNOW. A plain
+            // append takes its rows from the caller and reads no file of this table to decide what to
+            // write, which is Delta's definition (`readPredicates.isEmpty && readFiles.isEmpty`). Reading
+            // the snapshot's metadata for a schema check or an identity high-water mark is not a FILE read
+            // and does not spend the claim.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind, NoRemovedPaths,
                 IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
-                cancellationToken, written: written).ConfigureAwait(false);
+                cancellationToken, written: written, isBlindAppend: true).ConfigureAwait(false);
         }
         else
         {
             // Overwrite family: a single atomic attempt at the read version + 1 (unchanged behavior).
+            // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
+            // on files. Recording that is what lets another engine's checker examine it rather than fall
+            // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, snapshot.Metadata.Configuration, "WRITE");
+                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false);
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
@@ -5788,7 +5803,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool identityValuesPreGenerated = false,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
         bool dataChange = true,
-        string? clusteringProvider = null)
+        string? clusteringProvider = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5865,6 +5881,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // not before — the fix is a public opt-out on the request rather than a quiet revert here.
                 // That reopens a real hole, so it should be asked for rather than offered.
                 Reads = ReadSet.Blind,
+                // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
+                // Reads above: that is hardcoded Blind here because this method has no way to know, which
+                // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
+                IsBlindAppend = isBlindAppend,
             },
             cancellationToken).ConfigureAwait(false);
 
@@ -6636,7 +6656,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
-            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written).ConfigureAwait(false);
+            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
+            isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -6792,7 +6813,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
         return (totalDeleted, version);
     }
@@ -7242,7 +7263,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
     }
 
@@ -7698,15 +7719,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-            bool blindAppend = true;
-            foreach (var a in commitActions)
-            {
-                if (a is RemoveFile or MetadataAction or ProtocolAction)
-                {
-                    blindAppend = false;
-                    break;
-                }
-            }
+
+            // ONE rule, shared with ConflictChecker. This used to be a second copy — starting `true` and
+            // clearing on remove/metaData/protocol — which differed from the checker's in requiring no
+            // add, so an add-less commit was blind here and not there. That disagreement was inert while
+            // both only gated an AddFile branch an add-less commit never reaches; it stopped being inert
+            // the moment the checker learned to believe a declared commitInfo.isBlindAppend and this did
+            // not, because then a Spark commit declaring FALSE on an adds-only commit was correctly
+            // examined by one path and wrongly exempted by the other — which is the whole defect, alive
+            // on the buffered-transaction rebase instead of on the OCC loop.
+            bool blindAppend = Concurrency.ConflictChecker.IsBlindAppend(commitActions);
             foreach (var a in commitActions)
             {
                 switch (a)

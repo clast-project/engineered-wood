@@ -143,8 +143,9 @@ internal static class CompactionExecutor
 
         // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes.
         long newVersion = snapshot.Version + 1;
+        // Not blind: OPTIMIZE reads the files it rewrites and removes every one of them.
         var commitActions = InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "OPTIMIZE");
+            actions, snapshot.Metadata.Configuration, "OPTIMIZE", isBlindAppend: false);
         await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
             .ConfigureAwait(false);
         // Durable: the compacted files are the table's data now, so nothing may collect them. Cleared here
