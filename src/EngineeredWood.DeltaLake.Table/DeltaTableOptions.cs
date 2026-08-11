@@ -25,9 +25,22 @@ public sealed record DeltaTableOptions
     public long TargetFileSize { get; init; } = 128L * 1024 * 1024;
 
     /// <summary>
-    /// Number of commits between automatic checkpoints.
-    /// Set to 0 to disable automatic checkpointing. Default: 10.
+    /// Number of commits between automatic checkpoints, used when the table declares no interval of its
+    /// own. Set to 0 to disable automatic checkpointing. Default: 10.
     /// </summary>
+    /// <remarks>
+    /// <para>A table's <c>delta.checkpointInterval</c> property takes precedence over this: the property
+    /// is the table's own statement about how often it wants checkpointing, and another engine may be
+    /// tuning it deliberately. This value applies when the table declares none, or declares one that
+    /// cannot be read as a positive integer.</para>
+    ///
+    /// <para><b>Zero is the exception, and it wins outright.</b> Disabling checkpointing is a decision the
+    /// caller takes — a host may be driving checkpoints on a cadence of its own, through
+    /// <see cref="DeltaTable.CheckpointAsync"/> or otherwise — so no table property switches it back on.</para>
+    ///
+    /// <para>Resolved once when the table is opened or created. A property changed by a later commit takes
+    /// effect on the next open, the same granularity as every other configuration read here.</para>
+    /// </remarks>
     public int CheckpointInterval { get; init; } = 10;
 
     /// <summary>

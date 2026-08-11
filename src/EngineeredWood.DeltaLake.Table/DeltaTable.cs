@@ -37,6 +37,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private readonly LogCommitter _committer;
 
+    /// <summary>
+    /// The interval THIS table checkpoints at — its own <c>delta.checkpointInterval</c> where it declares
+    /// one, else the caller's option. Resolved once and held, because there are TWO independent checkpoint
+    /// triggers — the commit loop's <see cref="LogCommitOptions"/> and
+    /// <see cref="CheckpointIfDueAsync"/>, which every path that commits outside the committer calls — and
+    /// a value read separately in each is a value that can drift: fixing only one leaves the property
+    /// honoured on some write paths and ignored on others, which is harder to notice than ignoring it
+    /// everywhere.
+    /// </summary>
+    private readonly int _checkpointInterval;
+
     private Snapshot.Snapshot? _currentSnapshot;
     private bool _disposed;
 
@@ -55,9 +66,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             Format = options.CheckpointFormat,
         };
+        _checkpointInterval = ResolveCheckpointInterval(options, snapshot);
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
-            CheckpointInterval = options.CheckpointInterval,
+            CheckpointInterval = _checkpointInterval,
             // Shared with CheckpointAsync and with CheckpointIfDueAsync, so every checkpoint this table
             // writes — on the interval, from either commit trigger, or because a caller asked — uses the
             // caller's parquet options and checkpoint format rather than the committer's defaults.
@@ -65,6 +77,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
         });
         _currentSnapshot = snapshot;
+    }
+
+    /// <summary>
+    /// The checkpoint interval this table actually commits at: its own <c>delta.checkpointInterval</c>
+    /// where it declares one, otherwise the caller's <see cref="DeltaTableOptions.CheckpointInterval"/>.
+    ///
+    /// <para>The property is part of the Delta spec and a table's own statement about how often it wants
+    /// checkpointing — a cost it pays per commit and a count another engine may be tuning deliberately.
+    /// Reading only the code-level option meant a table declaring 100 was still checkpointed every 10,
+    /// i.e. ten times the objects its owner asked for. The value is STORED by writers that accept the
+    /// property, so ignoring it is not neutral: it is honouring someone else's declaration incorrectly.</para>
+    ///
+    /// <para><b>⚠ A caller that DISABLED checkpointing keeps it disabled.</b> <c>CheckpointInterval = 0</c>
+    /// means "never checkpoint" and is an absolute caller override — a table property must not switch it
+    /// back on, or a host that deliberately owns checkpointing on its own schedule would start racing one
+    /// it did not ask for.</para>
+    ///
+    /// <para>Resolved once per open, from the snapshot the table was constructed with. A value changed by
+    /// a later <c>set_tblproperties</c> therefore takes effect on the next open, which is the same
+    /// granularity every other configuration read here has.</para>
+    /// </summary>
+    private static int ResolveCheckpointInterval(DeltaTableOptions options, Snapshot.Snapshot? snapshot)
+    {
+        // Checked BEFORE the property is read, not after: zero is the caller taking the decision, so there
+        // is nothing for the table to declare over.
+        if (options.CheckpointInterval <= 0)
+            return options.CheckpointInterval;
+
+        return Checkpoint.CheckpointIntervalProperty.TryGet(snapshot?.Metadata.Configuration)
+            ?? options.CheckpointInterval;
     }
 
     /// <summary>
@@ -5186,8 +5228,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </remarks>
     private ValueTask CheckpointIfDueAsync(long committedVersion, CancellationToken cancellationToken)
     {
-        if (_options.CheckpointInterval <= 0
-            || committedVersion % _options.CheckpointInterval != 0)
+        if (_checkpointInterval <= 0
+            || committedVersion % _checkpointInterval != 0)
         {
             return default;
         }
