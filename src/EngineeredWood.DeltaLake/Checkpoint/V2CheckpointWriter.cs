@@ -328,7 +328,7 @@ public sealed class V2CheckpointWriter
         CancellationToken cancellationToken)
     {
         string sidecarName = $"{Guid.NewGuid()}.parquet";
-        string sidecarPath = $"_delta_log/_sidecars/{sidecarName}";
+        string sidecarPath = DeltaVersion.SidecarPrefix + sidecarName;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         long sizeInBytes;

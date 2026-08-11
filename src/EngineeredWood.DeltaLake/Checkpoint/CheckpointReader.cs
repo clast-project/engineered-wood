@@ -206,7 +206,42 @@ public sealed class CheckpointReader
     /// already names a directory is taken as written.
     /// </remarks>
     private static string SidecarPath(SidecarFile sidecar) =>
-        sidecar.Path.Contains('/') ? sidecar.Path : $"_delta_log/_sidecars/{sidecar.Path}";
+        sidecar.Path.Contains('/') ? sidecar.Path : DeltaVersion.SidecarPrefix + sidecar.Path;
+
+    /// <summary>
+    /// The sidecar files a single checkpoint file REFERENCES, resolved to table-relative paths — without
+    /// following them, so the file actions they contain are never read.
+    /// </summary>
+    /// <remarks>
+    /// <para>For log cleanup, which needs to know what a surviving checkpoint still depends on and nothing
+    /// else. Reading the sidecars themselves would be the expensive half and answers a different question.</para>
+    ///
+    /// <para><paramref name="checkpointPath"/> is one checkpoint FILE, not a version: a multi-part V1
+    /// checkpoint is several files and each is asked separately. A checkpoint with no sidecars — every
+    /// classic V1 one — returns empty, which is not the same as failing, and the caller must tell those
+    /// apart because only one of them means "I could not determine what is referenced".</para>
+    ///
+    /// <para>The body's non-sidecar actions are parsed and discarded rather than skipped. That is the cost
+    /// of reusing the one body reader, and it is bounded in the case this exists for: a checkpoint that
+    /// USES sidecars keeps its file actions in them, so its own body is small.</para>
+    /// </remarks>
+    internal async ValueTask<IReadOnlyList<string>> ReadSidecarPathsAsync(
+        string checkpointPath, CancellationToken cancellationToken = default)
+    {
+        var discarded = new List<DeltaAction>();
+        var sidecars = new List<SidecarFile>();
+
+        await ReadV2CheckpointAsync(checkpointPath, discarded, sidecars, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (sidecars.Count == 0)
+            return [];
+
+        var paths = new List<string>(sidecars.Count);
+        foreach (var sidecar in sidecars)
+            paths.Add(SidecarPath(sidecar));
+        return paths;
+    }
 
     /// <summary>
     /// Reads a UUID-named V2 checkpoint, whose body may be NDJSON or Parquet.

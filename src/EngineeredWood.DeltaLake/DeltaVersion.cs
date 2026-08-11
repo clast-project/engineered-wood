@@ -48,6 +48,17 @@ public static class DeltaVersion
     public const string LogPrefix = "_delta_log/";
 
     /// <summary>
+    /// Path prefix for the sidecar directory a V2 checkpoint's file actions live in.
+    /// </summary>
+    /// <remarks>
+    /// PROTOCOL.md fixes the location — "sidecar files must always reside in the table's own
+    /// _delta_log/_sidecars directory" — which is why a <c>sidecar</c> action may carry a bare file name.
+    /// It is a directory INSIDE the log, so anything walking <see cref="LogPrefix"/> sees sidecars too and
+    /// has to decide what to do about them.
+    /// </remarks>
+    public const string SidecarPrefix = "_delta_log/_sidecars/";
+
+    /// <summary>
     /// Attempts to parse a version number from a commit file name
     /// (e.g., <c>00000000000000000005.json</c>).
     /// </summary>

@@ -346,4 +346,192 @@ public class LogCleanupTests : IDisposable
 
         Assert.Equal(3, deleted); // v0, v1, v2
     }
+
+    // ── V2 checkpoint sidecars ─────────────────────────────────────────────────────────────────────────
+    //
+    // On a table big enough to use them, the sidecars ARE the log: the file actions live there and the
+    // checkpoint body is an index over them. Reclaiming checkpoints without their sidecars would free the
+    // index and leave the bulk, permanently — VacuumExecutor excludes _delta_log, so nothing else would
+    // ever collect them.
+
+    /// <summary>Writes v0 with a protocol that permits V2 checkpoints, then versions 1..<paramref name="through"/>.</summary>
+    private async ValueTask WriteV2CapableVersionsAsync(long through)
+    {
+        await _log.WriteCommitAsync(0,
+        [
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["v2Checkpoint"],
+                WriterFeatures = ["v2Checkpoint"],
+            },
+            new MetadataAction
+            {
+                Id = "cleanup-sidecar-test",
+                Format = Format.Parquet,
+                SchemaString = SchemaJson,
+                PartitionColumns = [],
+                CreatedTime = 1700000000000,
+            },
+        ]);
+
+        for (long v = 1; v <= through; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+    }
+
+    /// <summary>
+    /// Writes a V2 checkpoint at the current version whose file actions are FORCED into sidecars —
+    /// <c>SidecarThreshold = 0</c> rather than a hundred-file fixture, so the layout under test is the real
+    /// one without the table that normally produces it.
+    /// </summary>
+    private async ValueTask<Snapshot.Snapshot> WriteV2CheckpointWithSidecarsAsync()
+    {
+        var snapshot = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.V2CheckpointWriter(_fs) { SidecarThreshold = 0 }
+            .WriteCheckpointAsync(snapshot);
+        return snapshot;
+    }
+
+    private string[] SidecarNames() =>
+        Directory.Exists(SidecarDir)
+            ? [.. Directory.GetFiles(SidecarDir).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal)!]
+            : [];
+
+    private string SidecarDir => Path.Combine(_tempDir, "_delta_log", "_sidecars");
+
+    /// <summary>
+    /// The headline for sidecars: an expired checkpoint's sidecars go with it, and the surviving
+    /// checkpoint's do not. Two checkpoints, each with its own set, and only one survives the horizon.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesSidecars_NoSurvivingCheckpointReferences()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        await WriteV2CheckpointWithSidecarsAsync();               // checkpoint at v2, sidecar set A
+        string[] setA = SidecarNames();
+        Assert.NotEmpty(setA);
+
+        for (long v = 3; v <= 5; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+        await WriteV2CheckpointWithSidecarsAsync();               // checkpoint at v5, sidecar set B
+        string[] setB = [.. SidecarNames().Except(setA)];
+        Assert.NotEmpty(setB);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        foreach (string a in setA)
+            Assert.DoesNotContain(a, remaining);
+        foreach (string b in setB)
+            Assert.Contains(b, remaining);
+
+        // The v5 checkpoint still resolves through its sidecars, which is the whole point of keeping them.
+        var rebuilt = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        Assert.Equal(5, rebuilt.Version);
+        Assert.Equal(5, rebuilt.FileCount);
+        Assert.True(deleted > setA.Length, "the count should cover the commits AND the expired sidecars");
+    }
+
+    /// <summary>
+    /// ⚠ THE AGE CONDITION, and it is not decoration. A writer publishes its sidecars BEFORE the checkpoint
+    /// that names them — it must, since the checkpoint records their paths — so a sweep that deleted
+    /// everything unreferenced would destroy a checkpoint that is seconds from existing. A recent
+    /// unreferenced sidecar therefore survives, and an old one does not: the same file, told apart only by
+    /// its age.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_KeepsAnUnreferencedSidecar_ThatIsYoungerThanTheHorizon()
+    {
+        await WriteV2CapableVersionsAsync(through: 5);
+        await WriteV2CheckpointWithSidecarsAsync();
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // Two sidecars nothing references: one long expired, one a moment old — as a concurrent writer's
+        // would be, published ahead of the checkpoint about to name it.
+        Directory.CreateDirectory(SidecarDir);
+        string stale = Path.Combine(SidecarDir, "aaaaaaaa-stale.parquet");
+        string fresh = Path.Combine(SidecarDir, "bbbbbbbb-fresh.parquet");
+        File.WriteAllBytes(stale, [1]);
+        File.WriteAllBytes(fresh, [1]);
+        File.SetLastWriteTimeUtc(stale, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(fresh, Now.UtcDateTime.AddMinutes(-1));
+
+        await LogCleanup.RunAsync(_log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.DoesNotContain("aaaaaaaa-stale.parquet", remaining);
+        Assert.Contains("bbbbbbbb-fresh.parquet", remaining);
+    }
+
+    /// <summary>
+    /// FAILS CLOSED. A surviving checkpoint that cannot be read leaves the referenced set incomplete, and
+    /// sweeping against an incomplete set deletes live data — so an unreadable survivor abandons the sweep
+    /// entirely rather than proceeding with what it managed to collect.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_SweepsNoSidecars_WhenASurvivingCheckpointCannotBeRead()
+    {
+        await WriteV2CapableVersionsAsync(through: 5);
+        await WriteV2CheckpointWithSidecarsAsync();
+        string[] before = SidecarNames();
+        Assert.NotEmpty(before);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // An unreferenced, long-expired sidecar: without the corruption below it WOULD be swept, so its
+        // survival is what proves the sweep declined rather than merely found nothing to do.
+        string orphan = Path.Combine(SidecarDir, "cccccccc-orphan.parquet");
+        File.WriteAllBytes(orphan, [1]);
+        File.SetLastWriteTimeUtc(orphan, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        string checkpoint = Directory
+            .GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.checkpoint.*").Single();
+        File.WriteAllText(checkpoint, "not a checkpoint");
+
+        await LogCleanup.RunAsync(_log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.Contains("cccccccc-orphan.parquet", remaining);
+        foreach (string name in before)
+            Assert.Contains(name, remaining);
+    }
+
+    /// <summary>
+    /// A classic-checkpoint table pays a listing and stops. Asserted because the sweep must not become a
+    /// reason for the common case to start reading checkpoint bodies it has no use for.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_OnATableWithNoSidecars_LeavesTheCountUnchanged()
+    {
+        await WriteVersionsAsync(through: 5);
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(5, deleted); // v0..v4 and nothing else — no sidecar directory to sweep
+        Assert.Empty(SidecarNames());
+    }
+
+    private void BackdateSidecars(DateTime stamp)
+    {
+        if (!Directory.Exists(SidecarDir))
+            return;
+        foreach (string file in Directory.GetFiles(SidecarDir))
+            File.SetLastWriteTimeUtc(file, stamp);
+    }
 }
