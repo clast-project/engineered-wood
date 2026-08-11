@@ -174,6 +174,26 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal string EffectiveOperation =>
         _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
 
+    /// <summary>
+    /// This transaction's own claim about whether it READ anything, recorded as
+    /// <c>commitInfo.isBlindAppend</c> for later writers to consult. Null — the default — records NOTHING.
+    ///
+    /// <para>A property rather than a per-call argument for the same reason as <see cref="Operation"/>: it
+    /// describes the TRANSACTION, and several staging calls cannot each answer for the commit.</para>
+    ///
+    /// <para><b>⚠ Null is not false, and neither is a bug.</b> A reader treats an absent flag as "not
+    /// blind" and examines the commit anyway, so saying nothing costs only spurious conflicts — the honest
+    /// answer for a host that does not track its own reads. Claiming <c>true</c> wrongly is the UNSAFE
+    /// direction: another engine then SKIPS a concurrent-append check it owed, and the conflict it should
+    /// have raised silently does not happen. Declare <c>true</c> only where the transaction genuinely read
+    /// nothing.</para>
+    ///
+    /// <para>This library cannot derive it for a host with its own data plane. A transaction records the
+    /// reads made THROUGH it, but a host that scanned the table itself and then staged the result has made
+    /// a read this library never saw — which is exactly the case the claim exists for.</para>
+    /// </summary>
+    public bool? IsBlindAppend { get; set; }
+
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
 

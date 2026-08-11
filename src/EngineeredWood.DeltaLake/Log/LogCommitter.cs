@@ -101,7 +101,8 @@ public sealed class LogCommitter
         for (int attempt = 0; ; attempt++)
         {
             var finalActions = InCommitTimestamp.EnsureCommitInfo(
-                currentActions, baseSnapshot.Metadata.Configuration, request.Operation);
+                currentActions, baseSnapshot.Metadata.Configuration, request.Operation,
+                request.IsBlindAppend);
             try
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)

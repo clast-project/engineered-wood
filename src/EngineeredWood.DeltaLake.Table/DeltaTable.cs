@@ -2492,7 +2492,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             appTransactions: required,
             // Keep recording through the commit: a rebase attempt writes deletion vectors of its own, and an
             // attempt that then loses the conflict check leaves them behind exactly as a staging call would.
-            written: transaction.Written);
+            written: transaction.Written,
+            // The host's claim, passed through verbatim. NOT derived from `reads` above: a transaction
+            // records the reads made THROUGH it, and a host that scanned the table itself and staged the
+            // result made one this library never saw.
+            isBlindAppend: transaction.IsBlindAppend);
     }
 
     /// <summary>
@@ -2677,7 +2681,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
 
@@ -2705,6 +2710,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
+                IsBlindAppend = isBlindAppend,
                 // Checkpoint here too. This line used to be `false`, with a comment calling it "an
                 // accident of where the call happened to sit rather than a decision" — see #86.
                 //
@@ -5788,7 +5794,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool identityValuesPreGenerated = false,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
         bool dataChange = true,
-        string? clusteringProvider = null)
+        string? clusteringProvider = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5865,6 +5872,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // not before — the fix is a public opt-out on the request rather than a quiet revert here.
                 // That reopens a real hole, so it should be asked for rather than offered.
                 Reads = ReadSet.Blind,
+                // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
+                // Reads above: that is hardcoded Blind here because this method has no way to know, which
+                // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
+                IsBlindAppend = isBlindAppend,
             },
             cancellationToken).ConfigureAwait(false);
 
