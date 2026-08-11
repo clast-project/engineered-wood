@@ -87,10 +87,46 @@ internal static class SparkArrays
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index),
         FloatArray a => a.IsNull(index) ? null : a.GetValue(index),
         DoubleArray a => a.IsNull(index) ? null : a.GetValue(index),
-        Decimal128Array a => a.IsNull(index) ? null : (double?)a.GetValue(index),
+        Decimal128Array a => a.IsNull(index) ? null : WideDecimalAsDouble(a, index),
         _ => throw new NotSupportedException(
             $"{array.Data.DataType.Name} is not a numeric array"),
     };
+
+    /// <summary>
+    /// A Decimal128 cell as a double, going through the unscaled integer when the value is too
+    /// wide for <see cref="decimal"/>.
+    /// </summary>
+    /// <remarks>
+    /// Spark decimals reach precision 38 where <see cref="decimal"/> stops near 7.9e28, so
+    /// <c>Decimal128Array.GetValue</c> raises on a legitimate column value. Converting to double
+    /// is lossy either way, so the fallback costs nothing that the target type was going to keep.
+    /// </remarks>
+    private static double WideDecimalAsDouble(Decimal128Array array, int index)
+    {
+        try
+        {
+            return (double)array.GetValue(index)!.Value;
+        }
+        catch (OverflowException)
+        {
+            var scale = ((Decimal128Type)array.Data.DataType).Scale;
+            return (double)Unscaled(array, index) / Math.Pow(10, scale);
+        }
+    }
+
+    /// <summary>The raw unscaled integer behind a Decimal128 cell.</summary>
+    private static System.Numerics.BigInteger Unscaled(Decimal128Array array, int index)
+    {
+        // GC.KeepAlive because `array` is otherwise dead once the span is taken, and the span
+        // points into its buffer. See doc/arrow-span-lifetime.md.
+        var bytes = array.ValueBuffer.Span.Slice(index * 16, 16).ToArray();
+        GC.KeepAlive(array);
+#if NETSTANDARD2_0
+        return new System.Numerics.BigInteger(bytes);
+#else
+        return new System.Numerics.BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+#endif
+    }
 
     public static decimal? ReadDecimal(IArrowArray array, int index) => array switch
     {
@@ -100,10 +136,35 @@ internal static class SparkArrays
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index),
         FloatArray a => a.IsNull(index) ? null : (decimal?)a.GetValue(index),
         DoubleArray a => a.IsNull(index) ? null : (decimal?)a.GetValue(index),
-        Decimal128Array a => a.IsNull(index) ? null : a.GetValue(index),
+        Decimal128Array a => a.IsNull(index) ? null : ExactDecimal(a, index),
         _ => throw new NotSupportedException(
             $"{array.Data.DataType.Name} is not a numeric array"),
     };
+
+    /// <summary>
+    /// A Decimal128 cell as an exact <see cref="decimal"/>, refusing when it does not fit.
+    /// </summary>
+    /// <remarks>
+    /// Decimal arithmetic here is computed in <see cref="decimal"/>, which tops out around 7.9e28
+    /// while Spark decimals reach precision 38. A value past that cannot be evaluated exactly and
+    /// must not be evaluated approximately — a CHECK constraint that silently rounds is worse
+    /// than one that refuses. Refusing keeps the write fail-closed, which is the behaviour the
+    /// table already had before any of this existed.
+    /// </remarks>
+    private static decimal ExactDecimal(Decimal128Array array, int index)
+    {
+        try
+        {
+            return array.GetValue(index)!.Value;
+        }
+        catch (OverflowException)
+        {
+            var type = (Decimal128Type)array.Data.DataType;
+            throw new NotSupportedException(
+                $"a {Describe(type)} value is too wide to evaluate exactly; " +
+                "decimal arithmetic is currently limited to values System.Decimal can hold");
+        }
+    }
 
     /// <summary>Reads a value for casting, keeping strings as strings.</summary>
     public static CastInput? ReadForCast(IArrowArray array, int index)
@@ -254,9 +315,33 @@ internal static class SparkArrays
                 throw new NotSupportedException($"cast to '{text}' is not implemented");
             }
 
-            var parts = text[(open + 1)..text.LastIndexOf(')')].Split(',');
-            var precision = int.Parse(parts[0].Trim(), Invariant);
+            // Validated rather than sliced on faith: this is reachable from the public
+            // IFunctionRegistry surface, not only from the parser, so a malformed spelling must
+            // produce a message naming the problem instead of an ArgumentOutOfRangeException or
+            // a FormatException from somewhere inside.
+            var close = text.LastIndexOf(')');
+            if (close < open)
+                throw new NotSupportedException($"cast target '{text}' is missing its closing ')'");
+
+            var parts = text.Substring(open + 1, close - open - 1).Split(',');
+            if (parts.Length > 2
+                || !int.TryParse(parts[0].Trim(), NumberStyles.Integer, Invariant, out var precision)
+                || (parts.Length == 2
+                    && !int.TryParse(parts[1].Trim(), NumberStyles.Integer, Invariant, out _)))
+            {
+                throw new NotSupportedException(
+                    $"cast target '{text}' does not have a valid precision and scale");
+            }
+
             var scale = parts.Length > 1 ? int.Parse(parts[1].Trim(), Invariant) : 0;
+
+            if (precision is < 1 or > SparkNumericTypes.MaxPrecision || scale < 0 || scale > precision)
+            {
+                throw new NotSupportedException(
+                    $"cast target '{text}' is outside the supported range " +
+                    $"(precision 1..{SparkNumericTypes.MaxPrecision}, scale 0..precision)");
+            }
+
             return new Decimal128Type(precision, scale);
         }
 

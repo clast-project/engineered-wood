@@ -287,4 +287,66 @@ public sealed class SparkFunctionRegistryTests
         Assert.True(Ansi.IsRegistered("+"));
         Assert.True(Ansi.IsRegistered("cast"));
     }
+
+    // ── Limits, which must refuse rather than crash ────────────────────────────────────────
+
+    /// <summary>A decimal(38,0) cell holding 10^30 — past System.Decimal's ~7.9e28 ceiling.</summary>
+    private static RecordBatch WideDecimalBatch()
+    {
+        var type = new Decimal128Type(38, 0);
+        var bytes = new byte[16];
+        System.Numerics.BigInteger.Pow(10, 30).ToByteArray().CopyTo(bytes, 0);
+
+        var array = new Decimal128Array(new ArrayData(
+            type, 1, 0, 0, new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) }));
+
+        var schema = new Schema.Builder().Field(new Field("big", type, true)).Build();
+        return new RecordBatch(schema, new IArrowArray[] { array }, 1);
+    }
+
+    [Fact]
+    public void ADecimalTooWideForExactArithmeticIsRefusedRatherThanCrashing()
+    {
+        // Spark decimals reach precision 38 where System.Decimal stops near 7.9e28, so
+        // Decimal128Array.GetValue raises on a legitimate column value. It used to escape as a
+        // bare OverflowException, which is a crash on table data rather than a refusal.
+        var ex = Assert.Throws<NotSupportedException>(
+            () => Eval(Ansi, "big + big", WideDecimalBatch()));
+
+        Assert.Contains("too wide", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AWideDecimalStillParticipatesWhereTheResultIsADouble()
+    {
+        // Converting to double is lossy either way, so the wide value costs nothing the target
+        // type was going to keep. Only exact arithmetic has to refuse.
+        var result = Assert.IsType<DoubleArray>(
+            Eval(Ansi, "CAST(big AS DOUBLE)", WideDecimalBatch()));
+
+        Assert.Equal(1e30, result.GetValue(0)!.Value, 1e15);
+    }
+
+    [Theory]
+    [InlineData("DECIMAL(10")]        // no closing paren
+    [InlineData("DECIMAL(x,2)")]      // unparseable precision
+    [InlineData("DECIMAL(10,2,3)")]   // too many parameters
+    [InlineData("DECIMAL(0,0)")]      // precision below 1
+    [InlineData("DECIMAL(50,2)")]     // precision beyond Spark's maximum
+    [InlineData("DECIMAL(4,9)")]      // scale larger than precision
+    public void AMalformedCastTargetIsNamedRatherThanLeakingAnInternalFailure(string target)
+    {
+        // Reachable from the public IFunctionRegistry surface, not only from the parser, so it
+        // has to fail with something a caller can act on.
+        var call = new FunctionCall("cast", new Expression[]
+        {
+            new UnboundReference("a"),
+            new LiteralExpression(LiteralValue.Of(target)),
+        });
+
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            new ArrowRowEvaluator(Ansi).EvaluateExpression(call, Batch(("a", Ints(1)))));
+
+        Assert.Contains(target, ex.Message, StringComparison.Ordinal);
+    }
 }
