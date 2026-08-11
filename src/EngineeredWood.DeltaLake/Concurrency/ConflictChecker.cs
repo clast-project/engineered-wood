@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.Expressions;
 
@@ -202,11 +203,50 @@ public static class ConflictChecker
     }
 
     /// <summary>
-    /// A commit is a blind append when it only adds files: at least one add, and no remove, metadata, or
-    /// protocol action. That is the reader-side inference the protocol relies on — such a commit cannot
-    /// have depended on a read, so it is safe to linearize after a concurrent transaction.
+    /// Whether a concurrent commit was a blind append — i.e. whether the transaction that produced it READ
+    /// nothing, which is what makes it safe to linearize after ours under WriteSerializable.
     /// </summary>
+    /// <remarks>
+    /// <para>Blind-append is a property of the WRITER's transaction, not of the actions it emitted, so the
+    /// writer is the only party that actually knows it: Delta defines it as
+    /// <c>readPredicates.isEmpty &amp;&amp; readFiles.isEmpty</c> and records the answer in
+    /// <c>commitInfo.isBlindAppend</c>. When the flag is there we must BELIEVE it rather than re-derive it.</para>
+    /// <para><b>Why the inference below cannot be the primary answer.</b> Deriving "blind" from the action
+    /// shape ("only adds") errs in the UNSAFE direction: an <c>INSERT INTO t SELECT ... FROM t</c> — the
+    /// standard incremental/dedupe anti-join, i.e. the common case, not an exotic one — emits nothing but
+    /// adds and plainly read the table. Inferring blind there makes us SKIP a concurrentAppend check we owe,
+    /// and the conflict we were supposed to raise silently does not happen.</para>
+    /// <para>Delta itself does NOT make this inference: it reads <c>isBlindAppendOption.getOrElse(false)</c>,
+    /// and it computes an equivalent <c>onlyAddFiles</c> and pointedly does not use it here (checked at the
+    /// <c>v4.2.0</c> tag).</para>
+    /// <para>The two directions are deliberately NOT symmetric, and this is where we depart from Delta: an
+    /// ABSENT flag falls back to the inference rather than to "not blind", because this library emits no flag
+    /// itself and <c>getOrElse(false)</c> would make ordinary EW-to-EW concurrent appends start conflicting.
+    /// A PRESENT flag outranks anything we could infer — including a <c>false</c> on an adds-only commit,
+    /// which is exactly the read-then-append case above.</para>
+    /// </remarks>
     private static bool IsBlindAppend(IReadOnlyList<DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is not CommitInfo info)
+                continue;
+            if (info.GetValue("isBlindAppend") is not { } flag)
+                continue;
+            // Only an actual boolean is a statement; anything else is a malformed field, and a hint we
+            // cannot read is no better than one that is absent — fall through to the inference.
+            if (flag.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                return flag.GetBoolean();
+        }
+
+        return InferBlindAppend(actions);
+    }
+
+    /// <summary>
+    /// Fallback for a commit whose writer did not declare <c>isBlindAppend</c>: assume a commit that only
+    /// adds files did not read anything. At least one add, and no remove, metadata, or protocol action.
+    /// </summary>
+    private static bool InferBlindAppend(IReadOnlyList<DeltaAction> actions)
     {
         bool hasAdd = false;
         foreach (var action in actions)
