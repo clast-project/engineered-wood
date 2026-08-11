@@ -1,8 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Text.Json;
-
 namespace EngineeredWood.Expressions.Tests;
 
 /// <summary>
@@ -27,22 +25,13 @@ namespace EngineeredWood.Expressions.Tests;
 /// </remarks>
 public sealed class SparkExpressionCorpusTests
 {
-    private static readonly JsonDocument Corpus = LoadCorpus();
-
-    private static JsonDocument LoadCorpus()
-    {
-        var path = Path.Combine(AppContext.BaseDirectory, "Fixtures", "spark-expression-corpus.json");
-        Assert.True(File.Exists(path), $"corpus fixture not found at {path}; check the csproj copies Fixtures/**");
-        return JsonDocument.Parse(File.ReadAllText(path));
-    }
-
     [Theory]
     [InlineData("spark.sql.ansi.enabled", "true")]
     [InlineData("spark.sql.session.timeZone", "UTC")]
     [InlineData("spark.sql.storeAssignmentPolicy", "ANSI")]
     public void CorpusRecordsTheConfigurationItWasGatheredUnder(string key, string expected)
     {
-        var conf = Corpus.RootElement.GetProperty("conf");
+        var conf = SparkCorpus.Root.GetProperty("conf");
         Assert.True(conf.TryGetProperty(key, out var actual), $"corpus does not record {key}");
         Assert.Equal(expected, actual.GetString());
     }
@@ -50,7 +39,7 @@ public sealed class SparkExpressionCorpusTests
     [Fact]
     public void EveryGroupIsPopulated()
     {
-        var groups = Corpus.RootElement.GetProperty("groups");
+        var groups = SparkCorpus.Root.GetProperty("groups");
         Assert.NotEmpty(groups.EnumerateObject());
 
         foreach (var group in groups.EnumerateObject())
@@ -60,7 +49,7 @@ public sealed class SparkExpressionCorpusTests
     [Fact]
     public void EveryEntryCarriesAnExpressionAndAParseVerdict()
     {
-        foreach (var entry in AllEntries())
+        foreach (var entry in SparkCorpus.Entries())
         {
             Assert.True(entry.TryGetProperty("expression", out _), "entry has no expression");
             var expression = entry.GetProperty("expression").GetString();
@@ -83,7 +72,7 @@ public sealed class SparkExpressionCorpusTests
     {
         // If Spark ever starts accepting these, the corpus is describing a different language
         // than the one we are building a parser for, and we should find out here.
-        foreach (var entry in Corpus.RootElement.GetProperty("groups").GetProperty("malformed").EnumerateArray())
+        foreach (var entry in SparkCorpus.Group("malformed").EnumerateArray())
             Assert.False(entry.GetProperty("parse").GetProperty("ok").GetBoolean(),
                 $"'{entry.GetProperty("expression").GetString()}' is in the malformed group but parsed");
     }
@@ -95,7 +84,7 @@ public sealed class SparkExpressionCorpusTests
         // (DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT), not the grammar's to refuse. This
         // pins that distinction: a parser that rejects them at the syntax level would be
         // diverging from Spark, not matching it.
-        var group = Corpus.RootElement.GetProperty("groups").GetProperty("beyond-constraint-scope");
+        var group = SparkCorpus.Group("beyond-constraint-scope");
 
         foreach (var entry in group.EnumerateArray())
         {
@@ -108,10 +97,4 @@ public sealed class SparkExpressionCorpusTests
         }
     }
 
-    private static IEnumerable<JsonElement> AllEntries()
-    {
-        foreach (var group in Corpus.RootElement.GetProperty("groups").EnumerateObject())
-            foreach (var entry in group.Value.EnumerateArray())
-                yield return entry;
-    }
 }
