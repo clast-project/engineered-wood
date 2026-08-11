@@ -1,0 +1,349 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.IO.Local;
+
+namespace EngineeredWood.DeltaLake.Tests;
+
+/// <summary>
+/// <c>delta.logRetentionDuration</c> — deleting the commit files a checkpoint has made redundant.
+///
+/// <para>The property was accepted and stored and read by nobody, so <c>_delta_log</c> grew for the life of
+/// a table. Every test here drives <see cref="LogCleanup"/> directly with an injected clock, so a retention
+/// horizon can be crossed without sleeping and the assertions are about the RULE rather than about timing.
+/// </para>
+///
+/// <para>The rule has two halves and both are load-bearing: a file may go only when a checkpoint covers it
+/// AND it is older than the horizon. Each half has a test that fails if the other is dropped.</para>
+/// </summary>
+public class LogCleanupTests : IDisposable
+{
+    private readonly string _tempDir;
+    private readonly LocalTableFileSystem _fs;
+    private readonly TransactionLog _log;
+    private static readonly DateTimeOffset Now = new(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
+
+    public LogCleanupTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"delta_logclean_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+        _fs = new LocalTableFileSystem(_tempDir);
+        _log = new TransactionLog(_fs);
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+
+    private const string SchemaJson =
+        """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""";
+
+    /// <summary>Writes versions 0..<paramref name="through"/>; v0 carries protocol + metadata.</summary>
+    private async ValueTask WriteVersionsAsync(long through)
+    {
+        await _log.WriteCommitAsync(0,
+        [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = "cleanup-test",
+                Format = Format.Parquet,
+                SchemaString = SchemaJson,
+                PartitionColumns = [],
+                CreatedTime = 1700000000000,
+            },
+        ]);
+
+        for (long v = 1; v <= through; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+    }
+
+    private static AddFile Add(string path) => new()
+    {
+        Path = path,
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 100,
+        ModificationTime = 1700000001000,
+        DataChange = true,
+    };
+
+    /// <summary>
+    /// Backdates every log file so the horizon is unambiguously crossed, one minute apart in version order.
+    ///
+    /// <para>⚠ The SPACING matters and a first version of this stamped them all identically, which made
+    /// three tests fail: Delta treats a commit that is not STRICTLY newer than its predecessor as needing
+    /// timestamp adjustment, so a uniformly-stamped log is one long dependency chain and cleanup correctly
+    /// retains all of it. Real logs have distinct times; the fixture has to as well, or it tests a shape
+    /// that does not occur and hides the rule underneath it.</para>
+    /// </summary>
+    private void Backdate(DateTime start)
+    {
+        var files = Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"));
+        Array.Sort(files, StringComparer.Ordinal);
+        for (int i = 0; i < files.Length; i++)
+            File.SetLastWriteTimeUtc(files[i], start.AddMinutes(i));
+    }
+
+    private string LogFile(string name) => Path.Combine(_tempDir, "_delta_log", name);
+
+    private static Dictionary<string, string> Retention(string interval) =>
+        new() { ["delta.logRetentionDuration"] = interval };
+
+    // ── the base case ──────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The headline: commits a checkpoint subsumes, older than the horizon, are deleted — and THE TABLE IS
+    /// STILL READABLE, which is the assertion that separates cleanup from corruption. Everything v0 carried
+    /// (protocol, metadata) now comes from the checkpoint.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesExpiredCommits_AndTheTableStillReads()
+    {
+        await WriteVersionsAsync(through: 5);
+
+        // ⚠ A REAL checkpoint, not just the parameter. A first version of this passed
+        // latestCheckpointVersion: 5 without writing one, deleted the prefix, and then failed its own
+        // readability assertion with "version 0 is missing and no checkpoint covers it" — the fixture had
+        // manufactured exactly the corruption the rule exists to prevent. In production LogCommitter only
+        // calls cleanup immediately after writing one, so the argument is always truthful there.
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(5, deleted);                              // v0..v4; v5 is the checkpoint's own version
+        Assert.False(File.Exists(LogFile("00000000000000000000.json")));
+        Assert.False(File.Exists(LogFile("00000000000000000004.json")));
+        Assert.True(File.Exists(LogFile("00000000000000000005.json")));
+
+        // The metadata action lived in v0. If the survivors cannot describe the table, this throws.
+        var snapshot = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        Assert.Equal(5, snapshot.Version);
+    }
+
+    // ── half one: a checkpoint must cover it ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// ⚠ THE SAFETY RULE. With no checkpoint, every commit is the ONLY copy of its actions — deleting one
+    /// does not make the table older, it makes it unreadable. Delta returns early here too.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesNothing_WhenThereIsNoCheckpoint()
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: null, Now);
+
+        Assert.Equal(0, deleted);
+        Assert.Equal(6, Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.json").Length);
+    }
+
+    /// <summary>
+    /// The checkpoint's own version is what the survivors replay FROM, so it is never deletable — nor is
+    /// anything above it, however old the files are.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_NeverDeletesAtOrAboveTheCheckpointVersion()
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 2, Now);
+
+        Assert.Equal(2, deleted); // v0, v1 only
+        Assert.True(File.Exists(LogFile("00000000000000000002.json")));
+        Assert.True(File.Exists(LogFile("00000000000000000005.json")));
+    }
+
+    // ── half two: it must be older than the horizon ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// THE CONTROL FOR THE HORIZON. Same table, same checkpoint, files NOT backdated — so the only thing
+    /// that changed is age. Without this, the tests above pass equally if retention were ignored entirely,
+    /// which is the very bug being fixed.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_KeepsFilesInsideTheRetentionWindow()
+    {
+        await WriteVersionsAsync(through: 5);
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 30 days"), latestCheckpointVersion: 5, DateTimeOffset.UtcNow);
+
+        Assert.Equal(0, deleted);
+        Assert.True(File.Exists(LogFile("00000000000000000000.json")));
+    }
+
+    /// <summary>
+    /// An unset property must behave as Delta's 30 days rather than as "no retention" — the difference
+    /// between a default and a missing check is a table whose whole log disappears at its first checkpoint.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_WithNoProperty_UsesTheThirtyDayDefault()
+    {
+        await WriteVersionsAsync(through: 5);
+
+        int kept = await LogCleanup.RunAsync(
+            _log, configuration: null, latestCheckpointVersion: 5, DateTimeOffset.UtcNow);
+        Assert.Equal(0, kept); // minutes old, so inside 30 days
+
+        // ...and the same table with everything pushed past the default horizon IS collected, which is what
+        // makes the assertion above about the horizon rather than about the property being missing.
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        int deleted = await LogCleanup.RunAsync(
+            _log, configuration: null, latestCheckpointVersion: 5, DateTimeOffset.UtcNow);
+        Assert.Equal(5, deleted);
+    }
+
+    /// <summary>
+    /// ⚠ A NON-POSITIVE OR UNPARSEABLE VALUE FALLS BACK TO THE DEFAULT rather than being honoured. An odd
+    /// property must not read as an instruction to delete a table's entire log, and `interval 0 seconds`
+    /// literally means "keep nothing" if taken at face value.
+    /// </summary>
+    [Theory]
+    [InlineData("interval 0 seconds")]
+    [InlineData("interval -5 days")]
+    [InlineData("not an interval")]
+    [InlineData("interval 1 months")] // months are calendar-relative; the parser refuses them
+    public async Task Cleanup_RefusesAnOddRetention_AndKeepsTheDefault(string raw)
+    {
+        await WriteVersionsAsync(through: 5);
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention(raw), latestCheckpointVersion: 5, DateTimeOffset.UtcNow);
+
+        Assert.Equal(0, deleted);
+    }
+
+    // ── the opt-out and the boundary ───────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// <c>delta.enableExpiredLogCleanup = false</c> is Delta's own switch, honoured so a table whose log
+    /// retention something else owns keeps every file.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_IsDisabled_ByEnableExpiredLogCleanupFalse()
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        var config = Retention("interval 1 days");
+        config["delta.enableExpiredLogCleanup"] = "false";
+
+        int deleted = await LogCleanup.RunAsync(_log, config, latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(0, deleted);
+    }
+
+    /// <summary>
+    /// ⚠ A value PRESENT and unparseable disables cleanup, which is the opposite of what "default true"
+    /// would give. Absent means enabled — that is Delta's default and this asserts it elsewhere — but
+    /// someone who wrote <c>no</c> or <c>off</c> into this property was reaching for the switch, and the
+    /// only safe way to be wrong about that is to keep their files. Same principle as an odd
+    /// <c>logRetentionDuration</c> falling back to 30 days rather than being taken at face value: an
+    /// unreadable property must never be the thing that authorises deleting a table's log.
+    /// </summary>
+    [Theory]
+    [InlineData("no")]
+    [InlineData("off")]
+    [InlineData("0")]
+    [InlineData("")]
+    public async Task Cleanup_IsDisabled_ByAnUnparseableEnableExpiredLogCleanup(string raw)
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        var config = Retention("interval 1 days");
+        config["delta.enableExpiredLogCleanup"] = raw;
+
+        int deleted = await LogCleanup.RunAsync(_log, config, latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(0, deleted);
+        Assert.True(File.Exists(LogFile("00000000000000000000.json")));
+    }
+
+    /// <summary>
+    /// ⚠ A FILESYSTEM THAT CANNOT DATE ITS FILES GETS NO CLEANUP. An ITableFileSystem whose backing listing
+    /// carries no modification time may return a placeholder, and a host was found reporting a constant
+    /// epoch for every file — under which every commit looks decades old and is therefore expired the
+    /// instant it is written. An absent timestamp must decline the pass, not default to one, because the
+    /// opposite choice deletes live history silently.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesNothing_WhenTheListingCannotDateTheFiles()
+    {
+        await WriteVersionsAsync(through: 5);
+        foreach (var file in Directory.GetFiles(Path.Combine(_tempDir, "_delta_log")))
+            File.SetLastWriteTimeUtc(file, new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(0, deleted);
+        Assert.True(File.Exists(LogFile("00000000000000000000.json")));
+    }
+
+    /// <summary>
+    /// ⚠ THE ADJUSTMENT ANCHOR. Delta presents commit timestamps as strictly increasing with version,
+    /// adjusting a file that is not newer than its predecessor. A reader doing time-travel-BY-TIMESTAMP
+    /// therefore depends on the file a survivor was adjusted from — delete it and the same timestamp query
+    /// starts answering with a different version.
+    ///
+    /// <para>This library's own time travel reads IN-COMMIT timestamps and is immune, but a Delta reader on
+    /// the same table is not, so the anchor is not ours to break. Here the first SURVIVOR (v3) is NOT newer
+    /// than v2, so v2 is retained as its anchor — while v0 and v1, which nothing surviving depends on, still
+    /// go. Retaining the CHAIN rather than the whole log is what keeps cleanup useful on a table whose
+    /// timestamps are not strictly increasing.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_RetainsTheAnchor_TheFirstSurvivorDependsOn()
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        // v3 survives (checkpoint at 3) and is OLDER than v2 — exactly the shape that needs adjusting.
+        File.SetLastWriteTimeUtc(
+            LogFile("00000000000000000003.json"), new DateTime(2019, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 3, Now);
+
+        // v2 is RETAINED as v3's anchor; v0 and v1 are free of it and still go. The walk-back keeps the
+        // chain the survivor depends on, not the whole log — a rule that retained everything would make
+        // cleanup useless on any table whose timestamps are not strictly increasing.
+        Assert.Equal(2, deleted);
+        Assert.True(File.Exists(LogFile("00000000000000000002.json")));
+        Assert.False(File.Exists(LogFile("00000000000000000000.json")));
+    }
+
+    /// <summary>
+    /// THE CONTROL FOR THE ANCHOR RULE: the identical shape with the survivor NEWER than its predecessor
+    /// deletes the anchor too. Without it the test above passes equally if v2 were being retained for some
+    /// unrelated reason.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_Deletes_WhenTheFirstSurvivorIsNewerThanTheLastExpiredFile()
+    {
+        await WriteVersionsAsync(through: 5);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(
+            LogFile("00000000000000000003.json"), new DateTime(2020, 6, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 3, Now);
+
+        Assert.Equal(3, deleted); // v0, v1, v2
+    }
+}
