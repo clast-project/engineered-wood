@@ -194,6 +194,100 @@ Operators are enums:
 - `UnaryOperator`: `IsNull`, `IsNotNull`, `IsNaN`, `IsNotNaN`
 - `SetOperator`: `In`, `NotIn`
 
+### The tree has one semantics, and front ends normalise into it
+
+Stated here 2026-08-11 because it had only ever been implicit, and a format
+turned up whose native meaning differs.
+
+**A node means SQL three-valued logic.** `ComparisonOperator.Equal` propagates
+null — `null = null` is null, not true. `AndPredicate` and `OrPredicate` are
+Kleene. `NullSafeEqual` is the only operator that treats null as an ordinary
+value. Every evaluator in the tree, and every consumer that pattern-matches on a
+node, is entitled to assume this.
+
+Not to be confused with the other three-valued thing in this document.
+[Three-valued evaluation rules](#three-valued-evaluation-rules) is about
+*pruning* — `AlwaysTrue` / `AlwaysFalse` / `Unknown`, describing how much a
+statistic lets you conclude. This paragraph is about *nulls*, and the two are
+independent: a predicate with fully known statistics can still evaluate to null
+on a row.
+
+**A front end owes a normalisation into that semantics.** This is already how the
+Spark parser behaves and was not presented as a general rule: `BETWEEN` becomes
+two comparisons, `IN` over expressions becomes a disjunction, `IS TRUE` becomes
+`<=> TRUE`, and a bare boolean becomes `= TRUE`. The rule generalises — a format
+whose operators mean something else lowers them at decode time rather than
+asking the evaluator to behave differently.
+
+**Why not carry the dialect on the node instead.** The alternative considered was
+routing comparisons through `FunctionCall`, so that function identity carries the
+semantics and the registry resolves it — attractive because it needs no policy
+anywhere and matches Iceberg's own "complexity is pushed to the functions"
+philosophy. Rejected for two reasons:
+
+- It cannot be carried through. A `FunctionCall` is an `Expression`, not a
+  `Predicate`, so junction children lose their type and each comparison needs
+  wrapping in `… = TRUE` — which is itself a comparison. Terminating the
+  regress requires a `BooleanExpressionPredicate(Expression)` node the tree does
+  not have, so it trades comparison nodes for a different node rather than
+  removing a concept. And it does not stop at comparisons: dialects differ on
+  `AND`/`OR`/`NOT` too, so `Predicate` ends up with no members at all.
+- It would cost this document's primary deliverable. `StatisticsEvaluator` prunes
+  by matching `ComparisonPredicate(BoundReference, Op, Literal)` against min/max,
+  `SetPredicate` drives bloom probing and dictionary pruning, and Lance's
+  `IndexPruner` and Vortex's `VortexZoneStatsAccessor` match the same shapes.
+  Opaque calls make all of them return `Unknown`. Recovering pruning would mean
+  special-casing function names in the stats evaluator — the node set again, as
+  strings, with a runtime lookup and no type safety.
+
+#### Normalising Iceberg expressions
+
+Not built — there is no Iceberg data-file read path yet, so nothing evaluates an
+Iceberg expression row-wise. Recorded because
+[the derived-column RFC](https://github.com/apache/iceberg/issues/15923) would
+create one, and because the mapping is the specification for whoever writes the
+decoder.
+
+Iceberg's [expressions spec](https://github.com/apache/iceberg/blob/main/format/expressions-spec.md)
+is explicit that predicates are **two-valued** — "Evaluation of all predicates
+must produce `true` or `false`" — and that comparisons are **null-safe**:
+`null = null` is true, `34 = null` is false, `null <= null` is true. So Iceberg's
+`=` is our `NullSafeEqual`, not our `Equal`:
+
+| Iceberg | lowered to |
+|---|---|
+| `=` | `NullSafeEqual(a, b)` |
+| `!=` | `Not(NullSafeEqual(a, b))` |
+| `<`, `>` | `LessThan`, `GreaterThan` — these already agree |
+| `<=` | `Or(NullSafeEqual(a, b), And(IsNotNull(a), IsNotNull(b), LessThan(a, b)))` |
+| `>=` | as `<=`, with `GreaterThan` |
+
+The explicit null guards on `<=` are not defensiveness. Iceberg's `<=` is true
+when both operands are null and false when only one is, and without the guards a
+Kleene `Or` would yield null for the one-null case. Iceberg's own spec prescribes
+this shape of translation in the opposite direction: "Engines that implement SQL
+3-valued boolean logic must add `IS NULL` and `IS NOT NULL` to produce the
+2-valued equivalent."
+
+Three further differences a decoder has to handle, none of which are
+representational:
+
+- **Function identity is richer.** Iceberg names functions by catalog, namespace
+  and name, with reserved `sql_functions` and `iceberg_functions` sets and engine
+  sets such as `spark_builtin_functions.to_utc_timestamp`. `FunctionCall` carries
+  a bare string. Notably the pre-migration Iceberg tree had exactly this shape —
+  `ApplyExpression(FunctionIdentifier, …)`, dropped in `23cfc4e` — so this is a
+  question of whether to reinstate it, and it bears on
+  [#119](https://github.com/clast-project/engineered-wood/issues/119).
+- **Iceberg rejects `x = null`** outright, requiring `IS NULL`, and forbids null
+  or NaN constants as the direct child of a comparison. Our Spark parser builds
+  that node happily, because Spark accepts it. That is a validation difference
+  per front end, not a difference in what the tree can hold.
+- **Iceberg writes null-tolerance into the constraint** (`x < 10 OR x IS NULL`)
+  where Delta puts it in the evaluation rule (a null result violates). The same
+  tree means different things to the two writers, which is a Phase 10 concern
+  rather than a Phase 9 one.
+
 Convenience factories live in a static `Expressions` class:
 
 ```csharp
@@ -1321,6 +1415,16 @@ One surprise worth recording for whoever writes the grammar: in Spark 4.0
      over UTF-8 bytes. Divergence is concentrated in row-level evaluation, which
      is Delta-only today.
 
+     That last clause has since expired, and it was load-bearing. Iceberg's
+     [expressions spec](https://github.com/apache/iceberg/blob/main/format/expressions-spec.md)
+     specifies row-level semantics that differ from Spark's at the operator
+     level: predicates are two-valued and comparisons are null-safe, so
+     Iceberg's `=` means our `NullSafeEqual`. It stays latent only because
+     Iceberg has no data-file read path, and the
+     [derived-column RFC](https://github.com/apache/iceberg/issues/15923) would
+     end that. See
+     [Normalising Iceberg expressions](#normalising-iceberg-expressions).
+
    A useful way to sort the question: for each expected semantic difference, ask
    whether it resolves at lowering time (Spark `LIKE 'x%'` to `StartsWith`, `<>`
    to `Not(Equal)`), is pervasive and live (decimal promotion, ANSI cast and
@@ -1334,6 +1438,20 @@ One surprise worth recording for whoever writes the grammar: in Spark 4.0
    paid for. Dialect semantics are bound at `SparkFunctionRegistry` construction
    — see [Where the dialect configuration lives](#where-the-dialect-configuration-lives),
    which also records why that beats resolving the dialect in the parser.
+
+   **Amended later the same day**, after reading Iceberg's expressions spec. The
+   answer holds and the premise it rested on holds — Iceberg expressions are
+   JSON, so a derived-column feature needs a decoder rather than a second parser
+   — but the account of *where dialect lives* was incomplete. Registry-bound
+   configuration covers function semantics and nothing else; it cannot express
+   "`=` is null-safe here and null-propagating there", because comparison and
+   boolean semantics are evaluated from the nodes themselves.
+
+   The missing piece is not a policy at the evaluator. It is that the tree has a
+   canonical semantics and each front end normalises into it — stated now under
+   [The tree has one semantics](#the-tree-has-one-semantics-and-front-ends-normalise-into-it),
+   where it had previously only been implicit in what the Spark parser happened
+   to do.
 
    One correction to the reasoning above, since it was used to reach this
    answer and was partly wrong. The six-consumers argument was aimed at
