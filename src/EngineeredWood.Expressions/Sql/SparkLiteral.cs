@@ -157,6 +157,14 @@ internal static class SparkLiteral
     private static bool IsSuffixLetter(char c) =>
         c is 'y' or 'Y' or 's' or 'S' or 'l' or 'L' or 'f' or 'F' or 'd' or 'D';
 
+    /// <summary>Decodes the hex digits of an <c>X'…'</c> literal.</summary>
+    /// <remarks>
+    /// Digits are converted directly rather than through <c>byte.TryParse</c> with
+    /// <c>NumberStyles.HexNumber</c>. That style implies <c>AllowLeadingWhite</c> and
+    /// <c>AllowTrailingWhite</c>, so it reads the pair <c>"A "</c> as <c>0x0A</c> and would let
+    /// <c>X'A BC'</c> decode instead of being refused. It also avoids a two-character substring
+    /// per byte, which is what drew attention to the behaviour.
+    /// </remarks>
     private static byte[] ParseHex(string text, string sql, int position)
     {
         if (text.Length % 2 != 0)
@@ -166,16 +174,27 @@ internal static class SparkLiteral
         var bytes = new byte[text.Length / 2];
         for (var i = 0; i < bytes.Length; i++)
         {
-            if (!byte.TryParse(text.Substring(i * 2, 2), NumberStyles.HexNumber,
-                    CultureInfo.InvariantCulture, out bytes[i]))
-            {
+            var high = HexDigit(text[i * 2]);
+            var low = HexDigit(text[(i * 2) + 1]);
+
+            if (high < 0 || low < 0)
                 throw new SparkSqlParseException(
                     $"'{text}' is not a valid binary literal", sql, position);
-            }
+
+            bytes[i] = (byte)((high << 4) | low);
         }
 
         return bytes;
     }
+
+    /// <summary>The value of one hex digit, or -1 if the character is not one.</summary>
+    private static int HexDigit(char c) => c switch
+    {
+        >= '0' and <= '9' => c - '0',
+        >= 'a' and <= 'f' => c - 'a' + 10,
+        >= 'A' and <= 'F' => c - 'A' + 10,
+        _ => -1,
+    };
 
     private static long ParseLong(string text, string sql, int position) =>
         long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)

@@ -589,8 +589,14 @@ public static class SparkSqlParser
         // Keywords are matched here rather than recognised by the tokenizer, because Spark makes
         // most of them non-reserved — `value` and `year` are legal column names — and because
         // Delta stores constraints with their original casing, so `and` arrives lowercase.
+        //
+        // Compared over the token's span rather than a substring of it. Every precedence level
+        // probes several keywords per operand, so materialising a string for each probe would
+        // allocate steadily through a parse — and would give up the reason Token stores a range
+        // into the source instead of its own copy.
         private bool IsKeyword(string keyword) =>
-            Current.Kind == TokenKind.Identifier && Matches(TextOf(Current), keyword);
+            Current.Kind == TokenKind.Identifier
+            && Current.Text(_sql).Equals(keyword.AsSpan(), StringComparison.OrdinalIgnoreCase);
 
         private bool TakeKeyword(string keyword)
         {

@@ -196,6 +196,16 @@ public sealed class SparkSqlParserTests
             Assert.IsType<LiteralExpression>(Parse("X'ABCD'")).Value.AsBinary);
     }
 
+    [Theory]
+    [InlineData("X'A BC'")]   // NumberStyles.HexNumber would read "A " as 0x0A
+    [InlineData("X'AB C '")]
+    [InlineData("X'ZZ'")]
+    [InlineData("X'ABC'")]    // odd length
+    public void BinaryLiteralsRejectAnythingThatIsNotPurelyHexDigits(string sql)
+    {
+        Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+    }
+
     // ── Refusals, which must be clean rather than absent ───────────────────────────────────
 
     [Theory]
@@ -434,6 +444,17 @@ public sealed class SparkSqlParserTests
     };
 
     private static bool ChildrenEqual<T>(IReadOnlyList<T> left, IReadOnlyList<T> right)
-        where T : Expression =>
-        left.Count == right.Count && !left.Where((child, i) => !TreeEquals(child, right[i])).Any();
+        where T : Expression
+    {
+        if (left.Count != right.Count)
+            return false;
+
+        for (var i = 0; i < left.Count; i++)
+        {
+            if (!TreeEquals(left[i], right[i]))
+                return false;
+        }
+
+        return true;
+    }
 }
