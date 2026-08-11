@@ -38,11 +38,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         return ToBooleanArray(result, batch.Length);
     }
 
-    public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch)
-    {
-        var values = EvalExpression(expression, batch);
-        return MaterializeAsArray(values, batch.Length);
-    }
+    public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch) =>
+        EvalExpressionAsArray(expression, batch);
 
     public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch, IArrowType targetType)
     {
@@ -252,23 +249,88 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 return BoolsToLiteralValues(EvalPredicate(p, batch));
 
             case FunctionCall fc:
-                if (_functions is null || !_functions.IsRegistered(fc.Name))
-                    throw new InvalidOperationException(
-                        $"No function registered for '{fc.Name}'. " +
-                        "Provide an IFunctionRegistry to ArrowRowEvaluator.");
-
-                var argArrays = new IArrowArray[fc.Arguments.Count];
-                for (int i = 0; i < fc.Arguments.Count; i++)
-                    argArrays[i] = MaterializeAsArray(
-                        EvalExpression(fc.Arguments[i], batch), batch.Length);
-
-                var result = _functions.Invoke(fc.Name, argArrays, batch.Length);
-                return ArrowToLiteralValues(result, batch.Length);
+                return ArrowToLiteralValues(InvokeFunction(fc, batch), batch.Length);
 
             default:
                 throw new NotSupportedException(
                     $"Unsupported expression: {expression.GetType().Name}");
         }
+    }
+
+    // ── Arrow-native evaluation, for the function boundary ──
+
+    /// <summary>
+    /// Evaluates an expression straight to an Arrow array, without the
+    /// <c>LiteralValue?[]</c> detour the rest of the evaluator uses.
+    /// </summary>
+    /// <remarks>
+    /// This exists because a <see cref="LiteralValue"/> cannot carry a declared type. A
+    /// <c>decimal(10,2)</c> column round-tripped through one arrives as a bare
+    /// <see cref="decimal"/>, and the Arrow array rebuilt from it has lost the precision and
+    /// scale — which is exactly what Spark's promotion rules are computed from. A function
+    /// receiving two such arguments cannot know that <c>d1 + d2</c> should produce
+    /// <c>decimal(13,4)</c>. Worse, the type-inferring materializer has no decimal case at all,
+    /// so a decimal argument threw before the registry was ever consulted.
+    ///
+    /// Column references therefore pass through as the batch's own arrays, and a nested call's
+    /// result travels on as whatever the registry returned. Only literals are built here, and
+    /// only from what the value itself implies.
+    /// </remarks>
+    private IArrowArray EvalExpressionAsArray(Expression expression, RecordBatch batch) =>
+        expression switch
+        {
+            UnboundReference u => GetColumn(batch, u.Name),
+            BoundReference b => GetColumn(batch, b.Name),
+            FunctionCall fc => InvokeFunction(fc, batch),
+            Predicate p => ToBooleanArray(EvalPredicate(p, batch), batch.Length),
+            LiteralExpression lit => ConstantArray(lit.Value, batch.Length),
+            _ => MaterializeAsArray(EvalExpression(expression, batch), batch.Length),
+        };
+
+    private IArrowArray InvokeFunction(FunctionCall call, RecordBatch batch)
+    {
+        if (_functions is null || !_functions.IsRegistered(call.Name))
+            throw new InvalidOperationException(
+                $"No function registered for '{call.Name}'. " +
+                "Provide an IFunctionRegistry to ArrowRowEvaluator.");
+
+        var arguments = new IArrowArray[call.Arguments.Count];
+        for (int i = 0; i < call.Arguments.Count; i++)
+            arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
+
+        return _functions.Invoke(call.Name, arguments, batch.Length);
+    }
+
+    /// <summary>Builds a constant array of <paramref name="value"/>, repeated.</summary>
+    private static IArrowArray ConstantArray(LiteralValue value, int length)
+    {
+        // A decimal literal's type comes from the value, matching Spark: `1.5` is decimal(2,1),
+        // `.5` is decimal(1,1) and `1.` is decimal(1,0).
+        if (!value.IsNull && value.Type == LiteralValue.Kind.Decimal)
+        {
+            var (precision, scale) = DecimalTypeOf(value.AsDecimal);
+            return MaterializeAsArray(
+                Repeat(value, length), length, new Decimal128Type(precision, scale));
+        }
+
+        return MaterializeAsArray(Repeat(value.IsNull ? null : (LiteralValue?)value, length), length);
+    }
+
+    /// <summary>The precision and scale Spark gives a decimal literal.</summary>
+    private static (int Precision, int Scale) DecimalTypeOf(decimal value)
+    {
+        var bits = decimal.GetBits(value);
+        int scale = (bits[3] >> 16) & 0xFF;
+
+        // Digits in the unscaled value. `0.05` has one significant digit but needs precision 2
+        // to be representable at scale 2, so the scale is a floor.
+        var unscaled = BigInteger.Abs(
+            new BigInteger((uint)bits[0]) |
+            (new BigInteger((uint)bits[1]) << 32) |
+            (new BigInteger((uint)bits[2]) << 64));
+
+        int digits = unscaled.IsZero ? 1 : (int)Math.Floor(BigInteger.Log10(unscaled)) + 1;
+        return (Math.Max(Math.Max(digits, scale), 1), scale);
     }
 
     private static IArrowArray GetColumn(RecordBatch batch, string name)
