@@ -225,7 +225,7 @@ public static class ConflictChecker
     /// A PRESENT flag outranks anything we could infer — including a <c>false</c> on an adds-only commit,
     /// which is exactly the read-then-append case above.</para>
     /// </remarks>
-    private static bool IsBlindAppend(IReadOnlyList<DeltaAction> actions)
+    internal static bool IsBlindAppend(IReadOnlyList<DeltaAction> actions)
     {
         foreach (var action in actions)
         {

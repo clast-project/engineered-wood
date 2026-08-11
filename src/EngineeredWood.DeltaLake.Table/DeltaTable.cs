@@ -7698,15 +7698,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-            bool blindAppend = true;
-            foreach (var a in commitActions)
-            {
-                if (a is RemoveFile or MetadataAction or ProtocolAction)
-                {
-                    blindAppend = false;
-                    break;
-                }
-            }
+
+            // ONE rule, shared with ConflictChecker. This used to be a second copy — starting `true` and
+            // clearing on remove/metaData/protocol — which differed from the checker's in requiring no
+            // add, so an add-less commit was blind here and not there. That disagreement was inert while
+            // both only gated an AddFile branch an add-less commit never reaches; it stopped being inert
+            // the moment the checker learned to believe a declared commitInfo.isBlindAppend and this did
+            // not, because then a Spark commit declaring FALSE on an adds-only commit was correctly
+            // examined by one path and wrongly exempted by the other — which is the whole defect, alive
+            // on the buffered-transaction rebase instead of on the OCC loop.
+            bool blindAppend = Concurrency.ConflictChecker.IsBlindAppend(commitActions);
             foreach (var a in commitActions)
             {
                 switch (a)
