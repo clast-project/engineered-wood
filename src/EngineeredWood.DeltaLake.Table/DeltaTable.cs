@@ -58,8 +58,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
             CheckpointInterval = options.CheckpointInterval,
-            // Shared with the table's own explicit CheckpointAsync, so both write checkpoints under the
-            // caller's parquet options rather than the committer's defaults.
+            // Shared with CheckpointAsync and with CheckpointIfDueAsync, so every checkpoint this table
+            // writes — on the interval, from either commit trigger, or because a caller asked — uses the
+            // caller's parquet options and checkpoint format rather than the committer's defaults.
             CheckpointWriter = _checkpointWriter,
             PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
         });
@@ -4173,6 +4174,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var logCompaction = new Log.LogCompaction(_fs, _log);
         await logCompaction.CompactRangeAsync(startVersion, endVersion, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes a checkpoint for the table's current version, now, whatever the interval would have said —
+    /// and publishes the <c>_last_checkpoint</c> hint that points readers at it.
+    ///
+    /// <para>Every commit path already checkpoints on
+    /// <see cref="DeltaTableOptions.CheckpointInterval"/>, so this is not needed to keep a table
+    /// checkpointed. It is for a host with a cadence of its own: one that sets
+    /// <c>CheckpointInterval = 0</c> to take the decision entirely, or that wants a checkpoint at a moment
+    /// it knows to be a good one — after a bulk load, before handing the table to another engine — rather
+    /// than at whichever commit happens to land on a multiple.</para>
+    ///
+    /// <para>The checkpoint is written under the table's own
+    /// <see cref="DeltaTableOptions.ParquetWriteOptions"/> and
+    /// <see cref="DeltaTableOptions.CheckpointFormat"/>, which is the reason for having this rather than
+    /// constructing a <see cref="Checkpoint.CheckpointWriter"/> at the call site: that duplicates the
+    /// table's configuration, and a copy of a policy is a copy that drifts.</para>
+    ///
+    /// <para>Writing a checkpoint is not free — it materialises the whole active-file set — and it is
+    /// idempotent in effect but not in cost, so calling it per commit is a way to pay for checkpointing
+    /// twice. Concurrent writers are safe: a classic checkpoint overwrites one fixed path with identical
+    /// content, and a V2 one is UUID-named, so neither can corrupt the other.</para>
+    /// </summary>
+    /// <returns>The version checkpointed.</returns>
+    public async ValueTask<long> CheckpointAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        var snapshot = CurrentSnapshot;
+        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        return snapshot.Version;
     }
 
     /// <summary>
