@@ -2496,7 +2496,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // The host's claim, passed through verbatim. NOT derived from `reads` above: a transaction
             // records the reads made THROUGH it, and a host that scanned the table itself and staged the
             // result made one this library never saw.
-            isBlindAppend: transaction.IsBlindAppend);
+            isBlindAppend: transaction.EffectiveIsBlindAppend);
     }
 
     /// <summary>
@@ -3638,7 +3638,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 snapshot, plan.Actions,
                 new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
                 plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
-                rebaseSafe: true, cancellationToken, written: written).ConfigureAwait(false);
+                rebaseSafe: true, cancellationToken, written: written,
+                isBlindAppend: false).ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
         }, cancellationToken).ConfigureAwait(false);
@@ -5187,16 +5188,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)
         {
+            // Declared, not inferred — and we are entitled to declare here because we KNOW. A plain
+            // append takes its rows from the caller and reads no file of this table to decide what to
+            // write, which is Delta's definition (`readPredicates.isEmpty && readFiles.isEmpty`). Reading
+            // the snapshot's metadata for a schema check or an identity high-water mark is not a FILE read
+            // and does not spend the claim.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind, NoRemovedPaths,
                 IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
-                cancellationToken, written: written).ConfigureAwait(false);
+                cancellationToken, written: written, isBlindAppend: true).ConfigureAwait(false);
         }
         else
         {
             // Overwrite family: a single atomic attempt at the read version + 1 (unchanged behavior).
+            // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
+            // on files. Recording that is what lets another engine's checker examine it rather than fall
+            // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, snapshot.Metadata.Configuration, "WRITE");
+                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false);
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
@@ -6647,7 +6656,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
-            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written).ConfigureAwait(false);
+            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
+            isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -6803,7 +6813,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
         return (totalDeleted, version);
     }
@@ -7253,7 +7263,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths }, removedPaths,
             IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
     }
 

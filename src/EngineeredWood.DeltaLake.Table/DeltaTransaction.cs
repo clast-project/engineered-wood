@@ -194,6 +194,30 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// </summary>
     public bool? IsBlindAppend { get; set; }
 
+    /// <summary>
+    /// What the commit records: the host's claim if it made one, else <c>false</c> when this transaction
+    /// itself recorded a read, else nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The derivation runs in ONE direction only, and that asymmetry is the whole design.</b> A
+    /// read recorded through this transaction — a staged DELETE or UPDATE, a declared whole-table read, a
+    /// read predicate — proves the transaction was not blind, so <c>false</c> is a fact rather than a
+    /// guess. The converse does not hold: having recorded no read proves only that none came through THIS
+    /// object, and a host that scanned the table itself and staged the result read something we never saw.
+    /// So the absence of recorded reads stays silent rather than becoming <c>true</c>.</para>
+    ///
+    /// <para>Which is what makes the autocommit DML surface honest for free: <c>DeleteAsync</c> and
+    /// <c>UpdateAsync</c> stage their work through a transaction, so their commits declare <c>false</c>
+    /// without anyone passing anything, while a bare staged append — where only the host knows — declares
+    /// nothing until the host says otherwise.</para>
+    /// </remarks>
+    internal bool? EffectiveIsBlindAppend =>
+        IsBlindAppend
+        ?? (_declaredWholeTableRead || _removedPaths.Count > 0 || _dvEdits.Count > 0
+                || _readPredicates.Count > 0
+            ? false
+            : null);
+
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
 
