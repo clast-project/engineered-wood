@@ -633,6 +633,13 @@ metadata. For each batch:
 2. If the user did not provide a value: compute it via the row evaluator and
    substitute it into the batch
 
+Step 1 is the protocol's wording, not a paraphrase — [Generated
+Columns](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#generated-columns)
+requires that writers "MUST enforce that any data writing to the table satisfy
+the condition `(<value> <=> <generation expression>) IS TRUE`". Unlike the
+constraint semantics discussed
+[below](#what-delta-actually-does-with-a-constraint), this one is specified.
+
 Same parser injection as CHECK constraints.
 
 ## The Spark SQL parser
@@ -1057,7 +1064,9 @@ the results.
 ### What Delta actually does with a constraint
 
 Measured 2026-08-10 against delta-spark 4.0.0, because the corpus above is
-worthless if it is gathered under semantics Delta does not use.
+worthless if it is gathered under semantics Delta does not use. Cross-checked
+2026-08-10 against the protocol and delta-spark's own test suites; where upstream
+states or asserts a rule, it is cited below rather than resting on measurement.
 
 **Delta parses with Spark's session parser.** Verified in the 4.0.0 jar rather
 than inferred: `Constraints$.getCheckConstraints(Metadata, SparkSession)`
@@ -1086,10 +1095,52 @@ current-generation writer produces. Any harvested corpus must record the config
 it was gathered under, and two corpora gathered under different settings must
 never be compared.
 
+**That configuration dependence is unspecified by omission, not by design**,
+which is what makes choosing a policy legitimate rather than a deviation. The
+[protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#check-constraints)
+requires only that "evaluating the SQL expressions of CHECK constraints must
+return `true` for each row in a table". It never names a dialect — the value is
+"a SQL expression string", and for generated columns the metadata "SHOULD be
+parsed as a SQL expression" — and it says nothing about evaluation semantics.
+Neither does the [Delta Lake constraints
+documentation](https://docs.delta.io/latest/delta-constraints.html).
+
+delta-spark's tests confirm the silence is a blind spot. `CheckConstraintsSuite`
+and `InvariantEnforcementSuite` contain no reference to ANSI at all, and
+`GeneratedColumnSuite` — 2,235 lines — contains none to ANSI or to session
+timezone. Repo-wide only two files under `spark/src/test` mention
+`ansi.enabled`, and neither covers write-time constraint evaluation.
+
+The contrast makes it conclusive. Where *Delta itself* introduces a cast, it is
+meticulous: `ImplicitDMLCastingSuite` sweeps a three-dimensional matrix of
+`followAnsiEnabled × ansiEnabled × storeAssignmentPolicy`, backed by a dedicated
+`DeltaSQLConf.UPDATE_AND_MERGE_CASTING_FOLLOWS_ANSI_ENABLED_FLAG` and the
+`DELTA_CAST_OVERFLOW_IN_TABLE_WRITE` error class. Where the *user* supplies the
+expression, none of that machinery applies. So there is no upstream contract to
+match here, and none to violate.
+
 **A NULL constraint result rejects the write**, confirming the `HasFalseOrNull`
 shape in the CHECK-constraints pseudocode above. With constraint `a > 0`:
 `a = 1` is accepted, `a = -1` is rejected, and `a = NULL` is rejected with
 `DELTA_VIOLATE_CONSTRAINT`.
+
+This one is load-bearing upstream, so it can be relied on rather than merely
+observed. The protocol's "must return `true`" already excludes null by
+construction, and `CheckConstraintsSuite`'s "constraints with nulls" test asserts
+it directly: under `CHECK (nested.arr[0] < 100)` it expects an
+`InvariantViolationException` for three separate null origins — a null element, a
+null array, and a null parent struct — while the sibling constraint
+`CHECK (nested.arr[1] IS NULL)` admits those same rows. It is the *result* being
+null that violates, not the input.
+
+**Not every constraint on a table would pass Delta's own validator.**
+`DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT` rejects scalar subqueries and
+`DELTA_UDF_IN_CHECK_CONSTRAINT` rejects UDFs, but the UDF check only fires when
+`DeltaSQLConf.VALIDATE_CHECK_CONSTRAINTS` is `ASSERT`; `CheckConstraintsSuite`
+asserts that under `OFF` the same `ALTER TABLE ... CHECK (external_udf(value))`
+succeeds. A table can therefore carry a constraint referencing a function no
+other engine can resolve, which is an argument for the parser's
+unsupported-syntax error being a clean, quotable refusal rather than a crash.
 
 **The stored constraint text is token-spaced, not canonicalised.** Delta does
 not persist the expression verbatim, and it does not persist Catalyst's `.sql()`
@@ -1102,6 +1153,13 @@ preserving case, operator spelling and redundant parentheses:
 | `SUBSTRING(s, 1, 2) = 'ab'` | `SUBSTRING ( s , 1 , 2 ) = 'ab'` |
 | `((a) > (0))` | `( ( a ) > ( 0 ) )` |
 | `a <> 5` | `a <> 5` |
+
+delta-spark's own tests expect this form, so it is a real convention rather than
+an artefact of how these cases were probed: `CheckConstraintsSuite` writes
+`CHECK (nested.arr[1] < 5)` and asserts the resulting error quotes
+`(nested . arr [ 1 ] < 5)`. Note that the *runtime* violation message renders
+compactly instead (`(nested.arr[0] < 100)`) — the two error paths differ, and
+only the `ALTER`-time one shows the stored text.
 
 Three consequences for the parser. Keywords must match case-insensitively —
 `and` survives as written, so a keyword table keyed on uppercase will miss it.
