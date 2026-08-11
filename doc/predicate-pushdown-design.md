@@ -591,6 +591,12 @@ foreach (var batch in batches)
 }
 ```
 
+Rejecting on null as well as false is confirmed against delta-spark 4.0.0, not
+assumed — see
+[What Delta actually does with a constraint](#what-delta-actually-does-with-a-constraint),
+which also records that the *evaluation* semantics behind this pseudocode are a
+choice EngineeredWood has to make rather than inherit.
+
 The constraint expressions are stored as Spark SQL strings in
 `Metadata.Configuration`. Since [the parser decision](#the-spark-sql-parser),
 parsing no longer needs a separate package: the parser lives in
@@ -1042,6 +1048,72 @@ established before the corpus is harvested.
 precedence and coercion corpora can be harvested as static fixtures before the
 parser is written and developed against offline, which moves differential
 testing from something that follows phase 10 to something that precedes phase 9.
+
+All three are available as the `expr_oracle` command in
+`test/EngineeredWood.DeltaLake.Table.Tests/Interop/spark_driver.py`, which takes
+`{expressions, schema?, rows?, conf?}` and echoes the config in force alongside
+the results.
+
+### What Delta actually does with a constraint
+
+Measured 2026-08-10 against delta-spark 4.0.0, because the corpus above is
+worthless if it is gathered under semantics Delta does not use.
+
+**Delta parses with Spark's session parser.** Verified in the 4.0.0 jar rather
+than inferred: `Constraints$.getCheckConstraints(Metadata, SparkSession)`
+delegates to a lambda whose bytecode calls
+`SparkSession.sessionState().sqlParser().parseExpression(String)` and wraps the
+result in `Constraints$Check`. That is the same entry point oracle 1 uses, so
+oracle 1 is measuring the real thing and not an approximation of it.
+
+**Delta pins no configuration, so "what Spark does" depends on who writes the
+row.** `CheckDeltaInvariant` carries no `SQLConf` reference at all; the
+constraint is evaluated under whatever session performs the write. This is not
+theoretical — the same table, the same constraint `a + b < 0`, and the same row
+`(2147483647, 1)`:
+
+| `spark.sql.ansi.enabled` | outcome |
+|---|---|
+| `false` | **ACCEPTED** — the int overflow wraps to `-2147483648`, which satisfies `< 0` |
+| `true` | **REJECTED** — `ARITHMETIC_OVERFLOW` |
+
+So a constraint does not have one behaviour to match. EngineeredWood has no
+session config to inherit, which means it must *choose* a policy and document it
+rather than claim Spark parity. The defensible choice is ANSI: Spark 4.0
+defaults `spark.sql.ansi.enabled=true` and `spark.sql.storeAssignmentPolicy=ANSI`
+(both confirmed as the running defaults in the interop venv), so ANSI is what a
+current-generation writer produces. Any harvested corpus must record the config
+it was gathered under, and two corpora gathered under different settings must
+never be compared.
+
+**A NULL constraint result rejects the write**, confirming the `HasFalseOrNull`
+shape in the CHECK-constraints pseudocode above. With constraint `a > 0`:
+`a = 1` is accepted, `a = -1` is rejected, and `a = NULL` is rejected with
+`DELTA_VIOLATE_CONSTRAINT`.
+
+**The stored constraint text is token-spaced, not canonicalised.** Delta does
+not persist the expression verbatim, and it does not persist Catalyst's `.sql()`
+rendering either — it re-joins the parsed token stream with single spaces,
+preserving case, operator spelling and redundant parentheses:
+
+| written | stored as |
+|---|---|
+| `a>0   and   b IS NOT NULL` | `a > 0 and b IS NOT NULL` |
+| `SUBSTRING(s, 1, 2) = 'ab'` | `SUBSTRING ( s , 1 , 2 ) = 'ab'` |
+| `((a) > (0))` | `( ( a ) > ( 0 ) )` |
+| `a <> 5` | `a <> 5` |
+
+Three consequences for the parser. Keywords must match case-insensitively —
+`and` survives as written, so a keyword table keyed on uppercase will miss it.
+`<>` must be accepted rather than assumed normalised to `!=`. And parentheses
+appear routinely in stored text, which is independent confirmation that kernel's
+paren-free scope is unusable here. Note also that other writers (delta-rs,
+EngineeredWood itself) need not follow this convention, so the parser cannot
+rely on the spacing.
+
+One surprise worth recording for whoever writes the grammar: in Spark 4.0
+`a between 1 and 10` parses to an `UnresolvedFunction` rendering as
+`between(a, 1, 10)`, not to a desugared pair of comparisons.
 
 ## Open Questions
 

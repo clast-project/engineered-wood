@@ -793,8 +793,85 @@ def cmd_conflict_semantics(args):
     return {"isolation_levels": levels, "scenarios": [run(sc) for sc in scenarios]}
 
 
+def cmd_expr_oracle(args):
+    """Ask Spark what an expression MEANS, for differential-testing the EW parser and registry.
+
+    Phase 9 of the predicate-pushdown design replaces a generated grammar with a hand-written
+    one, which is only sound if something independent checks it. This is that something. Three
+    answers per expression, deliberately separated because they cost different things:
+
+      parse  -- sessionState.sqlParser.parseExpression, the SAME entry point Delta uses on
+                delta.constraints.* and delta.generationExpression (verified in the 4.0.0 jar:
+                Constraints$$anonfun$getCheckConstraints$1 calls it directly). `sql` comes back
+                fully parenthesised, so diffing it against our own rendering tests precedence
+                and associativity with no data and no evaluation.
+      type   -- resolved output type against an EMPTY frame carrying `schema`. Resolution and
+                type-checking still run, so this measures Spark's coercion rules -- decimal
+                promotion above all -- without evaluating a single row.
+      eval   -- per-row values over `rows`, which is what catches three-valued logic.
+
+    `parse` and `type` need no data, so a corpus can be harvested from `expressions` alone.
+
+    CONFIG IS PART OF THE ANSWER, not a detail. Delta pins nothing: CheckDeltaInvariant carries
+    no SQLConf reference, and a constraint is evaluated under whatever session writes the row --
+    measured, `a + b < 0` over (2147483647, 1) is ACCEPTED with ansi off and ARITHMETIC_OVERFLOW
+    with it on. So `conf` is echoed back in the result; record it with any expectation derived
+    from it, and never compare two corpora gathered under different settings.
+
+    args: {expressions: [str], schema?: [{name, type}], rows?: [[...]], conf?: {k: v}}
+    """
+    spark = _spark()
+
+    applied = {}
+    for key, value in (args.get("conf") or {}).items():
+        applied[key] = value
+        spark.conf.set(key, value)
+    # Report what is actually in force, not merely what was asked for.
+    for key in ("spark.sql.ansi.enabled", "spark.sql.session.timeZone",
+                "spark.sql.storeAssignmentPolicy"):
+        applied.setdefault(key, spark.conf.get(key))
+
+    ddl = ", ".join(f"{f['name']} {f['type']}" for f in args.get("schema") or [])
+    frame = spark.createDataFrame([], ddl) if ddl else None
+    rows = args.get("rows")
+    data = spark.createDataFrame([tuple(r) for r in rows], ddl) if (ddl and rows) else None
+
+    parser = spark._jsparkSession.sessionState().sqlParser()
+    results = []
+    for expr in args["expressions"]:
+        entry = {"expression": expr}
+
+        try:
+            tree = parser.parseExpression(expr)
+            entry["parse"] = {"ok": True, "node": tree.getClass().getSimpleName(),
+                              "sql": tree.sql()}
+        except Exception as exc:
+            entry["parse"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        if frame is not None:
+            try:
+                entry["type"] = {"ok": True,
+                                 "type": frame.selectExpr(f"({expr}) AS r")
+                                              .schema[0].dataType.simpleString()}
+            except Exception as exc:
+                entry["type"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        if data is not None:
+            try:
+                entry["eval"] = {"ok": True,
+                                 "values": [r[0] for r in
+                                            data.selectExpr(f"({expr}) AS r").collect()]}
+            except Exception as exc:
+                entry["eval"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        results.append(entry)
+
+    return {"conf": applied, "results": results}
+
+
 COMMANDS = {
     "probe": cmd_probe,
+    "expr_oracle": cmd_expr_oracle,
     "read": cmd_read,
     "read_row_ids": cmd_read_row_ids,
     "read_changes": cmd_read_changes,
