@@ -346,4 +346,385 @@ public class LogCleanupTests : IDisposable
 
         Assert.Equal(3, deleted); // v0, v1, v2
     }
+
+    // ── V2 checkpoint sidecars ─────────────────────────────────────────────────────────────────────────
+    //
+    // On a table big enough to use them, the sidecars ARE the log: the file actions live there and the
+    // checkpoint body is an index over them. Reclaiming checkpoints without their sidecars would free the
+    // index and leave the bulk, permanently — VacuumExecutor excludes _delta_log, so nothing else would
+    // ever collect them.
+
+    /// <summary>Writes v0 with a protocol that permits V2 checkpoints, then versions 1..<paramref name="through"/>.</summary>
+    private async ValueTask WriteV2CapableVersionsAsync(long through)
+    {
+        await _log.WriteCommitAsync(0,
+        [
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["v2Checkpoint"],
+                WriterFeatures = ["v2Checkpoint"],
+            },
+            new MetadataAction
+            {
+                Id = "cleanup-sidecar-test",
+                Format = Format.Parquet,
+                SchemaString = SchemaJson,
+                PartitionColumns = [],
+                CreatedTime = 1700000000000,
+            },
+        ]);
+
+        for (long v = 1; v <= through; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+    }
+
+    /// <summary>
+    /// Writes a V2 checkpoint at the current version whose file actions are FORCED into sidecars —
+    /// <c>SidecarThreshold = 0</c> rather than a hundred-file fixture, so the layout under test is the real
+    /// one without the table that normally produces it.
+    /// </summary>
+    private async ValueTask<Snapshot.Snapshot> WriteV2CheckpointWithSidecarsAsync()
+    {
+        var snapshot = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.V2CheckpointWriter(_fs) { SidecarThreshold = 0 }
+            .WriteCheckpointAsync(snapshot);
+        return snapshot;
+    }
+
+    private string[] SidecarNames() =>
+        Directory.Exists(SidecarDir)
+            ? [.. Directory.GetFiles(SidecarDir).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal)!]
+            : [];
+
+    private string SidecarDir => Path.Combine(_tempDir, "_delta_log", "_sidecars");
+
+    /// <summary>
+    /// The headline for sidecars: an expired checkpoint's sidecars go with it, and the surviving
+    /// checkpoint's do not. Two checkpoints, each with its own set, and only one survives the horizon.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesSidecars_NoSurvivingCheckpointReferences()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        await WriteV2CheckpointWithSidecarsAsync();               // checkpoint at v2, sidecar set A
+        string[] setA = SidecarNames();
+        Assert.NotEmpty(setA);
+
+        for (long v = 3; v <= 5; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+        await WriteV2CheckpointWithSidecarsAsync();               // checkpoint at v5, sidecar set B
+        string[] setB = [.. SidecarNames().Except(setA)];
+        Assert.NotEmpty(setB);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        foreach (string a in setA)
+            Assert.DoesNotContain(a, remaining);
+        foreach (string b in setB)
+            Assert.Contains(b, remaining);
+
+        // The v5 checkpoint still resolves through its sidecars, which is the whole point of keeping them.
+        var rebuilt = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        Assert.Equal(5, rebuilt.Version);
+        Assert.Equal(5, rebuilt.FileCount);
+        Assert.True(deleted > setA.Length, "the count should cover the commits AND the expired sidecars");
+    }
+
+    /// <summary>
+    /// ⚠ THE AGE CONDITION, and it is not decoration. A writer publishes its sidecars BEFORE the checkpoint
+    /// that names them — it must, since the checkpoint records their paths — so a sweep that deleted
+    /// everything unreferenced would destroy a checkpoint that is seconds from existing. A recent
+    /// unreferenced sidecar therefore survives, and an old one does not: the same file, told apart only by
+    /// its age.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_KeepsAnUnreferencedSidecar_ThatIsYoungerThanTheHorizon()
+    {
+        await WriteV2CapableVersionsAsync(through: 5);
+        await WriteV2CheckpointWithSidecarsAsync();
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // Two sidecars nothing references: one long expired, one a moment old — as a concurrent writer's
+        // would be, published ahead of the checkpoint about to name it.
+        Directory.CreateDirectory(SidecarDir);
+        string stale = Path.Combine(SidecarDir, "aaaaaaaa-stale.parquet");
+        string fresh = Path.Combine(SidecarDir, "bbbbbbbb-fresh.parquet");
+        File.WriteAllBytes(stale, [1]);
+        File.WriteAllBytes(fresh, [1]);
+        File.SetLastWriteTimeUtc(stale, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(fresh, Now.UtcDateTime.AddMinutes(-1));
+
+        await LogCleanup.RunAsync(_log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.DoesNotContain("aaaaaaaa-stale.parquet", remaining);
+        Assert.Contains("bbbbbbbb-fresh.parquet", remaining);
+    }
+
+    /// <summary>
+    /// FAILS CLOSED. A surviving checkpoint that cannot be read leaves the referenced set incomplete, and
+    /// sweeping against an incomplete set deletes live data — so an unreadable survivor abandons the sweep
+    /// entirely rather than proceeding with what it managed to collect.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_SweepsNoSidecars_WhenASurvivingCheckpointCannotBeRead()
+    {
+        await WriteV2CapableVersionsAsync(through: 5);
+        await WriteV2CheckpointWithSidecarsAsync();
+        string[] before = SidecarNames();
+        Assert.NotEmpty(before);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // An unreferenced, long-expired sidecar: without the corruption below it WOULD be swept, so its
+        // survival is what proves the sweep declined rather than merely found nothing to do.
+        string orphan = Path.Combine(SidecarDir, "cccccccc-orphan.parquet");
+        File.WriteAllBytes(orphan, [1]);
+        File.SetLastWriteTimeUtc(orphan, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        string checkpoint = Directory
+            .GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.checkpoint.*").Single();
+        File.WriteAllText(checkpoint, "not a checkpoint");
+
+        await LogCleanup.RunAsync(_log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.Contains("cccccccc-orphan.parquet", remaining);
+        foreach (string name in before)
+            Assert.Contains(name, remaining);
+    }
+
+    /// <summary>
+    /// ⚠ THE AWKWARD HISTORY: sidecars exist and the SURVIVING checkpoint is classic. A table that used V2
+    /// checkpoints and later wrote a classic one — a <c>delta.checkpointPolicy</c> change, or another
+    /// engine — keeps its sidecar directory, so the sweep runs and has to ask a checkpoint with no
+    /// sidecar column what it references. The answer is none, every old sidecar is unreferenced, and all
+    /// of them go.
+    ///
+    /// <para>This is also the case that makes the projected read matter rather than being an optimisation:
+    /// a classic checkpoint carries every file action in its body, so answering by materialising it would
+    /// be the table's whole file list allocated to discover a null result, on a commit path. The body is
+    /// asked for its <c>sidecar</c> column, has none, and is not read.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_SweepsSidecars_WhenTheSurvivingCheckpointIsClassic()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        await WriteV2CheckpointWithSidecarsAsync();               // V2 checkpoint at v2, with sidecars
+        Assert.NotEmpty(SidecarNames());
+
+        for (long v = 3; v <= 5; v++)
+            await _log.WriteCommitAsync(v, [Add($"f{v}.parquet")]);
+
+        // Classic: the table declares the v2Checkpoint FEATURE but no checkpointPolicy, which is exactly
+        // the combination CheckpointFormat.Automatic resolves to a classic checkpoint.
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+        Assert.True(File.Exists(LogFile("00000000000000000005.checkpoint.parquet")));
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Empty(SidecarNames());
+
+        var rebuilt = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        Assert.Equal(5, rebuilt.Version);
+        Assert.Equal(5, rebuilt.FileCount);
+    }
+
+    /// <summary>
+    /// A V2 body may be Parquet as well as NDJSON — delta-spark picks between them with a session config,
+    /// so which one a table carries is not something a reader can predict. The Parquet path is the one
+    /// that projects a single column, so it needs its own case; the tests above all exercise NDJSON,
+    /// which is what this writer produces by default.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_ReadsSidecarReferences_FromAParquetV2Body()
+    {
+        await WriteV2CapableVersionsAsync(through: 2);
+        var snapshot = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.V2CheckpointWriter(_fs)
+        {
+            SidecarThreshold = 0,
+            Body = Checkpoint.V2CheckpointBody.Parquet,
+        }.WriteCheckpointAsync(snapshot);
+        string[] referenced = SidecarNames();
+        Assert.NotEmpty(referenced);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BackdateSidecars(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // An expired sidecar the surviving Parquet-bodied checkpoint does NOT reference.
+        string orphan = Path.Combine(SidecarDir, "dddddddd-orphan.parquet");
+        File.WriteAllBytes(orphan, [1]);
+        File.SetLastWriteTimeUtc(orphan, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 2, Now);
+
+        string[] remaining = SidecarNames();
+        Assert.DoesNotContain("dddddddd-orphan.parquet", remaining);
+        foreach (string name in referenced)
+            Assert.Contains(name, remaining);
+    }
+
+    /// <summary>
+    /// A classic-checkpoint table pays a listing and stops. Asserted because the sweep must not become a
+    /// reason for the common case to start reading checkpoint bodies it has no use for.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_OnATableWithNoSidecars_LeavesTheCountUnchanged()
+    {
+        await WriteVersionsAsync(through: 5);
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(5, deleted); // v0..v4 and nothing else — no sidecar directory to sweep
+        Assert.Empty(SidecarNames());
+    }
+
+    private void BackdateSidecars(DateTime stamp)
+    {
+        if (!Directory.Exists(SidecarDir))
+            return;
+        foreach (string file in Directory.GetFiles(SidecarDir))
+            File.SetLastWriteTimeUtc(file, stamp);
+    }
+
+    // ── version checksum files ─────────────────────────────────────────────────────────────────────────
+    //
+    // This library writes none. delta-spark writes one beside every commit by default, so a table shared
+    // with it carries them, and a cleanup that does not recognise the name leaves one file per commit
+    // behind forever — the exact condition cleanup exists to end, surviving in a name it does not parse.
+
+    /// <summary>Writes a <c>&lt;version&gt;.crc</c> beside each of versions 0..<paramref name="through"/>.</summary>
+    private void WriteChecksumFiles(long through)
+    {
+        for (long v = 0; v <= through; v++)
+            File.WriteAllText(LogFile($"{DeltaVersion.Format(v)}.crc"), """{"tableSizeBytes":1,"numFiles":1}""");
+    }
+
+    private string[] ChecksumNames() =>
+        [.. Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.crc")
+            .Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal)!];
+
+    /// <summary>
+    /// A checksum file whose commit has just been deleted goes with it; the surviving version's stays.
+    /// The pairing is the assertion — a <c>.crc</c> must never outlive or predecease its own commit.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_DeletesChecksumFiles_ForTheCommitsItRemoved()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(10, deleted);                      // v0..v4 commits AND their five checksums
+        Assert.Equal(["00000000000000000005.crc"], ChecksumNames());
+        Assert.True(File.Exists(LogFile("00000000000000000005.json")));
+    }
+
+    /// <summary>
+    /// ⚠ THE REASON THEY ARE SWEPT SEPARATELY: a file outside the replay chain must not be able to gate
+    /// it. The prefix walk stops at the first file it may not delete, because a hole in the COMMITS is
+    /// corruption. A checksum file is not part of that chain, and delta-spark writes one AFTER the commit
+    /// it describes — so a single <c>.crc</c> can be newer than the horizon while every commit around it
+    /// is long expired. Folded into the walk it would halt cleanup at its own version and strand every
+    /// later commit; swept separately it halts nothing.
+    ///
+    /// <para>Here v1's checksum is minutes old and everything else is years old. The commits must still
+    /// go, and v1's checksum must survive on its own age.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_IsNotHaltedByARecentChecksum_AmongExpiredCommits()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(
+            LogFile($"{DeltaVersion.Format(1)}.crc"), Now.UtcDateTime.AddMinutes(-1));
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        // Every expired commit goes, including the ones AFTER the recent checksum.
+        for (long v = 0; v <= 4; v++)
+        {
+            Assert.False(
+                File.Exists(LogFile($"{DeltaVersion.Format(v)}.json")),
+                $"v{v} outlived the horizon because a checksum file halted the walk");
+        }
+
+        // v1's checksum is younger than the horizon, so it stays on its own age — the same rule the
+        // sidecar sweep applies, and the reason the count is 9 rather than 10.
+        Assert.Equal(9, deleted);
+        Assert.Equal(
+            ["00000000000000000001.crc", "00000000000000000005.crc"], ChecksumNames());
+    }
+
+    /// <summary>
+    /// A checksum for a version whose commit SURVIVES is kept even when the file itself is long expired —
+    /// the boundary is the commit it describes, not its own age, which is what keeps the two in step.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_KeepsAChecksum_WhoseCommitSurvives()
+    {
+        await WriteVersionsAsync(through: 5);
+        WriteChecksumFiles(through: 5);
+
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        // A checkpoint at v3 covers v0..v2 only, so v3, v4 and v5 keep their commits — and their checksums.
+        await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 3, Now);
+
+        Assert.Equal(
+            [
+                "00000000000000000003.crc",
+                "00000000000000000004.crc",
+                "00000000000000000005.crc",
+            ],
+            ChecksumNames());
+    }
 }
