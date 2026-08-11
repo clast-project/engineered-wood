@@ -1061,6 +1061,48 @@ All three are available as the `expr_oracle` command in
 `{expressions, schema?, rows?, conf?}` and echoes the config in force alongside
 the results.
 
+### The harvested corpus
+
+Done, 2026-08-11. `harvest_expression_corpus.py` (beside the driver) drives
+`expr_oracle` over 198 expressions grouped by feature and writes
+`test/EngineeredWood.Expressions.Tests/Fixtures/spark-expression-corpus.json`,
+pinned at `ansi.enabled=true`, `session.timeZone=UTC`,
+`storeAssignmentPolicy=ANSI`. 194 parse and 192 type-resolve; the failures are
+the deliberately malformed entries.
+
+Because it is checked in, the parser can be developed and tested offline — the
+Expressions test project needs no Spark, no JVM and no network.
+`SparkExpressionCorpusTests` guards it, and asserts the recorded configuration
+rather than merely storing it, since re-harvesting under different settings
+would silently invalidate every expectation derived from the file.
+
+Three things it turned up that are worth knowing before writing the parser.
+
+**`NOT` binds looser than comparison but tighter than `AND`.**
+`NOT a > 0 AND b > 0` renders as `((NOT (a > 0)) AND (b > 0))`. Easy to get
+wrong in a precedence table, and silently wrong if you do.
+
+**Spark's numeric promotion has sharp edges no one would guess.** From the
+coercion group:
+
+| expression | resolved type |
+|---|---|
+| `sh * sh` (smallint) | `smallint` — no widening, so it can overflow |
+| `a % b` (int, bigint) | `bigint` |
+| `d1 % d2` | `decimal(6,4)` — the *narrower* operand's scale |
+| `d1 / d2` | `decimal(21,9)` |
+| `d3 * d3` (both `decimal(38,10)`) | `decimal(38,6)` — clamped at precision 38, scale sacrificed |
+| `coalesce(d1, a)` | `decimal(12,2)` — the int widens into the decimal |
+| `s = a` (string, int) | `boolean` — permitted even under ANSI |
+
+**Rejecting aggregates and subqueries is validation, not parsing.** Spark's
+expression parser accepts `count(a)`, `sum(a) > 0`, `rank() OVER (ORDER BY a)`,
+`a > (SELECT 1)` and `a IN (SELECT 1)` — they parse, and most type-resolve.
+What rejects them is Delta, separately and later, via
+`DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT`. So a parser that refuses them
+at the grammar level would be diverging from Spark rather than matching it;
+the refusal belongs in a post-parse validation step, as it does upstream.
+
 ### What Delta actually does with a constraint
 
 Measured 2026-08-10 against delta-spark 4.0.0, because the corpus above is

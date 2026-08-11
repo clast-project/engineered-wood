@@ -818,7 +818,10 @@ def cmd_expr_oracle(args):
     with it on. So `conf` is echoed back in the result; record it with any expectation derived
     from it, and never compare two corpora gathered under different settings.
 
-    args: {expressions: [str], schema?: [{name, type}], rows?: [[...]], conf?: {k: v}}
+    args: {expressions: [str], schema?: [{name, type}], rows?: [[sql-literal]], conf?: {k: v}}
+
+    `rows` entries are SQL literal TEXT, one per schema field, each cast to the declared type --
+    see the comment at the construction site for why they are not JSON scalars.
     """
     spark = _spark()
 
@@ -831,10 +834,25 @@ def cmd_expr_oracle(args):
                 "spark.sql.storeAssignmentPolicy"):
         applied.setdefault(key, spark.conf.get(key))
 
-    ddl = ", ".join(f"{f['name']} {f['type']}" for f in args.get("schema") or [])
+    schema = args.get("schema") or []
+    ddl = ", ".join(f"{f['name']} {f['type']}" for f in schema)
     frame = spark.createDataFrame([], ddl) if ddl else None
+
+    # Rows are SQL literal TEXT, not JSON scalars, and each is cast to its declared type. JSON
+    # has no faithful form for a decimal, a timestamp or a struct, so routing them through
+    # createDataFrame would need a type-mapping layer that has to grow with every type Spark
+    # adds. Spark's own literal syntax already covers all of them:
+    #   "CAST('12.34' AS decimal(10,2))", "named_struct('a', array(1,2))", "NULL"
     rows = args.get("rows")
-    data = spark.createDataFrame([tuple(r) for r in rows], ddl) if (ddl and rows) else None
+    data = None
+    if ddl and rows:
+        selects = [
+            "SELECT " + ", ".join(
+                f"CAST({value} AS {field['type']}) AS {field['name']}"
+                for value, field in zip(row, schema))
+            for row in rows
+        ]
+        data = spark.sql(" UNION ALL ".join(selects))
 
     parser = spark._jsparkSession.sessionState().sqlParser()
     results = []
