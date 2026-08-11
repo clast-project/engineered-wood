@@ -220,7 +220,16 @@ public sealed class SparkSqlTokenizerTests
     [Fact]
     public void TokensCoverTheSourceInOrderWithoutOverlapping()
     {
-        foreach (var sql in SparkCorpus.ParsableExpressions())
+        // The corpus carries no comments, so the three appended cases are the only ones that
+        // exercise a gap holding anything other than whitespace.
+        var cases = SparkCorpus.ParsableExpressions().Concat(new[]
+        {
+            "a -- dropped? no: comment body\n > 0",
+            "a /* a - b * c / d */ > 0",
+            "a/*x*/+/*y*/b",
+        });
+
+        foreach (var sql in cases)
         {
             var previousEnd = 0;
 
@@ -231,14 +240,56 @@ public sealed class SparkSqlTokenizerTests
                 Assert.True(token.Start + token.Length <= sql.Length,
                     $"token at {token.Start} runs past the end of: {sql}");
 
-                // Anything skipped between tokens must be trivia, never dropped content.
-                for (var i = previousEnd; i < token.Start; i++)
+                AssertGapIsOnlyTrivia(sql, previousEnd, token.Start);
+                previousEnd = token.Start + token.Length;
+            }
+        }
+    }
+
+
+    /// <summary>
+    /// Asserts that everything the tokenizer skipped between two tokens really was trivia.
+    /// </summary>
+    /// <remarks>
+    /// This re-walks the gap rather than accepting a set of characters. Whitelisting <c>-</c>,
+    /// <c>/</c> and <c>*</c> — so that comment markers pass — would whitelist exactly the
+    /// operator characters whose loss this invariant exists to catch, and would still reject the
+    /// arbitrary text inside a comment body. Recognising the two comment forms is the only way
+    /// to be both.
+    /// </remarks>
+    private static void AssertGapIsOnlyTrivia(string sql, int start, int end)
+    {
+        var i = start;
+
+        while (i < end)
+        {
+            if (char.IsWhiteSpace(sql[i]))
+            {
+                i++;
+            }
+            else if (sql[i] == '-' && i + 1 < end && sql[i + 1] == '-')
+            {
+                while (i < end && sql[i] != '\n')
+                    i++;
+            }
+            else if (sql[i] == '/' && i + 1 < end && sql[i + 1] == '*')
+            {
+                var closed = false;
+                for (var j = i + 2; j + 1 < end; j++)
                 {
-                    Assert.True(char.IsWhiteSpace(sql[i]) || sql[i] == '-' || sql[i] == '/' || sql[i] == '*',
-                        $"character '{sql[i]}' at {i} was dropped from: {sql}");
+                    if (sql[j] == '*' && sql[j + 1] == '/')
+                    {
+                        i = j + 2;
+                        closed = true;
+                        break;
+                    }
                 }
 
-                previousEnd = token.Start + token.Length;
+                Assert.True(closed, $"unterminated block comment skipped at {i} in: {sql}");
+            }
+            else
+            {
+                Assert.Fail($"character '{sql[i]}' at {i} was dropped from: {sql}");
             }
         }
     }
