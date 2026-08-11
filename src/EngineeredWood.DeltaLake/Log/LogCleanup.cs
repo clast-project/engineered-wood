@@ -125,6 +125,16 @@ internal static class LogCleanup
         // value every commit looks decades old and is therefore expired the instant it is written.
         // Deleting by age is only safe where the age is real, so an absent timestamp declines the whole
         // pass rather than defaulting to one — the opposite choice silently deletes live history.
+        //
+        // "No cleanup" is the safe answer here, not the only possible one. A table with
+        // `delta.enableInCommitTimestamps` carries an authoritative, monotonic per-commit timestamp INSIDE
+        // the commit, which is exactly the fact this pass is missing — and the spec already treats file
+        // modification time as the unreliable one, requiring in-commit timestamps on catalog-managed
+        // tables because "the file modification timestamp of the published file will not accurately
+        // reflect the original commit time". Using it would make cleanup work where the listing cannot
+        // date anything, at the cost of reading commits rather than only listing them. See upstream #115;
+        // it is a bigger change than it looks (checkpoint files carry no such timestamp, and a mid-life
+        // enablement leaves the commits before it with none), which is why this pass declines instead.
         foreach (var candidate in candidates)
         {
             if (candidate.Modified <= UnknownModifiedThreshold)
