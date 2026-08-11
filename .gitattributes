@@ -1,0 +1,25 @@
+# Source files are UTF-8 with NO byte order mark. .editorconfig (charset = utf-8)
+# stops editors creating them; this file and the CI check below catch what slips past.
+#
+# MEASURED (git 2.40.0.windows.1) — `working-tree-encoding=UTF-8` does NOT strip a
+# BOM, and neither do the spellings UTF8, utf-8 or CP65001. Git's internal encoding
+# is already UTF-8, so it short-circuits the conversion and the BOM lands in the
+# index byte-for-byte. Do not re-propose it: it reads like enforcement and is a no-op.
+#
+# A clean filter does work, and is what the rule below declares. It is OPT-IN by
+# nature — an undefined filter driver is silently ignored, so a fresh clone has no
+# protection until someone runs the one-time config:
+#
+#     git config filter.nobom.clean "perl -0777 -pe 's/^\xef\xbb\xbf//'"
+#     git config filter.nobom.required true
+#
+# perl rather than sed because `sed '1s/^\xEF\xBB\xBF//'` is GNU-only: BSD sed on
+# macOS reads \x as a literal 'x', never matches, and strips nothing without error.
+# `required = true` matters for the same reason — without it a missing or failing
+# filter passes the BOM through silently instead of failing the add.
+#
+# Cost is roughly 40ms per file re-hashed on Windows (process spawn): invisible on an
+# ordinary `git add`, seconds on a full-tree re-add. That cost, plus the fresh-clone
+# gap, is why this is a convenience and NOT the guarantee. The actual guard is the
+# "Check for UTF-8 BOMs" step in .github/workflows/ci.yml, which needs no local setup.
+*.cs filter=nobom

@@ -66,6 +66,39 @@ jobs:
             echo "Documentation-only change — skipping restore, build, test and pack."
           fi
 
+      # Source files are UTF-8 without a BOM. This step is the only guarantee of that:
+      # .editorconfig is advisory (an editor may ignore it, a script writing a file has
+      # no editor at all), and the `filter=nobom` rule in .gitattributes needs a one-time
+      # local `git config` that a fresh clone has not run — an undefined filter driver is
+      # silently ignored, so the BOM would sail through unnoticed.
+      #
+      # Deliberately NOT gated on steps.changes.outputs.code: it needs no toolchain, takes
+      # about a second across ~800 files, and gating it would only create a path by which
+      # a change classified as documentation could carry a BOM in unchecked.
+      #
+      # Verified to fail, not just to pass: seeding a BOM into GrowableBuffer.cs makes this
+      # exit 1 and name the file. A check only ever observed passing is indistinguishable
+      # from one that inspects nothing — see the interop-tier note on the Test step below.
+      - name: Check for UTF-8 BOMs
+        shell: bash
+        run: |
+          found="$(git ls-files -- '*.cs' | perl -ne '
+              chomp;
+              open my $h, "<", $_ or next;
+              binmode $h;
+              read $h, my $head, 3;
+              print "$_\n" if defined $head && $head eq "\xef\xbb\xbf";
+          ')"
+
+          if [ -n "$found" ]; then
+            echo "::error::These .cs files start with a UTF-8 byte order mark:"
+            printf '%s\n' "$found"
+            echo "Strip it, or enable the filter documented in .gitattributes."
+            exit 1
+          fi
+
+          echo "No UTF-8 BOMs in tracked .cs files."
+
       - name: Setup .NET
         if: steps.changes.outputs.code == 'true'
         uses: actions/setup-dotnet@v4

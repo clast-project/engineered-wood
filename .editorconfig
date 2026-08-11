@@ -1,0 +1,15 @@
+# EditorConfig — https://EditorConfig.org
+# Primary purpose: keep source files encoded as UTF-8 *without* a byte order mark.
+# EditorConfig's `utf-8` means "no BOM"; `utf-8-bom` is the separate opt-in value.
+root = true
+
+[*]
+charset = utf-8
+
+[*.{cs,csx}]
+indent_style = space
+indent_size = 4
+
+[*.{csproj,props,targets,slnx,json,yml,yaml,xml}]
+indent_style = space
+indent_size = 2
