@@ -152,6 +152,14 @@ boolean-producing predicates, mirroring delta-kernel-rs:
 > first open question — it is a change to the public tree that Iceberg, Parquet,
 > Delta and Lance all consume, so it wants deciding before the parser, not
 > after.
+>
+> Worth knowing before that is decided: **`FunctionCall` currently has no
+> producers.** It is built only by the two `Expressions.Call` factories and
+> Iceberg's compatibility shim, and every consumer treats it as
+> pass-through-or-throw. Iceberg partition transforms do not lower into it — they
+> stay in the closed `Transform` hierarchy. The Spark parser would be its first
+> real producer, so nothing yet depends on its openness. See
+> [open question 6](#open-questions).
 
 ```csharp
 public abstract record Expression;
@@ -969,6 +977,72 @@ batch — mask them out of step and row identities silently detach from their ro
 - **Iceberg parity:** After migration, all existing Iceberg expression tests
   must still pass
 
+### Differential testing against Spark (phase 9)
+
+A hand-written parser buys back the correctness a generated grammar would have
+supplied only if something independent checks it. PySpark can be that something,
+and the Delta interop rig already hosts it — `spark_driver.py` runs a long-lived
+`SparkSession` over a stdin command loop with a `COMMANDS` dispatch table, so
+this is a new command plus one dispatch line. Session startup is the only
+expensive part; batch every expression through one session.
+
+Probed 2026-08-10 against `ew-spark40` (pyspark 4.0.1, JDK 17). Three oracles
+work, and they are worth separating because they cost different things and
+answer different questions:
+
+**1. Spark's own parser, for precedence.**
+`spark._jsparkSession.sessionState().sqlParser().parseExpression(s)` is the same
+entry point Delta uses on `delta.constraints.*` and `delta.generationExpression`.
+It returns the Catalyst tree; `.sql()` renders it fully parenthesised, so
+`(a + b) * 2 <= 10` comes back as `(((a + b) * 2) <= 10)` and
+`a > 0 AND b IS NOT NULL` as `((a > 0) AND (b IS NOT NULL))`. Diffing that string
+against our own tree's rendering tests associativity and precedence with no data
+and no evaluation. For a precedence-climbing parser this is the highest-value
+test that exists.
+
+**2. Resolved type without data, for coercion.** An empty DataFrame carrying the
+target schema still resolves and type-checks an expression, so
+`empty.selectExpr("(expr) AS r").schema[0].dataType` is a coercion oracle that
+evaluates nothing. Measured, with `d1 decimal(10,2)`, `d2 decimal(6,4)`,
+`a int`, `b bigint`:
+
+| expression | Spark's resolved type |
+|---|---|
+| `a + b` | `bigint` |
+| `d1 + d2` | `decimal(13,4)` |
+| `d1 * d2` | `decimal(17,6)` |
+| `d1 / d2` | `decimal(21,9)` |
+| `a / b` | `double` — `/` is not integer division |
+| `s = a` | `boolean`, implicit cross-type comparison |
+
+These are the rules the `SparkFunctionRegistry` has to reproduce, they are
+mechanical to get wrong, and hundreds of cases can be harvested for the cost of
+one Spark startup.
+
+**3. Per-row evaluation, for three-valued logic.** `a > 0` over `[1, null, -2]`
+gives `[true, null, false]`; `a > 0 AND b > 5` gives `[true, false, false]`, the
+null absorbed rather than propagated; `NOT (a > 0)` gives `[false, null, true]`;
+`a <=> NULL` gives `[false, true, false]`.
+
+**Pin the session config, and record it with the expectations.** "What does
+Spark do" is not well-formed on its own. Flipping `spark.sql.ansi.enabled`
+changes answers on the same data, including turning results into errors:
+
+| expression | `ansi=false` | `ansi=true` |
+|---|---|---|
+| `a / 0` | `[null, null, null]` | `DIVIDE_BY_ZERO` |
+| `CAST('abc' AS INT)` | `[null, null, null]` | `CAST_INVALID_INPUT` |
+
+`spark.sql.session.timeZone` and `spark.sql.storeAssignmentPolicy` matter the
+same way. The value to match is whatever Delta uses when it validates a
+constraint, which is a separate question from the session default and should be
+established before the corpus is harvested.
+
+**Sequencing.** Oracles 1 and 2 need no EngineeredWood code at all. The
+precedence and coercion corpora can be harvested as static fixtures before the
+parser is written and developed against offline, which moves differential
+testing from something that follows phase 10 to something that precedes phase 9.
+
 ## Open Questions
 
 1. **Where does `EngineeredWood.Expressions` live in the dependency graph?** It
@@ -996,3 +1070,51 @@ batch — mask them out of step and row identities silently detach from their ro
 
 5. **Should `ReadRowGroupAsync` also accept a filter?** Currently only
    `ReadAllAsync` would use it. Defer until page-level pushdown exists.
+
+6. **Where do per-format expression semantics live — one shared tree, or a
+   dialect AST per format lowered into one?** Open, and deliberately undecided;
+   raised while sizing phase 9 because the parser is the first front end that
+   would exercise the answer. Sharing nothing is ruled out. The two live options
+   are (a) one shared tree both front ends emit into, dialect differences carried
+   by an evaluation policy, which is the status quo — `23cfc4e` migrated Iceberg
+   off its parallel expression types onto this library — and (b) a dialect AST
+   per format, lowered into a shared tree.
+
+   What the code says, as of this writing:
+
+   - **The symmetry option (b) assumes is not there.** Delta stores Spark SQL
+     strings in table metadata and needs a real parser. Iceberg has no expression
+     grammar to parse: its partition transforms are a closed record hierarchy in
+     `EngineeredWood.Iceberg/Transform.cs` (`Identity`, `Bucket(int)`,
+     `Truncate(int)`, `Year`/`Month`/`Day`/`Hour`, `Void`) decoded from JSON by
+     `TransformConverter`, and its predicates arrive programmatically from the
+     host. So "a parser per format emitting into a tree" is one parser plus a
+     JSON decoder that already exists.
+   - **`FunctionCall` has no producers.** It is constructed only by the two
+     `Expressions.Call` factories and Iceberg's compatibility shim, and consumed
+     by `ExpressionBinder` and the four evaluators as pass-through-or-throw.
+     Iceberg partition transforms never become `FunctionCall`s. The open-ended,
+     string-keyed node that exists *because of* Iceberg's transform pattern is
+     not used for Iceberg transforms or for anything else, and the Spark parser
+     would be its first real producer.
+   - **The formats agree where the tree is most used.** `StringOrdering` records
+     that Parquet, Delta, Iceberg and Vortex all specify string min/max ordering
+     over UTF-8 bytes. Divergence is concentrated in row-level evaluation, which
+     is Delta-only today.
+
+   A useful way to sort the question when it is taken up: for each expected
+   semantic difference, ask whether it resolves at lowering time (Spark
+   `LIKE 'x%'` to `StartsWith`, `<>` to `Not(Equal)`), is pervasive and live
+   (decimal promotion, ANSI cast and overflow, division by zero), or is
+   localized and live (a named function one format has and the other does not).
+   Only a fourth kind — structural, with no representation in the shared tree and
+   no lowering into one — would actually require (b), and none has been found
+   for Iceberg. Pervasive differences argue against encoding dialect in node
+   identity, since there are already six consumers of this tree
+   (`ExpressionBinder`, `StatisticsEvaluator`, `ArrowRowEvaluator`, Lance's
+   `IndexPruner`, Vortex's `VortexZoneStatsAccessor`, Parquet's pruner) and each
+   would have to handle both arms of every dialect-split node.
+
+   Related and equally open, from [#101](https://github.com/clast-project/engineered-wood/issues/101):
+   whether the tree gains a closed arithmetic node at all — see the note under
+   [Expression tree](#expression-tree).
