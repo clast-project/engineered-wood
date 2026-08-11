@@ -65,6 +65,22 @@ public sealed record DeltaTableOptions
     /// </summary>
     public TimeSpan VacuumRetention { get; init; } = TimeSpan.FromDays(7);
 
+    /// <summary>
+    /// Whether vacuum leaves a top-level <c>metadata/</c> directory alone. Default: true, as in Delta.
+    /// </summary>
+    /// <remarks>
+    /// <para>UniForm writes converted Iceberg metadata to <c>metadata/</c>, and the name is reserved for
+    /// it. Nothing in the Delta log references those files, so no keep-set can protect them and a sweep
+    /// would collect the lot — which is why Delta hides the directory by NAME rather than by the
+    /// underscore convention every other protected directory relies on. This library can enable
+    /// <c>icebergCompatV1</c>/<c>V2</c> itself, so the case is reachable on a table we maintain.</para>
+    ///
+    /// <para>Set false to sweep it — appropriate only when nothing is generating Iceberg metadata for
+    /// this table and the directory is known to be junk. Delta exposes the same switch
+    /// (<c>shouldIcebergMetadataDirBeHidden</c>) and defaults it the same way.</para>
+    /// </remarks>
+    public bool HideIcebergMetadataDirectory { get; init; } = true;
+
     /// <summary>Whether to collect per-column statistics on write. Default: true.</summary>
     public bool CollectStats { get; init; } = true;
 
