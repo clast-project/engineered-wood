@@ -25,4 +25,16 @@
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions.Arrow\EngineeredWood.Expressions.Arrow.csproj" />
   </ItemGroup>
 
+  <!-- Linked, not copied: the corpus is one file harvested under one pinned Spark configuration,
+       and two copies could drift apart into two different claims about what Spark does. -->
+  <ItemGroup>
+    <None Include="..\EngineeredWood.Expressions.Tests\Fixtures\spark-expression-corpus.json"
+          Link="Fixtures\spark-expression-corpus.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
+  </ItemGroup>
+
 </Project>
