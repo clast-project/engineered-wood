@@ -220,10 +220,16 @@ public static class ConflictChecker
     /// and it computes an equivalent <c>onlyAddFiles</c> and pointedly does not use it here (checked at the
     /// <c>v4.2.0</c> tag).</para>
     /// <para>The two directions are deliberately NOT symmetric, and this is where we depart from Delta: an
-    /// ABSENT flag falls back to the inference rather than to "not blind", because this library emits no flag
-    /// itself and <c>getOrElse(false)</c> would make ordinary EW-to-EW concurrent appends start conflicting.
-    /// A PRESENT flag outranks anything we could infer — including a <c>false</c> on an adds-only commit,
-    /// which is exactly the read-then-append case above.</para>
+    /// ABSENT flag falls back to the inference rather than to "not blind". A PRESENT flag outranks anything
+    /// we could infer — including a <c>false</c> on an adds-only commit, which is exactly the read-then-append
+    /// case above.</para>
+    /// <para><b>Why absent still infers, now that this library DOES emit the flag.</b> Two populations of
+    /// unflagged commit remain and neither is going away. Every commit written before that landed, on every
+    /// existing table — <c>getOrElse(false)</c> would make ordinary appends among them start conflicting.
+    /// And delta-rs writes no flag at all: <c>is_blind_append</c> is an <c>Option&lt;bool&gt;</c> with
+    /// <c>skip_serializing_if = "Option::is_none"</c> that nothing computes (checked 2026-08-11), so on a
+    /// table delta-rs maintains the inference is not a fallback, it is the whole answer. Improving it is
+    /// tracked separately.</para>
     /// </remarks>
     internal static bool IsBlindAppend(IReadOnlyList<DeltaAction> actions)
     {

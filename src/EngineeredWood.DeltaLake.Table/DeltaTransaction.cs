@@ -181,12 +181,17 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <para>A property rather than a per-call argument for the same reason as <see cref="Operation"/>: it
     /// describes the TRANSACTION, and several staging calls cannot each answer for the commit.</para>
     ///
-    /// <para><b>⚠ Null is not false, and neither is a bug.</b> A reader treats an absent flag as "not
-    /// blind" and examines the commit anyway, so saying nothing costs only spurious conflicts — the honest
-    /// answer for a host that does not track its own reads. Claiming <c>true</c> wrongly is the UNSAFE
-    /// direction: another engine then SKIPS a concurrent-append check it owed, and the conflict it should
-    /// have raised silently does not happen. Declare <c>true</c> only where the transaction genuinely read
-    /// nothing.</para>
+    /// <para><b>⚠ Null is not false, and the difference is not uniform across readers.</b> delta-spark
+    /// takes an absent flag as "not blind" and examines the commit, so against it silence costs only
+    /// spurious conflicts. This library's own <see cref="Concurrency.ConflictChecker"/> instead infers from
+    /// the commit's shape when the flag is absent, and an adds-only commit infers as BLIND — so against a
+    /// later EW reader, silence on a staged append is read as a claim this transaction never made. <b>A
+    /// host that knows it read should set <c>false</c> rather than leave this null</b>; null is for a host
+    /// that genuinely does not know.</para>
+    ///
+    /// <para>Claiming <c>true</c> wrongly is the UNSAFE direction whichever reader sees it: the concurrent-
+    /// append check is skipped and the conflict that was owed silently does not happen. Declare
+    /// <c>true</c> only where the transaction genuinely read nothing.</para>
     ///
     /// <para>This library cannot derive it for a host with its own data plane. A transaction records the
     /// reads made THROUGH it, but a host that scanned the table itself and then staged the result has made

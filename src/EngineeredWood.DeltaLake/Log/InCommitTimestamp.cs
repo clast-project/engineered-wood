@@ -129,9 +129,12 @@ public static class InCommitTimestamp
     /// field is added only when the table has in-commit timestamps enabled. No-op if a commitInfo is already present.
     /// </summary>
     /// <param name="isBlindAppend">The transaction's own claim about whether it READ anything — Delta's
-    /// <c>commitInfo.isBlindAppend</c>. <c>null</c> writes NO field, which is not the same as <c>false</c>:
-    /// a reader treats an absent flag as "not blind" and examines the commit anyway, so saying nothing is
-    /// the conservative answer and the only honest one for a caller that does not track its reads.</param>
+    /// <c>commitInfo.isBlindAppend</c>. <c>null</c> writes NO field, which is not the same as <c>false</c>,
+    /// and which readers do not all resolve the same way: delta-spark takes an absent flag as "not blind"
+    /// and examines the commit, while this library's own <see cref="Concurrency.ConflictChecker"/> falls
+    /// back to inferring from the commit's shape and reads an adds-only commit as blind. So silence is the
+    /// honest answer for a caller that does not track its reads, but a caller that KNOWS it read should
+    /// pass <c>false</c> — see <see cref="LogCommitRequest.IsBlindAppend"/>.</param>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<string, string>? configuration,

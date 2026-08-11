@@ -120,10 +120,16 @@ public sealed record LogCommitRequest
     /// anything the other one changed.
     ///
     /// <para><b>⚠ Three states, and <c>null</c> is the default for a reason.</b> <c>null</c> writes NO
-    /// field. That is NOT the same as <c>false</c> in intent even though a reader treats them alike
-    /// (Delta's <c>isBlindAppendOption.getOrElse(false)</c>): saying nothing is the honest answer for a
-    /// caller that does not track its reads, and it costs only spurious conflicts. Claiming <c>true</c>
+    /// field, which is the honest answer for a caller that does not track its reads. Claiming <c>true</c>
     /// wrongly is the UNSAFE direction — another engine then SKIPS a check it owes.</para>
+    ///
+    /// <para><b>⚠ But absent does not mean the same thing to every reader, so silence is not uniformly
+    /// safe.</b> delta-spark reads <c>isBlindAppendOption.getOrElse(false)</c> and examines the commit, so
+    /// against it silence costs only spurious conflicts. This library's own
+    /// <see cref="Concurrency.ConflictChecker"/> instead falls back to inferring from the commit's shape,
+    /// and an adds-only commit infers as BLIND — so against a later EW reader, silence on an adds-only
+    /// commit is read as a blind-append claim we never made. <b>A caller that knows it read should say
+    /// <c>false</c> rather than say nothing.</b> Silence is for a caller that genuinely does not know.</para>
     ///
     /// <para><b>⚠ It is NOT derived from <see cref="Reads"/>, deliberately.</b> <see cref="ReadSet.Blind"/>
     /// is the DEFAULT, so it means "this caller said nothing about its reads" — not "this caller declares
