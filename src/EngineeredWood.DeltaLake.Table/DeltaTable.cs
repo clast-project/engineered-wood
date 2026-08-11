@@ -1785,6 +1785,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             snapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -1850,6 +1852,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
             .ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
         return newVersion;
     }
 
@@ -2121,6 +2125,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -2159,6 +2165,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -5121,16 +5129,37 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // duplicated work under the classic form, which overwrites one fixed path, but a V2 checkpoint is
         // UUID-named, so the second write leaves the first behind as a file nothing references and nothing
         // collects (VacuumExecutor excludes _delta_log).
-        if (!blindAppend &&
-            committedVersion > snapshot.Version &&
-            _options.CheckpointInterval > 0 &&
-            committedVersion % _options.CheckpointInterval == 0)
-        {
-            await _checkpointWriter.WriteCheckpointAsync(
-                CurrentSnapshot, cancellationToken).ConfigureAwait(false);
-        }
+        if (!blindAppend && committedVersion > snapshot.Version)
+            await CheckpointIfDueAsync(committedVersion, cancellationToken).ConfigureAwait(false);
 
         return committedVersion;
+    }
+
+    /// <summary>
+    /// Writes the interval checkpoint for a version that has just committed, if that version is one the
+    /// interval falls on. The commit paths that do NOT go through <see cref="LogCommitter"/> — the
+    /// overwrite family, OPTIMIZE, and the metadata-only changes — each call this; the ones that do get
+    /// the same check from the committer instead, and must not call it as well.
+    /// </summary>
+    /// <remarks>
+    /// <para>Call only AFTER the post-commit snapshot refresh: the checkpoint is written from
+    /// <see cref="CurrentSnapshot"/>, and is named for the version that snapshot is at. Under a concurrent
+    /// writer that can be a LATER version than <paramref name="committedVersion"/> — which is fine, since
+    /// what gets written is a real checkpoint of a real version either way, and it is the behaviour the
+    /// batch write path has always had.</para>
+    ///
+    /// <para><c>CheckpointInterval = 0</c> is "never checkpoint", an absolute caller override — a host may
+    /// be driving checkpoints on a cadence of its own and must not have one appear underneath it.</para>
+    /// </remarks>
+    private ValueTask CheckpointIfDueAsync(long committedVersion, CancellationToken cancellationToken)
+    {
+        if (_options.CheckpointInterval <= 0
+            || committedVersion % _options.CheckpointInterval != 0)
+        {
+            return default;
+        }
+
+        return _checkpointWriter.WriteCheckpointAsync(CurrentSnapshot, cancellationToken);
     }
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
@@ -7687,6 +7716,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             _currentSnapshot = await SnapshotBuilder.UpdateAsync(
                 CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+            // OPTIMIZE is the operation with the most reason to checkpoint: it removes every file it
+            // rewrote, so the commit it writes is the largest the table produces, and a log replay that
+            // cannot start from a checkpoint reads all of it.
+            await CheckpointIfDueAsync(result.Value, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
