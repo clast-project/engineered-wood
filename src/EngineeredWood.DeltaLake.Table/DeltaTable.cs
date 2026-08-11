@@ -7859,7 +7859,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             ?? _options.VacuumRetention;
 
         return await Vacuum.VacuumExecutor.ExecuteAsync(
-            _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
+            _fs, _log, CurrentSnapshot, retention, dryRun,
+            _options.HideIcebergMetadataDirectory, cancellationToken)
             .ConfigureAwait(false);
     }
 
