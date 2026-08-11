@@ -2654,11 +2654,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
-                // NOT checkpointed here, matching the behaviour this loop has always had: only the batch
-                // write path (CommitWriteAsync) and CommitDataFilesAsync auto-checkpoint, so a table written
-                // exclusively through DML never gets one. Worth revisiting — it is an accident of where the
-                // call happened to sit rather than a decision — but it is not this refactoring's to change.
-                WriteCheckpointOnInterval = false,
+                // Checkpoint here too. This line used to be `false`, with a comment calling it "an
+                // accident of where the call happened to sit rather than a decision" — see #86.
+                //
+                // This loop carries the transaction commit, both DELETE paths (deletion-vector and
+                // copy-on-write), UpdateAsync, UpdateRowsAsync, and the blind append. Opting out here meant
+                // a table written through anything but a plain batch append never got a checkpoint, and so
+                // never published a `_last_checkpoint` either. Three consequences, compounding: every open
+                // replays the log from v0; foreign readers get no resume hint; and commits accumulate
+                // without bound, because log cleanup is defined in terms of what a checkpoint subsumes, so
+                // with no checkpoint nothing can ever be reclaimed.
+                //
+                // OPTIMIZE and the metadata-only changes do NOT come through here — they commit through
+                // TransactionLog directly and get the same interval check from CheckpointIfDueAsync.
+                //
+                // No new mechanism — the condition (interval reached, writer present) and the ordering
+                // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
+                // own, identical to the batch write path that already sets this. LogCommitRequest's default
+                // is already true; this stops opting out.
+                WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
                 // refreshing from it replays fewer versions for the same result.
                 RefreshFrom = CurrentSnapshot,
@@ -5101,7 +5115,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Auto-checkpoint on the version that actually committed (a rebased append may differ from the
         // read version + 1). Skipped when nothing was staged (an all-empty append returns the read
         // version without committing).
-        if (committedVersion > snapshot.Version &&
+        //
+        // The OVERWRITE family only: a blind append goes through the OCC loop above, which checkpoints on
+        // the interval itself. Running both would write the interval's checkpoint TWICE — harmless
+        // duplicated work under the classic form, which overwrites one fixed path, but a V2 checkpoint is
+        // UUID-named, so the second write leaves the first behind as a file nothing references and nothing
+        // collects (VacuumExecutor excludes _delta_log).
+        if (!blindAppend &&
+            committedVersion > snapshot.Version &&
             _options.CheckpointInterval > 0 &&
             committedVersion % _options.CheckpointInterval == 0)
         {
