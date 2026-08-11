@@ -58,8 +58,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
             CheckpointInterval = options.CheckpointInterval,
-            // Shared with the table's own explicit CheckpointAsync, so both write checkpoints under the
-            // caller's parquet options rather than the committer's defaults.
+            // Shared with CheckpointAsync and with CheckpointIfDueAsync, so every checkpoint this table
+            // writes — on the interval, from either commit trigger, or because a caller asked — uses the
+            // caller's parquet options and checkpoint format rather than the committer's defaults.
             CheckpointWriter = _checkpointWriter,
             PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
         });
@@ -1785,6 +1786,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             snapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -1850,6 +1853,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
             .ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
         return newVersion;
     }
 
@@ -2121,6 +2126,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -2159,6 +2166,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -2654,11 +2663,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
-                // NOT checkpointed here, matching the behaviour this loop has always had: only the batch
-                // write path (CommitWriteAsync) and CommitDataFilesAsync auto-checkpoint, so a table written
-                // exclusively through DML never gets one. Worth revisiting — it is an accident of where the
-                // call happened to sit rather than a decision — but it is not this refactoring's to change.
-                WriteCheckpointOnInterval = false,
+                // Checkpoint here too. This line used to be `false`, with a comment calling it "an
+                // accident of where the call happened to sit rather than a decision" — see #86.
+                //
+                // This loop carries the transaction commit, both DELETE paths (deletion-vector and
+                // copy-on-write), UpdateAsync, UpdateRowsAsync, and the blind append. Opting out here meant
+                // a table written through anything but a plain batch append never got a checkpoint, and so
+                // never published a `_last_checkpoint` either. Three consequences, compounding: every open
+                // replays the log from v0; foreign readers get no resume hint; and commits accumulate
+                // without bound, because log cleanup is defined in terms of what a checkpoint subsumes, so
+                // with no checkpoint nothing can ever be reclaimed.
+                //
+                // OPTIMIZE and the metadata-only changes do NOT come through here — they commit through
+                // TransactionLog directly and get the same interval check from CheckpointIfDueAsync.
+                //
+                // No new mechanism — the condition (interval reached, writer present) and the ordering
+                // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
+                // own, identical to the batch write path that already sets this. LogCommitRequest's default
+                // is already true; this stops opting out.
+                WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
                 // refreshing from it replays fewer versions for the same result.
                 RefreshFrom = CurrentSnapshot,
@@ -4154,6 +4177,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Writes a checkpoint for the table's current version, now, whatever the interval would have said —
+    /// and publishes the <c>_last_checkpoint</c> hint that points readers at it.
+    ///
+    /// <para>Every commit path already checkpoints on
+    /// <see cref="DeltaTableOptions.CheckpointInterval"/>, so this is not needed to keep a table
+    /// checkpointed. It is for a host with a cadence of its own: one that sets
+    /// <c>CheckpointInterval = 0</c> to take the decision entirely, or that wants a checkpoint at a moment
+    /// it knows to be a good one — after a bulk load, before handing the table to another engine — rather
+    /// than at whichever commit happens to land on a multiple.</para>
+    ///
+    /// <para>The checkpoint is written under the table's own
+    /// <see cref="DeltaTableOptions.ParquetWriteOptions"/> and
+    /// <see cref="DeltaTableOptions.CheckpointFormat"/>, which is the reason for having this rather than
+    /// constructing a <see cref="Checkpoint.CheckpointWriter"/> at the call site: that duplicates the
+    /// table's configuration, and a copy of a policy is a copy that drifts.</para>
+    ///
+    /// <para>Writing a checkpoint is not free — it materialises the whole active-file set — and it is
+    /// idempotent in effect but not in cost, so calling it per commit is a way to pay for checkpointing
+    /// twice. Concurrent writers are safe: a classic checkpoint overwrites one fixed path with identical
+    /// content, and a V2 one is UUID-named, so neither can corrupt the other.</para>
+    /// </summary>
+    /// <returns>The version checkpointed.</returns>
+    public async ValueTask<long> CheckpointAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        var snapshot = CurrentSnapshot;
+        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        return snapshot.Version;
+    }
+
+    /// <summary>
     /// Reads the table — one entry point for every combination of projection, pruning, version and per-row
     /// metadata. See <see cref="DeltaReadOptions"/>; passing null reads every column of the current snapshot
     /// with no metadata, i.e. the same as <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>.
@@ -5101,15 +5156,43 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Auto-checkpoint on the version that actually committed (a rebased append may differ from the
         // read version + 1). Skipped when nothing was staged (an all-empty append returns the read
         // version without committing).
-        if (committedVersion > snapshot.Version &&
-            _options.CheckpointInterval > 0 &&
-            committedVersion % _options.CheckpointInterval == 0)
-        {
-            await _checkpointWriter.WriteCheckpointAsync(
-                CurrentSnapshot, cancellationToken).ConfigureAwait(false);
-        }
+        //
+        // The OVERWRITE family only: a blind append goes through the OCC loop above, which checkpoints on
+        // the interval itself. Running both would write the interval's checkpoint TWICE — harmless
+        // duplicated work under the classic form, which overwrites one fixed path, but a V2 checkpoint is
+        // UUID-named, so the second write leaves the first behind as a file nothing references and nothing
+        // collects (VacuumExecutor excludes _delta_log).
+        if (!blindAppend && committedVersion > snapshot.Version)
+            await CheckpointIfDueAsync(committedVersion, cancellationToken).ConfigureAwait(false);
 
         return committedVersion;
+    }
+
+    /// <summary>
+    /// Writes the interval checkpoint for a version that has just committed, if that version is one the
+    /// interval falls on. The commit paths that do NOT go through <see cref="LogCommitter"/> — the
+    /// overwrite family, OPTIMIZE, and the metadata-only changes — each call this; the ones that do get
+    /// the same check from the committer instead, and must not call it as well.
+    /// </summary>
+    /// <remarks>
+    /// <para>Call only AFTER the post-commit snapshot refresh: the checkpoint is written from
+    /// <see cref="CurrentSnapshot"/>, and is named for the version that snapshot is at. Under a concurrent
+    /// writer that can be a LATER version than <paramref name="committedVersion"/> — which is fine, since
+    /// what gets written is a real checkpoint of a real version either way, and it is the behaviour the
+    /// batch write path has always had.</para>
+    ///
+    /// <para><c>CheckpointInterval = 0</c> is "never checkpoint", an absolute caller override — a host may
+    /// be driving checkpoints on a cadence of its own and must not have one appear underneath it.</para>
+    /// </remarks>
+    private ValueTask CheckpointIfDueAsync(long committedVersion, CancellationToken cancellationToken)
+    {
+        if (_options.CheckpointInterval <= 0
+            || committedVersion % _options.CheckpointInterval != 0)
+        {
+            return default;
+        }
+
+        return _checkpointWriter.WriteCheckpointAsync(CurrentSnapshot, cancellationToken);
     }
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
@@ -7666,6 +7749,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             _currentSnapshot = await SnapshotBuilder.UpdateAsync(
                 CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+            // OPTIMIZE is the operation with the most reason to checkpoint: it removes every file it
+            // rewrote, so the commit it writes is the largest the table produces, and a log replay that
+            // cannot start from a checkpoint reads all of it.
+            await CheckpointIfDueAsync(result.Value, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
