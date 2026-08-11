@@ -27,16 +27,25 @@ namespace EngineeredWood.DeltaLake.Log;
 /// one would produce exactly that, so the walk stops at the first file it may not delete instead of
 /// skipping it.</para>
 ///
-/// <para><b>⚠ A V2 checkpoint's SIDECARS are not reclaimed, deliberately.</b> Deleting an expired
+/// <para><b>⚠ A V2 checkpoint's SIDECARS are not reclaimed.</b> Deleting an expired
 /// <c>&lt;version&gt;.checkpoint.&lt;uuid&gt;.json</c> leaves whatever it referenced in
 /// <c>_delta_log/_sidecars/</c> behind, and nothing else collects it either — <c>VacuumExecutor</c>
-/// excludes <c>_delta_log</c> entirely. The tempting fix, deleting each expired checkpoint's own sidecars,
-/// is WRONG: nothing in PROTOCOL.md makes a sidecar exclusive to one checkpoint, and delta-spark
-/// deliberately REUSES them across checkpoints rather than rewriting a large file list, so a surviving
-/// checkpoint may reference a sidecar an expired one also named. Reclaiming them safely means marking the
-/// set every surviving checkpoint references and sweeping the remainder, which is a different piece of
-/// work with its own failure mode — see upstream #111. Until then this reclaims commits and checkpoint files and leaves
-/// sidecars — strictly better than the nothing it replaces, and not a step toward deleting a live one.</para>
+/// excludes <c>_delta_log</c> entirely. See upstream #111; the short version is that deleting each
+/// expired checkpoint's OWN sidecars is not the safe shortcut it looks like.</para>
+///
+/// <para>Two reasons, and the first is the one that bites today. A concurrent writer's sidecars exist
+/// BEFORE the checkpoint that names them, so "referenced by no checkpoint I can see" does not mean dead —
+/// it may mean a checkpoint is mid-publish. And nothing in PROTOCOL.md makes a sidecar exclusive to one
+/// checkpoint: verified 2026-08-10 that neither delta-spark's <c>Checkpoints.scala</c> nor
+/// delta-kernel-rs's checkpoint writer reuses one today (both write a fresh set every checkpoint), but
+/// the spec permits it, and reuse is a change WE may want — rewriting an unchanged multi-million-row file
+/// list per checkpoint is the cost that makes V2 checkpoints expensive on a streaming table. A cleanup
+/// that assumes exclusivity would have to be revisited by exactly that work.</para>
+///
+/// <para>So reclaiming sidecars means marking the set every surviving checkpoint references and sweeping
+/// the remainder, which is its own change. Until then this reclaims commits and checkpoint files and
+/// leaves sidecars — strictly better than the nothing it replaces, and not a step toward deleting a live
+/// one.</para>
 /// </summary>
 internal static class LogCleanup
 {
