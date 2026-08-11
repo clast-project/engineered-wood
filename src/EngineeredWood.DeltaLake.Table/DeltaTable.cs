@@ -4239,6 +4239,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// idempotent in effect but not in cost, so calling it per commit is a way to pay for checkpointing
     /// twice. Concurrent writers are safe: a classic checkpoint overwrites one fixed path with identical
     /// content, and a V2 one is UUID-named, so neither can corrupt the other.</para>
+    ///
+    /// <para><b>⚠ This also runs log cleanup</b>, deleting commits the new checkpoint covers that are older
+    /// than the table's <c>delta.logRetentionDuration</c> — the same thing an automatic checkpoint does,
+    /// because it is the checkpoint that makes those files redundant and not the reason it was written.
+    /// A table that wants the checkpoint without the reclaim sets
+    /// <c>delta.enableExpiredLogCleanup = false</c>.</para>
     /// </summary>
     /// <returns>The version checkpointed.</returns>
     public async ValueTask<long> CheckpointAsync(CancellationToken cancellationToken = default)
@@ -4246,7 +4252,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
 
         var snapshot = CurrentSnapshot;
-        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        await WriteCheckpointAndCleanUpLogAsync(snapshot, cancellationToken).ConfigureAwait(false);
         return snapshot.Version;
     }
 
@@ -5234,7 +5240,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return default;
         }
 
-        return _checkpointWriter.WriteCheckpointAsync(CurrentSnapshot, cancellationToken);
+        return WriteCheckpointAndCleanUpLogAsync(CurrentSnapshot, cancellationToken);
+    }
+
+    /// <summary>
+    /// Writes a checkpoint and then reclaims what it made redundant. The single place a checkpoint is
+    /// written from this layer, so the two cannot come apart.
+    /// </summary>
+    /// <remarks>
+    /// <para>The pairing is the point. Log cleanup deletes only what a checkpoint covers, so a checkpoint
+    /// becoming durable is the one moment the work is both legitimate and worth doing — which means every
+    /// checkpoint trigger owes a cleanup, and a trigger that writes one without the other quietly stops
+    /// reclaiming on whichever commit paths reach it. There are two triggers left in this class
+    /// (<see cref="CheckpointIfDueAsync"/> and <see cref="CheckpointAsync"/>) and one in
+    /// <see cref="LogCommitter"/>; that is three chances to wire a checkpoint and forget the cleanup, and
+    /// it has already happened once — the interval itself drifted the same way twice, which is why the
+    /// tests assert cleanup per trigger rather than once.</para>
+    ///
+    /// <para>Ordering: the checkpoint must be DURABLE before anything is deleted, or a failure between the
+    /// two leaves commits removed with nothing covering them.</para>
+    /// </remarks>
+    private async ValueTask WriteCheckpointAndCleanUpLogAsync(
+        Snapshot.Snapshot snapshot, CancellationToken cancellationToken)
+    {
+        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+
+        await Log.LogCleanup.RunAsync(
+            _log, snapshot.Metadata.Configuration, snapshot.Version,
+            DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
     }
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
