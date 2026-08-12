@@ -889,26 +889,30 @@ in Parquet, and no Iceberg-side schema bridge to Arrow or Parquet.
 
 ### Missing features
 
-**Spark SQL parser.** Phase 9 of the predicate-pushdown design is not
-implemented. `Expression` / `Predicate` trees must be built in code via
-the `Expressions` static factory. This blocks any feature that needs to
-parse SQL expression strings from table metadata — notably Delta CHECK
-constraints and generated columns.
+**Nothing consumes the Spark SQL parser yet.** Phase 9 shipped on
+2026-08-11 — `SparkSqlParser` turns a constraint or generation
+expression into a tree, and `SparkFunctionRegistry` evaluates it over
+Arrow. But no table layer calls either: Delta still refuses a write to a
+table carrying `delta.constraints.*` or `delta.generationExpression`
+rather than validating it. That wiring is phase 10 /
+[#102](https://github.com/clast-project/engineered-wood/issues/102).
 
-The approach is settled: a hand-written tokenizer and recursive-descent
-parser inside `EngineeredWood.Expressions`, not the separate
-ANTLR-based `EngineeredWood.SparkSql` package earlier revisions of the
-design specified. See
-[`predicate-pushdown-design.md`](predicate-pushdown-design.md#the-spark-sql-parser)
-and [#101](https://github.com/clast-project/engineered-wood/issues/101).
+**Gaps inside the parser and registry**, each of which refuses by name
+rather than producing a wrong answer:
 
-**Built-in function registry.** `ArrowRowEvaluator` accepts an optional
-`IFunctionRegistry`, but the library ships no implementations.
-`FunctionCall` expressions throw at evaluation time unless the caller
-supplies a registry. A `SparkFunctionRegistry` is planned alongside the
-parser, and is the larger half of that phase: the tree has no arithmetic
-node, so `a + b` lowers to `FunctionCall("+")` and every type-coercion
-rule is registry work.
+- Decimal arithmetic is computed in `System.Decimal`, so values past its
+  range — Spark reaches precision 38 — cannot be evaluated exactly and
+  are refused
+  ([#131](https://github.com/clast-project/engineered-wood/issues/131)).
+- The timezone for temporal conversions is fixed at UTC. Honouring a
+  session timezone needs the parser to carry a zone-less temporal form,
+  which is also what `TIMESTAMP_NTZ` would need
+  ([#133](https://github.com/clast-project/engineered-wood/issues/133)).
+- `INTERVAL` literals, the `Y` and `S` literal suffixes, subqueries,
+  window functions and `*` are outside the parser's grammar, and
+  `current_date` / `current_timestamp` are deliberately absent because
+  they are non-deterministic — which Delta forbids in a constraint or
+  generated column anyway.
 
 **No table layer can push a predicate into the Parquet reader.** Row-group
 pruning and bloom probing are implemented and tested, but nothing in `src/` sets
