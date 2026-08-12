@@ -674,13 +674,19 @@ public IAsyncEnumerable<RecordBatch> ReadAllAsync(
 
 ### CHECK constraints
 
-> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102)),
-> but no longer blocked: phase 9 shipped, so the parser and the evaluator this
-> needs both exist. What ships today is still the fail-closed guard —
-> `DeltaTable.HonorWriterFeatures` detects an active `delta.constraints.*` and
-> rejects the write rather than committing rows it cannot validate. The design
-> below is the intended replacement, and `DeltaTableOptions.ExpressionParser`
-> does not exist yet.
+> **Implemented** for CHECK constraints and invariants, on the write paths that
+> hold the batches. `DeltaConstraintEnforcer` parses `delta.constraints.*` and
+> `delta.invariants` and evaluates them per batch before anything is written;
+> a violation refuses the commit with `DELTA_VIOLATE_CONSTRAINT`.
+>
+> The fail-closed guard did not go away, it narrowed. An expression that cannot
+> be parsed or cannot be evaluated still refuses, and so does any path that never
+> sees the rows — `HonorWriterFeatures` takes a `rowsWillBeValidated` flag that
+> only the validating paths pass, defaulting to the refusing answer so a path
+> added later inherits it.
+>
+> `DeltaTableOptions.ExpressionParser` still does not exist: the built-in parser
+> is used directly, and an override has had no caller to justify it.
 
 On write, parse `delta.constraints.{name}` into a `Predicate`, evaluate against
 each batch, and abort if any row fails:

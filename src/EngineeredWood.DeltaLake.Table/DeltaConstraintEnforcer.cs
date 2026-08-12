@@ -129,13 +129,14 @@ internal sealed class DeltaConstraintEnforcer
 
             for (var row = 0; row < batch.Length; row++)
             {
-                if (result.GetValue(row) is true)
+                var satisfied = result.GetValue(row);
+                if (satisfied is true)
                     continue;
 
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.ConstraintViolated,
                     $"{rule.Description} ({rule.Sql}) is violated by a row being written"
-                    + (result.GetValue(row) is null
+                    + (satisfied is null
                         ? " — the expression evaluated to null, which the protocol requires be "
                           + "treated as a violation rather than a pass."
                         : ".")

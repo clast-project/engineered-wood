@@ -254,7 +254,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        // ComputeWriteActionsAsync below evaluates the table's constraints against these batches,
+        // so the gate must not refuse the table first. The staging and DML paths deliberately do
+        // not say this: none of them route through that method, so none of them validate.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: true,
+            rowsWillBeValidated: DeltaConstraintEnforcer.Declares(_baseSnapshot));
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,

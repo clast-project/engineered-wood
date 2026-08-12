@@ -889,13 +889,24 @@ in Parquet, and no Iceberg-side schema bridge to Arrow or Parquet.
 
 ### Missing features
 
-**Nothing consumes the Spark SQL parser yet.** Phase 9 shipped on
-2026-08-11 — `SparkSqlParser` turns a constraint or generation
-expression into a tree, and `SparkFunctionRegistry` evaluates it over
-Arrow. But no table layer calls either: Delta still refuses a write to a
-table carrying `delta.constraints.*` or `delta.generationExpression`
-rather than validating it. That wiring is phase 10 /
+**Generated columns are still refused.** CHECK constraints and
+invariants are now enforced — `DeltaConstraintEnforcer` parses
+`delta.constraints.*` and `delta.invariants` and evaluates them against
+the rows being written, refusing the commit on a violation, on an
+expression it cannot parse, or on one it cannot evaluate. A column
+carrying `delta.generationExpression` still refuses every write, because
+generating a column means rewriting the batch rather than inspecting it.
+Remaining half of phase 10 /
 [#102](https://github.com/clast-project/engineered-wood/issues/102).
+
+**Constraint enforcement is per write path, not global.** Only paths
+that hand us the batches evaluate anything: `WriteAsync`, the
+transactional append, and create-with-data. `StageDataFiles` and
+`CommitDataFilesAsync` take finished Parquet files and so keep refusing
+a constrained table outright — there is nothing to check the rows
+against. `UPDATE` and `DELETE` refuse for the same reason, which is
+conservative rather than principled: an UPDATE changes values and ought
+to be re-validated once that path can.
 
 **Gaps inside the parser and registry**, each of which refuses by name
 rather than producing a wrong answer:

@@ -129,6 +129,44 @@ public class WriterFeatureEnforcementTests : IDisposable
     }
 
     [Fact]
+    public async Task TheTransactionalAppendEnforcesTheSameConstraint()
+    {
+        // The gate and the enforcer have to agree per path. This one routes through
+        // ComputeWriteActionsAsync and therefore validates, so refusing it up front would have
+        // left the transactional surface unable to write a constrained table at all — which is
+        // exactly what happened before this test existed.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        await using (var ok = table.StartTransaction())
+        {
+            await ok.WriteAsync([Batch(1)]);
+            await ok.CommitAsync();
+        }
+
+        await using var bad = table.StartTransaction();
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await bad.WriteAsync([Batch(-1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task APathThatCannotSeeTheRowsStillRefuses()
+    {
+        // StageDataFiles takes finished Parquet files, so there is nothing to check them against.
+        // Refusing is the only honest answer, and it must survive constraints becoming
+        // enforceable elsewhere.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        await using var tx = table.StartTransaction();
+        var ex = Assert.Throws<DeltaFormatException>(() => tx.StageDataFiles([]));
+
+        Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
+    }
+
+    [Fact]
     public async Task AConstraintThisWriterCannotParseStillRefusesTheWrite()
     {
         // The fail-closed guarantee survives evaluation: a constraint outside the parser's grammar

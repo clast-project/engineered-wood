@@ -710,9 +710,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // a second place for it to drift.
         return await provisionalTable.CollectOnFailureAsync(async written =>
         {
+            // Both gates guard a call to ComputeWriteActionsAsync below, which evaluates the
+            // constraints against initialBatches.
             if (previousSnapshot is not null)
-                provisionalTable.ValidateWritable(previousSnapshot, isAppend: false);
-            provisionalTable.ValidateWritable(provisionalSnapshot, isAppend: true);
+            {
+                provisionalTable.ValidateWritable(
+                    previousSnapshot, isAppend: false,
+                    rowsWillBeValidated: DeltaConstraintEnforcer.Declares(previousSnapshot));
+            }
+
+            provisionalTable.ValidateWritable(
+                provisionalSnapshot, isAppend: true,
+                rowsWillBeValidated: DeltaConstraintEnforcer.Declares(provisionalSnapshot));
             var (writeActions, _) = await provisionalTable.ComputeWriteActionsAsync(
                 provisionalSnapshot,
                 initialBatches,
