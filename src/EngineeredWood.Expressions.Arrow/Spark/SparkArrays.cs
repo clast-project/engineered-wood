@@ -67,6 +67,16 @@ internal static class SparkArrays
 
         /// <summary>Whether the value can take part in a numeric cast at all.</summary>
         public bool IsNumeric { get; }
+
+        /// <summary>The instant this value denotes, for a date or timestamp source.</summary>
+        public DateTimeOffset? Instant { get; init; }
+
+        /// <summary>Whether the source was a calendar date rather than a timestamp.</summary>
+        /// <remarks>
+        /// The two render differently and cast differently: a timestamp becomes epoch seconds
+        /// as a number, while Spark refuses a date-to-integer cast outright.
+        /// </remarks>
+        public bool IsDate { get; init; }
     }
 
     public static long? ReadInt64(IArrowArray array, int index) => array switch
@@ -166,9 +176,44 @@ internal static class SparkArrays
         }
     }
 
+    /// <summary>The Unix epoch, as the instant a Date32 counts days from.</summary>
+    private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    /// <summary>The instant a temporal cell denotes, or null if the array is not temporal.</summary>
+    public static DateTimeOffset? ReadInstant(IArrowArray array, int index) => array switch
+    {
+        // Date32 counts days from the epoch, and a calendar date is UTC midnight of that day —
+        // which is how ArrowRowEvaluator already reads one, so literals and columns agree.
+        Date32Array a => a.IsNull(index) ? null : Epoch.AddDays(a.GetValue(index)!.Value),
+        Date64Array a => a.IsNull(index) ? null : Epoch.AddMilliseconds(a.GetValue(index)!.Value),
+        TimestampArray a => a.IsNull(index) ? null : a.GetTimestamp(index),
+        _ => null,
+    };
+
+    public static bool IsTemporal(IArrowType type) =>
+        type is Date32Type or Date64Type or TimestampType;
+
+    public static bool IsDateType(IArrowType type) => type is Date32Type or Date64Type;
+
     /// <summary>Reads a value for casting, keeping strings as strings.</summary>
     public static CastInput? ReadForCast(IArrowArray array, int index)
     {
+        if (IsTemporal(array.Data.DataType))
+        {
+            var instant = ReadInstant(array, index);
+            if (instant is null)
+                return null;
+
+            var isDate = IsDateType(array.Data.DataType);
+            return new CastInput(
+                instant.Value.ToUnixTimeSeconds(), instant.Value.ToUnixTimeSeconds(),
+                RenderInstant(instant.Value, isDate))
+            {
+                Instant = instant,
+                IsDate = isDate,
+            };
+        }
+
         if (array is StringArray strings)
             return strings.IsNull(index) ? null : new CastInput(strings.GetString(index));
 
@@ -202,6 +247,52 @@ internal static class SparkArrays
         {
             return null;
         }
+    }
+
+    /// <summary>Renders an instant the way Spark prints it.</summary>
+    /// <remarks>
+    /// Measured: a timestamp prints as <c>2026-08-11 03:00:00</c> and a date as
+    /// <c>2026-08-11</c>, both in the resolved timezone.
+    /// </remarks>
+    public static string RenderInstant(DateTimeOffset instant, bool isDate)
+    {
+        var local = TimeZoneInfo.ConvertTime(instant, SparkDialectOptions.TimeZone);
+        return isDate
+            ? local.ToString("yyyy-MM-dd", Invariant)
+            : local.ToString("yyyy-MM-dd HH:mm:ss", Invariant);
+    }
+
+    /// <summary>Builds a Date32 array from instants, taking the calendar date in the zone.</summary>
+    public static IArrowArray BuildDate32(DateTimeOffset?[] values, int rowCount)
+    {
+        var builder = new Date32Array.Builder();
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (values[i] is { } instant)
+            {
+                var local = TimeZoneInfo.ConvertTime(instant, SparkDialectOptions.TimeZone);
+                builder.Append(new DateTimeOffset(local.Date, TimeSpan.Zero));
+            }
+            else
+            {
+                builder.AppendNull();
+            }
+        }
+
+        return builder.Build();
+    }
+
+    /// <summary>Builds a microsecond UTC timestamp array from instants.</summary>
+    public static IArrowArray BuildTimestamp(DateTimeOffset?[] values, int rowCount)
+    {
+        var builder = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (values[i] is { } instant) builder.Append(instant);
+            else builder.AppendNull();
+        }
+
+        return builder.Build();
     }
 
     /// <summary>Renders a numeric cell the way Spark would print it.</summary>
@@ -355,6 +446,12 @@ internal static class SparkArrays
             "DOUBLE" => DoubleType.Default,
             "STRING" => StringType.Default,
             "BOOLEAN" or "BOOL" => BooleanType.Default,
+            "DATE" => Date32Type.Default,
+            // Microseconds in UTC, matching what the readers produce and the fixed timezone
+            // policy. TIMESTAMP_NTZ is a distinct Spark type and is deliberately not aliased
+            // here: it has no offset at all, and pretending otherwise would silently reinterpret
+            // values rather than refuse them.
+            "TIMESTAMP" => new TimestampType(TimeUnit.Microsecond, "UTC"),
             "DECIMAL" or "DEC" or "NUMERIC" => new Decimal128Type(10, 0),
             _ => throw new NotSupportedException($"cast to '{text}' is not implemented"),
         };
