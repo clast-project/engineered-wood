@@ -106,6 +106,22 @@ public static class DeltaTableErrorCodes
     /// </remarks>
     public const string UnevaluableTableExpression = "DELTA_UNEVALUABLE_TABLE_EXPRESSION";
 
+    /// <summary>
+    /// A row being written does not satisfy a CHECK constraint or a column invariant the table
+    /// declares. The whole write is refused; nothing is committed.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="UnevaluableTableExpression"/>, and the difference is the one
+    /// a caller acts on: that code says we could not evaluate the rule, this one says we did and
+    /// the data failed it.</para>
+    /// <para>A null result violates, matching the protocol's requirement that evaluating a CHECK
+    /// constraint "must return <c>true</c> for each row" — and delta-spark, whose
+    /// <c>CheckConstraintsSuite</c> asserts a violation for a null-valued expression across three
+    /// separate null origins.</para>
+    /// <para>delta-spark's equivalent is <c>DELTA_VIOLATE_CONSTRAINT_WITH_VALUES</c>.</para>
+    /// </remarks>
+    public const string ConstraintViolated = "DELTA_VIOLATE_CONSTRAINT";
+
     // ── Write modes ──
 
     /// <summary>

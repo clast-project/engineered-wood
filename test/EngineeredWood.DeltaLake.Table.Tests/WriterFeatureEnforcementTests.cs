@@ -82,23 +82,68 @@ public class WriterFeatureEnforcementTests : IDisposable
     }
 
     [Fact]
-    public async Task ActiveColumnInvariant_RejectsWrite()
+    public async Task ActiveColumnInvariant_AdmitsASatisfyingRow()
     {
-        // delta.invariants carries an arbitrary SQL expression this writer cannot evaluate — the write
-        // is rejected up front rather than committing possibly-violating rows.
+        // The invariant is now evaluated rather than refused. Its SQL arrives JSON-wrapped, which
+        // is how the legacy writer-v2 feature stores it — unlike a CHECK constraint, whose value
+        // is the SQL itself.
         await using var table = await CreateTableAsync(
             fieldMetadataJson: @"{""delta.invariants"":""{\""expression\"":{\""expression\"":\""id > 0\""}}""}");
-        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.WriteAsync([Batch(1)]));
+
+        Assert.Equal(1, await table.WriteAsync([Batch(1)]));
+    }
+
+    [Fact]
+    public async Task ActiveColumnInvariant_RefusesAViolatingRow()
+    {
+        await using var table = await CreateTableAsync(
+            fieldMetadataJson: @"{""delta.invariants"":""{\""expression\"":{\""expression\"":\""id > 0\""}}""}");
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([Batch(-1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
         Assert.Contains("invariant", ex.Message);
     }
 
     [Fact]
-    public async Task ActiveCheckConstraint_RejectsWrite()
+    public async Task ActiveCheckConstraint_AdmitsASatisfyingRow()
     {
         await using var table = await CreateTableAsync(
             configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
-        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.WriteAsync([Batch(1)]));
+
+        Assert.Equal(1, await table.WriteAsync([Batch(1)]));
+    }
+
+    [Fact]
+    public async Task ActiveCheckConstraint_RefusesAViolatingRow()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([Batch(-1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
         Assert.Contains("delta.constraints.positive_id", ex.Message);
+    }
+
+    [Fact]
+    public async Task AConstraintThisWriterCannotParseStillRefusesTheWrite()
+    {
+        // The fail-closed guarantee survives evaluation: a constraint outside the parser's grammar
+        // refuses exactly as every constraint did before, rather than being skipped as
+        // unenforceable. INTERVAL has no representation in the expression tree.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string>
+            {
+                ["delta.constraints.exotic"] = "id > INTERVAL 1 DAY",
+            });
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([Batch(1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
     }
 
     [Fact]

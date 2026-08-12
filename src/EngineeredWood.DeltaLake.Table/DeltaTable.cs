@@ -4646,7 +4646,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// writer features must be honored. Kept together so a transactional append/update/delete runs the same
     /// gate as its single-shot equivalent instead of skipping it.
     /// </summary>
-    internal void ValidateWritable(Snapshot.Snapshot snapshot, bool isAppend)
+    /// <param name="rowsWillBeValidated">
+    /// True only when the caller holds the batches and will run <see cref="DeltaConstraintEnforcer"/>
+    /// over them. Left false everywhere else, so a path that cannot see the rows keeps refusing a
+    /// table with constraints rather than committing it unchecked.
+    /// </param>
+    internal void ValidateWritable(
+        Snapshot.Snapshot snapshot, bool isAppend, bool rowsWillBeValidated = false)
     {
         ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
@@ -4655,7 +4661,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // row-tracking table missing them (spec-invalid) cannot materialize, so a rewrite is still refused.
         if (!isAppend)
             RejectRowTrackingWrite(snapshot);
-        HonorWriterFeatures(snapshot, isAppend);
+        HonorWriterFeatures(snapshot, isAppend, rowsWillBeValidated);
     }
 
     /// <summary>
@@ -4690,7 +4696,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// carry arbitrary SQL this writer cannot evaluate, so an ACTIVE one rejects the write. A table that merely
     /// LISTS these features in its writer-v7 protocol (the common case) is unaffected.
     /// </summary>
-    private static void HonorWriterFeatures(Snapshot.Snapshot snapshot, bool isAppend)
+    private static void HonorWriterFeatures(
+        Snapshot.Snapshot snapshot, bool isAppend, bool rowsWillBeValidated = false)
     {
         var cfg = snapshot.Metadata.Configuration;
         if (cfg is not null)
@@ -4704,21 +4711,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             foreach (var key in cfg.Keys)
             {
+                // Only refused when the caller is not going to check the rows. A path that hands
+                // us batches evaluates the constraint instead (DeltaConstraintEnforcer); a path
+                // that does not — the host-engine commit seam most of all — has nothing to check
+                // against, and refusing is the only honest answer. Enforcement is write-time
+                // only in Delta, so one unvalidated commit poisons the table for every reader
+                // after it.
+                if (rowsWillBeValidated)
+                    break;
+
                 if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.UnevaluableTableExpression,
-                        $"Table declares CHECK constraint '{key}' which this writer cannot evaluate; write rejected.");
+                        $"Table declares CHECK constraint '{key}' and this write path cannot evaluate it "
+                        + "against the rows; write rejected.");
                 }
             }
         }
         foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
-            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
+            if (!rowsWillBeValidated
+                && field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.UnevaluableTableExpression,
-                    $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
+                    $"Column '{field.Name}' declares an invariant expression and this write path cannot "
+                    + "evaluate it against the rows; write rejected.");
             }
             if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
             {
@@ -4786,7 +4805,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
-        ValidateWritable(snapshot, isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
+        // Declares rather than Create: the gate only needs to know a rule exists, and parsing it
+        // belongs where the rows are, in ComputeWriteActionsAsync below.
+        ValidateWritable(
+            snapshot,
+            isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
+            rowsWillBeValidated: DeltaConstraintEnforcer.Declares(snapshot));
 
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
@@ -4840,6 +4864,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
         // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
+
+        // Beside the other per-batch guard, and before anything is written: a constraint
+        // violation must leave the table untouched rather than half-written. Create parses, so an
+        // expression this writer cannot read refuses here exactly as it did before evaluation
+        // existed.
+        var enforcer = DeltaConstraintEnforcer.Create(snapshot);
+        if (enforcer is not null)
+        {
+            foreach (var batch in batches)
+                enforcer.Validate(batch);
+        }
 
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
