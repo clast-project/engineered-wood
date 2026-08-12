@@ -371,4 +371,102 @@ public class WriterFeatureEnforcementTests : IDisposable
 
         Assert.Equal(1, await table.WriteAsync([batch]));
     }
+
+    // ── UPDATE: the gate, the validator, the generator and the rewrite must agree ──────────
+
+    /// <summary>Rewrites every row's <c>id</c> to <paramref name="to"/>.</summary>
+    private static Func<RecordBatch, RecordBatch> SetId(long to) => batch =>
+    {
+        var ids = new Int64Array.Builder();
+        for (var i = 0; i < batch.Length; i++)
+            ids.Append(to);
+
+        var columns = new List<IArrowArray>();
+        for (var i = 0; i < batch.ColumnCount; i++)
+        {
+            columns.Add(string.Equals(batch.Schema.FieldsList[i].Name, "id", StringComparison.Ordinal)
+                ? ids.Build()
+                : batch.Column(i));
+        }
+
+        return new RecordBatch(batch.Schema, columns, batch.Length);
+    };
+
+    [Fact]
+    public async Task UpdateRefusesAPostImageThatViolatesAConstraint()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        await table.WriteAsync([Batch(5)]);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(-1)));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task UpdateAdmitsAPostImageThatSatisfiesTheConstraint()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        await table.WriteAsync([Batch(5)]);
+
+        var (rows, _) = await table.UpdateAsync(
+            Expressions.Expressions.GreaterThan("id", 0L), SetId(7));
+
+        Assert.Equal(1, rows);
+    }
+
+    [Fact]
+    public async Task UpdateRecomputesAGeneratedColumnRatherThanCarryingTheStaleValue()
+    {
+        // The post-image comes out of the data file, so it still holds the OLD derived value.
+        // Leaving it there would persist a generated column that disagrees with its own
+        // expression — the exact state the feature exists to prevent.
+        await using var table = await CreateGeneratedColumnTableAsync();
+        await table.WriteAsync([Batch(1)]);
+
+        await table.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(41));
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(41L, rows.Single().Id);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
+    [Fact]
+    public async Task TheTransactionalUpdateAgreesWithTheSingleShotOne()
+    {
+        // Same table, same edit, different surface. Every defect found in this area so far has
+        // been two paths disagreeing about one table rather than either being wrong alone.
+        await using var table = await CreateGeneratedColumnTableAsync();
+        await table.WriteAsync([Batch(1)]);
+
+        await using (var tx = table.StartTransaction())
+        {
+            await tx.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(41));
+            await tx.CommitAsync();
+        }
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
+    [Fact]
+    public async Task UpdateLeavesUntouchedRowsUnvalidated()
+    {
+        // Rows the predicate did not match are copied through unchanged. They were already in the
+        // table, so re-checking them would refuse an unrelated UPDATE on data another engine
+        // wrote under semantics we do not share — and would be work with nothing to find.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        // Slip a violating row past the gate the only way possible: before the constraint exists.
+        await table.WriteAsync([Batch(5)]);
+
+        var (rows, _) = await table.UpdateAsync(
+            Expressions.Expressions.GreaterThan("id", 4L), SetId(6));
+
+        Assert.Equal(1, rows);
+    }
 }

@@ -348,7 +348,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
+        // columns, so a constrained table is writable here.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false,
+            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
@@ -375,7 +380,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
+        // columns, so a constrained table is writable here.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false,
+            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,

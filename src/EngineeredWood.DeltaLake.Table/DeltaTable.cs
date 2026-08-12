@@ -3627,7 +3627,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
-        ValidateWritable(snapshot, isAppend: false); // UPDATE is a data change
+        // UPDATE is a data change, and its post-image is re-validated below, so a constrained
+        // table is writable here rather than refused.
+        ValidateWritable(
+            snapshot, isAppend: false,
+            rowsWillBeValidated: WriteTimeExpressions.Declares(snapshot));
 
         // The rewrite's post-image files are written before the commit is attempted, and there is no
         // transaction here for a host to abort — so a conflict takes them back rather than orphaning them.
@@ -3685,6 +3689,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;
+
+        // Parsed once for the whole rewrite rather than per batch. Create refuses an expression
+        // this writer cannot read, which is what keeps the UPDATE fail-closed on a table whose
+        // constraint is outside the grammar.
+        var constraints = DeltaConstraintEnforcer.Create(snapshot);
+        var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
+
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
@@ -3774,6 +3785,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     var matchBatch = TakeRowsFromBatch(batch, matchRows);
                     var updatedBatch = updater(matchBatch);
+
+                    // Only the post-image. Rows the predicate did not match are copied through
+                    // untouched: they were already in the table, so re-checking them would refuse
+                    // an unrelated UPDATE over data another engine wrote under semantics we do not
+                    // share, and would be work with nothing to find.
+                    updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+                    constraints?.Validate(updatedBatch);
+
                     outputBatches.Add(updatedBatch);
                     // Matched rows keep their id; their commit version advances to this commit (they changed).
                     outTracking?.Add(batchIds is not null
