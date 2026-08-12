@@ -290,4 +290,64 @@ public sealed class SparkNamedFunctionTests
         Assert.False(Registry.IsRegistered("current_timestamp"));
         Assert.False(Registry.IsRegistered("to_date"));
     }
+
+    // ── From review of #134 ────────────────────────────────────────────────────────────────
+
+    private static IArrowArray Decimals(int precision, int scale, params decimal[] values)
+    {
+        var b = new Decimal128Array.Builder(new Decimal128Type(precision, scale));
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    [Fact]
+    public void NullIfComparesValuesRatherThanTheirRenderings()
+    {
+        // decimal(10,2) holding 1.00 renders as "1.00" and the int as "1", so comparing text
+        // would call them different and return the value. Measured: Spark says null.
+        var batch = Batch(("d", Decimals(10, 2, 1.00m)));
+
+        Assert.Null(Assert.IsType<Decimal128Array>(Eval("nullif(d, 1)", batch)).GetValue(0));
+        Assert.Equal(1.00m, Assert.IsType<Decimal128Array>(Eval("nullif(d, 2)", batch)).GetValue(0));
+    }
+
+    [Fact]
+    public void ANonBooleanConditionFailsRatherThanQuietlyTakingTheElseBranch()
+    {
+        // Spark rejects it outright as a DATATYPE_MISMATCH. Reading it as false would take ELSE
+        // on every row — a wrong answer indistinguishable from a deliberate one.
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Throws<NotSupportedException>(() => Eval("if(a, 10, 20)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval("CASE WHEN a THEN 1 ELSE 2 END", batch));
+    }
+
+    [Fact]
+    public void AQuotedSectionOfAPatternIsALiteralAndNotValidated()
+    {
+        // `yyyy-MM-dd'T'HH:mm:ss` is the ordinary ISO 8601 spelling, and both dialects treat a
+        // quoted section as a literal. Validating its letters would refuse it.
+        var batch = Batch(("ts", Timestamps(new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero))));
+
+        Assert.Equal("2026-08-11T12:30:45", Str(@"date_format(ts, 'yyyy-MM-dd\'T\'HH:mm:ss')", batch));
+    }
+
+    [Fact]
+    public void CaseFoldingDoesNotDependOnTheProcessCulture()
+    {
+        // Without RegexOptions.CultureInvariant a Turkish locale folds 'I' to a dotless
+        // lowercase, so ILIKE would match different rows on different machines.
+        var original = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentCulture =
+                new System.Globalization.CultureInfo("tr-TR");
+
+            Assert.True(Bool("s ILIKE 'I%'", Batch(("s", Strings("index")))));
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = original;
+        }
+    }
 }

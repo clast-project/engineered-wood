@@ -139,7 +139,13 @@ internal static class SparkFunctions
         var isRegex = name == "rlike";
         var options = name == "ilike" ? RegexOptions.IgnoreCase : RegexOptions.None;
 
-        // Patterns are almost always constant, so the compiled regex is reused across rows.
+        // Case folding must not depend on the process culture: without CultureInvariant a
+        // Turkish locale folds 'I' to a dotless lowercase, so ILIKE would match different rows
+        // on different machines. Not RegexOptions.Compiled, which trades startup and AOT
+        // friendliness for throughput this does not need.
+        options |= RegexOptions.CultureInvariant;
+
+        // Patterns are almost always constant, so the constructed Regex is reused across rows.
         Regex? cached = null;
         string? cachedPattern = null;
 
@@ -160,7 +166,7 @@ internal static class SparkFunctions
                 cached = new Regex(isRegex ? pattern : LikeToRegex(pattern), options);
             }
 
-            builder.Append(isRegex ? cached.IsMatch(text) : cached.IsMatch(text));
+            builder.Append(cached.IsMatch(text));
         }
 
         return builder.Build();
@@ -258,9 +264,23 @@ internal static class SparkFunctions
 
     private static string TranslatePattern(string javaPattern)
     {
+        // A single-quoted section is a literal in both dialects, so its letters carry no meaning
+        // and must not be validated. Rejecting them would refuse `yyyy-MM-dd\'T\'HH:mm:ss`, which
+        // is the ordinary way to write an ISO 8601 timestamp.
+        var inLiteral = false;
+
         foreach (var c in javaPattern)
         {
-            if (char.IsLetter(c) && c is not ('y' or 'M' or 'd' or 'H' or 'm' or 's'))
+            if (c == '\'')
+            {
+                inLiteral = !inLiteral;
+                continue;
+            }
+
+            if (inLiteral || !char.IsLetter(c))
+                continue;
+
+            if (c is not ('y' or 'M' or 'd' or 'H' or 'm' or 's'))
             {
                 throw new NotSupportedException(
                     $"date_format pattern letter '{c}' is not supported; " +
@@ -328,18 +348,28 @@ internal static class SparkFunctions
             return decimals.Build();
         }
 
-        if (type is DoubleType or FloatType)
+        if (type is FloatType)
         {
-            var doubles = new DoubleArray.Builder();
-            var floats = type is FloatType ? new FloatArray.Builder() : null;
+            var floats = new FloatArray.Builder();
             for (var i = 0; i < rowCount; i++)
             {
                 var value = choice[i] < 0 ? null : SparkArrays.ReadDouble(sources[choice[i]], i);
-                if (value is null) { doubles.AppendNull(); floats?.AppendNull(); }
-                else { doubles.Append(value.Value); floats?.Append((float)value.Value); }
+                if (value is null) floats.AppendNull(); else floats.Append((float)value.Value);
             }
 
-            return floats is null ? doubles.Build() : floats.Build();
+            return floats.Build();
+        }
+
+        if (type is DoubleType)
+        {
+            var doubles = new DoubleArray.Builder();
+            for (var i = 0; i < rowCount; i++)
+            {
+                var value = choice[i] < 0 ? null : SparkArrays.ReadDouble(sources[choice[i]], i);
+                if (value is null) doubles.AppendNull(); else doubles.Append(value.Value);
+            }
+
+            return doubles.Build();
         }
 
         var integers = new long?[rowCount];
@@ -368,6 +398,38 @@ internal static class SparkFunctions
         catch (NotSupportedException)
         {
             return array.IsNull(index);
+        }
+    }
+
+    /// <summary>
+    /// Whether two cells hold the same value, compared in their own terms.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not a comparison of rendered text. A <c>decimal(10,2)</c> holding 1.00 and an
+    /// <c>int</c> holding 1 render as "1.00" and "1" but are equal, and Spark agrees —
+    /// <c>nullif(CAST(1.00 AS DECIMAL(10,2)), 1)</c> is null. Comparing the renderings would have
+    /// returned the value instead.
+    /// </remarks>
+    public static bool AreEqual(IArrowArray left, IArrowArray right, int index)
+    {
+        if (SparkArrays.IsTemporal(left.Data.DataType) || SparkArrays.IsTemporal(right.Data.DataType))
+            return SparkArrays.ReadInstant(left, index) == SparkArrays.ReadInstant(right, index);
+
+        if (left is StringArray || right is StringArray)
+            return ReadString(left, index) == ReadString(right, index);
+
+        if (left is BooleanArray a && right is BooleanArray b)
+            return ReadBoolean(a, index) == ReadBoolean(b, index);
+
+        // Exact where both sides have an exact form, so scale differences do not separate equal
+        // values; double only when one side cannot be exact anyway.
+        try
+        {
+            return SparkArrays.ReadDecimal(left, index) == SparkArrays.ReadDecimal(right, index);
+        }
+        catch (NotSupportedException)
+        {
+            return SparkArrays.ReadDouble(left, index) == SparkArrays.ReadDouble(right, index);
         }
     }
 

@@ -821,12 +821,13 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
                 continue;
             }
 
-            var left = SparkFunctions.ReadString(args[0], row);
-            var right = SparkFunctions.IsNull(args[1], row)
-                ? null
-                : SparkFunctions.ReadString(args[1], row);
-
-            choice[row] = left == right ? -1 : 0;
+            // Compared in the operands' own terms, not as rendered text. A decimal(10,2)
+            // holding 1.00 and an int holding 1 render differently but are equal, and Spark
+            // agrees: nullif(CAST(1.00 AS DECIMAL(10,2)), 1) is null.
+            choice[row] = !SparkFunctions.IsNull(args[1], row)
+                && SparkFunctions.AreEqual(args[0], args[1], row)
+                ? -1
+                : 0;
         }
 
         return SparkFunctions.Unify(args[0].Data.DataType, args, choice, rowCount);
@@ -883,6 +884,20 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
     }
 
     /// <summary>A condition is taken only when it is true — null is not.</summary>
-    private static bool IsTrue(IArrowArray condition, int row) =>
-        condition is BooleanArray booleans && !booleans.IsNull(row) && booleans.GetValue(row)!.Value;
+    /// <remarks>
+    /// A non-boolean condition fails rather than being read as false. Spark rejects one outright
+    /// (<c>if(int_col, …)</c> is a DATATYPE_MISMATCH analysis error), and treating it as false
+    /// here would silently take the ELSE branch on every row — a wrong answer that looks like a
+    /// deliberate one.
+    /// </remarks>
+    private static bool IsTrue(IArrowArray condition, int row)
+    {
+        if (condition is not BooleanArray booleans)
+        {
+            throw new NotSupportedException(
+                $"a condition must be boolean, not {SparkArrays.Describe(condition.Data.DataType)}");
+        }
+
+        return !booleans.IsNull(row) && booleans.GetValue(row)!.Value;
+    }
 }
