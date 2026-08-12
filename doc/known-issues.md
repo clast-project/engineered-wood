@@ -903,10 +903,14 @@ that hand us the batches evaluate anything: `WriteAsync`, the
 transactional append, and create-with-data. `StageDataFiles` and
 `CommitDataFilesAsync` take finished Parquet files and so keep refusing
 a constrained table outright — there is nothing to check the rows
-against. `UPDATE` and `DELETE` refuse for the same reason, which is
-conservative rather than principled: an UPDATE changes values and ought
-to be re-validated, and to recompute any generated column it feeds,
-once that path can see them.
+against. `UPDATE` now re-validates: its post-image is checked against the
+constraints and its generated columns are recomputed, so a table
+carrying either is updatable. Only the post-image — rows the predicate
+did not match are copied through unchecked, since they were already in
+the table and re-validating them would refuse an unrelated `UPDATE` over
+data another engine wrote under semantics we do not share. `DELETE`
+still refuses, which costs nothing to fix but has not been done: a
+delete removes rows and cannot newly violate a row-level rule.
 
 **Gaps inside the parser and registry**, each of which refuses by name
 rather than producing a wrong answer:

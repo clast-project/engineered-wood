@@ -114,6 +114,43 @@ internal sealed class DeltaGeneratedColumns
         return result;
     }
 
+    /// <summary>
+    /// Returns <paramref name="batch"/> with every generated column recomputed from it.
+    /// </summary>
+    /// <remarks>
+    /// For an UPDATE's post-image, where <see cref="Apply"/> would be wrong. The rows come out of
+    /// a data file and still carry the OLD generated value, so checking it against the expression
+    /// would refuse any update that touched a column the expression reads — and accepting it
+    /// would persist a generated column that disagrees with its own definition. Spark recomputes
+    /// for the same reason, and does not let an UPDATE assign a generated column at all.
+    /// </remarks>
+    public RecordBatch Recompute(RecordBatch batch)
+    {
+        var result = batch;
+
+        foreach (var column in _columns)
+        {
+            var computed = Compute(column, result);
+            var existing = IndexOf(result, column.Name);
+
+            result = existing >= 0
+                ? Replace(result, existing, computed)
+                : Append(column, result, computed);
+        }
+
+        return result;
+    }
+
+    /// <summary>Returns the batch with one column's values swapped out.</summary>
+    private static RecordBatch Replace(RecordBatch batch, int index, IArrowArray values)
+    {
+        var columns = new List<IArrowArray>(batch.ColumnCount);
+        for (var i = 0; i < batch.ColumnCount; i++)
+            columns.Add(i == index ? values : batch.Column(i));
+
+        return new RecordBatch(batch.Schema, columns, batch.Length);
+    }
+
     /// <summary>Evaluates the generation expression as the column's declared type.</summary>
     /// <remarks>
     /// Materialised against the declared Arrow type rather than whatever the expression happens

@@ -371,4 +371,148 @@ public class WriterFeatureEnforcementTests : IDisposable
 
         Assert.Equal(1, await table.WriteAsync([batch]));
     }
+
+    // ── UPDATE: the gate, the validator, the generator and the rewrite must agree ──────────
+
+    /// <summary>Rewrites every row's <c>id</c> to <paramref name="to"/>.</summary>
+    private static Func<RecordBatch, RecordBatch> SetId(long to) => batch =>
+    {
+        var ids = new Int64Array.Builder();
+        for (var i = 0; i < batch.Length; i++)
+            ids.Append(to);
+
+        var columns = new List<IArrowArray>();
+        for (var i = 0; i < batch.ColumnCount; i++)
+        {
+            columns.Add(string.Equals(batch.Schema.FieldsList[i].Name, "id", StringComparison.Ordinal)
+                ? ids.Build()
+                : batch.Column(i));
+        }
+
+        return new RecordBatch(batch.Schema, columns, batch.Length);
+    };
+
+    [Fact]
+    public async Task UpdateRefusesAPostImageThatViolatesAConstraint()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        await table.WriteAsync([Batch(5)]);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(-1)));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task UpdateAdmitsAPostImageThatSatisfiesTheConstraint()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        await table.WriteAsync([Batch(5)]);
+
+        var (rows, _) = await table.UpdateAsync(
+            Expressions.Expressions.GreaterThan("id", 0L), SetId(7));
+
+        Assert.Equal(1, rows);
+    }
+
+    [Fact]
+    public async Task UpdateRecomputesAGeneratedColumnRatherThanCarryingTheStaleValue()
+    {
+        // The post-image comes out of the data file, so it still holds the OLD derived value.
+        // Leaving it there would persist a generated column that disagrees with its own
+        // expression — the exact state the feature exists to prevent.
+        await using var table = await CreateGeneratedColumnTableAsync();
+        await table.WriteAsync([Batch(1)]);
+
+        await table.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(41));
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(41L, rows.Single().Id);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
+    [Fact]
+    public async Task TheTransactionalUpdateAgreesWithTheSingleShotOne()
+    {
+        // Same table, same edit, different surface. Every defect found in this area so far has
+        // been two paths disagreeing about one table rather than either being wrong alone.
+        await using var table = await CreateGeneratedColumnTableAsync();
+        await table.WriteAsync([Batch(1)]);
+
+        await using (var tx = table.StartTransaction())
+        {
+            await tx.UpdateAsync(Expressions.Expressions.GreaterThan("id", 0L), SetId(41));
+            await tx.CommitAsync();
+        }
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
+    private static RecordBatch Rows(params long[] ids)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        var builder = new Int64Array.Builder();
+        foreach (var id in ids)
+            builder.Append(id);
+
+        return new RecordBatch(schema, [builder.Build()], ids.Length);
+    }
+
+    /// <summary>Commits a metadata action adding a CHECK constraint to an existing table.</summary>
+    private async Task AddConstraintAsync(long version, string name, string sql)
+    {
+        var log = new TransactionLog(new LocalTableFileSystem(_tempDir));
+        await log.WriteCommitAsync(version, new List<DeltaAction>
+        {
+            new MetadataAction
+            {
+                Id = "wfe-table",
+                Format = Format.Parquet,
+                SchemaString =
+                    @"{""type"":""struct"",""fields"":[{""name"":""id"",""type"":""long"",""nullable"":false,""metadata"":{}}]}",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string> { [$"delta.constraints.{name}"] = sql },
+            },
+        });
+    }
+
+    [Fact]
+    public async Task UpdateLeavesUntouchedRowsUnvalidated()
+    {
+        // The scenario has to be BUILT, not assumed: a violating row can only exist in a
+        // constrained table if it was written before the constraint was. Writing both rows in one
+        // batch puts them in one file, so the UPDATE rewrites that file and carries the violating
+        // row through its keep path — which is the path under test. An earlier version of this
+        // test created the table already constrained and wrote a satisfying row, so it passed
+        // whether or not untouched rows were re-validated.
+        await using (var unconstrained = await CreateTableAsync())
+        {
+            await unconstrained.WriteAsync([Rows(-5, 10)]);
+        }
+
+        await AddConstraintAsync(version: 2, "positive_id", "id > 0");
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var (rows, _) = await table.UpdateAsync(
+            Expressions.Expressions.GreaterThan("id", 4L), SetId(11));
+
+        Assert.Equal(1, rows);
+
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var column = (Int64Array)batch.Column("id");
+            for (var i = 0; i < batch.Length; i++)
+                ids.Add(column.GetValue(i)!.Value);
+        }
+
+        // The violating row survived untouched; the matched row was updated and validated.
+        Assert.Equal([-5L, 11L], ids.OrderBy(x => x).ToArray());
+    }
 }
