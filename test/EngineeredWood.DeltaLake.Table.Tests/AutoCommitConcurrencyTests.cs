@@ -234,4 +234,84 @@ public class AutoCommitConcurrencyTests : IDisposable
         await Assert.ThrowsAsync<DeltaConflictException>(
             async () => await tableB.WriteAsync([Batch(9)], DeltaWriteMode.Overwrite));
     }
+
+    // ── The claim governs the retry, not only the record ──────────────────────────────────
+
+    /// <summary>
+    /// A caller that declares it read the table is not rebased over a concurrent commit.
+    /// </summary>
+    /// <remarks>
+    /// The rebase re-commits staged actions verbatim, valid only because nothing the commit read was
+    /// touched. `isBlindAppend: false` says that precondition does not hold — the rows were computed
+    /// from the table — so rebasing would silently commit a value derived from a snapshot that moved.
+    /// `INSERT INTO t SELECT max(id) + 1 FROM t` is the shape: the old max, re-committed, no error.
+    /// </remarks>
+    [Fact]
+    public async Task DeclaredNotBlind_AbortsRatherThanRebasingOverAConcurrentCommit()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var writer = await DeltaTable.CreateAsync(fs, IdSchema);
+        await writer.WriteAsync([Batch(1)]);
+
+        // A second handle, still holding the older snapshot — the host that scanned and computed.
+        await using var stale = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await ReadIds(stale);
+
+        // Someone else commits first.
+        await writer.WriteAsync([Batch(2)]);
+
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(
+            async () => await stale.WriteAsync([Batch(99)], isBlindAppend: false));
+
+        Assert.Equal(ConflictRecovery.Replan, ex.Recovery);
+    }
+
+    /// <summary>A genuine blind append still rebases over a commit that invalidated nothing.</summary>
+    [Fact]
+    public async Task DeclaredBlind_StillRebasesOverAConcurrentCommit()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var writer = await DeltaTable.CreateAsync(fs, IdSchema);
+        await writer.WriteAsync([Batch(1)]);
+
+        await using var stale = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await ReadIds(stale);
+
+        await writer.WriteAsync([Batch(2)]);
+
+        await stale.WriteAsync([Batch(3)], isBlindAppend: true);
+
+        // A fresh handle: `writer`'s snapshot predates the commit just made through `stale`.
+        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var ids = (await ReadIds(reader)).OrderBy(x => x).ToArray();
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
+
+    /// <summary>
+    /// Saying nothing keeps the rebase, which is the behaviour every existing caller has.
+    /// </summary>
+    /// <remarks>
+    /// Absent means "the caller said nothing", not "the caller read something". #125 chose to read
+    /// absence permissively rather than make every silent caller pay conflicts, and this change does
+    /// not revisit that.
+    /// </remarks>
+    [Fact]
+    public async Task NoClaim_KeepsTheRebase()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var writer = await DeltaTable.CreateAsync(fs, IdSchema);
+        await writer.WriteAsync([Batch(1)]);
+
+        await using var stale = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await ReadIds(stale);
+
+        await writer.WriteAsync([Batch(2)]);
+
+        await stale.WriteAsync([Batch(3)]);
+
+        // A fresh handle: `writer`'s snapshot predates the commit just made through `stale`.
+        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var ids = (await ReadIds(reader)).OrderBy(x => x).ToArray();
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
 }
