@@ -5298,10 +5298,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // another engine then SKIPS the concurrentAppend check it owed. Null (absent) costs only
             // spurious conflicts, which is what this recorded before the flag existed.
             //
-            // Retires when WriteAsync takes the claim from its caller upstream.
+            // And the claim governs the RETRY, not only the record. CommitOccAsync rebases a collision
+            // onto the newer version and re-commits the staged actions verbatim, "valid precisely
+            // because nothing the commit read or removed was touched" — a precondition a caller
+            // declaring `false` has just told us does not hold. Rebasing anyway would re-commit rows
+            // computed from a snapshot that moved: for `INSERT INTO t SELECT max(id) + 1 FROM t`, the
+            // old max, with no error raised. So a declared-false append is not rebase-safe, and a
+            // collision surfaces as RebaseUnsafe/Replan — recompute and try again — which is the same
+            // treatment the overwrite family below gets for the same reason.
+            //
+            // Null keeps the rebase. It means "the caller said nothing", not "the caller read
+            // something", and #125 chose to read absence permissively rather than make every silent
+            // caller pay conflicts.
+            //
+            // ReadSet.Blind stays as it is: with the rebase disabled, any collision aborts either way,
+            // so the read set no longer gates safety — and we know the caller read SOMETHING, not what,
+            // so claiming WholeTable would be inventing detail we do not have.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind, NoRemovedPaths,
-                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
+                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: isBlindAppend != false,
                 cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
         else
