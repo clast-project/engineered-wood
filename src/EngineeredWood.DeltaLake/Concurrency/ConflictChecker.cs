@@ -112,8 +112,10 @@ public sealed record ReadSet
 /// transaction read. <c>dataChange=false</c> removes (compaction) are exempt: they rearrange bytes
 /// without changing which rows the table contains, so a read stays valid.</item>
 /// <item>concurrentAppend — the concurrent commit made a <c>dataChange=true</c> add matching one of this
-/// transaction's read predicates. Skipped only when the concurrent commit is itself a blind append and
-/// this transaction runs at <see cref="IsolationLevel.WriteSerializable"/>.</item>
+/// transaction's read predicates. Skipped only when the concurrent commit is itself a blind append, this
+/// transaction runs at <see cref="IsolationLevel.WriteSerializable"/>, AND this transaction does not
+/// itself change the metadata — see <see cref="ExamineConcurrentAdds"/> for the third term, which is the
+/// one that judges us rather than the winning commit.</item>
 /// </list>
 /// </summary>
 public static class ConflictChecker
@@ -126,6 +128,10 @@ public static class ConflictChecker
     /// <param name="pruner">Matches a concurrent add against the read predicates. May be null when
     /// <paramref name="reads"/> has no predicates (a blind append or whole-table read).</param>
     /// <param name="isolation">This transaction's isolation level.</param>
+    /// <param name="currentActions">The actions THIS transaction is about to commit. Read only to answer
+    /// "does this transaction change the metadata" — see <see cref="ExamineConcurrentAdds"/>, which is why
+    /// a transaction's own schema change withdraws its blind-append exemption. Post-rebase, if a rebase
+    /// ran: it is what would actually be committed that matters.</param>
     /// <param name="concurrent">The commits in <c>(readVersion, latestVersion]</c>, ascending.</param>
     /// <param name="rowLevelResolvedPaths">Paths whose concurrent remove/re-add has been reconciled at
     /// row granularity by deletion-vector union (Databricks row-level concurrency) before this check.
@@ -137,9 +143,13 @@ public static class ConflictChecker
         ISet<string> plannedRemovePaths,
         DeltaFilePruner? pruner,
         IsolationLevel isolation,
+        IReadOnlyList<DeltaAction> currentActions,
         IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent,
         ISet<string>? rowLevelResolvedPaths = null)
     {
+        // Hoisted: a property of THIS transaction, identical for every concurrent commit examined.
+        bool currentChangesMetadata = ChangesMetadata(currentActions);
+
         foreach (var (version, actions) in concurrent)
         {
             // 1 & 2 — a concurrent metadata or protocol change conflicts unconditionally.
@@ -153,11 +163,8 @@ public static class ConflictChecker
                         $"Concurrent commit {version} changed the protocol.");
             }
 
-            bool concurrentIsBlindAppend = IsBlindAppend(actions);
-
-            // Whether a concurrent add can conflict with our reads depends on the isolation level: a
-            // blind append is exempt under WriteSerializable, examined under Serializable.
-            bool examineAdds = isolation == IsolationLevel.Serializable || !concurrentIsBlindAppend;
+            bool examineAdds = ExamineConcurrentAdds(
+                isolation, IsBlindAppend(actions), currentChangesMetadata);
 
             foreach (var action in actions)
             {
@@ -200,6 +207,67 @@ public static class ConflictChecker
         }
 
         return ConflictResult.None;
+    }
+
+    /// <summary>
+    /// Whether a concurrent commit's <c>dataChange</c> adds have to be tested against our read predicates,
+    /// or may be skipped because the concurrent commit was a blind append.
+    /// </summary>
+    /// <remarks>
+    /// <para>Delta's gate, which has three terms and not two:</para>
+    /// <code>
+    /// val addedFilesToCheckForConflicts = isolationLevel match {
+    ///   case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    ///     winningCommitSummary.changedDataAddedFiles
+    ///   case Serializable | WriteSerializable =>
+    ///     winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+    ///   case SnapshotIsolation =>
+    ///     Seq.empty
+    /// }
+    /// </code>
+    /// <para>The third term is about the CURRENT transaction, not the concurrent one, which is what makes
+    /// it easy to miss: everything else here judges the winning commit. Under
+    /// <see cref="IsolationLevel.WriteSerializable"/> a transaction that itself changes the metadata falls
+    /// through to the <c>Serializable</c> branch and examines blind appends too. The justification for
+    /// exempting a blind append is that it cannot have depended on anything we did; a schema change is not
+    /// local to the files we read, so an append written against the OLD schema is not necessarily still
+    /// valid under the new one, and the exemption stops being safe to grant.</para>
+    /// <para><b>Metadata only, not protocol.</b> Delta's <c>metadataChanged</c> is
+    /// <c>newMetadata.nonEmpty</c>, assigned by a loop whose only case is <c>case m: Metadata</c>; a
+    /// <c>Protocol</c> action never sets it and no separate protocol term feeds this gate (checked against
+    /// the <c>v4.0.0</c> tag). Including protocol here would be STRICTER than Delta — a transaction that
+    /// only enables a table feature would start conflicting with concurrent appends where Delta does not —
+    /// and being gratuitously strict about concurrency is its own defect, not a safe direction to err in.
+    /// </para>
+    /// <para><c>SnapshotIsolation</c> has no counterpart in <see cref="IsolationLevel"/>, which is why the
+    /// Scala reads as three cases and this reads as two. Adding the level is a separate question.</para>
+    /// </remarks>
+    internal static bool ExamineConcurrentAdds(
+        IsolationLevel isolation, bool concurrentIsBlindAppend, bool currentChangesMetadata) =>
+        isolation == IsolationLevel.Serializable
+        || currentChangesMetadata
+        || !concurrentIsBlindAppend;
+
+    /// <summary>
+    /// Whether a set of actions changes the table metadata — Delta's <c>currentTransactionInfo</c>
+    /// <c>metadataChanged</c>, for <see cref="ExamineConcurrentAdds"/>.
+    /// </summary>
+    /// <remarks>
+    /// Derived from the actions rather than declared by the caller, and unlike <c>isBlindAppend</c> that
+    /// is the right call: whether a commit carries a <see cref="MetadataAction"/> is fully visible in what
+    /// is about to be written, so there is nothing only the writer could know and no defaulted value to
+    /// get wrong. Blind-append is the opposite — a property of the transaction's READS, which the actions
+    /// do not record — which is why that one has to be declared.
+    /// </remarks>
+    internal static bool ChangesMetadata(IReadOnlyList<DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is MetadataAction)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>

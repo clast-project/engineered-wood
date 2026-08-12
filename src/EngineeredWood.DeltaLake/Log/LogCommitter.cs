@@ -190,7 +190,7 @@ public sealed class LogCommitter
 
                 var verdict = ConflictChecker.Check(
                     request.Reads, request.PlannedRemovePaths, pruner, request.Isolation,
-                    concurrent, resolvedPaths);
+                    currentActions, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                 {
                     throw new DeltaConflictException(

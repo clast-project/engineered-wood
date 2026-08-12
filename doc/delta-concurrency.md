@@ -95,6 +95,43 @@ exempted from a concurrent-append check.
 The rule has exactly one implementation. `DeltaTable.CheckLogicalRebaseAsync` calls the same method,
 after a period where it kept a second copy that disagreed.
 
+### And one term that judges *us*
+
+Being a blind append is not enough to earn the exemption; **this** transaction has to qualify for it too.
+Delta's gate:
+
+```scala
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  case SnapshotIsolation =>
+    Seq.empty
+}
+```
+
+Under `WriteSerializable`, a transaction that itself changes the metadata falls through to the
+`Serializable` branch and examines concurrent blind appends too. The exemption is justified by a blind
+append not having depended on anything we did — but a schema change is not local to the files we read,
+and an append written against the *old* schema need not still be valid under the new one.
+
+This is a different rule from "a concurrent `metaData` action conflicts unconditionally" (rules 1 and 2
+above), which judges the *winning* commit. This one judges ours, and only widens which adds get examined
+— it never manufactures a conflict on its own.
+
+**Metadata, not protocol.** Delta's `metadataChanged` is `newMetadata.nonEmpty`, assigned by a loop whose
+only case is `case m: Metadata`; a `Protocol` action never sets it (checked at `v4.0.0`). Including
+protocol would be *stricter* than Delta — a transaction that only enables a table feature would start
+conflicting with concurrent appends — and gratuitous strictness about concurrency is its own defect.
+
+`ConflictChecker.ExamineConcurrentAdds` is the whole gate, and both paths call it. Sharing only the
+blind-append *rule* while each path decided what to do with the answer is precisely how the previous
+divergence went live, so the gate is shared too. `BlindAppendRebaseParityTests` pins the agreement.
+
+`SnapshotIsolation` has no counterpart in our `IsolationLevel`, which is why the Scala reads as three
+cases and ours as two.
+
 ## Entry points
 
 All of the OCC core lives in **`EngineeredWood.DeltaLake`** (the log layer), and is public: a host with

@@ -69,7 +69,30 @@ public class ConflictCheckerTests
         ISet<string> plannedRemoves,
         IsolationLevel isolation,
         params (long, IReadOnlyList<DeltaAction>)[] concurrent) =>
-        ConflictChecker.Check(reads, plannedRemoves, Pruner(), isolation, concurrent);
+        ConflictChecker.Check(reads, plannedRemoves, Pruner(), isolation, NoCurrentActions, concurrent);
+
+    /// <summary>
+    /// As <see cref="Check"/>, but states what THIS transaction is committing. Only the metadata-change
+    /// gate reads it, so the tests that do not care go through the overload above.
+    /// </summary>
+    private static ConflictResult CheckCommitting(
+        IReadOnlyList<DeltaAction> currentActions,
+        ReadSet reads,
+        ISet<string> plannedRemoves,
+        IsolationLevel isolation,
+        params (long, IReadOnlyList<DeltaAction>)[] concurrent) =>
+        ConflictChecker.Check(reads, plannedRemoves, Pruner(), isolation, currentActions, concurrent);
+
+    /// <summary>A transaction committing nothing that bears on the gate — no metadata change.</summary>
+    private static readonly IReadOnlyList<DeltaAction> NoCurrentActions = [];
+
+    private static MetadataAction Metadata(string schema = "{}") => new()
+    {
+        Id = "t",
+        Format = Format.Parquet,
+        SchemaString = schema,
+        PartitionColumns = [],
+    };
 
     private static readonly ISet<string> NoRemoves = new HashSet<string>();
 
@@ -230,6 +253,99 @@ public class ConflictCheckerTests
         var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict); // inferred blind: adds only
+    }
+
+    // ── the gate's third term: OUR OWN transaction changing metadata ──
+
+    // Everything else here judges the winning commit. This one term judges us, which is what makes it
+    // easy to leave out: Delta's `case WriteSerializable if !currentTransactionInfo.metadataChanged`.
+
+    /// <summary>
+    /// ⚠ THE CASE #126 IS ABOUT. A transaction that itself changes the schema loses the blind-append
+    /// exemption: under WriteSerializable it falls through to the Serializable branch and examines
+    /// concurrent blind appends too. The exemption's justification is that a blind append cannot have
+    /// depended on anything we did — but a schema change is not local to the files we read, and an append
+    /// written against the OLD schema need not still be valid under the new one.
+    /// </summary>
+    [Fact]
+    public void OwnMetadataChange_WithdrawsTheBlindAppendExemption()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""), // genuinely blind, and believed
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [Metadata("""{"type":"struct","fields":[]}""")],
+            reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+    }
+
+    /// <summary>
+    /// The control: the SAME transaction and the SAME concurrent commit, minus our metadata change, stays
+    /// exempt. Without it the test above would pass equally well if the exemption had been dropped
+    /// altogether — which would be a far more expensive change than the one intended.
+    /// </summary>
+    [Fact]
+    public void WithoutOwnMetadataChange_TheExemptionHolds()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [Add("ours.parquet", minId: 100, maxId: 200)],
+            reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// A PROTOCOL change of our own does NOT withdraw the exemption, because Delta's gate does not read
+    /// one: <c>metadataChanged</c> is <c>newMetadata.nonEmpty</c>, assigned by a loop whose only case is
+    /// <c>case m: Metadata</c> (checked at the <c>v4.0.0</c> tag).
+    ///
+    /// <para>Worth a test rather than a comment: the issue proposing this fix suggested deriving the term
+    /// from "a MetadataAction or ProtocolAction among them", which would be STRICTER than Delta — a
+    /// transaction that only enables a table feature would start conflicting with concurrent appends
+    /// where Delta lets it through. Erring strict is still erring.</para>
+    /// </summary>
+    [Fact]
+    public void OwnProtocolChange_DoesNotWithdrawTheExemption()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [new ProtocolAction { MinReaderVersion = 3, MinWriterVersion = 7 }],
+            reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// The term is about OUR transaction, not the concurrent one, and those are different rules that both
+    /// mention metadata. A concurrent metadata change conflicts unconditionally (rule 1, and
+    /// <see cref="ConcurrentMetadataChange_Conflicts"/> covers it); ours only widens which adds get
+    /// examined. Here our metadata change meets a concurrent blind append whose file does NOT match our
+    /// predicate — so the widened gate examines it and still finds nothing.
+    /// </summary>
+    [Fact]
+    public void OwnMetadataChange_WidensTheGate_ItDoesNotManufactureAConflict()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-far.parquet", minId: 100, maxId: 200)); // cannot contain id = 5
+
+        var result = CheckCommitting(
+            [Metadata()], reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
     }
 
     // ── the inference's one piece of POSITIVE evidence: a cdc action ──

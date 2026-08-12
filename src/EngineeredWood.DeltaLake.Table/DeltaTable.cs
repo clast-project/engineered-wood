@@ -7871,6 +7871,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             baseByPath[f.Path] = f;
         }
+        // A property of THIS transaction, so it is computed once rather than per concurrent commit.
+        bool currentChangesMetadata = Concurrency.ConflictChecker.ChangesMetadata(plannedActions);
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
@@ -7883,7 +7885,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // not, because then a Spark commit declaring FALSE on an adds-only commit was correctly
             // examined by one path and wrongly exempted by the other — which is the whole defect, alive
             // on the buffered-transaction rebase instead of on the OCC loop.
-            bool blindAppend = Concurrency.ConflictChecker.IsBlindAppend(commitActions);
+            //
+            // The GATE is shared for the same reason, not just the rule it consumes. Sharing only
+            // IsBlindAppend would have left this path deciding for itself what to do with the answer,
+            // which is how the divergence above became live — one call site learning something the other
+            // did not. ExamineConcurrentAdds is the whole decision, third term included.
+            bool examineAdds = Concurrency.ConflictChecker.ExamineConcurrentAdds(
+                serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable,
+                Concurrency.ConflictChecker.IsBlindAppend(commitActions),
+                currentChangesMetadata);
             foreach (var a in commitActions)
             {
                 switch (a)
@@ -7899,9 +7909,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                                 + $"(commit v{v}) — cannot rebase the transaction");
                         }
                         break;
-                    case AddFile added when added.DataChange && (!blindAppend || serializable):
+                    case AddFile added when added.DataChange && examineAdds:
                         // concurrentAppendCheck: rows appeared that the transaction's reads would have consumed.
-                        // Blind appends are exempt under WriteSerializable; under Serializable they conflict.
+                        // Blind appends are exempt under WriteSerializable; under Serializable they conflict,
+                        // and so do they when THIS transaction changes the metadata.
                         if (ReadsMatch(added))
                         {
                             throw new DeltaConflictException(
