@@ -26,7 +26,7 @@ namespace EngineeredWood.Lance.Table;
 /// <c>_versions/&lt;encoded&gt;.manifest</c> for the version manifest, and
 /// <c>_transactions/{readVersion}-&lt;uuid&gt;.txn</c> for the originating
 /// transaction. Output opens cleanly via
-/// <see cref="LanceTable.OpenAsync(string, ulong?, CancellationToken)"/>.
+/// <see cref="LanceTable.OpenAsync(string, ulong, CancellationToken)"/>.
 ///
 /// <para><b>Modes</b>:</para>
 /// <list type="bullet">
@@ -830,7 +830,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// version returned).</para>
     ///
     /// <para><b>Scope</b>: the rewrite gathers matching rows with
-    /// <see cref="ArrowCompute.Take"/>, so the shapes it can carry are that
+    /// <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>, so the shapes it can carry are that
     /// kernel's — leaves, nested (struct / list / FSL / map), and extension types
     /// alike. A column type neither it nor <see cref="LanceFileWriter"/> handles
     /// raises <see cref="NotSupportedException"/> rather than being written
@@ -1089,7 +1089,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// <para>Old data and deletion files remain on disk so prior
     /// versions stay readable; <see cref="VacuumAsync"/> with
     /// <see cref="LanceVacuumOptions.RetainVersions"/> = 1 reclaims them.
-    /// Survivors are gathered with <see cref="ArrowCompute.Take"/>, so the
+    /// Survivors are gathered with <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>, so the
     /// same column-type scope as <see cref="UpdateAsync"/> applies.</para>
     /// </summary>
     public static async ValueTask<LanceCompactionResult> CompactAsync(

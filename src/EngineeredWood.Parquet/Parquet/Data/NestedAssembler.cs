@@ -26,7 +26,7 @@ internal static class NestedAssembler
     /// <param name="leafDefLevels">Raw definition levels per leaf (null for required leaves).</param>
     /// <param name="leafRepLevels">Raw repetition levels per leaf (null for non-repeated leaves).</param>
     /// <param name="rowCount">Number of rows in the row group.</param>
-    /// <param name="leafFixedListLengths">
+    /// <param name="leafFixedLengths">
     /// Optional per-leaf fixed list lengths from <see cref="FixedListDetector"/>. A non-zero entry
     /// means that leaf's levels were proven to describe fully-defined lists of that exact length
     /// and were therefore never materialised; the list offsets are derived arithmetically.

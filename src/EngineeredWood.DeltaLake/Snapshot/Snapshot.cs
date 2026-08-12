@@ -22,7 +22,7 @@ public sealed class Snapshot
     /// <summary>The active protocol version.</summary>
     public required ProtocolAction Protocol { get; init; }
 
-    /// <summary>The parsed Delta schema from <see cref="Metadata.SchemaString"/>.</summary>
+    /// <summary>The parsed Delta schema from <see cref="MetadataAction.SchemaString"/>.</summary>
     public required StructType Schema { get; init; }
 
     /// <summary>The Arrow schema converted from the Delta schema.</summary>

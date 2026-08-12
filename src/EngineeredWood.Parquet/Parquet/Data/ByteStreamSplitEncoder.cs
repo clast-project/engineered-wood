@@ -7,7 +7,7 @@ namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
 /// Encodes values using the BYTE_STREAM_SPLIT encoding.
-/// Mirror of <see cref="ByteStreamSplitDecoder"/>.
+/// Mirror of the decode side, <c>ColumnChunkReader.DecodeByteStreamSplitValues</c>.
 /// </summary>
 /// <remarks>
 /// For N values of W-byte width, produces W interleaved streams of N bytes each:

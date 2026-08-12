@@ -12,7 +12,7 @@ namespace EngineeredWood.Expressions.Sql;
 /// carry a CHECK constraint or generation expression that this parser does not understand, and
 /// the required behaviour there is to refuse the write with an explanation — the same
 /// fail-closed outcome the table already had — never to commit rows that were not validated. A
-/// caller that catches this and reports <see cref="Message"/> alongside
+/// caller that catches this and reports <see cref="Exception.Message"/> alongside
 /// <see cref="Expression"/> tells the user exactly which constraint stopped them and where.
 /// </remarks>
 public sealed class SparkSqlParseException : Exception

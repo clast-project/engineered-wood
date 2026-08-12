@@ -8,7 +8,7 @@ namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
 /// An optimistic-concurrency transaction over a <see cref="DeltaTable"/>, pinned to the table version
-/// it was started at (see <see cref="DeltaTable.StartTransaction"/>).
+/// it was started at (see <see cref="DeltaTable.StartTransaction(IsolationLevel)"/>).
 ///
 /// <para>Stage read-dependent operations on it, then <see cref="CommitAsync"/>. At commit the
 /// transaction is validated against every commit that landed since it started: if none invalidated
@@ -31,8 +31,8 @@ namespace EngineeredWood.DeltaLake.Table;
 /// one of the two, every abandoned transaction's files sit on storage until VACUUM's retention horizon
 /// passes — a crash-looping producer's whole batch, on every restart.</para>
 ///
-/// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync"/>), and
-/// updates (<see cref="UpdateAsync"/>) can be staged, including several on one transaction. An append is
+/// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>), and
+/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>) can be staged, including several on one transaction. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
 /// delete/update reads the files it rewrites, so it aborts only if a concurrent commit removed one of
 /// them — and a delete of DIFFERENT rows in a file someone else also deleted from reconciles row-by-row
@@ -541,7 +541,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
     /// <summary>
     /// Stages a schema change computed by one of <see cref="DeltaTable"/>'s <c>Compute*</c> methods
-    /// (<see cref="DeltaTable.ComputeAddColumn"/>, <see cref="DeltaTable.ComputeRenameColumn"/>, …), so an
+    /// (<see cref="DeltaTable.ComputeAddColumn(Schema.StructField, MetadataAction, ProtocolAction)"/>, <see cref="DeltaTable.ComputeRenameColumn"/>, …), so an
     /// ALTER lands in the SAME version as the data written under it. Compute the change against this
     /// transaction's <see cref="Snapshot"/>; a concurrent commit that changes metadata or protocol aborts the
     /// transaction rather than silently overwriting it.

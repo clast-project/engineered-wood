@@ -1490,9 +1490,9 @@ internal static class ColumnChunkWriter
     }
 
     /// <summary>
-    /// For nested columns (maxDefLevel > 1), normalizes def levels to 0/1
+    /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1
     /// so value encoding methods can check != 0 for presence.
-    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel <= 1.
+    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel &lt;= 1.
     /// </summary>
     // True when the type's SIGNED byte ordering equals its logical ordering — the precondition for emitting
     // the deprecated Statistics.min/max fields (see the call site).

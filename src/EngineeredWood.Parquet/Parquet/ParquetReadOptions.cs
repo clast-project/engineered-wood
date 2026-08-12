@@ -151,7 +151,7 @@ public sealed record ParquetReadOptions
     /// the corresponding <see cref="Apache.Arrow.ExtensionArray"/> rather than
     /// the default storage type. For example, registering
     /// <c>GuidExtensionDefinition</c> causes <c>UUID</c>-annotated columns to
-    /// produce <see cref="GuidArray"/> instead of <see cref="Apache.Arrow.FixedSizeBinaryArray"/>.
+    /// produce <see cref="GuidArray"/> instead of <see cref="Apache.Arrow.Arrays.FixedSizeBinaryArray"/>.
     /// When <see langword="null"/> (the default), the reader produces the
     /// underlying storage types and ignores extension annotations.
     /// </summary>

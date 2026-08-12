@@ -6,7 +6,7 @@ using EngineeredWood.Vortex.FlatBuffers;
 namespace EngineeredWood.Vortex.Format;
 
 /// <summary>
-/// Numeric primitive type tags used inside <see cref="Primitive"/> dtypes.
+/// Numeric primitive type tags used inside <see cref="PrimitiveDType"/> dtypes.
 /// Mirrors the Vortex <c>PType</c> FlatBuffers enum (dtype.fbs).
 /// </summary>
 internal enum PType : byte

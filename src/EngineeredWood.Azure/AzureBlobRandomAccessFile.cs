@@ -9,7 +9,7 @@ namespace EngineeredWood.IO.Azure;
 
 /// <summary>
 /// <see cref="IRandomAccessFile"/> implementation for Azure Blob Storage.
-/// Uses <see cref="BlobClient.DownloadStreamingAsync"/> with HTTP range requests.
+/// Uses <c>BlobClient.DownloadStreamingAsync</c> with HTTP range requests.
 /// Concurrent requests are throttled via a semaphore.
 /// Multi-range reads automatically coalesce nearby ranges to reduce HTTP round-trips.
 /// </summary>

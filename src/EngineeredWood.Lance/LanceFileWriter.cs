@@ -25,8 +25,8 @@ namespace EngineeredWood.Lance;
 /// <see cref="double"/>) or variable-length strings/binary, nullable
 /// or not, packed into a single MiniBlockLayout page per column with
 /// as many chunks as needed (each chunk capped at 32 KB by the v2.1
-/// chunk-meta word). Fixed-width columns use <see cref="Flat"/> value
-/// compression; strings/binary use <see cref="Variable"/> with
+/// chunk-meta word). Fixed-width columns use <see cref="Proto.Encodings.V21.Flat"/> value
+/// compression; strings/binary use <see cref="Proto.Encodings.V21.Variable"/> with
 /// Flat(u32) offsets.
 ///
 /// <para><b>What this writer covers</b>:</para>
@@ -965,7 +965,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// <summary>
     /// Write a Boolean column. Values are bit-packed LSB-first (1 bit per
     /// value, ceil(N/8) bytes total) and emitted with
-    /// <see cref="Flat"/> { BitsPerValue = 1 }. Nullable bools use a Flat(16)
+    /// <see cref="Proto.Encodings.V21.Flat"/> { BitsPerValue = 1 }. Nullable bools use a Flat(16)
     /// def buffer with the same NULLABLE_ITEM cascade as other primitives.
     /// Currently single-chunk only — at 1 bit per value the 32 KiB chunk
     /// budget covers up to ~256K bools, comfortably handling typical pages.
