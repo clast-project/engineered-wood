@@ -33,6 +33,15 @@ public sealed record FalsePredicate : Predicate
 /// </summary>
 public sealed record AndPredicate(IReadOnlyList<Predicate> Children) : Predicate
 {
+    /// <remarks>
+    /// Hand-written because the generated version compares <see cref="Children"/> by reference —
+    /// see <see cref="SequenceEquality"/>.
+    /// </remarks>
+    public bool Equals(AndPredicate? other) =>
+        other is not null && SequenceEquality.Equal(Children, other.Children);
+
+    public override int GetHashCode() => SequenceEquality.HashOf(Children);
+
     public override string ToString() => $"({string.Join(" AND ", Children)})";
 }
 
@@ -42,6 +51,15 @@ public sealed record AndPredicate(IReadOnlyList<Predicate> Children) : Predicate
 /// </summary>
 public sealed record OrPredicate(IReadOnlyList<Predicate> Children) : Predicate
 {
+    /// <remarks>
+    /// Hand-written because the generated version compares <see cref="Children"/> by reference —
+    /// see <see cref="SequenceEquality"/>.
+    /// </remarks>
+    public bool Equals(OrPredicate? other) =>
+        other is not null && SequenceEquality.Equal(Children, other.Children);
+
+    public override int GetHashCode() => SequenceEquality.HashOf(Children);
+
     public override string ToString() => $"({string.Join(" OR ", Children)})";
 }
 
@@ -109,6 +127,19 @@ public sealed record SetPredicate(
     IReadOnlyList<LiteralValue> Values,
     SetOperator Op) : Predicate
 {
+    /// <remarks>
+    /// Hand-written because the generated version compares <see cref="Values"/> by reference —
+    /// see <see cref="SequenceEquality"/>.
+    /// </remarks>
+    public bool Equals(SetPredicate? other) =>
+        other is not null
+        && Op == other.Op
+        && Operand.Equals(other.Operand)
+        && SequenceEquality.Equal(Values, other.Values);
+
+    public override int GetHashCode() =>
+        unchecked((Operand.GetHashCode() * 31 + (int)Op) * 31 + SequenceEquality.HashOf(Values));
+
     public override string ToString() =>
         $"{Operand} {(Op == SetOperator.In ? "IN" : "NOT IN")} ({string.Join(", ", Values)})";
 }

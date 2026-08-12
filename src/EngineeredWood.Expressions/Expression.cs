@@ -48,5 +48,17 @@ public sealed record LiteralExpression(LiteralValue Value) : Expression
 /// </summary>
 public sealed record FunctionCall(string Name, IReadOnlyList<Expression> Arguments) : Expression
 {
+    /// <remarks>
+    /// Hand-written because the generated version compares <see cref="Arguments"/> by reference —
+    /// see <see cref="SequenceEquality"/>.
+    /// </remarks>
+    public bool Equals(FunctionCall? other) =>
+        other is not null
+        && Name == other.Name
+        && SequenceEquality.Equal(Arguments, other.Arguments);
+
+    public override int GetHashCode() =>
+        unchecked((Name?.GetHashCode() ?? 0) * 31 + SequenceEquality.HashOf(Arguments));
+
     public override string ToString() => $"{Name}({string.Join(", ", Arguments)})";
 }
