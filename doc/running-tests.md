@@ -8,7 +8,34 @@ The solution requires **.NET 10 SDK** (or later). The test projects multi-target
 
 - `net10.0` — primary target
 - `net8.0` — LTS target
-- `net472` — .NET Framework (Windows only)
+- `net472` — .NET Framework (**runs** on Windows only; **compiles** anywhere)
+
+#### Checking net472 off Windows
+
+The net472 distinction is compile vs. run, and only the second half is Windows-only. `dotnet test`
+needs Mono to host a .NET Framework test process and aborts without it, but the **compile** works on
+macOS and Linux out of the box: the SDK implicitly adds `Microsoft.NETFramework.ReferenceAssemblies`
+for any `.NETFramework` target, so no targeting pack (and no Mono) is needed to build.
+
+That compile is worth running before you push, because net472 is where the BCL gaps show up —
+`System.Index`/`System.Range`, `ToListAsync`, and the rest of what `netstandard2.0` does not carry.
+It has caught real breakage that a net10.0-only run does not.
+
+```
+dotnet build engineered-wood.slnx      # every project, every TFM it declares — what CI does
+```
+
+⚠ **Do not use `dotnet build -f net472` at the solution level.** It forces `net472` onto the `src/`
+libraries, which target `netstandard2.0` and never declare it — so restore produced no `net472`
+dependency graph for them, they get no reference assemblies, and the build dies with 17 × `MSB3644`
+(*"reference assemblies for .NETFramework,Version=v4.7.2 were not found"*). That error reads like a
+missing SDK component and is really a malformed command; installing a targeting pack will not fix it.
+`-f net472` is fine on a project that actually declares `net472` — every project under `test/`, plus
+`src/EngineeredWood.Parquet.TestTool`:
+
+```
+dotnet build test/EngineeredWood.DeltaLake.Tests/EngineeredWood.DeltaLake.Tests.csproj -f net472
+```
 
 ### Git Submodules
 
