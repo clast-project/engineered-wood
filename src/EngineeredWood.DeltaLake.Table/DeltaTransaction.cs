@@ -420,12 +420,23 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// IcebergCompat, which need write-time per-row processing an outside writer did not do — check
     /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> first.</para>
     /// </summary>
-    public void StageDataFiles(IReadOnlyList<WrittenDataFile> files)
+    /// <param name="constraintsEnforcedByCaller">
+    /// Declares that the caller has already enforced the table's CHECK constraints, invariants and
+    /// generated columns over the rows in <paramref name="files"/>. Nothing here can verify it —
+    /// the files are finished — so it is an assertion, and a false one commits rows every later
+    /// reader will trust. Left false, a table declaring any of those is refused, and
+    /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> reports false for it.
+    /// </param>
+    public void StageDataFiles(
+        IReadOnlyList<WrittenDataFile> files, bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: true, rowsWillBeValidated: constraintsEnforcedByCaller);
+
         if (files.Count == 0)
             return;
 
@@ -458,12 +469,15 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<WrittenDataFile> files,
         RowSelection? bornDeleted = null,
         bool identityValuesPreGenerated = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: true, rowsWillBeValidated: constraintsEnforcedByCaller);
         if (files.Count == 0)
             return 0;
 

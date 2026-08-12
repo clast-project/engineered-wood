@@ -900,10 +900,15 @@ cannot be parsed, or on one that cannot be evaluated. Phase 10 /
 
 **Constraint enforcement is per write path, not global.** Only paths
 that hand us the batches evaluate anything: `WriteAsync`, the
-transactional append, and create-with-data. `StageDataFiles` and
-`CommitDataFilesAsync` take finished Parquet files and so keep refusing
-a constrained table outright — there is nothing to check the rows
-against. `UPDATE` now re-validates: its post-image is checked against the
+transactional append, and create-with-data. `StageDataFiles`,
+`StageDataFilesAsync` and `CommitDataFilesAsync` take finished Parquet
+files and refuse a constrained table by default — there is nothing to
+check the rows against. A host that enforced the rules itself can say so
+with `constraintsEnforcedByCaller`, which is an assertion nothing
+verifies: a false claim commits rows every later reader will trust.
+`SupportsExternalDataFileCommit` reports false for such a table, so a
+host that checks before writing files is not sent off to produce
+orphans. `UPDATE` now re-validates: its post-image is checked against the
 constraints and its generated columns are recomputed, so a table
 carrying either is updatable. Only the post-image — rows the predicate
 did not match are copied through unchecked, since they were already in

@@ -5399,19 +5399,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// processing). A caller checks this BEFORE writing files externally so it can fall back to the batch path
     /// without leaving an orphan. (Partitioning is a separate check — inspect
     /// <c>CurrentSnapshot.Metadata.PartitionColumns</c>.)
+    ///
+    /// <para>A table declaring CHECK constraints, invariants or generated columns also reports false, because
+    /// this seam is handed finished files and has no rows to check them against. Such a table is still
+    /// committable, but only by a caller willing to say it enforced them itself —
+    /// <c>constraintsEnforcedByCaller</c> on <see cref="CommitDataFilesAsync"/>. The property answers the
+    /// unqualified question, since a caller that acts on it before writing files is exactly the caller a
+    /// half-true answer would leave holding orphans.</para>
     /// </summary>
-    public bool SupportsExternalDataFileCommit
+    public bool SupportsExternalDataFileCommit =>
+        !RequiresOwnWriterForPerRowProcessing && !WriteTimeExpressions.Declares(CurrentSnapshot);
+
+    /// <summary>
+    /// Whether the table needs engineered-wood's own writer for per-row work an outside writer cannot do.
+    /// </summary>
+    /// <remarks>
+    /// Narrower than <see cref="SupportsExternalDataFileCommit"/> on purpose: identity values and IcebergCompat
+    /// cannot be supplied by a caller's assertion, while constraint enforcement can.
+    /// </remarks>
+    private bool RequiresOwnWriterForPerRowProcessing
     {
         get
         {
             if (IsIcebergCompat)
-                return false;
+                return true;
             foreach (var f in CurrentSnapshot.Schema.Fields)
             {
                 if (IdentityColumn.GetConfig(f) is not null)
-                    return false;
+                    return true;
             }
-            return true;
+            return false;
         }
     }
 
@@ -5862,6 +5879,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// this version — the caller's snapshot-coupled <paramref name="extraActions"/> (deletion-vector ordinals /
     /// positions computed against it) would be invalidated by a concurrent commit. When null, an append rebases
     /// past a non-conflicting concurrent commit (bounded retry), reusing the already-written files as-is.</param>
+    /// <param name="constraintsEnforcedByCaller">
+    /// Declares that the caller has already enforced the table's CHECK constraints, invariants and generated
+    /// columns over the rows in <paramref name="files"/>. This seam is handed finished files, so nothing here
+    /// can check them — the flag is an assertion, and a false one commits rows every later reader will trust,
+    /// which is why it is spelled as a claim rather than as a way to skip validation. Left false, a table
+    /// declaring any of those is refused, and <see cref="SupportsExternalDataFileCommit"/> reports false for it.
+    /// </param>
     /// <param name="dataChange">False for a REWRITE commit (compaction / clustering OPTIMIZE): removes and adds
     /// carry <c>dataChange=false</c> — CDF readers exclude the commit, concurrent readers' dataChange checks
     /// ignore it, and (per the spec) it is legal on an <c>appendOnly</c> table.</param>
@@ -5882,7 +5906,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
         bool dataChange = true,
         string? clusteringProvider = null,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        bool constraintsEnforcedByCaller = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5892,7 +5917,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // ROWS, not reorganizing files.
         bool appendShaped = (mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
                              extraActions is not { Count: > 0 }) || !dataChange;
-        HonorWriterFeatures(CurrentSnapshot, appendShaped);
+        // This seam receives finished files, so there are no rows to check. The caller can still
+        // commit a constrained table by declaring it enforced the rules itself — an assertion,
+        // deliberately spelled as one, because nothing here can verify it and a wrong claim
+        // poisons the table for every later reader.
+        HonorWriterFeatures(CurrentSnapshot, appendShaped, constraintsEnforcedByCaller);
 
         if (dynamicPartitionOverwrite)
         {
@@ -5911,7 +5940,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // being committed — a deletion-vector-only or metadata-only fused flush (extraActions, no files) involves
         // no write-time processing.
         var cfg = CurrentSnapshot.Metadata.Configuration;
-        if (files.Count > 0 && !SupportsExternalDataFileCommit
+        if (files.Count > 0 && RequiresOwnWriterForPerRowProcessing
             && !(identityValuesPreGenerated && !IsIcebergCompat))
             throw new NotSupportedException(
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
@@ -6229,7 +6258,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Mirrors CommitDataFilesAsync' gate exactly: identity columns need write-time per-row processing an
         // outside writer did not do, UNLESS the caller generated the values itself (GenerateIdentityValues) —
         // which is what makes an identity table's appends stageable at all. IcebergCompat has no such escape.
-        if (files.Count > 0 && !SupportsExternalDataFileCommit
+        if (files.Count > 0 && RequiresOwnWriterForPerRowProcessing
             && !(identityValuesPreGenerated && !IsIcebergCompat))
         {
             throw new NotSupportedException(
