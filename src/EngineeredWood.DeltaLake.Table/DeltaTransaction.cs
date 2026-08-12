@@ -260,7 +260,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // not say this: none of them route through that method, so none of them validate.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: true,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
@@ -353,7 +353,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // columns, so a constrained table is writable here.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: false,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
@@ -385,7 +385,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // columns, so a constrained table is writable here.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: false,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
@@ -435,7 +435,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
             throw new ArgumentNullException(nameof(files));
 
         _table.ValidateWritable(
-            _baseSnapshot, isAppend: true, rowsWillBeValidated: constraintsEnforcedByCaller);
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
 
         if (files.Count == 0)
             return;
@@ -477,7 +481,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
             throw new ArgumentNullException(nameof(files));
 
         _table.ValidateWritable(
-            _baseSnapshot, isAppend: true, rowsWillBeValidated: constraintsEnforcedByCaller);
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
         if (files.Count == 0)
             return 0;
 

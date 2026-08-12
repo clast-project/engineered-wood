@@ -716,12 +716,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 provisionalTable.ValidateWritable(
                     previousSnapshot, isAppend: false,
-                    rowsWillBeValidated: WriteTimeExpressions.Declares(previousSnapshot));
+                    handling: WriteTimeExpressionHandling.ValidatedHere);
             }
 
             provisionalTable.ValidateWritable(
                 provisionalSnapshot, isAppend: true,
-                rowsWillBeValidated: WriteTimeExpressions.Declares(provisionalSnapshot));
+                handling: WriteTimeExpressionHandling.ValidatedHere);
             var (writeActions, _) = await provisionalTable.ComputeWriteActionsAsync(
                 provisionalSnapshot,
                 initialBatches,
@@ -3631,7 +3631,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // table is writable here rather than refused.
         ValidateWritable(
             snapshot, isAppend: false,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(snapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         // The rewrite's post-image files are written before the commit is attempted, and there is no
         // transaction here for a host to abort — so a conflict takes them back rather than orphaning them.
@@ -4674,13 +4674,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// writer features must be honored. Kept together so a transactional append/update/delete runs the same
     /// gate as its single-shot equivalent instead of skipping it.
     /// </summary>
-    /// <param name="rowsWillBeValidated">
-    /// True only when the caller holds the batches and will run <see cref="DeltaConstraintEnforcer"/>
-    /// over them. Left false everywhere else, so a path that cannot see the rows keeps refusing a
-    /// table with constraints rather than committing it unchecked.
+    /// <param name="handling">
+    /// How this path accounts for the table's write-time expressions. Defaults to
+    /// <see cref="WriteTimeExpressionHandling.Refuse"/>, so a path that cannot see the rows keeps
+    /// refusing a table that declares any rather than committing it unchecked.
     /// </param>
     internal void ValidateWritable(
-        Snapshot.Snapshot snapshot, bool isAppend, bool rowsWillBeValidated = false)
+        Snapshot.Snapshot snapshot,
+        bool isAppend,
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
     {
         ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
@@ -4689,7 +4691,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // row-tracking table missing them (spec-invalid) cannot materialize, so a rewrite is still refused.
         if (!isAppend)
             RejectRowTrackingWrite(snapshot);
-        HonorWriterFeatures(snapshot, isAppend, rowsWillBeValidated);
+        HonorWriterFeatures(snapshot, isAppend, handling);
     }
 
     /// <summary>
@@ -4725,7 +4727,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// LISTS these features in its writer-v7 protocol (the common case) is unaffected.
     /// </summary>
     private static void HonorWriterFeatures(
-        Snapshot.Snapshot snapshot, bool isAppend, bool rowsWillBeValidated = false)
+        Snapshot.Snapshot snapshot,
+        bool isAppend,
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
     {
         var cfg = snapshot.Metadata.Configuration;
         if (cfg is not null)
@@ -4745,7 +4749,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // against, and refusing is the only honest answer. Enforcement is write-time
                 // only in Delta, so one unvalidated commit poisons the table for every reader
                 // after it.
-                if (rowsWillBeValidated)
+                if (handling != WriteTimeExpressionHandling.Refuse)
                     break;
 
                 if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
@@ -4759,7 +4763,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
         foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
-            if (!rowsWillBeValidated
+            if (handling == WriteTimeExpressionHandling.Refuse
                 && field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
             {
                 throw new DeltaFormatException(
@@ -4767,7 +4771,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     $"Column '{field.Name}' declares an invariant expression and this write path cannot "
                     + "evaluate it against the rows; write rejected.");
             }
-            if (!rowsWillBeValidated
+            if (handling == WriteTimeExpressionHandling.Refuse
                 && field.Metadata is not null
                 && field.Metadata.ContainsKey("delta.generationExpression"))
             {
@@ -4841,7 +4845,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ValidateWritable(
             snapshot,
             isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(snapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
@@ -5921,7 +5925,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // commit a constrained table by declaring it enforced the rules itself — an assertion,
         // deliberately spelled as one, because nothing here can verify it and a wrong claim
         // poisons the table for every later reader.
-        HonorWriterFeatures(CurrentSnapshot, appendShaped, constraintsEnforcedByCaller);
+        HonorWriterFeatures(
+            CurrentSnapshot,
+            appendShaped,
+            constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
 
         if (dynamicPartitionOverwrite)
         {
