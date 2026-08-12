@@ -452,21 +452,67 @@ public class WriterFeatureEnforcementTests : IDisposable
         Assert.Equal(42L, rows.Single().Derived);
     }
 
+    private static RecordBatch Rows(params long[] ids)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        var builder = new Int64Array.Builder();
+        foreach (var id in ids)
+            builder.Append(id);
+
+        return new RecordBatch(schema, [builder.Build()], ids.Length);
+    }
+
+    /// <summary>Commits a metadata action adding a CHECK constraint to an existing table.</summary>
+    private async Task AddConstraintAsync(long version, string name, string sql)
+    {
+        var log = new TransactionLog(new LocalTableFileSystem(_tempDir));
+        await log.WriteCommitAsync(version, new List<DeltaAction>
+        {
+            new MetadataAction
+            {
+                Id = "wfe-table",
+                Format = Format.Parquet,
+                SchemaString =
+                    @"{""type"":""struct"",""fields"":[{""name"":""id"",""type"":""long"",""nullable"":false,""metadata"":{}}]}",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string> { [$"delta.constraints.{name}"] = sql },
+            },
+        });
+    }
+
     [Fact]
     public async Task UpdateLeavesUntouchedRowsUnvalidated()
     {
-        // Rows the predicate did not match are copied through unchanged. They were already in the
-        // table, so re-checking them would refuse an unrelated UPDATE on data another engine
-        // wrote under semantics we do not share — and would be work with nothing to find.
-        await using var table = await CreateTableAsync(
-            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        // The scenario has to be BUILT, not assumed: a violating row can only exist in a
+        // constrained table if it was written before the constraint was. Writing both rows in one
+        // batch puts them in one file, so the UPDATE rewrites that file and carries the violating
+        // row through its keep path — which is the path under test. An earlier version of this
+        // test created the table already constrained and wrote a satisfying row, so it passed
+        // whether or not untouched rows were re-validated.
+        await using (var unconstrained = await CreateTableAsync())
+        {
+            await unconstrained.WriteAsync([Rows(-5, 10)]);
+        }
 
-        // Slip a violating row past the gate the only way possible: before the constraint exists.
-        await table.WriteAsync([Batch(5)]);
+        await AddConstraintAsync(version: 2, "positive_id", "id > 0");
 
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
         var (rows, _) = await table.UpdateAsync(
-            Expressions.Expressions.GreaterThan("id", 4L), SetId(6));
+            Expressions.Expressions.GreaterThan("id", 4L), SetId(11));
 
         Assert.Equal(1, rows);
+
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var column = (Int64Array)batch.Column("id");
+            for (var i = 0; i < batch.Length; i++)
+                ids.Add(column.GetValue(i)!.Value);
+        }
+
+        // The violating row survived untouched; the matched row was updated and validated.
+        Assert.Equal([-5L, 11L], ids.OrderBy(x => x).ToArray());
     }
 }
