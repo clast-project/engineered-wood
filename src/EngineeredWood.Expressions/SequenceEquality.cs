@@ -1,8 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Collections.Generic;
-
 namespace EngineeredWood.Expressions;
 
 /// <summary>
@@ -51,10 +49,17 @@ internal static class SequenceEquality
         if (items is null)
             return 0;
 
+        // Indexed rather than foreach, matching Equal above: enumerating through the interface
+        // boxes the struct enumerator a list or array would otherwise hand back directly, and
+        // this runs once per hash of every node that holds a list.
+        //
+        // No per-item null check either. The comparer handles it — verified, GetHashCode(null)
+        // returns 0 rather than throwing — and testing for it would box each element of a
+        // value-type list such as SetPredicate's LiteralValues.
         var hash = 17;
         var comparer = EqualityComparer<T>.Default;
-        foreach (var item in items)
-            hash = unchecked((hash * 31) + (item is null ? 0 : comparer.GetHashCode(item)));
+        for (var i = 0; i < items.Count; i++)
+            hash = unchecked((hash * 31) + comparer.GetHashCode(items[i]!));
 
         return hash;
     }
