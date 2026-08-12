@@ -889,14 +889,13 @@ in Parquet, and no Iceberg-side schema bridge to Arrow or Parquet.
 
 ### Missing features
 
-**Generated columns are still refused.** CHECK constraints and
-invariants are now enforced — `DeltaConstraintEnforcer` parses
-`delta.constraints.*` and `delta.invariants` and evaluates them against
-the rows being written, refusing the commit on a violation, on an
-expression it cannot parse, or on one it cannot evaluate. A column
-carrying `delta.generationExpression` still refuses every write, because
-generating a column means rewriting the batch rather than inspecting it.
-Remaining half of phase 10 /
+**Write-time expressions are enforced.** `DeltaConstraintEnforcer`
+evaluates `delta.constraints.*` and `delta.invariants` against the rows
+being written, and `DeltaGeneratedColumns` computes a
+`delta.generationExpression` column the caller omitted or checks one it
+supplied — the protocol's `(<value> <=> <generation expression>) IS
+TRUE`. All three refuse the commit on a violation, on an expression that
+cannot be parsed, or on one that cannot be evaluated. Phase 10 /
 [#102](https://github.com/clast-project/engineered-wood/issues/102).
 
 **Constraint enforcement is per write path, not global.** Only paths
@@ -906,7 +905,8 @@ transactional append, and create-with-data. `StageDataFiles` and
 a constrained table outright — there is nothing to check the rows
 against. `UPDATE` and `DELETE` refuse for the same reason, which is
 conservative rather than principled: an UPDATE changes values and ought
-to be re-validated once that path can.
+to be re-validated, and to recompute any generated column it feeds,
+once that path can see them.
 
 **Gaps inside the parser and registry**, each of which refuses by name
 rather than producing a wrong answer:

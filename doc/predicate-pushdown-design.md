@@ -734,9 +734,12 @@ public sealed record DeltaTableOptions
 
 ### Generated columns
 
-> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102)),
-> and refused on write the same way CHECK constraints are. No longer blocked:
-> phase 9 shipped, including the temporal casts `CAST(ts AS DATE)` needs.
+> **Implemented**, on the write paths that hold the batches.
+> `DeltaGeneratedColumns` computes a column the caller omitted and checks one it
+> supplied, refusing with `DELTA_GENERATED_COLUMN_MISMATCH` when the two
+> disagree. It runs before the CHECK constraints, since a constraint may
+> reference a generated column and would otherwise read a null the table never
+> stores.
 
 On write, parse `delta.generationExpression` from each generated column's
 metadata. For each batch:
