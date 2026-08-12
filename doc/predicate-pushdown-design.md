@@ -26,10 +26,18 @@ the implementation phases to get there.
 `StatisticsEvaluator`), statistics-based pruning for Parquet (row groups + bloom
 filters) and Delta Lake (partition + stats in one unified pass), Iceberg
 migrated onto the shared library, and the Arrow-based row evaluator in
-`EngineeredWood.Expressions.Arrow`. Phases 9–14 (Spark SQL parser, Delta
-CHECK/generated-column wiring, Parquet column/offset index, ORC stripe pruning)
-are not built. See the phase table at the bottom for scope; the issue tracker,
-not this document, is authoritative for what is in flight.
+`EngineeredWood.Expressions.Arrow`.
+
+Phase 9 shipped 2026-08-11: a hand-written Spark SQL tokenizer and parser in
+`EngineeredWood.Expressions/Sql`, and a `SparkFunctionRegistry` in
+`EngineeredWood.Expressions.Arrow/Spark` covering arithmetic, casts including
+temporal ones, and the named string, pattern, date-part and conditional
+functions. A constraint or generation expression now goes from text in table
+metadata to a per-row Arrow result.
+
+Phases 10–14 (Delta CHECK/generated-column wiring, Parquet column/offset index,
+ORC stripe pruning) are not built. See the phase table at the bottom for scope;
+the issue tracker, not this document, is authoritative for what is in flight.
 
 **The wiring gap, which matters more than any unbuilt phase.** Nothing in `src/`
 sets `ParquetReadOptions.Filter`. Row-group pruning and bloom probing are built
@@ -666,13 +674,13 @@ public IAsyncEnumerable<RecordBatch> ReadAllAsync(
 
 ### CHECK constraints
 
-> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102),
-> blocked on phase 9 / [#101](https://github.com/clast-project/engineered-wood/issues/101)).
-> What ships today is the
-> fail-closed guard: `DeltaTable.HonorWriterFeatures` detects an active
-> `delta.constraints.*` and rejects the write rather than committing rows it
-> cannot validate. The design below is the intended replacement, and
-> `DeltaTableOptions.ExpressionParser` does not exist yet.
+> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102)),
+> but no longer blocked: phase 9 shipped, so the parser and the evaluator this
+> needs both exist. What ships today is still the fail-closed guard —
+> `DeltaTable.HonorWriterFeatures` detects an active `delta.constraints.*` and
+> rejects the write rather than committing rows it cannot validate. The design
+> below is the intended replacement, and `DeltaTableOptions.ExpressionParser`
+> does not exist yet.
 
 On write, parse `delta.constraints.{name}` into a `Predicate`, evaluate against
 each batch, and abort if any row fails:
@@ -720,9 +728,9 @@ public sealed record DeltaTableOptions
 
 ### Generated columns
 
-> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102),
-> blocked on phase 9 / [#101](https://github.com/clast-project/engineered-wood/issues/101)), and
-> refused on write the same way CHECK constraints are.
+> **Not implemented** (phase 10 / [#102](https://github.com/clast-project/engineered-wood/issues/102)),
+> and refused on write the same way CHECK constraints are. No longer blocked:
+> phase 9 shipped, including the temporal casts `CAST(ts AS DATE)` needs.
 
 On write, parse `delta.generationExpression` from each generated column's
 metadata. For each batch:
@@ -848,12 +856,12 @@ there is no intermediate concrete syntax tree to visit. Function calls become
 arithmetic node: `Expression` is `UnboundReference`, `BoundReference`,
 `LiteralExpression` and `FunctionCall`, plus the `Predicate` subtypes.
 
-That makes the function registry the larger and riskier half of this phase
-rather than a footnote to it. `ArrowRowEvaluator` already accepts an
-`IFunctionRegistry` and the library ships no implementations, so every coercion
-and promotion rule named above is registry work. A `SparkFunctionRegistry`
-provides Arrow-backed implementations for the functions Delta expressions
-actually use.
+That made the function registry the larger and riskier half of this phase rather
+than a footnote to it, since every coercion and promotion rule named above is
+registry work. `SparkFunctionRegistry` now ships it: arithmetic, casts, and the
+named functions, with the promotion rules checked against the corpus rather than
+derived. `ArrowRowEvaluator` still accepts any `IFunctionRegistry`, so a host can
+substitute its own.
 
 #### Where the dialect configuration lives
 
@@ -1060,6 +1068,7 @@ History, not status — these are done and stay done.
 | **Phase 6** | Bloom filter probing in Parquet | Parquet |
 | **Phase 7** | Delta Lake stats-based file pruning + partition pruning | DeltaLake.Table |
 | **Phase 8** | `EngineeredWood.Expressions.Arrow`: `ArrowRowEvaluator`, `IFunctionRegistry` | new project |
+| **Phase 9** | Spark SQL tokenizer and parser; `SparkFunctionRegistry` (arithmetic, casts, named functions) | Expressions + Expressions.Arrow |
 
 ### Designed, not built
 
@@ -1073,8 +1082,7 @@ oversight.
 | — | Per-read filter on the Parquet reader; Delta forwarding, with logical→physical rewriting under column mapping | Parquet + DeltaLake.Table | [#55](https://github.com/clast-project/engineered-wood/issues/55) |
 | — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
-| **Phase 9** | A hand-written parser from Spark SQL expression strings to `Expression` / `Predicate`, plus a `SparkFunctionRegistry`. Approach decided — see [The Spark SQL parser](#the-spark-sql-parser) | inside Expressions (+ Expressions.Arrow for the registry) | [#101](https://github.com/clast-project/engineered-wood/issues/101) |
-| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes (needs Phase 9) | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
+| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes. No longer blocked — Phase 9 shipped | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
 | **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled |
 | **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled |
 | **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering | Parquet | unfiled |
@@ -1087,10 +1095,23 @@ formats with concrete needs (Parquet pruning, Delta pruning), and migrate
 Iceberg to consume it." Each phase was independently testable and shippable.
 
 Phases 8-10 extend the architecture to row-level evaluation, unblocking CHECK
-constraints and generated columns. The Spark parser depends on nothing but the
-expression tree and can proceed in parallel with anything earlier; the function
-registry it needs is the part with real sequencing risk, since it is where
-Spark's coercion semantics land.
+constraints and generated columns. That reading held: the parser depended on
+nothing but the expression tree, while the registry was where the risk actually
+was, because Spark's coercion semantics land there. Phase 9 is done and Phase 10
+is the remaining piece.
+
+**What phase 9 cost, for whoever sizes the next one.** The parser was the
+predictable part. The registry was not: nine separate behaviours contradicted a
+reasonable-looking implementation and were only caught by asking Spark through
+the `expr_oracle` rig — ANSI divide-by-zero applying to floating point, two
+distinct overflow error classes, casts having their own overflow class, a string
+cast to an integer refusing `'12.5'` where a number truncates, four separate
+`substring` position rules, `concat` propagating null, `LIKE` honouring
+backslash escapes, `nullif` comparing values rather than renderings, and a
+non-boolean condition failing rather than reading as false. Review caught four
+more, three of them raw BCL exceptions escaping the fail-closed path at
+type-conversion boundaries. Budget measurement time for anything that claims to
+reproduce another engine's semantics.
 
 **What the original ordering got wrong.** It assumed the next win was more
 pruning machinery. It is not: every mechanism phases 5-7 built is already
