@@ -2658,15 +2658,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return union;
     }
 
-    /// <summary>Shared by blind-append commits, which plan no removes.</summary>
-    private static readonly HashSet<string> NoRemovedPaths = new(StringComparer.Ordinal);
-
     /// <summary>
     /// The optimistic-concurrency commit loop shared by the transactional path, the auto-committing
     /// <see cref="DeleteAsync"/>, and single-shot appends. Attempts the commit at the version after
     /// <paramref name="baseSnapshot"/>; on a collision it reads the intervening commits, runs the
-    /// <see cref="ConflictChecker"/> against <paramref name="reads"/> /
-    /// <paramref name="plannedRemovePaths"/>, and either aborts (a real conflict) or — when
+    /// <see cref="ConflictChecker"/> against <paramref name="reads"/> and the removes it reads off
+    /// <paramref name="dataActions"/>, and either aborts (a real conflict) or — when
     /// <paramref name="rebaseSafe"/> — rebases onto the latest version and retries. A no-conflict rebase
     /// re-commits the staged actions verbatim, valid precisely because nothing the commit read or removed
     /// was touched.
