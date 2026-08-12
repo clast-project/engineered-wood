@@ -122,6 +122,18 @@ public static class DeltaTableErrorCodes
     /// </remarks>
     public const string ConstraintViolated = "DELTA_VIOLATE_CONSTRAINT";
 
+    /// <summary>
+    /// A row supplies a value for a generated column that its expression does not produce.
+    /// </summary>
+    /// <remarks>
+    /// <para>Kept apart from <see cref="ConstraintViolated"/> because the remedy differs: a
+    /// constraint violation means the data is wrong, while this usually means the caller supplied
+    /// a column it should have let the table compute.</para>
+    /// <para>The comparison is the protocol's — <c>(&lt;value&gt; &lt;=&gt; &lt;generation
+    /// expression&gt;) IS TRUE</c>, null-safe, so two nulls agree.</para>
+    /// </remarks>
+    public const string GeneratedColumnMismatch = "DELTA_GENERATED_COLUMN_MISMATCH";
+
     // ── Write modes ──
 
     /// <summary>

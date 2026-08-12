@@ -260,7 +260,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // not say this: none of them route through that method, so none of them validate.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: true,
-            rowsWillBeValidated: DeltaConstraintEnforcer.Declares(_baseSnapshot));
+            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,

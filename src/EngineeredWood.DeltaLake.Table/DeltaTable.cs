@@ -716,12 +716,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 provisionalTable.ValidateWritable(
                     previousSnapshot, isAppend: false,
-                    rowsWillBeValidated: DeltaConstraintEnforcer.Declares(previousSnapshot));
+                    rowsWillBeValidated: WriteTimeExpressions.Declares(previousSnapshot));
             }
 
             provisionalTable.ValidateWritable(
                 provisionalSnapshot, isAppend: true,
-                rowsWillBeValidated: DeltaConstraintEnforcer.Declares(provisionalSnapshot));
+                rowsWillBeValidated: WriteTimeExpressions.Declares(provisionalSnapshot));
             var (writeActions, _) = await provisionalTable.ComputeWriteActionsAsync(
                 provisionalSnapshot,
                 initialBatches,
@@ -4748,11 +4748,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     $"Column '{field.Name}' declares an invariant expression and this write path cannot "
                     + "evaluate it against the rows; write rejected.");
             }
-            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
+            if (!rowsWillBeValidated
+                && field.Metadata is not null
+                && field.Metadata.ContainsKey("delta.generationExpression"))
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.UnevaluableTableExpression,
-                    $"Column '{field.Name}' declares a generation expression this writer cannot evaluate; write rejected.");
+                    $"Column '{field.Name}' declares a generation expression and this write path cannot "
+                    + "compute it for the rows; write rejected.");
             }
         }
     }
@@ -4819,7 +4822,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ValidateWritable(
             snapshot,
             isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
-            rowsWillBeValidated: DeltaConstraintEnforcer.Declares(snapshot));
+            rowsWillBeValidated: WriteTimeExpressions.Declares(snapshot));
 
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
@@ -4873,6 +4876,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
         // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
+
+        // Generated columns first, because a CHECK constraint may reference one: validating before
+        // the column exists would read a null the table never stores.
+        var generated = DeltaGeneratedColumns.Create(snapshot);
+        if (generated is not null)
+        {
+            var materialized = new List<RecordBatch>(batches.Count);
+            foreach (var batch in batches)
+                materialized.Add(generated.Apply(batch));
+
+            batches = materialized;
+        }
 
         // Beside the other per-batch guard, and before anything is written: a constraint
         // violation must leave the table untouched rather than half-written. Create parses, so an

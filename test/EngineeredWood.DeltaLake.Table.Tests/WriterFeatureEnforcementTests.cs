@@ -64,6 +64,70 @@ public class WriterFeatureEnforcementTests : IDisposable
         return await DeltaTable.OpenAsync(fs);
     }
 
+    /// <summary>A table whose second column is generated from its first.</summary>
+    /// <remarks>
+    /// The single-column fixture cannot express this: a column generated from itself is
+    /// circular, and only looked harmless while every such table was refused outright.
+    /// </remarks>
+    private async Task<DeltaTable> CreateGeneratedColumnTableAsync(string generation = "id + 1")
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction
+            {
+                MinReaderVersion = 1,
+                MinWriterVersion = 7,
+                WriterFeatures = ["generatedColumns"],
+            },
+            new MetadataAction
+            {
+                Id = "wfe-generated",
+                Format = Format.Parquet,
+                SchemaString =
+                    @"{""type"":""struct"",""fields"":[" +
+                    @"{""name"":""id"",""type"":""long"",""nullable"":false,""metadata"":{}}," +
+                    @"{""name"":""derived"",""type"":""long"",""nullable"":true,""metadata"":" +
+                    $@"{{""delta.generationExpression"":""{generation}""}}}}]}}",
+                PartitionColumns = [],
+            },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    private static RecordBatch IdAndDerived(long id, long derived)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("derived", Int64Type.Default, true))
+            .Build();
+        return new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(id).Build(),
+                new Int64Array.Builder().Append(derived).Build(),
+            ],
+            1);
+    }
+
+    /// <summary>Reads the table back, flattened to (id, derived) pairs.</summary>
+    private static async Task<List<(long Id, long? Derived)>> ReadAllAsync(DeltaTable table)
+    {
+        var rows = new List<(long, long?)>();
+
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var derived = (Int64Array)batch.Column("derived");
+
+            for (var i = 0; i < batch.Length; i++)
+                rows.Add((ids.GetValue(i)!.Value, derived.GetValue(i)));
+        }
+
+        return rows;
+    }
+
     private static RecordBatch Batch(long id)
     {
         var schema = new Apache.Arrow.Schema.Builder()
@@ -185,13 +249,61 @@ public class WriterFeatureEnforcementTests : IDisposable
     }
 
     [Fact]
-    public async Task GenerationExpression_RejectsWrite()
+    public async Task AnOmittedGeneratedColumnIsComputed()
     {
-        await using var table = await CreateTableAsync(
-            fieldMetadataJson: @"{""delta.generationExpression"":""id + 1""}",
-            writerFeatures: ["generatedColumns"]);
-        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.WriteAsync([Batch(1)]));
-        Assert.Contains("generation expression", ex.Message);
+        await using var table = await CreateGeneratedColumnTableAsync();
+
+        Assert.Equal(1, await table.WriteAsync([Batch(41)]));
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
+    [Fact]
+    public async Task ASuppliedGeneratedValueThatAgreesIsAccepted()
+    {
+        await using var table = await CreateGeneratedColumnTableAsync();
+
+        Assert.Equal(1, await table.WriteAsync([IdAndDerived(41, 42)]));
+    }
+
+    [Fact]
+    public async Task ASuppliedGeneratedValueThatDisagreesIsRefused()
+    {
+        await using var table = await CreateGeneratedColumnTableAsync();
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([IdAndDerived(41, 99)]));
+
+        Assert.Equal(DeltaTableErrorCodes.GeneratedColumnMismatch, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task AGenerationExpressionThisWriterCannotParseStillRefusesTheWrite()
+    {
+        await using var table = await CreateGeneratedColumnTableAsync("id + INTERVAL 1 DAY");
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([Batch(1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task TheTransactionalAppendComputesGeneratedColumnsToo()
+    {
+        // The gate asks one question for constraints and generated columns alike, so this path
+        // has to be covered for both — it was gated shut for constraints once already.
+        await using var table = await CreateGeneratedColumnTableAsync();
+
+        await using (var tx = table.StartTransaction())
+        {
+            await tx.WriteAsync([Batch(41)]);
+            await tx.CommitAsync();
+        }
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(42L, rows.Single().Derived);
     }
 
     [Fact]
@@ -206,5 +318,57 @@ public class WriterFeatureEnforcementTests : IDisposable
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
             async () => await table.WriteAsync([Batch(2)], DeltaWriteMode.Overwrite));
         Assert.Contains("append-only", ex.Message);
+    }
+
+    /// <summary>A table whose generated column is DECLARED narrower than its expression produces.</summary>
+    private async Task<DeltaTable> CreateRescalingTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction
+            {
+                MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["generatedColumns"],
+            },
+            new MetadataAction
+            {
+                Id = "wfe-rescale",
+                Format = Format.Parquet,
+                SchemaString =
+                    @"{""type"":""struct"",""fields"":[" +
+                    @"{""name"":""amount"",""type"":""decimal(10,4)"",""nullable"":false,""metadata"":{}}," +
+                    @"{""name"":""rounded"",""type"":""decimal(10,2)"",""nullable"":true,""metadata"":" +
+                    @"{""delta.generationExpression"":""amount""}}]}",
+                PartitionColumns = [],
+            },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    private static IArrowArray Decimals(int precision, int scale, decimal value)
+    {
+        var b = new Decimal128Array.Builder(new Decimal128Type(precision, scale));
+        b.Append(value);
+        return b.Build();
+    }
+
+    [Fact]
+    public async Task ASuppliedValueIsCheckedAgainstWhatWouldActuallyBeStored()
+    {
+        // The generated column is declared decimal(10,2) while its expression yields
+        // decimal(10,4), so what gets WRITTEN is the rescaled 1.23. A caller supplying exactly
+        // that must be accepted: comparing against the raw 1.2345 instead would make the stored
+        // value unsuppliable, and the column impossible to write explicitly at all.
+        await using var table = await CreateRescalingTableAsync();
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("amount", new Decimal128Type(10, 4), false))
+            .Field(new Field("rounded", new Decimal128Type(10, 2), true))
+            .Build();
+        var batch = new RecordBatch(
+            schema, [Decimals(10, 4, 1.2345m), Decimals(10, 2, 1.23m)], 1);
+
+        Assert.Equal(1, await table.WriteAsync([batch]));
     }
 }
