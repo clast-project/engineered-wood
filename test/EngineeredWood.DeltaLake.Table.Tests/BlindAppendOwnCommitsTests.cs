@@ -69,12 +69,22 @@ public class BlindAppendOwnCommitsTests : IDisposable
     }
 
     /// <summary>
-    /// A plain append declares <c>true</c>. It takes its rows from the caller and reads no file of this
-    /// table to decide what to write, which is Delta's definition — and this is the commit shape the
-    /// declaration actually buys something for, since it is the one another engine can then exempt.
+    /// A plain append declares nothing unless the caller does.
     /// </summary>
+    /// <remarks>
+    /// This asserted <c>true</c> until #137. The reasoning was that a plain append "takes its rows from
+    /// the caller and reads no file of this table to decide what to write, which is Delta's definition" —
+    /// true of what this library does, and not of what the field means. Delta's <c>isBlindAppend</c>
+    /// describes the TRANSACTION, and the caller is part of it: a host that scanned this table and handed
+    /// us the resulting rows has made a read we never saw.
+    ///
+    /// It is the same substitution #125 forbids one section earlier, arriving from the other side —
+    /// "writing a spec field off a defaulted value turns every silent caller into an assertive one" —
+    /// and #125's own measurement names the casualty: <c>insert_select_self</c> records <c>false</c> in
+    /// Spark, is adds-only, and is indistinguishable from a genuine blind append by anything but the flag.
+    /// </remarks>
     [Fact]
-    public async Task Append_DeclaresBlind()
+    public async Task Append_DeclaresNothingUnlessTheCallerDoes()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var schema = IdSchema();
@@ -82,7 +92,23 @@ public class BlindAppendOwnCommitsTests : IDisposable
         await using var table = await DeltaTable.CreateAsync(fs, schema);
         await table.WriteAsync([Rows(schema, 1, 2)]);
 
+        Assert.Null(await RecordedFlagAsync(table.CurrentSnapshot.Version));
+    }
+
+    /// <summary>A caller that genuinely read nothing can still say so, and it is recorded.</summary>
+    [Fact]
+    public async Task Append_RecordsTheCallersOwnClaim()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([Rows(schema, 1, 2)], isBlindAppend: true);
         Assert.True(await RecordedFlagAsync(table.CurrentSnapshot.Version));
+
+        // And a host that scanned the table to produce its rows says the opposite.
+        await table.WriteAsync([Rows(schema, 3, 4)], isBlindAppend: false);
+        Assert.False(await RecordedFlagAsync(table.CurrentSnapshot.Version));
     }
 
     /// <summary>An overwrite reads the active-file set to decide what to remove, so it declares <c>false</c>.</summary>

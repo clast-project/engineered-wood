@@ -4740,7 +4740,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>partitionBy</c>). The new data is Hive-split by the NEW columns. Ignored when equal to the current
     /// partitioning; empty list = departition.</para>
     /// </summary>
-    /// <para>[FABRICATOR-PATCH: OFFER-READY] <paramref name="isBlindAppend"/> is the caller's claim about
+    /// <para><paramref name="isBlindAppend"/> is the caller's claim about
     /// its own transaction, recorded verbatim in <c>commitInfo.isBlindAppend</c> on a plain append; null
     /// (the default) writes no field. A host that scanned this table and staged the result must pass
     /// <c>false</c>; only a host that genuinely read nothing may pass <c>true</c>. See
@@ -5198,7 +5198,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)
         {
-            // [FABRICATOR-PATCH: OFFER-READY] The claim is the CALLER's, not ours. This branch used to
+            // The claim is the CALLER's, not ours. This branch used to
             // hardcode `isBlindAppend: true`, reasoning that "a plain append takes its rows from the caller
             // and reads no file of this table to decide what to write". That is true of what THIS library
             // does and false of what the field means: Delta's `isBlindAppend` describes the TRANSACTION
