@@ -60,6 +60,12 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
     public bool IsRegistered(string name) => name switch
     {
         "+" or "-" or "*" or "/" or "%" or "negative" or "cast" or "try_cast" => true,
+        "length" or "upper" or "lower" or "trim" or "ltrim" or "rtrim" => true,
+        "substring" or "substr" or "concat" or "||" => true,
+        "like" or "ilike" or "rlike" => true,
+        "year" or "month" or "day" or "dayofmonth" or "hour" or "minute" or "second" => true,
+        "date_format" => true,
+        "coalesce" or "nvl" or "ifnull" or "nullif" or "if" or "case" => true,
         _ => false,
     };
 
@@ -87,6 +93,64 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             case "try_cast":
                 Expect(name, args, 2);
                 return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: false);
+
+            case "length":
+                Expect(name, args, 1);
+                return SparkFunctions.Length(args[0], rowCount);
+
+            case "upper":
+                Expect(name, args, 1);
+                return SparkFunctions.MapString(args[0], rowCount, t => t.ToUpperInvariant());
+
+            case "lower":
+                Expect(name, args, 1);
+                return SparkFunctions.MapString(args[0], rowCount, t => t.ToLowerInvariant());
+
+            case "trim":
+                Expect(name, args, 1);
+                return SparkFunctions.MapString(args[0], rowCount, t => t.Trim());
+
+            case "ltrim":
+                Expect(name, args, 1);
+                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimStart());
+
+            case "rtrim":
+                Expect(name, args, 1);
+                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimEnd());
+
+            case "substring" or "substr":
+                if (args.Count is not (2 or 3))
+                    throw new ArgumentException($"'{name}' takes 2 or 3 arguments", nameof(args));
+                return SparkFunctions.Substring(args, rowCount);
+
+            case "concat" or "||":
+                return SparkFunctions.Concat(args, rowCount);
+
+            case "like" or "ilike" or "rlike":
+                Expect(name, args, 2);
+                return SparkFunctions.Match(name, args, rowCount);
+
+            case "year" or "month" or "day" or "dayofmonth" or "hour" or "minute" or "second":
+                Expect(name, args, 1);
+                return SparkFunctions.DatePart(name, args[0], rowCount);
+
+            case "date_format":
+                Expect(name, args, 2);
+                return SparkFunctions.DateFormat(args, rowCount);
+
+            case "coalesce" or "nvl" or "ifnull":
+                return Coalesce(args, rowCount);
+
+            case "nullif":
+                Expect(name, args, 2);
+                return NullIf(args, rowCount);
+
+            case "if":
+                Expect(name, args, 3);
+                return If(args, rowCount);
+
+            case "case":
+                return Case(args, rowCount);
 
             default:
                 throw new NotSupportedException(
@@ -705,4 +769,120 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         return builder.Build();
     }
 
+    // ── Conditionals ───────────────────────────────────────────────────────────────────────
+
+    /// <summary>The type a set of branches unifies to.</summary>
+    private static IArrowType UnifiedType(IEnumerable<IArrowArray> branches)
+    {
+        IArrowType? type = null;
+        foreach (var branch in branches)
+        {
+            type = type is null
+                ? branch.Data.DataType
+                : SparkNumericTypes.CommonType(type, branch.Data.DataType);
+        }
+
+        return type ?? StringType.Default;
+    }
+
+    private static IArrowArray Coalesce(IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        if (args.Count == 0)
+            throw new ArgumentException("coalesce needs at least one argument", nameof(args));
+
+        var choice = new int[rowCount];
+        for (var row = 0; row < rowCount; row++)
+        {
+            choice[row] = -1;
+            for (var i = 0; i < args.Count; i++)
+            {
+                if (SparkFunctions.IsNull(args[i], row))
+                    continue;
+
+                choice[row] = i;
+                break;
+            }
+        }
+
+        return SparkFunctions.Unify(UnifiedType(args), args, choice, rowCount);
+    }
+
+    /// <summary>
+    /// <c>nullif(a, b)</c> — null when the two are equal, otherwise the first.
+    /// </summary>
+    private static IArrowArray NullIf(IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        var choice = new int[rowCount];
+        for (var row = 0; row < rowCount; row++)
+        {
+            if (SparkFunctions.IsNull(args[0], row))
+            {
+                choice[row] = -1;
+                continue;
+            }
+
+            var left = SparkFunctions.ReadString(args[0], row);
+            var right = SparkFunctions.IsNull(args[1], row)
+                ? null
+                : SparkFunctions.ReadString(args[1], row);
+
+            choice[row] = left == right ? -1 : 0;
+        }
+
+        return SparkFunctions.Unify(args[0].Data.DataType, args, choice, rowCount);
+    }
+
+    private static IArrowArray If(IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        var branches = new[] { args[1], args[2] };
+        var choice = new int[rowCount];
+
+        for (var row = 0; row < rowCount; row++)
+            choice[row] = IsTrue(args[0], row) ? 0 : 1;
+
+        return SparkFunctions.Unify(UnifiedType(branches), branches, choice, rowCount);
+    }
+
+    /// <summary>
+    /// <c>CASE</c>, as the parser emits it: condition and value in pairs, with an odd argument
+    /// count meaning a trailing ELSE.
+    /// </summary>
+    /// <remarks>
+    /// A CASE with no ELSE and no matching branch is null — measured,
+    /// <c>CASE WHEN a &gt; 0 THEN 1 END</c> gives null where the condition fails.
+    /// </remarks>
+    private static IArrowArray Case(IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        if (args.Count < 2)
+            throw new ArgumentException("case needs at least one when/then pair", nameof(args));
+
+        var hasElse = args.Count % 2 == 1;
+        var values = new List<IArrowArray>();
+        for (var i = 1; i < args.Count; i += 2)
+            values.Add(args[i]);
+
+        if (hasElse)
+            values.Add(args[args.Count - 1]);
+
+        var choice = new int[rowCount];
+        for (var row = 0; row < rowCount; row++)
+        {
+            choice[row] = hasElse ? values.Count - 1 : -1;
+
+            for (var branch = 0; branch * 2 + 1 < args.Count; branch++)
+            {
+                if (!IsTrue(args[branch * 2], row))
+                    continue;
+
+                choice[row] = branch;
+                break;
+            }
+        }
+
+        return SparkFunctions.Unify(UnifiedType(values), values, choice, rowCount);
+    }
+
+    /// <summary>A condition is taken only when it is true — null is not.</summary>
+    private static bool IsTrue(IArrowArray condition, int row) =>
+        condition is BooleanArray booleans && !booleans.IsNull(row) && booleans.GetValue(row)!.Value;
 }

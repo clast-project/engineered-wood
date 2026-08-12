@@ -283,9 +283,11 @@ public sealed class SparkFunctionRegistryTests
     public void AnUnimplementedFunctionIsNotClaimedAsRegistered()
     {
         // ArrowRowEvaluator's own error is what a caller should see, rather than this registry
-        // accepting the call and failing somewhere less legible.
-        Assert.False(Ansi.IsRegistered("substring"));
-        Assert.False(Ansi.IsRegistered("date_format"));
+        // accepting the call and failing somewhere less legible. current_timestamp is excluded
+        // deliberately: it is non-deterministic, which Delta forbids in a constraint or a
+        // generated column in the first place.
+        Assert.False(Ansi.IsRegistered("current_timestamp"));
+        Assert.False(Ansi.IsRegistered("to_date"));
         Assert.True(Ansi.IsRegistered("+"));
         Assert.True(Ansi.IsRegistered("cast"));
     }
