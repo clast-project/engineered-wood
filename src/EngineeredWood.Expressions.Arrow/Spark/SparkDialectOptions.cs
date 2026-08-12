@@ -33,4 +33,32 @@ public sealed record SparkDialectOptions
     /// false selects the legacy behaviour, where the same expressions yield null instead.
     /// </remarks>
     public bool Ansi { get; init; } = true;
+
+    /// <summary>
+    /// The timezone temporal conversions resolve against. Always UTC, deliberately.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this is settled rather than configurable.</b> Spark resolves a timestamp against
+    /// <c>spark.sql.session.timeZone</c>, and it changes answers: measured, the instant
+    /// 2026-08-11T03:00Z casts to the date <c>2026-08-11</c> under UTC and <c>2026-08-10</c>
+    /// under <c>America/Los_Angeles</c>. A generated column defined as
+    /// <c>CAST(ts AS DATE)</c> therefore stores a different value depending on which session
+    /// wrote the row — the same unspecified-by-omission problem as ANSI, and Delta pins neither.
+    /// </para>
+    /// <para>
+    /// EngineeredWood has no session to inherit from, so it fixes one. UTC is chosen because it
+    /// is what the harvested corpus is pinned to, and because the rest of the library already
+    /// assumes it: <c>ArrowRowEvaluator</c> reads a Date32 as UTC midnight of that day, so a
+    /// literal and a column value already compare on UTC footing.
+    /// </para>
+    /// <para>
+    /// It is a fixed property rather than a settable one because honouring another zone needs
+    /// more than this option. The parser resolves a zone-less <c>TIMESTAMP'…'</c> literal to an
+    /// instant in <c>EngineeredWood.Expressions</c>, which cannot see these options at all, so a
+    /// non-UTC setting here would make literals and column conversions disagree silently. Making
+    /// the zone configurable means moving both together.
+    /// </para>
+    /// </remarks>
+    public static TimeZoneInfo TimeZone => TimeZoneInfo.Utc;
 }

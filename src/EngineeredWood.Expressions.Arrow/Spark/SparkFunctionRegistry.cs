@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
@@ -30,6 +31,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry : IFunctionRegistry
 {
+    private static CultureInfo Invariant => CultureInfo.InvariantCulture;
+
     private readonly SparkDialectOptions _options;
 
     public SparkFunctionRegistry(SparkDialectOptions? options = null)
@@ -402,9 +405,98 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         if (target is BooleanType)
             return CastToBoolean(source, rowCount, raising);
 
+        if (SparkArrays.IsDateType(target))
+            return CastToDate(source, rowCount, raising);
+
+        if (target is TimestampType)
+            return CastToTimestamp(source, rowCount, raising);
+
         throw new NotSupportedException(
-            $"cast to {SparkArrays.Describe(target)} is not implemented. " +
-            "Temporal casts need the timezone policy settled first.");
+            $"cast to {SparkArrays.Describe(target)} is not implemented.");
+    }
+
+    /// <summary>
+    /// Casts to a calendar date, taking the date the instant falls on in the resolved timezone.
+    /// </summary>
+    /// <remarks>
+    /// This is where <see cref="SparkDialectOptions.TimeZone"/> is load-bearing rather than
+    /// decorative. The instant 2026-08-11T03:00Z is 2026-08-11 in UTC and 2026-08-10 in
+    /// America/Los_Angeles, so a generated column defined as <c>CAST(ts AS DATE)</c> stores a
+    /// different value depending on which zone resolves it. UTC is the fixed choice; see the
+    /// option for why it is not settable.
+    /// </remarks>
+    private IArrowArray CastToDate(IArrowArray source, int rowCount, bool raising)
+    {
+        var instants = new DateTimeOffset?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            var value = SparkArrays.ReadForCast(source, i);
+            if (value is null)
+                continue;
+
+            if (value.Value.Instant is { } instant)
+            {
+                instants[i] = instant;
+                continue;
+            }
+
+            if (value.Value.FromString
+                && DateTimeOffset.TryParse(value.Value.Text.Trim(), Invariant,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+            {
+                instants[i] = parsed;
+                continue;
+            }
+
+            if (!raising) continue;
+            throw SparkEvaluationException.InvalidCast(value.Value.Text, "DATE");
+        }
+
+        return SparkArrays.BuildDate32(instants, rowCount);
+    }
+
+    private IArrowArray CastToTimestamp(IArrowArray source, int rowCount, bool raising)
+    {
+        var instants = new DateTimeOffset?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            var value = SparkArrays.ReadForCast(source, i);
+            if (value is null)
+                continue;
+
+            if (value.Value.Instant is { } instant)
+            {
+                instants[i] = instant;
+                continue;
+            }
+
+            if (value.Value.FromString)
+            {
+                if (DateTimeOffset.TryParse(value.Value.Text.Trim(), Invariant,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+                {
+                    instants[i] = parsed;
+                    continue;
+                }
+
+                if (!raising) continue;
+                throw SparkEvaluationException.InvalidCast(value.Value.Text, "TIMESTAMP");
+            }
+
+            // A number is epoch seconds, which is the inverse of casting a timestamp to a number.
+            if (value.Value.IsNumeric)
+            {
+                instants[i] = DateTimeOffset.FromUnixTimeSeconds((long)value.Value.AsDouble);
+                continue;
+            }
+
+            if (!raising) continue;
+            throw SparkEvaluationException.InvalidCast(value.Value.Text, "TIMESTAMP");
+        }
+
+        return SparkArrays.BuildTimestamp(instants, rowCount);
     }
 
     private IArrowArray CastToIntegral(IArrowArray source, IArrowType target, int rowCount, bool raising)
@@ -416,6 +508,14 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             var value = SparkArrays.ReadForCast(source, i);
             if (value is null)
                 continue;
+
+            // Spark refuses a date-to-integer cast outright, while a timestamp becomes epoch
+            // seconds. Measured: CAST(DATE'…' AS LONG) is an error.
+            if (value.Value.IsDate)
+            {
+                throw new NotSupportedException(
+                    $"cast from DATE to {SparkArrays.Describe(target)} is not allowed");
+            }
 
             if (!value.Value.IsNumeric)
             {

@@ -266,15 +266,17 @@ public sealed class SparkFunctionRegistryTests
     }
 
     [Fact]
-    public void ATemporalCastIsRefusedByNameRatherThanSilentlyWrong()
+    public void AnUnsupportedCastTargetIsRefusedByNameRatherThanSilentlyWrong()
     {
-        // Timezone policy is unsettled, so this is the one place the registry declines rather
-        // than guesses. The message has to name the reason: a table carrying such a generated
-        // column must fail closed with something a caller can act on.
+        // TIMESTAMP_NTZ is a real Spark type with no offset at all. It is deliberately not
+        // aliased onto TIMESTAMP, because doing so would reinterpret values under the fixed
+        // timezone rather than admit it is unsupported. A table carrying such a column must fail
+        // closed with something a caller can act on.
         var batch = Batch(("g", Doubles(1.5)));
 
-        var ex = Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(g AS DATE)", batch));
-        Assert.Contains("not implemented", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var ex = Assert.Throws<NotSupportedException>(
+            () => Eval(Ansi, "CAST(g AS TIMESTAMP_NTZ)", batch));
+        Assert.Contains("TIMESTAMP_NTZ", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -348,5 +350,125 @@ public sealed class SparkFunctionRegistryTests
             new ArrowRowEvaluator(Ansi).EvaluateExpression(call, Batch(("a", Ints(1)))));
 
         Assert.Contains(target, ex.Message, StringComparison.Ordinal);
+    }
+
+    // ── Temporal casts, where the timezone policy is load-bearing ──────────────────────────
+
+    /// <summary>2026-08-11T03:00Z — 2026-08-11 in UTC, but 2026-08-10 in America/Los_Angeles.</summary>
+    private static readonly DateTimeOffset Straddling =
+        new(2026, 8, 11, 3, 0, 0, TimeSpan.Zero);
+
+    private static IArrowArray Timestamps(params DateTimeOffset[] values)
+    {
+        var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    private static IArrowArray Dates(params DateTimeOffset[] values)
+    {
+        var b = new Date32Array.Builder();
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    [Fact]
+    public void CastingATimestampToADateResolvesInUtc()
+    {
+        // The measurement that settled the policy: this instant is 2026-08-11 in UTC and
+        // 2026-08-10 in America/Los_Angeles, so the answer is a choice rather than a fact. A
+        // generated column CAST(ts AS DATE) stores whichever the resolving zone says.
+        var batch = Batch(("ts", Timestamps(Straddling)));
+
+        var result = Assert.IsType<Date32Array>(Eval(Ansi, "CAST(ts AS DATE)", batch));
+        Assert.Equal(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero),
+            result.GetDateTimeOffset(0)!.Value);
+    }
+
+    [Fact]
+    public void CastingADateToATimestampGivesUtcMidnight()
+    {
+        var batch = Batch(("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))));
+
+        var result = Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(dt AS TIMESTAMP)", batch));
+        Assert.Equal(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero),
+            result.GetTimestamp(0)!.Value);
+    }
+
+    [Fact]
+    public void ATimestampRendersWithItsTimeAndADateWithoutOne()
+    {
+        Assert.Equal("2026-08-11 03:00:00", Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(ts AS STRING)", Batch(("ts", Timestamps(Straddling))))).GetString(0));
+
+        Assert.Equal("2026-08-11", Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(dt AS STRING)",
+                Batch(("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))))))
+            .GetString(0));
+    }
+
+    [Fact]
+    public void ATimestampCastsToEpochSecondsAndBack()
+    {
+        var batch = Batch(("ts", Timestamps(Straddling)));
+
+        var seconds = Assert.IsType<Int64Array>(Eval(Ansi, "CAST(ts AS BIGINT)", batch));
+        Assert.Equal(Straddling.ToUnixTimeSeconds(), seconds.GetValue(0));
+
+        var back = Assert.IsType<TimestampArray>(
+            Eval(Ansi, "CAST(CAST(ts AS BIGINT) AS TIMESTAMP)", batch));
+        Assert.Equal(Straddling, back.GetTimestamp(0)!.Value);
+    }
+
+    [Fact]
+    public void ADateHasNoIntegerFormBecauseSparkRefusesOne()
+    {
+        // Measured: CAST(DATE'…' AS LONG) is an error, unlike the timestamp case.
+        var batch = Batch(("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))));
+
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(dt AS BIGINT)", batch));
+    }
+
+    [Fact]
+    public void AStringParsesToADateOrATimestamp()
+    {
+        var batch = Batch(("s", Strings("2026-08-11 03:00:00")));
+
+        Assert.Equal(Straddling, Assert.IsType<TimestampArray>(
+            Eval(Ansi, "CAST(s AS TIMESTAMP)", batch)).GetTimestamp(0)!.Value);
+
+        var dates = Batch(("s", Strings("2026-08-11")));
+        Assert.Equal(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero),
+            Assert.IsType<Date32Array>(Eval(Ansi, "CAST(s AS DATE)", dates)).GetDateTimeOffset(0)!.Value);
+    }
+
+    [Fact]
+    public void AnUnparseableStringIsRefusedByBothTemporalCasts()
+    {
+        var batch = Batch(("s", Strings("abc")));
+
+        Assert.Equal("CAST_INVALID_INPUT",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS DATE)", batch)).ErrorClass);
+        Assert.Equal("CAST_INVALID_INPUT",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS TIMESTAMP)", batch)).ErrorClass);
+
+        Assert.Null(Assert.IsType<Date32Array>(
+            Eval(Ansi, "TRY_CAST(s AS DATE)", batch)).GetDateTimeOffset(0));
+    }
+
+    [Fact]
+    public void TheTimezonePolicyIsUtcAndTheLiteralPathAgreesWithIt()
+    {
+        // The parser resolves a zone-less TIMESTAMP'…' literal as UTC, in a different assembly
+        // that cannot see these options. This asserts the two agree, which is the coupling that
+        // makes the policy fixed rather than settable.
+        Assert.Equal(TimeZoneInfo.Utc, SparkDialectOptions.TimeZone);
+
+        var batch = Batch(("ts", Timestamps(Straddling)));
+        var result = Assert.IsType<BooleanArray>(
+            new ArrowRowEvaluator(Ansi).EvaluatePredicate(
+                SparkSqlParser.ParsePredicate("ts = TIMESTAMP'2026-08-11 03:00:00'"), batch));
+
+        Assert.True(result.GetValue(0));
     }
 }
