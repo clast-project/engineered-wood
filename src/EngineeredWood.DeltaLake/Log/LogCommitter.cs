@@ -189,8 +189,8 @@ public sealed class LogCommitter
                     _options.PreferTypedCheckpointStats);
 
                 var verdict = ConflictChecker.Check(
-                    request.Reads, request.PlannedRemovePaths, pruner, request.Isolation,
-                    concurrent, resolvedPaths);
+                    request.Reads, pruner, request.Isolation,
+                    currentActions, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                 {
                     throw new DeltaConflictException(

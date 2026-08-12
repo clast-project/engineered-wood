@@ -370,7 +370,6 @@ public class LogCommitterTests : IDisposable
             {
                 BaseSnapshot = snapshot,
                 Actions = [Remove("doomed.parquet")],
-                PlannedRemovePaths = new HashSet<string>(StringComparer.Ordinal) { "doomed.parquet" },
             }));
 
         Assert.Contains("which this transaction also removes", conflict.Message, StringComparison.Ordinal);

@@ -64,14 +64,35 @@ public class ConflictCheckerTests
     private static (long, IReadOnlyList<DeltaAction>) Commit(long version, params DeltaAction[] actions) =>
         (version, actions);
 
+    /// <summary>For a transaction whose own actions do not bear on the verdict.</summary>
     private static ConflictResult Check(
         ReadSet reads,
-        ISet<string> plannedRemoves,
         IsolationLevel isolation,
         params (long, IReadOnlyList<DeltaAction>)[] concurrent) =>
-        ConflictChecker.Check(reads, plannedRemoves, Pruner(), isolation, concurrent);
+        ConflictChecker.Check(reads, Pruner(), isolation, NoCurrentActions, concurrent);
 
-    private static readonly ISet<string> NoRemoves = new HashSet<string>();
+    /// <summary>
+    /// As <see cref="Check"/>, but states what THIS transaction is committing. Two things are read off it —
+    /// whether we change the metadata, and which paths we remove — so the delete/delete and metadata-gate
+    /// tests go through this one and the rest through the overload above.
+    /// </summary>
+    private static ConflictResult CheckCommitting(
+        IReadOnlyList<DeltaAction> currentActions,
+        ReadSet reads,
+        IsolationLevel isolation,
+        params (long, IReadOnlyList<DeltaAction>)[] concurrent) =>
+        ConflictChecker.Check(reads, Pruner(), isolation, currentActions, concurrent);
+
+    /// <summary>A transaction committing nothing that bears on the verdict.</summary>
+    private static readonly IReadOnlyList<DeltaAction> NoCurrentActions = [];
+
+    private static MetadataAction Metadata(string schema = "{}") => new()
+    {
+        Id = "t",
+        Format = Format.Parquet,
+        SchemaString = schema,
+        PartitionColumns = [],
+    };
 
     /// <summary>A commitInfo action from raw JSON. Values are cloned so they outlive the parsed document.</summary>
     private static CommitInfo Info(string json)
@@ -94,7 +115,7 @@ public class ConflictCheckerTests
         var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
         var concurrent = Commit(6, Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
+        var result = Check(reads, IsolationLevel.Serializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
         Assert.Equal(6, result.ConflictingVersion);
@@ -107,7 +128,7 @@ public class ConflictCheckerTests
         var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
         var concurrent = Commit(6, Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -120,7 +141,7 @@ public class ConflictCheckerTests
         var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
         var concurrent = Commit(6, Add("part-far.parquet", minId: 100, maxId: 200));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
+        var result = Check(reads, IsolationLevel.Serializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -146,7 +167,7 @@ public class ConflictCheckerTests
             Info("""{"isBlindAppend":false}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
         Assert.Equal(6, result.ConflictingVersion);
@@ -161,7 +182,7 @@ public class ConflictCheckerTests
             Info("""{"isBlindAppend":true}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -181,7 +202,7 @@ public class ConflictCheckerTests
             Remove("part-unrelated.parquet"),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -195,7 +216,7 @@ public class ConflictCheckerTests
             Info("""{"isBlindAppend":true}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
+        var result = Check(reads, IsolationLevel.Serializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
     }
@@ -213,7 +234,7 @@ public class ConflictCheckerTests
             Info("""{"operation":"WRITE","engineInfo":"some-other-engine"}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict); // inferred blind: adds only
     }
@@ -227,9 +248,102 @@ public class ConflictCheckerTests
             Info("""{"isBlindAppend":"yes"}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict); // inferred blind: adds only
+    }
+
+    // ── the gate's third term: OUR OWN transaction changing metadata ──
+
+    // Everything else here judges the winning commit. This one term judges us, which is what makes it
+    // easy to leave out: Delta's `case WriteSerializable if !currentTransactionInfo.metadataChanged`.
+
+    /// <summary>
+    /// ⚠ THE CASE #126 IS ABOUT. A transaction that itself changes the schema loses the blind-append
+    /// exemption: under WriteSerializable it falls through to the Serializable branch and examines
+    /// concurrent blind appends too. The exemption's justification is that a blind append cannot have
+    /// depended on anything we did — but a schema change is not local to the files we read, and an append
+    /// written against the OLD schema need not still be valid under the new one.
+    /// </summary>
+    [Fact]
+    public void OwnMetadataChange_WithdrawsTheBlindAppendExemption()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""), // genuinely blind, and believed
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [Metadata("""{"type":"struct","fields":[]}""")],
+            reads, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+    }
+
+    /// <summary>
+    /// The control: the SAME transaction and the SAME concurrent commit, minus our metadata change, stays
+    /// exempt. Without it the test above would pass equally well if the exemption had been dropped
+    /// altogether — which would be a far more expensive change than the one intended.
+    /// </summary>
+    [Fact]
+    public void WithoutOwnMetadataChange_TheExemptionHolds()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [Add("ours.parquet", minId: 100, maxId: 200)],
+            reads, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// A PROTOCOL change of our own does NOT withdraw the exemption, because Delta's gate does not read
+    /// one: <c>metadataChanged</c> is <c>newMetadata.nonEmpty</c>, assigned by a loop whose only case is
+    /// <c>case m: Metadata</c> (checked at the <c>v4.0.0</c> tag).
+    ///
+    /// <para>Worth a test rather than a comment: the issue proposing this fix suggested deriving the term
+    /// from "a MetadataAction or ProtocolAction among them", which would be STRICTER than Delta — a
+    /// transaction that only enables a table feature would start conflicting with concurrent appends
+    /// where Delta lets it through. Erring strict is still erring.</para>
+    /// </summary>
+    [Fact]
+    public void OwnProtocolChange_DoesNotWithdrawTheExemption()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = CheckCommitting(
+            [new ProtocolAction { MinReaderVersion = 3, MinWriterVersion = 7 }],
+            reads, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// The term is about OUR transaction, not the concurrent one, and those are different rules that both
+    /// mention metadata. A concurrent metadata change conflicts unconditionally (rule 1, and
+    /// <see cref="ConcurrentMetadataChange_Conflicts"/> covers it); ours only widens which adds get
+    /// examined. Here our metadata change meets a concurrent blind append whose file does NOT match our
+    /// predicate — so the widened gate examines it and still finds nothing.
+    /// </summary>
+    [Fact]
+    public void OwnMetadataChange_WidensTheGate_ItDoesNotManufactureAConflict()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-far.parquet", minId: 100, maxId: 200)); // cannot contain id = 5
+
+        var result = CheckCommitting(
+            [Metadata()], reads, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
     }
 
     // ── the inference's one piece of POSITIVE evidence: a cdc action ──
@@ -252,7 +366,7 @@ public class ConflictCheckerTests
             Add("part-new.parquet", minId: 1, maxId: 10),
             Cdc("_change_data/cdc-00000.parquet"));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
     }
@@ -270,7 +384,7 @@ public class ConflictCheckerTests
             Info("""{"operation":"MERGE","engineInfo":"delta-rs"}"""),
             Add("part-new.parquet", minId: 1, maxId: 10));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -290,7 +404,7 @@ public class ConflictCheckerTests
             Add("part-new.parquet", minId: 1, maxId: 10),
             Cdc("_change_data/cdc-00000.parquet"));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -340,20 +454,45 @@ public class ConflictCheckerTests
         var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" } };
         var concurrent = Commit(6, Remove("part-read.parquet"));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+        var result = Check(reads, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentDeleteRead, result.Type);
         Assert.Equal(6, result.ConflictingVersion);
+    }
+
+    /// <summary>
+    /// A file we READ but do not remove, deleted concurrently, is <c>ConcurrentDeleteRead</c> — even though
+    /// this transaction is committing removes of its own. The two categories are distinguished by which
+    /// paths OUR actions remove, and a read path is not among them.
+    ///
+    /// <para>This used to be a way to get it wrong. The delete/delete check took a caller-supplied
+    /// <c>plannedRemovePaths</c> set restating what the actions already said, and its documentation had to
+    /// warn that naming a merely-read path there would report this case as delete/delete. Deriving the set
+    /// from the actions makes that unrepresentable — a read path is not a <c>RemoveFile</c> — so this test
+    /// pins a property of the API's shape rather than of its implementation.</para>
+    /// </summary>
+    [Fact]
+    public void ReadFile_IsNotAPlannedRemove_EvenWhenTheTransactionRemovesOthers()
+    {
+        var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" } };
+        var concurrent = Commit(6, Remove("part-read.parquet"));
+
+        var result = CheckCommitting(
+            [Remove("part-other.parquet")], reads, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentDeleteRead, result.Type);
     }
 
     /// <summary>Two transactions removing the same file conflict (delete/delete).</summary>
     [Fact]
     public void DeleteDelete_SameFile_Conflicts()
     {
-        var plannedRemoves = new HashSet<string> { "part-target.parquet" };
         var concurrent = Commit(6, Remove("part-target.parquet"));
 
-        var result = Check(ReadSet.Blind, plannedRemoves, IsolationLevel.WriteSerializable, concurrent);
+        // The removes come off the actions this transaction is committing — the same place the commit
+        // itself will carry them, so the two cannot disagree.
+        var result = CheckCommitting(
+            [Remove("part-target.parquet")], ReadSet.Blind, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.Equal(ConflictType.ConcurrentDeleteDelete, result.Type);
     }
@@ -373,7 +512,7 @@ public class ConflictCheckerTests
         };
 
         // Even a transaction that read nothing (a blind append) conflicts with a metadata change.
-        var result = Check(ReadSet.Blind, NoRemoves, IsolationLevel.WriteSerializable, Commit(6, metadata));
+        var result = Check(ReadSet.Blind, IsolationLevel.WriteSerializable, Commit(6, metadata));
 
         Assert.Equal(ConflictType.MetadataChanged, result.Type);
     }
@@ -396,7 +535,7 @@ public class ConflictCheckerTests
             Remove("part-a.parquet", dataChange: false),
             Add("part-compacted.parquet", minId: 1, maxId: 10, dataChange: false));
 
-        var result = Check(reads, NoRemoves, IsolationLevel.Serializable, concurrent);
+        var result = Check(reads, IsolationLevel.Serializable, concurrent);
 
         Assert.False(result.HasConflict);
     }
@@ -408,7 +547,7 @@ public class ConflictCheckerTests
     public void NoConcurrentCommits_Passes()
     {
         var reads = new ReadSet { WholeTable = true };
-        var result = Check(reads, NoRemoves, IsolationLevel.Serializable);
+        var result = Check(reads, IsolationLevel.Serializable);
         Assert.False(result.HasConflict);
     }
 
@@ -416,8 +555,8 @@ public class ConflictCheckerTests
     [Fact]
     public void EarliestConflictingVersion_IsReported()
     {
-        var plannedRemoves = new HashSet<string> { "part-target.parquet" };
-        var result = Check(ReadSet.Blind, plannedRemoves, IsolationLevel.WriteSerializable,
+        var result = CheckCommitting(
+            [Remove("part-target.parquet")], ReadSet.Blind, IsolationLevel.WriteSerializable,
             Commit(6, Add("part-x.parquet", 1, 10)),
             Commit(7, Remove("part-target.parquet")),
             Commit(8, Remove("part-target.parquet")));

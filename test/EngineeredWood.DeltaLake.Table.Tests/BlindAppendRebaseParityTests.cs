@@ -129,6 +129,71 @@ public class BlindAppendRebaseParityTests : IDisposable
     }
 
     /// <summary>
+    /// #126's term, on this path. A transaction that itself changes the metadata loses the blind-append
+    /// exemption, so the identical declared-blind commit that <see cref="RebaseCheck_ExemptsADeclaredBlindAppend"/>
+    /// lets through now conflicts.
+    ///
+    /// <para>This is the test the issue asked for by name: the OCC loop and this path share the rule, and
+    /// "if this gate gains a term, that sharing has to extend to the term rather than only to the rule —
+    /// that is exactly how the last divergence became live." Sharing <c>ExamineConcurrentAdds</c> rather
+    /// than just <c>IsBlindAppend</c> is what makes them agree; this asserts they do.</para>
+    /// </summary>
+    [Fact]
+    public async Task RebaseCheck_OwnMetadataChange_WithdrawsTheExemption()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([Row(schema, 1)]);                                  // v1
+        var baseSnapshot = table.CurrentSnapshot;
+
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(
+            baseSnapshot.Version + 1, DeclaredAppend(isBlindAppend: true, "concurrent.parquet"));
+
+        await using var reader = await DeltaTable.OpenAsync(fs);
+
+        var conflict = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await reader.CheckLogicalRebaseAsync(
+                baseSnapshot,
+                plannedActions: [baseSnapshot.Metadata with { SchemaString = "{\"type\":\"struct\",\"fields\":[]}" }],
+                readWholeTable: true,
+                serializable: false));
+
+        Assert.Equal(DeltaErrorCodes.ConcurrentAppend, conflict.ErrorCode);
+    }
+
+    /// <summary>
+    /// A protocol change of our own does NOT withdraw it — Delta's <c>metadataChanged</c> is
+    /// <c>newMetadata.nonEmpty</c> and no protocol term feeds this gate (<c>v4.0.0</c>). Paired with the
+    /// test above so the term is pinned to metadata specifically rather than to "we are committing
+    /// something table-wide", which is the reading that would make it stricter than Delta.
+    /// </summary>
+    [Fact]
+    public async Task RebaseCheck_OwnProtocolChange_DoesNotWithdrawTheExemption()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([Row(schema, 1)]);                                  // v1
+        var baseSnapshot = table.CurrentSnapshot;
+
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(
+            baseSnapshot.Version + 1, DeclaredAppend(isBlindAppend: true, "concurrent.parquet"));
+
+        await using var reader = await DeltaTable.OpenAsync(fs);
+
+        await reader.CheckLogicalRebaseAsync(
+            baseSnapshot,
+            plannedActions: [new ProtocolAction { MinReaderVersion = 3, MinWriterVersion = 7 }],
+            readWholeTable: true,
+            serializable: false);
+    }
+
+    /// <summary>
     /// Serializable examines a declared blind append anyway — the level's whole point. Included because the
     /// unified rule now decides <c>blindAppend</c> for this path too, and a rule change that quietly
     /// dropped the isolation gate would leave both cases above passing.

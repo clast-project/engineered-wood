@@ -186,7 +186,6 @@ public class ConflictClassificationTests : IDisposable
         {
             BaseSnapshot = snapshot,
             Actions = [Remove("doomed.parquet")],
-            PlannedRemovePaths = new HashSet<string>(StringComparer.Ordinal) { "doomed.parquet" },
         });
 
         // Deliberately NOT the same code as a row-level collision: this is file granularity, and the

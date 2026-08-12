@@ -70,6 +70,33 @@ exempts a concurrent *blind append* and nothing else; blinding also drops the `P
 unrelated statements in the same transaction, admitting a concurrentAppend that both levels catch —
 pinned by `StagedRowDelete_DoesNotExemptTheTransactionsReadPredicates`.
 
+## Derived from the actions, or declared
+
+`ConflictChecker.Check` takes the actions the transaction is about to commit, and reads two things off
+them: whether it changes the metadata, and which paths it removes. Both used to be stated separately —
+`plannedRemovePaths` as a parameter, `metadataChanged` not at all.
+
+The test for which way a fact should travel is whether the actions record it:
+
+| fact | source | why |
+|---|---|---|
+| removes | derived | a `RemoveFile` *is* the removal |
+| metadata change | derived | a `MetadataAction` *is* the change |
+| reads | **declared** (`ReadSet`) | a commit does not record what it looked at |
+| `isBlindAppend` | **declared** | a property of the transaction's reads, same reason |
+
+Deriving is not merely tidier. A restated fact can contradict the thing it restates, and this one did:
+`plannedRemovePaths`'s documentation had to warn that naming a merely-*read* path there would report a
+concurrent delete of it as delete/delete rather than the concurrentDeleteRead it is. The table layer
+carried a paragraph explaining that its read-set had to be a *different object* from the removed-path set
+for that reason. Derived from the actions, the mistake is unrepresentable — a read path is not a
+`RemoveFile` — and both the warning and the paragraph are gone.
+
+The converse holds for reads. `ReadSet.Blind` is the *default*, so it means "this caller said nothing",
+not "this caller declares it read nothing"; sourcing a spec field off it would turn every silent caller
+into an assertive one. That is why `isBlindAppend` is asked for rather than inferred here, even though a
+later reader may end up inferring it (below).
+
 ## How "blind append" is decided
 
 Blind-append is a property of the *writer's transaction* — `readPredicates.isEmpty &&
@@ -94,6 +121,43 @@ exempted from a concurrent-append check.
 
 The rule has exactly one implementation. `DeltaTable.CheckLogicalRebaseAsync` calls the same method,
 after a period where it kept a second copy that disagreed.
+
+### And one term that judges *us*
+
+Being a blind append is not enough to earn the exemption; **this** transaction has to qualify for it too.
+Delta's gate:
+
+```scala
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  case SnapshotIsolation =>
+    Seq.empty
+}
+```
+
+Under `WriteSerializable`, a transaction that itself changes the metadata falls through to the
+`Serializable` branch and examines concurrent blind appends too. The exemption is justified by a blind
+append not having depended on anything we did — but a schema change is not local to the files we read,
+and an append written against the *old* schema need not still be valid under the new one.
+
+This is a different rule from "a concurrent `metaData` action conflicts unconditionally" (rules 1 and 2
+above), which judges the *winning* commit. This one judges ours, and only widens which adds get examined
+— it never manufactures a conflict on its own.
+
+**Metadata, not protocol.** Delta's `metadataChanged` is `newMetadata.nonEmpty`, assigned by a loop whose
+only case is `case m: Metadata`; a `Protocol` action never sets it (checked at `v4.0.0`). Including
+protocol would be *stricter* than Delta — a transaction that only enables a table feature would start
+conflicting with concurrent appends — and gratuitous strictness about concurrency is its own defect.
+
+`ConflictChecker.ExamineConcurrentAdds` is the whole gate, and both paths call it. Sharing only the
+blind-append *rule* while each path decided what to do with the answer is precisely how the previous
+divergence went live, so the gate is shared too. `BlindAppendRebaseParityTests` pins the agreement.
+
+`SnapshotIsolation` has no counterpart in our `IsolationLevel`, which is why the Scala reads as three
+cases and ours as two.
 
 ## Entry points
 
