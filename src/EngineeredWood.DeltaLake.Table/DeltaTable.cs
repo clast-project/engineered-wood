@@ -4740,12 +4740,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>partitionBy</c>). The new data is Hive-split by the NEW columns. Ignored when equal to the current
     /// partitioning; empty list = departition.</para>
     /// </summary>
-    /// <para><paramref name="isBlindAppend"/> is the caller's claim about
-    /// its own transaction, recorded verbatim in <c>commitInfo.isBlindAppend</c> on a plain append; null
-    /// (the default) writes no field. A host that scanned this table and staged the result must pass
-    /// <c>false</c>; only a host that genuinely read nothing may pass <c>true</c>. See
-    /// <see cref="DeltaTransaction.IsBlindAppend"/>, whose contract this mirrors on the auto-committing
-    /// surface, and the note in <c>CommitWriteAsync</c> for why the library must not answer this itself.</para>
+    /// <param name="isBlindAppend">
+    /// The caller's claim about its own transaction, recorded verbatim in
+    /// <c>commitInfo.isBlindAppend</c> on a plain append; null (the default) writes no field. A host that
+    /// scanned this table and staged the result must pass <c>false</c>; only a host that genuinely read
+    /// nothing may pass <c>true</c>. See <see cref="DeltaTransaction.IsBlindAppend"/>, whose contract this
+    /// mirrors on the auto-committing surface, and the note in <c>CommitWriteAsync</c> for why the library
+    /// must not answer this itself.
+    /// </param>
     public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
