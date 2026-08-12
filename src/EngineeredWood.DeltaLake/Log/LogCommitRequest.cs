@@ -50,12 +50,10 @@ public sealed record LogCommitRequest
     /// </summary>
     public ReadSet Reads { get; init; } = ReadSet.Blind;
 
-    /// <summary>
-    /// Paths this commit removes, for the delete/delete check. Must name ONLY what this commit removes:
-    /// adding a merely-READ path here reports a concurrent delete of it as delete/delete rather than the
-    /// concurrentDeleteRead it is. Put read paths in <see cref="Reads"/>.
-    /// </summary>
-    public ISet<string> PlannedRemovePaths { get; init; } = EmptyPaths;
+    // The delete/delete check reads the removed paths off Actions. It used to take a PlannedRemovePaths
+    // set here, which restated them — and which had to be a DIFFERENT object from Reads.Files even when
+    // the caller's two sets were equal, because naming a merely-read path as planned-removed reports a
+    // concurrent delete of it as delete/delete rather than the concurrentDeleteRead it is.
 
     /// <summary>The level the conflict check is run at. See <see cref="IsolationLevel"/>.</summary>
     public IsolationLevel Isolation { get; init; } = IsolationLevel.WriteSerializable;
@@ -157,5 +155,4 @@ public sealed record LogCommitRequest
     /// </summary>
     public Snapshot.Snapshot? RefreshFrom { get; init; }
 
-    private static readonly HashSet<string> EmptyPaths = new(StringComparer.Ordinal);
 }

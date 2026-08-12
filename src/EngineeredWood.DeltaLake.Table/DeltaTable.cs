@@ -2460,11 +2460,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var reads = new ReadSet
         {
             // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read
-            // (DeclareFilesRead). A NEW set when there are declared paths — never transaction.RemovedPaths
-            // itself, which is ALSO passed below as plannedRemovePaths and drives the delete/delete check.
-            // Adding a merely-read file to that object would make a concurrent delete of it report as
-            // ConcurrentDeleteDelete ("this transaction also removes it") for a file this transaction never
-            // removes, instead of the ConcurrentDeleteRead it is.
+            // (DeclareFilesRead). A NEW set when there are declared paths, so the union never mutates
+            // transaction.RemovedPaths — the transaction goes on using it, and a merely-read path added to
+            // it would be a file the transaction believes it removes.
             Files = UnionReadFiles(transaction),
             Predicates = transaction.ReadPredicates,
             // What the HOST declared it read (DeclareWholeTableRead), which the loop cannot infer — it never
@@ -2494,7 +2492,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return CommitOccAsync(
-            baseSnapshot, actions, reads, transaction.RemovedPaths,
+            baseSnapshot, actions, reads,
             transaction.IsolationLevel, transaction.EffectiveOperation, rebaseSafe: true,
             cancellationToken,
             rowLevelDeletes: transaction.DvEdits,
@@ -2644,8 +2642,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// The read-set's file half: what the transaction rewrites, unioned with what its host declared it read.
     /// Returns the transaction's own removed-path set unchanged when nothing was declared — the common case,
-    /// and one copy fewer — and a fresh set otherwise, because that object is also the commit loop's
-    /// <c>plannedRemovePaths</c> and must keep meaning ONLY what this transaction removes.
+    /// and one copy fewer — and a fresh set otherwise, so the union is never written back into the
+    /// transaction's own state.
+    ///
+    /// <para>Sharing the object is safe now that the delete/delete check reads removed paths off the ACTIONS
+    /// rather than taking a parallel set: there is no longer a second parameter this one could contradict.</para>
     /// </summary>
     private static ISet<string> UnionReadFiles(DeltaTransaction transaction)
     {
@@ -2683,7 +2684,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot baseSnapshot,
         IReadOnlyList<DeltaAction> dataActions,
         ReadSet reads,
-        ISet<string> plannedRemovePaths,
         IsolationLevel isolationLevel,
         string operation,
         bool rebaseSafe,
@@ -2705,7 +2705,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 BaseSnapshot = baseSnapshot,
                 Actions = dataActions,
                 Reads = reads,
-                PlannedRemovePaths = plannedRemovePaths,
                 Isolation = isolationLevel,
                 Operation = operation,
                 RebaseSafe = rebaseSafe,
@@ -3650,7 +3649,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long committed = await CommitOccAsync(
                 snapshot, plan.Actions,
                 new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
-                plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
+                IsolationLevel.WriteSerializable, "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false).ConfigureAwait(false);
 
@@ -5315,7 +5314,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // so the read set no longer gates safety — and we know the caller read SOMETHING, not what,
             // so claiming WholeTable would be inventing detail we do not have.
             committedVersion = await CommitOccAsync(
-                snapshot, actions, ReadSet.Blind, NoRemovedPaths,
+                snapshot, actions, ReadSet.Blind,
                 IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: isBlindAppend != false,
                 cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
@@ -6809,7 +6808,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         long version = await CommitOccAsync(
             snapshot, actions,
-            new ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
             isBlindAppend: false).ConfigureAwait(false);
@@ -6966,7 +6965,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // single-attempt (rebaseSafe:false) as the overwrite family does.
         long version = await CommitOccAsync(
             snapshot, actions,
-            new ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);
@@ -7416,7 +7415,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         return await CommitOccAsync(
             snapshot, actions,
-            new ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);

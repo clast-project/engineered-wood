@@ -189,7 +189,7 @@ public sealed class LogCommitter
                     _options.PreferTypedCheckpointStats);
 
                 var verdict = ConflictChecker.Check(
-                    request.Reads, request.PlannedRemovePaths, pruner, request.Isolation,
+                    request.Reads, pruner, request.Isolation,
                     currentActions, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                 {

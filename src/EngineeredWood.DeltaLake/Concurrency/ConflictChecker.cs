@@ -123,15 +123,17 @@ public static class ConflictChecker
     /// <summary>
     /// Validates a transaction against the commits that landed since it started.
     /// </summary>
-    /// <param name="reads">What the transaction read.</param>
-    /// <param name="plannedRemovePaths">Paths the transaction plans to remove (for delete/delete).</param>
+    /// <param name="reads">What the transaction read. Not derivable from
+    /// <paramref name="currentActions"/> — a commit does not record what it looked at — which is exactly
+    /// why this stays a parameter and <c>plannedRemovePaths</c> no longer is.</param>
     /// <param name="pruner">Matches a concurrent add against the read predicates. May be null when
     /// <paramref name="reads"/> has no predicates (a blind append or whole-table read).</param>
     /// <param name="isolation">This transaction's isolation level.</param>
-    /// <param name="currentActions">The actions THIS transaction is about to commit. Read only to answer
-    /// "does this transaction change the metadata" — see <see cref="ExamineConcurrentAdds"/>, which is why
-    /// a transaction's own schema change withdraws its blind-append exemption. Post-rebase, if a rebase
-    /// ran: it is what would actually be committed that matters.</param>
+    /// <param name="currentActions">The actions THIS transaction is about to commit. Two things are read
+    /// off it: whether the transaction changes the metadata (see <see cref="ExamineConcurrentAdds"/>), and
+    /// which paths it removes, for the delete/delete check.
+    /// <para>Post-rebase, if a rebase ran — it is what would actually be committed that matters, and a
+    /// rebase that remapped a deletion vector onto a concurrent one changed which paths those are.</para></param>
     /// <param name="concurrent">The commits in <c>(readVersion, latestVersion]</c>, ascending.</param>
     /// <param name="rowLevelResolvedPaths">Paths whose concurrent remove/re-add has been reconciled at
     /// row granularity by deletion-vector union (Databricks row-level concurrency) before this check.
@@ -140,15 +142,15 @@ public static class ConflictChecker
     /// nor counts as a foreign add (concurrentAppend). May be null when no row-level resolution ran.</param>
     public static ConflictResult Check(
         ReadSet reads,
-        ISet<string> plannedRemovePaths,
         DeltaFilePruner? pruner,
         IsolationLevel isolation,
         IReadOnlyList<DeltaAction> currentActions,
         IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent,
         ISet<string>? rowLevelResolvedPaths = null)
     {
-        // Hoisted: a property of THIS transaction, identical for every concurrent commit examined.
+        // Both hoisted: properties of THIS transaction, identical for every concurrent commit examined.
         bool currentChangesMetadata = ChangesMetadata(currentActions);
+        var plannedRemovePaths = RemovedPaths(currentActions);
 
         foreach (var (version, actions) in concurrent)
         {
@@ -259,6 +261,35 @@ public static class ConflictChecker
     /// get wrong. Blind-append is the opposite — a property of the transaction's READS, which the actions
     /// do not record — which is why that one has to be declared.
     /// </remarks>
+    /// <summary>
+    /// The paths a set of actions removes, for the delete/delete check.
+    /// </summary>
+    /// <remarks>
+    /// <para>Used to be a caller-supplied <c>plannedRemovePaths</c> parameter, restating what the actions
+    /// already said. Both call sites wrote the duplication out longhand —
+    /// <c>Actions = [Remove("doomed.parquet")], PlannedRemovePaths = { "doomed.parquet" }</c> — and the
+    /// parameter came with a documented way to get it wrong: naming a merely-READ path there reported a
+    /// concurrent delete of it as delete/delete rather than the concurrentDeleteRead it actually is. A
+    /// derived set cannot be wrong in that way, because a read path is not a <see cref="RemoveFile"/>.</para>
+    /// <para>Same test as <see cref="ChangesMetadata"/>: derive what the actions record, require a
+    /// declaration for what they do not. Reads are the second kind, which is why <see cref="ReadSet"/> is
+    /// still passed in.</para>
+    /// </remarks>
+    private static ISet<string> RemovedPaths(IReadOnlyList<DeltaAction> actions)
+    {
+        HashSet<string>? paths = null;
+        foreach (var action in actions)
+        {
+            if (action is RemoveFile remove)
+                (paths ??= new HashSet<string>(StringComparer.Ordinal)).Add(remove.Path);
+        }
+
+        return paths ?? NoRemovedPaths;
+    }
+
+    /// <summary>Shared empty set for the common commit that removes nothing.</summary>
+    private static readonly ISet<string> NoRemovedPaths = new HashSet<string>(StringComparer.Ordinal);
+
     internal static bool ChangesMetadata(IReadOnlyList<DeltaAction> actions)
     {
         foreach (var action in actions)
