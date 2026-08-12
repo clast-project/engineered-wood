@@ -4794,12 +4794,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>partitionBy</c>). The new data is Hive-split by the NEW columns. Ignored when equal to the current
     /// partitioning; empty list = departition.</para>
     /// </summary>
+    /// <param name="isBlindAppend">
+    /// The caller's claim about its own transaction, recorded verbatim in
+    /// <c>commitInfo.isBlindAppend</c> on a plain append; null (the default) writes no field. A host that
+    /// scanned this table and staged the result must pass <c>false</c>; only a host that genuinely read
+    /// nothing may pass <c>true</c>. See <see cref="DeltaTransaction.IsBlindAppend"/>, whose contract this
+    /// mirrors on the auto-committing surface, and the note in <c>CommitWriteAsync</c> for why the library
+    /// must not answer this itself.
+    /// </param>
     public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
-        IReadOnlyList<string>? repartitionTo = null)
-        => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo);
+        IReadOnlyList<string>? repartitionTo = null,
+        bool? isBlindAppend = null)
+        => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo,
+            isBlindAppend: isBlindAppend);
 
     /// <summary>
     /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
@@ -4835,7 +4845,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<string, string>? overwritePartitions,
         CancellationToken cancellationToken,
         bool dynamicPartitionOverwrite = false,
-        IReadOnlyList<string>? repartitionTo = null)
+        IReadOnlyList<string>? repartitionTo = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
@@ -4859,7 +4870,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long newVersion = snapshot.Version + 1;
             return await CommitWriteAsync(
                 snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
-                cancellationToken, written).ConfigureAwait(false);
+                cancellationToken, written, isBlindAppend).ConfigureAwait(false);
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -5264,21 +5275,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool dynamicPartitionOverwrite,
         long newVersion,
         CancellationToken cancellationToken,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool? isBlindAppend = null)
     {
         long committedVersion;
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)
         {
-            // Declared, not inferred — and we are entitled to declare here because we KNOW. A plain
-            // append takes its rows from the caller and reads no file of this table to decide what to
-            // write, which is Delta's definition (`readPredicates.isEmpty && readFiles.isEmpty`). Reading
-            // the snapshot's metadata for a schema check or an identity high-water mark is not a FILE read
-            // and does not spend the claim.
+            // The claim is the CALLER's, not ours. This branch used to
+            // hardcode `isBlindAppend: true`, reasoning that "a plain append takes its rows from the caller
+            // and reads no file of this table to decide what to write". That is true of what THIS library
+            // does and false of what the field means: Delta's `isBlindAppend` describes the TRANSACTION
+            // (`readPredicates.isEmpty && readFiles.isEmpty`), and a host with its own data plane that
+            // scanned the table and handed us the resulting rows has made a read we never saw.
+            // DeltaTransaction.IsBlindAppend says exactly this one file away — "This library cannot derive
+            // it for a host with its own data plane" — and WriteAsync IS that host-facing surface.
+            //
+            // MEASURED against fabricator: an autocommit `INSERT INTO t SELECT max(id)+1 FROM t` — the
+            // anti-join incremental shape, which reads the target and emits nothing but adds — arrives here
+            // as a plain Append and recorded `isBlindAppend: true`. That is the UNSAFE direction and the
+            // exact commit shape the interop tier singled out as the one the flag alone can tell apart:
+            // another engine then SKIPS the concurrentAppend check it owed. Null (absent) costs only
+            // spurious conflicts, which is what this recorded before the flag existed.
+            //
+            // Retires when WriteAsync takes the claim from its caller upstream.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind, NoRemovedPaths,
                 IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
-                cancellationToken, written: written, isBlindAppend: true).ConfigureAwait(false);
+                cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
         else
         {
@@ -7924,7 +7948,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> WriteAsync(
         IAsyncEnumerable<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool? isBlindAppend = null)
     {
         var batchList = new List<RecordBatch>();
         await foreach (var batch in batches.WithCancellation(cancellationToken)
@@ -7932,7 +7957,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             batchList.Add(batch);
         }
-        return await WriteAsync(batchList, mode, cancellationToken).ConfigureAwait(false);
+        return await WriteAsync(batchList, mode, cancellationToken, isBlindAppend: isBlindAppend)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
