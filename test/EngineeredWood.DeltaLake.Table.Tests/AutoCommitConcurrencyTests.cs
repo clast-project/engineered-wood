@@ -281,10 +281,7 @@ public class AutoCommitConcurrencyTests : IDisposable
 
         await stale.WriteAsync([Batch(3)], isBlindAppend: true);
 
-        // A fresh handle: `writer`'s snapshot predates the commit just made through `stale`.
-        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
-        var ids = (await ReadIds(reader)).OrderBy(x => x).ToArray();
-        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+        Assert.Equal([1L, 2L, 3L], await ReadIdsFresh());
     }
 
     /// <summary>
@@ -309,9 +306,6 @@ public class AutoCommitConcurrencyTests : IDisposable
 
         await stale.WriteAsync([Batch(3)]);
 
-        // A fresh handle: `writer`'s snapshot predates the commit just made through `stale`.
-        await using var reader = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
-        var ids = (await ReadIds(reader)).OrderBy(x => x).ToArray();
-        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+        Assert.Equal([1L, 2L, 3L], await ReadIdsFresh());
     }
 }
