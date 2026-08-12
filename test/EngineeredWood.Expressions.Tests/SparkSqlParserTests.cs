@@ -33,7 +33,7 @@ public sealed class SparkSqlParserTests
             var fromSource = Normalize(Parse(sql));
             var fromRendering = Normalize(Parse(rendered));
 
-            if (!TreeEquals(fromSource, fromRendering))
+            if (fromSource != fromRendering)
                 mismatches.Add($"{sql}\n    ours:  {fromSource}\n    spark: {rendered} -> {fromRendering}");
         }
 
@@ -122,9 +122,7 @@ public sealed class SparkSqlParserTests
     [Fact]
     public void ArithmeticAndCastsBecomeFunctionCalls()
     {
-        // TreeEquals rather than Assert.Equal: FunctionCall compares its argument list by
-        // reference, so two structurally identical calls are not `==`.
-        AssertTree(
+        Assert.Equal(
             new FunctionCall("+", new Expression[] { new UnboundReference("a"), new UnboundReference("b") }),
             Parse("a + b"));
 
@@ -342,11 +340,6 @@ public sealed class SparkSqlParserTests
 
     private static LiteralExpression True => new(LiteralValue.Of(true));
 
-    private static void AssertTree(Expression expected, Expression actual)
-    {
-        Assert.True(TreeEquals(expected, actual), $"expected {expected}, got {actual}");
-    }
-
     /// <summary>
     /// Flattens nested same-operator junctions, so <c>And(And(a, b), c)</c> and
     /// <c>And(a, b, c)</c> compare equal.
@@ -417,44 +410,5 @@ public sealed class SparkSqlParserTests
         }
 
         return flattened;
-    }
-
-    /// <summary>
-    /// Compares two trees by structure.
-    /// </summary>
-    /// <remarks>
-    /// Record equality cannot be used: the list-bearing nodes (<see cref="FunctionCall"/>,
-    /// <see cref="AndPredicate"/>, <see cref="OrPredicate"/>, <see cref="SetPredicate"/>) compare
-    /// their <c>IReadOnlyList</c> members by reference, so two structurally identical trees built
-    /// from different list instances are unequal.
-    /// </remarks>
-    private static bool TreeEquals(Expression left, Expression right) => (left, right) switch
-    {
-        (AndPredicate a, AndPredicate b) => ChildrenEqual(a.Children, b.Children),
-        (OrPredicate a, OrPredicate b) => ChildrenEqual(a.Children, b.Children),
-        (NotPredicate a, NotPredicate b) => TreeEquals(a.Child, b.Child),
-        (ComparisonPredicate a, ComparisonPredicate b) =>
-            a.Op == b.Op && TreeEquals(a.Left, b.Left) && TreeEquals(a.Right, b.Right),
-        (UnaryPredicate a, UnaryPredicate b) => a.Op == b.Op && TreeEquals(a.Operand, b.Operand),
-        (SetPredicate a, SetPredicate b) =>
-            a.Op == b.Op && TreeEquals(a.Operand, b.Operand) && a.Values.SequenceEqual(b.Values),
-        (FunctionCall a, FunctionCall b) =>
-            a.Name == b.Name && ChildrenEqual(a.Arguments, b.Arguments),
-        _ => left.Equals(right),
-    };
-
-    private static bool ChildrenEqual<T>(IReadOnlyList<T> left, IReadOnlyList<T> right)
-        where T : Expression
-    {
-        if (left.Count != right.Count)
-            return false;
-
-        for (var i = 0; i < left.Count; i++)
-        {
-            if (!TreeEquals(left[i], right[i]))
-                return false;
-        }
-
-        return true;
     }
 }
