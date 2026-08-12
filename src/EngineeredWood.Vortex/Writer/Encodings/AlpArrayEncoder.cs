@@ -19,7 +19,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// (out-of-band index + original-bit-pattern value). Decode is
 /// <c>encoded * 10^f * 10^-e</c>; the reader overwrites patched indices with
 /// their stored originals. See "ALP: Adaptive Lossless floating-Point
-/// Compression" (Afroozeh & Boncz, VLDB 2024).</para>
+/// Compression" (Afroozeh &amp; Boncz, VLDB 2024).</para>
 ///
 /// <para>Wire shape: 0 buffers, 1 child (encoded primitive) or 3 children
 /// (encoded + patch_indices + patch_values), metadata

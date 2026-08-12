@@ -62,7 +62,7 @@ internal ref struct RleBitPackedDecoder
     }
 
     /// <summary>
-    /// Reads <paramref name="count"/> values into the destination span.
+    /// Reads <paramref name="destination"/>.Length values into it.
     /// </summary>
     public void ReadBatch(Span<int> destination)
     {
@@ -257,7 +257,7 @@ internal ref struct RleBitPackedDecoder
     }
 
     /// <summary>
-    /// Reads <paramref name="count"/> values into the destination span and simultaneously
+    /// Reads <paramref name="destination"/>.Length values into it and simultaneously
     /// counts how many decoded values equal <paramref name="matchValue"/>.
     /// Avoids a separate pass to count non-null values after level decoding.
     /// </summary>

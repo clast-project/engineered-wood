@@ -9,8 +9,7 @@ namespace EngineeredWood.Lance.Encodings.V20;
 
 /// <summary>
 /// Phase 2 decoder interface. Given a pre-loaded <see cref="PageContext"/>
-/// and a target Arrow type, produces a decoded array of <paramref name="numRows"/>
-/// values.
+/// and a target Arrow type, produces a decoded array of <c>numRows</c> values.
 /// </summary>
 internal interface IArrayDecoder
 {

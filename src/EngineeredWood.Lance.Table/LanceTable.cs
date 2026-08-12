@@ -102,7 +102,7 @@ public sealed class LanceTable : IAsyncDisposable
     /// <summary>
     /// Open a BTREE scalar index by name. Convenience wrapper that calls
     /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
-    /// and opens it via <see cref="Indices.BTreeIndex.OpenAsync"/>.
+    /// and opens it via <see cref="Indices.BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>.
     /// </summary>
     public async ValueTask<Indices.BTreeIndex> OpenBTreeIndexAsync(
         string indexName, CancellationToken cancellationToken = default)
@@ -115,7 +115,7 @@ public sealed class LanceTable : IAsyncDisposable
     /// <summary>
     /// Open a BITMAP scalar index by name. Convenience wrapper that calls
     /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
-    /// and opens it via <see cref="Indices.BitmapIndex.OpenAsync"/>.
+    /// and opens it via <see cref="Indices.BitmapIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>.
     /// </summary>
     public async ValueTask<Indices.BitmapIndex> OpenBitmapIndexAsync(
         string indexName, CancellationToken cancellationToken = default)

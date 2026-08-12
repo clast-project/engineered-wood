@@ -7,7 +7,7 @@ using System.Runtime.CompilerServices;
 namespace EngineeredWood.Parquet;
 
 /// <summary>
-/// Scalar fallbacks for <see cref="System.Numerics.BitOperations"/> methods
+/// Scalar fallbacks for <c>System.Numerics.BitOperations</c> methods
 /// that are unavailable on netstandard2.0.
 /// </summary>
 internal static class BitPolyfills

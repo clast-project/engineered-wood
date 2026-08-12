@@ -334,8 +334,8 @@ internal static class LayoutSerializer
     /// Co-exists dict-layout sharing with zone-pruning predicates: dict
     /// columns get <c>vortex.stats(vortex.dict(values, codes-chunked), zones)</c>;
     /// non-dict columns get <c>vortex.stats(vortex.chunked(...), zones)</c>.
-    /// The reader's <see cref="LayoutPlanner.WithZoneInfo"/> already attaches
-    /// <see cref="ZoneInfo"/> to either plan shape, so no reader changes
+    /// The reader's <see cref="Layouts.LayoutPlanner.WithZoneInfo(Layouts.ColumnPlan, Layouts.ZoneInfo)"/> already attaches
+    /// <see cref="Layouts.ZoneInfo"/> to either plan shape, so no reader changes
     /// were needed.
     /// </summary>
     public static byte[] SerializeStructDictMixedStats(

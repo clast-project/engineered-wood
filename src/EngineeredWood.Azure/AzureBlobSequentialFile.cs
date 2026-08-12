@@ -13,7 +13,7 @@ namespace EngineeredWood.IO.Azure;
 /// <remarks>
 /// Azure block blobs support up to 50,000 blocks of up to 4 GiB each (service version 2019-12-12+).
 /// The default block size of 4 MiB allows files up to ~195 GiB, which is well beyond
-/// typical Parquet file sizes. For larger files, increase <paramref name="blockSize"/>.
+/// typical Parquet file sizes. For larger files, increase the <c>blockSize</c> constructor argument.
 /// </remarks>
 public sealed class AzureBlobSequentialFile : ISequentialFile
 {

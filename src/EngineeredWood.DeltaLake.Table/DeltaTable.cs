@@ -1076,7 +1076,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         StructType NewSchema);
 
     /// <summary>
-    /// The compute-only counterpart of <see cref="AddColumnAsync"/>: builds the metaData (+ protocol upgrade)
+    /// The compute-only counterpart of <see cref="AddColumnAsync(StructField, CancellationToken)"/>: builds the metaData (+ protocol upgrade)
     /// actions for appending a nullable column WITHOUT committing. For CHAINED adds in one transaction pass the
     /// previous change's <paramref name="baseMetadata"/> / <paramref name="baseProtocol"/> so the second column
     /// composes on the first's pending schema/protocol. Pure computation, no IO.
@@ -1430,7 +1430,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Replaces the table's schema wholesale with <paramref name="newSchema"/> as a metadata-only commit (a new
-    /// <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync"/> this can add,
+    /// <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync(StructField, CancellationToken)"/> this can add,
     /// drop, or retype columns — the "schema overwrite" primitive a CREATE OR REPLACE uses (adopt exactly the
     /// incoming schema). Callers align the data (typically a paired <c>Overwrite</c> write that removes the
     /// old-schema files). On a column-mapping table fresh field ids are assigned (continuing past the current
@@ -1640,7 +1640,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Adds a nullable field INSIDE a nested struct column as a metadata-only commit — the nested analog of
-    /// <see cref="AddColumnAsync"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
+    /// <see cref="AddColumnAsync(StructField, CancellationToken)"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
     /// column first, e.g. <c>["s", "inner"]</c> adds a member to <c>s.inner</c>); every segment must resolve to
     /// a STRUCT. Old files lack the member — the read path reconciles it to a typed NULL child. On a
     /// column-mapping table the new field is assigned a fresh column id + physical name RECURSIVELY (a
@@ -2349,7 +2349,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// this call. If none of them invalidated its reads it commits (rebasing onto the newer version if
     /// necessary); otherwise it aborts with a <see cref="DeltaConflictException"/> — first committer
     /// wins. Use this when a write depends on a read that a concurrent writer could invalidate; the
-    /// auto-committing <see cref="DeleteAsync"/> / write methods are the single-shot equivalent.</para>
+    /// auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> / write methods are the single-shot equivalent.</para>
     /// </summary>
     public DeltaTransaction StartTransaction(
         IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
@@ -2660,7 +2660,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// The optimistic-concurrency commit loop shared by the transactional path, the auto-committing
-    /// <see cref="DeleteAsync"/>, and single-shot appends. Attempts the commit at the version after
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>, and single-shot appends. Attempts the commit at the version after
     /// <paramref name="baseSnapshot"/>; on a collision it reads the intervening commits, runs the
     /// <see cref="ConflictChecker"/> against <paramref name="reads"/> and the removes it reads off
     /// <paramref name="dataActions"/>, and either aborts (a real conflict) or — when
@@ -3386,7 +3386,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
-    /// by the auto-committing <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/>
+    /// by the auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/>
     /// path.</summary>
     internal sealed record DeleteActions(
         IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted,
@@ -3656,7 +3656,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
     /// count — everything a commit needs, without committing. Shared by the auto-committing
-    /// <see cref="UpdateAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
     internal sealed record UpdateActions(
         IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated, long NextRowId);
 
@@ -4189,7 +4189,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>, so a multi-statement transaction that captures its
     /// change rows eagerly (they are in hand at statement time) lands them in the SAME atomic version as its data
     /// files. <paramref name="changeType"/> must be one of <c>insert</c> / <c>delete</c> / <c>update_preimage</c> /
-    /// <c>update_postimage</c> (see <see cref="ChangeDataFeed.CdfConfig"/>); the <c>_change_type</c> column is
+    /// <c>update_postimage</c> (see <see cref="DeltaLake.ChangeDataFeed.CdfConfig"/>); the <c>_change_type</c> column is
     /// added for you. <paramref name="rows"/> carry the feed's user columns (a partitioned table's partition
     /// values ride on <paramref name="partitionValues"/>, physical-keyed like a data file). Requires the table to
     /// have Change Data Feed enabled — a CDC file on a non-CDF table would be dead weight no reader consults.

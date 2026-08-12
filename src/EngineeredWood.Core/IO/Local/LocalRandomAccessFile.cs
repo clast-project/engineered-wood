@@ -8,8 +8,10 @@ namespace EngineeredWood.IO.Local;
 
 /// <summary>
 /// <see cref="IRandomAccessFile"/> implementation for local files using the
-/// <see cref="RandomAccess"/> API. Supports fully concurrent offset-based reads
-/// with no shared position cursor.
+/// <c>RandomAccess</c> API on net6.0+, where offset-based reads are fully concurrent with no
+/// shared position cursor. Not a <c>see cref</c> because <c>System.IO.RandomAccess</c> does not
+/// exist on netstandard2.0, which this assembly also targets; that leg seeks a shared
+/// <see cref="FileStream"/> instead and is therefore NOT safe for concurrent reads.
 /// </summary>
 public sealed class LocalRandomAccessFile : IRandomAccessFile
 {

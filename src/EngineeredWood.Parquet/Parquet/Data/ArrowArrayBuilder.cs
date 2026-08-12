@@ -1200,7 +1200,7 @@ internal sealed class ColumnBuildState : IDisposable
     }
 
     /// <summary>
-    /// Reserves space for <paramref name="count"/> boolean values (bit-packed).
+    /// Reserves space for every element of <paramref name="values"/> (bit-packed).
     /// Writes the decoded booleans into the native bit buffer.
     /// </summary>
     public void AddBoolValues(ReadOnlySpan<bool> values)

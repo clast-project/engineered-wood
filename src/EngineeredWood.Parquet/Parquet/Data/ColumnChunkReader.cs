@@ -430,7 +430,6 @@ internal static class ColumnChunkReader
     /// <param name="pageMap">Pre-scanned page map for this column chunk.</param>
     /// <param name="startPage">First page index (inclusive) to decode.</param>
     /// <param name="endPage">Last page index (inclusive) to decode.</param>
-    /// <param name="batchRowCount">Number of rows in the resulting batch.</param>
     /// <param name="arrowField">Arrow field for this column.</param>
     /// <param name="preserveDefLevels">
     /// If true, raw definition levels are returned for nested assembly.

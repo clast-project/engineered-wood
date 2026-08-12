@@ -59,7 +59,7 @@ internal static class LogCleanup
         new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     /// <summary>
-    /// Deletes what <paramref name="snapshot"/>'s configuration says is expired. Returns how many files
+    /// Deletes what <paramref name="configuration"/> says is expired. Returns how many files
     /// were deleted.
     ///
     /// <para><b>Best-effort and quiet.</b> A failed delete is swallowed: cleanup runs after a commit that

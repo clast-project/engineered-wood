@@ -46,6 +46,27 @@
     a strong name changes assembly identity, so it could not go out under the same
     version. The Clast.* dependencies moved to 0.2.0 for the same reason.
   -->
+  <!--
+    Ship XML documentation in every package. The libraries carry a great deal of it, the
+    packages already carry symbols and SourceLink, and without this none of it reaches a
+    consumer's IntelliSense.
+
+    Turning it on also puts Roslyn's documentation diagnostics on the build. Those are worth
+    having: a cref that does not resolve is a dead link in shipped docs, and a paramref naming
+    a parameter that no longer exists is documentation actively describing the wrong thing.
+    Both were found here by enabling it, including two left behind by #126's own refactor.
+
+    Two are suppressed as POLICY rather than correctness:
+      CS1591 (missing XML comment on a public member) — ~1850 sites. Requiring a comment on
+             every public member is a separate decision from shipping the ones we have.
+      CS1573 (a parameter has no matching param tag)  — ~700 sites, same argument.
+    Everything else stays on, and TreatWarningsAsErrors (net10.0) makes it a gate.
+  -->
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+  </PropertyGroup>
+
   <PropertyGroup>
     <Version>0.3.0</Version>
     <Authors>clast-project</Authors>

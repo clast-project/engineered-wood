@@ -21,7 +21,7 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <para>Apache.Arrow .NET 22.1 doesn't have ListViewArray, so we materialize
 /// to a regular <see cref="ListArray"/> (i32 offsets) or <see cref="LargeListArray"/>
 /// (i64 offsets) depending on the schema field type. Output type matches
-/// <paramref name="expectedType"/>: <see cref="ListType"/> → ListArray,
+/// <c>expectedType</c>: <see cref="ListType"/> → ListArray,
 /// <see cref="LargeListType"/> → LargeListArray. When offsets are already
 /// contiguous (the common case from the writer's serialize path) we keep the
 /// elements buffer; otherwise we re-pack into a fresh contiguous elements array.</para>

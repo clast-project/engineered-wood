@@ -351,7 +351,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Streams the entire file as Arrow <see cref="RecordBatch"/>es, one per
+    /// Streams the entire file as Arrow <see cref="Apache.Arrow.RecordBatch"/>es, one per
     /// chunk in the layout tree. For files without chunking (the common case
     /// today) this yields exactly one batch with all rows.
     /// </summary>
@@ -360,7 +360,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         => ReadAllCoreAsync(acceptedZones: null, columnIndices: null, rowOffset: 0, rowCount: long.MaxValue, cancellationToken);
 
     /// <summary>
-    /// Streams the file as Arrow <see cref="RecordBatch"/>es, pruned by
+    /// Streams the file as Arrow <see cref="Apache.Arrow.RecordBatch"/>es, pruned by
     /// <paramref name="predicate"/> (from the shared
     /// <see cref="EngineeredWood.Expressions"/> library) against the per-zone
     /// stats. Predicates are conservative — zones whose stats prove no row
@@ -386,7 +386,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Streams the file as Arrow <see cref="RecordBatch"/>es, optionally
+    /// Streams the file as Arrow <see cref="Apache.Arrow.RecordBatch"/>es, optionally
     /// filtered by zone. When <paramref name="acceptedZones"/> is non-null,
     /// only chunks whose zone index is in the set are decoded — letting
     /// callers prune whole zones based on the per-column stats returned
@@ -404,7 +404,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Streams a column-projected view of the file: each emitted
-    /// <see cref="RecordBatch"/> contains only the columns whose indices
+    /// <see cref="Apache.Arrow.RecordBatch"/> contains only the columns whose indices
     /// appear in <paramref name="columnIndices"/>, in the order given.
     /// Skipped columns are never decoded — useful when the caller only
     /// needs a few columns from a wide file.
@@ -726,7 +726,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     ///
     /// <para>Use the returned <see cref="ZoneStats"/> to derive a
     /// <see cref="HashSet{T}"/> of accepted zone indices, then pass that set
-    /// to <see cref="ReadAllAsync(System.Collections.Generic.IReadOnlySet{int}?, CancellationToken)"/>
+    /// to <see cref="ReadAllAsync(ISet{int}, CancellationToken)"/>
     /// to skip whole zones at decode time.</para>
     /// </summary>
     public async Task<ZoneStats?> GetZoneStatsAsync(

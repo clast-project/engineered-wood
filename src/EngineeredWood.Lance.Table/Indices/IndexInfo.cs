@@ -44,7 +44,7 @@ public sealed class IndexInfo
 
     /// <summary>
     /// Path of the index directory relative to the dataset root, e.g.
-    /// <c>"_indices/{uuid}"</c>. Pass to <see cref="BTreeIndex.OpenAsync"/>
+    /// <c>"_indices/{uuid}"</c>. Pass to <see cref="BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>
     /// to read the index files.
     /// </summary>
     public required string DirectoryPath { get; init; }
