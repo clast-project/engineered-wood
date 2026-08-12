@@ -251,17 +251,6 @@ public static class ConflictChecker
         || !concurrentIsBlindAppend;
 
     /// <summary>
-    /// Whether a set of actions changes the table metadata — Delta's <c>currentTransactionInfo</c>
-    /// <c>metadataChanged</c>, for <see cref="ExamineConcurrentAdds"/>.
-    /// </summary>
-    /// <remarks>
-    /// Derived from the actions rather than declared by the caller, and unlike <c>isBlindAppend</c> that
-    /// is the right call: whether a commit carries a <see cref="MetadataAction"/> is fully visible in what
-    /// is about to be written, so there is nothing only the writer could know and no defaulted value to
-    /// get wrong. Blind-append is the opposite — a property of the transaction's READS, which the actions
-    /// do not record — which is why that one has to be declared.
-    /// </remarks>
-    /// <summary>
     /// The paths a set of actions removes, for the delete/delete check.
     /// </summary>
     /// <remarks>
@@ -290,6 +279,17 @@ public static class ConflictChecker
     /// <summary>Shared empty set for the common commit that removes nothing.</summary>
     private static readonly ISet<string> NoRemovedPaths = new HashSet<string>(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Whether a set of actions changes the table metadata — Delta's <c>currentTransactionInfo</c>
+    /// <c>metadataChanged</c>, for <see cref="ExamineConcurrentAdds"/>.
+    /// </summary>
+    /// <remarks>
+    /// Derived from the actions rather than declared by the caller, and unlike <c>isBlindAppend</c> that
+    /// is the right call: whether a commit carries a <see cref="MetadataAction"/> is fully visible in what
+    /// is about to be written, so there is nothing only the writer could know and no defaulted value to
+    /// get wrong. Blind-append is the opposite — a property of the transaction's READS, which the actions
+    /// do not record — which is why that one has to be declared.
+    /// </remarks>
     internal static bool ChangesMetadata(IReadOnlyList<DeltaAction> actions)
     {
         foreach (var action in actions)
