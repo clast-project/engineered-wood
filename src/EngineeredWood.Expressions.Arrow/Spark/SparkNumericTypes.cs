@@ -66,6 +66,46 @@ internal static class SparkNumericTypes
             ? operand
             : throw new NotSupportedException($"unary minus is not defined for {operand.Name}");
 
+    /// <summary>
+    /// The type two branches of a conditional unify to — <c>coalesce</c>, <c>if</c>, <c>CASE</c>.
+    /// </summary>
+    /// <remarks>
+    /// Close to <see cref="ArithmeticResult"/> but not the same function, and worth keeping
+    /// separate: unification widens to hold either operand, where arithmetic widens to hold a
+    /// <em>result</em>. Measured, <c>coalesce(decimal(10,2), int)</c> is <c>decimal(12,2)</c>
+    /// while <c>decimal(10,2) + int</c> is <c>decimal(13,2)</c> — the extra digit addition needs
+    /// for a carry is not needed here.
+    /// </remarks>
+    public static IArrowType CommonType(IArrowType left, IArrowType right)
+    {
+        if (left.GetType() == right.GetType() && !IsDecimal(left))
+            return left;
+
+        if (left is StringType || right is StringType)
+        {
+            return left is StringType && right is StringType
+                ? StringType.Default
+                : throw new NotSupportedException(
+                    $"no common type for {left.Name} and {right.Name}");
+        }
+
+        if (IsDecimal(left) || IsDecimal(right))
+        {
+            var (lp, ls) = AsDecimal(left);
+            var (rp, rs) = AsDecimal(right);
+            var scale = Math.Max(ls, rs);
+            return Clamp(Math.Max(lp - ls, rp - rs) + scale, scale);
+        }
+
+        if (IsFloatingPoint(left) || IsFloatingPoint(right))
+            return DoubleOrFloat(left, right);
+
+        if (IsIntegral(left) && IsIntegral(right))
+            return WiderIntegral(left, right);
+
+        throw new NotSupportedException($"no common type for {left.Name} and {right.Name}");
+    }
+
     public static bool IsDecimal(IArrowType type) => type is Decimal128Type or Decimal256Type;
 
     public static bool IsFloatingPoint(IArrowType type) => type is FloatType or DoubleType;
