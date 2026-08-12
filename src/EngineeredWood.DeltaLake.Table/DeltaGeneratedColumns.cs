@@ -100,30 +100,75 @@ internal sealed class DeltaGeneratedColumns
 
         foreach (var column in _columns)
         {
-            var supplied = IndexOf(result, column.Name);
+            // Computed the same way whether it is about to be stored or about to be compared
+            // against, which is the point: a caller must be able to supply the value the table
+            // would have written.
+            var computed = Compute(column, result);
 
-            if (supplied >= 0)
-                ValidateSupplied(column, result);
+            if (IndexOf(result, column.Name) >= 0)
+                ValidateSupplied(column, result, computed);
             else
-                result = Append(column, result);
+                result = Append(column, result, computed);
         }
 
         return result;
     }
 
-    /// <summary>Checks a caller-supplied value against the expression.</summary>
-    private void ValidateSupplied(Generated column, RecordBatch batch)
+    /// <summary>Evaluates the generation expression as the column's declared type.</summary>
+    /// <remarks>
+    /// Materialised against the declared Arrow type rather than whatever the expression happens
+    /// to produce, so <c>CAST(ts AS DATE)</c> lands as the table's DATE column instead of
+    /// something merely date-shaped — and so a <c>decimal(10,2)</c> column generated from a
+    /// <c>decimal(10,4)</c> expression carries the rescaled value that will actually be written.
+    /// </remarks>
+    private IArrowArray Compute(Generated column, RecordBatch batch)
     {
-        // Built as the protocol states it rather than as an equality plus a null check, because
-        // NullSafeEqual already produces true or false and never null — which is exactly what
-        // "IS TRUE" is there to guarantee.
+        try
+        {
+            return _evaluator.EvaluateExpression(column.Expression, batch, column.Field.DataType);
+        }
+        catch (Exception ex) when (ex is not DeltaFormatException)
+        {
+            throw Unevaluable(column, ex);
+        }
+    }
+
+    /// <summary>Checks a caller-supplied value against the value that would be stored.</summary>
+    /// <remarks>
+    /// Compared against <paramref name="computed"/> rather than against the raw expression, and
+    /// the difference is reachable: a <c>decimal(10,2)</c> column generated from a
+    /// <c>decimal(10,4)</c> expression stores 1.23 where the expression yields 1.2345. Comparing
+    /// against the expression would reject a caller supplying 1.23 — the very value the table
+    /// writes — leaving the column impossible to supply explicitly at all.
+    ///
+    /// The comparison itself is the protocol's, <c>(&lt;value&gt; &lt;=&gt; &lt;generated&gt;)
+    /// IS TRUE</c>, evaluated through the shared evaluator so its null-safe semantics are the
+    /// ones used rather than a second implementation of them.
+    /// </remarks>
+    private void ValidateSupplied(Generated column, RecordBatch batch, IArrowArray computed)
+    {
+        const string suppliedName = "__ew_supplied";
+        const string computedName = "__ew_generated";
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field(suppliedName, batch.Column(IndexOf(batch, column.Name)).Data.DataType, true))
+            .Field(new Field(computedName, computed.Data.DataType, true))
+            .Build();
+
+        var pair = new RecordBatch(
+            schema,
+            [batch.Column(IndexOf(batch, column.Name)), computed],
+            batch.Length);
+
         var agrees = new ComparisonPredicate(
-            new UnboundReference(column.Name), ComparisonOperator.NullSafeEqual, column.Expression);
+            new UnboundReference(suppliedName),
+            ComparisonOperator.NullSafeEqual,
+            new UnboundReference(computedName));
 
         BooleanArray result;
         try
         {
-            result = _evaluator.EvaluatePredicate(agrees, batch);
+            result = _evaluator.EvaluatePredicate(agrees, pair);
         }
         catch (Exception ex) when (ex is not DeltaFormatException)
         {
@@ -144,22 +189,9 @@ internal sealed class DeltaGeneratedColumns
         }
     }
 
-    /// <summary>Computes the column and adds it to the batch.</summary>
-    private RecordBatch Append(Generated column, RecordBatch batch)
+    /// <summary>Adds the computed column to the batch.</summary>
+    private static RecordBatch Append(Generated column, RecordBatch batch, IArrowArray values)
     {
-        IArrowArray values;
-        try
-        {
-            // Materialised against the column's declared Arrow type rather than whatever the
-            // expression happens to produce, so `CAST(ts AS DATE)` lands as the table's DATE
-            // column instead of something merely date-shaped.
-            values = _evaluator.EvaluateExpression(column.Expression, batch, column.Field.DataType);
-        }
-        catch (Exception ex) when (ex is not DeltaFormatException)
-        {
-            throw Unevaluable(column, ex);
-        }
-
         var schema = new Apache.Arrow.Schema.Builder();
         var arrays = new List<IArrowArray>(batch.ColumnCount + 1);
 

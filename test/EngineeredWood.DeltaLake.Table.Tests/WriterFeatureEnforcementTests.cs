@@ -319,4 +319,56 @@ public class WriterFeatureEnforcementTests : IDisposable
             async () => await table.WriteAsync([Batch(2)], DeltaWriteMode.Overwrite));
         Assert.Contains("append-only", ex.Message);
     }
+
+    /// <summary>A table whose generated column is DECLARED narrower than its expression produces.</summary>
+    private async Task<DeltaTable> CreateRescalingTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction
+            {
+                MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["generatedColumns"],
+            },
+            new MetadataAction
+            {
+                Id = "wfe-rescale",
+                Format = Format.Parquet,
+                SchemaString =
+                    @"{""type"":""struct"",""fields"":[" +
+                    @"{""name"":""amount"",""type"":""decimal(10,4)"",""nullable"":false,""metadata"":{}}," +
+                    @"{""name"":""rounded"",""type"":""decimal(10,2)"",""nullable"":true,""metadata"":" +
+                    @"{""delta.generationExpression"":""amount""}}]}",
+                PartitionColumns = [],
+            },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    private static IArrowArray Decimals(int precision, int scale, decimal value)
+    {
+        var b = new Decimal128Array.Builder(new Decimal128Type(precision, scale));
+        b.Append(value);
+        return b.Build();
+    }
+
+    [Fact]
+    public async Task ASuppliedValueIsCheckedAgainstWhatWouldActuallyBeStored()
+    {
+        // The generated column is declared decimal(10,2) while its expression yields
+        // decimal(10,4), so what gets WRITTEN is the rescaled 1.23. A caller supplying exactly
+        // that must be accepted: comparing against the raw 1.2345 instead would make the stored
+        // value unsuppliable, and the column impossible to write explicitly at all.
+        await using var table = await CreateRescalingTableAsync();
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("amount", new Decimal128Type(10, 4), false))
+            .Field(new Field("rounded", new Decimal128Type(10, 2), true))
+            .Build();
+        var batch = new RecordBatch(
+            schema, [Decimals(10, 4, 1.2345m), Decimals(10, 2, 1.23m)], 1);
+
+        Assert.Equal(1, await table.WriteAsync([batch]));
+    }
 }
