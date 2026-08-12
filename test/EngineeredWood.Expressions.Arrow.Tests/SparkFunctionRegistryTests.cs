@@ -471,4 +471,28 @@ public sealed class SparkFunctionRegistryTests
 
         Assert.True(result.GetValue(0));
     }
+
+    [Fact]
+    public void AnEpochSecondBeyondTheRepresentableRangeIsRefusedRatherThanCrashing()
+    {
+        var batch = Batch(("b", Longs(999_999_999_999_999L)));
+
+        var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(b AS TIMESTAMP)", batch));
+        Assert.Equal("CAST_OVERFLOW", ex.ErrorClass);
+
+        Assert.Null(Assert.IsType<TimestampArray>(
+            Eval(Ansi, "TRY_CAST(b AS TIMESTAMP)", batch)).GetTimestamp(0));
+    }
+
+    [Fact]
+    public void ALargeEpochSecondKeepsItsExactValueRatherThanGoingThroughDouble()
+    {
+        // Past 2^53 a double can no longer hold every integer, so routing epoch seconds through
+        // one would shift the instant. Within DateTimeOffset's range the value must be exact.
+        const long seconds = 253_402_300_799L; // 9999-12-31T23:59:59Z, the last representable second
+        var batch = Batch(("b", Longs(seconds)));
+
+        var result = Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(b AS TIMESTAMP)", batch));
+        Assert.Equal(seconds, result.GetTimestamp(0)!.Value.ToUnixTimeSeconds());
+    }
 }

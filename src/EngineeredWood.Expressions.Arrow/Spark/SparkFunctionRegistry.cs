@@ -33,6 +33,20 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
+    /// <summary>
+    /// The epoch seconds <see cref="DateTimeOffset"/> can represent — years 1 through 9999.
+    /// </summary>
+    /// <remarks>
+    /// Outside this, a cast is refused rather than approximated. Spark does not refuse: measured,
+    /// it accepts an arbitrarily large epoch second and its microsecond field silently overflows,
+    /// landing near year 294247 — a value PySpark itself cannot then convert back. Reproducing
+    /// that would put a meaningless instant into a generated column, so this deliberately differs
+    /// and fails closed instead.
+    /// </remarks>
+    private const decimal MinEpochSecond = -62135596800m;
+
+    private const decimal MaxEpochSecond = 253402300799m;
+
     private readonly SparkDialectOptions _options;
 
     public SparkFunctionRegistry(SparkDialectOptions? options = null)
@@ -488,7 +502,16 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             // A number is epoch seconds, which is the inverse of casting a timestamp to a number.
             if (value.Value.IsNumeric)
             {
-                instants[i] = DateTimeOffset.FromUnixTimeSeconds((long)value.Value.AsDouble);
+                // From the exact decimal, not the double: past 2^53 a double can no longer hold
+                // every integer, and a shifted instant is worse than a refused one.
+                if (value.Value.Exact is not { } seconds
+                    || seconds < MinEpochSecond || seconds > MaxEpochSecond)
+                {
+                    if (!raising) continue;
+                    throw SparkEvaluationException.CastOverflow(value.Value.Text, "TIMESTAMP");
+                }
+
+                instants[i] = DateTimeOffset.FromUnixTimeSeconds((long)decimal.Truncate(seconds));
                 continue;
             }
 
