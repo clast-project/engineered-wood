@@ -52,6 +52,15 @@ public class ConflictCheckerTests
         DeletionTimestamp = 0,
     };
 
+    /// <summary>A change-data file, as a DML commit on a CDF-enabled table carries alongside its adds.</summary>
+    private static CdcFile Cdc(string path) => new()
+    {
+        Path = path,
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 100,
+        DataChange = false, // per the protocol: a cdc file is not itself a data change
+    };
+
     private static (long, IReadOnlyList<DeltaAction>) Commit(long version, params DeltaAction[] actions) =>
         (version, actions);
 
@@ -221,6 +230,69 @@ public class ConflictCheckerTests
         var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
 
         Assert.False(result.HasConflict); // inferred blind: adds only
+    }
+
+    // ── the inference's one piece of POSITIVE evidence: a cdc action ──
+
+    /// <summary>
+    /// ⚠ THE CASE #127 IS ABOUT. An insert-only MERGE on a change-data-feed table commits adds and a cdc
+    /// file and NO remove — it scanned the target to decide what was missing, so it read. Every other clause
+    /// of the inference sees only adds and calls that blind, which skips a concurrent-append check we owe.
+    ///
+    /// <para>Not hypothetical: this is delta-rs 1.6.2's measured output for that statement, and delta-rs
+    /// declares no flag on any commit, so the inference is the whole answer there. Pinned against the real
+    /// engine by <c>DeltaRsBlindAppendGroundTruthTests</c>; asserted as a verdict here.</para>
+    /// </summary>
+    [Fact]
+    public void CdcAction_IsNotBlind_ThoughTheCommitOnlyAdds()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"operation":"MERGE","engineInfo":"delta-rs"}"""), // no isBlindAppend, as delta-rs writes none
+            Add("part-new.parquet", minId: 1, maxId: 10),
+            Cdc("_change_data/cdc-00000.parquet"));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+    }
+
+    /// <summary>
+    /// The control for the test above: the SAME commit without the cdc action is inferred blind and passes.
+    /// Without this, that test would pass just as well if the add's stats had stopped matching the read
+    /// predicate, and it would be proving nothing about cdc.
+    /// </summary>
+    [Fact]
+    public void SameCommitWithoutCdc_IsStillInferredBlind()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"operation":"MERGE","engineInfo":"delta-rs"}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// A DECLARED flag still outranks the cdc evidence, in the direction that costs us nothing to honour:
+    /// a writer that says it read nothing is believed even on a cdc-carrying commit. The inference exists
+    /// only to answer for writers that said nothing, and #125 settled that a declaration wins; adding
+    /// positive evidence to the fallback must not quietly reopen that.
+    /// </summary>
+    [Fact]
+    public void DeclaredBlind_OutranksTheCdcEvidence()
+    {
+        var reads = new ReadSet { Predicates = [Ex.Equal("id", LiteralValue.Of(5L))] };
+        var concurrent = Commit(6,
+            Info("""{"isBlindAppend":true}"""),
+            Add("part-new.parquet", minId: 1, maxId: 10),
+            Cdc("_change_data/cdc-00000.parquet"));
+
+        var result = Check(reads, NoRemoves, IsolationLevel.WriteSerializable, concurrent);
+
+        Assert.False(result.HasConflict);
     }
 
     /// <summary>

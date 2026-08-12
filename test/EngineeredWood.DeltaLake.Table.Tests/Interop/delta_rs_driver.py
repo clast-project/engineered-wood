@@ -235,6 +235,75 @@ def cmd_write(args):
     return {"written": tbl.num_rows, "columns": names}
 
 
+def cmd_blind_append_ground_truth(args):
+    """Per commit shape on a CDF table: what delta-rs declares, and what it emits.
+
+    The C# side asserts on the pair. Deliberately reports the raw shape (which action
+    kinds appear, whether isBlindAppend was written at all) rather than a verdict.
+    """
+    import pyarrow as pa
+    from deltalake import DeltaTable, write_deltalake
+
+    base = pa.table({"id": pa.array([1, 2, 3], pa.int64()),
+                     "val": pa.array(["a", "b", "c"])})
+
+    def fresh(name):
+        path = os.path.join(args["path"], name)
+        write_deltalake(path, base, mode="overwrite",
+                        configuration={"delta.enableChangeDataFeed": "true"})
+        return path
+
+    def append(path):
+        write_deltalake(path, pa.table({"id": pa.array([4], pa.int64()),
+                                        "val": pa.array(["d"])}), mode="append")
+
+    def update(path):
+        DeltaTable(path).update(updates={"val": "'X'"}, predicate="id = 2")
+
+    def delete(path):
+        DeltaTable(path).delete(predicate="id = 3")
+
+    def merge_insert_only(path):
+        src = pa.table({"id": pa.array([99], pa.int64()), "val": pa.array(["z"])})
+        (DeltaTable(path).merge(source=src, predicate="t.id = s.id",
+                                source_alias="s", target_alias="t")
+         .when_not_matched_insert_all().execute())
+
+    def merge_matched_update(path):
+        src = pa.table({"id": pa.array([2], pa.int64()), "val": pa.array(["Y"])})
+        (DeltaTable(path).merge(source=src, predicate="t.id = s.id",
+                                source_alias="s", target_alias="t")
+         .when_matched_update_all().execute())
+
+    scenarios = []
+    for name, run in [("append", append),
+                      ("update", update),
+                      ("delete", delete),
+                      ("merge_insert_only", merge_insert_only),
+                      ("merge_matched_update", merge_matched_update)]:
+        path = fresh(name)
+        run(path)
+        # The LAST commit is the operation under test; earlier ones are table setup.
+        log = _raw_log_actions(path)
+        last = max(int(a["version"]) for a in log)
+        actions = [a["action"] for a in log if int(a["version"]) == last]
+        kinds = sorted({next(iter(a)) for a in actions})
+        info = next((a["commitInfo"] for a in actions if "commitInfo" in a), {})
+        scenarios.append({
+            "name": name,
+            "operation": info.get("operation"),
+            "field_present": "isBlindAppend" in info,
+            "is_blind_append": info.get("isBlindAppend"),
+            "action_kinds": kinds,
+            "only_adds": kinds == ["add"] or kinds == ["add", "commitInfo"],
+            "has_cdc": "cdc" in kinds,
+            "has_remove": "remove" in kinds,
+        })
+
+    import deltalake
+    return {"deltalake": deltalake.__version__, "scenarios": scenarios}
+
+
 def cmd_read_epoch_micros(args):
     """Read a table and report column `col` as exact microseconds since the Unix epoch.
 
@@ -380,6 +449,7 @@ COMMANDS = {
     "raw_log": cmd_raw_log,
     "add_stats": cmd_add_stats,
     "write": cmd_write,
+    "blind_append_ground_truth": cmd_blind_append_ground_truth,
 }
 
 

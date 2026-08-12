@@ -227,9 +227,10 @@ public static class ConflictChecker
     /// unflagged commit remain and neither is going away. Every commit written before that landed, on every
     /// existing table — <c>getOrElse(false)</c> would make ordinary appends among them start conflicting.
     /// And delta-rs writes no flag at all: <c>is_blind_append</c> is an <c>Option&lt;bool&gt;</c> with
-    /// <c>skip_serializing_if = "Option::is_none"</c> that nothing computes (checked 2026-08-11), so on a
-    /// table delta-rs maintains the inference is not a fallback, it is the whole answer. Improving it is
-    /// tracked separately.</para>
+    /// <c>skip_serializing_if = "Option::is_none"</c> that nothing computes (checked 2026-08-11, and
+    /// observed on every commit shape it writes), so on a table delta-rs maintains the inference is not a
+    /// fallback, it is the whole answer. That is why <see cref="InferBlindAppend"/> is worth improving on
+    /// its own terms rather than treated as a legacy path.</para>
     /// </remarks>
     internal static bool IsBlindAppend(IReadOnlyList<DeltaAction> actions)
     {
@@ -250,8 +251,25 @@ public static class ConflictChecker
 
     /// <summary>
     /// Fallback for a commit whose writer did not declare <c>isBlindAppend</c>: assume a commit that only
-    /// adds files did not read anything. At least one add, and no remove, metadata, or protocol action.
+    /// adds files did not read anything. At least one add, and no remove, cdc, metadata, or protocol action.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Why <c>cdc</c> disqualifies.</b> A change-data file records row-level changes, which only a
+    /// statement that located those rows can produce — an UPDATE, a DELETE, a MERGE. The rest of this
+    /// inference reads the ABSENCE of evidence ("nothing here says it read"); a cdc action is the presence
+    /// of it, and the only positive evidence available at all.</para>
+    /// <para>It is corrective rather than defensive, because the case it catches is one an engine actually
+    /// writes. Measured against delta-rs 1.6.2 on a table with <c>delta.enableChangeDataFeed</c>: an
+    /// insert-only MERGE commits <c>add</c> + <c>cdc</c> and NO remove — it scanned the target to decide
+    /// what was missing, so it plainly read, and every clause above it sees only adds and calls it blind.
+    /// The same shape Spark records <c>isBlindAppend=false</c> for (<c>BlindAppendGroundTruthTests</c>), and
+    /// the same shape #88 identified as the one the inference misjudges. UPDATE, DELETE and matched MERGE
+    /// all carry removes as well, so this changes no verdict for them.</para>
+    /// <para>It matters because delta-rs declares no flag on ANY commit — measured, not inferred: not on
+    /// create, append, UPDATE, DELETE, or MERGE — so on a table delta-rs maintains this inference is not a
+    /// fallback, it is the whole answer, and an insert-only MERGE there is a concurrent-append check we
+    /// would otherwise skip. Pinned by <c>DeltaRsBlindAppendGroundTruthTests</c>.</para>
+    /// </remarks>
     private static bool InferBlindAppend(IReadOnlyList<DeltaAction> actions)
     {
         bool hasAdd = false;
@@ -263,6 +281,7 @@ public static class ConflictChecker
                     hasAdd = true;
                     break;
                 case RemoveFile:
+                case CdcFile:
                 case MetadataAction:
                 case ProtocolAction:
                     return false;

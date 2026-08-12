@@ -70,6 +70,31 @@ exempts a concurrent *blind append* and nothing else; blinding also drops the `P
 unrelated statements in the same transaction, admitting a concurrentAppend that both levels catch —
 pinned by `StagedRowDelete_DoesNotExemptTheTransactionsReadPredicates`.
 
+## How "blind append" is decided
+
+Blind-append is a property of the *writer's transaction* — `readPredicates.isEmpty &&
+readFiles.isEmpty` — not of the actions it emitted, so only the writer knows it, and Delta records the
+answer in `commitInfo.isBlindAppend`. `ConflictChecker.IsBlindAppend` answers in three steps:
+
+1. **A declared boolean flag wins**, including a `false` on a commit that contains nothing but adds.
+   Delta itself only ever reads the flag.
+2. **Absent or malformed, a `cdc` action means not blind.** A change-data file records row-level
+   changes, so the statement located those rows and therefore read. This is the only *positive*
+   evidence in the fallback; everything else is an absence.
+3. **Otherwise infer from the shape**: at least one add, and no remove, metadata, or protocol action.
+
+Step 3 errs unsafely on its own — `INSERT INTO t SELECT … FROM t` and an insert-only `MERGE` both emit
+adds only and both plainly read — which is why step 1 exists and why Delta makes no inference at all.
+We keep the fallback rather than following Delta into `getOrElse(false)` because two populations of
+unflagged commit are not going away: everything committed before this library emitted the flag, and
+**everything delta-rs writes**. delta-rs declares `isBlindAppend` on no commit shape at all —
+measured, not read off its source, by `DeltaRsBlindAppendGroundTruthTests` — so on a table it maintains
+the fallback is the whole answer, and step 2 is what keeps an insert-only `MERGE` there from being
+exempted from a concurrent-append check.
+
+The rule has exactly one implementation. `DeltaTable.CheckLogicalRebaseAsync` calls the same method,
+after a period where it kept a second copy that disagreed.
+
 ## Entry points
 
 All of the OCC core lives in **`EngineeredWood.DeltaLake`** (the log layer), and is public: a host with
