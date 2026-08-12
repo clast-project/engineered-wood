@@ -260,7 +260,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // not say this: none of them route through that method, so none of them validate.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: true,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
@@ -353,7 +353,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // columns, so a constrained table is writable here.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: false,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
@@ -385,7 +385,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // columns, so a constrained table is writable here.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: false,
-            rowsWillBeValidated: WriteTimeExpressions.Declares(_baseSnapshot));
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
@@ -420,12 +420,27 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// IcebergCompat, which need write-time per-row processing an outside writer did not do — check
     /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> first.</para>
     /// </summary>
-    public void StageDataFiles(IReadOnlyList<WrittenDataFile> files)
+    /// <param name="constraintsEnforcedByCaller">
+    /// Declares that the caller has already enforced the table's CHECK constraints, invariants and
+    /// generated columns over the rows in <paramref name="files"/>. Nothing here can verify it —
+    /// the files are finished — so it is an assertion, and a false one commits rows every later
+    /// reader will trust. Left false, a table declaring any of those is refused, and
+    /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> reports false for it.
+    /// </param>
+    public void StageDataFiles(
+        IReadOnlyList<WrittenDataFile> files, bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
+
         if (files.Count == 0)
             return;
 
@@ -458,12 +473,19 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<WrittenDataFile> files,
         RowSelection? bornDeleted = null,
         bool identityValuesPreGenerated = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
         if (files.Count == 0)
             return 0;
 

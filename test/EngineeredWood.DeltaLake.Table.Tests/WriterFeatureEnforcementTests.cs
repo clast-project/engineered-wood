@@ -515,4 +515,53 @@ public class WriterFeatureEnforcementTests : IDisposable
         // The violating row survived untouched; the matched row was updated and validated.
         Assert.Equal([-5L, 11L], ids.OrderBy(x => x).ToArray());
     }
+
+    [Fact]
+    public async Task SupportsExternalCommitIsFalseForAConstrainedTable()
+    {
+        // The property's contract is "CommitDataFilesAsync is usable for this table", and a caller
+        // acts on it BEFORE writing files externally. It used to report true for a constrained
+        // table while the commit refused — sending exactly that caller off to write files it would
+        // then be unable to commit, which is the orphan the property exists to prevent.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        Assert.False(table.SupportsExternalDataFileCommit);
+    }
+
+    [Fact]
+    public async Task SupportsExternalCommitStaysTrueForAnUnconstrainedTable()
+    {
+        await using var table = await CreateTableAsync();
+
+        Assert.True(table.SupportsExternalDataFileCommit);
+    }
+
+    [Fact]
+    public async Task TheHostSeamRefusesAConstrainedTableUnlessTheCallerClaimsEnforcement()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.CommitDataFilesAsync([]));
+        Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
+
+        // The claim is not checkable here — the files are finished — so this asserts only that
+        // making it is what lifts the refusal.
+        await table.CommitDataFilesAsync([], constraintsEnforcedByCaller: true);
+    }
+
+    [Fact]
+    public async Task TheStagedSeamAgreesWithTheCommittingOne()
+    {
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+
+        await using var refusing = table.StartTransaction();
+        Assert.Throws<DeltaFormatException>(() => refusing.StageDataFiles([]));
+
+        await using var claiming = table.StartTransaction();
+        claiming.StageDataFiles([], constraintsEnforcedByCaller: true);
+    }
 }

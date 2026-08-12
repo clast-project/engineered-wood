@@ -81,6 +81,12 @@ public class StagedCommitParityTests : IDisposable
             typeof(DeltaTable), nameof(DeltaTable.StartTransactionAsync), "baseVersion"),
         ["cancellationToken"] = new(
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync), "cancellationToken"),
+        // The host's assertion that it enforced the table's write-time expressions itself. Stageable
+        // because it says something about the ROWS in this call's files, which a rebase carries
+        // unchanged — unlike the overwrite family below, whose meaning depends on the base snapshot.
+        ["constraintsEnforcedByCaller"] = new(
+            typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync),
+            "constraintsEnforcedByCaller"),
     };
 
     /// <summary>
