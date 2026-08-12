@@ -289,13 +289,19 @@ def cmd_blind_append_ground_truth(args):
         actions = [a["action"] for a in log if int(a["version"]) == last]
         kinds = sorted({next(iter(a)) for a in actions})
         info = next((a["commitInfo"] for a in actions if "commitInfo" in a), {})
+        # only_adds characterizes the FILE actions, so a bookkeeping action the commit happens to
+        # carry (txn, domainMetadata, commitInfo itself) does not make an adds-only commit look
+        # otherwise. Same definition as spark_driver.py's, deliberately: the two ground-truth suites
+        # are a pair, and a field that meant subtly different things in each would be worse than
+        # useless.
+        file_kinds = [k for k in kinds if k in ("add", "remove", "cdc")]
         scenarios.append({
             "name": name,
             "operation": info.get("operation"),
             "field_present": "isBlindAppend" in info,
             "is_blind_append": info.get("isBlindAppend"),
             "action_kinds": kinds,
-            "only_adds": kinds == ["add"] or kinds == ["add", "commitInfo"],
+            "only_adds": len(file_kinds) > 0 and set(file_kinds) == {"add"},
             "has_cdc": "cdc" in kinds,
             "has_remove": "remove" in kinds,
         })
