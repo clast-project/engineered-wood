@@ -51,7 +51,7 @@ internal sealed class FsstSymbolTable16 : FsstSymbolTable
     /// <b>Measured, not cautious — do not raise this to 16 without re-measuring.</b> A longer
     /// cap is not reliably better: on a URL corpus, ratio runs 3.54x at 14, 2.01x at 15 and
     /// 1.41x at 16 — worse than this cap's 1.88x — at an essentially unchanged symbol count.
-    /// A greedy trainer allowed *longer* symbols should not lose 60%, since it can still choose
+    /// A greedy trainer allowed <em>longer</em> symbols should not lose 60%, since it can still choose
     /// shorter ones, so the erratic response looks like cap sensitivity in Clast.Fsst's FSST16
     /// trainer. 8 is the stable choice until that is understood; the table of measurements is
     /// in <c>doc/parquet-fsst.md</c>.
