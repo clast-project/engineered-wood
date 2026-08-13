@@ -23,6 +23,7 @@ return args[0] switch
     "create_test_file" => await CreateTestFile(args.Skip(1).ToArray()),
     "read_test_file" => await ReadTestFile(args.Skip(1).ToArray()),
     "strip_path_in_schema" => StripPathInSchema(args.Skip(1).ToArray()),
+    "create_fsst_test_file" => await EngineeredWood.Parquet.TestTool.FsstTestData.Create(args.Skip(1).ToArray()),
     _ => PrintUsage(),
 };
 
@@ -40,6 +41,14 @@ static int PrintUsage()
           ew-test-tool read_test_file <path> [--batch-rows <n>] [--batch-bytes <n>] [--validate]
             Reads the file one RecordBatch at a time and reports peak memory.
             --validate checks every encoding-exercise column for correct values.
+
+          ew-test-tool create_fsst_test_file <path> [--compression <codec>]
+            Creates a small Parquet file exercising the FSST encoding's corner cases,
+            for use as reference data by other implementations. Every FSST column is
+            duplicated by a DELTA_LENGTH_BYTE_ARRAY column holding the same values, so
+            a reader can bit-compare the two without external expected data. Reads the
+            file back, verifies that comparison, and reports what was actually written
+            (symbol table type and size, offset encoding per page, escape counts).
 
           ew-test-tool strip_path_in_schema <input> <output>
             Reads <input>, decodes its footer, and writes <output> with the same

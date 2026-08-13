@@ -34,6 +34,7 @@
     <InternalsVisibleTo Include="EngineeredWood.Parquet.Tests" />
     <InternalsVisibleTo Include="EngineeredWood.Benchmarks" />
     <InternalsVisibleTo Include="EngineeredWood.Parquet.Benchmarks" />
+    <InternalsVisibleTo Include="EngineeredWood.Parquet.TestTool" />
     <InternalsVisibleTo Include="EngineeredWood.Orc" />
     <InternalsVisibleTo Include="EngineeredWood.Orc.Tests" />
     <InternalsVisibleTo Include="EngineeredWood.Orc.Benchmarks" />
