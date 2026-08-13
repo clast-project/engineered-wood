@@ -21,15 +21,15 @@ namespace EngineeredWood.Parquet.Data;
 /// histogram slots covering lengths 1..16, <c>symbol_data</c> starting at offset 34, and a
 /// code stream of little-endian <c>u16</c> codes where 65,535 is the escape marker followed
 /// by one literal byte written as a <c>u16</c> (§4.7, §8.3).</para>
-/// <para><b>Reading is liberal, writing is conservative.</b> The proposal contradicts itself
-/// on how long an FSST_16 symbol may be — §1.2 says 1..8 bytes while §3.3, §3.5 and §3.6 all
-/// describe 16 — and that disagreement never reaches the wire format: §3.3 gives the histogram
-/// its 16 slots unconditionally, so a table holding only short symbols is simply one whose
-/// entries for lengths 9..16 are zero, which §3.6's reconstruction loop reads without noticing.
-/// <see cref="Parse"/> therefore honours all 16 slots whatever the answer turns out to be,
-/// while <see cref="TryTrain"/> caps what it emits at <see cref="TrainedMaxSymbolLength"/> —
-/// 8, the value both readings accept. If the spec settles on 16, that one constant changes and
-/// nothing else does.</para>
+/// <para><b>Reading is liberal, writing is conservative.</b> <see cref="Parse"/> honours all
+/// 16 histogram slots, which is what the spec settled on: §1.2 originally said symbols were
+/// 1..8 bytes while §3.3, §3.5 and §3.6 described 16, and the author has since clarified that
+/// FSST_16 symbols may be 1..16. That disagreement never reached the wire format anyway —
+/// §3.3 gives the histogram its 16 slots unconditionally, so a table holding only short symbols
+/// is simply one whose entries for lengths 9..16 are zero, which §3.6's reconstruction loop
+/// reads without noticing. <see cref="TryTrain"/> emits nothing longer than
+/// <see cref="TrainedMaxSymbolLength"/>, which the spec permits and which is a tuning choice
+/// rather than a conformance one.</para>
 /// </remarks>
 internal sealed class FsstSymbolTable16 : FsstSymbolTable
 {
@@ -43,10 +43,19 @@ internal sealed class FsstSymbolTable16 : FsstSymbolTable
     public const int MaxSymbolLength = 16;
 
     /// <summary>
-    /// Longest symbol this writer will train, and the only part of this class the §1.2/§3.3
-    /// contradiction can reach. 8 is legal under both readings; 16 is legal only if §1.2 is
-    /// the stale text it appears to be.
+    /// Longest symbol this writer will train. The spec allows up to
+    /// <see cref="MaxSymbolLength"/>; emitting less is conformant, because a table whose
+    /// histogram entries for lengths 9..16 are zero is an ordinary FSST_16 table.
     /// </summary>
+    /// <remarks>
+    /// <b>Measured, not cautious — do not raise this to 16 without re-measuring.</b> A longer
+    /// cap is not reliably better: on a URL corpus, ratio runs 3.54x at 14, 2.01x at 15 and
+    /// 1.41x at 16 — worse than this cap's 1.88x — at an essentially unchanged symbol count.
+    /// A greedy trainer allowed <em>longer</em> symbols should not lose 60%, since it can still choose
+    /// shorter ones, so the erratic response looks like cap sensitivity in Clast.Fsst's FSST16
+    /// trainer. 8 is the stable choice until that is understood; the table of measurements is
+    /// in <c>doc/parquet-fsst.md</c>.
+    /// </remarks>
     public const int TrainedMaxSymbolLength = 8;
 
     /// <summary>Code that introduces a literal byte rather than a symbol.</summary>
@@ -139,23 +148,56 @@ internal sealed class FsstSymbolTable16 : FsstSymbolTable
         var rawSymbols = new byte[count * MaxSymbolLength];
         trained.ExportRaw(rawLengths, rawSymbols);
 
-        bool ascending = true;
-        for (int code = 0; code < count; code++)
+        foreach (byte len in rawLengths)
         {
-            byte len = rawLengths[code];
             if (len is < 1 or > MaxSymbolLength)
                 return null;
-            if (code > 0 && len < rawLengths[code - 1])
-                ascending = false;
         }
 
-        // Clast.Fsst documents that its 16-bit trainer already assigns codes in ascending
-        // length order, which is exactly what §3.3 needs — so the common path renumbers
-        // nothing. The counting sort below is not dead code, though: the histogram *is* the
-        // length information, so a trainer that ever stopped promising that order would
-        // silently produce tables no reader could cut apart correctly.
+        ArrangeByLength(rawLengths, rawSymbols, out var lengths, out var symbols, out var remap);
+        return new FsstSymbolTable16(lengths, symbols, trained, remap);
+    }
+
+    /// <summary>
+    /// Puts the trained table into the ascending-length code order §3.3 requires, producing a
+    /// remap from trained code to spec code. <paramref name="remap"/> is
+    /// <see langword="null"/> — and the outputs alias the inputs — when the table was already
+    /// in that order, which is the only case that happens in practice.
+    /// </summary>
+    /// <remarks>
+    /// <para>Clast.Fsst's 16-bit trainer assigns codes in ascending length order already, so
+    /// the renumbering path below never runs against it — measured over 48 trained tables, not
+    /// one came back out of order. It is kept because the histogram <em>is</em> the length
+    /// information: a trainer that quietly stopped promising that order would otherwise produce
+    /// tables no reader could cut apart, and the failure would be silent corruption rather than
+    /// an error.</para>
+    /// <para>That is also why this is a separate method rather than an inline branch — it is
+    /// the one piece of this class that production data cannot reach, so a test has to reach it
+    /// directly instead.</para>
+    /// </remarks>
+    internal static void ArrangeByLength(
+        byte[] rawLengths, byte[] rawSymbols,
+        out byte[] lengths, out byte[] symbols, out ushort[]? remap)
+    {
+        int count = rawLengths.Length;
+
+        bool ascending = true;
+        for (int code = 1; code < count; code++)
+        {
+            if (rawLengths[code] < rawLengths[code - 1])
+            {
+                ascending = false;
+                break;
+            }
+        }
+
         if (ascending)
-            return new FsstSymbolTable16(rawLengths, rawSymbols, trained, remap: null);
+        {
+            lengths = rawLengths;
+            symbols = rawSymbols;
+            remap = null;
+            return;
+        }
 
         Span<int> histogram = stackalloc int[MaxSymbolLength + 1];
         foreach (byte len in rawLengths)
@@ -169,10 +211,13 @@ internal sealed class FsstSymbolTable16 : FsstSymbolTable
             running += histogram[len];
         }
 
-        var lengths = new byte[count];
-        var symbols = new byte[count * MaxSymbolLength];
-        var remap = new ushort[MaxSymbols + 1];
-        remap[EscapeCode] = EscapeCode;
+        lengths = new byte[count];
+        symbols = new byte[count * MaxSymbolLength];
+
+        // Indexed by trained code, so it must span the whole code space; the escape marker maps
+        // to itself because it is not a symbol and must survive Compress untouched.
+        var built = new ushort[MaxSymbols + 1];
+        built[EscapeCode] = EscapeCode;
 
         for (int oldCode = 0; oldCode < count; oldCode++)
         {
@@ -181,10 +226,10 @@ internal sealed class FsstSymbolTable16 : FsstSymbolTable
             lengths[newCode] = len;
             rawSymbols.AsSpan(oldCode * MaxSymbolLength, MaxSymbolLength)
                 .CopyTo(symbols.AsSpan(newCode * MaxSymbolLength, MaxSymbolLength));
-            remap[oldCode] = (ushort)newCode;
+            built[oldCode] = (ushort)newCode;
         }
 
-        return new FsstSymbolTable16(lengths, symbols, trained, remap);
+        remap = built;
     }
 
     /// <inheritdoc/>

@@ -156,9 +156,11 @@ public class Fsst16EncodingTests : IDisposable
     }
 
     /// <summary>
-    /// The writer emits nothing longer than 8 bytes, which is legal under both readings of the
-    /// spec's contradictory symbol-length limit. If §1.2 turns out to be stale prose and the
-    /// cap becomes 16, this assertion is the one that should be revisited.
+    /// The writer emits nothing longer than 8 bytes. The spec permits up to 16 — §1.2 has since
+    /// been clarified to say FSST_16 symbols may be 1–16 — but permits is not requires, and a
+    /// table with zeros in the length-9..16 slots is an ordinary FSST_16 table. The cap is a
+    /// measured tuning choice (see <c>TrainedMaxSymbolLength</c>), so this pins the choice, not
+    /// a conformance limit.
     /// </summary>
     [Fact]
     public void SymbolTable_Train_EmitsNoSymbolLongerThanTheTrainedCap()
@@ -179,6 +181,152 @@ public class Fsst16EncodingTests : IDisposable
             int slot = 2 + ((length - 1) * 2);
             Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(slot, 2)));
         }
+    }
+
+    /// <summary>
+    /// A table whose symbols are 9, 12 and 16 bytes — lengths the writer never emits, since it
+    /// caps training at 8, but which §1.2 (as clarified) explicitly permits and a conformant
+    /// foreign writer may therefore produce. Everything else in this file tops out at 3-byte
+    /// hand-built symbols or 8-byte trained ones, so without this the upper half of the
+    /// histogram is only ever exercised as zeros.
+    /// </summary>
+    private static byte[] LongSymbolTableBody()
+    {
+        var body = new byte[FsstSymbolTable16.BodyHeaderSize];
+        BinaryPrimitives.WriteUInt16LittleEndian(body, 3);
+        foreach (int length in new[] { 9, 12, 16 })
+            BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(2 + ((length - 1) * 2)), 1);
+
+        // Ascending by length, so code 0 = the 9-byte symbol, 1 = the 12-byte, 2 = the 16-byte.
+        return [.. body, .. System.Text.Encoding.UTF8.GetBytes("abcdefghi" + "0123456789ab" + "0123456789abcdef")];
+    }
+
+    [Fact]
+    public void SymbolTable_LongSymbols_ParseAndReserialize()
+    {
+        byte[] body = LongSymbolTableBody();
+        var table = FsstSymbolTable16.Parse(body);
+
+        Assert.Equal(3, table.SymbolCount);
+        Assert.Equal(FsstSymbolTable16.BodyHeaderSize + 9 + 12 + 16, table.SerializedSize);
+        Assert.Equal(body, table.Serialize());
+    }
+
+    [Fact]
+    public void DataPage_LongSymbols_Decode()
+    {
+        var table = FsstSymbolTable16.Parse(LongSymbolTableBody());
+        byte[] stream = [.. Codes(0, 2), .. Codes(1), .. Codes(2, 0)];
+
+        Assert.Equal(
+            [
+                "abcdefghi0123456789abcdef",
+                "0123456789ab",
+                "0123456789abcdefabcdefghi",
+            ],
+            DecodePage(HandBuiltPage([4, 6, 10], stream), table, 3));
+    }
+
+    // ───── Renumbering into ascending length order (§3.3) ─────
+
+    /// <summary>
+    /// Clast.Fsst's 16-bit trainer already emits ascending code order, so
+    /// <see cref="FsstSymbolTable16.TryTrain"/> never renumbers in practice and no
+    /// corpus-driven test can reach that path. These two drive it directly.
+    /// </summary>
+    [Fact]
+    public void ArrangeByLength_AlreadyAscending_IsLeftAlone()
+    {
+        var rawLengths = new byte[] { 1, 2, 2, 5 };
+        var rawSymbols = new byte[rawLengths.Length * FsstSymbolTable16.MaxSymbolLength];
+
+        FsstSymbolTable16.ArrangeByLength(
+            rawLengths, rawSymbols, out var lengths, out var symbols, out var remap);
+
+        Assert.Null(remap);              // nothing to renumber, so nothing allocated
+        Assert.Same(rawLengths, lengths);
+        Assert.Same(rawSymbols, symbols);
+    }
+
+    [Fact]
+    public void ArrangeByLength_OutOfOrder_RenumbersAndRemaps()
+    {
+        // Lengths in the gain order an 8-bit-style trainer would produce, with each symbol's
+        // bytes tagged by its trained code so a mis-mapped symbol is visible.
+        var rawLengths = new byte[] { 3, 1, 2, 1 };
+        var rawSymbols = new byte[rawLengths.Length * FsstSymbolTable16.MaxSymbolLength];
+        for (int code = 0; code < rawLengths.Length; code++)
+            for (int b = 0; b < rawLengths[code]; b++)
+                rawSymbols[(code * FsstSymbolTable16.MaxSymbolLength) + b] = (byte)(0xA0 + code);
+
+        FsstSymbolTable16.ArrangeByLength(
+            rawLengths, rawSymbols, out var lengths, out var symbols, out var remap);
+
+        Assert.NotNull(remap);
+        Assert.Equal(new byte[] { 1, 1, 2, 3 }, lengths);
+
+        // Stable within a length: trained codes 1 and 3 are both 1-byte, and keep their order.
+        Assert.Equal(0, remap![1]);
+        Assert.Equal(1, remap[3]);
+        Assert.Equal(2, remap[2]);
+        Assert.Equal(3, remap[0]);
+
+        // The escape marker is not a symbol and must survive Compress unrenumbered.
+        Assert.Equal(FsstSymbolTable16.EscapeCode, remap[FsstSymbolTable16.EscapeCode]);
+
+        // Every symbol's bytes must have travelled with its code.
+        for (int oldCode = 0; oldCode < rawLengths.Length; oldCode++)
+        {
+            int newCode = remap[oldCode];
+            Assert.Equal(rawLengths[oldCode], lengths[newCode]);
+            for (int b = 0; b < rawLengths[oldCode]; b++)
+                Assert.Equal(
+                    (byte)(0xA0 + oldCode),
+                    symbols[(newCode * FsstSymbolTable16.MaxSymbolLength) + b]);
+        }
+    }
+
+    /// <summary>
+    /// The renumbered table must still serialize to something <see cref="FsstSymbolTable16.Parse"/>
+    /// accepts — the histogram is derived from the lengths, so a renumbering that broke the
+    /// ascending order would produce a body that no longer describes its own symbol data.
+    /// </summary>
+    [Fact]
+    public void ArrangeByLength_OutOfOrder_ProducesABodyThatReparses()
+    {
+        var rawLengths = new byte[] { 4, 2, 1, 2 };
+        var rawSymbols = new byte[rawLengths.Length * FsstSymbolTable16.MaxSymbolLength];
+        for (int code = 0; code < rawLengths.Length; code++)
+            for (int b = 0; b < rawLengths[code]; b++)
+                rawSymbols[(code * FsstSymbolTable16.MaxSymbolLength) + b] = (byte)('a' + code);
+
+        FsstSymbolTable16.ArrangeByLength(
+            rawLengths, rawSymbols, out var lengths, out var symbols, out _);
+
+        // Serialize by the same rules FsstSymbolTable16.Serialize uses, then let Parse validate.
+        var body = new byte[FsstSymbolTable16.BodyHeaderSize + lengths.Sum(l => (int)l)];
+        BinaryPrimitives.WriteUInt16LittleEndian(body, (ushort)lengths.Length);
+        int pos = FsstSymbolTable16.BodyHeaderSize;
+        foreach (byte len in lengths)
+        {
+            var slot = body.AsSpan(2 + ((len - 1) * 2), 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                slot, (ushort)(BinaryPrimitives.ReadUInt16LittleEndian(slot) + 1));
+            pos += len;
+        }
+
+        int at = FsstSymbolTable16.BodyHeaderSize;
+        for (int code = 0; code < lengths.Length; code++)
+        {
+            symbols.AsSpan(code * FsstSymbolTable16.MaxSymbolLength, lengths[code])
+                .CopyTo(body.AsSpan(at, lengths[code]));
+            at += lengths[code];
+        }
+
+        Assert.Equal(pos, at);
+        var reparsed = FsstSymbolTable16.Parse(body);
+        Assert.Equal(lengths.Length, reparsed.SymbolCount);
+        Assert.Equal(body, reparsed.Serialize());
     }
 
     // ───── Symbol table page dispatch ─────
