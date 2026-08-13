@@ -41,6 +41,40 @@ public enum Encoding
     /// </summary>
     [Experimental("EWPARQUET0001")]
     Alp = 10,
+
+    /// <summary>
+    /// Fast Static Symbol Table (FSST) substring compression for BYTE_ARRAY columns.
+    /// The Parquet spec proposal is not yet finalized; the wire format may change
+    /// before the spec is ratified.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>This is 11, but the FSST proposal says 10.</b> Both ALP and FSST are
+    /// unratified proposals that claim slot 10, and only one can have it. ALP shipped
+    /// here first, so FSST takes 11 — which is also what the arrow-rs proof-of-concept
+    /// expects to happen ("may become 11 once ALP encoding lands"). Files written by
+    /// this library are therefore self-consistent but will not interoperate with an
+    /// implementation that has settled on 10 for FSST until the spec picks a winner.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0003")]
+    Fsst = 11,
+}
+
+/// <summary>
+/// Type of a symbol table carried by a <see cref="PageType.SymbolTablePage"/>.
+/// </summary>
+/// <remarks>
+/// From the FSST proposal's <c>SymbolTableType</c> enum. Only <see cref="Fsst"/>
+/// (8-bit codes) is implemented; <see cref="Fsst16"/> is recognized on read so that
+/// a file using it produces a clear diagnostic rather than silent corruption.
+/// </remarks>
+[Experimental("EWPARQUET0003")]
+public enum SymbolTableType
+{
+    /// <summary>8-bit codes: 0-254 are symbols, 255 is the escape marker.</summary>
+    Fsst = 0,
+
+    /// <summary>16-bit codes: 0-65534 are symbols, 65535 is the escape marker. Not implemented.</summary>
+    Fsst16 = 1,
 }
 
 /// <summary>
@@ -91,6 +125,12 @@ public enum PageType
     IndexPage = 1,
     DictionaryPage = 2,
     DataPageV2 = 3,
+
+    /// <summary>
+    /// Symbol table shared by every FSST-encoded data page in a column chunk.
+    /// Part of the unratified FSST proposal; see <see cref="Encoding.Fsst"/>.
+    /// </summary>
+    SymbolTablePage = 4,
 }
 
 /// <summary>

@@ -183,9 +183,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
             await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
 
-            // Calculate offsets: dictionary page comes first if present
-            long dataPageOffset = chunkStart + result.DictionaryPageSize;
+            // Calculate offsets: a dictionary page or an FSST symbol table page comes first if
+            // present. A chunk has at most one of the two — FSST is a non-dictionary encoding.
+            long dataPageOffset = chunkStart + result.DictionaryPageSize + result.SymbolTablePageSize;
             long? dictionaryPageOffset = result.DictionaryPageSize > 0 ? chunkStart : null;
+            long? symbolTablePageOffset = result.SymbolTablePageSize > 0 ? chunkStart : null;
 
             // Write Bloom filter block if present.
             long? bloomFilterOffset = null;
@@ -212,6 +214,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 Statistics = result.MetaData.Statistics,
                 BloomFilterOffset = bloomFilterOffset,
                 BloomFilterLength = bloomFilterLength,
+                SymbolTablePageOffset = symbolTablePageOffset,
+                SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
             };
 
             columnChunks[i] = new ColumnChunk

@@ -289,6 +289,8 @@ ParquetFileReader.ReadRowGroupAsync()
 | DELTA_LENGTH_BYTE_ARRAY | `DeltaLengthByteArrayDecoder` | Delta-encoded lengths + raw data |
 | DELTA_BYTE_ARRAY | `DeltaByteArrayDecoder` | Delta-encoded prefix lengths + suffix lengths + suffix data |
 | BYTE_STREAM_SPLIT | `ByteStreamSplitDecoder` | AVX2 SIMD with scalar fallback; interleaved byte streams for float/double |
+| ALP (experimental, 10) | `AlpDecoder` | Unratified proposal; decimal-aware integer encoding + FOR + bit-packing, per 1024-value vector |
+| FSST (experimental, 11) | `FsstPageDecoder` + `FsstSymbolTable` | Unratified proposal; symbol table lives in a chunk-level `SYMBOL_TABLE_PAGE`, data pages carry a 9-byte header + end-offset array + code stream |
 
 **Arrow array construction** — `ArrowArrayBuilder` dispatches by Arrow type. For nullable flat columns, it scatters non-null values right-to-left in-place to open gaps for nulls, avoiding a temporary buffer. Validity bitmaps are built from definition levels with SIMD (`Vector256`/`Vector128`) when available.
 
@@ -330,10 +332,12 @@ ParquetFileWriter.WriteRowGroupAsync(RecordBatch)
 | Boolean | RLE (1-bit) | PLAIN |
 | Int32, Int64 | DELTA_BINARY_PACKED | PLAIN |
 | Float, Double | BYTE_STREAM_SPLIT | PLAIN |
-| ByteArray | DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY | PLAIN |
+| ByteArray | DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, or FSST | PLAIN |
 | FixedLenByteArray | DELTA_BYTE_ARRAY | PLAIN |
 
 Dictionary encoding is attempted first (unless disabled or Boolean). Cardinality threshold: 20% of non-null values. The `DictionaryEncoder` uses an open-addressing hash table with FNV-1a hashing for ByteArray/FLBA to avoid GC pressure from collision chains.
+
+**FSST** inverts the usual page-at-a-time flow, because its symbol table is shared by the whole column chunk and so cannot be known until every value has been seen. `FsstCompressedColumn.TryCompress` trains the table and compresses the chunk's non-null values once, up front; the data pages that follow are slices of that one payload, with their end offsets rebased onto each page's own data section. Compressing eagerly is also what makes the proposal's "fall back if FSST did not help" rule answerable before any page is written — `TryCompress` returns null and the chunk reverts to `DELTA_LENGTH_BYTE_ARRAY`. Two details are load-bearing: codes are renumbered into ascending-length order (the wire format stores a length histogram, not per-symbol lengths, so code order *is* the length information), and the symbol table page is written before the data pages with its offset recorded in `ColumnMetaData.symbol_table_page_offset`, which the reader uses as the chunk's start the way it uses the dictionary page offset.
 
 **Write options** — `ParquetWriteOptions` controls compression (per-column overrides), page version, page size, dictionary limits, row group splitting, byte array encoding strategy, key-value metadata, and application identifier.
 
