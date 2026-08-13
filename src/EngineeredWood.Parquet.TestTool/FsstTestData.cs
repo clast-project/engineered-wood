@@ -37,6 +37,18 @@ internal static class FsstTestData
     /// <summary>Small enough to force many data pages per column chunk (§1.4 coverage).</summary>
     private const int DataPageSize = 2048;
 
+    /// <summary>Codecs the Parquet writer can actually emit — a subset of the thrift enum.</summary>
+    private static readonly CompressionCodec[] SupportedCodecs =
+    [
+        CompressionCodec.Uncompressed,
+        CompressionCodec.Snappy,
+        CompressionCodec.Gzip,
+        CompressionCodec.Brotli,
+        CompressionCodec.Lz4,
+        CompressionCodec.Deflate,
+        CompressionCodec.Zstd,
+    ];
+
     private sealed record Section(string Name, string?[] Strings, byte[]?[] Binaries, string Rationale);
 
     public static async Task<int> Create(string[] args)
@@ -56,9 +68,15 @@ internal static class FsstTestData
             if (args[i] == "--compression" && i + 1 < args.Length)
             {
                 string name = args[++i];
-                if (!Enum.TryParse(name, ignoreCase: true, out codec))
+
+                // Parsing the whole enum would accept LZO and LZ4_RAW-vs-Hadoop framings the
+                // writer cannot emit, and the failure would surface as a NotSupportedException
+                // from inside the page writer rather than as a usage error here.
+                if (!Enum.TryParse(name, ignoreCase: true, out codec) || !SupportedCodecs.Contains(codec))
                 {
-                    Console.Error.WriteLine($"Unknown compression codec '{name}'.");
+                    Console.Error.WriteLine(
+                        $"Unsupported compression codec '{name}'. Supported: " +
+                        string.Join(", ", SupportedCodecs.Select(c => c.ToString().ToLowerInvariant())) + ".");
                     return 1;
                 }
             }
@@ -187,9 +205,12 @@ internal static class FsstTestData
             string tail = i % 9 == 0 ? "→文" : $"{rng.Next(100)}";
             strings[i] = $"session-{i}-user{rng.Next(50)}-region-eu-west-{tail}";
 
-            var raw = new byte[28];
-            System.Text.Encoding.UTF8.GetBytes($"blob-{i:D4}-region-eu-west-").CopyTo(raw, 0);
-            for (int b = 24; b < raw.Length; b++)
+            // Derived rather than hardcoded: the prefix is 25 bytes, and an earlier version
+            // started the overwrite at 24 and silently ate its trailing '-'.
+            byte[] prefix = System.Text.Encoding.UTF8.GetBytes($"blob-{i:D4}-region-eu-west-");
+            var raw = new byte[prefix.Length + 3];
+            prefix.CopyTo(raw, 0);
+            for (int b = prefix.Length; b < raw.Length; b++)
                 raw[b] = i % 9 == 0 ? (byte)(0xF0 + rng.Next(0x10)) : (byte)('a' + rng.Next(26));
             binaries[i] = raw;
         }
@@ -461,10 +482,6 @@ internal static class FsstTestData
     private static string DescribeTable(FsstSymbolTable table)
     {
         byte[] body = table.Serialize();
-        int headerSize = table is FsstSymbolTable16
-            ? FsstSymbolTable16.BodyHeaderSize
-            : FsstSymbolTable8.BodyHeaderSize;
-
         int longest = 0;
         int slots = table is FsstSymbolTable16 ? FsstSymbolTable16.MaxSymbolLength : FsstSymbolTable8.MaxSymbolLength;
         for (int length = 1; length <= slots; length++)
@@ -477,8 +494,9 @@ internal static class FsstTestData
         }
 
         string type = table is FsstSymbolTable16 ? "FSST_16" : "FSST";
+        // body = the whole SYMBOL_TABLE_PAGE body: the fixed header plus symbol_data.
         return $"{type,-7} table of {table.SymbolCount,4} symbols " +
-               $"(longest {longest,2}, body {headerSize + body.Length - headerSize} bytes)";
+               $"(longest {longest,2}, body {body.Length} bytes)";
     }
 
     private static string DescribeOffsetEncodings(List<PageInfo> pages)
