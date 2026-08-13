@@ -103,6 +103,14 @@ internal sealed class FsstCompressedColumn
         if (written + table.SerializedSize >= rawBytes)
             return null;
 
+        // The buffer above was sized for the worst case, but this column survives only because
+        // it beat the raw bytes — so at least half of it (three quarters, for 16-bit codes) is
+        // slack that would otherwise stay live for the whole page-writing loop below. Trimming
+        // costs one copy and is done only here, after the fallback check, so a chunk about to
+        // be discarded never pays for it.
+        if (written != payload.Length)
+            Array.Resize(ref payload, written);
+
         return new FsstCompressedColumn(table, payload, endOffsets);
     }
 #pragma warning restore EWPARQUET0003
