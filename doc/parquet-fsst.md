@@ -45,8 +45,10 @@ Phase 1 only (§1.4): one symbol table per column chunk, in its own page.
 - `PageType.SymbolTablePage = 4`, `SymbolTablePageHeader { type, is_compressed }` at
   `PageHeader` field 9 (the spec does not assign a field id; 9 is the next free one).
 - `ColumnMetaData.symbol_table_page_offset` (18) and `symbol_table_page_length` (19).
-- Symbol table type `FSST` (8-bit codes) only — `SymbolTableType.Fsst` in the C# enum.
-  `FSST_16` is recognized and rejected with a clear error rather than misread.
+- Both symbol table types: `FSST` (8-bit codes) and `FSST_16` (16-bit), selected by
+  `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`. Both are written as encoding 11 —
+  the symbol table page's type field is what tells them apart (§2.3), so the data pages are
+  byte-identical in structure either way.
 - BYTE_ARRAY only (§1.3), V2 data pages only.
 - Both offset encodings, PLAIN and DELTA_BINARY_PACKED. The writer encodes the offset array
   both ways per page and keeps the smaller, recording the choice in the header byte — which
@@ -59,10 +61,13 @@ Phase 1 only (§1.4): one symbol table per column chunk, in its own page.
 not a per-symbol length: codes are assigned in ascending length order and the histogram is
 what lets a reader cut `symbol_data` back into symbols. Clast.Fsst (like cwida's original)
 assigns codes by training gain, in no particular length order — measured directly, a table
-trained on URLs came back with lengths `2, 2, 1, 3, 3, ...`. `FsstSymbolTable.TryTrain`
+trained on URLs came back with lengths `2, 2, 1, 3, 3, ...`. `FsstSymbolTable8.TryTrain`
 therefore counting-sorts the trained codes by length and carries a 256-entry remap that
 `Compress` applies to every emitted code. Escape markers (255) and the literal byte that
 follows them pass through untouched — the literal is a raw byte, not a code.
+
+This applies to the **8-bit** trainer only. The 16-bit one already emits codes in ascending
+length order, so `FsstSymbolTable16.TryTrain` verifies that and skips the renumbering.
 
 **Compression happens per chunk, not per page.** The symbol table cannot be trained until
 every value has been seen, so `FsstCompressedColumn.TryCompress` compresses the whole
@@ -88,38 +93,18 @@ example from §6.1/§6.2 byte for byte.
 
 ## Not implemented
 
-- **`FSST_16`.** Note this is *not* deferred by the spec: §1.4's phase split is about
-  per-chunk versus per-page symbol tables, and says nothing about code width. FSST_16 is
-  fully specified in this document — §2.3 (enum), §3.3 (body layout), §3.4 (invariants),
-  §3.5 (max sizes), §3.6 (lookup construction), §4.7 (code stream), §5.1, §5.3 and §8.3
-  (decode pseudocode) — and Appendix C measures it favourably against OnPair16. Two
-  concrete things stopped it here, neither of them the spec's scope:
-
-  1. **No 16-bit trainer available** — tracked as
-     [clast-project/fsst#1](https://github.com/clast-project/fsst/issues/1).
-     Clast.Fsst ships an 8-bit table (`SymbolTable`) and
-     a 12-bit one (`SymbolMap` / `Fsst12Encoder`), but nothing 16-bit — and 12-bit has no
-     slot in `SymbolTableType`, which is `FSST = 0, FSST_16 = 1` only (comment [ae]
-     proposed FSST_8/12/16; only 16 was added). cwida's construction is 8-bit-specific, so
-     FSST_16 means writing symbol-table training, compression and decompression from
-     scratch rather than plumbing an existing codec. That is the bulk of the work.
-  2. **The spec contradicts itself on FSST_16 symbol length.** §1.2 says "Symbols may be
-     between 1 and 8 bytes inclusive", but §3.3 gives FSST_16 a `uint16[16]` histogram
-     covering lengths 1–16, §3.5 computes max `symbol_data` as 65,535 × **16**, and §3.6
-     sets `max_symbol_length = 16`. Three sections say 16 and the intro says 8. A reader
-     can be liberal and just honour the 16 histogram slots; a **writer cannot guess**,
-     because the answer decides what it is allowed to emit. §1.2 reads like stale prose
-     from the FSST8 description, but it is worth resolving with the author before writing
-     bytes no one else can check — nothing else writes FSST_16 today, so a clean-room
-     implementation could be perfectly self-consistent and still wrong.
 - FIXED_LEN_BYTE_ARRAY. §1.3 is BYTE_ARRAY only; the doc's comment thread floats FLBA for
   UUIDs as possible future work.
 - Composite dictionary + FSST (§9.2), which the spec itself says needs a further spec change.
+- **Automatic choice between the two widths.** `ByteArrayEncoding.Fsst16` is an explicit
+  opt-in, as `Fsst` is; the writer never picks for you. See below.
 
-## Design sketch: adding FSST_16
+## FSST_16
 
-Written while the FSST8 work was fresh, so that picking this up later starts from a plan
-rather than from research. Blocked on [clast-project/fsst#1](https://github.com/clast-project/fsst/issues/1).
+Sketched while the FSST8 work was fresh and built from that sketch once
+[clast-project/fsst#1](https://github.com/clast-project/fsst/issues/1) shipped a 16-bit
+trainer in Clast.Fsst 0.3.x. The reasoning below is kept because it is what the code encodes;
+where the plan and the result differ, the difference is called out.
 
 ### The §1.2 ambiguity does not reach the wire format
 
@@ -136,7 +121,12 @@ Consequence: **`Serialize`, `Parse` and every validation rule are identical unde
 reading.** The only thing that changes is the cap handed to the trainer. So the Parquet side
 can be built in full before the spec answers, and the answer later moves one argument.
 
-The reader should be liberal regardless — honour all 16 histogram slots, whatever we write.
+That is what happened. `FsstSymbolTable16.TrainedMaxSymbolLength` is **8** — the value legal
+under *both* readings, since a table of short symbols is just one whose histogram entries for
+lengths 9–16 are zero. Reading stays liberal and honours all 16 slots regardless. If the spec
+settles on 16, that one constant changes and nothing else does;
+`SymbolTable_Train_EmitsNoSymbolLongerThanTheTrainedCap` is the test that should be revisited
+with it.
 
 ### What is shared, and what forks
 
@@ -152,12 +142,17 @@ interpretation of the data section changes. So:
 | Code stream compress/decompress/validate | forks (LE u16 codes, escape 65,535 + one u16 literal in 0–255) |
 | `ColumnChunkWriter` / `ColumnChunkReader` plumbing | **unchanged**, if the table type is abstracted — see below |
 
-Suggested shape: make `FsstSymbolTable` an abstract base with `FsstSymbolTable8` and
+Shape as built: `FsstSymbolTable` is an abstract base with `FsstSymbolTable8` and
 `FsstSymbolTable16` subclasses, rather than a type-tagged class with internal branching.
-The reader already threads one nullable `FsstSymbolTable?` through seven signatures
+The reader already threaded one nullable `FsstSymbolTable?` through seven signatures
 (`ReadDataPageV1/V2`, the two `*FromEntry` variants, the two `TryReadFixedListPage*`
-probes, and `DecodeValues`) plus `ColumnPageMap`; a base class keeps every one of those
-untouched. The virtual call lands once per page, not per value, so it is not on a hot path.
+probes, and `DecodeValues`) plus `ColumnPageMap`; the base class kept every one of those
+untouched, as predicted. The virtual call lands once per page, not per value.
+
+Two members had to move onto the base that the sketch did not anticipate: the decoder itself
+is a different type per width (`FsstDecoder` versus `Fsst16Decoder`), so `Decoder` became
+`TryDecompressBatch` plus `MaxDecompressedLength`, and `MaxCompressedLength` went from static
+to instance for the 2x/4x split below.
 
 Numbers that differ: worst-case *compression* expansion is 4x rather than 2x (§5.3 — a byte
 that escapes costs a 2-byte marker plus a 2-byte literal), so the `MaxCompressedLength`
@@ -171,10 +166,17 @@ A question FSST8 did not raise, and the one real design decision here. Appendix 
 FSST16 wins on compression ratio, while note 1 says FSST8 may still be preferred for encode
 time on low-cardinality data — so there is no universally right answer.
 
-Recommendation: **ship an explicit `ByteArrayEncoding.Fsst16` member first, and no policy.**
+Shipped as recommended: **an explicit `ByteArrayEncoding.Fsst16` member, and no policy.**
 That mirrors how `Fsst` shipped, and it inherits the per-column override machinery
 (`GetByteArrayEncoding`) for free. Deciding automatically before there is data on this
 codebase's own workloads would be guessing in the writer.
+
+Clast.Fsst's own measurements point the same way and are worth repeating here, because they
+cut against the assumption that a wider code space is simply better: on a 1.4 MB synthetic URL
+corpus **FSST8 reaches 3.11x against FSST16's 2.27x**, and the gap widens on short name-like
+values. Two bytes per code has to be paid for by symbols longer than two bytes. FSST_16 earns
+its place where the vocabulary genuinely exceeds 255 symbols *and* the repeated substrings are
+long — and, separately, because it is what the proposal specifies.
 
 Two options considered and not recommended yet:
 
@@ -188,27 +190,46 @@ Two options considered and not recommended yet:
   table is exactly the signal that a wider code space would pay, and only then is a retrain
   at 16 worth attempting. Needs a threshold picked from measurement, not from intuition.
 
-### What Clast.Fsst has to provide
+### What Clast.Fsst provides
 
-Per the issue: `Fsst16Encoder.BuildSymbolTable(rows, zeroTerminated, maxSymbolLength)` →
-`SymbolTable16`, plus `TryCompress` / `CompressBatch` / `MaxCompressedLength`, and
+**Clast.Fsst 0.3.1 is the minimum.** 0.3.0 introduced the 16-bit trainer but shipped a broken
+8-bit compressor with it — its own documented roundtrip returned wrong bytes for most values,
+which cost 9 tests here and 2 in Vortex until 0.3.1 fixed it. FSST_16 itself was never
+affected. Note that 0.3.1's `AssemblyVersion` still reads `0.3.0.0`, so identify the binary by
+package version rather than by assembly metadata.
+
+Clast.Fsst supplies `Fsst16Encoder.BuildSymbolTable(rows, maxSymbolLength)` →
+`SymbolTable16`, `TryCompress` / `CompressBatch` / `MaxCompressedLength`, and
 `Fsst16Decoder.FromSymbols(lengths, symbols)` / `MaxDecompressedLength` /
-`TryDecompressBatch`. `ExportRaw` needs **16-byte slots**, not the 8-byte slots the
-existing `SymbolTable.ExportRaw` uses.
+`TryDecompressBatch`. `ExportRaw` uses **16-byte slots**, not the 8-byte slots
+`SymbolTable.ExportRaw` uses.
 
-The code-renumbering trap applies unchanged and is the thing most likely to be forgotten:
-whatever order the 16-bit trainer assigns codes in, they must be counting-sorted into
-ascending length order and every emitted code remapped, because the histogram *is* the
-length information. The remap table becomes `ushort[65536]`.
+**The code-renumbering trap turned out not to apply.** The sketch assumed the 16-bit trainer
+would assign codes by gain, as the 8-bit one does, and that every emitted code would therefore
+need remapping through a `ushort[65536]`. It does not: Clast.Fsst assigns FSST16 codes in ascending
+symbol-length order already, which is exactly what §3.3 needs. `FsstSymbolTable16.TryTrain`
+checks that the exported lengths are non-decreasing and, when they are, keeps the raw table
+untouched — no remap allocated, no code rewritten. The counting sort is still there for when
+they are not, because the histogram *is* the length information and a trainer that quietly
+stopped promising that order would otherwise produce tables no reader could cut apart.
+
+Two other properties of these tables matter to a writer: they always contain all 256
+single-byte symbols, so they **never escape** and never expand beyond 2x in practice (the 4x
+bound is still what `MaxCompressedLength` must use, since a foreign table may escape); and the
+escape encoding is code 65,535 followed by the literal byte widened to a little-endian `u16`,
+which `ValidateCodeStream` rejects if the literal exceeds 255.
 
 ### Tests
 
-Mirror the FSST8 set, with one honest gap to call out: **§6's worked examples are FSST8
-only.** There is no FSST_16 example to decode, so the test that currently pins the
-implementation to the specification rather than to its own encoder has no counterpart. A
-hand-built FSST_16 page derived from §3.3 and §4.7 is still worth having, but it must be
-commented as *derived from the rules*, not quoted from the document — otherwise it reads
-like external corroboration when it is not.
+`Fsst16EncodingTests` mirrors the FSST8 set — 26 tests over the table body, the page body,
+dispatch, and end-to-end files — with the one honest gap the sketch predicted: **§6's worked
+examples are FSST8 only.** There is no FSST_16 example to decode, so the test pinning the
+implementation to the specification rather than to its own encoder has no counterpart. The
+hand-built table and page (`HandBuiltSymbolTableBody`, `DataPage_HandBuiltFromTheRules_Decodes`)
+are commented as *derived from* §3.3, §4.4 and §4.7 — not quoted — so they are not mistaken for
+external corroboration.
 
-Also worth an explicit test: an FSST_16 table containing only short symbols, serialized and
-reparsed, to pin the "histogram entries 9–16 are zero and that is legal" property above.
+`SymbolTable_ShortSymbolsOnly_LeavesUpperHistogramSlotsZero` pins the "histogram entries 9–16
+are zero and that is legal" property the §1.2 argument rests on, and
+`SymbolTablePage_TypeFieldSelectsTheCodeWidth` pins the dispatch — that the type field, and
+nothing in the data page, is what selects the code width.

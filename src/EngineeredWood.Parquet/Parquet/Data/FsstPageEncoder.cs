@@ -60,9 +60,17 @@ internal sealed class FsstCompressedColumn
     /// <see langword="null"/> when FSST is not worth using for this column chunk — no
     /// trainable corpus, or output that does not beat storing the bytes as they are.
     /// </summary>
-    public static FsstCompressedColumn? TryCompress(ReadOnlySpan<byte[]> values)
+#pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+    public static FsstCompressedColumn? TryCompress(
+        ReadOnlySpan<byte[]> values, SymbolTableType symbolTableType)
     {
-        var table = FsstSymbolTable.TryTrain(values);
+        FsstSymbolTable? table = symbolTableType switch
+        {
+            SymbolTableType.Fsst => FsstSymbolTable8.TryTrain(values),
+            SymbolTableType.Fsst16 => FsstSymbolTable16.TryTrain(values),
+            _ => null,
+        };
+
         if (table is null)
             return null;
 
@@ -70,12 +78,13 @@ internal sealed class FsstCompressedColumn
         foreach (var value in values)
             rawBytes += value.Length;
 
-        // §5.3: worst case is every byte escaping to a two-byte sequence. Accumulated and
-        // doubled in long, because an int would wrap negative somewhere past a 1 GB chunk and
-        // turn a size question into an allocation crash. A chunk whose worst case will not fit
-        // an array is simply one FSST declines — the caller already has a fallback for that,
-        // and it is the same answer as "FSST did not shrink this".
-        long worstCase = FsstSymbolTable.MaxCompressedLength(rawBytes);
+        // §5.3: worst case is every byte escaping — to a two-byte sequence for 8-bit codes, a
+        // four-byte one for 16-bit. Accumulated and scaled in long, because an int would wrap
+        // negative somewhere past a 1 GB chunk and turn a size question into an allocation
+        // crash. A chunk whose worst case will not fit an array is simply one FSST declines —
+        // the caller already has a fallback for that, and it is the same answer as "FSST did
+        // not shrink this".
+        long worstCase = table.MaxCompressedLength(rawBytes);
         if (worstCase > MaxArrayLength)
             return null;
 
@@ -94,8 +103,17 @@ internal sealed class FsstCompressedColumn
         if (written + table.SerializedSize >= rawBytes)
             return null;
 
+        // The buffer above was sized for the worst case, but this column survives only because
+        // it beat the raw bytes — so at least half of it (three quarters, for 16-bit codes) is
+        // slack that would otherwise stay live for the whole page-writing loop below. Trimming
+        // costs one copy and is done only here, after the fallback check, so a chunk about to
+        // be discarded never pays for it.
+        if (written != payload.Length)
+            Array.Resize(ref payload, written);
+
         return new FsstCompressedColumn(table, payload, endOffsets);
     }
+#pragma warning restore EWPARQUET0003
 }
 
 /// <summary>

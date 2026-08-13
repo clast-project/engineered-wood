@@ -310,7 +310,8 @@ internal static class ColumnChunkWriter
         if (UsesFsst(physicalType, options) && nonNullCount > 0)
         {
             fsstColumn = FsstCompressedColumn.TryCompress(
-                ExtractDenseByteArrays(array, rowCount, nonNullCount, valueDefLevels));
+                ExtractDenseByteArrays(array, rowCount, nonNullCount, valueDefLevels),
+                FsstTableType(options));
         }
 
         if (fsstColumn != null)
@@ -387,7 +388,19 @@ internal static class ColumnChunkWriter
         options.DataPageVersion == DataPageVersion.V2
         && physicalType == PhysicalType.ByteArray
 #pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
-        && options.ByteArrayEncoding == ByteArrayEncoding.Fsst;
+        && options.ByteArrayEncoding is ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16;
+#pragma warning restore EWPARQUET0003
+
+    /// <summary>
+    /// Which symbol table the chunk trains. Both widths are written as
+    /// <see cref="Encoding.Fsst"/>; the SYMBOL_TABLE_PAGE header is what tells them apart
+    /// (§2.3), so the choice never reaches the data pages.
+    /// </summary>
+#pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+    private static SymbolTableType FsstTableType(ParquetWriteOptions options) =>
+        options.ByteArrayEncoding == ByteArrayEncoding.Fsst16
+            ? SymbolTableType.Fsst16
+            : SymbolTableType.Fsst;
 #pragma warning restore EWPARQUET0003
 
     /// <summary>
@@ -436,9 +449,7 @@ internal static class ColumnChunkWriter
                 : null,
             SymbolTablePageHeader = new SymbolTablePageHeader
             {
-#pragma warning disable EWPARQUET0003 // Only the 8-bit variant is implemented; see FsstSymbolTable.
-                Type = SymbolTableType.Fsst,
-#pragma warning restore EWPARQUET0003
+                Type = table.Type,
                 IsCompressed = isCompressed,
             },
         };

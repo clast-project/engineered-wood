@@ -39,7 +39,7 @@ internal static class EncodingStrategyResolver
             {
                 ByteArrayEncoding.DeltaByteArray => Encoding.DeltaByteArray,
 #pragma warning disable EWPARQUET0003 // FSST is intentionally selectable; the experimental signal lives on the enum values, not internal dispatch.
-                ByteArrayEncoding.Fsst => Encoding.Fsst,
+                ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16 => Encoding.Fsst,
 #pragma warning restore EWPARQUET0003
                 _ => Encoding.DeltaLengthByteArray,
             },

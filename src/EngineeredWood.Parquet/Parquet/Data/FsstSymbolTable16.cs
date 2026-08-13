@@ -1,0 +1,378 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using System.Buffers.Binary;
+
+namespace EngineeredWood.Parquet.Data;
+
+/// <summary>
+/// The 16-bit code variant of <see cref="FsstSymbolTable"/> — the proposal's
+/// <c>SymbolTableType.FSST_16</c>.
+/// </summary>
+/// <remarks>
+/// <para>Body layout (§3.3, <c>SymbolTableType.FSST_16</c>):</para>
+/// <code>
+/// +------------------+---------------------------+---------------------+
+/// |   symbol_count   |     length_histogram      |     symbol_data     |
+/// |  (2 bytes, u16)  |    (32 bytes, u16[16])    |     (variable)      |
+/// +------------------+---------------------------+---------------------+
+/// </code>
+/// <para>Everything is wider than the 8-bit variant: a <c>u16</c> count, sixteen <c>u16</c>
+/// histogram slots covering lengths 1..16, <c>symbol_data</c> starting at offset 34, and a
+/// code stream of little-endian <c>u16</c> codes where 65,535 is the escape marker followed
+/// by one literal byte written as a <c>u16</c> (§4.7, §8.3).</para>
+/// <para><b>Reading is liberal, writing is conservative.</b> The proposal contradicts itself
+/// on how long an FSST_16 symbol may be — §1.2 says 1..8 bytes while §3.3, §3.5 and §3.6 all
+/// describe 16 — and that disagreement never reaches the wire format: §3.3 gives the histogram
+/// its 16 slots unconditionally, so a table holding only short symbols is simply one whose
+/// entries for lengths 9..16 are zero, which §3.6's reconstruction loop reads without noticing.
+/// <see cref="Parse"/> therefore honours all 16 slots whatever the answer turns out to be,
+/// while <see cref="TryTrain"/> caps what it emits at <see cref="TrainedMaxSymbolLength"/> —
+/// 8, the value both readings accept. If the spec settles on 16, that one constant changes and
+/// nothing else does.</para>
+/// </remarks>
+internal sealed class FsstSymbolTable16 : FsstSymbolTable
+{
+    /// <summary>Codes 0..65534 are symbols; 65535 is reserved as the escape marker.</summary>
+    public const int MaxSymbols = 65535;
+
+    /// <summary>
+    /// Histogram slots, and the width of a <c>symbol_data</c> slot in the raw table — symbols
+    /// may be 1..16 bytes as far as a <em>reader</em> is concerned (§3.3, §3.5, §3.6).
+    /// </summary>
+    public const int MaxSymbolLength = 16;
+
+    /// <summary>
+    /// Longest symbol this writer will train, and the only part of this class the §1.2/§3.3
+    /// contradiction can reach. 8 is legal under both readings; 16 is legal only if §1.2 is
+    /// the stale text it appears to be.
+    /// </summary>
+    public const int TrainedMaxSymbolLength = 8;
+
+    /// <summary>Code that introduces a literal byte rather than a symbol.</summary>
+    public const ushort EscapeCode = 0xFFFF;
+
+    /// <summary>
+    /// Bytes of fixed header: <c>symbol_count</c> plus <c>length_histogram</c>, so
+    /// <c>symbol_data</c> begins at offset 34.
+    /// </summary>
+    public const int BodyHeaderSize = 2 + (2 * MaxSymbolLength);
+
+    /// <summary>Per-code symbol length, ascending — the spec's code order.</summary>
+    private readonly byte[] _lengths;
+
+    /// <summary>Per-code symbol bytes in 16-byte slots, matching Clast.Fsst's raw layout.</summary>
+    private readonly byte[] _symbols;
+
+    /// <summary>Set on the write path only: the trained table the compressor needs.</summary>
+    private readonly Clast.Fsst.SymbolTable16? _trained;
+
+    /// <summary>
+    /// Set on the write path only, and only when the trainer's own code order was not already
+    /// ascending by length: trained code → spec code.
+    /// </summary>
+    private readonly ushort[]? _remap;
+
+    private Clast.Fsst.Fsst16Decoder? _decoder;
+
+    private FsstSymbolTable16(
+        byte[] lengths, byte[] symbols, Clast.Fsst.SymbolTable16? trained, ushort[]? remap)
+    {
+        _lengths = lengths;
+        _symbols = symbols;
+        _trained = trained;
+        _remap = remap;
+    }
+
+    /// <inheritdoc/>
+#pragma warning disable EWPARQUET0003 // The enum value names a wire constant; writing one is the caller's opt-in.
+    public override SymbolTableType Type => SymbolTableType.Fsst16;
+#pragma warning restore EWPARQUET0003
+
+    /// <inheritdoc/>
+    public override int SymbolCount => _lengths.Length;
+
+    /// <inheritdoc/>
+    public override int SerializedSize
+    {
+        get
+        {
+            int size = BodyHeaderSize;
+            foreach (byte len in _lengths) size += len;
+            return size;
+        }
+    }
+
+    /// <summary>
+    /// Trains a symbol table over <paramref name="values"/>, or returns <see langword="null"/>
+    /// when no usable table comes out — an empty corpus, or a table the 16-bit code space
+    /// cannot address. Callers fall back to another encoding rather than failing the write.
+    /// </summary>
+    public static FsstSymbolTable16? TryTrain(ReadOnlySpan<byte[]> values)
+    {
+        if (values.Length == 0)
+            return null;
+
+        Clast.Fsst.SymbolTable16 trained;
+        try
+        {
+            trained = Clast.Fsst.Fsst16Encoder.BuildSymbolTable(
+                values, maxSymbolLength: TrainedMaxSymbolLength);
+        }
+        catch (Exception)
+        {
+            // Training is a heuristic over the caller's bytes; a corpus it cannot handle is a
+            // reason to pick another encoding, not to fail the write.
+            return null;
+        }
+
+        int count = trained.SymbolCount;
+
+        // The escape marker owns code 65535, so a table that fills the code space has nowhere
+        // to put its last symbol. Clast.Fsst caps itself below this; the check is here so a
+        // future version relaxing that cap degrades to another encoding rather than writing
+        // codes a reader would have to interpret as escapes.
+        if (count <= 0 || count > MaxSymbols)
+            return null;
+
+        var rawLengths = new byte[count];
+        var rawSymbols = new byte[count * MaxSymbolLength];
+        trained.ExportRaw(rawLengths, rawSymbols);
+
+        bool ascending = true;
+        for (int code = 0; code < count; code++)
+        {
+            byte len = rawLengths[code];
+            if (len is < 1 or > MaxSymbolLength)
+                return null;
+            if (code > 0 && len < rawLengths[code - 1])
+                ascending = false;
+        }
+
+        // Clast.Fsst documents that its 16-bit trainer already assigns codes in ascending
+        // length order, which is exactly what §3.3 needs — so the common path renumbers
+        // nothing. The counting sort below is not dead code, though: the histogram *is* the
+        // length information, so a trainer that ever stopped promising that order would
+        // silently produce tables no reader could cut apart correctly.
+        if (ascending)
+            return new FsstSymbolTable16(rawLengths, rawSymbols, trained, remap: null);
+
+        Span<int> histogram = stackalloc int[MaxSymbolLength + 1];
+        foreach (byte len in rawLengths)
+            histogram[len]++;
+
+        Span<int> nextCode = stackalloc int[MaxSymbolLength + 1];
+        int running = 0;
+        for (int len = 1; len <= MaxSymbolLength; len++)
+        {
+            nextCode[len] = running;
+            running += histogram[len];
+        }
+
+        var lengths = new byte[count];
+        var symbols = new byte[count * MaxSymbolLength];
+        var remap = new ushort[MaxSymbols + 1];
+        remap[EscapeCode] = EscapeCode;
+
+        for (int oldCode = 0; oldCode < count; oldCode++)
+        {
+            byte len = rawLengths[oldCode];
+            int newCode = nextCode[len]++;
+            lengths[newCode] = len;
+            rawSymbols.AsSpan(oldCode * MaxSymbolLength, MaxSymbolLength)
+                .CopyTo(symbols.AsSpan(newCode * MaxSymbolLength, MaxSymbolLength));
+            remap[oldCode] = (ushort)newCode;
+        }
+
+        return new FsstSymbolTable16(lengths, symbols, trained, remap);
+    }
+
+    /// <inheritdoc/>
+    public override int Serialize(Span<byte> destination)
+    {
+        int size = SerializedSize;
+        if (destination.Length < size)
+            throw new ArgumentException(
+                $"FSST_16 symbol table needs {size} bytes, got {destination.Length}.", nameof(destination));
+
+        BinaryPrimitives.WriteUInt16LittleEndian(destination, (ushort)SymbolCount);
+
+        var histogram = destination.Slice(2, 2 * MaxSymbolLength);
+        histogram.Clear();
+        foreach (byte len in _lengths)
+        {
+            var slot = histogram.Slice((len - 1) * 2, 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                slot, (ushort)(BinaryPrimitives.ReadUInt16LittleEndian(slot) + 1));
+        }
+
+        // Symbols are already in ascending-length code order, so a straight walk emits the
+        // ascending length blocks the histogram describes.
+        int pos = BodyHeaderSize;
+        for (int code = 0; code < _lengths.Length; code++)
+        {
+            byte len = _lengths[code];
+            _symbols.AsSpan(code * MaxSymbolLength, len).CopyTo(destination.Slice(pos, len));
+            pos += len;
+        }
+
+        return pos;
+    }
+
+    /// <summary>
+    /// Reads a symbol table page body, validating every invariant §3.7 requires a reader
+    /// to check.
+    /// </summary>
+    public static FsstSymbolTable16 Parse(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < BodyHeaderSize)
+            throw new ParquetFormatException(
+                $"FSST_16 symbol table page is {body.Length} bytes, too small for the " +
+                $"{BodyHeaderSize}-byte header.");
+
+        int symbolCount = BinaryPrimitives.ReadUInt16LittleEndian(body);
+
+        // Widened deliberately: §3.7 requires arithmetic wide enough that a hostile histogram
+        // cannot wrap the sum past the length check. Sixteen u16 slots can describe just over
+        // 16 MB of symbol data, which overflows nothing here but would in 32-bit arithmetic
+        // once multiplied out by a caller reusing this shape.
+        long histogramSum = 0;
+        long symbolDataSize = 0;
+        for (int i = 0; i < MaxSymbolLength; i++)
+        {
+            int n = BinaryPrimitives.ReadUInt16LittleEndian(body.Slice(2 + (i * 2), 2));
+            histogramSum += n;
+            symbolDataSize += (long)n * (i + 1);
+        }
+
+        if (histogramSum != symbolCount)
+            throw new ParquetFormatException(
+                $"FSST_16 symbol table length_histogram sums to {histogramSum} but symbol_count " +
+                $"is {symbolCount}.");
+
+        long expectedLength = BodyHeaderSize + symbolDataSize;
+        if (body.Length != expectedLength)
+            throw new ParquetFormatException(
+                $"FSST_16 symbol table page is {body.Length} bytes but its histogram describes " +
+                $"{expectedLength} ({symbolDataSize} bytes of symbol data plus a {BodyHeaderSize}-byte header).");
+
+        var lengths = new byte[symbolCount];
+        var symbols = new byte[symbolCount * MaxSymbolLength];
+
+        int code = 0;
+        int pos = BodyHeaderSize;
+        for (int i = 0; i < MaxSymbolLength; i++)
+        {
+            int len = i + 1;
+            for (int n = BinaryPrimitives.ReadUInt16LittleEndian(body.Slice(2 + (i * 2), 2)); n > 0; n--)
+            {
+                lengths[code] = (byte)len;
+                body.Slice(pos, len).CopyTo(symbols.AsSpan(code * MaxSymbolLength, len));
+                pos += len;
+                code++;
+            }
+        }
+
+        return new FsstSymbolTable16(lengths, symbols, trained: null, remap: null);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Every byte escaping to a two-byte marker plus a two-byte literal (§5.3) — 4x, where the
+    /// 8-bit variant's worst case is 2x.
+    /// </remarks>
+    public override long MaxCompressedLength(long rawLength) => rawLength * 4;
+
+    /// <inheritdoc/>
+    public override int Compress(ReadOnlySpan<byte> value, Span<byte> destination)
+    {
+        if (_trained is null)
+            throw new InvalidOperationException(
+                "This FSST_16 symbol table was parsed from a page and cannot compress; train one instead.");
+
+        if (value.Length == 0)
+            return 0;
+
+        if (!Clast.Fsst.Fsst16Encoder.TryCompress(_trained, value, destination, out int written))
+            throw new InvalidOperationException(
+                $"FSST_16 compression needed more than the {destination.Length} bytes provided " +
+                $"for a {value.Length}-byte value.");
+
+        if ((written & 1) != 0)
+            throw new InvalidOperationException(
+                $"FSST_16 compression produced {written} bytes, which is not a whole number of " +
+                "16-bit codes.");
+
+        // Renumber trained codes into the spec's ascending-length codes. Escapes are copied
+        // through with their literal, which must not be remapped — it is a raw byte widened to
+        // 16 bits, not a code.
+        var remap = _remap;
+        if (remap != null)
+        {
+            for (int i = 0; i < written; i += 2)
+            {
+                var slot = destination.Slice(i, 2);
+                ushort c = BinaryPrimitives.ReadUInt16LittleEndian(slot);
+                if (c == EscapeCode)
+                    i += 2;
+                else
+                    BinaryPrimitives.WriteUInt16LittleEndian(slot, remap[c]);
+            }
+        }
+
+        return written;
+    }
+
+    /// <inheritdoc/>
+    public override void ValidateCodeStream(ReadOnlySpan<byte> codes)
+    {
+        if ((codes.Length & 1) != 0)
+            throw new ParquetFormatException(
+                $"FSST_16 value is {codes.Length} bytes, which is not a whole number of 16-bit codes.");
+
+        int symbolCount = SymbolCount;
+        int i = 0;
+        while (i < codes.Length)
+        {
+            ushort c = BinaryPrimitives.ReadUInt16LittleEndian(codes.Slice(i, 2));
+            if (c == EscapeCode)
+            {
+                if (i + 4 > codes.Length)
+                    throw new ParquetFormatException(
+                        "FSST_16 value ends with an escape marker and no literal.");
+
+                ushort literal = BinaryPrimitives.ReadUInt16LittleEndian(codes.Slice(i + 2, 2));
+                if (literal > byte.MaxValue)
+                    throw new ParquetFormatException(
+                        $"FSST_16 escape literal is {literal}, which is not a byte value (§8.3).");
+
+                i += 4;
+            }
+            else
+            {
+                if (c >= symbolCount)
+                    throw new ParquetFormatException(
+                        $"FSST_16 value uses symbol code {c} but the table has only {symbolCount} symbols.");
+                i += 2;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public override int MaxDecompressedLength(int compressedLength) =>
+        Clast.Fsst.Fsst16Decoder.MaxDecompressedLength(compressedLength);
+
+    /// <inheritdoc/>
+    public override bool TryDecompressBatch(
+        ReadOnlySpan<byte> compressedData,
+        ReadOnlySpan<int> compressedLengths,
+        Span<byte> destination,
+        Span<int> destinationOffsets,
+        out int totalWritten) =>
+        Decoder.TryDecompressBatch(
+            compressedData, compressedLengths, destination, destinationOffsets, out totalWritten);
+
+    /// <summary>Decoder over this table's symbols, built once and reused across pages.</summary>
+    private Clast.Fsst.Fsst16Decoder Decoder =>
+        _decoder ??= Clast.Fsst.Fsst16Decoder.FromSymbols(_lengths, _symbols);
+}

@@ -82,6 +82,24 @@ public enum ByteArrayEncoding
     /// </remarks>
     [Experimental("EWPARQUET0003")]
     Fsst,
+
+    /// <summary>
+    /// FSST_16 (encoding 11 with a 16-bit symbol table): as <see cref="Fsst"/>, but codes are
+    /// two bytes, so the table can hold up to 65,535 symbols instead of 255.
+    /// </summary>
+    /// <remarks>
+    /// <para>Which width wins is data-dependent and there is no universally right answer, so
+    /// this is an explicit choice rather than something the writer infers. The proposal's
+    /// Appendix C measures FSST_16 ahead on compression ratio, while noting FSST may still be
+    /// preferred for encode time on low-cardinality data; two bytes per code also means the
+    /// symbols have to be longer than two bytes to pay for themselves. <b>Measure on your own
+    /// data</b> — for short, name-like values the 8-bit variant is usually the better default.</para>
+    /// <para>Every caveat on <see cref="Fsst"/> applies unchanged: BYTE_ARRAY columns only, V2
+    /// data pages only, per-chunk fallback when it does not shrink the data, and a wire format
+    /// that is <b>not yet ratified</b>.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0003")]
+    Fsst16,
 }
 
 /// <summary>
