@@ -118,30 +118,6 @@ floats); UTF-8 / binary / unsigned / decimal-FLBA columns get only
 `min_value`/`max_value` (parquet-mr behavior), so a legacy signed-order
 reader can no longer mis-prune them.
 
-### Known runtime issue: FSST8 corrupts data under Clast.Fsst 0.3.0
-
-**Status:** Open — blocks this branch; needs a fixed Clast.Fsst release.
-**Affected:** `ByteArrayEncoding.Fsst` (8-bit codes) on the **write** path,
-in Parquet and Vortex. `ByteArrayEncoding.Fsst16`, FSST12, and every read
-path are unaffected.
-
-Clast.Fsst 0.3.0 — taken for its new FSST16 support — regressed the 8-bit
-compressor. Its own documented roundtrip (`FsstEncoder.Compress` followed by
-`FsstDecoder.FromSymbolTable(...).Decompress`) returns wrong bytes for most
-values, so this is upstream of anything EngineeredWood does: no remapping,
-symbol table framing, or Parquet plumbing is involved.
-
-Measured on 42 values of `record-{i}-payload-{i % 11}`: 0.2.0 roundtrips all
-42, 0.3.0 corrupts 38. The release notes' three ratio fixes ("length-2
-symbols were unreachable", "probe symbols carried a zeroed code field", the
-pair-frequency overflow) are the likely neighbourhood — all three change which
-code the compressor emits.
-
-It surfaces as 9 failing `FsstEncodingTests` and 2 failing
-`VortexFileWriterTests` — every one of them a writer-side FSST8 roundtrip.
-Reverting to 0.2.0 fixes FSST8 but removes FSST16 entirely, since 0.2.0 has no
-16-bit trainer.
-
 ### Known runtime issue: concatenated Gzip members on .NET Framework
 
 **Status:** Open — workaround in place, fix requires third-party Gzip

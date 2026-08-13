@@ -55,22 +55,19 @@ Phase 1 only (§1.4): one symbol table per column chunk, in its own page.
   is what the byte is for. Delta wins on essentially any page of short values, where four
   bytes of offset per value is a real cost.
 
-> **FSST8 writing is broken on Clast.Fsst 0.3.0.** The 0.3.0 upgrade was taken for its 16-bit
-> trainer and regressed the 8-bit compressor: its own documented roundtrip returns wrong bytes
-> for most values. `ByteArrayEncoding.Fsst` therefore corrupts data on this version, while
-> `Fsst16` and all read paths are unaffected. See
-> [`known-issues.md`](known-issues.md#known-runtime-issue-fsst8-corrupts-data-under-clastfsst-030).
-
 ## Two things that are easy to get wrong
 
 **Code order is the length information.** The symbol table body stores a `length_histogram`,
 not a per-symbol length: codes are assigned in ascending length order and the histogram is
 what lets a reader cut `symbol_data` back into symbols. Clast.Fsst (like cwida's original)
 assigns codes by training gain, in no particular length order — measured directly, a table
-trained on URLs came back with lengths `2, 2, 1, 3, 3, ...`. `FsstSymbolTable.TryTrain`
+trained on URLs came back with lengths `2, 2, 1, 3, 3, ...`. `FsstSymbolTable8.TryTrain`
 therefore counting-sorts the trained codes by length and carries a 256-entry remap that
 `Compress` applies to every emitted code. Escape markers (255) and the literal byte that
 follows them pass through untouched — the literal is a raw byte, not a code.
+
+This applies to the **8-bit** trainer only. The 16-bit one already emits codes in ascending
+length order, so `FsstSymbolTable16.TryTrain` verifies that and skips the renumbering.
 
 **Compression happens per chunk, not per page.** The symbol table cannot be trained until
 every value has been seen, so `FsstCompressedColumn.TryCompress` compresses the whole
@@ -106,7 +103,7 @@ example from §6.1/§6.2 byte for byte.
 
 Sketched while the FSST8 work was fresh and built from that sketch once
 [clast-project/fsst#1](https://github.com/clast-project/fsst/issues/1) shipped a 16-bit
-trainer in Clast.Fsst 0.3.0. The reasoning below is kept because it is what the code encodes;
+trainer in Clast.Fsst 0.3.x. The reasoning below is kept because it is what the code encodes;
 where the plan and the result differ, the difference is called out.
 
 ### The §1.2 ambiguity does not reach the wire format
@@ -195,7 +192,13 @@ Two options considered and not recommended yet:
 
 ### What Clast.Fsst provides
 
-Clast.Fsst 0.3.0 supplies `Fsst16Encoder.BuildSymbolTable(rows, maxSymbolLength)` →
+**Clast.Fsst 0.3.1 is the minimum.** 0.3.0 introduced the 16-bit trainer but shipped a broken
+8-bit compressor with it — its own documented roundtrip returned wrong bytes for most values,
+which cost 9 tests here and 2 in Vortex until 0.3.1 fixed it. FSST_16 itself was never
+affected. Note that 0.3.1's `AssemblyVersion` still reads `0.3.0.0`, so identify the binary by
+package version rather than by assembly metadata.
+
+Clast.Fsst supplies `Fsst16Encoder.BuildSymbolTable(rows, maxSymbolLength)` →
 `SymbolTable16`, `TryCompress` / `CompressBatch` / `MaxCompressedLength`, and
 `Fsst16Decoder.FromSymbols(lengths, symbols)` / `MaxDecompressedLength` /
 `TryDecompressBatch`. `ExportRaw` uses **16-byte slots**, not the 8-byte slots
@@ -203,7 +206,7 @@ Clast.Fsst 0.3.0 supplies `Fsst16Encoder.BuildSymbolTable(rows, maxSymbolLength)
 
 **The code-renumbering trap turned out not to apply.** The sketch assumed the 16-bit trainer
 would assign codes by gain, as the 8-bit one does, and that every emitted code would therefore
-need remapping through a `ushort[65536]`. It does not: 0.3.0 assigns FSST16 codes in ascending
+need remapping through a `ushort[65536]`. It does not: Clast.Fsst assigns FSST16 codes in ascending
 symbol-length order already, which is exactly what §3.3 needs. `FsstSymbolTable16.TryTrain`
 checks that the exported lengths are non-decreasing and, when they are, keeps the raw table
 untouched — no remap allocated, no code rewritten. The counting sort is still there for when
