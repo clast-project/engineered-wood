@@ -122,7 +122,7 @@ actually shrink, so enabling it cannot make a file bigger.
 > is also what the arrow-rs proof-of-concept expects to happen once ALP lands. Files
 > written here are self-consistent, but will not interoperate with an implementation that
 > settles on 10 for FSST until the spec picks a winner. Only the 8-bit code variant
-> (`SymbolTableType.FSST`) is implemented; `FSST_16` is recognized and rejected with a
+> (the spec's `FSST` symbol table type) is implemented; `FSST_16` is recognized and rejected with a
 > clear error rather than misread. See [doc/parquet-fsst.md](doc/parquet-fsst.md), which
 > also records how the arrow-rs and arrow-cpp proofs-of-concept differ from the spec.
 

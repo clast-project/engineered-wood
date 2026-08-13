@@ -30,6 +30,12 @@ internal enum FsstOffsetEncoding : byte
 /// </remarks>
 internal sealed class FsstCompressedColumn
 {
+    /// <summary>
+    /// Largest array the runtime will allocate (<c>Array.MaxLength</c>, spelled out because
+    /// netstandard2.0 does not expose it).
+    /// </summary>
+    private const long MaxArrayLength = 0x7FFFFFC7;
+
     private FsstCompressedColumn(FsstSymbolTable table, byte[] payload, int[] endOffsets)
     {
         Table = table;
@@ -60,12 +66,20 @@ internal sealed class FsstCompressedColumn
         if (table is null)
             return null;
 
-        int rawBytes = 0;
+        long rawBytes = 0;
         foreach (var value in values)
             rawBytes += value.Length;
 
-        // §5.3: worst case is every byte escaping to a two-byte sequence.
-        var payload = new byte[FsstSymbolTable.MaxCompressedLength(rawBytes)];
+        // §5.3: worst case is every byte escaping to a two-byte sequence. Accumulated and
+        // doubled in long, because an int would wrap negative somewhere past a 1 GB chunk and
+        // turn a size question into an allocation crash. A chunk whose worst case will not fit
+        // an array is simply one FSST declines — the caller already has a fallback for that,
+        // and it is the same answer as "FSST did not shrink this".
+        long worstCase = FsstSymbolTable.MaxCompressedLength(rawBytes);
+        if (worstCase > MaxArrayLength)
+            return null;
+
+        var payload = new byte[(int)worstCase];
         var endOffsets = new int[values.Length + 1];
 
         int written = 0;

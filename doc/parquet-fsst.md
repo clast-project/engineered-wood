@@ -45,8 +45,8 @@ Phase 1 only (§1.4): one symbol table per column chunk, in its own page.
 - `PageType.SymbolTablePage = 4`, `SymbolTablePageHeader { type, is_compressed }` at
   `PageHeader` field 9 (the spec does not assign a field id; 9 is the next free one).
 - `ColumnMetaData.symbol_table_page_offset` (18) and `symbol_table_page_length` (19).
-- `SymbolTableType.FSST` (8-bit codes) only. `FSST_16` is recognized and rejected with a
-  clear error rather than misread.
+- Symbol table type `FSST` (8-bit codes) only — `SymbolTableType.Fsst` in the C# enum.
+  `FSST_16` is recognized and rejected with a clear error rather than misread.
 - BYTE_ARRAY only (§1.3), V2 data pages only.
 - Both offset encodings, PLAIN and DELTA_BINARY_PACKED. The writer encodes the offset array
   both ways per page and keeps the smaller, recording the choice in the header byte — which

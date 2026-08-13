@@ -239,10 +239,14 @@ internal sealed class FsstSymbolTable
     }
 
     /// <summary>
-    /// Upper bound on the compressed size of a <paramref name="rawLength"/>-byte value:
+    /// Upper bound on the compressed size of a <paramref name="rawLength"/>-byte input:
     /// every byte escaping to a two-byte sequence (§5.3).
     /// </summary>
-    public static int MaxCompressedLength(int rawLength) => rawLength * 2;
+    /// <remarks>
+    /// Takes and returns <see cref="long"/> so the doubling cannot silently wrap for a
+    /// column chunk over 1 GB — callers bound the result before allocating.
+    /// </remarks>
+    public static long MaxCompressedLength(long rawLength) => rawLength * 2;
 
     /// <summary>
     /// Compresses one value into <paramref name="destination"/> and returns the byte count.

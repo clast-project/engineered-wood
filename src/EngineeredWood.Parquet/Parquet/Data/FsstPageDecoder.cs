@@ -32,14 +32,30 @@ internal static class FsstPageDecoder
                 "(8-bit codes) is implemented.");
 #pragma warning restore EWPARQUET0003
 
+        // A page flagged compressed under an Uncompressed codec is contradictory, but there is
+        // no codec to invoke: the bytes can only be plain, and rejecting the file would refuse
+        // one that is perfectly readable.
         if (!pageHeader.IsCompressed || columnMeta.Codec == CompressionCodec.Uncompressed)
             return FsstSymbolTable.Parse(compressedData);
 
         int size = header.UncompressedPageSize;
+        if (size < 0)
+            throw new ParquetFormatException(
+                $"Symbol table page declares a negative uncompressed_page_size ({size}).");
+
         byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Max(size, 1));
         try
         {
-            Decompressor.Decompress(columnMeta.Codec, compressedData, buffer);
+            // The written count is checked rather than assumed: a pooled buffer arrives holding
+            // whatever the last renter left in it, so slicing to the DECLARED size after a short
+            // decompression would feed Parse stale bytes — which it could conceivably validate
+            // as a well-formed table. That is the silent-wrong-data case §3.7 exists to stop.
+            int written = Decompressor.Decompress(columnMeta.Codec, compressedData, buffer);
+            if (written != size)
+                throw new ParquetFormatException(
+                    $"Symbol table page declares uncompressed_page_size {size} but decompressed " +
+                    $"to {written} bytes.");
+
             return FsstSymbolTable.Parse(buffer.AsSpan(0, size));
         }
         finally

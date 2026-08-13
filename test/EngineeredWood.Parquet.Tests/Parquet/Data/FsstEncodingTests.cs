@@ -124,6 +124,75 @@ public class FsstEncodingTests : IDisposable
         Assert.Equal(body, reparsed.Serialize());
     }
 
+    private static PageHeader SymbolTablePageHeaderFor(int uncompressedSize, int compressedSize) =>
+        new()
+        {
+            Type = PageType.SymbolTablePage,
+            UncompressedPageSize = uncompressedSize,
+            CompressedPageSize = compressedSize,
+            SymbolTablePageHeader = new SymbolTablePageHeader
+            {
+                Type = SymbolTableType.Fsst,
+                IsCompressed = true,
+            },
+        };
+
+    [Fact]
+    public void SymbolTablePage_RejectsBodyThatDecompressesToTheWrongSize()
+    {
+        // A pooled decompression buffer arrives holding the previous renter's bytes, so a page
+        // that decompresses short must be rejected rather than sliced to its declared size —
+        // otherwise Parse would be handed stale bytes it might well validate.
+        byte[] body = SpecExampleSymbolTableBody();
+        var compressed = new byte[Compressor.GetMaxCompressedLength(CompressionCodec.Snappy, body.Length)];
+        int compressedLen = Compressor.Compress(CompressionCodec.Snappy, body, compressed, null, null);
+
+        var columnMeta = ByteArrayColumnMeta(CompressionCodec.Snappy);
+        var header = SymbolTablePageHeaderFor(body.Length + 40, compressedLen); // lies about the size
+
+        var ex = Assert.Throws<ParquetFormatException>(() =>
+            FsstPageDecoder.ReadSymbolTablePage(
+                header, compressed.AsSpan(0, compressedLen), columnMeta));
+        Assert.Contains("decompressed to", ex.Message);
+    }
+
+    [Fact]
+    public void SymbolTablePage_RejectsNegativeUncompressedSize()
+    {
+        var columnMeta = ByteArrayColumnMeta(CompressionCodec.Snappy);
+        var header = SymbolTablePageHeaderFor(-1, 4);
+
+        var ex = Assert.Throws<ParquetFormatException>(() =>
+            FsstPageDecoder.ReadSymbolTablePage(header, new byte[4], columnMeta));
+        Assert.Contains("negative", ex.Message);
+    }
+
+    [Fact]
+    public void SymbolTablePage_CompressedFlagUnderUncompressedCodec_ReadsAsPlain()
+    {
+        // Contradictory, but there is no codec to invoke — the bytes can only be plain, and
+        // refusing the file would reject one that is perfectly readable.
+        byte[] body = SpecExampleSymbolTableBody();
+        var columnMeta = ByteArrayColumnMeta(CompressionCodec.Uncompressed);
+        var header = SymbolTablePageHeaderFor(body.Length, body.Length);
+
+        var table = FsstPageDecoder.ReadSymbolTablePage(header, body, columnMeta);
+        Assert.Equal(6, table.SymbolCount);
+    }
+
+    private static EngineeredWood.Parquet.Metadata.ColumnMetaData ByteArrayColumnMeta(
+        CompressionCodec codec) =>
+        new()
+        {
+            Type = PhysicalType.ByteArray,
+            Encodings = [Encoding.Fsst],
+            Codec = codec,
+            NumValues = 0,
+            TotalUncompressedSize = 0,
+            TotalCompressedSize = 0,
+            DataPageOffset = 0,
+        };
+
     // ───── Data page body (§4.3) ─────
 
     private static string[] DecodePage(ReadOnlySpan<byte> page, FsstSymbolTable table, int count)
