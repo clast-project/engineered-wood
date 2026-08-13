@@ -25,18 +25,11 @@ internal static class FsstPageDecoder
             ?? throw new ParquetFormatException(
                 "Symbol table page is missing its symbol_table_page_header.");
 
-#pragma warning disable EWPARQUET0003 // Reading a page another writer produced is not an opt-in to writing one.
-        if (pageHeader.Type != SymbolTableType.Fsst)
-            throw new NotSupportedException(
-                $"Symbol table type '{pageHeader.Type}' is not supported; only FSST " +
-                "(8-bit codes) is implemented.");
-#pragma warning restore EWPARQUET0003
-
         // A page flagged compressed under an Uncompressed codec is contradictory, but there is
         // no codec to invoke: the bytes can only be plain, and rejecting the file would refuse
         // one that is perfectly readable.
         if (!pageHeader.IsCompressed || columnMeta.Codec == CompressionCodec.Uncompressed)
-            return FsstSymbolTable.Parse(compressedData);
+            return FsstSymbolTable.Parse(pageHeader.Type, compressedData);
 
         int size = header.UncompressedPageSize;
         if (size < 0)
@@ -56,7 +49,7 @@ internal static class FsstPageDecoder
                     $"Symbol table page declares uncompressed_page_size {size} but decompressed " +
                     $"to {written} bytes.");
 
-            return FsstSymbolTable.Parse(buffer.AsSpan(0, size));
+            return FsstSymbolTable.Parse(pageHeader.Type, buffer.AsSpan(0, size));
         }
         finally
         {
@@ -177,10 +170,10 @@ internal static class FsstPageDecoder
                 previous = end;
             }
 
-            int capacity = Clast.Fsst.FsstDecoder.MaxDecompressedLength(compressedTotal);
+            int capacity = table.MaxDecompressedLength(compressedTotal);
             decompressed = ArrayPool<byte>.Shared.Rent(Math.Max(capacity, 1));
 
-            if (!table.Decoder.TryDecompressBatch(
+            if (!table.TryDecompressBatch(
                     dataSection.Slice(0, compressedTotal), lengths.AsSpan(0, count),
                     decompressed, valueOffsets.AsSpan(0, count + 1), out int totalWritten))
                 throw new ParquetFormatException(

@@ -55,7 +55,7 @@ public class FsstEncodingTests : IDisposable
         // §3.5: 1 (symbol_count) + 8 (length_histogram) + 40 (symbol_data) = 49.
         Assert.Equal(49, body.Length);
 
-        var table = FsstSymbolTable.Parse(body);
+        var table = FsstSymbolTable8.Parse(body);
 
         Assert.Equal(6, table.SymbolCount);
         Assert.Equal(body.Length, table.SerializedSize);
@@ -68,7 +68,7 @@ public class FsstEncodingTests : IDisposable
         byte[] body = SpecExampleSymbolTableBody();
         body[0] = 5; // histogram still sums to 6
 
-        var ex = Assert.Throws<ParquetFormatException>(() => FsstSymbolTable.Parse(body));
+        var ex = Assert.Throws<ParquetFormatException>(() => FsstSymbolTable8.Parse(body));
         Assert.Contains("length_histogram", ex.Message);
     }
 
@@ -78,7 +78,7 @@ public class FsstEncodingTests : IDisposable
         byte[] body = SpecExampleSymbolTableBody();
         byte[] truncated = body.AsSpan(0, body.Length - 1).ToArray();
 
-        var ex = Assert.Throws<ParquetFormatException>(() => FsstSymbolTable.Parse(truncated));
+        var ex = Assert.Throws<ParquetFormatException>(() => FsstSymbolTable8.Parse(truncated));
         Assert.Contains("histogram describes", ex.Message);
     }
 
@@ -86,14 +86,14 @@ public class FsstEncodingTests : IDisposable
     public void SymbolTable_Parse_RejectsBodyTooSmallForHeader()
     {
         var ex = Assert.Throws<ParquetFormatException>(
-            () => FsstSymbolTable.Parse(new byte[4]));
+            () => FsstSymbolTable8.Parse(new byte[4]));
         Assert.Contains("too small", ex.Message);
     }
 
     [Fact]
     public void SymbolTable_Parse_AcceptsEmptyTable()
     {
-        var table = FsstSymbolTable.Parse(new byte[9]);
+        var table = FsstSymbolTable8.Parse(new byte[9]);
         Assert.Equal(0, table.SymbolCount);
     }
 
@@ -106,7 +106,7 @@ public class FsstEncodingTests : IDisposable
         for (int i = 0; i < values.Length; i++)
             values[i] = System.Text.Encoding.UTF8.GetBytes($"https://example.com/catalog/item/{i}?ref=search");
 
-        var table = FsstSymbolTable.TryTrain(values);
+        var table = FsstSymbolTable8.TryTrain(values);
         Assert.NotNull(table);
 
         // Re-reading the serialized form recovers the lengths, which must be non-decreasing.
@@ -119,7 +119,7 @@ public class FsstEncodingTests : IDisposable
         Assert.Equal(table.SymbolCount, histogramSum);
 
         // Parse validates the histogram against symbol_data, so a wrong order would not survive.
-        var reparsed = FsstSymbolTable.Parse(body);
+        var reparsed = FsstSymbolTable8.Parse(body);
         Assert.Equal(table.SymbolCount, reparsed.SymbolCount);
         Assert.Equal(body, reparsed.Serialize());
     }
@@ -217,7 +217,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_SpecExample_DecodesToTheDocumentedValues()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
 
         byte[] page =
         [
@@ -252,7 +252,7 @@ public class FsstEncodingTests : IDisposable
         for (int i = 0; i < values.Length; i++)
             values[i] = System.Text.Encoding.UTF8.GetBytes($"user-{i}@example.com/session/{i % 13}");
 
-        var column = FsstCompressedColumn.TryCompress(values);
+        var column = FsstCompressedColumn.TryCompress(values, SymbolTableType.Fsst);
         Assert.NotNull(column);
 
         byte[] page = FsstPageEncoder.Encode(column!, valueIndex: 0, count: values.Length);
@@ -269,7 +269,7 @@ public class FsstEncodingTests : IDisposable
         for (int i = 0; i < values.Length; i++)
             values[i] = System.Text.Encoding.UTF8.GetBytes($"https://cdn.example.net/assets/{i}.png");
 
-        var column = FsstCompressedColumn.TryCompress(values);
+        var column = FsstCompressedColumn.TryCompress(values, SymbolTableType.Fsst);
         Assert.NotNull(column);
 
         // A page in the middle: offsets must be rebased onto the page's own data section.
@@ -289,7 +289,7 @@ public class FsstEncodingTests : IDisposable
                 ? []
                 : System.Text.Encoding.UTF8.GetBytes($"repeating-payload-value-{i % 7}");
 
-        var column = FsstCompressedColumn.TryCompress(values);
+        var column = FsstCompressedColumn.TryCompress(values, SymbolTableType.Fsst);
         Assert.NotNull(column);
 
         byte[] page = FsstPageEncoder.Encode(column!, 0, values.Length);
@@ -302,7 +302,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_RejectsUnknownOffsetEncoding()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
         byte[] page = [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
         var ex = Assert.Throws<ParquetFormatException>(() => DecodePage(page, table, 0));
@@ -312,7 +312,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_RejectsNumValuesThatDisagreeWithThePage()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
         byte[] page = [0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
         var ex = Assert.Throws<ParquetFormatException>(() => DecodePage(page, table, 4));
@@ -322,7 +322,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_RejectsNonMonotonicOffsets()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
         byte[] page =
         [
             0x00,
@@ -340,7 +340,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_RejectsOffsetPastTheDataSection()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
         byte[] page =
         [
             0x00,
@@ -359,7 +359,7 @@ public class FsstEncodingTests : IDisposable
     {
         // §5.2: a trailing escape has no literal to escape, and must not be allowed to borrow
         // the following value's first byte.
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody());
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody());
         byte[] page =
         [
             0x00,
@@ -378,7 +378,7 @@ public class FsstEncodingTests : IDisposable
     [Fact]
     public void DataPage_RejectsCodeWithNoSymbol()
     {
-        var table = FsstSymbolTable.Parse(SpecExampleSymbolTableBody()); // 6 symbols: codes 0-5
+        var table = FsstSymbolTable8.Parse(SpecExampleSymbolTableBody()); // 6 symbols: codes 0-5
         byte[] page =
         [
             0x00,

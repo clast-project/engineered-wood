@@ -63,9 +63,9 @@ public enum Encoding
 /// Type of a symbol table carried by a <see cref="PageType.SymbolTablePage"/>.
 /// </summary>
 /// <remarks>
-/// From the FSST proposal's <c>SymbolTableType</c> enum. Only <see cref="Fsst"/>
-/// (8-bit codes) is implemented; <see cref="Fsst16"/> is recognized on read so that
-/// a file using it produces a clear diagnostic rather than silent corruption.
+/// From the FSST proposal's <c>SymbolTableType</c> enum. Both widths are read and written.
+/// The data pages are identical either way — the type recorded here is what tells a reader
+/// how wide the codes in them are (§2.3).
 /// </remarks>
 [Experimental("EWPARQUET0003")]
 public enum SymbolTableType
@@ -73,7 +73,7 @@ public enum SymbolTableType
     /// <summary>8-bit codes: 0-254 are symbols, 255 is the escape marker.</summary>
     Fsst = 0,
 
-    /// <summary>16-bit codes: 0-65534 are symbols, 65535 is the escape marker. Not implemented.</summary>
+    /// <summary>16-bit codes: 0-65534 are symbols, 65535 is the escape marker.</summary>
     Fsst16 = 1,
 }
 
