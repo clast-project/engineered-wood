@@ -106,10 +106,16 @@ Sketched while the FSST8 work was fresh and built from that sketch once
 trainer in Clast.Fsst 0.3.x. The reasoning below is kept because it is what the code encodes;
 where the plan and the result differ, the difference is called out.
 
-### The §1.2 ambiguity does not reach the wire format
+### The §1.2 ambiguity — resolved, and it never reached the wire format
 
-This is the finding that de-risks the whole thing, and it is worth checking before treating
-the spec contradiction as a blocker on *implementation* rather than on *emission policy*.
+**Resolved 2026-08-13: the spec author clarified §1.2 to say that when the type is FSST_16,
+codes are `uint16` and symbols may be 1–16 bytes, and §3.3's table now spells out
+`length_histogram` as a `uint16[16]` of size 32.** So §1.2's "1 to 8 bytes" was FSST8 prose,
+as suspected, and 16 wins. The clarification confirms this implementation's *reader* exactly —
+the 34-byte body header and the 16 honoured histogram slots were already written that way — and
+required no change to it.
+
+What follows is why that resolution moved nothing, and why the writer still caps at 8.
 
 §3.3 gives FSST_16 a `uint16[16]` histogram at offset 2 and `symbol_data` at offset 34,
 **unconditionally**. It does not shrink when symbols happen to be short. So if §1.2 wins and
@@ -121,12 +127,42 @@ Consequence: **`Serialize`, `Parse` and every validation rule are identical unde
 reading.** The only thing that changes is the cap handed to the trainer. So the Parquet side
 can be built in full before the spec answers, and the answer later moves one argument.
 
-That is what happened. `FsstSymbolTable16.TrainedMaxSymbolLength` is **8** — the value legal
-under *both* readings, since a table of short symbols is just one whose histogram entries for
-lengths 9–16 are zero. Reading stays liberal and honours all 16 slots regardless. If the spec
-settles on 16, that one constant changes and nothing else does;
-`SymbolTable_Train_EmitsNoSymbolLongerThanTheTrainedCap` is the test that should be revisited
-with it.
+That is what happened, and it is why the resolution cost nothing: no serialized byte, no
+validation rule, and no already-written file changed meaning when 16 won.
+
+### Why the writer still caps at 8
+
+`FsstSymbolTable16.TrainedMaxSymbolLength` is **8**. That was originally the cautious choice —
+the length legal under either reading of the contradiction — but the spec has since resolved to
+16, so caution is no longer the reason. It stays at 8 on measurement.
+
+Crucially, the clarified §1.2 says symbols *may* be 1–16, not that they must be: a table whose
+histogram entries for lengths 9–16 are zero is an ordinary, conformant FSST_16 table (which is
+what `SymbolTable_ShortSymbolsOnly_LeavesUpperHistogramSlotsZero` pins). So the cap is a tuning
+knob, not a conformance question.
+
+And raising it is **not** a free win. Compression ratio against the cap, measured over 4,000
+values per corpus with the symbol table body counted in:
+
+| corpus | cap 7 | cap 8 | cap 12 | cap 14 | cap 15 | cap 16 |
+|---|---|---|---|---|---|---|
+| URLs | 2.70x | 1.88x | 2.91x | **3.54x** | 2.01x | 1.41x |
+| CDN URLs | 2.02x | 2.02x | 2.02x | 1.72x | 1.96x | **2.28x** |
+| file paths | 2.05x | 2.47x | 2.19x | 2.02x | 2.18x | **2.54x** |
+| UUIDs | — | 2.46x | 2.46x | — | — | **3.26x** |
+| log lines | — | 2.09x | 2.09x | — | — | **2.35x** |
+
+Two things to take from this. First, the best cap is corpus-dependent, so no single value is
+right — 16 would cost the flagship URL case 60% against its best, and land *below* cap 8.
+Second, and more importantly, **the response to the cap is erratic rather than monotone**: on
+the URL corpus it swings 3.54x → 2.01x → 1.41x across caps 14, 15 and 16 on identical data, at
+an essentially unchanged symbol count. A greedy trainer given a larger search space should not
+lose 60% by being allowed *longer* symbols — it can always pick shorter ones — so this looks
+like cap sensitivity in Clast.Fsst's FSST16 trainer rather than a property of FSST itself.
+
+Until that is understood, 8 is the stable, conservative choice, and tuning the cap here would
+be overfitting to whichever corpus was measured last. **Do not raise this constant on the
+strength of the spec resolution alone** — the spec permits 16, it does not recommend it.
 
 ### What is shared, and what forks
 

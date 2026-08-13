@@ -156,9 +156,11 @@ public class Fsst16EncodingTests : IDisposable
     }
 
     /// <summary>
-    /// The writer emits nothing longer than 8 bytes, which is legal under both readings of the
-    /// spec's contradictory symbol-length limit. If §1.2 turns out to be stale prose and the
-    /// cap becomes 16, this assertion is the one that should be revisited.
+    /// The writer emits nothing longer than 8 bytes. The spec permits up to 16 — §1.2 has since
+    /// been clarified to say FSST_16 symbols may be 1–16 — but permits is not requires, and a
+    /// table with zeros in the length-9..16 slots is an ordinary FSST_16 table. The cap is a
+    /// measured tuning choice (see <c>TrainedMaxSymbolLength</c>), so this pins the choice, not
+    /// a conformance limit.
     /// </summary>
     [Fact]
     public void SymbolTable_Train_EmitsNoSymbolLongerThanTheTrainedCap()
