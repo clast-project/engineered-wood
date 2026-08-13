@@ -115,3 +115,100 @@ example from §6.1/§6.2 byte for byte.
 - FIXED_LEN_BYTE_ARRAY. §1.3 is BYTE_ARRAY only; the doc's comment thread floats FLBA for
   UUIDs as possible future work.
 - Composite dictionary + FSST (§9.2), which the spec itself says needs a further spec change.
+
+## Design sketch: adding FSST_16
+
+Written while the FSST8 work was fresh, so that picking this up later starts from a plan
+rather than from research. Blocked on [clast-project/fsst#1](https://github.com/clast-project/fsst/issues/1).
+
+### The §1.2 ambiguity does not reach the wire format
+
+This is the finding that de-risks the whole thing, and it is worth checking before treating
+the spec contradiction as a blocker on *implementation* rather than on *emission policy*.
+
+§3.3 gives FSST_16 a `uint16[16]` histogram at offset 2 and `symbol_data` at offset 34,
+**unconditionally**. It does not shrink when symbols happen to be short. So if §1.2 wins and
+a writer may only emit symbols of 1–8 bytes, the result is simply a table whose histogram
+entries for lengths 9–16 are zero — a legal, ordinary FSST_16 table. §3.6's reconstruction
+loop runs `L in 1..16` and does nothing for the empty slots.
+
+Consequence: **`Serialize`, `Parse` and every validation rule are identical under either
+reading.** The only thing that changes is the cap handed to the trainer. So the Parquet side
+can be built in full before the spec answers, and the answer later moves one argument.
+
+The reader should be liberal regardless — honour all 16 histogram slots, whatever we write.
+
+### What is shared, and what forks
+
+The page body is **not** parameterised by symbol table type. §4.3's section list, §4.4's
+9-byte header and §4.5's end-offset array are the same bytes for FSST and FSST_16; only the
+interpretation of the data section changes. So:
+
+| Component | FSST_16 impact |
+|---|---|
+| `FsstPageEncoder` header + offset array | **unchanged** — shared verbatim |
+| `FsstPageDecoder` header + offset parsing + monotonicity checks | **unchanged** |
+| Symbol table body serialize/parse | forks on field widths (u16 count, `uint16[16]` histogram, offset 34) |
+| Code stream compress/decompress/validate | forks (LE u16 codes, escape 65,535 + one u16 literal in 0–255) |
+| `ColumnChunkWriter` / `ColumnChunkReader` plumbing | **unchanged**, if the table type is abstracted — see below |
+
+Suggested shape: make `FsstSymbolTable` an abstract base with `FsstSymbolTable8` and
+`FsstSymbolTable16` subclasses, rather than a type-tagged class with internal branching.
+The reader already threads one nullable `FsstSymbolTable?` through seven signatures
+(`ReadDataPageV1/V2`, the two `*FromEntry` variants, the two `TryReadFixedListPage*`
+probes, and `DecodeValues`) plus `ColumnPageMap`; a base class keeps every one of those
+untouched. The virtual call lands once per page, not per value, so it is not on a hot path.
+
+Numbers that differ: worst-case *compression* expansion is 4x rather than 2x (§5.3 — a byte
+that escapes costs a 2-byte marker plus a 2-byte literal), so the `MaxCompressedLength`
+bound and the `MaxArrayLength` guard in `FsstCompressedColumn.TryCompress` need the 4x
+figure. The *decompression* bound stays 8x either way: FSST8 is one byte per code expanding
+to at most 8, FSST_16 is two bytes per code expanding to at most 16.
+
+### How does a writer choose 8-bit or 16-bit?
+
+A question FSST8 did not raise, and the one real design decision here. Appendix C says
+FSST16 wins on compression ratio, while note 1 says FSST8 may still be preferred for encode
+time on low-cardinality data — so there is no universally right answer.
+
+Recommendation: **ship an explicit `ByteArrayEncoding.Fsst16` member first, and no policy.**
+That mirrors how `Fsst` shipped, and it inherits the per-column override machinery
+(`GetByteArrayEncoding`) for free. Deciding automatically before there is data on this
+codebase's own workloads would be guessing in the writer.
+
+Two options considered and not recommended yet:
+
+- *Train both and keep the smaller.* This is what the per-page offset-encoding choice does,
+  but the cost is not comparable: offsets are re-encoded, whereas this means training a
+  second symbol table and compressing the entire chunk again. Training is the expensive
+  half of the writer's byte-array work.
+- *Escape density heuristic.* Cheaper and worth revisiting: the chunk is already fully
+  compressed with the 8-bit table before any page is written, so the fraction of emitted
+  codes that are escapes is free to measure. A high escape rate with a saturated 255-symbol
+  table is exactly the signal that a wider code space would pay, and only then is a retrain
+  at 16 worth attempting. Needs a threshold picked from measurement, not from intuition.
+
+### What Clast.Fsst has to provide
+
+Per the issue: `Fsst16Encoder.BuildSymbolTable(rows, zeroTerminated, maxSymbolLength)` →
+`SymbolTable16`, plus `TryCompress` / `CompressBatch` / `MaxCompressedLength`, and
+`Fsst16Decoder.FromSymbols(lengths, symbols)` / `MaxDecompressedLength` /
+`TryDecompressBatch`. `ExportRaw` needs **16-byte slots**, not the 8-byte slots the
+existing `SymbolTable.ExportRaw` uses.
+
+The code-renumbering trap applies unchanged and is the thing most likely to be forgotten:
+whatever order the 16-bit trainer assigns codes in, they must be counting-sorted into
+ascending length order and every emitted code remapped, because the histogram *is* the
+length information. The remap table becomes `ushort[65536]`.
+
+### Tests
+
+Mirror the FSST8 set, with one honest gap to call out: **§6's worked examples are FSST8
+only.** There is no FSST_16 example to decode, so the test that currently pins the
+implementation to the specification rather than to its own encoder has no counterpart. A
+hand-built FSST_16 page derived from §3.3 and §4.7 is still worth having, but it must be
+commented as *derived from the rules*, not quoted from the document — otherwise it reads
+like external corroboration when it is not.
+
+Also worth an explicit test: an FSST_16 table containing only short symbols, serialized and
+reparsed, to pin the "histogram entries 9–16 are zero and that is legal" property above.
