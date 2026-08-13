@@ -35,6 +35,9 @@ internal sealed class ColumnPageMap
     /// <summary>Decoded dictionary, or null if the column is not dictionary-encoded.</summary>
     public DictionaryDecoder? Dictionary { get; }
 
+    /// <summary>Decoded FSST symbol table, or null if the column is not FSST-encoded.</summary>
+    public FsstSymbolTable? SymbolTable { get; }
+
     /// <summary>Data pages in file order (dictionary page excluded).</summary>
     public PageMapEntry[] Pages { get; }
 
@@ -56,12 +59,14 @@ internal sealed class ColumnPageMap
 
     public ColumnPageMap(
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         PageMapEntry[] pages,
         int[] cumulativeRows,
         int[] cumulativeValues,
         int totalRows)
     {
         Dictionary = dictionary;
+        SymbolTable = symbolTable;
         Pages = pages;
         CumulativeRows = cumulativeRows;
         CumulativeValues = cumulativeValues;
@@ -108,6 +113,7 @@ internal static class PageMapBuilder
     {
         var pages = new List<PageMapEntry>();
         DictionaryDecoder? dictionary = null;
+        FsstSymbolTable? symbolTable = null;
 
         int pos = 0;
         long valuesRead = 0;
@@ -137,6 +143,10 @@ internal static class PageMapBuilder
             {
                 case PageType.DictionaryPage:
                     dictionary = DecodeDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    break;
+
+                case PageType.SymbolTablePage:
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
                     break;
 
                 case PageType.DataPage:
@@ -210,7 +220,8 @@ internal static class PageMapBuilder
         cumulativeRows[pagesArray.Length] = totalRows;
         cumulativeValues[pagesArray.Length] = totalValues;
 
-        return new ColumnPageMap(dictionary, pagesArray, cumulativeRows, cumulativeValues, totalRows);
+        return new ColumnPageMap(
+            dictionary, symbolTable, pagesArray, cumulativeRows, cumulativeValues, totalRows);
     }
 
     /// <summary>

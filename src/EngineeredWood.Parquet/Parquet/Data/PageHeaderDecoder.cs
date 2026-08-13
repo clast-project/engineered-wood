@@ -27,6 +27,7 @@ internal static class PageHeaderDecoder
         DataPageHeader? dataPageHeader = null;
         DictionaryPageHeader? dictionaryPageHeader = null;
         DataPageHeaderV2? dataPageHeaderV2 = null;
+        SymbolTablePageHeader? symbolTablePageHeader = null;
 
         reader.PushStruct();
         while (true)
@@ -61,6 +62,9 @@ internal static class PageHeaderDecoder
                 case 8: // data_page_header_v2
                     dataPageHeaderV2 = ReadDataPageHeaderV2(ref reader);
                     break;
+                case 9 when fieldType == ThriftType.Struct: // symbol_table_page_header (FSST proposal)
+                    symbolTablePageHeader = ReadSymbolTablePageHeader(ref reader);
+                    break;
                 default:
                     reader.Skip(fieldType);
                     break;
@@ -82,6 +86,45 @@ internal static class PageHeaderDecoder
             DataPageHeader = dataPageHeader,
             DictionaryPageHeader = dictionaryPageHeader,
             DataPageHeaderV2 = dataPageHeaderV2,
+            SymbolTablePageHeader = symbolTablePageHeader,
+        };
+    }
+
+    private static SymbolTablePageHeader ReadSymbolTablePageHeader(ref ThriftCompactReader reader)
+    {
+#pragma warning disable EWPARQUET0003 // Reading a page another writer produced is not an opt-in to writing one.
+        SymbolTableType type = SymbolTableType.Fsst;
+#pragma warning restore EWPARQUET0003
+        bool isCompressed = false;
+
+        reader.PushStruct();
+        while (true)
+        {
+            var (fieldType, fieldId) = reader.ReadFieldHeader();
+            if (fieldType == ThriftType.Stop)
+                break;
+
+            switch (fieldId)
+            {
+                case 1: // type
+#pragma warning disable EWPARQUET0003
+                    type = (SymbolTableType)reader.ReadZigZagInt32();
+#pragma warning restore EWPARQUET0003
+                    break;
+                case 2: // is_compressed
+                    isCompressed = reader.ReadBool();
+                    break;
+                default:
+                    reader.Skip(fieldType);
+                    break;
+            }
+        }
+        reader.PopStruct();
+
+        return new SymbolTablePageHeader
+        {
+            Type = type,
+            IsCompressed = isCompressed,
         };
     }
 

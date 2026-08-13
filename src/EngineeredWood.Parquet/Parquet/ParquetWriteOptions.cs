@@ -65,6 +65,23 @@ public enum ByteArrayEncoding
     /// Most effective for sorted or prefix-heavy data (URLs, file paths, dictionary-like keys).
     /// </summary>
     DeltaByteArray,
+
+    /// <summary>
+    /// FSST (encoding 11): trains a per-column-chunk symbol table that maps frequent 1-8 byte
+    /// substrings to single-byte codes, then stores each value as a sequence of codes. Strong
+    /// for high-cardinality machine-generated text — URLs, UUIDs, log lines, identifiers —
+    /// where a dictionary cannot help but the values still share substrings.
+    /// </summary>
+    /// <remarks>
+    /// <para>BYTE_ARRAY columns only; a FIXED_LEN_BYTE_ARRAY column falls back to its usual
+    /// encoding. The writer also falls back per column chunk when FSST does not actually
+    /// shrink the data, so this setting cannot make a file bigger.</para>
+    /// <para>New in parquet-format and <b>not yet ratified</b>; older readers cannot decode it,
+    /// and this library writes the encoding as 11 rather than the proposal's 10 — see
+    /// <see cref="Encoding.Fsst"/>.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0003")]
+    Fsst,
 }
 
 /// <summary>

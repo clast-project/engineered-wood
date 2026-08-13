@@ -74,6 +74,7 @@ internal static class ColumnChunkReader
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
             byteArrayOutput);
         DictionaryDecoder? dictionary = null;
+        FsstSymbolTable? symbolTable = null;
 
         int pos = 0;
         long valuesRead = 0;
@@ -117,14 +118,18 @@ internal static class ColumnChunkReader
                     dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
+                case PageType.SymbolTablePage:
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                    break;
+
                 case PageType.DataPage:
                     valuesRead += ReadDataPageV1(
-                        pageHeader, pageData, column, columnMeta, dictionary, state);
+                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
                     break;
 
                 case PageType.DataPageV2:
                     valuesRead += ReadDataPageV2(
-                        pageHeader, pageData, column, columnMeta, dictionary, state);
+                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
                     break;
 
                 default:
@@ -217,6 +222,7 @@ internal static class ColumnChunkReader
             column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput);
 
         DictionaryDecoder? dictionary = null;
+        FsstSymbolTable? symbolTable = null;
         int listLength = 0;
         int pos = 0;
         long valuesRead = 0;
@@ -251,9 +257,13 @@ internal static class ColumnChunkReader
                     dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
+                case PageType.SymbolTablePage:
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                    break;
+
                 case PageType.DataPage:
                     if (!TryReadFixedListPageV1(
-                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
                             ref listLength, valuesRead))
                         return null;
                     valuesRead += pageHeader.DataPageHeader!.NumValues;
@@ -261,7 +271,7 @@ internal static class ColumnChunkReader
 
                 case PageType.DataPageV2:
                     if (!TryReadFixedListPageV2(
-                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
                             ref listLength, valuesRead))
                         return null;
                     valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
@@ -290,6 +300,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state,
         ref int listLength,
         long startIndex)
@@ -332,7 +343,7 @@ internal static class ColumnChunkReader
                 return false;
 
             var valueData = pageData.Slice(afterRep + afterDef);
-            DecodeValues(valueData, dataHeader.Encoding, column, dictionary, numValues, state);
+            DecodeValues(valueData, dataHeader.Encoding, column, dictionary, symbolTable, numValues, state);
             return true;
         }
         finally
@@ -348,6 +359,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state,
         ref int listLength,
         long startIndex)
@@ -387,7 +399,7 @@ internal static class ColumnChunkReader
 
         try
         {
-            DecodeValues(valueData, v2Header.Encoding, column, dictionary, numValues, state);
+            DecodeValues(valueData, v2Header.Encoding, column, dictionary, symbolTable, numValues, state);
             return true;
         }
         finally
@@ -470,11 +482,11 @@ internal static class ColumnChunkReader
 
             if (entry.Type == PageType.DataPage)
             {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
             else if (entry.Type == PageType.DataPageV2)
             {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
         }
 
@@ -552,11 +564,11 @@ internal static class ColumnChunkReader
 
             if (entry.Type == PageType.DataPage)
             {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
             else if (entry.Type == PageType.DataPageV2)
             {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
         }
 
@@ -600,6 +612,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         int numValues = entry.NumValues;
@@ -643,7 +656,7 @@ internal static class ColumnChunkReader
             }
 
             var valueData = pageData.Slice(offset);
-            DecodeValues(valueData, entry.Encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, entry.Encoding, column, dictionary, symbolTable, nonNullCount, state);
         }
         finally
         {
@@ -661,6 +674,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         int numValues = entry.NumValues;
@@ -726,7 +740,7 @@ internal static class ColumnChunkReader
 
         try
         {
-            DecodeValues(valueData, entry.Encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, entry.Encoding, column, dictionary, symbolTable, nonNullCount, state);
         }
         finally
         {
@@ -778,6 +792,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         var dataHeader = header.DataPageHeader
@@ -830,7 +845,7 @@ internal static class ColumnChunkReader
             // Decode values
             var valueData = pageData.Slice(offset);
             var encoding = dataHeader.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -847,6 +862,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         var v2Header = header.DataPageHeaderV2
@@ -921,7 +937,7 @@ internal static class ColumnChunkReader
         try
         {
             var encoding = v2Header.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -937,6 +953,7 @@ internal static class ColumnChunkReader
         Encoding encoding,
         ColumnDescriptor column,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         int nonNullCount,
         ColumnBuildState state)
     {
@@ -976,6 +993,20 @@ internal static class ColumnChunkReader
             DecodeAlpValues(data, column, nonNullCount, state);
         }
 #pragma warning restore EWPARQUET0001
+#pragma warning disable EWPARQUET0003 // The reader must accept FSST-encoded pages produced by other writers regardless of our experimental marking.
+        else if (encoding == Encoding.Fsst)
+        {
+            if (column.PhysicalType != PhysicalType.ByteArray)
+                throw new NotSupportedException(
+                    $"Physical type '{column.PhysicalType}' is not supported for FSST decoding.");
+            if (symbolTable == null)
+                throw new ParquetFormatException(
+                    $"FSST-encoded data page but no symbol table page found for column " +
+                    $"'{column.DottedPath}'.");
+
+            FsstPageDecoder.Decode(data, symbolTable, nonNullCount, state);
+        }
+#pragma warning restore EWPARQUET0003
         else if (encoding == Encoding.Rle)
         {
             DecodeRleBooleanValues(data, column, nonNullCount, state);

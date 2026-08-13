@@ -497,6 +497,20 @@ internal static class MetadataEncoder
             writer.WriteZigZagInt32(meta.BloomFilterLength.Value);
         }
 
+        // Field 18: symbol_table_page_offset (optional, i64, FSST proposal)
+        if (meta.SymbolTablePageOffset.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I64, 18);
+            writer.WriteZigZagInt64(meta.SymbolTablePageOffset.Value);
+        }
+
+        // Field 19: symbol_table_page_length (optional, i32, FSST proposal)
+        if (meta.SymbolTablePageLength.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I32, 19);
+            writer.WriteZigZagInt32(meta.SymbolTablePageLength.Value);
+        }
+
         writer.WriteStructStop();
         writer.PopStruct();
     }
@@ -679,6 +693,29 @@ internal static class MetadataEncoder
             writer.WriteFieldHeader(ThriftType.Struct, 8);
             WriteDataPageHeaderV2(writer, header.DataPageHeaderV2);
         }
+
+        // Field 9: symbol_table_page_header (optional, FSST proposal)
+        if (header.SymbolTablePageHeader != null)
+        {
+            writer.WriteFieldHeader(ThriftType.Struct, 9);
+            WriteSymbolTablePageHeader(writer, header.SymbolTablePageHeader);
+        }
+
+        writer.WriteStructStop();
+        writer.PopStruct();
+    }
+
+    private static void WriteSymbolTablePageHeader(
+        ThriftCompactWriter writer, Data.SymbolTablePageHeader header)
+    {
+        writer.PushStruct();
+
+        // Field 1: type (SymbolTableType as i32)
+        writer.WriteFieldHeader(ThriftType.I32, 1);
+        writer.WriteZigZagInt32((int)header.Type);
+
+        // Field 2: is_compressed (bool)
+        writer.WriteBoolField(2, header.IsCompressed);
 
         writer.WriteStructStop();
         writer.PopStruct();

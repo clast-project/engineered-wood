@@ -719,9 +719,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 ?? throw new ParquetFormatException(
                     $"Column chunk {i} has no inline metadata.");
 
+            // The chunk starts at whichever side-table page precedes the data pages — a
+            // dictionary page, or an FSST symbol table page. Starting at DataPageOffset would
+            // read past a symbol table the data pages cannot be decoded without.
             long start = colMeta.DictionaryPageOffset is > 0 and long dpo
                 ? dpo
-                : colMeta.DataPageOffset;
+                : colMeta.SymbolTablePageOffset is > 0 and long stpo
+                    ? stpo
+                    : colMeta.DataPageOffset;
             long length = colMeta.TotalCompressedSize;
 
             // PARQUET-816 workaround: old parquet-mr writers (<= 1.2.8) exclude the
