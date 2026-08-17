@@ -342,63 +342,50 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         return builder.Build();
     }
 
+    /// <summary>
+    /// Decimal arithmetic, computed on the unscaled integers so that the whole of Spark's
+    /// precision range is evaluable rather than only the part <see cref="decimal"/> can hold.
+    /// </summary>
     private IArrowArray DecimalArithmetic(
         string op, IArrowArray left, IArrowArray right, Decimal128Type resultType, int rowCount)
     {
-        var builder = new Decimal128Array.Builder(resultType);
+        var results = new Int128?[rowCount];
 
         for (var i = 0; i < rowCount; i++)
         {
-            var a = SparkArrays.ReadDecimal(left, i);
-            var b = SparkArrays.ReadDecimal(right, i);
+            var a = SparkWideDecimals.Read(left, i);
+            var b = SparkWideDecimals.Read(right, i);
 
             if (a is null || b is null)
-            {
-                builder.AppendNull();
                 continue;
-            }
 
-            if ((op is "/" or "%") && b.Value == 0m)
+            if (op is "/" or "%" && b.Value.IsZero)
             {
-                if (!_options.Ansi)
-                {
-                    builder.AppendNull();
-                    continue;
-                }
-
+                if (!_options.Ansi) continue;
                 throw SparkEvaluationException.DivideByZero();
             }
 
-            decimal computed;
-            try
-            {
-                computed = op switch
-                {
-                    "+" => a.Value + b.Value,
-                    "-" => a.Value - b.Value,
-                    "*" => a.Value * b.Value,
-                    "/" => a.Value / b.Value,
-                    "%" => a.Value % b.Value,
-                    _ => throw new NotSupportedException($"'{op}' over decimals"),
-                };
-            }
-            catch (OverflowException)
-            {
-                if (!_options.Ansi)
-                {
-                    builder.AppendNull();
-                    continue;
-                }
+            var computed = SparkWideDecimals.Evaluate(op, a.Value, b.Value, resultType);
 
-                throw SparkEvaluationException.Overflow(
-                    false, $"{a.Value} {op} {b.Value} overflows {SparkArrays.Describe(resultType)}");
+            if (computed is null)
+            {
+                if (!_options.Ansi) continue;
+
+                // Spark's own message names the exact result, which we no longer hold once it has
+                // been rejected. The operands are as informative and cost nothing to keep: the
+                // error CLASS is the part a caller matches on, not the wording.
+                throw SparkEvaluationException.NumericValueOutOfRange(
+                    $"{Show(a.Value)} {op} {Show(b.Value)}", resultType);
             }
 
-            builder.Append(SparkArrays.Rescale(computed, resultType.Scale));
+            results[i] = computed;
         }
 
-        return builder.Build();
+        return SparkWideDecimals.Build(results, resultType, rowCount);
     }
+
+    /// <summary>An operand as Spark would print it, for an overflow message.</summary>
+    private static string Show(SparkWideDecimals.Operand operand) => SparkWideDecimals.Render(operand);
 
     private IArrowArray Negate(IArrowArray operand, int rowCount)
     {
@@ -681,6 +668,14 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
 
     private IArrowArray CastToDecimal(IArrowArray source, Decimal128Type target, int rowCount, bool raising)
     {
+        // A decimal or integral source has an exact unscaled form, so the cast is a rescale and the
+        // whole precision range is reachable. Everything else — strings, booleans, floating point,
+        // temporals — keeps the System.Decimal path below, which stops near 7.9e28. Only a string
+        // can actually spell a value past that, and what Spark does when one does is unmeasured;
+        // guessing it here would be the one thing this file's rules are not allowed to do.
+        if (SparkWideDecimals.IsExact(source.Data.DataType))
+            return CastExactToDecimal(source, target, rowCount, raising);
+
         var builder = new Decimal128Array.Builder(target);
 
         for (var i = 0; i < rowCount; i++)
@@ -699,11 +694,14 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, SparkArrays.Describe(target));
             }
 
+            // Both refusals below are NUMERIC_VALUE_OUT_OF_RANGE rather than CAST_OVERFLOW, which
+            // is what this used to report. Measured: a cast to a decimal names that condition
+            // whatever the source is — decimal, double, string or integer all reach it — while
+            // CAST_OVERFLOW belongs to casts targeting an integral type.
             if (value.Value.Exact is not { } exact)
             {
                 if (!raising) { builder.AppendNull(); continue; }
-                throw SparkEvaluationException.CastOverflow(
-                    value.Value.Text, SparkArrays.Describe(target));
+                throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
 
             try
@@ -713,12 +711,38 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             catch (OverflowException)
             {
                 if (!raising) { builder.AppendNull(); continue; }
-                throw SparkEvaluationException.CastOverflow(
-                    value.Value.Text, SparkArrays.Describe(target));
+                throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
         }
 
         return builder.Build();
+    }
+
+    /// <summary>Casts a decimal or integral column to a decimal type, on the unscaled integers.</summary>
+    private IArrowArray CastExactToDecimal(
+        IArrowArray source, Decimal128Type target, int rowCount, bool raising)
+    {
+        var mantissas = new Int128?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkWideDecimals.Read(source, i) is not { } value)
+                continue;
+
+            var cast = SparkWideDecimals.Cast(value, target);
+
+            if (cast is null)
+            {
+                if (!raising) continue;
+
+                throw SparkEvaluationException.NumericValueOutOfRange(
+                    SparkWideDecimals.Render(value), target);
+            }
+
+            mantissas[i] = cast;
+        }
+
+        return SparkWideDecimals.Build(mantissas, target, rowCount);
     }
 
     private static IArrowArray CastToString(IArrowArray source, int rowCount)

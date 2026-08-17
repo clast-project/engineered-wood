@@ -294,39 +294,204 @@ public sealed class SparkFunctionRegistryTests
 
     // ── Limits, which must refuse rather than crash ────────────────────────────────────────
 
-    /// <summary>A decimal(38,0) cell holding 10^30 — past System.Decimal's ~7.9e28 ceiling.</summary>
-    private static RecordBatch WideDecimalBatch()
+    private static RecordBatch WideDecimalBatch(
+        params (string Name, System.Numerics.BigInteger Unscaled)[] columns) =>
+        WideDecimalBatch(0, columns);
+
+    /// <summary>A decimal(38,s) column built from unscaled integers, past System.Decimal's reach.</summary>
+    private static RecordBatch WideDecimalBatch(
+        int scale, params (string Name, System.Numerics.BigInteger Unscaled)[] columns)
     {
-        var type = new Decimal128Type(38, 0);
-        var bytes = new byte[16];
-        System.Numerics.BigInteger.Pow(10, 30).ToByteArray().CopyTo(bytes, 0);
+        var type = new Decimal128Type(38, scale);
+        var schema = new Schema.Builder();
+        var arrays = new List<IArrowArray>();
 
-        var array = new Decimal128Array(new ArrayData(
-            type, 1, 0, 0, new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) }));
+        foreach (var (name, unscaled) in columns)
+        {
+            // Sign-extended by hand: BigInteger.ToByteArray gives the shortest two's complement
+            // form, and Arrow wants all sixteen bytes.
+            var bytes = new byte[16];
+            if (unscaled.Sign < 0) bytes.AsSpan().Fill(0xFF);
+            unscaled.ToByteArray().CopyTo(bytes, 0);
 
-        var schema = new Schema.Builder().Field(new Field("big", type, true)).Build();
-        return new RecordBatch(schema, new IArrowArray[] { array }, 1);
+            schema.Field(new Field(name, type, true));
+            arrays.Add(new Decimal128Array(new ArrayData(
+                type, 1, 0, 0, new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) })));
+        }
+
+        return new RecordBatch(schema.Build(), arrays, 1);
+    }
+
+    /// <summary>The unscaled integer behind the single cell of a decimal result.</summary>
+    private static System.Numerics.BigInteger Unscaled(Decimal128Array array)
+    {
+        // The byte[] overload rather than the span one: it reads signed little-endian two's
+        // complement, which is Arrow's decimal layout, and net472 has only this one.
+        return new System.Numerics.BigInteger(array.ValueBuffer.Span.Slice(0, 16).ToArray());
     }
 
     [Fact]
-    public void ADecimalTooWideForExactArithmeticIsRefusedRatherThanCrashing()
+    public void ADecimalPastSystemDecimalsRangeIsEvaluatedRatherThanRefused()
     {
-        // Spark decimals reach precision 38 where System.Decimal stops near 7.9e28, so
-        // Decimal128Array.GetValue raises on a legitimate column value. It used to escape as a
-        // bare OverflowException, which is a crash on table data rather than a refusal.
-        var ex = Assert.Throws<NotSupportedException>(
-            () => Eval(Ansi, "big + big", WideDecimalBatch()));
+        // Spark decimals reach precision 38 where System.Decimal stops near 7.9e28. Arithmetic is
+        // computed on the unscaled integer, so the top of the range is ordinary arithmetic rather
+        // than the NotSupportedException it used to raise.
+        var batch = WideDecimalBatch(
+            ("big", System.Numerics.BigInteger.Pow(10, 30)),
+            ("one", System.Numerics.BigInteger.One));
 
-        Assert.Contains("too wide", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var sum = Assert.IsType<Decimal128Array>(Eval(Ansi, "big + one", batch));
+
+        Assert.Equal(System.Numerics.BigInteger.Pow(10, 30) + 1, Unscaled(sum));
+    }
+
+    [Fact]
+    public void AWideNegativeDecimalKeepsItsSignThroughTheUnscaledForm()
+    {
+        // Two's complement sign extension is the part of reading sixteen raw bytes that a positive
+        // value cannot exercise.
+        var batch = WideDecimalBatch(
+            ("neg", -System.Numerics.BigInteger.Pow(10, 30)),
+            ("one", System.Numerics.BigInteger.One));
+
+        var sum = Assert.IsType<Decimal128Array>(Eval(Ansi, "neg + one", batch));
+
+        Assert.Equal(-System.Numerics.BigInteger.Pow(10, 30) + 1, Unscaled(sum));
+    }
+
+    [Fact]
+    public void ADiscardedHalfRoundsAwayFromZeroRatherThanToEven()
+    {
+        // 246913 / 2000000 is exactly 0.1234565, and decimal(38,0) / decimal(38,0) lands on
+        // decimal(38,6), so the discarded digit is exactly half a unit with an even digit before
+        // it — the one case where half-up and half-even disagree. Spark rounds half away from
+        // zero, measured as CAST(2.5 AS DECIMAL(3,0)) = 3.
+        var batch = WideDecimalBatch(("a", 246913), ("b", 2000000));
+
+        var quotient = Assert.IsType<Decimal128Array>(Eval(Ansi, "a / b", batch));
+        var type = Assert.IsType<Decimal128Type>(quotient.Data.DataType);
+
+        Assert.Equal(6, type.Scale);
+        Assert.Equal(123457, Unscaled(quotient));   // half to even would give 123456
+    }
+
+    [Fact]
+    public void ANegativeQuotientRoundsAwayFromZeroToo()
+    {
+        // Away from zero, not down: the sign of the quotient decides the direction, and where the
+        // quotient is zero the signs of the operands do. -1/2000000 is exactly -0.0000005, which
+        // rounds to -0.000001 while its integer part never leaves zero.
+        var batch = WideDecimalBatch(("a", -246913), ("b", 2000000), ("tiny", -1));
+
+        Assert.Equal(-123457, Unscaled(Assert.IsType<Decimal128Array>(Eval(Ansi, "a / b", batch))));
+        Assert.Equal(-1, Unscaled(Assert.IsType<Decimal128Array>(Eval(Ansi, "tiny / b", batch))));
+    }
+
+    [Fact]
+    public void AResultBeyondTheDeclaredPrecisionOverflowsEvenWhereItFitsTheWidth()
+    {
+        // 6e37 + 6e37 is 1.2e38, which no decimal(38,0) can hold — but Int128 runs to about
+        // 1.7e38, so the width alone does not catch it. Spark bounds a result by the precision it
+        // declared, not by the machine word behind it.
+        //
+        // NUMERIC_VALUE_OUT_OF_RANGE, not ARITHMETIC_OVERFLOW: harvested, and not what this test
+        // asserted when it was written from Spark's integer behaviour instead of measured. A
+        // decimal result that will not fit names a different condition from an int one that will
+        // not. See the wide-decimal group of the corpus.
+        var big = System.Numerics.BigInteger.Parse("60000000000000000000000000000000000000");
+        var batch = WideDecimalBatch(("a", big), ("b", big));
+
+        var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "a + b", batch));
+        Assert.Equal("NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION", ex.ErrorClass);
+
+        // The legacy dialect nulls instead, which Spark's own message says it will: "set
+        // spark.sql.ansi.enabled to false to bypass this error, and return NULL instead".
+        var tolerated = Assert.IsType<Decimal128Array>(Eval(Legacy, "a + b", batch));
+        Assert.True(tolerated.IsNull(0));
+    }
+
+    [Fact]
+    public void IntegerOverflowKeepsItsOwnErrorClass()
+    {
+        // The other half of the split above: a decimal result that does not fit is
+        // NUMERIC_VALUE_OUT_OF_RANGE, while the same condition on an int stays
+        // ARITHMETIC_OVERFLOW. Both harvested.
+        var batch = Batch(("a", Ints(int.MaxValue)), ("b", Ints(1)));
+
+        var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "a + b", batch));
+        Assert.Equal("ARITHMETIC_OVERFLOW", ex.ErrorClass);
+    }
+
+    [Fact]
+    public void AnAllScaleDecimalDividesAndAddsAtTheTopOfTheRange()
+    {
+        // decimal(38,38) is the hardest shape for division: the dividend pre-scales by 10^44,
+        // which no 128-bit mantissa holds even where the quotient is exactly 1.
+        //
+        // Addition is the interesting half. decimal(38,38) + decimal(38,38) wants precision 39,
+        // and clamping that back to 38 comes out of the SCALE — so the result is decimal(38,37),
+        // narrower than either operand, and the sum has to be rounded down a digit rather than
+        // simply carried. Both answers harvested into the corpus's wide-decimal group.
+        var tenth = System.Numerics.BigInteger.Pow(10, 37);   // 0.1 at scale 38
+        var batch = WideDecimalBatch(38, ("a", tenth), ("b", tenth));
+
+        var sum = Assert.IsType<Decimal128Array>(Eval(Ansi, "a + b", batch));
+        Assert.Equal(37, Assert.IsType<Decimal128Type>(sum.Data.DataType).Scale);
+        Assert.Equal(2 * System.Numerics.BigInteger.Pow(10, 36), Unscaled(sum));   // 0.2
+
+        var quotient = Assert.IsType<Decimal128Array>(Eval(Ansi, "a / b", batch));
+        Assert.Equal(6, Assert.IsType<Decimal128Type>(quotient.Data.DataType).Scale);
+        Assert.Equal(1000000, Unscaled(quotient));                                 // 1.000000
+    }
+
+    [Fact]
+    public void CastingAWideDecimalRescalesItRatherThanRefusingIt()
+    {
+        var batch = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
+
+        var widened = Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "CAST(big AS DECIMAL(38,2))", batch));
+
+        Assert.Equal(System.Numerics.BigInteger.Pow(10, 32), Unscaled(widened));
+    }
+
+    [Fact]
+    public void CastingAWideDecimalRoundsAwayFromZeroAndRefusesWhatDoesNotFit()
+    {
+        // 2.5 and -2.5 at scale 1, cast to scale 0. Measured: CAST(2.5 AS DECIMAL(3,0)) is 3, so
+        // the discarded half goes away from zero rather than to the even neighbour.
+        var halves = WideDecimalBatch(1, ("up", 25), ("down", -25));
+
+        Assert.Equal(3, Unscaled(Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "CAST(up AS DECIMAL(38,0))", halves))));
+        Assert.Equal(-3, Unscaled(Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "CAST(down AS DECIMAL(38,0))", halves))));
+
+        // A value that no longer fits the narrower target is Spark's CAST_OVERFLOW, and null in
+        // the legacy dialect — the same split arithmetic overflow takes.
+        var wide = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
+
+        // NUMERIC_VALUE_OUT_OF_RANGE rather than CAST_OVERFLOW. Harvested, and it is the target
+        // type that decides: CAST(big AS INT) on the same value reports CAST_OVERFLOW.
+        var ex = Assert.Throws<SparkEvaluationException>(
+            () => Eval(Ansi, "CAST(big AS DECIMAL(10,0))", wide));
+        Assert.Equal("NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION", ex.ErrorClass);
+
+        Assert.Equal("CAST_OVERFLOW", Assert.Throws<SparkEvaluationException>(
+            () => Eval(Ansi, "CAST(big AS INT)", wide)).ErrorClass);
+
+        Assert.True(Assert.IsType<Decimal128Array>(
+            Eval(Legacy, "CAST(big AS DECIMAL(10,0))", wide)).IsNull(0));
     }
 
     [Fact]
     public void AWideDecimalStillParticipatesWhereTheResultIsADouble()
     {
         // Converting to double is lossy either way, so the wide value costs nothing the target
-        // type was going to keep. Only exact arithmetic has to refuse.
-        var result = Assert.IsType<DoubleArray>(
-            Eval(Ansi, "CAST(big AS DOUBLE)", WideDecimalBatch()));
+        // type was going to keep.
+        var batch = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
+
+        var result = Assert.IsType<DoubleArray>(Eval(Ansi, "CAST(big AS DOUBLE)", batch));
 
         Assert.Equal(1e30, result.GetValue(0)!.Value, 1e15);
     }

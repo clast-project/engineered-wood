@@ -337,15 +337,16 @@ internal static class SparkFunctions
 
         if (type is Decimal128Type decimalType)
         {
-            var decimals = new Decimal128Array.Builder(decimalType);
+            var mantissas = new Int128?[rowCount];
             for (var i = 0; i < rowCount; i++)
             {
-                var value = choice[i] < 0 ? null : SparkArrays.ReadDecimal(sources[choice[i]], i);
-                if (value is null) decimals.AppendNull();
-                else decimals.Append(SparkArrays.Rescale(value.Value, decimalType.Scale));
+                if (choice[i] < 0) continue;
+
+                if (SparkWideDecimals.Read(sources[choice[i]], i) is { } value)
+                    mantissas[i] = SparkWideDecimals.Cast(value, decimalType);
             }
 
-            return decimals.Build();
+            return SparkWideDecimals.Build(mantissas, decimalType, rowCount);
         }
 
         if (type is FloatType)
@@ -423,6 +424,16 @@ internal static class SparkFunctions
 
         // Exact where both sides have an exact form, so scale differences do not separate equal
         // values; double only when one side cannot be exact anyway.
+        if (SparkWideDecimals.IsExact(left.Data.DataType) && SparkWideDecimals.IsExact(right.Data.DataType))
+        {
+            var first = SparkWideDecimals.Read(left, index);
+            var second = SparkWideDecimals.Read(right, index);
+
+            return first is null || second is null
+                ? first is null && second is null
+                : SparkWideDecimals.AreEqual(first.Value, second.Value);
+        }
+
         try
         {
             return SparkArrays.ReadDecimal(left, index) == SparkArrays.ReadDecimal(right, index);
