@@ -1745,13 +1745,15 @@ public class ReadRowGroupTests
         using var reader = new ParquetFileReader(file, ownsFile: false);
         var schema = await reader.GetSchemaAsync();
 
-        // Reading all columns should throw a clear ParquetFormatException for the corrupted column
-        var ex = await Assert.ThrowsAsync<AggregateException>(
+        // Reading all columns should throw a clear ParquetFormatException for the corrupted column.
+        // It arrives as ITSELF: columns are decoded with Parallel.For, which used to wrap the one real
+        // failure in an AggregateException, so a message written for the caller reached them as "One or
+        // more errors occurred" with the real one a level down. A single column failing is the ordinary
+        // case and is now rethrown in place (issue #157, where the same wrapping hid the size diagnostic).
+        var ex = await Assert.ThrowsAsync<ParquetFormatException>(
             () => reader.ReadRowGroupAsync(0).AsTask());
-        var inner = Assert.Single(ex.InnerExceptions);
-        Assert.IsType<ParquetFormatException>(inner);
-        Assert.Contains("timestamp_us_no_tz", inner.Message);
-        Assert.Contains("corrupted page header", inner.Message);
+        Assert.Contains("timestamp_us_no_tz", ex.Message);
+        Assert.Contains("corrupted page header", ex.Message);
 
         // Excluding the corrupted column by name allows the rest of the file to be read
         var goodColumns = schema.Root.Children

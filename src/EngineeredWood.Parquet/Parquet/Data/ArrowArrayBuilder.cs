@@ -1042,6 +1042,9 @@ internal sealed class ColumnBuildState : IDisposable
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
 
+    // Dotted column path, for the diagnostics in ByteArrayCapacity. Null when the caller had none to give.
+    private readonly string? _columnPath;
+
     // For ByteArray/String (view mode): 16-byte views buffer + overflow data buffer
     private readonly ByteArrayOutputKind _byteArrayOutput;
     private NativeBuffer<byte>? _viewsBuffer;   // 16 bytes per non-null value (dense)
@@ -1078,13 +1081,14 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
-        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default)
+        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null)
     {
         _physicalType = physicalType;
         MaxDefLevel = maxDefLevel;
         MaxRepLevel = maxRepLevel;
         _capacity = capacity;
         _byteArrayOutput = byteArrayOutput;
+        _columnPath = columnPath;
 
         if (maxDefLevel > 0)
         {
@@ -1251,7 +1255,7 @@ internal sealed class ColumnBuildState : IDisposable
         }
 
         // Ensure data buffer has enough space
-        int dataNeeded = _dataByteOffset + sourceData.Length;
+        int dataNeeded = CheckedDataBytes(sourceData.Length);
         if (dataNeeded > _dataBuffer!.ByteSpan.Length)
             _dataBuffer.Grow(dataNeeded);
 
@@ -1283,10 +1287,27 @@ internal sealed class ColumnBuildState : IDisposable
     /// </summary>
     internal Span<byte> ReserveByteArrayData(int byteCount)
     {
-        int needed = _dataByteOffset + byteCount;
+        int needed = CheckedDataBytes(byteCount);
         if (needed > _dataBuffer!.ByteSpan.Length)
             _dataBuffer.Grow(needed);
         return _dataBuffer.ByteSpan.Slice(_dataByteOffset, byteCount);
+    }
+
+    /// <summary>
+    /// The data-buffer write position after <paramref name="byteCount"/> more bytes, refusing rather than
+    /// wrapping when that exceeds what one Arrow array can address.
+    /// </summary>
+    /// <remarks>
+    /// The backstop for every decode path. The PLAIN decoder catches its own overflow earlier and more
+    /// precisely — it can still see the individual value lengths — but the dictionary, delta and FSST paths
+    /// all arrive here, and this is the one place they share. See <see cref="ByteArrayCapacity"/>.
+    /// </remarks>
+    private int CheckedDataBytes(int byteCount)
+    {
+        long needed = (long)_dataByteOffset + byteCount;
+        if (needed > ByteArrayCapacity.MaxBytes)
+            throw ByteArrayCapacity.ChunkTooLarge(_columnPath, needed);
+        return (int)needed;
     }
 
     /// <summary>
@@ -1356,7 +1377,7 @@ internal sealed class ColumnBuildState : IDisposable
 #endif
 
             // Append to overflow buffer
-            int needed = _dataByteOffset + len;
+            int needed = CheckedDataBytes(len);
             if (needed > _dataBuffer!.ByteSpan.Length)
                 _dataBuffer.Grow(needed);
             value.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));

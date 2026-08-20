@@ -73,8 +73,16 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
         if (newElementCount <= inner.Length)
             return;
 
-        // Exponential growth (2x) to amortise repeated grows.
-        int newCount = Math.Max(newElementCount, checked(inner.Length * 2));
+        // Exponential growth (2x) to amortise repeated grows, CLAMPED at int.MaxValue. Doubling in a
+        // checked context threw OverflowException once the buffer passed about 1 GiB — before the caller
+        // had reached any limit of its own, and reported as arithmetic overflow rather than as the size
+        // refusal the caller was about to make. Doubling is an optimisation, so giving up on it at the
+        // ceiling costs an extra grow at worst; asking for more than int.MaxValue elements is still the
+        // caller's error and still throws, from the allocation below.
+        long doubled = (long)inner.Length * 2;
+        int newCount = doubled > int.MaxValue
+            ? Math.Max(newElementCount, int.MaxValue)
+            : Math.Max(newElementCount, (int)doubled);
         inner.Grow(newCount, zeroFill: false);
     }
 

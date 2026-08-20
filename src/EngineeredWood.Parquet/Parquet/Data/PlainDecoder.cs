@@ -160,21 +160,39 @@ internal static class PlainDecoder
     /// Use <see cref="CopyByteArrayData"/> as the second pass to write data into a
     /// pre-allocated buffer.
     /// </summary>
-    public static int MeasureByteArrays(ReadOnlySpan<byte> data, Span<int> offsets, int count)
+    public static int MeasureByteArrays(
+        ReadOnlySpan<byte> data, Span<int> offsets, int count, string? columnPath = null)
     {
-        int srcPos = 0;
-        int totalDataSize = 0;
+        // Both accumulators are LONG. As ints they wrapped negative once a page carried more than 2 GiB of
+        // values — the running total corrupted `offsets` and then reached a span slice as
+        // ArgumentOutOfRangeException, the opaque failure of issue #157, while `srcPos` going negative
+        // defeated the end-of-data check below and read at a negative index. The total is checked every
+        // iteration rather than at the end, so neither can happen before the refusal.
+        long srcPos = 0;
+        long totalDataSize = 0;
         offsets[0] = 0;
         for (int i = 0; i < count; i++)
         {
             if (srcPos + 4 > data.Length)
                 throw new ParquetFormatException("Unexpected end of PLAIN ByteArray data.");
-            int len = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(srcPos));
+            int len = BinaryPrimitives.ReadInt32LittleEndian(data.Slice((int)srcPos));
+            if (len < 0)
+                throw new ParquetFormatException($"PLAIN ByteArray value {i} has a negative length ({len}).");
+
             srcPos += 4 + len;
             totalDataSize += len;
-            offsets[i + 1] = totalDataSize;
+            if (totalDataSize > ByteArrayCapacity.MaxBytes)
+            {
+                // One value on its own over the limit is unsplittable and gets its own message; anything
+                // else is an accumulation, which batching can fix.
+                throw len > ByteArrayCapacity.MaxBytes
+                    ? ByteArrayCapacity.ValueTooLarge(columnPath, i, len)
+                    : ByteArrayCapacity.ChunkTooLarge(columnPath, totalDataSize);
+            }
+
+            offsets[i + 1] = (int)totalDataSize;
         }
-        return totalDataSize;
+        return (int)totalDataSize;
     }
 
     /// <summary>
