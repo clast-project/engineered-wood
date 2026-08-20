@@ -213,38 +213,47 @@ internal static class ColumnChunkWriter
                 maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options);
         }
 
-        // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
-        // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
-        // not just the distinct dictionary entries.
-        bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
-        bool floatingPointTotalOrder =
-            options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
-        var stats = dictResult != null && !isFloatingPoint
-            ? StatisticsCollector.ComputeFromDictEntries(
-                dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount)
-            : StatisticsCollector.Compute(
-                array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                floatingPointTotalOrder);
-        // The DEPRECATED min/max fields are defined with SIGNED byte ordering. Our values are computed with the
-        // CORRECT logical ordering (they mirror min_value/max_value), so a legacy reader that honors the
-        // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
-        // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
-        // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
-        if (!SignedOrderMatchesLogical(ValueType(array)))
+        // Statistics OFF leaves the column chunk with no Statistics at all — not merely no bounds — and
+        // skips computing them, so a non-dictionary column also skips the collector's full scan of its
+        // values. That is write time saved as well as footer bytes. This guards rather than returns early
+        // because the GC.KeepAlive at the end of the method roots `array` across everything above it.
+        // See ParquetWriteOptions.WriteStatistics for why the null count goes with the bounds.
+        if (options.GetWriteStatistics(pathInSchema))
         {
-            stats = new Statistics
+            // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
+            // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
+            // not just the distinct dictionary entries.
+            bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+            bool floatingPointTotalOrder =
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+            var stats = dictResult != null && !isFloatingPoint
+                ? StatisticsCollector.ComputeFromDictEntries(
+                    dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
+                    physicalType, typeLength, rowCount - nonNullCount)
+                : StatisticsCollector.Compute(
+                    array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
+                    floatingPointTotalOrder);
+            // The DEPRECATED min/max fields are defined with SIGNED byte ordering. Our values are computed with the
+            // CORRECT logical ordering (they mirror min_value/max_value), so a legacy reader that honors the
+            // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
+            // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
+            // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
+            if (!SignedOrderMatchesLogical(ValueType(array)))
             {
-                NullCount = stats.NullCount,
-                MinValue = stats.MinValue,
-                MaxValue = stats.MaxValue,
-                IsMinValueExact = stats.IsMinValueExact,
-                IsMaxValueExact = stats.IsMaxValueExact,
-                NanCount = stats.NanCount,
-                DistinctCount = stats.DistinctCount,
-            };
+                stats = new Statistics
+                {
+                    NullCount = stats.NullCount,
+                    MinValue = stats.MinValue,
+                    MaxValue = stats.MaxValue,
+                    IsMinValueExact = stats.IsMinValueExact,
+                    IsMaxValueExact = stats.IsMaxValueExact,
+                    NanCount = stats.NanCount,
+                    DistinctCount = stats.DistinctCount,
+                };
+            }
+
+            result.MetaData.Statistics = stats;
         }
-        result.MetaData.Statistics = stats;
 
         // Build Bloom filter if enabled for this column.
         if (options.HasBloomFilter(pathInSchema))
