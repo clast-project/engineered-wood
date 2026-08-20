@@ -156,13 +156,9 @@ public class WriteStatisticsOptionTests : IDisposable
     }
 
     // BufferedParquetWriter is the other writer, and it reaches ColumnChunkWriter by different entry
-    // points — so the switch has to hold there too.
-    //
-    // NOTE: on the low-cardinality column the absence is currently over-determined. BufferedParquetWriter
-    // routes dictionary-encoded columns through WriteDictionaryColumnFromResult, which never sets
-    // Statistics at all, so that column has none regardless of this option — a pre-existing gap, and the
-    // opposite defect to the one this option adds. The assertion is written to stay true either way: with
-    // the option OFF nothing carries statistics, however that comes about.
+    // points — so the switch has to hold there too. Since issue #163 the low-cardinality column carries
+    // statistics when the option is ON, so its absence here is now this option's doing and nothing else;
+    // BufferedWriterStatisticsTests asserts the ON direction.
     [Fact]
     public async Task BufferedWriter_HonoursTheSwitch()
     {
