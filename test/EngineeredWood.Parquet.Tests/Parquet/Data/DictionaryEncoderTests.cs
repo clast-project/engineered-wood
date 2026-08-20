@@ -608,6 +608,88 @@ public class DictionaryEncoderTests
         AssertRuns([0, 1], [10, 20], result.Value);
     }
 
+    // A dictionary entry is a set of BYTES, so +0.0 and -0.0 are two entries. Keying on the value made them
+    // one — IEquatable<double>.Equals calls them equal — and the second zero's indices pointed at the
+    // first one's bytes (issue #154). Asserted on the dictionary page's raw bytes, since -0.0 == 0.0.
+    [Fact]
+    public void TryEncode_DoubleSignedZeros_AreSeparateEntries()
+    {
+        var builder = new DoubleArray.Builder();
+        for (int i = 0; i < 100; i++) builder.Append(i % 2 == 0 ? 0.0 : -0.0);
+        var array = builder.Build();
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.Double, 0, null, 100, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Value.DictionaryCount);
+        Assert.Equal(2 * 8, result.Value.DictionaryPageData.Length);
+
+        var page = result.Value.DictionaryPageData;
+        Assert.Equal(BitPatterns.Of(0.0), BitConverter.ToInt64(page, 0));
+        Assert.Equal(BitPatterns.Of(-0.0), BitConverter.ToInt64(page, 8));
+
+        // Index i must point at the entry whose bytes are the value written for row i.
+        var indices = Indices(result.Value);
+        for (int i = 0; i < 100; i++)
+            Assert.Equal(i % 2 == 0 ? 0 : 1, indices[i]);
+    }
+
+    [Fact]
+    public void TryEncode_FloatSignedZeros_AreSeparateEntries()
+    {
+        var builder = new FloatArray.Builder();
+        for (int i = 0; i < 100; i++) builder.Append(i % 2 == 0 ? 0.0f : -0.0f);
+        var array = builder.Build();
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.Float, 0, null, 100, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Value.DictionaryCount);
+
+        var page = result.Value.DictionaryPageData;
+        Assert.Equal(BitPatterns.Of(0.0f), BitConverter.ToInt32(page, 0));
+        Assert.Equal(BitPatterns.Of(-0.0f), BitConverter.ToInt32(page, 4));
+    }
+
+    // The other half of moving to bit equality, and the deliberate half: NaNs used to share one entry
+    // regardless of payload, because double.Equals(NaN, NaN) is true. Under bit equality they are separate
+    // entries — the same rule applied consistently, at the cost of an entry per distinct payload.
+    [Fact]
+    public void TryEncode_DoubleNaNPayloads_AreSeparateEntries()
+    {
+        double nanA = BitConverter.Int64BitsToDouble(unchecked((long)0xFFF8000000000000)); // canonical
+        double nanB = BitConverter.Int64BitsToDouble(unchecked((long)0x7FF8000000000001)); // other payload
+        Assert.True(double.IsNaN(nanA) && double.IsNaN(nanB));
+
+        var builder = new DoubleArray.Builder();
+        for (int i = 0; i < 100; i++) builder.Append(i % 2 == 0 ? nanA : nanB);
+        var array = builder.Build();
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.Double, 0, null, 100, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Value.DictionaryCount);
+    }
+
+    // Bit equality must not disturb the integer arms, where value equality and bit equality already agree.
+    [Fact]
+    public void TryEncode_Int64_StillFoldsEqualValues()
+    {
+        var builder = new Int64Array.Builder();
+        for (int i = 0; i < 100; i++) builder.Append(i % 3);
+        var array = builder.Build();
+
+        var result = DictionaryEncoder.TryEncode(
+            array, PhysicalType.Int64, 0, null, 100, DefaultOptions);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Value.DictionaryCount);
+        Assert.Equal(3 * 8, result.Value.DictionaryPageData.Length);
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(2)]
