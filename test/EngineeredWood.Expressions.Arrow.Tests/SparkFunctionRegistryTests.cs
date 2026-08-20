@@ -346,6 +346,39 @@ public sealed class SparkFunctionRegistryTests
     }
 
     [Fact]
+    public void ComparingAWideDecimalAgainstADoubleDegradesToADoubleComparison()
+    {
+        // The one place the System.Decimal ceiling is still reachable, and the reason the refusal
+        // in ExactDecimal has to stay. Equality is exact only where BOTH sides have an exact form;
+        // a double never does, so the pair falls back to comparing as doubles — and getting there
+        // runs the wide decimal through the exact-decimal read, which refuses. The refusal is the
+        // mechanism that selects the fallback, not a failure.
+        //
+        // nullif rather than `=`: nullif is what reaches SparkFunctions.AreEqual, and it nulls
+        // when the two are equal.
+        //
+        // 2^100 rather than a power of ten, and it is about 1.27e30 so it clears decimal's ceiling
+        // near 7.9e28 either way. A power of two survives the unscaled BigInteger to double
+        // conversion exactly, so this asserts on the fallback and not on a rounding difference.
+        var value = System.Numerics.BigInteger.Pow(2, 100);
+        var wide = WideDecimalBatch(("big", value));
+        var batch = new RecordBatch(
+            new Schema.Builder()
+                .Field(new Field("big", wide.Schema.GetFieldByName("big").DataType, true))
+                .Field(new Field("same", DoubleType.Default, true))
+                .Field(new Field("other", DoubleType.Default, true))
+                .Build(),
+            new[] { wide.Column(0), Doubles(Math.Pow(2, 100)), Doubles(Math.Pow(2, 101)) },
+            1);
+
+        Assert.True(Eval(Ansi, "nullif(big, same)", batch).IsNull(0));
+
+        var kept = Assert.IsType<Decimal128Array>(Eval(Ansi, "nullif(big, other)", batch));
+        Assert.False(kept.IsNull(0));
+        Assert.Equal(value, Unscaled(kept));
+    }
+
+    [Fact]
     public void AWideNegativeDecimalKeepsItsSignThroughTheUnscaledForm()
     {
         // Two's complement sign extension is the part of reading sixteen raw bytes that a positive
