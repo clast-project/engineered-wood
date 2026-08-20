@@ -130,13 +130,16 @@ internal static class NestedAssembler
             return new StructArray(structType, parentCount, childArrays, ArrowBuffer.Empty, nullCount: 0);
 
         int structDefLevel = ComputeAccumulatedDefLevel(node);
+        int structRepLevel = ComputeAccumulatedRepLevel(node);
 
         int[]? defLevels = null;
+        int[]? repLevels = null;
         for (int i = firstLeafIndex; i < lastLeafIndex; i++)
         {
             if (leafDefLevels[i] != null)
             {
                 defLevels = leafDefLevels[i];
+                repLevels = leafRepLevels[i];
                 break;
             }
         }
@@ -147,13 +150,27 @@ internal static class NestedAssembler
         int nullCount = 0;
         var bitmapBytes = new byte[(parentCount + 7) / 8];
 
-        for (int i = 0; i < parentCount; i++)
+        // The level entries are NOT one per struct slot whenever the chosen leaf sits under a
+        // repeated node: a list child emits one entry per element, so a struct slot holding two
+        // list items contributes two entries and indexing them by slot reads the next slot's
+        // validity. An entry whose repetition level exceeds the struct's own continues the slot
+        // already open; the first entry at or below it opens the next one.
+        int slot = 0;
+        for (int i = 0; i < defLevels.Length && slot < parentCount; i++)
         {
+            if (repLevels != null && repLevels[i] > structRepLevel)
+                continue;
+
             if (defLevels[i] >= structDefLevel)
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
+                bitmapBytes[slot >> 3] |= (byte)(1 << (slot & 7));
             else
                 nullCount++;
+            slot++;
         }
+
+        // Defensive: levels that describe fewer slots than the parent claims leave the remainder
+        // unset, which reads as null. Counting them keeps the bitmap and null count consistent.
+        nullCount += parentCount - slot;
 
         var bitmapBuffer = new ArrowBuffer(bitmapBytes);
         return new StructArray(structType, parentCount, childArrays, bitmapBuffer, nullCount);
@@ -238,13 +255,8 @@ internal static class NestedAssembler
                 repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty list markers) before inner recursive assembly
-        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
-        if (keepIndices != null)
-        {
-            int subtreeLeafEnd = firstLeafIndex + CountLeaves(repeatedChild);
-            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
-                keepIndices, firstLeafIndex, subtreeLeafEnd);
-        }
+        FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+            emptyDefThreshold, firstLeafIndex, firstLeafIndex + CountLeaves(repeatedChild));
 
         // Determine element node and assemble element array
         IArrowArray elementArray;
@@ -340,13 +352,8 @@ internal static class NestedAssembler
             repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty map markers) before inner recursive assembly
-        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
-        if (keepIndices != null)
-        {
-            int subtreeLeafEnd = firstLeafIndex + CountLeaves(keyValueGroup);
-            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
-                keepIndices, firstLeafIndex, subtreeLeafEnd);
-        }
+        FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+            emptyDefThreshold, firstLeafIndex, firstLeafIndex + CountLeaves(keyValueGroup));
 
         // Assemble key and value arrays with elementCount as parentCount
         var keyNode = keyValueGroup.Children[0];
@@ -647,22 +654,22 @@ internal static class NestedAssembler
     /// Returns indices where defLevels[i] >= threshold (entries that belong to actual elements,
     /// not phantom null/empty markers from an outer list). Returns null if all entries qualify.
     /// </summary>
-    private static int[]? ComputeKeepIndices(int[]? defLevels, int threshold, int numValues)
+    private static int[]? ComputeKeepIndices(int[]? defLevels, int threshold)
     {
         if (defLevels == null) return null;
 
         int keepCount = 0;
-        for (int i = 0; i < numValues; i++)
+        for (int i = 0; i < defLevels.Length; i++)
         {
             if (defLevels[i] >= threshold)
                 keepCount++;
         }
 
-        if (keepCount == numValues) return null; // No phantoms
+        if (keepCount == defLevels.Length) return null; // No phantoms
 
         var indices = new int[keepCount];
         int idx = 0;
-        for (int i = 0; i < numValues; i++)
+        for (int i = 0; i < defLevels.Length; i++)
         {
             if (defLevels[i] >= threshold)
                 indices[idx++] = i;
@@ -685,22 +692,49 @@ internal static class NestedAssembler
 
     /// <summary>
     /// Filters leaf arrays, def levels, and rep levels for leaves in [startLeaf, endLeaf)
-    /// by removing phantom entries (positions not in keepIndices). Creates shallow clones
-    /// of the arrays so that the caller's originals are not modified.
+    /// by removing phantom entries — the level entries that mark a null or empty list/map rather
+    /// than an element of one. Creates shallow clones of the arrays so that the caller's originals
+    /// are not modified.
     /// </summary>
+    /// <remarks>
+    /// Each leaf is filtered against its OWN definition levels. Sibling leaves under one repeated
+    /// group do not share a level index space: a leaf with a deeper repeated ancestor emits one
+    /// entry per element of that inner repetition, so it holds more entries than a sibling without
+    /// one. Deriving a single keep-list from the subtree's first leaf and applying it to all of them
+    /// therefore drops the wrong entries from every leaf that repeats more deeply — silently, since
+    /// the shorter list is still a valid set of indices into the longer array. The threshold is a
+    /// property of the schema path down to the repeated group, so it is the same in every leaf's
+    /// level space even though the indices are not.
+    /// </remarks>
     private static void FilterSubtree(
         ref IArrowArray[] leafArrays,
         ref int[]?[] leafDefLevels,
         ref int[]?[] leafRepLevels,
-        int[] keepIndices,
+        int emptyDefThreshold,
         int startLeaf, int endLeaf)
     {
+        int[]?[]? keepPerLeaf = null;
+        for (int i = startLeaf; i < endLeaf; i++)
+        {
+            if (ComputeKeepIndices(leafDefLevels[i], emptyDefThreshold) is not { } keep)
+                continue;
+
+            (keepPerLeaf ??= new int[]?[endLeaf - startLeaf])[i - startLeaf] = keep;
+        }
+
+        // Nothing in this subtree carries a phantom entry, so leave the caller's arrays alone.
+        if (keepPerLeaf is null)
+            return;
+
         leafArrays = (IArrowArray[])leafArrays.Clone();
         leafDefLevels = (int[]?[])leafDefLevels.Clone();
         leafRepLevels = (int[]?[])leafRepLevels.Clone();
 
         for (int i = startLeaf; i < endLeaf; i++)
         {
+            if (keepPerLeaf[i - startLeaf] is not { } keepIndices)
+                continue;
+
             leafDefLevels[i] = FilterLevelArray(leafDefLevels[i], keepIndices);
             leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
             leafArrays[i] = ArrowCompute.Take(leafArrays[i], keepIndices);
