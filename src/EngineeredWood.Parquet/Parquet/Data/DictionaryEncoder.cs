@@ -86,10 +86,12 @@ internal static class DictionaryEncoder
         // the arms are still reading them. See doc/arrow-span-lifetime.md.
         var result = physicalType switch
         {
+            // The type argument is the BIT PATTERN of a value slot, not the value — see TryEncodeFixed.
+            // FLOAT and DOUBLE go in as uint/ulong so that the dictionary is keyed on bits.
             PhysicalType.Int32 => TryEncodeFixed<int>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
             PhysicalType.Int64 => TryEncodeFixed<long>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.Float => TryEncodeFixed<float>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.Double => TryEncodeFixed<double>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
+            PhysicalType.Float => TryEncodeFixed<uint>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
+            PhysicalType.Double => TryEncodeFixed<ulong>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
             PhysicalType.ByteArray => TryEncodeByteArray(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
             PhysicalType.FixedLenByteArray => TryEncodeFixedLenByteArray(array, defLevels, nonNullCount, typeLength, options.DictionaryPageSizeLimit),
             _ => null,
@@ -109,21 +111,42 @@ internal static class DictionaryEncoder
         dictionaryCount <= 1 ? 1 : 32 - BitPolyfills.LeadingZeroCount((uint)(dictionaryCount - 1));
 #endif
 
-    private static DictionaryResult? TryEncodeFixed<T>(
+    /// <summary>
+    /// Dictionary-encodes a fixed-width column, keyed on the BIT PATTERN of each value slot.
+    /// </summary>
+    /// <typeparam name="TBits">
+    /// An integer type the width of one value slot — never the value's own type for FLOAT or DOUBLE, which
+    /// come in as <see cref="uint"/> and <see cref="ulong"/>. Nothing here interprets a slot, so reading the
+    /// buffer as an integer of the same width changes only the equality used to fold slots together, and
+    /// the dictionary page comes out byte-for-byte the same.
+    /// </typeparam>
+    /// <remarks>
+    /// A dictionary entry is a set of BYTES: two slots belong in the same entry exactly when their encoded
+    /// bytes match. Keying on the VALUE is LOOSER than that for floating point and merges slots that are not
+    /// the same — <c>IEquatable&lt;double&gt;.Equals(-0.0, 0.0)</c> is <c>true</c>, so both zeros landed in
+    /// one entry and every index for the second one pointed at the first one's bytes. Whichever zero came
+    /// first won and the other was silently rewritten (issue #154).
+    /// <para>
+    /// Two consequences worth naming. NaNs with different payloads are now separate entries rather than one,
+    /// which is the same rule applied consistently. And separating the zeros costs a dictionary entry, so a
+    /// column sitting exactly on the cardinality threshold can now fall out of dictionary encoding — the
+    /// values are right either way, since declining just writes them plain.
+    /// </para>
+    /// </remarks>
+    private static DictionaryResult? TryEncodeFixed<TBits>(
         IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit)
-        where T : unmanaged, IEquatable<T>
+        where TBits : unmanaged, IEquatable<TBits>
     {
         int rowCount = array.Length;
         int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
-        int elementSize = Marshal.SizeOf<T>();
+        int elementSize = Marshal.SizeOf<TBits>();
 
         // The fixed-width twin of the constant probe in TryEncodeByteArray, and cheaper: every value slot is
         // the same width, so "all rows equal" is exactly "the value buffer is periodic with period
         // elementSize" — one vectorized compare that stops at the first differing byte.
         //
-        // Byte equality is stricter than the Dictionary<T,int> below, which compares by value. That only
-        // ever costs a missed fast path (+0.0 and -0.0 are equal but differ in bytes, so such a column
-        // falls through to the loop), never a wrong answer: byte-identical values read back identical.
+        // This probe compares BYTES, which is now the same equality the dictionary below uses; the two agree
+        // rather than one being stricter than the other.
         if (defLevels is null && rowCount > 0
             && IsConstantFixedWidth(array.Data.Buffers[1].Span, rowCount, elementSize))
         {
@@ -139,16 +162,16 @@ internal static class DictionaryEncoder
             };
         }
 
-        var dict = new Dictionary<T, int>();
+        var dict = new Dictionary<TBits, int>();
         var indices = new int[nonNullCount];
-        var valueBuffer = MemoryMarshal.Cast<byte, T>(array.Data.Buffers[1].Span);
+        var valueBuffer = MemoryMarshal.Cast<byte, TBits>(array.Data.Buffers[1].Span);
         int idx = 0;
 
         for (int i = 0; i < rowCount; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
 
-            T value = valueBuffer[i];
+            TBits value = valueBuffer[i];
             if (!dict.TryGetValue(value, out int dictIdx))
             {
                 if (dict.Count >= maxCardinality)
@@ -164,7 +187,7 @@ internal static class DictionaryEncoder
         }
 
         // Produce PLAIN-encoded dictionary page: values in index order
-        var entries = new T[dict.Count];
+        var entries = new TBits[dict.Count];
         foreach (var kvp in dict)
             entries[kvp.Value] = kvp.Key;
 

@@ -667,11 +667,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public required Apache.Arrow.Types.IArrowType ArrowType { get; init; }
         public required bool IsNullable { get; init; }
 
-        // Running dictionary: maps values → index
+        // Running dictionary: maps a value's BIT PATTERN → index. The float and double dictionaries are
+        // keyed on uint/ulong rather than on the value because a dictionary entry is a set of BYTES, and
+        // value equality is looser than that: IEquatable<double>.Equals(-0.0, 0.0) is true, which merged
+        // the two zeros into one entry and silently rewrote whichever came second (issue #154).
         private Dictionary<int, int>? _fixedDict;
         private Dictionary<long, int>? _longDict;
-        private Dictionary<float, int>? _floatDict;
-        private Dictionary<double, int>? _doubleDict;
+        private Dictionary<uint, int>? _floatDict;
+        private Dictionary<ulong, int>? _doubleDict;
         private BytesDictionary? _bytesDict;
 
         // Accumulated indices (compact, non-null only)
@@ -872,24 +875,21 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         private void EncodeFixedFloat(ReadOnlySpan<float> valueBuffer, int srcOffset, int rowCount)
         {
-            _floatDict ??= new Dictionary<float, int>();
+            _floatDict ??= new Dictionary<uint, int>();
             _dictEntries ??= new List<byte[]>();
+
+            var bitBuffer = MemoryMarshal.Cast<float, uint>(valueBuffer);
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
-                float val = valueBuffer[srcOffset + i];
-                if (!_floatDict.TryGetValue(val, out int idx))
+                uint bits = bitBuffer[srcOffset + i];
+                if (!_floatDict.TryGetValue(bits, out int idx))
                 {
                     idx = DictionaryCount++;
-                    _floatDict[val] = idx;
+                    _floatDict[bits] = idx;
                     var bytes = new byte[4];
-
-#if NET8_0_OR_GREATER
-                    MemoryMarshal.Write(bytes, in val);
-#else
-                    MemoryMarshal.Write(bytes, ref val);
-#endif
+                    BinaryPrimitives.WriteUInt32LittleEndian(bytes, bits);
                     _dictEntries.Add(bytes);
                     _dictPageSize += 4;
                 }
@@ -899,24 +899,21 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         private void EncodeFixedDouble(ReadOnlySpan<double> valueBuffer, int srcOffset, int rowCount)
         {
-            _doubleDict ??= new Dictionary<double, int>();
+            _doubleDict ??= new Dictionary<ulong, int>();
             _dictEntries ??= new List<byte[]>();
+
+            var bitBuffer = MemoryMarshal.Cast<double, ulong>(valueBuffer);
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
-                double val = valueBuffer[srcOffset + i];
-                if (!_doubleDict.TryGetValue(val, out int idx))
+                ulong bits = bitBuffer[srcOffset + i];
+                if (!_doubleDict.TryGetValue(bits, out int idx))
                 {
                     idx = DictionaryCount++;
-                    _doubleDict[val] = idx;
+                    _doubleDict[bits] = idx;
                     var bytes = new byte[8];
-
-#if NET8_0_OR_GREATER
-                    MemoryMarshal.Write(bytes, in val);
-#else
-                    MemoryMarshal.Write(bytes, ref val);
-#endif
+                    BinaryPrimitives.WriteUInt64LittleEndian(bytes, bits);
                     _dictEntries.Add(bytes);
                     _dictPageSize += 8;
                 }

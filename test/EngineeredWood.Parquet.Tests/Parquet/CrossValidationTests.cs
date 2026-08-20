@@ -394,6 +394,50 @@ public class CrossValidationTests : IDisposable
         Assert.Equal(values, buffer);
     }
 
+    // The signed-zero defect of issue #154 was in the bytes we wrote, so the check that settles it is an
+    // INDEPENDENT reader seeing both signs. Compared on raw bits — -0.0 == 0.0 compares true, so an
+    // equality assertion passes against the corrupt file too.
+    [Fact]
+    public async Task EWWrite_PSRead_DictionaryKeepsSignedZerosApart()
+    {
+        var path = TempPath("ew-signed-zeros.parquet");
+        const int rows = 200;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", DoubleType.Default, nullable: false))
+            .Field(new Field("f", FloatType.Default, nullable: false))
+            .Build();
+
+        var doubles = new DoubleArray.Builder();
+        var floats = new FloatArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            doubles.Append(i % 2 == 0 ? 0.0 : -0.0);
+            floats.Append(i % 2 == 0 ? 0.0f : -0.0f);
+        }
+
+        await WriteEW(path, new RecordBatch(schema, [doubles.Build(), floats.Build()], rows));
+
+        using var reader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = reader.RowGroup(0);
+
+        var readDoubles = new double[rows];
+        using (var col = rg.Column(0).LogicalReader<double>())
+            col.ReadBatch(readDoubles);
+
+        var readFloats = new float[rows];
+        using (var col = rg.Column(1).LogicalReader<float>())
+            col.ReadBatch(readFloats);
+
+        for (int i = 0; i < rows; i++)
+        {
+            Assert.Equal(BitPatterns.Of(i % 2 == 0 ? 0.0 : -0.0),
+                BitPatterns.Of(readDoubles[i]));
+            Assert.Equal(BitPatterns.Of(i % 2 == 0 ? 0.0f : -0.0f),
+                BitPatterns.Of(readFloats[i]));
+        }
+    }
+
     [Fact]
     public async Task EWWrite_PSRead_DictionaryEncoded()
     {
