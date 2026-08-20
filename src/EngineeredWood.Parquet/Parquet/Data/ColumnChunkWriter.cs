@@ -233,26 +233,7 @@ internal static class ColumnChunkWriter
                 : StatisticsCollector.Compute(
                     array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
                     floatingPointTotalOrder);
-            // The DEPRECATED min/max fields are defined with SIGNED byte ordering. Our values are computed with the
-            // CORRECT logical ordering (they mirror min_value/max_value), so a legacy reader that honors the
-            // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
-            // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
-            // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
-            if (!SignedOrderMatchesLogical(ValueType(array)))
-            {
-                stats = new Statistics
-                {
-                    NullCount = stats.NullCount,
-                    MinValue = stats.MinValue,
-                    MaxValue = stats.MaxValue,
-                    IsMinValueExact = stats.IsMinValueExact,
-                    IsMaxValueExact = stats.IsMaxValueExact,
-                    NanCount = stats.NanCount,
-                    DistinctCount = stats.DistinctCount,
-                };
-            }
-
-            result.MetaData.Statistics = stats;
+            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array));
         }
 
         // Build Bloom filter if enabled for this column.
@@ -483,18 +464,47 @@ internal static class ColumnChunkWriter
     /// Writes a dictionary-encoded column from a pre-built <see cref="DictionaryEncoder.DictionaryResult"/>.
     /// Used by <see cref="BufferedParquetWriter"/> which builds dictionaries incrementally.
     /// </summary>
+    /// <remarks>
+    /// Statistics are computed HERE rather than inside <see cref="WriteDictionaryColumn"/>, because
+    /// <c>WriteColumn</c> — the other caller — assigns them itself once its own encoding decision
+    /// is made, and computing them a level down would have that path do the work twice. This is the entry
+    /// point only the buffered writer uses, so it is where the buffered writer's statistics belong.
+    /// </remarks>
     internal static ColumnChunkResult WriteDictionaryColumnFromResult(
         DictionaryEncoder.DictionaryResult dictResult,
         int rowCount,
+        int nonNullCount,
         IReadOnlyList<string> pathInSchema,
         PhysicalType physicalType,
+        int typeLength,
+        Apache.Arrow.Types.IArrowType arrowType,
         int maxDefLevel,
         int maxRepLevel,
         int[]? defLevels,
         int[]? repLevels,
-        ParquetWriteOptions options) =>
-        WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
+        ParquetWriteOptions options)
+    {
+        var result = WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
             maxDefLevel, maxRepLevel, defLevels, repLevels, options);
+
+        // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
+        if (!options.GetWriteStatistics(pathInSchema))
+            return result;
+
+        // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries either
+        // way, but nan_count counts VALUES, so it has to see the indices. WriteColumn full-scans the Arrow
+        // array for the same reason; here there is no array left to scan.
+        var stats = physicalType is PhysicalType.Float or PhysicalType.Double
+            ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
+                dictResult, physicalType, rowCount - nonNullCount,
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
+            : StatisticsCollector.ComputeFromDictEntries(
+                dictResult.DictionaryPageData, dictResult.DictionaryCount,
+                physicalType, typeLength, rowCount - nonNullCount);
+
+        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType);
+        return result;
+    }
 
     private static ColumnChunkResult WriteDictionaryColumn(
         DictionaryEncoder.DictionaryResult dictResult,
@@ -1646,12 +1656,36 @@ internal static class ColumnChunkWriter
     }
 
     /// <summary>
-    /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1
-    /// so value encoding methods can check != 0 for presence.
-    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel &lt;= 1.
+    /// Drops the DEPRECATED <c>min</c>/<c>max</c> fields on the column types where signed byte ordering
+    /// is not the logical ordering.
     /// </summary>
+    /// <remarks>
+    /// Those fields are defined with SIGNED byte ordering. Our values are computed with the CORRECT
+    /// logical ordering (they mirror min_value/max_value), so a legacy reader that honors the deprecated
+    /// fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns. parquet-mr's
+    /// rule: emit the deprecated fields only where signed ordering IS the logical ordering (booleans,
+    /// signed ints incl. date/time/timestamp, floats); drop them elsewhere.
+    /// </remarks>
+    private static Statistics DropDeprecatedMinMaxIfMisordered(
+        Statistics stats, Apache.Arrow.Types.IArrowType type)
+    {
+        if (SignedOrderMatchesLogical(type))
+            return stats;
+
+        return new Statistics
+        {
+            NullCount = stats.NullCount,
+            MinValue = stats.MinValue,
+            MaxValue = stats.MaxValue,
+            IsMinValueExact = stats.IsMinValueExact,
+            IsMaxValueExact = stats.IsMaxValueExact,
+            NanCount = stats.NanCount,
+            DistinctCount = stats.DistinctCount,
+        };
+    }
+
     // True when the type's SIGNED byte ordering equals its logical ordering — the precondition for emitting
-    // the deprecated Statistics.min/max fields (see the call site).
+    // the deprecated Statistics.min/max fields (see DropDeprecatedMinMaxIfMisordered).
     private static bool SignedOrderMatchesLogical(Apache.Arrow.Types.IArrowType type) => type switch
     {
         BooleanType => true,
@@ -1718,6 +1752,11 @@ internal static class ColumnChunkWriter
         return ArrowCompute.Take(array.Values, physical);
     }
 
+    /// <summary>
+    /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1
+    /// so value encoding methods can check != 0 for presence.
+    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel &lt;= 1.
+    /// </summary>
     private static int[]? NormalizeDefLevels(int[]? defLevels, int maxDefLevel)
     {
         if (defLevels == null)
