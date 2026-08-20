@@ -238,6 +238,39 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, bool>? ColumnDictionaryEnabled { get; init; }
 
     /// <summary>
+    /// Whether to compute and write column-chunk statistics. Default <see langword="true"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Off means the column chunk carries NO <c>Statistics</c> at all</b> — not merely no bounds.
+    /// The null count, distinct count and NaN count go with the min/max, because that is what
+    /// "statistics off" means everywhere else: MEASURED, pyarrow's <c>write_statistics=False</c> leaves
+    /// <c>statistics</c> null on every column chunk, null count included, and parquet-cpp's
+    /// <c>disable_statistics</c> is the same switch underneath. An option by that name that quietly kept
+    /// some of them would be the surprising one.</para>
+    ///
+    /// <para>Turning them off saves both footer bytes and write time: the collector is not run, so a
+    /// column that is not dictionary-encoded skips a full scan of its values. Binary bounds are already
+    /// truncated at 64 bytes each, so the footer saving is bounded per column — it is a wide schema, not
+    /// a single wide column, where it adds up.</para>
+    ///
+    /// <para>Statistics are how a reader prunes row groups it does not need. A file written without them
+    /// is read correctly by everything, just without that shortcut.</para>
+    /// </remarks>
+    public bool WriteStatistics { get; init; } = true;
+
+    /// <summary>
+    /// Per-column statistics overrides, keyed by dotted column path (e.g. "col1" or "struct1.field1").
+    /// Columns not listed use <see cref="WriteStatistics"/>.
+    /// </summary>
+    /// <remarks>
+    /// A map rather than a list of exclusions, so it overrides in both directions: a column set
+    /// <see langword="true"/> here still gets statistics when <see cref="WriteStatistics"/> is
+    /// <see langword="false"/> globally, which is the shape that lets a caller keep bounds on the one
+    /// column it prunes by and drop them everywhere else.
+    /// </remarks>
+    public IReadOnlyDictionary<string, bool>? ColumnWriteStatistics { get; init; }
+
+    /// <summary>
     /// Enables VARIANT shredding on write, using these inference thresholds. Default
     /// <see langword="null"/>: variant columns are written in the canonical <c>struct&lt;metadata,
     /// value&gt;</c> form, which is spec-legal and what every reader accepts.
@@ -419,4 +452,13 @@ public sealed record ParquetWriteOptions
         ColumnDictionaryEnabled.TryGetValue(string.Join(".", pathInSchema), out bool enabled)
             ? enabled
             : DictionaryEnabled;
+
+    /// <summary>
+    /// Resolves whether a column carries statistics, checking per-column overrides first.
+    /// </summary>
+    internal bool GetWriteStatistics(IReadOnlyList<string> pathInSchema) =>
+        ColumnWriteStatistics != null &&
+        ColumnWriteStatistics.TryGetValue(string.Join(".", pathInSchema), out bool enabled)
+            ? enabled
+            : WriteStatistics;
 }
