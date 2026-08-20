@@ -314,11 +314,6 @@ public class MalformedNestedLevelsTests
         ]);
     }
 
-    // ───── Raw file construction ─────
-
-    /// <summary>
-    /// One leaf column's page contents, written verbatim — including levels no correct writer emits.
-    /// </summary>
     /// <summary>
     /// <c>optional group m (MAP) { repeated group key_value { required int32 key; optional boolean value; } }</c>.
     /// </summary>
@@ -352,6 +347,11 @@ public class MalformedNestedLevelsTests
         ]);
     }
 
+    // ───── Raw file construction ─────
+
+    /// <summary>
+    /// One leaf column's page contents, written verbatim — including levels no correct writer emits.
+    /// </summary>
     private sealed record ColumnSpec(
         string[] Path, PhysicalType Type,
         int[]? RepLevels, int MaxRepLevel, int[]? DefLevels, int MaxDefLevel, byte[] ValueBytes)
