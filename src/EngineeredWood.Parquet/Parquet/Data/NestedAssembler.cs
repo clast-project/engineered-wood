@@ -195,6 +195,8 @@ internal static class NestedAssembler
         var elementField = new Apache.Arrow.Field("element", elementType, nullable: false);
         var listType = new ListType(elementField);
 
+        ValidateListExtent(node, offsets, parentCount, elementArray.Length, "element");
+
         var offsetsBuffer = ToArrowBuffer(offsets);
         var bitmapBuffer = nullCount > 0 ? new ArrowBuffer(bitmap!) : ArrowBuffer.Empty;
 
@@ -304,6 +306,8 @@ internal static class NestedAssembler
         // Filter out phantom entries (null/empty list markers) from the element array
         elementArray = FilterElementArray(elementArray, defLevels, emptyDefThreshold);
 
+        ValidateListExtent(node, offsets, parentCount, elementArray.Length, "element");
+
         var listType = new ListType(elementField);
         var offsetsBuffer = ToArrowBuffer(offsets);
         var bitmapBuffer = nullCount > 0 ? new ArrowBuffer(bitmap!) : ArrowBuffer.Empty;
@@ -376,6 +380,8 @@ internal static class NestedAssembler
         int entryCount = keyArray.Length;
         var kvStructType = new StructType(new[] { keyField, valueField });
         var kvStruct = new StructArray(kvStructType, entryCount, structChildren, ArrowBuffer.Empty, nullCount: 0);
+
+        ValidateListExtent(node, offsets, parentCount, entryCount, "key/value entry");
 
         var offsetsBuffer = ToArrowBuffer(offsets);
         var bitmapBuffer = nullCount > 0 ? new ArrowBuffer(bitmap!) : ArrowBuffer.Empty;
@@ -699,6 +705,53 @@ internal static class NestedAssembler
             leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
             leafArrays[i] = ArrowCompute.Take(leafArrays[i], keepIndices);
         }
+    }
+
+    /// <summary>
+    /// Verifies that the list offsets just built stay inside the child array they index.
+    /// </summary>
+    /// <remarks>
+    /// <para>Offsets come from the repetition levels; the child's length comes from the definition
+    /// levels. A file whose two level streams disagree produces a <see cref="ListArray"/> that
+    /// Arrow's own <c>Validate(full)</c> rejects — "offset for slot N out of bounds" — and that any
+    /// consumer indexing the offending row reads past the end of. Writers do emit such files:
+    /// DuckDB 1.5.5 writes one level entry per declared slot for a NULL fixed-size-list row where
+    /// the format allows exactly one, so its repetition levels claim elements the definition levels
+    /// never define. Handing the array back regardless would propagate the corruption far from the
+    /// file that caused it, so refuse it here instead — the same answer PyArrow gives.</para>
+    /// <para>The check is O(1) per nested level: only the terminal offset can exceed the child, since
+    /// the offsets this assembler builds are non-decreasing by construction. A child LONGER than the
+    /// terminal offset is not a violation — every offset still resolves — so it is left alone rather
+    /// than risking a false refusal of a file that reads correctly today.</para>
+    /// </remarks>
+    private static void ValidateListExtent(
+        SchemaNode node, int[] offsets, int parentCount, int childLength, string elementNoun)
+    {
+        int required = offsets[parentCount];
+        if (required <= childLength)
+            return;
+
+        ThrowInconsistentLevels(node, required, childLength, elementNoun);
+    }
+
+    private static void ThrowInconsistentLevels(
+        SchemaNode node, int required, int available, string elementNoun)
+        => throw new ParquetFormatException(
+            $"Malformed Parquet file: column '{ColumnPath(node)}' needs {required} {elementNoun}(s) " +
+            $"but the column chunk only defines {available}. Its repetition and definition levels " +
+            "disagree about how many values the column holds, so the decoded data cannot be " +
+            "represented as a valid Arrow array.");
+
+    /// <summary>
+    /// Builds the dotted schema path of a node, excluding the unnamed root.
+    /// </summary>
+    private static string ColumnPath(SchemaNode node)
+    {
+        var parts = new List<string>();
+        for (var current = node; current?.Parent != null; current = current.Parent)
+            parts.Add(current.Name);
+        parts.Reverse();
+        return string.Join(".", parts);
     }
 
     /// <summary>

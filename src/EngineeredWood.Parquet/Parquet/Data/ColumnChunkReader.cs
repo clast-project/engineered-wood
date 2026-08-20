@@ -164,6 +164,8 @@ internal static class ColumnChunkReader
                 repLevels[i] = src[i];
         }
 
+        EnsureFullRowCoverage(state, column, rowCount);
+
         IArrowArray array;
         if (isRepeated)
         {
@@ -176,6 +178,31 @@ internal static class ColumnChunkReader
         }
 
         return new ColumnResult(array, defLevels, repLevels);
+    }
+
+    /// <summary>
+    /// Verifies that a non-repeated column decoded one entry per row before its array is built.
+    /// </summary>
+    /// <remarks>
+    /// The array builders index the level (or value) buffer by row, so a chunk that decoded fewer
+    /// entries than the row group declares reads off the end of its own buffer — surfacing as an
+    /// <see cref="IndexOutOfRangeException"/> from deep inside the builder, naming nothing useful.
+    /// A malformed file deserves to be reported as one (issue #165). Over-long chunks are left
+    /// alone: the surplus entries are simply ignored, which harms nothing.
+    /// </remarks>
+    private static void EnsureFullRowCoverage(ColumnBuildState state, ColumnDescriptor column, int rowCount)
+    {
+        if (column.MaxRepetitionLevel > 0)
+            return;
+
+        int decoded = column.MaxDefinitionLevel > 0 ? state.DefLevelSpan.Length : state.ValueCount;
+        if (decoded >= rowCount)
+            return;
+
+        throw new ParquetFormatException(
+            $"Malformed Parquet file: column '{string.Join(".", column.Path)}' holds {decoded} " +
+            $"value(s) but the row group declares {rowCount} row(s). A non-repeated column must " +
+            "carry one entry per row.");
     }
 
     /// <summary>
@@ -508,6 +535,8 @@ internal static class ColumnChunkReader
                 repLevels[i] = src[i];
         }
 
+        EnsureFullRowCoverage(state, column, pageRowCount);
+
         IArrowArray array;
         if (isRepeated)
         {
@@ -589,6 +618,8 @@ internal static class ColumnChunkReader
             for (int i = 0; i < src.Length; i++)
                 repLevels[i] = src[i];
         }
+
+        EnsureFullRowCoverage(state, column, pageRowCount);
 
         IArrowArray array;
         if (isRepeated)
