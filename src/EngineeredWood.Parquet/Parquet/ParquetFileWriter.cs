@@ -439,13 +439,20 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         // For fixed-width types: copy value buffer, bitmap
         // For variable-width types: copy offsets + data buffer, bitmap
-        int nullCount = data.NullCount;
         int srcOffset = data.Offset;
 
-        ArrowBuffer newBitmap;
-        if (data.Buffers.Length > 0 && data.Buffers[0].Length > 0 && nullCount > 0)
+        // The branch is decided by whether a validity bitmap EXISTS, never by the slice's null count.
+        // `data` is a slice, and a slice whose parent had nulls carries an UNKNOWN (negative) count — so a
+        // `nullCount > 0` test silently fails for exactly the arrays that need the copy, and the bitmap was
+        // taken unshifted: row group N then read its validity from bit 0 instead of bit srcOffset, and every
+        // row from the first row-group boundary onward was aligned against the wrong mask (issue #155).
+        //
+        // The copy walks the slice's bits anyway, so it counts the nulls on the way through rather than
+        // asking Arrow to recompute them afterwards.
+        ArrowBuffer newBitmap = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (data.Buffers.Length > 0 && data.Buffers[0].Length > 0)
         {
-            // Copy null bitmap
             var bitmapBytes = new byte[(length + 7) / 8];
             var srcBitmap = data.Buffers[0].Span;
             for (int i = 0; i < length; i++)
@@ -453,16 +460,15 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 bool isSet = (srcBitmap[(srcOffset + i) / 8] & (1 << ((srcOffset + i) % 8))) != 0;
                 if (isSet)
                     bitmapBytes[i / 8] |= (byte)(1 << (i % 8));
+                else
+                    nullCount++;
             }
-            newBitmap = new ArrowBuffer(bitmapBytes);
-        }
-        else if (nullCount == 0)
-        {
-            newBitmap = ArrowBuffer.Empty;
-        }
-        else
-        {
-            newBitmap = data.Buffers.Length > 0 ? data.Buffers[0] : ArrowBuffer.Empty;
+
+            // A null-free slice of a nullable column keeps no bitmap: absent validity means all-valid in
+            // Arrow, and it is what the rest of the write path already sees for a column with no nulls.
+            // This is reachable on its own — a column whose nulls all fall in EARLIER row groups.
+            if (nullCount > 0)
+                newBitmap = new ArrowBuffer(bitmapBytes);
         }
 
         switch (type)

@@ -929,6 +929,65 @@ public class CrossValidationTests : IDisposable
         Assert.Equal(500, meta.RowGroups[0].NumRows);
     }
 
+    // The auto-split validity defect of issue #155 was in the bytes on disk, not in our reader — so the
+    // check that matters is an INDEPENDENT reader agreeing. Nulls fall on every third row, and
+    // RowGroupMaxRows splits them across four groups, so the boundary lands on a valid row whose
+    // corresponding leading bit is null.
+    [Fact]
+    public async Task AutoSplit_NullableColumns_PSReadsSameNullPositions()
+    {
+        var path = TempPath("auto-split-nullable.parquet");
+        const int totalRows = 350;
+        const int maxRowsPerGroup = 100;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: true))
+            .Field(new Field("s", StringType.Default, nullable: true))
+            .Build();
+
+        var ints = new Int32Array.Builder();
+        var strings = new StringArray.Builder();
+        for (int i = 0; i < totalRows; i++)
+        {
+            if (i % 3 == 0) { ints.AppendNull(); strings.AppendNull(); }
+            else { ints.Append(i); strings.Append($"v{i}"); }
+        }
+
+        var batch = new RecordBatch(schema, [ints.Build(), strings.Build()], totalRows);
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = maxRowsPerGroup });
+
+        var expectedInts = Enumerable.Range(0, totalRows).Select(i => i % 3 == 0 ? (int?)null : i).ToArray();
+        var expectedStrings = Enumerable.Range(0, totalRows).Select(i => i % 3 == 0 ? null : $"v{i}").ToArray();
+
+        using var reader = new ParquetSharp.ParquetFileReader(path);
+        Assert.Equal(4, reader.FileMetaData.NumRowGroups);
+
+        var seenInts = new List<int?>();
+        var seenStrings = new List<string?>();
+        for (int g = 0; g < reader.FileMetaData.NumRowGroups; g++)
+        {
+            using var rg = reader.RowGroup(g);
+            int rows = checked((int)rg.MetaData.NumRows);
+
+            using (var col = rg.Column(0).LogicalReader<int?>())
+            {
+                var buffer = new int?[rows];
+                col.ReadBatch(buffer);
+                seenInts.AddRange(buffer);
+            }
+
+            using (var col = rg.Column(1).LogicalReader<string?>())
+            {
+                var buffer = new string?[rows];
+                col.ReadBatch(buffer);
+                seenStrings.AddRange(buffer);
+            }
+        }
+
+        Assert.Equal(expectedInts, seenInts);
+        Assert.Equal(expectedStrings, seenStrings);
+    }
+
     [Fact]
     public async Task AutoSplit_WithNullableAndStringColumns()
     {
