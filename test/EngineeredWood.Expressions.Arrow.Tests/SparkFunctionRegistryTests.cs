@@ -363,7 +363,8 @@ public sealed class SparkFunctionRegistryTests
         // literal text "<out of range>" AS THE VALUE, and inside the ceiling a value carrying more
         // than 28 significant digits was silently rounded to 28. Rendering now works from the
         // unscaled integer and scale, which is exact across all of precision 38.
-        var batch = WideDecimalBatch(scale, ("d", System.Numerics.BigInteger.Parse(unscaled)));
+        var batch = WideDecimalBatch(scale, ("d",
+            System.Numerics.BigInteger.Parse(unscaled, System.Globalization.CultureInfo.InvariantCulture)));
 
         var rendered = Assert.IsType<StringArray>(Eval(Ansi, "CAST(d AS STRING)", batch));
         Assert.Equal(expected, rendered.GetString(0));
@@ -495,7 +496,8 @@ public sealed class SparkFunctionRegistryTests
         // asserted when it was written from Spark's integer behaviour instead of measured. A
         // decimal result that will not fit names a different condition from an int one that will
         // not. See the wide-decimal group of the corpus.
-        var big = System.Numerics.BigInteger.Parse("60000000000000000000000000000000000000");
+        var big = System.Numerics.BigInteger.Parse(
+            "60000000000000000000000000000000000000", System.Globalization.CultureInfo.InvariantCulture);
         var batch = WideDecimalBatch(("a", big), ("b", big));
 
         var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "a + b", batch));
