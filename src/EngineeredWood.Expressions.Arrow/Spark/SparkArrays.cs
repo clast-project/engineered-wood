@@ -235,23 +235,18 @@ internal static class SparkArrays
 
         // Only in-range values get an exact form; the rest travel as a double and are refused by
         // whichever cast needs exactness.
+        //
+        // The bound is what makes an unguarded ReadDecimal safe here, and the two are a pair. The
+        // ONLY condition under which reading an exact decimal raises is a magnitude past
+        // System.Decimal's ceiling of ~7.9228e28, and this bound is stricter than that, so nothing
+        // that passes it can raise. Excess significant DIGITS do not raise — Decimal128Array
+        // rounds them to 28 and reports success, which is #175 and not something a catch here
+        // could see anyway. Loosen this bound and the exception becomes reachable again.
         decimal? exact = asDouble.Value is >= -7.9e28 and <= 7.9e28
-            ? ReadDecimalOrNull(array, index)
+            ? ReadDecimal(array, index)
             : null;
 
         return new CastInput(asDouble.Value, exact, Render(array, index, exact));
-    }
-
-    private static decimal? ReadDecimalOrNull(IArrowArray array, int index)
-    {
-        try
-        {
-            return ReadDecimal(array, index);
-        }
-        catch (OverflowException)
-        {
-            return null;
-        }
     }
 
     /// <summary>Renders an instant the way Spark prints it.</summary>

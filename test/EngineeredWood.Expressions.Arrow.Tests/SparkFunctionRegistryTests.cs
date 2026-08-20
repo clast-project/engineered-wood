@@ -346,6 +346,27 @@ public sealed class SparkFunctionRegistryTests
     }
 
     [Fact]
+    public void ACastNeedingExactnessRefusesPastTheCeilingRatherThanRaisingFromTheRead()
+    {
+        // Pins the pair that ReadForCast depends on: its +/-7.9e28 bound is stricter than
+        // System.Decimal's ~7.9228e28 ceiling, so a value that passes the bound can never make the
+        // exact read raise, and a value that fails it gets no exact form and is REFUSED by
+        // whichever cast needs one. What must not happen either side of that line is a
+        // NotSupportedException escaping the evaluator.
+        //
+        // Excess significant digits are not this line -- Decimal128Array rounds those to 28 and
+        // reports success. That silent loss is #175 and deliberately not asserted here.
+        var past = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
+
+        var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(big AS INT)", past));
+        Assert.Equal("CAST_OVERFLOW", ex.ErrorClass);
+
+        // Under the bound the exact form is produced rather than refused, and nothing raises.
+        var under = WideDecimalBatch(("small", new System.Numerics.BigInteger(42)));
+        Assert.Equal(42, Assert.IsType<Int32Array>(Eval(Ansi, "CAST(small AS INT)", under)).GetValue(0));
+    }
+
+    [Fact]
     public void ComparingAWideDecimalAgainstADoubleDegradesToADoubleComparison()
     {
         // The one place the System.Decimal ceiling is still reachable, and the reason the refusal
