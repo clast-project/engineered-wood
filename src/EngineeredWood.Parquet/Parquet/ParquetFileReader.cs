@@ -259,17 +259,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             maxBytes = ImplicitLargeChunkBatchBytes;
         }
 
-        bool hasBatchLimit = batchSize is > 0 || maxBytes is > 0;
-
-        // When no batch limit is set, fall back to the standard single-batch path.
-        if (!hasBatchLimit)
-        {
-            yield return await ReadRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
-                .ConfigureAwait(false);
-            yield break;
-        }
-
-        // Check whether the entire row group fits in one batch.
+        // No delegation back to ReadRowGroupAsync when there is no batch limit: it would call
+        // PrepareRowGroupAsync a second time for the row group already prepared above, and since
+        // ReadAllAsync now always comes through here that is every row group of every ordinary read. With
+        // no limit set nothing below narrows the batch, so the single-pass branch handles it unchanged.
         bool fitsInOneBatch = true;
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
             fitsInOneBatch = false;

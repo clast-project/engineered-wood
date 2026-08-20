@@ -179,7 +179,16 @@ internal static class PlainDecoder
             if (len < 0)
                 throw new ParquetFormatException($"PLAIN ByteArray value {i} has a negative length ({len}).");
 
-            srcPos += 4 + len;
+            // The value's own bytes are checked here, not left to whoever slices them later: a length
+            // near int.MaxValue would otherwise make `4 + len` wrap NEGATIVE in 32-bit arithmetic, walk
+            // srcPos backwards past the guard above, and reach a span slice as ArgumentOutOfRangeException
+            // — the same opaque failure this whole change is about, reached from a malformed file instead
+            // of a large one. `4L` keeps the arithmetic in 64 bits so the check itself cannot wrap.
+            if (srcPos + 4L + len > data.Length)
+                throw new ParquetFormatException(
+                    $"PLAIN ByteArray value {i} claims {len:N0} bytes, which runs past the end of the page.");
+
+            srcPos += 4L + len;
             totalDataSize += len;
             if (totalDataSize > ByteArrayCapacity.MaxBytes)
             {

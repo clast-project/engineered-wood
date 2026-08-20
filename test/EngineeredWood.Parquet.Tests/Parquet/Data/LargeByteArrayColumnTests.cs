@@ -58,6 +58,56 @@ public class LargeByteArrayColumnTests
         Assert.Contains("This BYTE_ARRAY column", ex.Message);
     }
 
+    // A length prefix near int.MaxValue is the malformed-file route to the same opaque failure this
+    // change is about. `4 + len` in 32-bit arithmetic wraps NEGATIVE, walks the read position backwards
+    // past the end-of-data guard, and reaches a span slice as ArgumentOutOfRangeException. Cheap to test
+    // directly, since only the length prefix has to be large — not the data.
+    [Theory]
+    [InlineData(int.MaxValue)]
+    [InlineData(int.MaxValue - 3)]   // 4 + len overflows by exactly one
+    [InlineData(1024)]               // simply runs past the end, no overflow involved
+    public void MeasureByteArrays_LengthRunningPastTheEnd_IsAFormatError(int declaredLength)
+    {
+        var page = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(page, declaredLength);
+        var offsets = new int[2];
+
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => PlainDecoder.MeasureByteArrays(page, offsets, count: 1, columnPath: "payload"));
+
+        Assert.Contains("runs past the end", ex.Message);
+    }
+
+    [Fact]
+    public void MeasureByteArrays_NegativeLength_IsAFormatError()
+    {
+        var page = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(page, -1);
+        var offsets = new int[2];
+
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => PlainDecoder.MeasureByteArrays(page, offsets, count: 1, columnPath: "payload"));
+
+        Assert.Contains("negative length", ex.Message);
+    }
+
+    // The guards above must not reject a well-formed page: the last value ending exactly at the end of
+    // the buffer is the boundary they could most easily get wrong.
+    [Fact]
+    public void MeasureByteArrays_ValuesEndingExactlyAtTheEnd_AreAccepted()
+    {
+        // Two values of 3 and 5 bytes: [len=3][3 bytes][len=5][5 bytes]
+        var page = new byte[4 + 3 + 4 + 5];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(page.AsSpan(0), 3);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(page.AsSpan(7), 5);
+        var offsets = new int[3];
+
+        int total = PlainDecoder.MeasureByteArrays(page, offsets, count: 2, columnPath: "payload");
+
+        Assert.Equal(8, total);
+        Assert.Equal([0, 3, 8], offsets);
+    }
+
     // ── The multi-gigabyte cases ───────────────────────────────────────────────────────────────────
     //
     // ONE TARGET FRAMEWORK ONLY. These four decode 2+ GiB each — MEASURED at 16s on net10.0 and 28s on
