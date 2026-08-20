@@ -40,6 +40,14 @@
    "type": "decimal(38,10)"
   },
   {
+   "name": "d4",
+   "type": "decimal(38,0)"
+  },
+  {
+   "name": "d5",
+   "type": "decimal(38,38)"
+  },
+  {
    "name": "s",
    "type": "string"
   },
@@ -78,6 +86,8 @@
    "'12.34'",
    "'1.2345'",
    "'9.99'",
+   "'1000000000000000000000000000000'",
+   "'0.1'",
    "'abc'",
    "'abc'",
    "'2026-08-11 12:30:00'",
@@ -87,6 +97,8 @@
    "named_struct('arr', array(1, 2, 3), 'm', map('k', 7), 'name', 'leaf')"
   ],
   [
+   "NULL",
+   "NULL",
    "NULL",
    "NULL",
    "NULL",
@@ -112,6 +124,8 @@
    "'0.00'",
    "'0.0000'",
    "'0.0'",
+   "'-1000000000000000000000000000000'",
+   "'0.5'",
    "''",
    "'xyz'",
    "'1970-01-01 00:00:00'",
@@ -2227,9 +2241,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-08-11",
-      "2026-08-11",
-      "2026-08-11"
+      "2026-08-13",
+      "2026-08-13",
+      "2026-08-13"
      ]
     }
    },
@@ -2247,9 +2261,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-08-11 05:53:36.396217",
-      "2026-08-11 05:53:36.396217",
-      "2026-08-11 05:53:36.396217"
+      "2026-08-13 16:55:39.131489",
+      "2026-08-13 16:55:39.131489",
+      "2026-08-13 16:55:39.131489"
      ]
     }
    },
@@ -2982,11 +2996,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#646]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, s#8, t#9, ts#10, dt#11, bl#12, bin#13, nested#14], false\n"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#654]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#647]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#15, cast(10 as bigint) AS b#16L, cast(2 as sm"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#655]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as sm"
     }
    },
    {
@@ -3747,6 +3761,620 @@
       null,
       "0.00"
      ]
+    }
+   }
+  ],
+  "wide-decimal": [
+   {
+    "expression": "d4 + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d4 + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000001",
+      null,
+      "-999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "d4 - 1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(d4 - 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "999999999999999999999999999999",
+      null,
+      "-1000000000000000000000000000001"
+     ]
+    }
+   },
+   {
+    "expression": "d4 * 2",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d4 * 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2000000000000000000000000000000",
+      null,
+      "-2000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "-d4",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1000000000000000000000000000000",
+      null,
+      "1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d4 + d1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d4 + d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000012.34",
+      null,
+      "-1000000000000000000000000000000.00"
+     ]
+    }
+   },
+   {
+    "expression": "d4 + d3",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d4 + d3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000009.990000",
+      null,
+      "-1000000000000000000000000000000.000000"
+     ]
+    }
+   },
+   {
+    "expression": "d4 * d1",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d4 * d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12340000000000000000000000000000.00",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "d5 / d5",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(d5 / d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.000000",
+      null,
+      "1.000000"
+     ]
+    }
+   },
+   {
+    "expression": "d5 * d5",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d5 * d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,37)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0100000000000000000000000000000000000",
+      null,
+      "0.2500000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d5 + d5",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d5 + d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,37)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.2000000000000000000000000000000000000",
+      null,
+      "1.0000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d4 = d4",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d4 = d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "d4 > d1",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(d4 > d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(d4, d1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(d4, d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "-1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(d4 AS DECIMAL(38,2))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS DECIMAL(38,2))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000.00",
+      null,
+      "-1000000000000000000000000000000.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(d4 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+30,
+      null,
+      -1e+30
+     ]
+    }
+   },
+   {
+    "expression": "CAST(d4 AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "-1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(CAST(246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.123457",
+      "0.123457",
+      "0.123457"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(CAST(-246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.123457",
+      "-0.123457",
+      "-0.123457"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(CAST(-1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.000001",
+      "-0.000001",
+      "-0.000001"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(CAST(1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.000001",
+      "0.000001",
+      "0.000001"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(2.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3",
+      "3",
+      "3"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-2.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-3",
+      "-3",
+      "-3"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1.45 AS DECIMAL(38,2)) AS DECIMAL(38,1))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.45BD AS DECIMAL(38,2)) AS DECIMAL(38,1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      "1.5",
+      "1.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(3.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(3.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "4",
+      "4",
+      "4"
+     ]
+    }
+   },
+   {
+    "expression": "d3 * d3",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d3 * d3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99.800100",
+      null,
+      "0.000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0)) + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(CAST(60000000000000000000000000000000000000BD AS DECIMAL(38,0)) + CAST(60000000000000000000000000000000000000BD AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  120000000000000000000000000000000000000 cannot be represented as Decimal(38, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0)) + CAST(60000000000000000000000000000000000"
+    }
+   },
+   {
+    "expression": "d4 * d4",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d4 * d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  1000000000000000000000000000000000000000000000000000000000000 cannot be represented as Decimal(38, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(d4 * d4) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(d4 AS DECIMAL(10,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS DECIMAL(10,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(10,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  1000000000000000000000000000000 cannot be represented as Decimal(10, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST(d4 AS DECIMAL(10,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(d4 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  12345.0 cannot be represented as Decimal(3, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('12345' AS DECIMAL(3,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('12345' AS DECIMAL(3,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  12345 cannot be represented as Decimal(3, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST('12345' AS DECIMAL(3,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(a AS DECIMAL(2,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(a AS DECIMAL(2,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  -2147483648 cannot be represented as Decimal(2, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST(a AS DECIMAL(2,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
     }
    }
   ],

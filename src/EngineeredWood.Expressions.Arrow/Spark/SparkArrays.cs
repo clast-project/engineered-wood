@@ -155,11 +155,16 @@ internal static class SparkArrays
     /// A Decimal128 cell as an exact <see cref="decimal"/>, refusing when it does not fit.
     /// </summary>
     /// <remarks>
-    /// Decimal arithmetic here is computed in <see cref="decimal"/>, which tops out around 7.9e28
-    /// while Spark decimals reach precision 38. A value past that cannot be evaluated exactly and
-    /// must not be evaluated approximately — a CHECK constraint that silently rounds is worse
-    /// than one that refuses. Refusing keeps the write fail-closed, which is the behaviour the
-    /// table already had before any of this existed.
+    /// Decimal arithmetic no longer runs through <see cref="decimal"/>: <c>SparkWideDecimals</c>
+    /// computes on the unscaled integer and covers Spark's full precision 38. This stays for the
+    /// callers that want a <see cref="decimal"/> specifically, where a value past decimal's
+    /// ceiling near 7.9e28 has no exact form at all.
+    /// <para>
+    /// Refusing rather than rounding is load-bearing in both directions. It is what lets equality
+    /// fall back to a double comparison when one side is a float and cannot be exact anyway, and
+    /// it is what keeps a cast needing exactness fail-closed — a CHECK constraint that silently
+    /// rounds is worse than one that refuses.
+    /// </para>
     /// </remarks>
     private static decimal ExactDecimal(Decimal128Array array, int index)
     {
@@ -171,8 +176,8 @@ internal static class SparkArrays
         {
             var type = (Decimal128Type)array.Data.DataType;
             throw new NotSupportedException(
-                $"a {Describe(type)} value is too wide to evaluate exactly; " +
-                "decimal arithmetic is currently limited to values System.Decimal can hold");
+                $"a {Describe(type)} value is too wide for an exact System.Decimal; " +
+                "a caller that can degrade to a double does so, and one needing exactness refuses");
         }
     }
 

@@ -301,6 +301,14 @@ public sealed class SparkSqlParserTests
             "INTERVAL 1 DAY",           // LiteralValue has no interval kind
             "1Y",                       // no 8-bit integer kind; widening would change coercion
             "1S",                       // no 16-bit integer kind
+
+            // A 38-digit literal, which Spark reads as decimal(38,0). SparkLiteral.ParseDecimal
+            // goes through decimal.TryParse and throws above ~28 digits. Everything downstream is
+            // already in place — LiteralValue.HighPrecisionDecimal is constructed, compared and
+            // evaluated — so this is a missing fallback in one method rather than a missing
+            // feature, but it is its own change and not part of the arithmetic work in #131.
+            "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
+            + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
             "a > (SELECT 1)",           // subquery — Delta refuses these too
             "*",                        // not an expression
             "a IN (SELECT 1)",          // subquery

@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow.Types;
+
 namespace EngineeredWood.Expressions.Arrow.Spark;
 
 /// <summary>
@@ -39,6 +41,25 @@ public sealed class SparkEvaluationException : Exception
     /// </remarks>
     internal static SparkEvaluationException Overflow(bool narrowerThanInt, string detail) =>
         new(narrowerThanInt ? "BINARY_ARITHMETIC_OVERFLOW" : "ARITHMETIC_OVERFLOW", detail);
+
+    /// <summary>
+    /// A value that will not fit the precision of the decimal type it is landing in.
+    /// </summary>
+    /// <remarks>
+    /// Not <c>ARITHMETIC_OVERFLOW</c>, and not <c>CAST_OVERFLOW</c>. Measured, and neither answer
+    /// was the obvious one: a decimal result too wide for its type reports
+    /// <c>NUMERIC_VALUE_OUT_OF_RANGE</c> where the same overflow on an <c>int</c> reports
+    /// <c>ARITHMETIC_OVERFLOW</c>, and a cast lands here too whenever the target is a decimal —
+    /// from a decimal, a double, a string or an integer alike. <c>CAST_OVERFLOW</c> is what a cast
+    /// to an *integral* type reports, so <c>CAST(d AS DECIMAL(10,0))</c> and <c>CAST(d AS INT)</c>
+    /// name different conditions for the same value. Pinned by the <c>wide-decimal</c> group of
+    /// <c>Fixtures/spark-expression-corpus.json</c>.
+    /// </remarks>
+    internal static SparkEvaluationException NumericValueOutOfRange(string value, Decimal128Type type) =>
+        new("NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION",
+            $"{value} cannot be represented as Decimal({type.Precision}, {type.Scale}). " +
+            "If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, " +
+            "and return NULL instead.");
 
     internal static SparkEvaluationException DivideByZero() =>
         new("DIVIDE_BY_ZERO", "Division by zero. Use `try_divide` to tolerate a zero divisor.");

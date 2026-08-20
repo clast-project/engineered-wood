@@ -65,6 +65,10 @@ SCHEMA = [
     {"name": "d1", "type": "decimal(10,2)"},
     {"name": "d2", "type": "decimal(6,4)"},
     {"name": "d3", "type": "decimal(38,10)"},
+    # d4 and d5 sit where System.Decimal cannot follow: d4 holds 10^30 against decimal's ~7.9e28
+    # ceiling, and d5 is all scale, which is the shape that makes division pre-scale hardest.
+    {"name": "d4", "type": "decimal(38,0)"},
+    {"name": "d5", "type": "decimal(38,38)"},
     {"name": "s", "type": "string"},
     {"name": "t", "type": "string"},
     {"name": "ts", "type": "timestamp"},
@@ -79,12 +83,19 @@ SCHEMA = [
 # zeros so the ANSI-sensitive group has something to overflow and divide by.
 #
 # Values are SQL literal text, cast to the declared type by the driver.
+#
+# d4 and d5 deliberately hold values that do NOT overflow, on every row: `eval` is answered per
+# EXPRESSION, not per row, so one overflowing row turns the whole answer into a single error and
+# the values from the other rows are lost. Cases meant to overflow are written as literals in the
+# wide-decimal group instead, where erroring on every row is the point.
 ROWS = [
-    ["1", "10", "2", "1.5", "2.5", "'12.34'", "'1.2345'", "'9.99'", "'abc'", "'abc'",
+    ["1", "10", "2", "1.5", "2.5", "'12.34'", "'1.2345'", "'9.99'",
+     "'1000000000000000000000000000000'", "'0.1'", "'abc'", "'abc'",
      "'2026-08-11 12:30:00'", "'2026-08-11'", "true", "X'00'",
      "named_struct('arr', array(1, 2, 3), 'm', map('k', 7), 'name', 'leaf')"],
-    ["NULL"] * 15,
-    ["-2147483648", "0", "-1", "0.0", "0.0", "'0.00'", "'0.0000'", "'0.0'", "''", "'xyz'",
+    ["NULL"] * 17,
+    ["-2147483648", "0", "-1", "0.0", "0.0", "'0.00'", "'0.0000'", "'0.0'",
+     "'-1000000000000000000000000000000'", "'0.5'", "''", "'xyz'",
      "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
@@ -184,6 +195,52 @@ GROUPS = {
         "b + b", "f + g", "sh * sh",
         "s = a", "s < a", "dt < ts",
         "concat(s, d1)", "greatest(a, g)", "coalesce(d1, a)",
+    ],
+    "wide-decimal": [
+        # Spark decimals reach precision 38; System.Decimal stops near 7.9e28. Everything here
+        # lives above that line, so none of it could be evaluated exactly before issue #131 and
+        # none of its answers were measured until this group existed.
+
+        # Values, on columns that do not overflow on any row.
+        "d4 + 1", "d4 - 1", "d4 * 2", "-d4",
+        "d4 + d1", "d4 + d3", "d4 * d1",
+        "d5 / d5", "d5 * d5", "d5 + d5",
+        "d4 = d4", "d4 > d1", "coalesce(d4, d1)",
+        "CAST(d4 AS DECIMAL(38,2))", "CAST(d4 AS DOUBLE)", "CAST(d4 AS STRING)",
+
+        # Rounding, as literals so that every row gives the same answer and the answer is the
+        # whole point. Each denominator makes the discarded part EXACTLY half a unit with an even
+        # digit before it, which is the only case where half-up and half-even disagree:
+        # 246913/2000000 is 0.1234565, and decimal(38,0)/decimal(38,0) resolves to decimal(38,6).
+        "CAST(246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+        "CAST(-246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+        "CAST(-1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+        "CAST(1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+        # A rescale rather than a division, and both signs, because away-from-zero and
+        # toward-negative-infinity differ only on the negative side.
+        "CAST(CAST(2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+        "CAST(CAST(-2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+        "CAST(CAST(1.45 AS DECIMAL(38,2)) AS DECIMAL(38,1))",
+        # Control: half-up and half-even agree here, so a disagreement would mean something else
+        # is wrong.
+        "CAST(CAST(3.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+        # Clamped multiply, where the result scale falls below s1+s2 and digits are discarded.
+        "d3 * d3",
+
+        # Overflow, as literals so every row errors and the ERROR CLASS is what gets recorded.
+        # 6e37 + 6e37 is 1.2e38: too many digits for decimal(38,0), but comfortably inside a
+        # 128-bit mantissa, so this is the gap a width check alone would let through.
+        "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
+        " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
+        "d4 * d4",
+        "CAST(d4 AS DECIMAL(10,0))",
+        "CAST(d4 AS INT)",
+        # The same overflow reached from the sources that do NOT have an exact integer form, to
+        # check whether the error class follows the target type or the source. A decimal source
+        # and a double source landing on different classes would be worth knowing.
+        "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))",
+        "CAST('12345' AS DECIMAL(3,0))",
+        "CAST(a AS DECIMAL(2,0))",
     ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
