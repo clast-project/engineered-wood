@@ -345,6 +345,49 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal(System.Numerics.BigInteger.Pow(10, 30) + 1, Unscaled(sum));
     }
 
+    [Theory]
+    // Measured from Spark 4.0 via the expr_oracle driver on 2026-08-20, under the corpus's pinned
+    // configuration (ansi on, UTC, ANSI store assignment). decimal(38,0) first:
+    [InlineData(0, "1000000000000000000000000000000", "1000000000000000000000000000000")]
+    [InlineData(0, "-1000000000000000000000000000000", "-1000000000000000000000000000000")]
+    [InlineData(0, "99999999999999999999999999999999999999", "99999999999999999999999999999999999999")]
+    // decimal(38,38), where the scale is the whole width. Trailing zeros are KEPT to the declared
+    // scale, and the smallest magnitude prints all 37 leading zeros rather than in exponent form.
+    [InlineData(38, "12345678901234567890123456789012345678", "0.12345678901234567890123456789012345678")]
+    [InlineData(38, "-1", "-0.00000000000000000000000000000000000001")]
+    [InlineData(38, "10000000000000000000000000000000000000", "0.10000000000000000000000000000000000000")]
+    public void AWideDecimalRendersEveryDigitRatherThanAPlaceholder(
+        int scale, string unscaled, string expected)
+    {
+        // Was #175: past System.Decimal's ceiling the exact form is null and Render emitted the
+        // literal text "<out of range>" AS THE VALUE, and inside the ceiling a value carrying more
+        // than 28 significant digits was silently rounded to 28. Rendering now works from the
+        // unscaled integer and scale, which is exact across all of precision 38.
+        var batch = WideDecimalBatch(scale, ("d", System.Numerics.BigInteger.Parse(unscaled)));
+
+        var rendered = Assert.IsType<StringArray>(Eval(Ansi, "CAST(d AS STRING)", batch));
+        Assert.Equal(expected, rendered.GetString(0));
+
+        // It composed into ordinary string data through concat, which is what made it a
+        // corruption rather than a cosmetic wart. Measured the same way.
+        var joined = Assert.IsType<StringArray>(Eval(Ansi, "concat('v=', CAST(d AS STRING))", batch));
+        Assert.Equal("v=" + expected, joined.GetString(0));
+    }
+
+    [Fact]
+    public void ANarrowDecimalStillRendersExactlyAsItDidBefore()
+    {
+        // The other half of #175: rendering moved off System.Decimal for EVERY decimal, not just
+        // wide ones, so the narrow cases have to be unchanged. Spark's answers for decimal(10,2),
+        // measured in the same run — trailing zeros kept, sign attached, zero not special-cased.
+        var batch = Batch(("a", Decimals(10, 2, 1.00m)), ("b", Decimals(10, 2, -1.50m)),
+                          ("c", Decimals(10, 2, 0.00m)));
+
+        Assert.Equal("1.00", Assert.IsType<StringArray>(Eval(Ansi, "CAST(a AS STRING)", batch)).GetString(0));
+        Assert.Equal("-1.50", Assert.IsType<StringArray>(Eval(Ansi, "CAST(b AS STRING)", batch)).GetString(0));
+        Assert.Equal("0.00", Assert.IsType<StringArray>(Eval(Ansi, "CAST(c AS STRING)", batch)).GetString(0));
+    }
+
     [Fact]
     public void ACastNeedingExactnessRefusesPastTheCeilingRatherThanRaisingFromTheRead()
     {

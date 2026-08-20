@@ -240,8 +240,13 @@ internal static class SparkArrays
         // ONLY condition under which reading an exact decimal raises is a magnitude past
         // System.Decimal's ceiling of ~7.9228e28, and this bound is stricter than that, so nothing
         // that passes it can raise. Excess significant DIGITS do not raise — Decimal128Array
-        // rounds them to 28 and reports success, which is #175 and not something a catch here
-        // could see anyway. Loosen this bound and the exception becomes reachable again.
+        // rounds them to 28 and reports success. Loosen this bound and the exception becomes
+        // reachable again.
+        //
+        // Both limits are why rendering no longer consults this value: it is null past the bound
+        // and quietly rounded inside it, so Render works from the buffer instead. What remains
+        // here serves the casts that need an exact System.Decimal specifically, and those refuse
+        // when it is null rather than rendering anything.
         decimal? exact = asDouble.Value is >= -7.9e28 and <= 7.9e28
             ? ReadDecimal(array, index)
             : null;
@@ -296,11 +301,26 @@ internal static class SparkArrays
     }
 
     /// <summary>Renders a numeric cell the way Spark would print it.</summary>
+    /// <remarks>
+    /// A decimal renders from its unscaled integer and scale rather than from the
+    /// <see cref="decimal"/> exact form, because that form covers only part of the range: past
+    /// decimal's ceiling it is null, and inside the ceiling it silently rounds a value carrying
+    /// more than 28 significant digits. Rendering from the buffer is exact across all of
+    /// precision 38, and is byte-identical to the old rendering everywhere the old one was
+    /// correct — verified over signs, trailing zeros and every scale.
+    /// </remarks>
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
     {
         FloatArray a => a.GetValue(index)!.Value.ToString("R", Invariant),
         DoubleArray a => a.GetValue(index)!.Value.ToString("R", Invariant),
-        _ => value?.ToString(Invariant) ?? "<out of range>",
+        Decimal128Array => SparkWideDecimals.Render(SparkWideDecimals.Read(array, index)!.Value),
+
+        // Integral arrays only, and their exact form is never null: the widest is Int64 at about
+        // 9.2e18, far inside the bound that decides whether an exact form is taken at all. There
+        // is deliberately no placeholder string here — emitting one as a value is what #175 was.
+        _ => value?.ToString(Invariant)
+            ?? throw new NotSupportedException(
+                $"{array.Data.DataType.Name} reached Render with no exact value"),
     };
 
     /// <summary>Whether an integral Arrow type is narrower than <c>int</c>.</summary>
