@@ -348,35 +348,21 @@ internal static class NestedAssembler
         var keyNode = keyValueGroup.Children[0];
         var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
 
-        IArrowArray? valueArray = null;
-        if (keyValueGroup.Children.Count > 1)
-        {
-            var valueNode = keyValueGroup.Children[1];
-            valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-        }
+        // IsMapNode has already established that key_value carries exactly a key and a value; a group that
+        // does not is classified as a list and assembled by AssembleList instead.
+        var valueNode = keyValueGroup.Children[1];
+        var valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
 
         // Filter out phantom entries from key and value arrays
         keyArray = FilterElementArray(keyArray, defLevels, emptyDefThreshold);
-        if (valueArray != null)
-            valueArray = FilterElementArray(valueArray, leafDefLevels[firstLeafIndex + 1] ?? defLevels, emptyDefThreshold);
+        valueArray = FilterElementArray(valueArray, leafDefLevels[firstLeafIndex + 1] ?? defLevels, emptyDefThreshold);
 
         // Build the key_value struct array
         var keyField = NodeToField(keyNode);
         keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false); // keys are non-nullable
 
-        Apache.Arrow.Field valueField;
-        IArrowArray[] structChildren;
-        if (valueArray != null)
-        {
-            var valueNode = keyValueGroup.Children[1];
-            valueField = NodeToField(valueNode);
-            structChildren = [keyArray, valueArray];
-        }
-        else
-        {
-            valueField = new Apache.Arrow.Field("value", Apache.Arrow.Types.StringType.Default, nullable: true);
-            structChildren = [keyArray];
-        }
+        var valueField = NodeToField(valueNode);
+        IArrowArray[] structChildren = [keyArray, valueArray];
 
         var mapType = new MapType(keyField, valueField);
 
