@@ -535,6 +535,15 @@ public class ReadRowGroupTests
                 {
                     var batch = await reader.ReadRowGroupAsync(0);
                     Assert.True(batch.Length >= 0);
+
+                    // Reaching every child array, not just the batch, is the point. A nested column can be
+                    // assembled into an array that is INTERNALLY inconsistent and only throws when something
+                    // reaches into it — map_no_value.parquet built a key_value struct declaring two children
+                    // and holding one, and this sweep read it clean for as long as it stopped at
+                    // batch.Length (issue #156). Anything that actually consumes the batch — an IPC write, a
+                    // copy into another engine — walks the children, so the sweep does too.
+                    for (int c = 0; c < batch.ColumnCount; c++)
+                        TouchChildArrays(batch.Column(c));
                 }
             }
             catch (NotSupportedException ex)
@@ -553,6 +562,47 @@ public class ReadRowGroupTests
 
         Assert.True(failures.Count == 0,
             $"Failed on {failures.Count} files:\n" + string.Join("\n", failures));
+    }
+
+    /// <summary>
+    /// Walks every child of a nested array through the typed accessors a consumer would use, so an array
+    /// whose type and children disagree throws here rather than in someone else's code.
+    /// </summary>
+    private static void TouchChildArrays(IArrowArray array)
+    {
+        switch (array)
+        {
+            case MapArray map:
+                // MapArray derives from ListArray, so it must be matched first — and Keys/Values are the
+                // accessors that reach into the key_value struct's children.
+                TouchChildArrays(map.Keys);
+                TouchChildArrays(map.Values);
+                break;
+            case ListArray list:
+                TouchChildArrays(list.Values);
+                break;
+            case LargeListArray largeList:
+                TouchChildArrays(largeList.Values);
+                break;
+            case FixedSizeListArray fixedList:
+                TouchChildArrays(fixedList.Values);
+                break;
+            case StructArray structArray:
+                foreach (var child in structArray.Fields)
+                    TouchChildArrays(child);
+                break;
+            case DenseUnionArray denseUnion:
+                foreach (var child in denseUnion.Fields)
+                    TouchChildArrays(child);
+                break;
+            case SparseUnionArray sparseUnion:
+                foreach (var child in sparseUnion.Fields)
+                    TouchChildArrays(child);
+                break;
+            default:
+                _ = array.Length;
+                break;
+        }
     }
 
     [Fact]
@@ -1489,7 +1539,8 @@ public class ReadRowGroupTests
     {
         // map_no_value.parquet: 3 rows, 3 columns:
         //   my_map: map<int32, int32> (all values null)
-        //   my_map_no_v: map with no value child (pyarrow reads as list)
+        //   my_map_no_v: MAP-annotated but its key_value group has no value child, so it reads as
+        //                list<key: int32> — see MapNoValue_MapWithoutValueChildReadsAsList
         //   my_list: list<int32>
         // Row 0: keys=[1,2,3], Row 1: keys=[4,5,6], Row 2: keys=[7,8,9]
         await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
@@ -1524,6 +1575,61 @@ public class ReadRowGroupTests
         Assert.Equal(1, listRow0.GetValue(0));
         Assert.Equal(2, listRow0.GetValue(1));
         Assert.Equal(3, listRow0.GetValue(2));
+    }
+
+    // A MAP whose key_value group has a key and NO value is not a map Arrow can build — MapType requires a
+    // value field. Both halves of the read path used to invent one (`value: string`) and only one of them
+    // invented the array to go with it, so the key_value StructArray declared two children and held one:
+    // touching the map's values threw as soon as anything reached for child 1 (issue #156). The whole batch
+    // read fine, which is why the test above could step around it by never touching column 1.
+    //
+    // The reader now agrees with arrow-cpp instead of inventing anything: MEASURED, PyArrow reads this same
+    // column as `list<key: int32 not null>` with values [[1,2,3],[4,5,6],[7,8,9]].
+    [Fact]
+    public async Task MapNoValue_MapWithoutValueChildReadsAsList()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var field = batch.Schema.FieldsList[1];
+        Assert.Equal("my_map_no_v", field.Name);
+        var listType = Assert.IsType<ListType>(field.DataType);
+
+        // The element keeps the key's own name and non-nullability, exactly as PyArrow reports it.
+        Assert.Equal("key", listType.ValueField.Name);
+        Assert.IsType<Int32Type>(listType.ValueField.DataType);
+        Assert.False(listType.ValueField.IsNullable);
+
+        var list = Assert.IsType<ListArray>(batch.Column(1));
+        Assert.Equal(3, list.Length);
+
+        var rows = Enumerable.Range(0, list.Length)
+            .Select(i => ((Int32Array)list.GetSlicedValues(i)!).Values.ToArray())
+            .ToArray();
+
+        Assert.Equal([1, 2, 3], rows[0]);
+        Assert.Equal([4, 5, 6], rows[1]);
+        Assert.Equal([7, 8, 9], rows[2]);
+    }
+
+    // The map that IS well formed must keep reading as a map, with its all-null values reachable — the
+    // column the fix above must not sweep up. Its key_value group has both children.
+    [Fact]
+    public async Task MapNoValue_WellFormedMapStillExposesItsNullValues()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var map = Assert.IsType<MapArray>(batch.Column(0));
+        var values = Assert.IsType<Int32Array>(map.Values);
+
+        Assert.Equal(9, map.Keys.Length);
+        Assert.Equal(9, values.Length);
+        Assert.Equal(9, values.NullCount);
     }
 
     [Fact]

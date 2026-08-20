@@ -114,13 +114,58 @@ internal static class ArrowSchemaConverter
     internal static bool IsListNode(SchemaNode node) =>
         !node.IsLeaf &&
         (node.Element.LogicalType is LogicalType.ListType ||
-         node.Element.ConvertedType == ConvertedType.List);
+         node.Element.ConvertedType == ConvertedType.List ||
+         // A MAP whose key_value group is REAL but not a key-and-value pair reads as a LIST of that same
+         // group. Without a repeated group there is nothing to make a list out of either, so that case is
+         // deliberately not swept in here — it falls through to the struct path below.
+         (IsMapAnnotated(node) && HasRepeatedGroup(node) && !HasKeyAndValue(node)));
 
     internal static bool IsMapNode(SchemaNode node) =>
+        IsMapAnnotated(node) && HasRepeatedGroup(node) && HasKeyAndValue(node);
+
+    private static bool IsMapAnnotated(SchemaNode node) =>
         !node.IsLeaf &&
         (node.Element.LogicalType is LogicalType.MapType ||
          node.Element.ConvertedType == ConvertedType.Map ||
          node.Element.ConvertedType == ConvertedType.MapKeyValue);
+
+    /// <summary>
+    /// Whether a MAP-annotated node has the one repeated <c>key_value</c> group the annotation promises.
+    /// </summary>
+    /// <remarks>
+    /// Both the map and the list assembler read repetition and definition thresholds off this group, so a
+    /// node without it can be read as neither — the thresholds would describe a nesting level the file does
+    /// not have, and the offsets and validity computed from them would be wrong rather than merely absent.
+    /// Such a node is left to the struct path, which is what the group literally is.
+    /// </remarks>
+    private static bool HasRepeatedGroup(SchemaNode node) =>
+        node.Children.Count == 1 &&
+        !node.Children[0].IsLeaf &&
+        node.Children[0].Element.RepetitionType == FieldRepetitionType.Repeated;
+
+    /// <summary>
+    /// Whether the <c>key_value</c> group carries exactly a key and a value, which is what Arrow's
+    /// <see cref="MapType"/> needs and more than the Parquet spec requires. Call only after
+    /// <see cref="HasRepeatedGroup"/>.
+    /// </summary>
+    /// <remarks>
+    /// The spec makes <c>value</c> optional, but <see cref="MapType"/> requires it — so a <c>key_value</c>
+    /// with only a key cannot be built as a map without inventing a column the file does not contain.
+    /// Reading it as a LIST of the repeated group invents nothing, and is what arrow-cpp does: PyArrow reads
+    /// parquet-testing's <c>map_no_value.parquet</c> as <c>list&lt;key: int32 not null&gt;</c>, and we now
+    /// agree with it field for field.
+    /// <para>
+    /// The same applies above two children, where the list rules make the group itself a struct element —
+    /// better than the map path, which silently dropped every child past the second.
+    /// </para>
+    /// <para>
+    /// This used to be unguarded, and both halves of the read path independently invented a
+    /// <c>value: string</c> field while only one of them invented an array to go with it. The resulting
+    /// <see cref="StructArray"/> declared two children and held one, so the map threw
+    /// <c>IndexOutOfRangeException</c> the moment anything reached for its values (issue #156).
+    /// </para>
+    /// </remarks>
+    private static bool HasKeyAndValue(SchemaNode node) => node.Children[0].Children.Count == 2;
 
     private static Apache.Arrow.Field BuildListField(SchemaNode node, ParquetReadOptions? options = null)
     {
@@ -166,16 +211,9 @@ internal static class ArrowSchemaConverter
         // Key field must be non-nullable per Arrow spec
         keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false);
 
-        Apache.Arrow.Field valueField;
-        if (keyValueGroup.Children.Count > 1)
-        {
-            valueField = NodeToArrowField(keyValueGroup.Children[1], options);
-        }
-        else
-        {
-            // Map with no value column — use null type (shouldn't happen often)
-            valueField = new Apache.Arrow.Field("value", Apache.Arrow.Types.StringType.Default, nullable: true);
-        }
+        // IsMapNode has already established that key_value carries exactly a key and a value; a group that
+        // does not is classified as a list and never arrives here.
+        var valueField = NodeToArrowField(keyValueGroup.Children[1], options);
 
         var mapType = new MapType(keyField, valueField);
         return new Apache.Arrow.Field(node.Name, mapType, nullable);
