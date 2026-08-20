@@ -73,17 +73,26 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
         if (newElementCount <= inner.Length)
             return;
 
-        // Exponential growth (2x) to amortise repeated grows, CLAMPED at int.MaxValue. Doubling in a
-        // checked context threw OverflowException once the buffer passed about 1 GiB — before the caller
-        // had reached any limit of its own, and reported as arithmetic overflow rather than as the size
-        // refusal the caller was about to make. Doubling is an optimisation, so giving up on it at the
-        // ceiling costs an extra grow at worst; asking for more than int.MaxValue elements is still the
-        // caller's error and still throws, from the allocation below.
+        // Exponential growth (2x) to amortise repeated grows — but only while doubling still fits.
+        //
+        // Apache.Arrow's own Grow does `checked(Length * 2)` unconditionally (it carries a TODO about
+        // exactly this), so once the buffer passes int.MaxValue/2 its NEXT grow throws OverflowException
+        // however little was asked for. That put a hard ceiling near 1 GiB on any buffer that grows,
+        // reported as arithmetic overflow rather than as whatever size limit the caller was actually
+        // approaching. Past the halfway point we therefore size the new buffer exactly and copy, instead
+        // of delegating to a doubling that cannot succeed.
         long doubled = (long)inner.Length * 2;
-        int newCount = doubled > int.MaxValue
-            ? Math.Max(newElementCount, int.MaxValue)
-            : Math.Max(newElementCount, (int)doubled);
-        inner.Grow(newCount, zeroFill: false);
+        if (doubled <= int.MaxValue)
+        {
+            inner.Grow(Math.Max(newElementCount, (int)doubled), zeroFill: false);
+            return;
+        }
+
+        var grown = new Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>(
+            newElementCount, zeroFill: false, default);
+        inner.Span.CopyTo(grown.Span);
+        inner.Dispose();
+        _inner = grown;
     }
 
     public void Dispose()

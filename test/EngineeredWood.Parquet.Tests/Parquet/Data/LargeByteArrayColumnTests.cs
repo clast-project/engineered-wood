@@ -58,6 +58,18 @@ public class LargeByteArrayColumnTests
         Assert.Contains("This BYTE_ARRAY column", ex.Message);
     }
 
+    // ── The multi-gigabyte cases ───────────────────────────────────────────────────────────────────
+    //
+    // ONE TARGET FRAMEWORK ONLY. These four decode 2+ GiB each — MEASURED at 16s on net10.0 and 28s on
+    // net472, plus a ~2 GiB native allocation apiece as the buffer grows to the point of refusal. Run on
+    // all three that is a minute of CI and three peaks of that size, for no additional coverage: what
+    // they exercise is int overflow arithmetic and the shared NativeBuffer growth path, which are
+    // identical on every target. The message tests above carry the wording on all of them.
+    //
+    // (The files themselves are small — the corpus file is 4 KB and the generated one about 126 KB, both
+    // highly compressible — so this is a time and memory decision, not a disk one.)
+#if NET10_0_OR_GREATER
+
     // The corpus file the issue is about: a MAP(STRING, INT32) whose key chunk is 2,147,483,749
     // uncompressed bytes, 101 past int.MaxValue. It is 4 KB on disk but decompresses to 2.1 GB, which is
     // why the corpus sweep skips it and why this is the only test that reads it.
@@ -119,11 +131,15 @@ public class LargeByteArrayColumnTests
         }
     }
 
-    // The single-batch API cannot split, so it refuses — and refuses from the metadata, before spending
-    // the decompression. Both facts matter: the message is the diagnostic issue #157 asked for, and the
-    // speed is what makes it safe to hit on a multi-gigabyte chunk.
+    // The single-batch API cannot split, so it refuses — with the message issue #157 asked for.
+    //
+    // It refuses from the DECODER, having counted the actual bytes, not from a metadata estimate. An
+    // earlier revision of this fix guessed from TotalUncompressedSize; that figure includes page
+    // headers, level bytes and any dictionary page, so it is an UPPER bound on the decoded data and
+    // using it to refuse would reject a column whose values fit but whose overhead carried the total
+    // over. Being fast is not worth being wrong here.
     [Fact]
-    public async Task FlatOversizedChunk_SingleBatchApiRefusesFromTheMetadata()
+    public async Task FlatOversizedChunk_SingleBatchApiRefusesWithTheColumnAndTheRemedy()
     {
         string path = Path.Combine(
             Path.GetTempPath(), "ew-big-flat-single-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
@@ -134,18 +150,11 @@ public class LargeByteArrayColumnTests
             await using var file = new LocalRandomAccessFile(path);
             await using var reader = new ParquetFileReader(file, ownsFile: false);
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
             var ex = await Assert.ThrowsAsync<NotSupportedException>(
                 async () => await reader.ReadRowGroupAsync(0));
-            sw.Stop();
 
             Assert.Contains("payload", ex.Message);
             Assert.Contains(nameof(ParquetReadOptions.MaxBatchByteSize), ex.Message);
-
-            // Decompressing 2.3 GB takes seconds; reading the footer takes milliseconds. A generous
-            // bound still separates the two decisively.
-            Assert.True(sw.ElapsedMilliseconds < 1000,
-                $"expected refusal from metadata, took {sw.ElapsedMilliseconds}ms");
         }
         finally
         {
@@ -207,4 +216,5 @@ public class LargeByteArrayColumnTests
 
         Assert.Contains("arr.key_value.key", ex.Message);
     }
+#endif
 }

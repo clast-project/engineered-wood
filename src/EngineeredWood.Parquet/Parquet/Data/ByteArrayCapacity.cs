@@ -47,35 +47,6 @@ internal static class ByteArrayCapacity
             "this large. A nested (list/map/struct) column cannot be split this way yet, and a single row " +
             "larger than the limit cannot be split at all.");
 
-    /// <summary>
-    /// Refuses a whole-chunk read whose decoded BYTE_ARRAY data provably cannot fit one Arrow array,
-    /// before any of it is decompressed.
-    /// </summary>
-    /// <remarks>
-    /// <para>The bound is a LOWER one, so this never rejects a chunk that would in fact have fitted.
-    /// Uncompressed size counts the 4-byte length prefix each PLAIN value carries plus page headers and
-    /// level data, none of which reach the Arrow data buffer; subtracting only the prefixes leaves a
-    /// figure still at or above the real decoded size. Rejecting only when even that exceeds the limit
-    /// keeps the check exact in the direction that matters.</para>
-    /// <para>Up front rather than mid-decode for two reasons. It saves decompressing gigabytes purely to
-    /// discover they will not fit — the corpus's <c>large_string_map.brotli.parquet</c> is 4 KB on disk
-    /// and 2.1 GB decompressed. And the buffer growth doubles as it goes, so it overflowed on its own,
-    /// as an <c>OverflowException</c> from inside the allocator, before the running total had reached the
-    /// limit the decoder checks.</para>
-    /// <para>Whole-chunk reads only. The batched path decodes a page range at a time and each range is
-    /// well under the limit, which is exactly how such a column becomes readable.</para>
-    /// </remarks>
-    internal static void ThrowIfChunkCannotFit(
-        Schema.ColumnDescriptor column, Metadata.ColumnMetaData columnMeta)
-    {
-        if (column.PhysicalType != PhysicalType.ByteArray)
-            return;
-
-        long lowerBound = columnMeta.TotalUncompressedSize - (4L * columnMeta.NumValues);
-        if (lowerBound > MaxBytes)
-            throw ChunkTooLarge(column.DottedPath, lowerBound);
-    }
-
     private static string Describe(string? columnPath) =>
         columnPath is null ? "This BYTE_ARRAY column" : $"Column '{columnPath}'";
 }

@@ -242,9 +242,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
 
         // A BYTE_ARRAY chunk holding more bytes than one Arrow array can address cannot be returned as a
-        // single batch at all — it used to fail deep in the decoder. Splitting it is the only way to read
-        // it, so a caller who asked for no particular batch size still gets one here rather than an error
-        // they can do nothing about.
+        // single batch at all. Splitting it is the only way to read it, so a caller who asked for no
+        // particular batch size still gets one here rather than an error they can do nothing about. The
+        // test is an over-estimate (see HasChunkOverArrowLimit) and splitting a chunk that would have fit
+        // is harmless, so erring towards splitting is the right direction to be wrong in.
         //
         // Deliberately engaged only when a chunk is ALREADY over the limit, not at some margin below it:
         // a file that reads as one batch today keeps doing so, and the implicit cap can only turn a
@@ -536,9 +537,16 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Whether any BYTE_ARRAY chunk in this row group holds more uncompressed bytes than one Arrow array
-    /// can address. Uncompressed size is an upper bound on the decoded data — it also counts page headers
-    /// and levels — so this never engages the implicit cap for a chunk that would in fact have fitted.
+    /// can address.
     /// </summary>
+    /// <remarks>
+    /// Uncompressed size is an UPPER bound on the decoded data — it also counts page headers, level bytes
+    /// and any dictionary page — so this can fire for a chunk whose values would in fact have fitted, when
+    /// the overhead is what carried it over. That is deliberate here: being wrong in this direction only
+    /// splits a read that could have been done in one batch, which costs an extra batch boundary and
+    /// changes nothing about the data. Nothing REFUSES on this estimate; the refusal is made by the
+    /// decoder, which counts the actual bytes.
+    /// </remarks>
     private static bool HasChunkOverArrowLimit(RowGroupContext ctx)
     {
         for (int i = 0; i < ctx.Count; i++)

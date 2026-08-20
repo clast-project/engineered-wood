@@ -53,8 +53,6 @@ internal static class ColumnChunkReader
         bool validateCrc = false,
         bool fixedListFastPath = false)
     {
-        ByteArrayCapacity.ThrowIfChunkCannotFit(column, columnMeta);
-
         if (fixedListFastPath && IsFixedListCandidate(column))
         {
             var fast = TryReadFixedListColumn(
