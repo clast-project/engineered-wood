@@ -421,6 +421,18 @@ public class CrossValidationTests : IDisposable
         using var reader = new ParquetSharp.ParquetFileReader(path);
         using var rg = reader.RowGroup(0);
 
+        // The defect lives in the DICTIONARY, so the test is worthless unless the dictionary was actually
+        // chosen — and that is a heuristic, not a guarantee. Two distinct values over 200 rows sits far
+        // inside the 20% cardinality threshold, but asserting it here means a future change to the
+        // heuristic or the defaults fails loudly instead of quietly writing plain and still passing.
+        // Read through ParquetSharp rather than our own metadata, since the independent reader is the point.
+        for (int c = 0; c < 2; c++)
+        {
+            Assert.Contains(
+                ParquetSharp.Encoding.RleDictionary,
+                rg.MetaData.GetColumnChunkMetaData(c).Encodings);
+        }
+
         var readDoubles = new double[rows];
         using (var col = rg.Column(0).LogicalReader<double>())
             col.ReadBatch(readDoubles);

@@ -131,6 +131,17 @@ public class SignedZeroDictionaryTests : IDisposable
 
         await using var readFile = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        // Same guard as the two writer tests above: the defect is in the dictionary, so the case is only
+        // exercising it while the dictionary is what got chosen. BufferedParquetWriter decides that at
+        // FLUSH time from the accumulated cardinality, so this is a heuristic here too.
+        for (int c = 0; c < 2; c++)
+        {
+            Assert.Contains(EngineeredWood.Parquet.Encoding.RleDictionary,
+                metadata.RowGroups[0].Columns[c].MetaData!.Encodings);
+        }
+
         var read = await reader.ReadRowGroupAsync(0);
 
         var d = (DoubleArray)read.Column(0);
