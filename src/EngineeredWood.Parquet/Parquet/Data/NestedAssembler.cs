@@ -348,6 +348,12 @@ internal static class NestedAssembler
         var keyNode = keyValueGroup.Children[0];
         var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
 
+        // Assembling the key advanced leafIndex past the key's whole subtree, so this is exactly where the
+        // value's leaves begin. `firstLeafIndex + 1` would say the same thing only for a single-leaf key,
+        // and would land INSIDE the key's own subtree for a struct-typed one — filtering the value against
+        // another column's definition levels.
+        int valueFirstLeafIndex = leafIndex;
+
         // IsMapNode has already established that key_value carries exactly a key and a value; a group that
         // does not is classified as a list and assembled by AssembleList instead.
         var valueNode = keyValueGroup.Children[1];
@@ -355,7 +361,7 @@ internal static class NestedAssembler
 
         // Filter out phantom entries from key and value arrays
         keyArray = FilterElementArray(keyArray, defLevels, emptyDefThreshold);
-        valueArray = FilterElementArray(valueArray, leafDefLevels[firstLeafIndex + 1] ?? defLevels, emptyDefThreshold);
+        valueArray = FilterElementArray(valueArray, leafDefLevels[valueFirstLeafIndex] ?? defLevels, emptyDefThreshold);
 
         // Build the key_value struct array
         var keyField = NodeToField(keyNode);
