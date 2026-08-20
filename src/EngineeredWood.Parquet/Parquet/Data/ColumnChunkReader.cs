@@ -72,7 +72,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -219,7 +219,8 @@ internal static class ColumnChunkReader
         // maxDefLevel/maxRepLevel are declared as 0: no level arrays are rented or filled, and the
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
         using var state = new ColumnBuildState(
-            column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput);
+            column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
+            column.DottedPath);
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
@@ -472,7 +473,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
 
         for (int p = startPage; p <= endPage; p++)
         {
@@ -553,7 +554,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
 
         for (int p = startPage; p <= endPage; p++)
         {
@@ -1081,7 +1082,7 @@ internal static class ColumnChunkReader
                     var offsets = ArrayPool<int>.Shared.Rent(count + 1);
                     try
                     {
-                        int totalLen = PlainDecoder.MeasureByteArrays(data, offsets, count);
+                        int totalLen = PlainDecoder.MeasureByteArrays(data, offsets, count, column.DottedPath);
                         Span<byte> dest = state.ReserveByteArrayData(totalLen);
                         PlainDecoder.CopyByteArrayData(data, offsets, dest, count);
                         state.CommitByteArrayData(offsets.AsSpan(0, count + 1), count, totalLen);

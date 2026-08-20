@@ -142,7 +142,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             var results = new ColumnResult[ctx.Count];
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
@@ -205,18 +205,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 }
             }
 
-            if (_options.BatchSize is > 0 || _options.MaxBatchByteSize is > 0)
+            // Always via the batching entry point, even with no batch limit configured: it falls back to
+            // the single-batch read itself when there is nothing to split, and it is where the implicit
+            // cap for an over-sized chunk is decided. Routing around it here would put that decision in
+            // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
+            await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)
+                .ConfigureAwait(false))
             {
-                await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)
-                    .ConfigureAwait(false))
-                {
-                    yield return batch;
-                }
-            }
-            else
-            {
-                yield return await ReadRowGroupAsync(i, columnNames, cancellationToken)
-                    .ConfigureAwait(false);
+                yield return batch;
             }
         }
     }
@@ -241,20 +237,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         int? batchSize = _options.BatchSize;
         long? maxBytes = _options.MaxBatchByteSize;
-        bool hasBatchLimit = batchSize is > 0 || maxBytes is > 0;
-
-        // When no batch limit is set, fall back to the standard single-batch path.
-        if (!hasBatchLimit)
-        {
-            yield return await ReadRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
-                .ConfigureAwait(false);
-            yield break;
-        }
 
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
 
-        // Check whether the entire row group fits in one batch.
+        // A BYTE_ARRAY chunk holding more bytes than one Arrow array can address cannot be returned as a
+        // single batch at all. Splitting it is the only way to read it, so a caller who asked for no
+        // particular batch size still gets one here rather than an error they can do nothing about. The
+        // test is an over-estimate (see HasChunkOverArrowLimit) and splitting a chunk that would have fit
+        // is harmless, so erring towards splitting is the right direction to be wrong in.
+        //
+        // Deliberately engaged only when a chunk is ALREADY over the limit, not at some margin below it:
+        // a file that reads as one batch today keeps doing so, and the implicit cap can only turn a
+        // failure into a success. Nested columns are excluded because the nested path decodes the whole
+        // row group before slicing, so splitting does not help them (issue #157) — they still get the
+        // NotSupportedException, which says so.
+        if (batchSize is not > 0 && maxBytes is not > 0
+            && !ctx.HasNestedColumns
+            && HasChunkOverArrowLimit(ctx))
+        {
+            maxBytes = ImplicitLargeChunkBatchBytes;
+        }
+
+        // No delegation back to ReadRowGroupAsync when there is no batch limit: it would call
+        // PrepareRowGroupAsync a second time for the row group already prepared above, and since
+        // ReadAllAsync now always comes through here that is every row group of every ordinary read. With
+        // no limit set nothing below narrows the batch, so the single-pass branch handles it unchanged.
         bool fitsInOneBatch = true;
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
             fitsInOneBatch = false;
@@ -278,7 +286,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             try
             {
                 var results = new ColumnResult[ctx.Count];
-                Parallel.For(0, ctx.Count, i =>
+                ForEachColumn(ctx.Count, i =>
                 {
                     results[i] = ColumnChunkReader.ReadColumn(
                         buffers[i].Memory.Span, ctx.Columns[i],
@@ -371,7 +379,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             try
             {
                 var results = new ColumnResult[ctx.Count];
-                Parallel.For(0, ctx.Count, i =>
+                ForEachColumn(ctx.Count, i =>
                 {
                     int startPage = pageOffsets[i];
                     int endPage = pageEnds[i];
@@ -438,7 +446,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             var results = new ColumnResult[ctx.Count];
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 pageMaps[i] = PageMapBuilder.Build(
                     buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
@@ -487,6 +495,64 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             columns[i] = Apache.Arrow.ArrowArrayFactory.BuildArray(batch.Column(i).Data.Slice(offset, length));
 
         return new RecordBatch(batch.Schema, columns, length);
+    }
+
+    /// <summary>
+    /// Decodes the row group's columns in parallel, letting a single failure surface as itself.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Parallel.For(int, int, Action{int})"/> wraps whatever a body throws in an
+    /// <see cref="AggregateException"/>, so a diagnostic written for the caller arrives as
+    /// "One or more errors occurred" with the real message one level down — which is how the oversized
+    /// BYTE_ARRAY column of issue #157 reached a caller even once it had a message worth reading. One
+    /// column failing is the ordinary case, so that one is rethrown in place, stack intact. Genuine
+    /// multi-column failures keep the aggregate, which is the only honest shape for them.
+    /// </remarks>
+    private static void ForEachColumn(int count, Action<int> body)
+    {
+        try
+        {
+            Parallel.For(0, count, body);
+        }
+        catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(ex.InnerExceptions[0]).Throw();
+        }
+    }
+
+    /// <summary>
+    /// Batch budget used when a chunk is too large to decode into one Arrow array and the caller set no
+    /// budget of their own. Small enough that the sum across every column in a batch stays far below the
+    /// limit, large enough not to shred a big read into thousands of batches.
+    /// </summary>
+    private const long ImplicitLargeChunkBatchBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Whether any BYTE_ARRAY chunk in this row group holds more uncompressed bytes than one Arrow array
+    /// can address.
+    /// </summary>
+    /// <remarks>
+    /// Uncompressed size is an UPPER bound on the decoded data — it also counts page headers, level bytes
+    /// and any dictionary page — so this can fire for a chunk whose values would in fact have fitted, when
+    /// the overhead is what carried it over. That is deliberate here: being wrong in this direction only
+    /// splits a read that could have been done in one batch, which costs an extra batch boundary and
+    /// changes nothing about the data. Nothing REFUSES on this estimate; the refusal is made by the
+    /// decoder, which counts the actual bytes.
+    /// </remarks>
+    private static bool HasChunkOverArrowLimit(RowGroupContext ctx)
+    {
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var meta = ctx.Chunks[i].MetaData!;
+            if (meta.Type == PhysicalType.ByteArray
+                && meta.TotalUncompressedSize > Data.ByteArrayCapacity.MaxBytes)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -613,7 +679,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             var results = new ColumnResult[ctx.Count];
 
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
