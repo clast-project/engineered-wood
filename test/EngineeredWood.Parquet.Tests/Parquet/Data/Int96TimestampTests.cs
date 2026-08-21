@@ -1,11 +1,13 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Data;
 
 namespace EngineeredWood.Tests.Parquet.Data;
 
@@ -157,6 +159,49 @@ public class Int96TimestampTests
 
         Assert.Equal(6, array.Length);
         Assert.IsType<FixedSizeBinaryArray>(array);
+    }
+
+    /// <summary>
+    /// The value buffer is sized <c>capacity * 12</c> for INT96 and narrowing leaves that
+    /// allocation alone, so an odd row count leaves a byte length that is not a whole number of
+    /// <c>long</c>s. The nullable build path then reverse-scatters over
+    /// <c>GetWritableValueSpan&lt;long&gt;()</c>, which is where that would matter. Every INT96 file
+    /// in the corpus has an even row count, so the case is reached directly.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(5)]
+    public void Int96_OddRowCount_ScattersWithoutRunningOffTheBuffer(int rowCount)
+    {
+        // 2009-03-01T00:00:00Z, then one row later per minute; the last row is null.
+        const int JulianDay = 2454892;
+        int nonNull = rowCount - 1;
+
+        using var state = new ColumnBuildState(
+            PhysicalType.Int96, maxDefLevel: 1, maxRepLevel: 0, capacity: rowCount);
+
+        var defLevels = state.ReserveDefLevels(rowCount);
+        for (int i = 0; i < rowCount; i++)
+            defLevels[i] = (byte)(i < nonNull ? 1 : 0);
+
+        var values = state.ReserveFixedBytes(nonNull, 12);
+        for (int i = 0; i < nonNull; i++)
+        {
+            var slot = values.Slice(i * 12, 12);
+            BinaryPrimitives.WriteInt64LittleEndian(slot, i * 60_000_000_000L);
+            BinaryPrimitives.WriteInt32LittleEndian(slot.Slice(8), JulianDay);
+        }
+
+        var field = new Field(
+            "ts", new TimestampType(TimeUnit.Microsecond, (TimeZoneInfo?)null), nullable: true);
+        var timestamps = Assert.IsType<TimestampArray>(
+            ArrowArrayBuilder.Build(state, field, rowCount));
+
+        Assert.Equal(rowCount, timestamps.Length);
+        for (int i = 0; i < nonNull; i++)
+            Assert.Equal(1235865600000000L + i * 60_000_000L, timestamps.GetValue(i));
+        Assert.Null(timestamps.GetValue(rowCount - 1));
     }
 
     /// <summary>

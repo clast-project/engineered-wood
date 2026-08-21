@@ -536,15 +536,9 @@ internal static class NestedAssembler
             return new Apache.Arrow.Field(node.Name, arrowType, nullable);
         }
 
-        if (ArrowSchemaConverter.IsListNode(node))
-        {
-            var fields = ArrowSchemaConverter.ToArrowFields(
-                new SchemaNode { Element = node.Element, Children = node.Children, Parent = node.Parent }, options);
-            // ToArrowFields returns fields for children; we need the list field for this node itself
-            // Use the converter's field-building instead
-        }
-
-        // Delegate to the ArrowSchemaConverter for full recursive handling
+        // Delegate to the ArrowSchemaConverter for full recursive handling. A list node needs no
+        // special case here: ToArrowFields returns fields for a root's CHILDREN, so the list field
+        // for this node comes from wrapping it in the dummy root below, exactly like any other group.
         var dummyRoot = new SchemaNode
         {
             Element = new SchemaElement { Name = "__root__", NumChildren = 1 },
