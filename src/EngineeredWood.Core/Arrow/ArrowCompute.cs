@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -71,6 +72,14 @@ public static class ArrowCompute
                 return TakeVarBinary64(a, indices);
             case LargeBinaryArray a:
                 return TakeVarBinary64(a, indices);
+
+            // StringViewArray derives from BinaryViewArray, exactly as StringArray does from BinaryArray, so
+            // these two are ordered narrowest-first for the same reason and the compiler enforces it (CS8120
+            // on the other order). Both go through the one helper, which passes source.Data.DataType through.
+            case StringViewArray a:
+                return TakeVarBinaryView(a, indices);
+            case BinaryViewArray a:
+                return TakeVarBinaryView(a, indices);
 
             case StructArray a:
                 return TakeStruct(a, indices);
@@ -217,6 +226,17 @@ public static class ArrowCompute
                     AllNullBitmap(length), Zeros((length + 1) * sizeof(long)), ArrowBuffer.Empty,
                 });
 
+            // A view column has no offsets buffer to zero and no trailing values buffer to leave empty: its
+            // second buffer is one BinaryViewBytes-wide entry per row, and an all-zero entry is a length-0
+            // INLINE value, which reaches no data buffer at all. So the variadic data buffers that
+            // TakeVarBinaryView has to carry across are simply absent here, and two buffers — the minimum
+            // Arrow accepts for a view array — is the whole of it.
+            case StringViewType or BinaryViewType:
+                return BuildNull(type, length, new[]
+                {
+                    AllNullBitmap(length), Zeros(length * BinaryViewBytes),
+                });
+
             // All-zero offsets make every row a zero-length slice of an empty child — which, combined with
             // the cleared validity bit, reads as NULL rather than as an empty list.
             case ListType lt:
@@ -296,8 +316,8 @@ public static class ArrowCompute
     /// </summary>
     /// <param name="value">
     /// The value's Arrow encoding: for a fixed-width type, exactly one value slot, little-endian (so
-    /// <c>FixedWidthBytes(type)</c> bytes); for String/Binary and their Large twins, the encoded bytes, of
-    /// any length; for Boolean, a single byte, zero for false and non-zero for true.
+    /// <c>FixedWidthBytes(type)</c> bytes); for String/Binary and their Large and View twins, the encoded
+    /// bytes, of any length; for Boolean, a single byte, zero for false and non-zero for true.
     /// </param>
     /// <exception cref="ArgumentException"><paramref name="value"/> is not the width the type requires.</exception>
     /// <exception cref="NotSupportedException">The type is one this cannot build a constant of.</exception>
@@ -334,6 +354,9 @@ public static class ArrowCompute
 
             case LargeStringType or LargeBinaryType:
                 return RepeatVarBinary(type, value, length, largeOffsets: true);
+
+            case StringViewType or BinaryViewType:
+                return RepeatVarBinaryView(type, value, length);
 
             default:
             {
@@ -596,6 +619,52 @@ public static class ArrowCompute
         return ArrowArrayFactory.BuildArray(new ArrayData(
             type, length, nullCount: 0, offset: 0,
             new[] { ArrowBuffer.Empty, new ArrowBuffer(offsetBytes), new ArrowBuffer(values) }));
+    }
+
+    /// <summary>
+    /// The view-typed constant. Unlike <see cref="RepeatVarBinary"/>, which tiles the value across a values
+    /// buffer once per row, this stores the bytes AT MOST ONCE: a value of
+    /// <see cref="MaxInlineViewBytes"/> or fewer lives inside every view entry, and a longer one goes into a
+    /// single data buffer that all <paramref name="length"/> entries point at.
+    ///
+    /// <para>That makes the constant's data cost independent of its row count, so the overflow check
+    /// <see cref="RepeatVarBinary"/> needs — a long value times many rows exceeding one Arrow buffer — has
+    /// nothing to guard here. The views buffer itself is still one 16-byte entry per row, and is bounded by
+    /// the same <c>length * width</c> ceiling every fixed-width path in this file lives under.</para>
+    /// </summary>
+    private static IArrowArray RepeatVarBinaryView(
+        IArrowType type, ReadOnlySpan<byte> value, int length)
+    {
+        var views = new byte[length * BinaryViewBytes];
+
+        // The first entry is built by hand and the rest are copies of it: every row holds the same length,
+        // the same prefix, and — for an out-of-line value — the same buffer index and the same offset zero,
+        // because they all name the one copy of the bytes.
+        if (length > 0)
+        {
+            var first = views.AsSpan(0, BinaryViewBytes);
+            BinaryPrimitives.WriteInt32LittleEndian(first, value.Length);
+
+            if (value.Length <= MaxInlineViewBytes)
+            {
+                value.CopyTo(first.Slice(ViewPrefixOffset));
+            }
+            else
+            {
+                value.Slice(0, ViewPrefixBytes).CopyTo(first.Slice(ViewPrefixOffset));
+                // Buffer index 0 and offset 0 are already there from the zero-fill: the single data buffer
+                // below is the array's only one, and the value sits at its start.
+            }
+
+            FillRepeating(views.AsSpan(BinaryViewBytes), first);
+        }
+
+        var buffers = value.Length <= MaxInlineViewBytes
+            ? new[] { ArrowBuffer.Empty, new ArrowBuffer(views) }
+            : new[] { ArrowBuffer.Empty, new ArrowBuffer(views), new ArrowBuffer(value.ToArray()) };
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, length, nullCount: 0, offset: 0, buffers));
     }
 
     /// <summary>
@@ -908,6 +977,87 @@ public static class ArrowCompute
         return ArrowArrayFactory.BuildArray(new ArrayData(
             source.Data.DataType, count, validity.NullCount, offset: 0,
             new[] { validity.Build(), new ArrowBuffer(offsetBytes), new ArrowBuffer(values) }));
+    }
+
+    /// <summary>
+    /// The layout of one entry in a view array's views buffer, fixed by the Arrow spec whatever the value's
+    /// own length is: 16 bytes, holding a 4-byte little-endian length, then either the value itself in the
+    /// remaining 12 or a 4-byte prefix followed by a data-buffer index and an offset into it.
+    /// </summary>
+    private const int BinaryViewBytes = 16;
+
+    /// <summary>Longest value that fits inside a view entry rather than in a data buffer.</summary>
+    private const int MaxInlineViewBytes = 12;
+
+    /// <summary>Where a view entry's inline bytes — or, out of line, its prefix — start.</summary>
+    private const int ViewPrefixOffset = 4;
+
+    /// <summary>How many leading bytes an out-of-line view entry carries inline as a prefix.</summary>
+    private const int ViewPrefixBytes = 4;
+
+    /// <summary>
+    /// Gathers a STRING_VIEW or BINARY_VIEW column.
+    ///
+    /// <para>A view array holds one 16-byte entry per row: a length, then either the value itself inline (up
+    /// to 12 bytes) or a 4-byte prefix plus the index of one of the variadic data buffers that follow and an
+    /// offset into it. Every entry is self-describing and none of them is stated relative to the row's own
+    /// position, so a gather is a fixed-width copy of the selected entries with the data buffers carried
+    /// across untouched — no value bytes are read at all, where <see cref="TakeVarBinary32"/> has to rebuild
+    /// the offsets and re-copy every byte it keeps.</para>
+    ///
+    /// <para>Sharing the data buffers rather than rebuilding them is the deliberate part. It means the
+    /// gathered array pins every byte the source held even when it keeps three rows out of a million — the
+    /// one arm here that does not allocate exactly what it keeps. The alternative, compacting the kept values
+    /// into a fresh buffer, turns the cheapest gather in this file into one of the most expensive and throws
+    /// away the buffer sharing the layout exists for; Arrow itself shares buffers this way (its own
+    /// <c>ArrayData.Slice</c> does), so a caller who needs the source's memory released should read the
+    /// column as String/Binary instead of asking this to compact.</para>
+    ///
+    /// <para>Retaining those buffers is safe past the caller's array going out of scope for a different
+    /// reason than the <c>GC.KeepAlive</c> on <see cref="Take(IArrowArray, ReadOnlySpan{int})"/>: an
+    /// <see cref="ArrowBuffer"/> is a managed reference to whatever backs it, so it roots a native
+    /// allocation's <c>NativeMemoryManager</c> and keeps its finalizer from running. What it does not survive
+    /// is the source's buffers being DISPOSED — identical to what Arrow's own slicing already exposes.
+    /// See doc/arrow-span-lifetime.md.</para>
+    /// </summary>
+    private static IArrowArray TakeVarBinaryView(IArrowArray source, ReadOnlySpan<int> indices)
+    {
+        int count = indices.Length;
+        ReadOnlySpan<byte> srcViews = source.Data.Buffers[1].Span;
+        int arrOffset = source.Data.Offset;
+
+        // Deliberately a ZEROED allocation, for the reason spelled out in TakeFixedWidth: the null path below
+        // writes nothing, so the entry has to arrive already meaning something. All-zero is a length-0 inline
+        // view — precisely what Arrow's own builder writes for AppendNull — whereas leftover heap bytes would
+        // be a view claiming an arbitrary length at an arbitrary offset in a real data buffer.
+        var views = new byte[count * BinaryViewBytes];
+        var validity = new ValidityWriter(count, source.NullCount);
+        bool probeNulls = validity.SourceHasNulls;
+
+        for (int i = 0; i < count; i++)
+        {
+            int r = indices[i];
+            if (probeNulls && source.IsNull(r))
+            {
+                validity.SetNull(i);
+                continue; // entry stays zero: a length-0 inline value
+            }
+
+            srcViews.Slice((arrOffset + r) * BinaryViewBytes, BinaryViewBytes)
+                    .CopyTo(views.AsSpan(i * BinaryViewBytes, BinaryViewBytes));
+        }
+
+        // Buffers 2.. are the variadic data buffers, copied across in the same order and in full. A view names
+        // its buffer by INDEX, so dropping an unreferenced one or reordering them would silently repoint every
+        // out-of-line value in the result.
+        var buffers = new ArrowBuffer[source.Data.Buffers.Length];
+        buffers[0] = validity.Build();
+        buffers[1] = new ArrowBuffer(views);
+        for (int b = 2; b < buffers.Length; b++)
+            buffers[b] = source.Data.Buffers[b];
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            source.Data.DataType, count, validity.NullCount, offset: 0, buffers));
     }
 
     private static IArrowArray TakeStruct(StructArray source, ReadOnlySpan<int> indices)
