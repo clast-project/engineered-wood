@@ -340,8 +340,12 @@ internal static class ArrowSchemaConverter
         {
             ConvertedType.Utf8 => Apache.Arrow.Types.StringType.Default,
             ConvertedType.Date => Date32Type.Default,
-            ConvertedType.TimestampMillis => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, TimeZoneInfo.Utc),
-            ConvertedType.TimestampMicros => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, TimeZoneInfo.Utc),
+            // "UTC", not TimeZoneInfo.Utc, for the same reason as the logical-type path above: the
+            // TimeZoneInfo overload renders the "+00:00" offset. A file old enough to carry only a
+            // converted type is exactly the kind this matters for, since it was written by a tool
+            // whose output is still being read by everything else.
+            ConvertedType.TimestampMillis => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, "UTC"),
+            ConvertedType.TimestampMicros => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"),
             ConvertedType.TimeMillis => new Time32Type(Apache.Arrow.Types.TimeUnit.Millisecond),
             ConvertedType.TimeMicros => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
             ConvertedType.Int8 => Int8Type.Default,

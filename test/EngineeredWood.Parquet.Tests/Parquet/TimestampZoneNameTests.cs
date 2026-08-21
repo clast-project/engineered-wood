@@ -6,6 +6,12 @@ using Apache.Arrow.Types;
 using EngineeredWood.Compression;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Data;
+using EngineeredWood.Parquet.Metadata;
+using EngineeredWood.Parquet.Schema;
+
+// Both namespaces define TimeUnit; every use here means Arrow's.
+using TimeUnit = Apache.Arrow.Types.TimeUnit;
 
 namespace EngineeredWood.Tests.Parquet;
 
@@ -91,5 +97,39 @@ public class TimestampZoneNameTests : IDisposable
             await RoundTripAsync(new TimestampType(TimeUnit.Microsecond, "America/New_York")));
 
         Assert.Equal("UTC", read.Timezone);
+    }
+
+    [Theory]
+    [InlineData(ConvertedType.TimestampMillis, TimeUnit.Millisecond)]
+    [InlineData(ConvertedType.TimestampMicros, TimeUnit.Microsecond)]
+    public void ALegacyConvertedTypeTimestampAlsoNamesItsZoneUtc(
+        ConvertedType converted, TimeUnit unit)
+    {
+        // A file old enough to carry only a converted type and no LogicalType takes a different
+        // branch of the converter, and it was rendering the same "+00:00". Those files are exactly
+        // where this matters -- written by a tool old enough that everything else is still reading
+        // its output. No fixture can cover it: PyArrow writes both annotations at every format
+        // version, so the converted-type-only path is reachable through the converter alone.
+        var element = new SchemaElement
+        {
+            Name = "at",
+            Type = PhysicalType.Int64,
+            RepetitionType = FieldRepetitionType.Optional,
+            ConvertedType = converted,
+        };
+        var column = new ColumnDescriptor
+        {
+            Path = ["at"],
+            PhysicalType = PhysicalType.Int64,
+            MaxDefinitionLevel = 1,
+            MaxRepetitionLevel = 0,
+            SchemaElement = element,
+            SchemaNode = new SchemaNode { Element = element, Children = [] },
+        };
+
+        var type = Assert.IsType<TimestampType>(ArrowSchemaConverter.ToArrowType(column));
+
+        Assert.Equal(unit, type.Unit);
+        Assert.Equal("UTC", type.Timezone);
     }
 }
