@@ -254,6 +254,28 @@ public class TakeTypeMatrixTests
     }
 
     [Fact]
+    public void StringView_GathersFromASourceWithNoDataBuffersAtAll()
+    {
+        // Every value fits inline, so the source has the two-buffer shape Arrow's own builder emits when
+        // nothing spills — and the shape MakeNullArray and a short Repeat constant both produce. The gather
+        // has to carry ZERO variadic buffers across, which is the boundary of the copy loop that carries
+        // them: an off-by-one there reads past the source's buffer array rather than producing a wrong value.
+        string[] values = ["alpha", "", "bravo", "exactly12chr"];
+        var array = RawArrays.VarBinaryView(StringViewType.Default, values, dataBufferCount: 0);
+
+        Assert.Equal(0, Assert.IsType<StringViewArray>(array).DataBufferCount);
+
+        var result = Assert.IsType<StringViewArray>(ArrowCompute.Take(array, (int[])[3, 0, 1, 2]));
+
+        Assert.Equal(0, result.DataBufferCount);
+        Assert.Equal(2, result.Data.Buffers.Length);
+        Assert.Equal("exactly12chr", result.GetString(0));
+        Assert.Equal("alpha", result.GetString(1));
+        Assert.Equal("", result.GetString(2));
+        Assert.Equal("bravo", result.GetString(3));
+    }
+
+    [Fact]
     public void StringView_GathersNullsAsEmptyInlineEntries()
     {
         string[] values = ["alpha", "a value long enough to go out of line", "charlie", "delta"];

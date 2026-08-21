@@ -94,13 +94,29 @@ internal static class RawArrays
     /// bytes as a prefix, the buffer's index and the offset within it. Out-of-line values are spread round-robin
     /// across the data buffers deliberately, so a gather that dropped, reordered or renumbered them produces
     /// wrong VALUES rather than only a different buffer count.</para>
+    ///
+    /// <para>A <paramref name="dataBufferCount"/> of ZERO is legal and meaningful rather than a mistake: it is
+    /// the shape Arrow's own builder emits when nothing spills, and the one MakeNullArray and a short Repeat
+    /// constant produce. It requires every value to fit inline, which is checked rather than left to fail as a
+    /// divide-by-zero further down.</para>
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="dataBufferCount"/> is negative.</exception>
+    /// <exception cref="ArgumentException">
+    /// A value is too long to sit inline but <paramref name="dataBufferCount"/> is zero, so there is no buffer
+    /// to put it in.
+    /// </exception>
     public static IArrowArray VarBinaryView(
         IArrowType type, string[] physicalValues, bool[]? physicalValid = null, int offset = 0,
         int dataBufferCount = 2)
     {
         const int viewBytes = 16;
         const int maxInline = 12;
+
+        if (dataBufferCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(dataBufferCount), dataBufferCount, "A view array cannot have negative data buffers.");
+        }
 
         int physical = physicalValues.Length;
         var views = new byte[physical * viewBytes];
@@ -119,6 +135,14 @@ internal static class RawArrays
             {
                 value.CopyTo(view.Slice(4));
                 continue;
+            }
+
+            if (dataBufferCount == 0)
+            {
+                throw new ArgumentException(
+                    $"Value {i} is {value.Length} bytes, so it cannot sit inline, but this array was asked "
+                    + $"for no data buffers to put it in. Pass dataBufferCount: 0 only when every value is "
+                    + $"{maxInline} bytes or fewer.", nameof(dataBufferCount));
             }
 
             int buffer = spilled++ % dataBufferCount;
