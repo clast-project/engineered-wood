@@ -45,7 +45,7 @@ public class BridgeRoundTripTests : BridgeHarness
         Assert.Equal(batch.Length, read.Length);
 
         Assert.Equal([1, null, 3], Values<int?>((Int32Array)read.Column("id"), (a, i) => a.GetValue(i)));
-        Assert.Equal(
+        Assert.Equal<IEnumerable<string?>>(
             ["first", null, "third"],
             Values<string?>((StringArray)read.Column("label"), (a, i) => a.GetString(i)));
         Assert.Equal(

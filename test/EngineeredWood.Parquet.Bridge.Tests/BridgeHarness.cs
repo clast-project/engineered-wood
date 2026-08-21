@@ -109,8 +109,14 @@ public readonly record struct BridgeResult(int ExitCode, string Stdout)
             System.Text.Encoding.UTF8.GetBytes(Stdout),
             new JsonReaderOptions { CommentHandling = JsonCommentHandling.Disallow });
         Assert.True(JsonDocument.TryParseValue(ref reader, out var document), "stdout is not JSON");
+
+        // A JsonDocument holds pooled buffers, so it has to be returned even though what escapes
+        // here is an element. Clone is what makes that safe: it detaches the value from the
+        // document's memory, so the returned element outlives the dispose below. Removing either
+        // half breaks the other.
+        using var owned = document!;
         Assert.False(reader.Read(), "stdout carries more than one JSON value");
-        return document!.RootElement.Clone();
+        return owned.RootElement.Clone();
     }
 
     /// <summary>The <c>kind</c> and <c>detail</c> of an error control message.</summary>

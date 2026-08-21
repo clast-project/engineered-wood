@@ -29,7 +29,7 @@ public class BridgeContractTests : BridgeHarness
         Assert.False(string.IsNullOrWhiteSpace(control.GetProperty("version").GetString()));
 
         var directions = control.GetProperty("directions")
-            .EnumerateArray().Select(item => item.GetString()).ToArray();
+            .EnumerateArray().Select(item => item.GetString()!).ToArray();
         Assert.Equal(["read", "write"], directions);
     }
 
