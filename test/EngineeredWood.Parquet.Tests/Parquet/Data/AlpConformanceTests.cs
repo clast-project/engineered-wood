@@ -47,13 +47,13 @@ public sealed class AlpConformanceTests : IDisposable
     [Fact]
     public async Task ReadAlpExtended_MatchesPlainReferencesBitExact()
     {
-        var path = Path.Combine(AppContext.BaseDirectory, "TestData", "alp_extended.zstd.parquet");
+        var path = TestData.GetPath("alp_extended.zstd.parquet");
         await using var file = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(file, ownsFile: false);
 
         var metadata = await reader.ReadMetadataAsync();
-        Assert.Equal(9_000, metadata.NumRows);
-        Assert.Equal([6_144L, 1_024L, 1_024L, 808L], metadata.RowGroups.Select(rowGroup => rowGroup.NumRows));
+        Assert.Equal(9_032, metadata.NumRows);
+        Assert.Equal([6_144L, 1_024L, 1_024L, 808L, 32L], metadata.RowGroups.Select(rowGroup => rowGroup.NumRows));
 
         for (int rowGroupIndex = 0; rowGroupIndex < metadata.RowGroups.Count; rowGroupIndex++)
         {

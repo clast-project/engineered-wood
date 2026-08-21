@@ -17,6 +17,12 @@ internal static class TestData
         Path.Combine(DataDirectory, fileName);
 
     /// <summary>
+    /// Returns the full path to a file in the parquet-testing/bad_data/ directory.
+    /// </summary>
+    public static string GetBadDataPath(string relativePath) =>
+        Path.Combine(Path.GetDirectoryName(DataDirectory)!, "bad_data", relativePath);
+
+    /// <summary>
     /// Returns all .parquet files in the data directory.
     /// </summary>
     public static IEnumerable<string> GetAllParquetFiles() =>
