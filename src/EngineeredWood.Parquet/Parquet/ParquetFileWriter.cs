@@ -23,6 +23,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     private readonly List<RowGroup> _rowGroups = new();
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
+    private Apache.Arrow.Schema? _declaredSchema;
     private Dictionary<string, ShredSchema?>? _variantShredDecisions;
     private bool _headerWritten;
     private bool _closed;
@@ -39,6 +40,31 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _file = file;
         _ownsFile = ownsFile;
         _options = options ?? ParquetWriteOptions.Default;
+    }
+
+    /// <summary>
+    /// Declares the schema to record when no row group is ever written, so that a zero-row table
+    /// keeps its columns instead of producing a file whose footer declares an empty schema.
+    /// </summary>
+    /// <remarks>
+    /// This is a footer fallback only. The moment a row group is written, the schema captured from
+    /// that batch — after any variant shredding, which changes column types — wins and this
+    /// declaration is ignored. It therefore cannot desynchronize the footer from the encoded data.
+    /// </remarks>
+    /// <param name="schema">The Arrow schema the empty file should declare.</param>
+    public void DeclareSchema(Apache.Arrow.Schema schema)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(schema);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+        if (schema is null) throw new ArgumentNullException(nameof(schema));
+#endif
+        if (_closed)
+            throw new InvalidOperationException("Writer has been closed.");
+
+        _declaredSchema = schema;
     }
 
     /// <summary>
@@ -563,7 +589,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         // The header is written before the first row group but the schema is captured during it, so a
         // row group that throws leaves this null. Falling back here keeps dispose from replacing that
-        // exception with an NRE out of the footer.
+        // exception with an NRE out of the footer. A caller that wrote no rows at all can supply the
+        // schema through DeclareSchema so the empty file still describes its columns.
+        if (_parquetSchema is null && _declaredSchema is not null)
+            _parquetSchema = ArrowToSchemaConverter.Convert(_declaredSchema);
+
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
         // Calculate total rows
