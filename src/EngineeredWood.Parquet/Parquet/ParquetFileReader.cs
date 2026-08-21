@@ -871,7 +871,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         var topLevelArrays = NestedAssembler.Assemble(
             ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths, ctx.RowCount,
-            _options.ExtensionRegistry);
+            _options);
 
         // NestedAssembler wraps only top-level variant columns; wrap variants nested inside a
         // struct/list/map so the arrays match the schema's (variant-aware) field types at every depth.

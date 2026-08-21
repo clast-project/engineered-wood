@@ -87,6 +87,8 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 - **Deeply nested**: list-of-list, map-of-map, list-of-map, etc.
 - **Decimal**: INT32→Decimal32, INT64→Decimal64, FLBA→Decimal128/256 with big-endian↔little-endian conversion
 - **Temporal**: Timestamp (millis/micros/nanos), Date, Time
+- **INT96**: decoded to a naive `timestamp[us]` by default; `ParquetReadOptions.Int96Output`
+  selects `timestamp[ns]` or the raw `fixed_size_binary[12]` instead
 
 ### Encodings
 
