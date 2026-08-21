@@ -88,15 +88,19 @@ public class TimestampZoneNameTests : IDisposable
     }
 
     [Fact]
-    public async Task AZoneThatIsNotUtcIsStillReadAsUtc()
+    public async Task AZoneThatIsNotUtcSurvivesThroughArrowSchema()
     {
-        // Parquet has nowhere to put the name, so an adjusted column written with any zone comes
-        // back as UTC. That is a property of the format rather than of this fix, and pinning it
-        // keeps the previous assertions from being read as a promise to round-trip zone names.
+        // Parquet has nowhere to put the name, so the format alone can only answer UTC. This used
+        // to assert exactly that, as a fence against reading the tests above as a promise to
+        // round-trip zone names -- and then ARROW:schema made that promise real, because the
+        // declared schema recorded in the footer does carry the name.
+        //
+        // The fence still matters, so it moved to where it is now true: with the footer entry
+        // turned off, the name is gone. `Write_WithoutArrowSchema_LosesTheZoneName` holds that end.
         var read = Assert.IsType<TimestampType>(
             await RoundTripAsync(new TimestampType(TimeUnit.Microsecond, "America/New_York")));
 
-        Assert.Equal("UTC", read.Timezone);
+        Assert.Equal("America/New_York", read.Timezone);
     }
 
     [Theory]

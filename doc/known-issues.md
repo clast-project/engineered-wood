@@ -496,14 +496,35 @@ is deliberately deferred; refusing is the cheap, safe interim. `Millisecond`
 already round-trips exactly and is unaffected.
 
 The underlying cause was a **Parquet-writer** bug rather than a Delta one, and
-is now fixed there too: `ArrowToSchemaConverter.MapTimeUnit` fell through to
-MICROS for any unmapped unit, relabelling values instead of rescaling them. It
-throws instead, which covers nested columns for free since `MapArrowType` is
-reached per leaf while building the schema tree. That also closed a second,
-worse case — `Time32(Second)` was written as INT32 annotated TIME(MICROS), an
-illegal pairing (micros requires INT64) whose file could not be read back at
-all. `Timestamp(Nanosecond)` stays valid at the Parquet level; NANOS is a real
-Parquet unit, and only Delta cannot carry it.
+that layer is now fully fixed. `ArrowToSchemaConverter.MapTimeUnit` first fell
+through to MICROS for any unmapped unit, relabelling values instead of rescaling
+them; it then threw instead, which was honest but left a whole Arrow type
+unwritable. `TimeUnitRescaler` now multiplies a second-precision column into
+milliseconds before any schema is derived from it, so the Parquet writer accepts
+all four Arrow units and preserves every instant exactly. Only a value too large
+to fit milliseconds is still refused, which is what PyArrow does with the same
+input. That also closed a second, worse case — `Time32(Second)` was written as
+INT32 annotated TIME(MICROS), an illegal pairing (micros requires INT64) whose
+file could not be read back at all. `Timestamp(Nanosecond)` stays valid at the
+Parquet level; NANOS is a real Parquet unit, and only Delta cannot carry it.
+
+The Delta layer above still refuses both units, and the TODO above still stands
+for it.
+
+**Second precision does not survive a Parquet round trip, by design.** A column
+written as `timestamp[s]` reads back as `timestamp[ms]`. The unit is recorded in
+the `ARROW:schema` footer entry EngineeredWood now writes, but the reader
+deliberately does not restore it, because PyArrow — which defines that
+convention — does not either: measured, it reads its own `timestamp[s]` column
+back as `timestamp[ms]` while restoring `tz=America/New_York` faithfully.
+EngineeredWood restores the zone and leaves the unit, so it behaves the same way.
+
+The reader also declines to restore a **fixed-size list's width** from
+`ARROW:schema`, though PyArrow does. The width is not verifiable against the
+data, and PyArrow's attempt to rebuild it is a live source of read failures on
+files whose lists are not uniform — reproduced as `Expected all lists to be of
+size=2 but index 1 had size=0` on PyArrow's own output. A fixed-size list
+therefore reads back as an ordinary list, which is what DuckDB also returns.
 
 **Stats collection gaps.**
 
