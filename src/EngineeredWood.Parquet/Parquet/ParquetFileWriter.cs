@@ -627,10 +627,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     private static bool IsNestedType(Apache.Arrow.Types.IArrowType type) =>
         type is Apache.Arrow.Types.StructType
             or Apache.Arrow.Types.ListType
+            or Apache.Arrow.Types.FixedSizeListType
             or Apache.Arrow.Types.MapType
             // VariantType / any extension whose storage is itself nested.
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.StructType }
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.ListType }
+            or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.FixedSizeListType }
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.MapType };
 
     /// <summary>

@@ -113,6 +113,12 @@ internal static class NestedLevelWriter
                     parentDefLevels, parentRepLevels, parentCount, parentValueMap);
                 break;
 
+            case FixedSizeListType:
+                DecomposeFixedList(array, field, path, leaves,
+                    parentDefLevel, parentRepLevel,
+                    parentDefLevels, parentRepLevels, parentCount, parentValueMap);
+                break;
+
             case MapType:
                 DecomposeMap(array, field, path, leaves,
                     parentDefLevel, parentRepLevel,
@@ -552,6 +558,90 @@ internal static class NestedLevelWriter
         path.Add(elementField.Name);
         DecomposeRecursive(elementArray, elementField, path, leaves,
             repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount);
+        path.RemoveAt(path.Count - 1);
+        path.RemoveAt(path.Count - 1);
+    }
+
+    /// <summary>
+    /// Decomposes a fixed-size list, which Parquet has no type for: it writes as an ordinary
+    /// 3-level LIST, exactly as PyArrow, Polars, and DuckDB write theirs. The declared width is not
+    /// representable on disk and does not survive the round trip.
+    /// </summary>
+    /// <remarks>
+    /// This cannot reuse <see cref="DecomposeList"/>, and not only because there is no offsets
+    /// buffer to read. A null slot of a fixed-size list still occupies its full width of child
+    /// positions, so the child cannot be consumed sequentially the way a variable list's is — the
+    /// first null would shift every value after it. The child index is therefore mapped explicitly,
+    /// the same way <see cref="DecomposeStruct"/> maps around a null struct row.
+    /// </remarks>
+    private static void DecomposeFixedList(
+        IArrowArray array, Field field, List<string> path,
+        List<LeafColumn> leaves,
+        int parentDefLevel, int parentRepLevel,
+        int[]? parentDefLevels, int[]? parentRepLevels,
+        int parentCount, int[]? parentValueMap = null)
+    {
+        var fixedArray = (FixedSizeListArray)array;
+        var fixedType = (FixedSizeListType)field.DataType;
+        int width = fixedType.ListSize;
+
+        // 3-level: optional group (LIST) → repeated group "list" → element
+        int listDefLevel = parentDefLevel + (field.IsNullable ? 1 : 0);
+        int repeatedDefLevel = listDefLevel + 1;
+        int repeatedRepLevel = parentRepLevel + 1;
+
+        var elementField = fixedType.ValueField;
+        var elementArray = fixedArray.Values;
+
+        var defList = new List<int>();
+        var repList = new List<int>();
+        var childMap = new List<int>();
+        int inputCount = parentDefLevels?.Length ?? parentCount;
+
+        // A sliced fixed-size list's child is NOT sliced with it, so the child span for a logical
+        // slot starts at (offset + slot) * width — the same arithmetic ArrowCompute uses to gather
+        // one. The slot's own IsNull applies the offset internally, so it takes the logical index.
+        int arrayOffset = fixedArray.Data.Offset;
+
+        int slotIdx = 0;
+        for (int i = 0; i < inputCount; i++)
+        {
+            int pDef = parentDefLevels?[i] ?? parentDefLevel;
+            int pRep = parentRepLevels?[i] ?? 0;
+
+            if (pDef < parentDefLevel)
+            {
+                // Ancestor is null — emit phantom entry
+                defList.Add(pDef);
+                repList.Add(pRep);
+                childMap.Add(-1);
+                continue;
+            }
+
+            int slot = parentValueMap?[i] ?? slotIdx++;
+            if (field.IsNullable && fixedArray.IsNull(slot))
+            {
+                defList.Add(listDefLevel - 1);
+                repList.Add(pRep);
+                childMap.Add(-1);
+                continue;
+            }
+
+            // Arrow requires a positive width, so unlike a variable list there is no empty case.
+            int start = checked((arrayOffset + slot) * width);
+            for (int j = 0; j < width; j++)
+            {
+                defList.Add(repeatedDefLevel); // placeholder — child will add more
+                repList.Add(j == 0 ? pRep : repeatedRepLevel);
+                childMap.Add(start + j);
+            }
+        }
+
+        path.Add("list");
+        path.Add(elementField.Name);
+        DecomposeRecursive(elementArray, elementField, path, leaves,
+            repeatedDefLevel, repeatedRepLevel, defList.ToArray(), repList.ToArray(),
+            parentCount, childMap.ToArray());
         path.RemoveAt(path.Count - 1);
         path.RemoveAt(path.Count - 1);
     }
