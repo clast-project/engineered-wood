@@ -311,7 +311,12 @@ internal static class ArrowSchemaConverter
                     Metadata.TimeUnit.Nanos => Apache.Arrow.Types.TimeUnit.Nanosecond,
                     _ => Apache.Arrow.Types.TimeUnit.Microsecond,
                 },
-                ts.IsAdjustedToUtc ? TimeZoneInfo.Utc : null),
+                // Parquet records only isAdjustedToUTC, never a zone name, so an adjusted column
+                // can only come back as UTC. Arrow spells that "UTC"; the TimeZoneInfo overload
+                // renders it as the "+00:00" offset instead, which is a legal but unconventional
+                // spelling that no other Parquet-to-Arrow implementation produces — and which
+                // therefore reads as a type mismatch to every consumer that compares zone strings.
+                ts.IsAdjustedToUtc ? "UTC" : null),
             // Arrow requires Time32 for second/millisecond units and Time64 for micro/nanosecond units —
             // a Time32 with a micro/nano unit is a malformed type (4-byte buffer read with 8-byte semantics),
             // mishandled crossing the Arrow C-data-interface. Match on the unit accordingly.
@@ -335,8 +340,12 @@ internal static class ArrowSchemaConverter
         {
             ConvertedType.Utf8 => Apache.Arrow.Types.StringType.Default,
             ConvertedType.Date => Date32Type.Default,
-            ConvertedType.TimestampMillis => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, TimeZoneInfo.Utc),
-            ConvertedType.TimestampMicros => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, TimeZoneInfo.Utc),
+            // "UTC", not TimeZoneInfo.Utc, for the same reason as the logical-type path above: the
+            // TimeZoneInfo overload renders the "+00:00" offset. A file old enough to carry only a
+            // converted type is exactly the kind this matters for, since it was written by a tool
+            // whose output is still being read by everything else.
+            ConvertedType.TimestampMillis => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, "UTC"),
+            ConvertedType.TimestampMicros => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"),
             ConvertedType.TimeMillis => new Time32Type(Apache.Arrow.Types.TimeUnit.Millisecond),
             ConvertedType.TimeMicros => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
             ConvertedType.Int8 => Int8Type.Default,
