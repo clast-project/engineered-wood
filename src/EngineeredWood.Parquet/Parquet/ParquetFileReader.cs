@@ -928,9 +928,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Restores the units and zone names the declared schema carries for <paramref name="field"/>,
-    /// matched by name so that a projected read still finds its own field.
+    /// Restores the timestamp and time ZONE names the declared schema carries for
+    /// <paramref name="field"/>, matched by name so that a projected read still finds its own field.
     /// </summary>
+    /// <remarks>
+    /// Zone names only. The unit stays as the file encodes it, because PyArrow reads its own
+    /// <c>timestamp[s]</c> back as <c>timestamp[ms]</c> and restoring the unit here would make us
+    /// the outlier against every file anyone else wrote.
+    /// </remarks>
     private static Field RestoreDeclaredUnits(Field field, Apache.Arrow.Schema? declared)
     {
         var target = DeclaredField(field.Name, declared);
@@ -940,7 +945,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var type = Data.TimeUnitRescaler.ToDeclaredUnits(field.DataType, target.DataType);
         return ReferenceEquals(type, field.DataType)
             ? field
-            : new Field(field.Name, type, field.IsNullable);
+            : new Field(field.Name, type, field.IsNullable, field.Metadata);
     }
 
     private static Field? DeclaredField(string name, Apache.Arrow.Schema? declared)
@@ -980,7 +985,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 continue;
 
             arrays[i] = restored;
-            fields[i] = new Field(fields[i].Name, restored.Data.DataType, fields[i].IsNullable);
+            fields[i] = new Field(
+                fields[i].Name, restored.Data.DataType, fields[i].IsNullable, fields[i].Metadata);
         }
     }
 

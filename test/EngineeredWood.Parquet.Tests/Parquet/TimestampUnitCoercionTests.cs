@@ -225,4 +225,42 @@ public class TimestampUnitCoercionTests : IDisposable
             Assert.Equal(3_661_000, arr.GetValue(0));
         }
     }
+
+    [Fact]
+    public async Task CoercionKeepsFieldMetadataSuchAsFieldIds()
+    {
+        // Rebuilding a Field to change its type drops everything else on it unless the metadata is
+        // carried across -- and PARQUET:field_id lives in exactly that metadata. Silently losing it
+        // because a table happened to contain a second-precision column would break Iceberg and
+        // Delta column mapping for that file.
+        var metadata = new Dictionary<string, string> { ["PARQUET:field_id"] = "7" };
+        var coerced = new Field(
+            "at", new TimestampType(TimeUnit.Second, "UTC"), nullable: true, metadata);
+        var untouched = new Field(
+            "id", Int32Type.Default, nullable: false,
+            new Dictionary<string, string> { ["PARQUET:field_id"] = "9" });
+        var schema = new Apache.Arrow.Schema.Builder().Field(coerced).Field(untouched).Build();
+
+        string path = TempPath("ts_field_ids.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(
+                schema,
+                [
+                    Int64Backed(new TimestampType(TimeUnit.Second, "UTC"), 1_700_000_000L, timestamp: true),
+                    new Int32Array.Builder().Append(1).Build(),
+                ],
+                1));
+            await writer.CloseAsync();
+        }
+
+        await using var rf = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(rf, ownsFile: false);
+        var elements = (await reader.ReadMetadataAsync()).Schema;
+
+        // The coerced column keeps its id, and so does the one that was never touched.
+        Assert.Equal(7, elements.Single(element => element.Name == "at").FieldId);
+        Assert.Equal(9, elements.Single(element => element.Name == "id").FieldId);
+    }
 }

@@ -711,7 +711,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             var coerced = Data.TimeUnitRescaler.ToParquetUnits(original);
             if (!ReferenceEquals(coerced, original))
             {
-                columns ??= [.. Enumerable.Range(0, batch.ColumnCount).Select(batch.Column)];
+                if (columns is null)
+                {
+                    columns = new IArrowArray[batch.ColumnCount];
+                    for (int c = 0; c < columns.Length; c++)
+                        columns[c] = batch.Column(c);
+                }
+
                 columns[i] = coerced;
             }
         }
@@ -723,7 +729,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         for (int i = 0; i < fields.Length; i++)
         {
             var field = batch.Schema.FieldsList[i];
-            fields[i] = new Apache.Arrow.Field(field.Name, columns[i].Data.DataType, field.IsNullable);
+            fields[i] = new Apache.Arrow.Field(
+                field.Name, columns[i].Data.DataType, field.IsNullable, field.Metadata);
         }
 
         return new RecordBatch(

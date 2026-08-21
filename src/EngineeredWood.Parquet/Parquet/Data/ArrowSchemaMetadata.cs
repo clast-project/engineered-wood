@@ -16,10 +16,12 @@ namespace EngineeredWood.Parquet.Data;
 /// not, which is why a <c>timestamp[us, tz=America/New_York]</c> round-trips through those two and
 /// comes back as UTC through DuckDB.</para>
 ///
-/// <para>What the reader restores from it is deliberately narrow — timestamp and time units and
-/// zones, and nothing else. Restoring a fixed-size list's width from here is the one thing this
-/// pass will not do: the width is not verifiable against the data, and PyArrow's attempt to do it
-/// is itself a source of read failures on files whose lists are not uniform.</para>
+/// <para>What the reader restores from it is deliberately narrow — timestamp and time ZONE names,
+/// and nothing else. Units are not restored: PyArrow reads its own <c>timestamp[s]</c> back as
+/// <c>timestamp[ms]</c>, so restoring the unit would make us the one engine returning seconds where
+/// every other returns milliseconds. A fixed-size list's width is not restored either — the width
+/// is not verifiable against the data, and PyArrow's attempt to do it is itself a source of read
+/// failures on files whose lists are not uniform.</para>
 /// </remarks>
 internal static class ArrowSchemaMetadata
 {
@@ -63,7 +65,7 @@ internal static class ArrowSchemaMetadata
             if (!ReferenceEquals(type, field.DataType))
             {
                 fields ??= [.. schema.FieldsList];
-                fields[i] = new Apache.Arrow.Field(field.Name, type, field.IsNullable);
+                fields[i] = new Apache.Arrow.Field(field.Name, type, field.IsNullable, field.Metadata);
             }
         }
 

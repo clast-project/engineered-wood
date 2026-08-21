@@ -106,7 +106,7 @@ internal static class TimeUnitRescaler
             if (!ReferenceEquals(type, field.DataType))
             {
                 fields ??= [.. schema.FieldsList];
-                fields[i] = new Field(field.Name, type, field.IsNullable);
+                fields[i] = new Field(field.Name, type, field.IsNullable, field.Metadata);
             }
         }
 
@@ -161,7 +161,8 @@ internal static class TimeUnitRescaler
                     {
                         fields ??= [.. actual.Fields];
                         fields[i] = new Field(
-                            actual.Fields[i].Name, type, actual.Fields[i].IsNullable);
+                            actual.Fields[i].Name, type, actual.Fields[i].IsNullable,
+                            actual.Fields[i].Metadata);
                     }
                 }
 
@@ -181,8 +182,12 @@ internal static class TimeUnitRescaler
                 }
 
                 return new MapType(
-                    new Field(actual.KeyField.Name, key, actual.KeyField.IsNullable),
-                    new Field(actual.ValueField.Name, value, actual.ValueField.IsNullable),
+                    new Field(
+                        actual.KeyField.Name, key, actual.KeyField.IsNullable,
+                        actual.KeyField.Metadata),
+                    new Field(
+                        actual.ValueField.Name, value, actual.ValueField.IsNullable,
+                        actual.ValueField.Metadata),
                     actual.KeySorted);
             }
 
@@ -198,7 +203,8 @@ internal static class TimeUnitRescaler
                 return ReferenceEquals(value, actual.ValueField.DataType)
                     ? derived
                     : new ListType(new Field(
-                        actual.ValueField.Name, value, actual.ValueField.IsNullable));
+                        actual.ValueField.Name, value, actual.ValueField.IsNullable,
+                        actual.ValueField.Metadata));
             }
 
             default:
@@ -265,7 +271,8 @@ internal static class TimeUnitRescaler
                 for (int i = 0; i < fields.Length; i++)
                 {
                     fields[i] = new Field(
-                        source.Fields[i].Name, children[i].Data.DataType, source.Fields[i].IsNullable);
+                        source.Fields[i].Name, children[i].Data.DataType,
+                        source.Fields[i].IsNullable, source.Fields[i].Metadata);
                 }
 
                 return new StructArray(new ArrayData(
@@ -291,7 +298,8 @@ internal static class TimeUnitRescaler
                     return array;
                 var source = (ListType)la.Data.DataType;
                 var valueField = new Field(
-                    source.ValueField.Name, values.Data.DataType, source.ValueField.IsNullable);
+                    source.ValueField.Name, values.Data.DataType, source.ValueField.IsNullable,
+                    source.ValueField.Metadata);
                 return new ListArray(new ArrayData(
                     new ListType(valueField), la.Length, la.NullCount, la.Offset,
                     la.Data.Buffers, [values.Data]));
@@ -305,7 +313,8 @@ internal static class TimeUnitRescaler
                     return array;
                 var source = (FixedSizeListType)fa.Data.DataType;
                 var valueField = new Field(
-                    source.ValueField.Name, values.Data.DataType, source.ValueField.IsNullable);
+                    source.ValueField.Name, values.Data.DataType, source.ValueField.IsNullable,
+                    source.ValueField.Metadata);
                 return new FixedSizeListArray(new ArrayData(
                     new FixedSizeListType(valueField, source.ListSize), fa.Length, fa.NullCount,
                     fa.Offset, fa.Data.Buffers, [values.Data]));
