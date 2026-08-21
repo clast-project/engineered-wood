@@ -260,6 +260,29 @@ returns, raise `ThreadPool.SetMinThreads` or put the interop classes in one
 xUnit collection — they share a single Spark process, so parallelism across them
 buys nothing anyway.
 
+### Parquet interoperability (optional — not part of the suite)
+
+The same argument as the Delta tiers, one format over. Round-tripping through
+our own reader proves the reader and writer agree with each other, not that
+they agree with Parquet.
+
+`test/EngineeredWood.Parquet.Bridge` is an executable that lets
+[Parquity](https://github.com/sovsparrow/parquity) drive EngineeredWood as one
+engine in its writer-by-reader matrix, against PyArrow, DuckDB and Polars. It
+is run by hand rather than from `dotnet test`, so nothing here is skipped or
+reported — no test in the suite depends on it.
+
+```console
+pip install parquity
+dotnet build test/EngineeredWood.Parquet.Bridge -c Release
+```
+
+See [the bridge's README](../test/EngineeredWood.Parquet.Bridge/README.md) for
+the engines file it needs, the commands worth running, and what the exit codes
+of the contract mean. Ten of the Parquet bugs fixed so far were found this way,
+including one that silently corrupted every value after the first row-group
+boundary at default write options.
+
 ### Regenerating Avro Test Data
 
 The Avro test suite includes pre-generated `.avro` files in
