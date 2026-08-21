@@ -22,6 +22,8 @@
     <Project Path="test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj" />
     <Project Path="test/EngineeredWood.Parquet.Benchmarks/EngineeredWood.Parquet.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Parquet.Compatibility/EngineeredWood.Parquet.Compatibility.csproj" />
+    <Project Path="test/EngineeredWood.Parquet.Bridge/EngineeredWood.Parquet.Bridge.csproj" />
+    <Project Path="test/EngineeredWood.Parquet.Bridge.Tests/EngineeredWood.Parquet.Bridge.Tests.csproj" />
     <Project Path="test/EngineeredWood.Orc.Tests/EngineeredWood.Orc.Tests.csproj" />
     <Project Path="test/EngineeredWood.Orc.Benchmarks/EngineeredWood.Orc.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Avro.Tests/EngineeredWood.Avro.Tests.csproj" />
