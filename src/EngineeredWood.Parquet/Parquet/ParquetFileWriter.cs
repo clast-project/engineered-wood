@@ -43,12 +43,6 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Writes a row group from the given <see cref="RecordBatch"/>.
-    /// The schema is inferred from the first batch; subsequent batches must have the same schema.
-    /// If the batch exceeds <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, it is automatically
-    /// split into multiple row groups.
-    /// </summary>
-    /// <summary>
     /// Declares the schema to record when no row group is ever written, so that a zero-row table
     /// keeps its columns instead of producing a file whose footer declares an empty schema.
     /// </summary>
@@ -73,6 +67,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _declaredSchema = schema;
     }
 
+    /// <summary>
+    /// Writes a row group from the given <see cref="RecordBatch"/>.
+    /// The schema is inferred from the first batch; subsequent batches must have the same schema.
+    /// If the batch exceeds <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, it is automatically
+    /// split into multiple row groups.
+    /// </summary>
     public async ValueTask WriteRowGroupAsync(
         RecordBatch batch,
         CancellationToken cancellationToken = default)
