@@ -197,6 +197,126 @@ public class TakeTypeMatrixTests
     }
 
     [Fact]
+    public void StringView_GathersInlineAndOutOfLineValues()
+    {
+        // Straddles the 12-byte inline boundary on purpose: at or under it the value lives in its own view
+        // entry, over it the entry only points at a data buffer, and a gather that handled one of those two
+        // and not the other would still pass a test made entirely of short strings.
+        string[] values =
+        [
+            "alpha", "", "exactly12chr", "a string far too long to sit inline", "q",
+            "another value that has to spill out of line",
+        ];
+        var array = RawArrays.VarBinaryView(StringViewType.Default, values);
+
+        int[] indices = [3, 1, 5, 2, 0, 5];
+        var result = Assert.IsType<StringViewArray>(ArrowCompute.Take(array, indices));
+
+        Assert.Equal(indices.Length, result.Length);
+        Assert.Same(StringViewType.Default, result.Data.DataType);
+        for (int i = 0; i < indices.Length; i++)
+            Assert.Equal(values[indices[i]], result.GetString(i));
+
+        // No null was gathered, so there must be no validity buffer to check at read time.
+        Assert.Equal(0, result.Data.NullCount);
+        Assert.Equal(0, result.Data.Buffers[0].Length);
+    }
+
+    [Fact]
+    public void StringView_KeepsEveryDataBufferSoViewBufferIndicesStillResolve()
+    {
+        // Every kept value is out of line and they are spread across four data buffers, so the result can
+        // only read correctly if all four survive, in order. Compacting or dropping the unreferenced ones
+        // would renumber the rest and silently repoint the values that remain.
+        string[] values =
+        [
+            "the first out-of-line value", "the second out-of-line value",
+            "the third out-of-line value", "the fourth out-of-line value",
+            "the fifth out-of-line value", "the sixth out-of-line value",
+        ];
+        var array = RawArrays.VarBinaryView(
+            StringViewType.Default, values, dataBufferCount: 4);
+
+        var source = Assert.IsType<StringViewArray>(array);
+        Assert.Equal(4, source.DataBufferCount);
+
+        // One row only, and it is not the one in data buffer 0 — a gather that kept just the buffer it
+        // happens to reference would still pass if row 0 were the survivor.
+        var result = Assert.IsType<StringViewArray>(ArrowCompute.Take(array, (int[])[2]));
+
+        Assert.Equal(4, result.DataBufferCount);
+        Assert.Equal(values[2], result.GetString(0));
+
+        // The buffers are the source's own, shared rather than rebuilt — the documented trade-off of this
+        // arm, and what makes the gather cost independent of how much value data the source holds.
+        for (int b = 0; b < 4; b++)
+            Assert.Equal(source.DataBuffer(b).Length, result.DataBuffer(b).Length);
+    }
+
+    [Fact]
+    public void StringView_GathersNullsAsEmptyInlineEntries()
+    {
+        string[] values = ["alpha", "a value long enough to go out of line", "charlie", "delta"];
+        bool[] valid = [true, false, true, false];
+        var array = RawArrays.VarBinaryView(StringViewType.Default, values, valid);
+
+        var result = Assert.IsType<StringViewArray>(ArrowCompute.Take(array, (int[])[1, 2, 3, 0]));
+
+        Assert.Null(result.GetString(0));
+        Assert.Equal("charlie", result.GetString(1));
+        Assert.Null(result.GetString(2));
+        Assert.Equal("alpha", result.GetString(3));
+        Assert.Equal(2, result.NullCount);
+
+        // A null entry must be all-zero rather than the source's, which for row 1 pointed out of line: a
+        // stale entry under a cleared validity bit is a length and a buffer offset that a consumer reading
+        // values without consulting validity would follow.
+        var views = result.Data.Buffers[1].Span;
+        foreach (int row in (int[])[0, 2])
+        {
+            for (int b = 0; b < 16; b++)
+                Assert.Equal(0, views[row * 16 + b]);
+        }
+    }
+
+    [Fact]
+    public void StringView_HonoursTheSourcesLogicalOffset()
+    {
+        string[] values = ["skipped", "alpha", "a value long enough to go out of line", "charlie"];
+        var array = RawArrays.VarBinaryView(StringViewType.Default, values, offset: 1);
+
+        // Logical row 0 is physical slot 1: reading the views buffer without adding the array's offset
+        // would return "skipped" here.
+        var result = Assert.IsType<StringViewArray>(ArrowCompute.Take(array, (int[])[1, 0, 2]));
+
+        Assert.Equal(values[2], result.GetString(0));
+        Assert.Equal("alpha", result.GetString(1));
+        Assert.Equal("charlie", result.GetString(2));
+    }
+
+    [Fact]
+    public void BinaryView_IsNotRetaggedAsStringView()
+    {
+        // The twin of LargeBinary_IsNotNarrowedToBinary: the gather must reuse the source's own DataType
+        // rather than defaulting to the string-view type whose LAYOUT is indistinguishable from this
+        // one. A binary-view column rebuilt as a string-view one contradicts the batch it lands in.
+        var array = RawArrays.VarBinaryView(
+            BinaryViewType.Default, ["aa", "a value long enough to go out of line", "cc"]);
+
+        var result = ArrowCompute.Take(array, (int[])[1, 2]);
+
+        Assert.IsType<BinaryViewArray>(result);
+        Assert.Equal(ArrowTypeId.BinaryView, result.Data.DataType.TypeId);
+        Assert.Same(BinaryViewType.Default, result.Data.DataType);
+
+        var view = (BinaryViewArray)result;
+        Assert.Equal(
+            System.Text.Encoding.UTF8.GetBytes("a value long enough to go out of line"),
+            view.GetBytes(0).ToArray());
+        Assert.Equal(System.Text.Encoding.UTF8.GetBytes("cc"), view.GetBytes(1).ToArray());
+    }
+
+    [Fact]
     public void VarBinary_GathersNullsWithMonotonicOffsets()
     {
         string[] values = ["alpha", "bravo", "charlie", "delta"];

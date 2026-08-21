@@ -565,6 +565,77 @@ public class ReadRowGroupTests
     }
 
     /// <summary>
+    /// Reads the whole corpus twice — once with the default output kind, once with
+    /// <see cref="ByteArrayOutputKind.ViewType"/> — and requires that every file the default read handles,
+    /// the view read handles too.
+    ///
+    /// <para>Differential rather than absolute on purpose. The sweep above catches
+    /// <see cref="NotSupportedException"/> and records it as a SKIP, which is right for a file whose codec
+    /// or encoding this reader does not implement — and is exactly why issue #194 hid here for as long as
+    /// it did: <c>ArrowCompute</c> refusing to gather a view array throws that same type, so a
+    /// view-kind sweep on its own would have reported four silent skips and passed. Comparing the two runs
+    /// is what turns "the option quietly did nothing" into a failure.</para>
+    ///
+    /// <para>Only the reads are compared, not the values; the per-value equivalence is pinned on the
+    /// nested columns that matter by <c>NestedOutputKindTests</c>.</para>
+    /// </summary>
+    [Fact]
+    public async Task SweepTest_ViewTypeReadsEveryFileTheDefaultKindDoes()
+    {
+        static async Task<Exception?> TryReadAsync(string filePath, ByteArrayOutputKind kind)
+        {
+            try
+            {
+                await using var file = new LocalRandomAccessFile(filePath);
+                using var reader = new ParquetFileReader(
+                    file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = kind });
+
+                var metadata = await reader.ReadMetadataAsync();
+                if (metadata.RowGroups.Count == 0)
+                    return null;
+
+                using var batch = await reader.ReadRowGroupAsync(0);
+                for (int c = 0; c < batch.ColumnCount; c++)
+                    TouchChildArrays(batch.Column(c));
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex;
+            }
+        }
+
+        var regressions = new List<string>();
+        int compared = 0;
+
+        foreach (var filePath in TestData.GetAllParquetFiles())
+        {
+            var fileName = Path.GetFileName(filePath);
+            if (fileName.Contains("encrypt", StringComparison.OrdinalIgnoreCase) ||
+                fileName.Contains("malformed", StringComparison.OrdinalIgnoreCase) ||
+                fileName == "large_string_map.brotli.parquet" || // 2GB+ uncompressed data
+                fileName == "fixed_length_byte_array.parquet") // malformed: payloads too small for row count
+            {
+                continue;
+            }
+
+            if (await TryReadAsync(filePath, ByteArrayOutputKind.Default) is not null)
+                continue; // the file is out of reach for reasons that have nothing to do with view types
+
+            compared++;
+            if (await TryReadAsync(filePath, ByteArrayOutputKind.ViewType) is { } viewFailure)
+                regressions.Add($"{fileName}: {viewFailure.GetType().Name}: {viewFailure.Message}");
+        }
+
+        // Guards against a corpus that stopped being found: zero comparisons would pass vacuously.
+        Assert.True(compared > 0, "no corpus file could be read with the default output kind");
+        Assert.True(regressions.Count == 0,
+            $"UseViewTypes failed on {regressions.Count} file(s) the default kind reads:\n"
+            + string.Join("\n", regressions));
+    }
+
+    /// <summary>
     /// Walks every child of a nested array through the typed accessors a consumer would use, so an array
     /// whose type and children disagree throws here rather than in someone else's code.
     /// </summary>

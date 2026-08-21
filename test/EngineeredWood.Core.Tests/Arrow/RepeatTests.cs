@@ -251,6 +251,115 @@ public class RepeatTests
     }
 
     [Fact]
+    public void StringView_ShortValueIsInlineInEveryEntry()
+    {
+        byte[] value = System.Text.Encoding.UTF8.GetBytes("abc");
+
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.Repeat(StringViewType.Default, value, 3));
+
+        AssertNoValidityBuffer(result);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal("abc", result.GetString(i));
+
+        // A value of 12 bytes or fewer lives inside its own view entry, so the constant needs no data
+        // buffer at all — two buffers, which is Arrow's minimum for a view array.
+        Assert.Equal(2, result.Data.Buffers.Length);
+        Assert.Equal(0, result.DataBufferCount);
+    }
+
+    [Fact]
+    public void StringView_LongValueIsStoredOnceAndSharedByEveryRow()
+    {
+        // Over the 12-byte inline limit, so it has to go out of line.
+        byte[] value = System.Text.Encoding.UTF8.GetBytes("a value that cannot possibly sit inline");
+
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.Repeat(StringViewType.Default, value, 1000));
+
+        AssertNoValidityBuffer(result);
+        Assert.Equal(1000, result.Length);
+        for (int i = 0; i < 1000; i += 137)
+            Assert.Equal(System.Text.Encoding.UTF8.GetString(value), result.GetString(i));
+
+        // The point of the view layout for a constant: ONE copy of the bytes however many rows there are,
+        // where the String arm tiles the value 1000 times. RepeatVarBinary needs an overflow guard for
+        // exactly that reason; this arm cannot reach it.
+        Assert.Equal(1, result.DataBufferCount);
+        Assert.Equal(value.Length, result.DataBuffer(0).Length);
+    }
+
+    /// <summary>
+    /// Pins the inline/out-of-line boundary at exactly 12 bytes, the spec's limit. An off-by-one here is the
+    /// one mistake in this arm that produces a WRONG array rather than a throw: a 13-byte value written
+    /// inline overruns its entry's 12 bytes into the buffer index and offset, and a 12-byte value pushed out
+    /// of line is read back inline — as its own length, prefix and pointer bytes — because
+    /// <c>BinaryView.IsInline</c> is decided by the length alone.
+    /// </summary>
+    [Theory]
+    [InlineData(11, 0)]
+    [InlineData(12, 0)]   // the longest value that still fits inline
+    [InlineData(13, 1)]   // one byte over, so it needs a data buffer
+    [InlineData(40, 1)]
+    public void View_InlineBoundaryIsTwelveBytes(int valueLength, int expectedDataBuffers)
+    {
+        // Distinct bytes so a value read out of the wrong part of the entry cannot coincidentally match.
+        var value = new byte[valueLength];
+        for (int i = 0; i < valueLength; i++)
+            value[i] = (byte)('a' + (i % 26));
+
+        var result = Assert.IsType<BinaryViewArray>(
+            ArrowCompute.Repeat(BinaryViewType.Default, value, 4));
+
+        Assert.Equal(expectedDataBuffers, result.DataBufferCount);
+        for (int i = 0; i < 4; i++)
+            Assert.Equal(value, result.GetBytes(i).ToArray());
+    }
+
+    [Fact]
+    public void StringView_EmptyValueIsAnEmptyStringNotANull()
+    {
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.Repeat(StringViewType.Default, System.Array.Empty<byte>(), 3));
+
+        // An all-zero view entry is what MakeNullArray writes for a NULL row, so the two cases are told
+        // apart only by the validity buffer — which this arm must leave absent.
+        AssertNoValidityBuffer(result);
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.False(result.IsNull(i));
+            Assert.Equal("", result.GetString(i));
+        }
+    }
+
+    [Fact]
+    public void StringView_ZeroLengthIsWellFormed()
+    {
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.Repeat(StringViewType.Default, System.Text.Encoding.UTF8.GetBytes("abc"), 0));
+
+        Assert.Equal(0, result.Length);
+        Assert.Equal(2, result.Data.Buffers.Length);
+    }
+
+    [Fact]
+    public void BinaryView_IsNotRetaggedAsStringViewAndKeepsRawBytes()
+    {
+        // Bytes that are not valid UTF-8, so a column built as StringView would be wrong in substance and
+        // not only in its tag.
+        byte[] value = [0x00, 0xFF, 0x7F, 0xC3, 0x28];
+
+        var result = ArrowCompute.Repeat(BinaryViewType.Default, value, 3);
+
+        Assert.IsType<BinaryViewArray>(result);
+        Assert.Same(BinaryViewType.Default, result.Data.DataType);
+
+        var view = (BinaryViewArray)result;
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(value, view.GetBytes(i).ToArray());
+    }
+
+    [Fact]
     public void Extension_KeepsItsAnnotation()
     {
         var moneyType = new MoneyType();
