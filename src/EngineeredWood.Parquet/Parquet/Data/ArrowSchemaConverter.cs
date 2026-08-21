@@ -311,7 +311,12 @@ internal static class ArrowSchemaConverter
                     Metadata.TimeUnit.Nanos => Apache.Arrow.Types.TimeUnit.Nanosecond,
                     _ => Apache.Arrow.Types.TimeUnit.Microsecond,
                 },
-                ts.IsAdjustedToUtc ? TimeZoneInfo.Utc : null),
+                // Parquet records only isAdjustedToUTC, never a zone name, so an adjusted column
+                // can only come back as UTC. Arrow spells that "UTC"; the TimeZoneInfo overload
+                // renders it as the "+00:00" offset instead, which is a legal but unconventional
+                // spelling that no other Parquet-to-Arrow implementation produces — and which
+                // therefore reads as a type mismatch to every consumer that compares zone strings.
+                ts.IsAdjustedToUtc ? "UTC" : null),
             // Arrow requires Time32 for second/millisecond units and Time64 for micro/nanosecond units —
             // a Time32 with a micro/nano unit is a malformed type (4-byte buffer read with 8-byte semantics),
             // mishandled crossing the Arrow C-data-interface. Match on the unit accordingly.
