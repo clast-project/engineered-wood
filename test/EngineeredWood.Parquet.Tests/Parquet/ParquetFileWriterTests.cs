@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -352,6 +352,171 @@ public class ParquetFileWriterTests : IDisposable
         }
 
         Assert.Equal(Enumerable.Range(0, rows).Select(i => i * 100), seen);
+    }
+
+    // A NULLABLE column auto-split across row groups used to be re-aligned against the WRONG validity bits
+    // from the first boundary onward (issue #155). The slice handed to CopyArray has an unknown (negative)
+    // null count, so the branch that copies the bitmap with the slice's offset applied was skipped and the
+    // ORIGINAL bitmap was reused unshifted — row group N read its validity starting at bit 0.
+    //
+    // ['A', null, 'C'] happened to survive by luck (unshifted bit 0 is 'A', valid), so the case that pins
+    // this down is one whose nulls fall BEFORE a boundary.
+    [Theory]
+    [InlineData("A,B,C")]
+    [InlineData("A,-,C")]
+    [InlineData("-,B,C")]
+    [InlineData("-,-,C")]
+    [InlineData("-,B,C,-,E")]
+    [InlineData("-,B,C,D")] // nulls only in group 1: later groups are null-free
+    public async Task RoundTrip_NullableStringColumn_AutoSplitPreservesNullPositions(string spec)
+    {
+        // "-" is a null; anything else is that literal string.
+        string?[] values = spec.Split(',').Select(v => v == "-" ? null : v).ToArray();
+
+        var builder = new StringArray.Builder();
+        foreach (var v in values)
+        {
+            if (v is null) builder.AppendNull();
+            else builder.Append(v);
+        }
+
+        var column = builder.Build();
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", StringType.Default, nullable: true)).Build();
+        var batch = new RecordBatch(schema, [column], values.Length);
+
+        string path = TempPath($"nullable_autosplit_{spec.Replace(',', '_')}.parquet");
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 2,
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        Assert.Equal(values, await ReadStringColumn(path));
+    }
+
+    // The int64 shape of the same defect: a fixed-width column takes a different arm of CopyArray's switch
+    // but shares the one bitmap decision above.
+    [Fact]
+    public async Task RoundTrip_NullableInt64Column_AutoSplitPreservesNullPositions()
+    {
+        const int rows = 11;
+        var builder = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            if (i % 3 == 0) builder.AppendNull();
+            else builder.Append(i);
+        }
+
+        var column = builder.Build();
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("n", Int64Type.Default, nullable: true)).Build();
+        var batch = new RecordBatch(schema, [column], rows);
+
+        string path = TempPath("nullable_int64_autosplit.parquet");
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 2,
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        var seen = new List<long?>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var read = await reader.ReadRowGroupAsync(g);
+            var n = Assert.IsType<Int64Array>(read.Column(0));
+            for (int i = 0; i < read.Length; i++)
+                seen.Add(n.GetValue(i));
+        }
+
+        var expected = Enumerable.Range(0, rows).Select(i => i % 3 == 0 ? (long?)null : i);
+        Assert.Equal(expected, seen);
+    }
+
+    // A BOOLEAN column packs its values into a bitmap as well, so the value copy and the validity copy must
+    // both honour the slice offset — a shift of either one is invisible in a single-row-group file.
+    [Fact]
+    public async Task RoundTrip_NullableBooleanColumn_AutoSplitPreservesNullPositions()
+    {
+        const int rows = 11;
+        var builder = new BooleanArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            if (i % 3 == 0) builder.AppendNull();
+            else builder.Append(i % 2 == 0);
+        }
+
+        var column = builder.Build();
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("b", BooleanType.Default, nullable: true)).Build();
+        var batch = new RecordBatch(schema, [column], rows);
+
+        string path = TempPath("nullable_bool_autosplit.parquet");
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 2,
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        var seen = new List<bool?>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var read = await reader.ReadRowGroupAsync(g);
+            var b = Assert.IsType<BooleanArray>(read.Column(0));
+            for (int i = 0; i < read.Length; i++)
+                seen.Add(b.GetValue(i));
+        }
+
+        var expected = Enumerable.Range(0, rows).Select(i => i % 3 == 0 ? (bool?)null : i % 2 == 0);
+        Assert.Equal(expected, seen);
+    }
+
+    /// <summary>Reads every row group of a single-string-column file back, in order.</summary>
+    private static async Task<string?[]> ReadStringColumn(string path)
+    {
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        var seen = new List<string?>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var batch = await reader.ReadRowGroupAsync(g);
+            var s = Assert.IsType<StringArray>(batch.Column(0));
+            for (int i = 0; i < batch.Length; i++)
+                seen.Add(s.IsNull(i) ? null : s.GetString(i));
+        }
+
+        return seen.ToArray();
     }
 
     /// <summary>Rows 0..n of a list column as flat int arrays, for comparing what came back.</summary>

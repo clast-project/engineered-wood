@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -2577,5 +2578,372 @@ public class SparkInteropTests : IDisposable
         }
 
         throw new InvalidOperationException($"version {version} has no commitInfo action");
+    }
+
+    // ── Partition path encoding ──
+
+    /// <summary>
+    /// Partition values chosen to exercise every corner of Spark's escape table: non-ASCII (never
+    /// escaped), the always-escaped <c>#</c>/<c>?</c>, and the four characters Spark escapes ONLY on
+    /// Windows — <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c>, <c>'|'</c>. The trailing space is the case
+    /// that used to leave a stray stripped-name directory behind on Windows and then throw
+    /// (GitHub issue #84); <c>}</c> is here because EW escaped it and Spark never has.
+    /// </summary>
+    private static readonly string[] AwkwardPartitionValues =
+        ["café", "日本", "a b#c?d", "a<b>c|d", "a b ", "a}b"];
+
+    /// <summary>Partition directories under a table root, relative and slash-normalised.</summary>
+    private static List<string> PartitionDirectories(string root) =>
+        Directory.GetDirectories(root)
+            .Select(d => Path.GetFileName(d)!)
+            .Where(d => d != "_delta_log")
+            .OrderBy(d => d, StringComparer.Ordinal)
+            .ToList();
+
+    /// <summary>
+    /// <para><b>The reference encoding for partition values, measured rather than assumed.</b> Two
+    /// distinct layers: the physical directory is Hive-escaped, and <c>add.path</c> is a URL-encoding
+    /// of that directory-relative path — so a <c>%</c> the first layer produced appears as <c>%25</c>
+    /// in the log.</para>
+    ///
+    /// <para>The finding that matters is what Spark does NOT escape. Non-ASCII stays literal at BOTH
+    /// layers: <c>region=café</c> on disk and <c>region=café</c> in the log. Spark's
+    /// <c>ExternalCatalogUtils.escapePathName</c> bounds its escape table at <c>c &lt; 128</c>, so no
+    /// character above ASCII is ever escaped. <c>}</c> is absent from the table too, even though the
+    /// three other bracket characters are in it — layer 2 is where it finally gets escaped, which makes
+    /// it the one value here that the two layers treat differently.</para>
+    ///
+    /// <para><b>Space is the platform-dependent one, and the expectation below has to branch because
+    /// Spark does.</b> Spark's <c>charToEscape</c> adds <c>' '</c>, <c>'&lt;'</c>, <c>'&gt;'</c> and
+    /// <c>'|'</c> under <c>if (Shell.WINDOWS)</c>, so the SAME Spark build writes <c>region=a b…</c> on
+    /// macOS and <c>region=a%20b…</c> on Windows. Pinning either form unconditionally makes this test
+    /// fail on the other OS through no fault of EW's, which is exactly what it did until issue #85.</para>
+    ///
+    /// <para>This is worth pinning because delta-rs does something DIFFERENT — it percent-encodes
+    /// non-ASCII as UTF-8 bytes (<c>region=caf%C3%A9</c>), as
+    /// <c>DeltaRsInteropTests.DeltaRs_NonAsciiPartition_PathEncodingGroundTruth</c> records. Reading
+    /// only that measurement would suggest EW is the odd one out and should be "fixed" to match, which
+    /// would break parity with the reference implementation instead of achieving it. Note that on
+    /// Windows the two converge on the four characters above — delta-rs escapes them everywhere — so a
+    /// Windows-only measurement cannot tell the two encodings apart. It is still the non-ASCII case
+    /// that separates them, on every platform.</para>
+    /// </summary>
+    [Fact]
+    public void Spark_NonAsciiPartition_PathEncodingGroundTruth()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var written = Spark.Invoke("partition_paths", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            partition_by = new[] { "region" },
+            rows = new object[]
+            {
+                new object[] { 1L, "café" },
+                new object[] { 2L, "日本" },
+                new object[] { 3L, "a b#c?d" },
+                new object[] { 4L, "a}b" },
+            },
+        });
+
+        var dirs = written.GetProperty("directories").EnumerateArray()
+            .Select(d => d.GetString()!).ToList();
+        var addPaths = written.GetProperty("add_paths").EnumerateArray()
+            .Select(p => p.GetString()!).ToList();
+
+        bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        // Layer 1 — non-ASCII literal; '#' and '?' escaped; '}' left alone; space only escaped on Windows.
+        Assert.Contains("region=café", dirs);
+        Assert.Contains("region=日本", dirs);
+        Assert.Contains("region=a}b", dirs);
+        Assert.Contains(windows ? "region=a%20b%23c%3Fd" : "region=a b%23c%3Fd", dirs);
+
+        // Layer 2 — non-ASCII STILL literal, because Spark's layer 2 is Java's URI quoting via
+        // Path.toUri().toString(), and toString() leaves non-ASCII alone (toASCIIString() would not).
+        // A space becomes %20 whether or not layer 1 escaped it, so layer 1's Windows '%20' shows up
+        // here as '%2520'. And '}' — untouched by layer 1 on every platform — IS escaped here, which is
+        // the only place in the two layers that it ever gets escaped.
+        Assert.Contains(addPaths, p => p.StartsWith("region=café/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith("region=日本/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith("region=a%7Db/", StringComparison.Ordinal));
+        Assert.Contains(addPaths, p => p.StartsWith(
+            windows ? "region=a%2520b%2523c%253Fd/" : "region=a%20b%2523c%253Fd/", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// EW's partition paths are byte-identical to Spark's, for the same values, at both layers.
+    /// </summary>
+    /// <remarks>
+    /// <para>Asserted against Spark's output captured in the same test run rather than against literals,
+    /// so the two can never drift apart silently — if delta-spark ever changes its escaping, this fails
+    /// rather than quietly pinning a stale expectation. That property is what makes this test
+    /// platform-agnostic for free: Spark's escape table differs on Windows, and both sides of the
+    /// comparison move together.</para>
+    ///
+    /// <para>Three of <see cref="AwkwardPartitionValues"/> could not be written by EW on Windows at all
+    /// before issue #84 — <c>&lt;</c>, <c>&gt;</c> and <c>|</c> reached <c>CreateDirectory</c> literally
+    /// and Win32 rejected them, and a trailing space created a stripped-name directory and then threw.
+    /// So on Windows this test now also covers "EW can write these", not only "EW agrees with Spark".</para>
+    /// </remarks>
+    [Fact]
+    public async Task EwPartitionPaths_AreIdenticalToSparks()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        string sparkDir = Path.Combine(_tempDir, "spark");
+        string ewDir = Path.Combine(_tempDir, "ew");
+        Directory.CreateDirectory(sparkDir);
+        Directory.CreateDirectory(ewDir);
+
+        long[] ids = [.. Enumerable.Range(1, AwkwardPartitionValues.Length).Select(i => (long)i)];
+
+        var written = Spark.Invoke("partition_paths", new
+        {
+            path = sparkDir,
+            schema = "id long, region string",
+            partition_by = new[] { "region" },
+            rows = ids.Select(id => new object[] { id, AwkwardPartitionValues[id - 1] }).ToArray(),
+        });
+
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(ewDir), IdRegionSchema, partitionColumns: ["region"]))
+        {
+            await table.WriteAsync([IdRegionBatch(ids, AwkwardPartitionValues)]);
+        }
+
+        // Layer 1: the directory names on disk.
+        var sparkDirs = written.GetProperty("directories").EnumerateArray()
+            .Select(d => d.GetString()!)
+            .Where(d => !d.StartsWith("_delta_log", StringComparison.Ordinal))
+            .OrderBy(d => d, StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(sparkDirs, PartitionDirectories(ewDir));
+
+        // Layer 2: the partition prefix of add.path, with the generated file name dropped.
+        static List<string> PartitionPrefixes(IEnumerable<string> paths) =>
+            paths.Select(p => p[..p.IndexOf('/')])
+                .OrderBy(p => p, StringComparer.Ordinal)
+                .ToList();
+
+        var sparkPrefixes = PartitionPrefixes(
+            written.GetProperty("add_paths").EnumerateArray().Select(p => p.GetString()!));
+
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(ewDir));
+        var ewPrefixes = PartitionPrefixes(
+            reopened.CurrentSnapshot.ActiveFiles.Values.Select(a => a.Path));
+
+        Assert.Equal(sparkPrefixes, ewPrefixes);
+    }
+
+    // ── V2 checkpoints written by the reference implementation ──
+
+    /// <summary>
+    /// <para>EW's V2 checkpoint reader had only ever been pointed at checkpoints EW itself wrote — a
+    /// round trip through one implementation validates that implementation's assumptions, not the
+    /// format. This is the first time a foreign-written V2 checkpoint reaches it.</para>
+    ///
+    /// <para>The commit files at or below the checkpoint version are DELETED before EW opens the
+    /// table, so a successful read proves the checkpoint carried the state. Without that, EW would
+    /// replay the commits and the V2 path would never be exercised at all.</para>
+    ///
+    /// <para>A <c>DELETE</c> runs first so the table has a remove tombstone. Tombstones are the part
+    /// no file-set comparison would notice were missing — a checkpoint that drops them still yields
+    /// the correct ACTIVE file set, and only VACUUM safety and streaming readers break. That is the
+    /// bug this repository shipped in its own V2 writer (#73), so the assertion is deliberate.</para>
+    ///
+    /// <para>Run against BOTH bodies the spec defines. Which one a V2 checkpoint gets is a Spark
+    /// session config, not something derived from the table, so a reader meets whichever the producer
+    /// happened to be configured for. The default is JSON, which is why the parquet arm went
+    /// unexercised for so long — and why "EW reads Spark's V2 output" was true of only half the
+    /// format.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("json")]
+    [InlineData("parquet")]
+    public async Task SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone(string body)
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var written = Spark.Invoke("v2_checkpoint", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 1L, "us" },
+                new object[] { 2L, "eu" },
+                new object[] { 3L, "ap" },
+            },
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id = 2" },
+            top_level_file_format = body,
+        });
+
+        // Spark actually emitted the body that was asked for — without this the parquet arm could
+        // silently be a second run of the json one.
+        var logFiles = written.GetProperty("log_files").EnumerateArray()
+            .Select(f => f.GetString()!).ToList();
+        Assert.Contains(logFiles, f =>
+            f.Contains(".checkpoint.", StringComparison.Ordinal) &&
+            f.EndsWith("." + body, StringComparison.Ordinal));
+
+        // File actions went to a sidecar, so the sidecar resolution path is exercised too.
+        Assert.NotEmpty(written.GetProperty("sidecars").EnumerateArray());
+
+        long checkpointVersion = ParseCheckpointVersion(logFiles, body);
+
+        // Hide everything the checkpoint subsumes. A read that still works came from the checkpoint.
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        foreach (string commit in Directory.GetFiles(logDir, "*.json"))
+        {
+            string name = Path.GetFileName(commit);
+            if (name.Contains(".checkpoint.", StringComparison.Ordinal)) continue;
+            if (long.TryParse(Path.GetFileNameWithoutExtension(name), out long v) &&
+                v <= checkpointVersion)
+            {
+                File.Delete(commit);
+            }
+        }
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var snapshot = table.CurrentSnapshot;
+
+        Assert.Equal(checkpointVersion, snapshot.Version);
+
+        // Protocol and metadata survived as non-file actions in the checkpoint body.
+        Assert.Contains("v2Checkpoint", snapshot.Protocol.ReaderFeatures ?? []);
+        Assert.NotEmpty(snapshot.Metadata.Id);
+
+        // The data: the DELETE removed id=2.
+        var rows = await ReadAllViaEw(table);
+        Assert.Equal([(1L, "us"), (3L, "ap")], rows);
+
+        // NOT just file-set parity. The DELETE rewrote a file, so the checkpoint must carry the
+        // remove tombstone for the file it replaced.
+        Assert.NotEmpty(snapshot.Tombstones);
+    }
+
+    // ── V2 checkpoints written by EW, read by the reference implementation ──
+
+    /// <summary>
+    /// The direction that had no coverage at all: Spark rebuilding a table's state from a V2 checkpoint
+    /// EW wrote. Run in both arms — file actions inline, and file actions in sidecars.
+    /// </summary>
+    /// <remarks>
+    /// <para>Before this, no V2 checkpoint EW produced had ever been read by anything but EW, and not by
+    /// oversight: both interop drivers located a checkpoint by globbing the classic name, which a
+    /// <c>&lt;n&gt;.checkpoint.&lt;uuid&gt;.json</c> never matches. Every checkpoint assertion in this
+    /// suite silently applied to V1 only, so switching a table to V2 would have moved it OUT of coverage
+    /// rather than into it.</para>
+    ///
+    /// <para><b>The VACUUM assertion is the part that can actually fail.</b> Reading rows back proves the
+    /// add actions survived, which a file-set comparison would also show — but a checkpoint that drops
+    /// its unexpired REMOVE tombstones yields exactly the same rows, and only VACUUM retention safety
+    /// breaks. Spark's <c>VacuumCommand</c> builds its reachable set from the snapshot's add AND remove
+    /// actions, so a data file named by a surviving tombstone is not listed as vacuumable and one whose
+    /// tombstone was lost is. That is the bug this repository shipped in its own V2 writer (#73), and it
+    /// is the reason the DELETE is here.</para>
+    ///
+    /// <para>delta-rs covers the same checkpoints from the other side, but only as far as the
+    /// reconstruction — it exposes no tombstone API, and deltalake's Python layer declines to
+    /// materialize rows from a <c>v2Checkpoint</c> table. So the tombstone half of this is Spark's
+    /// alone. See
+    /// <c>DeltaRsInteropTests.EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone</c>.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
+    [InlineData(1, 1)]      // threshold below → one sidecar
+    [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
+    public async Task EwWrittenV2Checkpoint_SparkReadsFromTheCheckpointAlone(
+        int sidecarThreshold, int expectedSidecars)
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
+            // Checkpointed explicitly below, so the version it lands on is not left to an interval.
+            options: new DeltaTableOptions { CheckpointInterval = 0 });
+
+        for (long i = 1; i <= 6; i++)
+            await table.WriteAsync([IdRegionBatch([i], [i % 2 == 0 ? "us" : "eu"])]);
+
+        // Copy-on-write: the file holding id=3 is rewritten without it, leaving a remove tombstone and
+        // an unreferenced data file on disk — which is what the VACUUM assertion turns on.
+        await table.DeleteAsync(b =>
+        {
+            var ids = (Int64Array)b.Column(0);
+            var doomed = new BooleanArray.Builder();
+            for (int i = 0; i < b.Length; i++)
+                doomed.Append(ids.GetValue(i) == 3);
+            return doomed.Build();
+        });
+
+        Assert.NotEmpty(table.CurrentSnapshot.Tombstones);
+
+        await new EngineeredWood.DeltaLake.Checkpoint.CheckpointWriter(fs)
+        {
+            V2Writer = new EngineeredWood.DeltaLake.Checkpoint.V2CheckpointWriter(fs)
+            {
+                SidecarThreshold = sidecarThreshold,
+                // 6 adds + 1 tombstone: a cap of 4 splits them in two.
+                MaxActionsPerSidecar = expectedSidecars > 1 ? 4 : int.MaxValue,
+            },
+        }.WriteCheckpointAsync(table.CurrentSnapshot);
+
+        // One commit ABOVE the checkpoint. Spark's log segment is "a checkpoint plus the commits after
+        // it" and it refuses a table whose newest version is a checkpoint with no commit file — but the
+        // requirement is welcome here anyway: it means the checkpoint version and everything below it
+        // are hidden outright, so the tombstone asserted on below has nowhere to come from except the
+        // checkpoint.
+        await table.WriteAsync([IdRegionBatch([7], ["us"])]);
+
+        var result = Spark.Invoke("checkpoint_only_read", new { path = _tempDir });
+
+        // It really was a UUID-named V2 checkpoint Spark read — otherwise this is a V1 test in disguise.
+        string checkpointFile = result.GetProperty("checkpoint_file").GetString()!;
+        Assert.Contains(".checkpoint.", checkpointFile, StringComparison.Ordinal);
+        Assert.EndsWith(".json", checkpointFile, StringComparison.Ordinal);
+        Assert.Equal(expectedSidecars, result.GetProperty("sidecars").GetArrayLength());
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+
+        // Spark declares it understands the feature, and reconstructed the same rows EW sees.
+        Assert.Contains("v2Checkpoint",
+            result.GetProperty("detail").GetProperty("table_features").EnumerateArray()
+                .Select(f => f.GetString()));
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+
+        // NOT file-set equality, and the assertion that can actually fail. Spark's own reconstructed
+        // tombstones, taken twice — once from the full log, once from the checkpoint alone — must agree.
+        // A checkpoint that dropped its unexpired removes yields identical ROWS, so nothing above would
+        // notice; this is where it shows up.
+        static List<string> Paths(JsonElement e) =>
+            e.EnumerateArray().Select(f => f.GetString()!).ToList();
+
+        var fromLog = Paths(result.GetProperty("tombstones_with_commits"));
+        var fromCheckpoint = Paths(result.GetProperty("tombstones_from_checkpoint"));
+
+        // Non-empty first: equal-but-empty would pass while asserting nothing.
+        Assert.NotEmpty(fromLog);
+        Assert.Equal(fromLog, fromCheckpoint);
+    }
+
+    /// <summary>The version of the UUID-named checkpoint with the given body in a log listing.</summary>
+    private static long ParseCheckpointVersion(IEnumerable<string> logFiles, string body)
+    {
+        foreach (string f in logFiles)
+        {
+            int marker = f.IndexOf(".checkpoint.", StringComparison.Ordinal);
+            if (marker > 0 && f.EndsWith("." + body, StringComparison.Ordinal) &&
+                long.TryParse(f[..marker], out long v))
+            {
+                return v;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"no UUID-named .{body} checkpoint in the log: " + string.Join(", ", logFiles));
     }
 }

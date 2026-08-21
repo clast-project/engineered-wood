@@ -5,11 +5,15 @@ name: CI
 # filtering never reports its checks — they stay Pending forever and the PR
 # can never merge. The job below therefore always runs and always reports;
 # it decides internally whether there is anything worth compiling.
+# NOTE: `pull_request` is deliberately NOT filtered by base branch. A stacked PR
+# (one targeting another PR's branch rather than main) would otherwise get no CI
+# at all — and the failure is silent in the same way path filtering is: the
+# required `build` check never reports, so the PR sits Blocked until someone
+# retargets it. Measured on PR #99, which accumulated a whole feature unverified.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   build:
@@ -62,6 +66,39 @@ jobs:
             echo "Documentation-only change — skipping restore, build, test and pack."
           fi
 
+      # Source files are UTF-8 without a BOM. This step is the only guarantee of that:
+      # .editorconfig is advisory (an editor may ignore it, a script writing a file has
+      # no editor at all), and the `filter=nobom` rule in .gitattributes needs a one-time
+      # local `git config` that a fresh clone has not run — an undefined filter driver is
+      # silently ignored, so the BOM would sail through unnoticed.
+      #
+      # Deliberately NOT gated on steps.changes.outputs.code: it needs no toolchain, takes
+      # about a second across ~800 files, and gating it would only create a path by which
+      # a change classified as documentation could carry a BOM in unchecked.
+      #
+      # Verified to fail, not just to pass: seeding a BOM into GrowableBuffer.cs makes this
+      # exit 1 and name the file. A check only ever observed passing is indistinguishable
+      # from one that inspects nothing — see the interop-tier note on the Test step below.
+      - name: Check for UTF-8 BOMs
+        shell: bash
+        run: |
+          found="$(git ls-files -- '*.cs' | perl -ne '
+              chomp;
+              open my $h, "<", $_ or next;
+              binmode $h;
+              read $h, my $head, 3;
+              print "$_\n" if defined $head && $head eq "\xef\xbb\xbf";
+          ')"
+
+          if [ -n "$found" ]; then
+            echo "::error::These .cs files start with a UTF-8 byte order mark:"
+            printf '%s\n' "$found"
+            echo "Strip it, or enable the filter documented in .gitattributes."
+            exit 1
+          fi
+
+          echo "No UTF-8 BOMs in tracked .cs files."
+
       - name: Setup .NET
         if: steps.changes.outputs.code == 'true'
         uses: actions/setup-dotnet@v4
@@ -69,6 +106,43 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+
+      - name: Setup Python
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The two interop tiers cheap enough to gate every commit on. Both are pure
+      # Python — no JDK, no JVM — and add seconds. The Spark tier is the expensive
+      # one and runs in interop-nightly.yml instead.
+      #
+      # Versions are pinned because these tiers are ORACLES: an upgrade that changes
+      # behaviour must show up as a deliberate bump in this file, not as a build that
+      # started failing overnight for reasons nobody chose.
+      #
+      # pyarrow is listed EXPLICITLY. deltalake 1.6.2 no longer depends on it — it is
+      # an optional extra (`deltalake[pyarrow]`) — so `deltalake` alone installs a
+      # package whose read paths raise "Pyarrow is required" the moment a driver
+      # command touches data. That went unnoticed locally because pyarrow is already
+      # present on a dev box for the ORC cross-validation, which is exactly the kind
+      # of undeclared dependency this job exists to surface. Declaring it also turns
+      # ON the ORC PyArrow cross-validation tests, which had been soft-skipping here.
+      #
+      # tzdata likewise: CPython on Windows ships NO time-zone database, so
+      # `zoneinfo.ZoneInfo("UTC")` — which delta_rs_driver's read_epoch_micros needs —
+      # raises ZoneInfoNotFoundError on a clean runner. Linux has a system tz database
+      # and does not, which is why the nightly did not hit this.
+      #
+      # tzdata is pinned like the rest despite being a data package whose drift cannot
+      # affect anything here (only UTC is looked up, and UTC does not move). A rule with
+      # one unexplained exception stops being a rule; if a future release ever needs to
+      # float, that should be a stated decision rather than the absence of a version.
+      - name: Install interop oracles (delta-rs, DuckDB)
+        if: steps.changes.outputs.code == 'true'
+        run: >
+          python -m pip install --disable-pip-version-check
+          deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata==2026.3
 
       - name: Restore
         if: steps.changes.outputs.code == 'true'
@@ -80,9 +154,22 @@ jobs:
 
       - name: Test
         if: steps.changes.outputs.code == 'true'
-        # The delta-rs / Spark interop tests are gated behind EW_REQUIRE_* and
-        # skip here; the Rust / pyarrow / pylance cross-validation tests
-        # soft-skip when those toolchains aren't installed on the runner.
+        # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a
+        # silent no-op, which is the whole point of setting them here.
+        #
+        # An interop test that cannot reach its toolchain does not report Skipped —
+        # `if (!X.EnsureAvailable()) return;` returns normally, so xUnit counts it
+        # PASSED. Measured: with no JDK present the 54 Spark interop tests report
+        # "Passed: 54, Skipped: 0" in 94ms. Nothing in a CI summary distinguishes
+        # that from real coverage, so a tier can go dark and take its conformance
+        # guarantees with it while the build stays green. (Reporting them as skips
+        # instead would need xunit.v3 or SkippableFact — xUnit 2.9.3 has no
+        # Assert.Skip — which is a bigger change than making CI demand the tiers.)
+        #
+        # The Spark tier stays unset here and is exercised by interop-nightly.yml.
+        env:
+          EW_REQUIRE_DELTA_INTEROP: '1'
+          EW_REQUIRE_DUCKDB_INTEROP: '1'
         run: dotnet test engineered-wood.slnx --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
 
       - name: Pack

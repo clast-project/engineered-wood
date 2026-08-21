@@ -535,6 +535,15 @@ public class ReadRowGroupTests
                 {
                     var batch = await reader.ReadRowGroupAsync(0);
                     Assert.True(batch.Length >= 0);
+
+                    // Reaching every child array, not just the batch, is the point. A nested column can be
+                    // assembled into an array that is INTERNALLY inconsistent and only throws when something
+                    // reaches into it — map_no_value.parquet built a key_value struct declaring two children
+                    // and holding one, and this sweep read it clean for as long as it stopped at
+                    // batch.Length (issue #156). Anything that actually consumes the batch — an IPC write, a
+                    // copy into another engine — walks the children, so the sweep does too.
+                    for (int c = 0; c < batch.ColumnCount; c++)
+                        TouchChildArrays(batch.Column(c));
                 }
             }
             catch (NotSupportedException ex)
@@ -553,6 +562,118 @@ public class ReadRowGroupTests
 
         Assert.True(failures.Count == 0,
             $"Failed on {failures.Count} files:\n" + string.Join("\n", failures));
+    }
+
+    /// <summary>
+    /// Reads the whole corpus twice — once with the default output kind, once with
+    /// <see cref="ByteArrayOutputKind.ViewType"/> — and requires that every file the default read handles,
+    /// the view read handles too.
+    ///
+    /// <para>Differential rather than absolute on purpose. The sweep above catches
+    /// <see cref="NotSupportedException"/> and records it as a SKIP, which is right for a file whose codec
+    /// or encoding this reader does not implement — and is exactly why issue #194 hid here for as long as
+    /// it did: <c>ArrowCompute</c> refusing to gather a view array throws that same type, so a
+    /// view-kind sweep on its own would have reported four silent skips and passed. Comparing the two runs
+    /// is what turns "the option quietly did nothing" into a failure.</para>
+    ///
+    /// <para>Only the reads are compared, not the values; the per-value equivalence is pinned on the
+    /// nested columns that matter by <c>NestedOutputKindTests</c>.</para>
+    /// </summary>
+    [Fact]
+    public async Task SweepTest_ViewTypeReadsEveryFileTheDefaultKindDoes()
+    {
+        static async Task<Exception?> TryReadAsync(string filePath, ByteArrayOutputKind kind)
+        {
+            try
+            {
+                await using var file = new LocalRandomAccessFile(filePath);
+                using var reader = new ParquetFileReader(
+                    file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = kind });
+
+                var metadata = await reader.ReadMetadataAsync();
+                if (metadata.RowGroups.Count == 0)
+                    return null;
+
+                using var batch = await reader.ReadRowGroupAsync(0);
+                for (int c = 0; c < batch.ColumnCount; c++)
+                    TouchChildArrays(batch.Column(c));
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex;
+            }
+        }
+
+        var regressions = new List<string>();
+        int compared = 0;
+
+        foreach (var filePath in TestData.GetAllParquetFiles())
+        {
+            var fileName = Path.GetFileName(filePath);
+            if (fileName.Contains("encrypt", StringComparison.OrdinalIgnoreCase) ||
+                fileName.Contains("malformed", StringComparison.OrdinalIgnoreCase) ||
+                fileName == "large_string_map.brotli.parquet" || // 2GB+ uncompressed data
+                fileName == "fixed_length_byte_array.parquet") // malformed: payloads too small for row count
+            {
+                continue;
+            }
+
+            if (await TryReadAsync(filePath, ByteArrayOutputKind.Default) is not null)
+                continue; // the file is out of reach for reasons that have nothing to do with view types
+
+            compared++;
+            if (await TryReadAsync(filePath, ByteArrayOutputKind.ViewType) is { } viewFailure)
+                regressions.Add($"{fileName}: {viewFailure.GetType().Name}: {viewFailure.Message}");
+        }
+
+        // Guards against a corpus that stopped being found: zero comparisons would pass vacuously.
+        Assert.True(compared > 0, "no corpus file could be read with the default output kind");
+        Assert.True(regressions.Count == 0,
+            $"UseViewTypes failed on {regressions.Count} file(s) the default kind reads:\n"
+            + string.Join("\n", regressions));
+    }
+
+    /// <summary>
+    /// Walks every child of a nested array through the typed accessors a consumer would use, so an array
+    /// whose type and children disagree throws here rather than in someone else's code.
+    /// </summary>
+    private static void TouchChildArrays(IArrowArray array)
+    {
+        switch (array)
+        {
+            case MapArray map:
+                // MapArray derives from ListArray, so it must be matched first — and Keys/Values are the
+                // accessors that reach into the key_value struct's children.
+                TouchChildArrays(map.Keys);
+                TouchChildArrays(map.Values);
+                break;
+            case ListArray list:
+                TouchChildArrays(list.Values);
+                break;
+            case LargeListArray largeList:
+                TouchChildArrays(largeList.Values);
+                break;
+            case FixedSizeListArray fixedList:
+                TouchChildArrays(fixedList.Values);
+                break;
+            case StructArray structArray:
+                foreach (var child in structArray.Fields)
+                    TouchChildArrays(child);
+                break;
+            case DenseUnionArray denseUnion:
+                foreach (var child in denseUnion.Fields)
+                    TouchChildArrays(child);
+                break;
+            case SparseUnionArray sparseUnion:
+                foreach (var child in sparseUnion.Fields)
+                    TouchChildArrays(child);
+                break;
+            default:
+                _ = array.Length;
+                break;
+        }
     }
 
     [Fact]
@@ -1489,7 +1610,8 @@ public class ReadRowGroupTests
     {
         // map_no_value.parquet: 3 rows, 3 columns:
         //   my_map: map<int32, int32> (all values null)
-        //   my_map_no_v: map with no value child (pyarrow reads as list)
+        //   my_map_no_v: MAP-annotated but its key_value group has no value child, so it reads as
+        //                list<key: int32> — see MapNoValue_MapWithoutValueChildReadsAsList
         //   my_list: list<int32>
         // Row 0: keys=[1,2,3], Row 1: keys=[4,5,6], Row 2: keys=[7,8,9]
         await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
@@ -1524,6 +1646,61 @@ public class ReadRowGroupTests
         Assert.Equal(1, listRow0.GetValue(0));
         Assert.Equal(2, listRow0.GetValue(1));
         Assert.Equal(3, listRow0.GetValue(2));
+    }
+
+    // A MAP whose key_value group has a key and NO value is not a map Arrow can build — MapType requires a
+    // value field. Both halves of the read path used to invent one (`value: string`) and only one of them
+    // invented the array to go with it, so the key_value StructArray declared two children and held one:
+    // touching the map's values threw as soon as anything reached for child 1 (issue #156). The whole batch
+    // read fine, which is why the test above could step around it by never touching column 1.
+    //
+    // The reader now agrees with arrow-cpp instead of inventing anything: MEASURED, PyArrow reads this same
+    // column as `list<key: int32 not null>` with values [[1,2,3],[4,5,6],[7,8,9]].
+    [Fact]
+    public async Task MapNoValue_MapWithoutValueChildReadsAsList()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var field = batch.Schema.FieldsList[1];
+        Assert.Equal("my_map_no_v", field.Name);
+        var listType = Assert.IsType<ListType>(field.DataType);
+
+        // The element keeps the key's own name and non-nullability, exactly as PyArrow reports it.
+        Assert.Equal("key", listType.ValueField.Name);
+        Assert.IsType<Int32Type>(listType.ValueField.DataType);
+        Assert.False(listType.ValueField.IsNullable);
+
+        var list = Assert.IsType<ListArray>(batch.Column(1));
+        Assert.Equal(3, list.Length);
+
+        var rows = Enumerable.Range(0, list.Length)
+            .Select(i => ((Int32Array)list.GetSlicedValues(i)!).Values.ToArray())
+            .ToArray();
+
+        Assert.Equal([1, 2, 3], rows[0]);
+        Assert.Equal([4, 5, 6], rows[1]);
+        Assert.Equal([7, 8, 9], rows[2]);
+    }
+
+    // The map that IS well formed must keep reading as a map, with its all-null values reachable — the
+    // column the fix above must not sweep up. Its key_value group has both children.
+    [Fact]
+    public async Task MapNoValue_WellFormedMapStillExposesItsNullValues()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var map = Assert.IsType<MapArray>(batch.Column(0));
+        var values = Assert.IsType<Int32Array>(map.Values);
+
+        Assert.Equal(9, map.Keys.Length);
+        Assert.Equal(9, values.Length);
+        Assert.Equal(9, values.NullCount);
     }
 
     [Fact]
@@ -1639,13 +1816,15 @@ public class ReadRowGroupTests
         using var reader = new ParquetFileReader(file, ownsFile: false);
         var schema = await reader.GetSchemaAsync();
 
-        // Reading all columns should throw a clear ParquetFormatException for the corrupted column
-        var ex = await Assert.ThrowsAsync<AggregateException>(
+        // Reading all columns should throw a clear ParquetFormatException for the corrupted column.
+        // It arrives as ITSELF: columns are decoded with Parallel.For, which used to wrap the one real
+        // failure in an AggregateException, so a message written for the caller reached them as "One or
+        // more errors occurred" with the real one a level down. A single column failing is the ordinary
+        // case and is now rethrown in place (issue #157, where the same wrapping hid the size diagnostic).
+        var ex = await Assert.ThrowsAsync<ParquetFormatException>(
             () => reader.ReadRowGroupAsync(0).AsTask());
-        var inner = Assert.Single(ex.InnerExceptions);
-        Assert.IsType<ParquetFormatException>(inner);
-        Assert.Contains("timestamp_us_no_tz", inner.Message);
-        Assert.Contains("corrupted page header", inner.Message);
+        Assert.Contains("timestamp_us_no_tz", ex.Message);
+        Assert.Contains("corrupted page header", ex.Message);
 
         // Excluding the corrupted column by name allows the rest of the file to be read
         var goodColumns = schema.Root.Children

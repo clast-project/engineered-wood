@@ -34,6 +34,13 @@ internal static class ColumnChunkWriter
         public int DictionaryPageSize { get; init; }
 
         /// <summary>
+        /// Size of the FSST symbol table page in bytes (including header), or 0 if the column
+        /// chunk is not FSST-encoded. Like the dictionary page it precedes the data pages, so
+        /// the caller adds it when computing DataPageOffset.
+        /// </summary>
+        public int SymbolTablePageSize { get; init; }
+
+        /// <summary>
         /// Serialized Bloom filter block (Thrift header + bitset), or null if not enabled.
         /// </summary>
         public byte[]? BloomFilterData { get; init; }
@@ -206,38 +213,28 @@ internal static class ColumnChunkWriter
                 maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options);
         }
 
-        // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
-        // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
-        // not just the distinct dictionary entries.
-        bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
-        bool floatingPointTotalOrder =
-            options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
-        var stats = dictResult != null && !isFloatingPoint
-            ? StatisticsCollector.ComputeFromDictEntries(
-                dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount)
-            : StatisticsCollector.Compute(
-                array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                floatingPointTotalOrder);
-        // The DEPRECATED min/max fields are defined with SIGNED byte ordering. Our values are computed with the
-        // CORRECT logical ordering (they mirror min_value/max_value), so a legacy reader that honors the
-        // deprecated fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns.
-        // parquet-mr's rule: emit the deprecated fields only where signed ordering IS the logical ordering
-        // (booleans, signed ints incl. date/time/timestamp, floats); drop them elsewhere.
-        if (!SignedOrderMatchesLogical(ValueType(array)))
+        // Statistics OFF leaves the column chunk with no Statistics at all — not merely no bounds — and
+        // skips computing them, so a non-dictionary column also skips the collector's full scan of its
+        // values. That is write time saved as well as footer bytes. This guards rather than returns early
+        // because the GC.KeepAlive at the end of the method roots `array` across everything above it.
+        // See ParquetWriteOptions.WriteStatistics for why the null count goes with the bounds.
+        if (options.GetWriteStatistics(pathInSchema))
         {
-            stats = new Statistics
-            {
-                NullCount = stats.NullCount,
-                MinValue = stats.MinValue,
-                MaxValue = stats.MaxValue,
-                IsMinValueExact = stats.IsMinValueExact,
-                IsMaxValueExact = stats.IsMaxValueExact,
-                NanCount = stats.NanCount,
-                DistinctCount = stats.DistinctCount,
-            };
+            // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
+            // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
+            // not just the distinct dictionary entries.
+            bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+            bool floatingPointTotalOrder =
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+            var stats = dictResult != null && !isFloatingPoint
+                ? StatisticsCollector.ComputeFromDictEntries(
+                    dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
+                    physicalType, typeLength, rowCount - nonNullCount)
+                : StatisticsCollector.Compute(
+                    array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
+                    floatingPointTotalOrder);
+            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array));
         }
-        result.MetaData.Statistics = stats;
 
         // Build Bloom filter if enabled for this column.
         if (options.HasBloomFilter(pathInSchema))
@@ -294,12 +291,32 @@ internal static class ColumnChunkWriter
         int valuesPerPage = EstimateValuesPerPage(array, physicalType, typeLength, options.DataPageSize);
         if (valuesPerPage < 1) valuesPerPage = 1;
 
+        // FSST trains one symbol table per column chunk (§1.4), so the whole chunk is compressed
+        // up front — before any page is written — and the pages below are slices of the result.
+        // A null here means FSST declined this chunk (nothing to train on, or no size win), and
+        // the pages fall back to DELTA_LENGTH_BYTE_ARRAY.
+        FsstCompressedColumn? fsstColumn = null;
+        int symbolTablePageSize = 0;
+        if (UsesFsst(physicalType, options) && nonNullCount > 0)
+        {
+            fsstColumn = FsstCompressedColumn.TryCompress(
+                ExtractDenseByteArrays(array, rowCount, nonNullCount, valueDefLevels),
+                FsstTableType(options));
+        }
+
+        if (fsstColumn != null)
+        {
+            symbolTablePageSize = WriteSymbolTablePage(
+                output, fsstColumn.Table, options, ref totalUncompressedSize, ref totalCompressedSize);
+        }
+
         // Reusable encoder for def/rep levels across pages
         int maxLiteralGroups = options.MaxLiteralGroups;
         var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
         var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
 
         int offset = 0;
+        int valueIndex = 0;
         while (offset < rowCount)
         {
             int pageValues = Math.Min(valuesPerPage, rowCount - offset);
@@ -313,7 +330,7 @@ internal static class ColumnChunkWriter
             {
                 WriteDataPageV2(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
-                    valueDefLevels, options, defEncoder, repEncoder,
+                    valueDefLevels, options, defEncoder, repEncoder, fsstColumn, valueIndex,
                     ref totalUncompressedSize, ref totalCompressedSize, out pageEncoding);
             }
             else
@@ -327,6 +344,7 @@ internal static class ColumnChunkWriter
 
             encodings.Add(pageEncoding);
             offset += pageValues;
+            valueIndex += pageNonNull;
         }
 
         var metadata = new ColumnMetaData
@@ -339,28 +357,154 @@ internal static class ColumnChunkWriter
             TotalUncompressedSize = totalUncompressedSize,
             TotalCompressedSize = totalCompressedSize,
             DataPageOffset = 0, // set by caller
+            SymbolTablePageOffset = symbolTablePageSize > 0 ? 0 : null, // set by caller
+            SymbolTablePageLength = symbolTablePageSize > 0 ? symbolTablePageSize : null,
         };
 
         output.TryGetBuffer(out var buffer);
-        return new ColumnChunkResult { Data = buffer, MetaData = metadata };
+        return new ColumnChunkResult
+        {
+            Data = buffer,
+            MetaData = metadata,
+            SymbolTablePageSize = symbolTablePageSize,
+        };
+    }
+
+    /// <summary>
+    /// Whether this column chunk should attempt FSST. V2 pages only — a V1 page always writes
+    /// PLAIN — and BYTE_ARRAY only, which is all §1.3 defines.
+    /// </summary>
+    private static bool UsesFsst(PhysicalType physicalType, ParquetWriteOptions options) =>
+        options.DataPageVersion == DataPageVersion.V2
+        && physicalType == PhysicalType.ByteArray
+#pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+        && options.ByteArrayEncoding is ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16;
+#pragma warning restore EWPARQUET0003
+
+    /// <summary>
+    /// Which symbol table the chunk trains. Both widths are written as
+    /// <see cref="Encoding.Fsst"/>; the SYMBOL_TABLE_PAGE header is what tells them apart
+    /// (§2.3), so the choice never reaches the data pages.
+    /// </summary>
+#pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+    private static SymbolTableType FsstTableType(ParquetWriteOptions options) =>
+        options.ByteArrayEncoding == ByteArrayEncoding.Fsst16
+            ? SymbolTableType.Fsst16
+            : SymbolTableType.Fsst;
+#pragma warning restore EWPARQUET0003
+
+    /// <summary>
+    /// Materializes the chunk's non-null values so the symbol table can be trained over them.
+    /// Reads the Arrow buffers the same way the DELTA_LENGTH_BYTE_ARRAY path does.
+    /// </summary>
+    private static byte[][] ExtractDenseByteArrays(
+        IArrowArray array, int rowCount, int nonNullCount, int[]? defLevels)
+    {
+        var data = array.Data;
+        ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+        ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
+
+        var values = new byte[nonNullCount][];
+        int idx = 0;
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (defLevels != null && defLevels[i] == 0) continue;
+            int start = arrowOffsets[i];
+            int len = arrowOffsets[i + 1] - start;
+            values[idx++] = arrowData.Slice(start, len).ToArray();
+        }
+
+        return values;
+    }
+
+    private static int WriteSymbolTablePage(
+        MemoryStream output,
+        FsstSymbolTable table,
+        ParquetWriteOptions options,
+        ref int totalUncompressed, ref int totalCompressed)
+    {
+        byte[] body = table.Serialize();
+        int uncompressedSize = body.Length;
+
+        int compressedLen = CompressTo(body, options);
+        bool isCompressed = options.Compression != CompressionCodec.Uncompressed;
+
+        var pageHeader = new PageHeader
+        {
+            Type = PageType.SymbolTablePage,
+            UncompressedPageSize = uncompressedSize,
+            CompressedPageSize = compressedLen,
+            Crc = options.PageChecksumEnabled
+                ? unchecked((int)ComputeCrc32C(t_compressBuffer.AsSpan(0, compressedLen)))
+                : null,
+            SymbolTablePageHeader = new SymbolTablePageHeader
+            {
+                Type = table.Type,
+                IsCompressed = isCompressed,
+            },
+        };
+
+        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
+        int pageSize = headerBytes.Length + compressedLen;
+
+#if NET8_0_OR_GREATER
+        output.Write(headerBytes);
+#else
+        output.Write(headerBytes, 0, headerBytes.Length);
+#endif
+        output.Write(t_compressBuffer!, 0, compressedLen);
+
+        totalUncompressed += headerBytes.Length + uncompressedSize;
+        totalCompressed += pageSize;
+
+        return pageSize;
     }
 
     /// <summary>
     /// Writes a dictionary-encoded column from a pre-built <see cref="DictionaryEncoder.DictionaryResult"/>.
     /// Used by <see cref="BufferedParquetWriter"/> which builds dictionaries incrementally.
     /// </summary>
+    /// <remarks>
+    /// Statistics are computed HERE rather than inside <see cref="WriteDictionaryColumn"/>, because
+    /// <c>WriteColumn</c> — the other caller — assigns them itself once its own encoding decision
+    /// is made, and computing them a level down would have that path do the work twice. This is the entry
+    /// point only the buffered writer uses, so it is where the buffered writer's statistics belong.
+    /// </remarks>
     internal static ColumnChunkResult WriteDictionaryColumnFromResult(
         DictionaryEncoder.DictionaryResult dictResult,
         int rowCount,
+        int nonNullCount,
         IReadOnlyList<string> pathInSchema,
         PhysicalType physicalType,
+        int typeLength,
+        Apache.Arrow.Types.IArrowType arrowType,
         int maxDefLevel,
         int maxRepLevel,
         int[]? defLevels,
         int[]? repLevels,
-        ParquetWriteOptions options) =>
-        WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
+        ParquetWriteOptions options)
+    {
+        var result = WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
             maxDefLevel, maxRepLevel, defLevels, repLevels, options);
+
+        // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
+        if (!options.GetWriteStatistics(pathInSchema))
+            return result;
+
+        // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries either
+        // way, but nan_count counts VALUES, so it has to see the indices. WriteColumn full-scans the Arrow
+        // array for the same reason; here there is no array left to scan.
+        var stats = physicalType is PhysicalType.Float or PhysicalType.Double
+            ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
+                dictResult, physicalType, rowCount - nonNullCount,
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
+            : StatisticsCollector.ComputeFromDictEntries(
+                dictResult.DictionaryPageData, dictResult.DictionaryCount,
+                physicalType, typeLength, rowCount - nonNullCount);
+
+        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType);
+        return result;
+    }
 
     private static ColumnChunkResult WriteDictionaryColumn(
         DictionaryEncoder.DictionaryResult dictResult,
@@ -790,6 +934,7 @@ internal static class ColumnChunkWriter
         int[]? defLevels, int[]? repLevels, int[]? valueDefLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
+        FsstCompressedColumn? fsstColumn, int valueIndex,
         ref int totalUncompressed, ref int totalCompressed,
         out Encoding valueEncoding)
     {
@@ -814,7 +959,7 @@ internal static class ColumnChunkWriter
         // Encode values into reusable buffer with type-aware V2 encoding
         int uncompressedValuesSize = EncodeValuesToBuffer(
             array, offset, numValues, nonNullCount, physicalType, typeLength,
-            valueDefLevels, options, out valueEncoding);
+            valueDefLevels, options, fsstColumn, valueIndex, out valueEncoding);
 
         // Compress values section only (V2: levels are uncompressed)
         int compressedValuesLen = CompressTo(
@@ -991,7 +1136,8 @@ internal static class ColumnChunkWriter
     private static int EncodeValuesToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount,
         PhysicalType physicalType, int typeLength, int[]? defLevels,
-        ParquetWriteOptions options, out Encoding encoding)
+        ParquetWriteOptions options, FsstCompressedColumn? fsstColumn, int valueIndex,
+        out Encoding encoding)
     {
         bool useDba = options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray;
 #pragma warning disable EWPARQUET0001 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
@@ -1011,8 +1157,19 @@ internal static class ColumnChunkWriter
         }
 
         encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding);
+
+        // FSST is decided per column chunk, not per page: when the chunk declined it (nothing
+        // trainable, or no size win) the resolver's answer is stale and the page falls back.
+        bool useFsst = fsstColumn != null && UsesFsst(physicalType, options);
+#pragma warning disable EWPARQUET0003 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+        if (!useFsst && encoding == Encoding.Fsst)
+#pragma warning restore EWPARQUET0003
+            encoding = Encoding.DeltaLengthByteArray;
+
         return physicalType switch
         {
+            PhysicalType.ByteArray when useFsst =>
+                EncodeFsstToBuffer(fsstColumn!, valueIndex, nonNullCount),
             PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels, options.MaxLiteralGroups),
             PhysicalType.Int32 => EncodeDeltaInt32ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Int64 => EncodeDeltaInt64ToBuffer(array, offset, numValues, nonNullCount, defLevels),
@@ -1027,6 +1184,15 @@ internal static class ColumnChunkWriter
             PhysicalType.FixedLenByteArray when useDba => EncodeDbaFlbaToBuffer(array, offset, numValues, nonNullCount, defLevels, typeLength),
             _ => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
         };
+    }
+
+    private static int EncodeFsstToBuffer(
+        FsstCompressedColumn fsstColumn, int valueIndex, int nonNullCount)
+    {
+        byte[] page = FsstPageEncoder.Encode(fsstColumn, valueIndex, nonNullCount);
+        EnsureValuesBuffer(page.Length);
+        page.CopyTo(t_valuesBuffer!, 0);
+        return page.Length;
     }
 
     private static int EncodeAlpSingleToBuffer(
@@ -1490,12 +1656,36 @@ internal static class ColumnChunkWriter
     }
 
     /// <summary>
-    /// For nested columns (maxDefLevel > 1), normalizes def levels to 0/1
-    /// so value encoding methods can check != 0 for presence.
-    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel <= 1.
+    /// Drops the DEPRECATED <c>min</c>/<c>max</c> fields on the column types where signed byte ordering
+    /// is not the logical ordering.
     /// </summary>
+    /// <remarks>
+    /// Those fields are defined with SIGNED byte ordering. Our values are computed with the CORRECT
+    /// logical ordering (they mirror min_value/max_value), so a legacy reader that honors the deprecated
+    /// fields under signed semantics would mis-prune UTF-8 / unsigned / decimal-FLBA columns. parquet-mr's
+    /// rule: emit the deprecated fields only where signed ordering IS the logical ordering (booleans,
+    /// signed ints incl. date/time/timestamp, floats); drop them elsewhere.
+    /// </remarks>
+    private static Statistics DropDeprecatedMinMaxIfMisordered(
+        Statistics stats, Apache.Arrow.Types.IArrowType type)
+    {
+        if (SignedOrderMatchesLogical(type))
+            return stats;
+
+        return new Statistics
+        {
+            NullCount = stats.NullCount,
+            MinValue = stats.MinValue,
+            MaxValue = stats.MaxValue,
+            IsMinValueExact = stats.IsMinValueExact,
+            IsMaxValueExact = stats.IsMaxValueExact,
+            NanCount = stats.NanCount,
+            DistinctCount = stats.DistinctCount,
+        };
+    }
+
     // True when the type's SIGNED byte ordering equals its logical ordering — the precondition for emitting
-    // the deprecated Statistics.min/max fields (see the call site).
+    // the deprecated Statistics.min/max fields (see DropDeprecatedMinMaxIfMisordered).
     private static bool SignedOrderMatchesLogical(Apache.Arrow.Types.IArrowType type) => type switch
     {
         BooleanType => true,
@@ -1562,6 +1752,11 @@ internal static class ColumnChunkWriter
         return ArrowCompute.Take(array.Values, physical);
     }
 
+    /// <summary>
+    /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1
+    /// so value encoding methods can check != 0 for presence.
+    /// Returns null if defLevels is null. Returns defLevels unchanged if maxDefLevel &lt;= 1.
+    /// </summary>
     private static int[]? NormalizeDefLevels(int[]? defLevels, int maxDefLevel)
     {
         if (defLevels == null)

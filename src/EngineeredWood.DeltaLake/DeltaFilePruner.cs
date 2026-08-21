@@ -5,14 +5,23 @@ using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.Expressions;
 
-namespace EngineeredWood.DeltaLake.Table;
+namespace EngineeredWood.DeltaLake;
 
 /// <summary>
 /// Evaluates a <see cref="Predicate"/> against a Delta <see cref="AddFile"/>
 /// using both partition values and per-file column statistics. Skips files
 /// that the evaluator proves cannot contain matching rows.
+///
+/// <para>Partition pruning and statistics pruning are ONE pass rather than two: for a partition column the
+/// accessor reports the file's constant value as both bounds, for a data column it decodes the recorded
+/// min/max, and a single <c>AlwaysFalse</c> from either source drops the file. A predicate that cannot be
+/// resolved evaluates Unknown, which KEEPS the file — pruning never guesses.</para>
+///
+/// <para>Pure, and useful outside a scan: the conflict checker prunes a concurrent <c>add</c> against a
+/// transaction's read predicates with it, and a host planning its own scan can apply it to a candidate set
+/// it assembled itself.</para>
 /// </summary>
-internal sealed class DeltaFilePruner
+public sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
 
@@ -20,8 +29,8 @@ internal sealed class DeltaFilePruner
     /// <param name="partitionColumns">Partition columns, whose values are constant per file.</param>
     /// <param name="preferTypedStats">
     /// Whether a checkpoint's typed <c>stats_parsed</c> columns win over its JSON <c>stats</c> string
-    /// when both are present — see <see cref="DeltaTableOptions.PreferTypedCheckpointStats"/>. A
-    /// checkpoint carrying only typed statistics is read from them either way.
+    /// when both are present — see <c>DeltaTableOptions.PreferTypedCheckpointStats</c> in the table
+    /// layer. A checkpoint carrying only typed statistics is read from them either way.
     /// </param>
     public DeltaFilePruner(
         StructType schema, IReadOnlyList<string> partitionColumns, bool preferTypedStats = true)

@@ -55,6 +55,49 @@ public enum DecimalOutputKind
 }
 
 /// <summary>
+/// Controls the Arrow output type for INT96 columns.
+/// </summary>
+/// <remarks>
+/// INT96 is deprecated in the Parquet format and nothing writes it today, but Hive, Impala and
+/// Spark before 3.0 wrote it for every timestamp, so it is common in files that already exist.
+/// The physical layout is settled — 8 bytes of nanoseconds-within-day little-endian, then a
+/// 4-byte Julian day — so only the Arrow unit is a choice.
+/// </remarks>
+public enum Int96OutputKind
+{
+    /// <summary>
+    /// Default: <c>timestamp[us]</c> with no timezone. Reads every date a writer can express,
+    /// including the far-future values Spark overflowed on write. DuckDB reads INT96 this way.
+    /// </summary>
+    /// <remarks>
+    /// The conversion floors: an INT96 carrying sub-microsecond precision — Impala wrote true
+    /// nanoseconds — loses the last three digits without warning. Choose
+    /// <see cref="TimestampNanoseconds"/> when that matters.
+    /// </remarks>
+    TimestampMicroseconds = 0,
+
+    /// <summary>
+    /// <c>timestamp[ns]</c> with no timezone, preserving everything INT96 can express.
+    /// PyArrow and Polars read INT96 this way, so this is the choice that matches them value
+    /// for value.
+    /// </summary>
+    /// <remarks>
+    /// <c>timestamp[ns]</c> only spans roughly 1677-09-21 to 2262-04-11, and INT96's Julian day
+    /// reaches well past both ends — 9999-12-31 is an everyday Spark value. A timestamp outside
+    /// that window throws <see cref="ParquetFormatException"/> naming the row and this option,
+    /// rather than wrapping into a plausible-looking date the way PyArrow does. The same file read
+    /// as <see cref="TimestampMicroseconds"/> gives the right answer.
+    /// </remarks>
+    TimestampNanoseconds,
+
+    /// <summary>
+    /// The undecoded 12 bytes as <c>FixedSizeBinaryType(12)</c> — the behaviour before INT96 was
+    /// interpreted. Nothing is lost either way; this only declines to say what the bytes mean.
+    /// </summary>
+    FixedSizeBinary,
+}
+
+/// <summary>
 /// Options that control how Parquet data is read and mapped to Apache Arrow types.
 /// </summary>
 /// <remarks>
@@ -78,6 +121,13 @@ public sealed record ParquetReadOptions
     /// Controls the Arrow output type for DECIMAL columns.
     /// </summary>
     public DecimalOutputKind DecimalOutput { get; init; } = DecimalOutputKind.Default;
+
+    /// <summary>
+    /// Controls the Arrow output type for INT96 columns. Defaults to
+    /// <see cref="Int96OutputKind.TimestampMicroseconds"/> — an INT96 column reads back as a
+    /// naive <c>timestamp[us]</c>, not as raw bytes.
+    /// </summary>
+    public Int96OutputKind Int96Output { get; init; } = Int96OutputKind.TimestampMicroseconds;
 
     /// <summary>
     /// Maximum number of rows per <see cref="Apache.Arrow.RecordBatch"/>. When set, row groups
@@ -151,7 +201,7 @@ public sealed record ParquetReadOptions
     /// the corresponding <see cref="Apache.Arrow.ExtensionArray"/> rather than
     /// the default storage type. For example, registering
     /// <c>GuidExtensionDefinition</c> causes <c>UUID</c>-annotated columns to
-    /// produce <see cref="GuidArray"/> instead of <see cref="Apache.Arrow.FixedSizeBinaryArray"/>.
+    /// produce <see cref="GuidArray"/> instead of <see cref="Apache.Arrow.Arrays.FixedSizeBinaryArray"/>.
     /// When <see langword="null"/> (the default), the reader produces the
     /// underlying storage types and ignores extension annotations.
     /// </summary>

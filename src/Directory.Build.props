@@ -46,6 +46,27 @@
     a strong name changes assembly identity, so it could not go out under the same
     version. The Clast.* dependencies moved to 0.2.0 for the same reason.
   -->
+  <!--
+    Ship XML documentation in every package. The libraries carry a great deal of it, the
+    packages already carry symbols and SourceLink, and without this none of it reaches a
+    consumer's IntelliSense.
+
+    Turning it on also puts Roslyn's documentation diagnostics on the build. Those are worth
+    having: a cref that does not resolve is a dead link in shipped docs, and a paramref naming
+    a parameter that no longer exists is documentation actively describing the wrong thing.
+    Both were found here by enabling it, including two left behind by #126's own refactor.
+
+    Two are suppressed as POLICY rather than correctness:
+      CS1591 (missing XML comment on a public member) — ~1850 sites. Requiring a comment on
+             every public member is a separate decision from shipping the ones we have.
+      CS1573 (a parameter has no matching param tag)  — ~700 sites, same argument.
+    Everything else stays on, and TreatWarningsAsErrors (net10.0) makes it a gate.
+  -->
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+  </PropertyGroup>
+
   <PropertyGroup>
     <Version>0.3.0</Version>
     <Authors>clast-project</Authors>
@@ -59,7 +80,7 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
     <PackageTags>arrow;parquet;orc;avro;lance;vortex;delta-lake;iceberg;columnar;analytics</PackageTags>
-    <PackageReleaseNotes>Preliminary 0.3.0 release. BREAKING: ITableFileSystem.RenameAsync is removed and replaced by TryWriteAllBytesAsync, which creates a file only if it does not already exist; any custom ITableFileSystem must implement it, and it must be atomic, because table-format commit protocols depend on exactly one writer creating a given version. Delta Lake commits now cost a single conditional request per commit instead of a write-to-temp plus rename. New: DeltaTable.CreateOrReplaceAsync publishes protocol, metadata, removes and initial data in one commit, creating a table with data or atomically replacing an existing one while preserving its history. The Google Cloud Storage backend moves to Clast.Google.Cloud.Storage.V1 4.15.0. EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
+    <PackageReleaseNotes>Preliminary 0.3.0 release. BREAKING: ITableFileSystem.RenameAsync is removed and replaced by TryWriteAllBytesAsync, which creates a file only if it does not already exist; any custom ITableFileSystem must implement it, and it must be atomic, because table-format commit protocols depend on exactly one writer creating a given version. Delta Lake commits now cost a single conditional request per commit instead of a write-to-temp plus rename. New: DeltaTable.CreateOrReplaceAsync publishes protocol, metadata, removes and initial data in one commit, creating a table with data or atomically replacing an existing one while preserving its history. The Google Cloud Storage backend moves to Clast.Google.Cloud.Storage.V1 4.15.0. Spark expression evaluation takes a new dependency on Clast.DatabaseDecimal 0.3.0, which is what carries decimal arithmetic across Spark's whole precision range instead of stopping at the values System.Decimal can hold. EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
@@ -102,7 +123,7 @@
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Lance'">A reader and writer for the Lance columnar file format (v2.0 / v2.1 / v2.2) that speaks Apache Arrow. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Lance.Table'">The Lance dataset/table API — manifests, fragments, time travel, and predicate-based delete/update — on top of EngineeredWood.Lance. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Vortex'">A reader, writer, and predicate-based zone-pruning API for the Vortex columnar file format that speaks Apache Arrow. $(_PreRelease)</Description>
-    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake'">A low-level Delta Lake transaction-log API for .NET — actions, checkpoints, and statistics for metadata consumers. $(_PreRelease)</Description>
+    <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake'">A low-level Delta Lake transaction-log API for .NET — actions, snapshots, checkpoints, statistics-based file skipping, and optimistic-concurrency commits, for a host that brings its own data plane. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.DeltaLake.Table'">A high-level Delta Lake table API (Reader v3 / Writer v7) with Arrow read/write, deletion vectors, column mapping, and predicate pushdown. $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Iceberg'">Apache Iceberg metadata (v1/v2/v3), manifest read/write, and predicate-aware scan planning for .NET (metadata-only). $(_PreRelease)</Description>
     <Description Condition="'$(MSBuildProjectName)' == 'EngineeredWood.Azure'">Azure Blob Storage I/O backends (random-access read, streaming write, and table file system) for EngineeredWood. $(_PreRelease)</Description>

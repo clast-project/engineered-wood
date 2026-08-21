@@ -33,6 +33,14 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
 {
     private Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>? _inner;
 
+    /// <summary>
+    /// Most <typeparamref name="T"/> elements a buffer can hold. Not a policy of ours: the buffer is
+    /// handed to an <see cref="ArrowBuffer"/>, which wraps a <see cref="ReadOnlyMemory{T}"/> whose
+    /// length is an <see cref="int"/>, and it is reached through a <see cref="Span{T}"/> throughout.
+    /// Owning the allocation, as <see cref="Grow"/> does past the halfway point, does not raise it.
+    /// </summary>
+    private static int MaxElements => int.MaxValue / Math.Max(1, System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
+
     /// <summary>Creates a native buffer sized for <paramref name="elementCount"/> elements of <typeparamref name="T"/>.</summary>
     /// <param name="elementCount">Number of elements.</param>
     /// <param name="zeroFill">If true, the buffer is zeroed. Set to false when the caller
@@ -73,9 +81,31 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
         if (newElementCount <= inner.Length)
             return;
 
-        // Exponential growth (2x) to amortise repeated grows.
-        int newCount = Math.Max(newElementCount, checked(inner.Length * 2));
-        inner.Grow(newCount, zeroFill: false);
+        // Exponential growth (2x) to amortise repeated grows, SATURATING at int.MaxValue.
+        //
+        // Apache.Arrow's own Grow does `checked(Length * 2)` unconditionally — it carries a TODO
+        // proposing exactly this saturation — so once the buffer passes int.MaxValue/2 its NEXT grow
+        // throws OverflowException however little was asked for. That is a hard ceiling near 1 GiB on
+        // any buffer that grows, reported as arithmetic overflow rather than as whatever limit the
+        // caller was actually approaching. So past the halfway point we grow the buffer ourselves.
+        //
+        // Saturating rather than sizing to exactly what was asked for: an exact grow is O(n) every time,
+        // and callers arrive here repeatedly — the Parquet decoder grows once per page — so a buffer
+        // walking from 1 GiB to the ceiling in page-sized steps would copy gigabytes hundreds of times
+        // over. One allocation at the ceiling keeps growth amortised, at the cost of reserving the last
+        // doubling in full. Only reachable above 1 GiB, where that trade is clearly the right one.
+        long doubled = (long)inner.Length * 2;
+        if (doubled <= int.MaxValue)
+        {
+            inner.Grow(Math.Max(newElementCount, (int)doubled), zeroFill: false);
+            return;
+        }
+
+        var grown = new Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>(
+            Math.Max(newElementCount, MaxElements), zeroFill: false, default);
+        inner.Span.CopyTo(grown.Span);
+        inner.Dispose();
+        _inner = grown;
     }
 
     public void Dispose()

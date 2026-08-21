@@ -31,6 +31,7 @@ internal static class VacuumExecutor
         DeltaSnapshot snapshot,
         TimeSpan retentionPeriod,
         bool dryRun,
+        bool hideIcebergMetadataDir,
         CancellationToken cancellationToken)
     {
         // ── Mark: the keep-set is the CURRENT version's files, plus their deletion vectors. ──
@@ -78,7 +79,8 @@ internal static class VacuumExecutor
 
         await foreach (var file in fs.ListAsync("", cancellationToken).ConfigureAwait(false))
         {
-            if (IsExcludedDirectory(file.Path))
+            if (IsExcludedPath(
+                file.Path, snapshot.Metadata.PartitionColumns, hideIcebergMetadataDir))
                 continue;
 
             if (keep.Contains(file.Path) || file.LastModified >= cutoff)
@@ -161,23 +163,94 @@ internal static class VacuumExecutor
     }
 
     /// <summary>
-    /// Directories vacuum must never sweep.
+    /// Whether vacuum must leave <paramref name="path"/> alone — the HIDDEN-NAME rule, applied to every
+    /// component of the relative path.
     ///
-    /// <para><c>_delta_log/</c> is the log itself — its lifetime is governed by
-    /// <c>delta.logRetentionDuration</c> and log cleanup, not by vacuum.</para>
+    /// <para>A name beginning <c>_</c> or <c>.</c> is hidden by the Hadoop convention Delta inherits, and
+    /// belongs to whoever wrote it: <c>_delta_log/</c> (governed by log cleanup, not vacuum),
+    /// <c>_change_data/</c> (referenced by <c>cdc</c> actions, so never in <c>ActiveFiles</c> — sweeping it
+    /// deletes live history), and anything a co-operating engine keeps beside the data, such as an index
+    /// sidecar. None of them can be judged against this snapshot's active files, and a file vacuum cannot
+    /// judge is a file it must not delete.</para>
     ///
-    /// <para><c>_change_data/</c> holds change-data-feed files, which are referenced by <c>cdc</c>
-    /// actions rather than <c>add</c> actions and so never appear in the snapshot's active files.
-    /// Sweeping it would delete live CDF history — which the previous implementation did, since those
-    /// files are <c>.parquet</c> and absent from <c>ActiveFiles</c>. Excluding the directory
-    /// under-deletes (expired CDF is never collected) but cannot destroy readable history; building a
-    /// proper CDF keep-set needs the snapshot to track <c>cdc</c> actions, which it does not yet.</para>
+    /// <para><b>⚠ PARTITION DIRECTORIES ARE THE EXCEPTION, and without it this rule silently stops
+    /// collecting.</b> A partition column may be named with a leading underscore, so <c>_region=eu/</c> is a
+    /// hidden NAME and live data — excluding it would make every orphan inside it immortal. Matched against
+    /// the snapshot's declared partition columns rather than by looking for <c>=</c>, so an ordinary
+    /// directory that happens to contain one is not mistaken for a partition.</para>
+    ///
+    /// <para><b>⚠ Applied PER COMPONENT and to FILES as well as directories</b>, which is what Delta does
+    /// (<c>DeltaFileOperations.recursiveListDirs</c> filters on <c>getPath.getName</c> at every level, for
+    /// both) — a listing that recurses would otherwise reach a hidden directory's contents by their full
+    /// path and collect them one level down.</para>
+    ///
+    /// <para><b><c>_delta_index</c> is a CARVE-OUT and IS swept</b>, which is the spec's rule and not a
+    /// concession to it. A bloom-filter index is tied to the data file it indexes, so when that file is
+    /// collected the index has to go with it — Databricks documents VACUUM as the intended cleanup for a
+    /// dropped index. A foreign sweep also removes indexes for LIVE data, since no keep-set here can know
+    /// about them, but both reference implementations behave identically, so that is ecosystem-normal
+    /// rather than a hazard this rule should invent protection against. Protecting it would be a
+    /// divergence introduced, not one closed.</para>
+    ///
+    /// <para><b>ONE divergence, deliberate and in the safe direction: <c>_change_data</c> stays
+    /// protected.</b> The spec sweeps it and relies on the keep-set holding live CDF files; that set
+    /// cannot be built here, because the snapshot does not track <c>cdc</c> actions. Protecting it
+    /// under-deletes — expired CDF is never collected — but cannot destroy readable history. Revisit when
+    /// the snapshot learns about <c>cdc</c>. Note that this now falls out of the general rule rather than
+    /// being a named exclusion, so it is one <c>if</c> away from matching the spec exactly.</para>
     /// </summary>
-    private static bool IsExcludedDirectory(string path) =>
-        path.StartsWith("_delta_log/", StringComparison.Ordinal)
-        || path.StartsWith("_delta_log\\", StringComparison.Ordinal)
-        || path.StartsWith(CdfConfig.ChangeDataDir + "/", StringComparison.Ordinal)
-        || path.StartsWith(CdfConfig.ChangeDataDir + "\\", StringComparison.Ordinal);
+    private static bool IsExcludedPath(
+        string path, IReadOnlyList<string> partitionColumns, bool hideIcebergMetadataDir)
+    {
+        var components = path.Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < components.Length; i++)
+        {
+            string component = components[i];
+            if (component.Length == 0)
+                continue;
+
+            // UniForm's Iceberg metadata, hidden by NAME rather than by convention — it begins with
+            // neither `_` nor `.`, so no prefix rule reaches it, and upstream answers with a literal
+            // equality test plus a flag for exactly that reason. Scoped to a DIRECTORY component (never
+            // the last one, which is the file), because upstream's predicate is `isHiddenDirectory` and a
+            // data file that happens to be named `metadata` is not the thing being protected.
+            if (hideIcebergMetadataDir
+                && i < components.Length - 1
+                && component.Equals(IcebergMetadataDir, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (component[0] != '_' && component[0] != '.')
+                continue;
+
+            // Swept: see the carve-out note above. Prefix rather than equality, as upstream tests it.
+            if (component.StartsWith(DeltaIndexDir, StringComparison.Ordinal))
+                continue;
+
+            // A partition directory is live data whatever it is called.
+            bool isPartitionDir = false;
+            foreach (var column in partitionColumns)
+            {
+                if (component.StartsWith(column + "=", StringComparison.Ordinal))
+                {
+                    isPartitionDir = true;
+                    break;
+                }
+            }
+            if (!isPartitionDir)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>UniForm writes converted Iceberg metadata here; the name is reserved for it.</summary>
+    private const string IcebergMetadataDir = "metadata";
+
+    /// <summary>Bloom-filter indexes, tied to the data files they index and collected with them.</summary>
+    private const string DeltaIndexDir = "_delta_index";
+
+    private static readonly char[] PathSeparators = ['/', '\\'];
 
     // Writes a commitInfo-only commit, retrying past versions a concurrent writer takes (the commit carries
     // no data actions, so re-attempting at the next version is always safe). Returns the committed version.

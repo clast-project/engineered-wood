@@ -34,6 +34,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     private readonly ParquetReadOptions _options;
     private FileMetaData? _metadata;
     private SchemaDescriptor? _schema;
+    private Apache.Arrow.Schema? _declaredArrowSchema;
+    private bool _declaredArrowSchemaResolved;
     private long _fileLength;
     private bool _disposed;
 
@@ -119,6 +121,26 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Gets the file's schema as an Arrow <see cref="Apache.Arrow.Schema"/>, without reading
+    /// any data. This is the schema every <see cref="RecordBatch"/> from
+    /// <see cref="ReadAllAsync"/> carries — and the only way to observe it for a file with no
+    /// row groups, which yields no batches at all.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async ValueTask<Apache.Arrow.Schema> GetArrowSchemaAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var declared = DeclaredArrowSchema(metadata);
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in ArrowSchemaConverter.ToArrowFields(schema.Root, _options))
+            builder.Field(RestoreDeclaredUnits(field, declared));
+
+        return builder.Build();
+    }
+
+    /// <summary>
     /// Reads a single row group and returns the data as an Arrow <see cref="RecordBatch"/>.
     /// </summary>
     /// <param name="rowGroupIndex">Zero-based index of the row group to read.</param>
@@ -142,7 +164,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             var results = new ColumnResult[ctx.Count];
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
@@ -205,18 +227,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 }
             }
 
-            if (_options.BatchSize is > 0 || _options.MaxBatchByteSize is > 0)
+            // Always via the batching entry point, even with no batch limit configured: it falls back to
+            // the single-batch read itself when there is nothing to split, and it is where the implicit
+            // cap for an over-sized chunk is decided. Routing around it here would put that decision in
+            // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
+            await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)
+                .ConfigureAwait(false))
             {
-                await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)
-                    .ConfigureAwait(false))
-                {
-                    yield return batch;
-                }
-            }
-            else
-            {
-                yield return await ReadRowGroupAsync(i, columnNames, cancellationToken)
-                    .ConfigureAwait(false);
+                yield return batch;
             }
         }
     }
@@ -241,20 +259,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         int? batchSize = _options.BatchSize;
         long? maxBytes = _options.MaxBatchByteSize;
-        bool hasBatchLimit = batchSize is > 0 || maxBytes is > 0;
-
-        // When no batch limit is set, fall back to the standard single-batch path.
-        if (!hasBatchLimit)
-        {
-            yield return await ReadRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
-                .ConfigureAwait(false);
-            yield break;
-        }
 
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
 
-        // Check whether the entire row group fits in one batch.
+        // A BYTE_ARRAY chunk holding more bytes than one Arrow array can address cannot be returned as a
+        // single batch at all. Splitting it is the only way to read it, so a caller who asked for no
+        // particular batch size still gets one here rather than an error they can do nothing about. The
+        // test is an over-estimate (see HasChunkOverArrowLimit) and splitting a chunk that would have fit
+        // is harmless, so erring towards splitting is the right direction to be wrong in.
+        //
+        // Deliberately engaged only when a chunk is ALREADY over the limit, not at some margin below it:
+        // a file that reads as one batch today keeps doing so, and the implicit cap can only turn a
+        // failure into a success. Nested columns are excluded because the nested path decodes the whole
+        // row group before slicing, so splitting does not help them (issue #157) — they still get the
+        // NotSupportedException, which says so.
+        if (batchSize is not > 0 && maxBytes is not > 0
+            && !ctx.HasNestedColumns
+            && HasChunkOverArrowLimit(ctx))
+        {
+            maxBytes = ImplicitLargeChunkBatchBytes;
+        }
+
+        // No delegation back to ReadRowGroupAsync when there is no batch limit: it would call
+        // PrepareRowGroupAsync a second time for the row group already prepared above, and since
+        // ReadAllAsync now always comes through here that is every row group of every ordinary read. With
+        // no limit set nothing below narrows the batch, so the single-pass branch handles it unchanged.
         bool fitsInOneBatch = true;
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
             fitsInOneBatch = false;
@@ -278,7 +308,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             try
             {
                 var results = new ColumnResult[ctx.Count];
-                Parallel.For(0, ctx.Count, i =>
+                ForEachColumn(ctx.Count, i =>
                 {
                     results[i] = ColumnChunkReader.ReadColumn(
                         buffers[i].Memory.Span, ctx.Columns[i],
@@ -371,7 +401,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             try
             {
                 var results = new ColumnResult[ctx.Count];
-                Parallel.For(0, ctx.Count, i =>
+                ForEachColumn(ctx.Count, i =>
                 {
                     int startPage = pageOffsets[i];
                     int endPage = pageEnds[i];
@@ -438,7 +468,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             var results = new ColumnResult[ctx.Count];
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 pageMaps[i] = PageMapBuilder.Build(
                     buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
@@ -487,6 +517,64 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             columns[i] = Apache.Arrow.ArrowArrayFactory.BuildArray(batch.Column(i).Data.Slice(offset, length));
 
         return new RecordBatch(batch.Schema, columns, length);
+    }
+
+    /// <summary>
+    /// Decodes the row group's columns in parallel, letting a single failure surface as itself.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Parallel.For(int, int, Action{int})"/> wraps whatever a body throws in an
+    /// <see cref="AggregateException"/>, so a diagnostic written for the caller arrives as
+    /// "One or more errors occurred" with the real message one level down — which is how the oversized
+    /// BYTE_ARRAY column of issue #157 reached a caller even once it had a message worth reading. One
+    /// column failing is the ordinary case, so that one is rethrown in place, stack intact. Genuine
+    /// multi-column failures keep the aggregate, which is the only honest shape for them.
+    /// </remarks>
+    private static void ForEachColumn(int count, Action<int> body)
+    {
+        try
+        {
+            Parallel.For(0, count, body);
+        }
+        catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(ex.InnerExceptions[0]).Throw();
+        }
+    }
+
+    /// <summary>
+    /// Batch budget used when a chunk is too large to decode into one Arrow array and the caller set no
+    /// budget of their own. Small enough that the sum across every column in a batch stays far below the
+    /// limit, large enough not to shred a big read into thousands of batches.
+    /// </summary>
+    private const long ImplicitLargeChunkBatchBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Whether any BYTE_ARRAY chunk in this row group holds more uncompressed bytes than one Arrow array
+    /// can address.
+    /// </summary>
+    /// <remarks>
+    /// Uncompressed size is an UPPER bound on the decoded data — it also counts page headers, level bytes
+    /// and any dictionary page — so this can fire for a chunk whose values would in fact have fitted, when
+    /// the overhead is what carried it over. That is deliberate here: being wrong in this direction only
+    /// splits a read that could have been done in one batch, which costs an extra batch boundary and
+    /// changes nothing about the data. Nothing REFUSES on this estimate; the refusal is made by the
+    /// decoder, which counts the actual bytes.
+    /// </remarks>
+    private static bool HasChunkOverArrowLimit(RowGroupContext ctx)
+    {
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var meta = ctx.Chunks[i].MetaData!;
+            if (meta.Type == PhysicalType.ByteArray
+                && meta.TotalUncompressedSize > Data.ByteArrayCapacity.MaxBytes)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -613,7 +701,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             var results = new ColumnResult[ctx.Count];
 
-            Parallel.For(0, ctx.Count, i =>
+            ForEachColumn(ctx.Count, i =>
             {
                 results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
@@ -719,9 +807,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 ?? throw new ParquetFormatException(
                     $"Column chunk {i} has no inline metadata.");
 
+            // The chunk starts at whichever side-table page precedes the data pages — a
+            // dictionary page, or an FSST symbol table page. Starting at DataPageOffset would
+            // read past a symbol table the data pages cannot be decoded without.
             long start = colMeta.DictionaryPageOffset is > 0 and long dpo
                 ? dpo
-                : colMeta.DataPageOffset;
+                : colMeta.SymbolTablePageOffset is > 0 and long stpo
+                    ? stpo
+                    : colMeta.DataPageOffset;
             long length = colMeta.TotalCompressedSize;
 
             // PARQUET-816 workaround: old parquet-mr writers (<= 1.2.8) exclude the
@@ -781,7 +874,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             for (int i = 0; i < results.Length; i++)
                 arrowArrays[i] = results[i].Array;
 
-            return BuildRecordBatch(ctx.LeafArrowFields, arrowArrays, ctx.RowCount);
+            var leafFields = (Field[])ctx.LeafArrowFields.Clone();
+            RestoreDeclaredUnits(leafFields, arrowArrays);
+            return BuildRecordBatch(leafFields, arrowArrays, ctx.RowCount);
         }
 
         // Nested path: group leaf arrays into Struct/List/Map arrays
@@ -800,7 +895,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         var topLevelArrays = NestedAssembler.Assemble(
             ctx.SchemaRoot!, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths, ctx.RowCount,
-            _options.ExtensionRegistry);
+            _options);
 
         // NestedAssembler wraps only top-level variant columns; wrap variants nested inside a
         // struct/list/map so the arrays match the schema's (variant-aware) field types at every depth.
@@ -812,7 +907,87 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     topLevelArrays[i], ctx.TopLevelFields![i].DataType);
         }
 
-        return BuildRecordBatch(ctx.TopLevelFields!, topLevelArrays, ctx.RowCount);
+        var topLevelFields = (Field[])ctx.TopLevelFields!.Clone();
+        RestoreDeclaredUnits(topLevelFields, topLevelArrays);
+        return BuildRecordBatch(topLevelFields, topLevelArrays, ctx.RowCount);
+    }
+
+    /// <summary>
+    /// The Arrow schema the writer recorded under <c>ARROW:schema</c>, decoded once per file.
+    /// Absent for a file no Arrow-aware writer produced, and for anything DuckDB wrote.
+    /// </summary>
+    private Apache.Arrow.Schema? DeclaredArrowSchema(Metadata.FileMetaData metadata)
+    {
+        if (!_declaredArrowSchemaResolved)
+        {
+            _declaredArrowSchema = Data.ArrowSchemaMetadata.Decode(metadata.KeyValueMetadata);
+            _declaredArrowSchemaResolved = true;
+        }
+
+        return _declaredArrowSchema;
+    }
+
+    /// <summary>
+    /// Restores the timestamp and time ZONE names the declared schema carries for
+    /// <paramref name="field"/>, matched by name so that a projected read still finds its own field.
+    /// </summary>
+    /// <remarks>
+    /// Zone names only. The unit stays as the file encodes it, because PyArrow reads its own
+    /// <c>timestamp[s]</c> back as <c>timestamp[ms]</c> and restoring the unit here would make us
+    /// the outlier against every file anyone else wrote.
+    /// </remarks>
+    private static Field RestoreDeclaredUnits(Field field, Apache.Arrow.Schema? declared)
+    {
+        var target = DeclaredField(field.Name, declared);
+        if (target is null)
+            return field;
+
+        var type = Data.TimeUnitRescaler.ToDeclaredUnits(field.DataType, target.DataType);
+        return ReferenceEquals(type, field.DataType)
+            ? field
+            : new Field(field.Name, type, field.IsNullable, field.Metadata);
+    }
+
+    private static Field? DeclaredField(string name, Apache.Arrow.Schema? declared)
+    {
+        if (declared is null)
+            return null;
+
+        foreach (var candidate in declared.FieldsList)
+        {
+            if (string.Equals(candidate.Name, name, StringComparison.Ordinal))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Rewrites each assembled column into the units the writer originally declared. Parquet keeps
+    /// only MILLIS, MICROS or NANOS and no zone name, so without this a <c>timestamp[s]</c> reads
+    /// back as milliseconds and every zone reads back as UTC.
+    /// </summary>
+    private void RestoreDeclaredUnits(Field[] fields, IArrowArray[] arrays)
+    {
+        // Assembly always follows a metadata read, so the footer is cached by now.
+        var declared = _metadata is null ? null : DeclaredArrowSchema(_metadata);
+        if (declared is null)
+            return;
+
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var target = DeclaredField(fields[i].Name, declared);
+            if (target is null)
+                continue;
+
+            var restored = Data.TimeUnitRescaler.ToDeclaredUnits(arrays[i], target.DataType);
+            if (ReferenceEquals(restored, arrays[i]))
+                continue;
+
+            arrays[i] = restored;
+            fields[i] = new Field(
+                fields[i].Name, restored.Data.DataType, fields[i].IsNullable, fields[i].Metadata);
+        }
     }
 
     private static RecordBatch BuildRecordBatch(

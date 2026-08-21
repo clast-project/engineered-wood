@@ -48,6 +48,17 @@ public static class DeltaVersion
     public const string LogPrefix = "_delta_log/";
 
     /// <summary>
+    /// Path prefix for the sidecar directory a V2 checkpoint's file actions live in.
+    /// </summary>
+    /// <remarks>
+    /// PROTOCOL.md fixes the location — "sidecar files must always reside in the table's own
+    /// _delta_log/_sidecars directory" — which is why a <c>sidecar</c> action may carry a bare file name.
+    /// It is a directory INSIDE the log, so anything walking <see cref="LogPrefix"/> sees sidecars too and
+    /// has to decide what to do about them.
+    /// </remarks>
+    public const string SidecarPrefix = "_delta_log/_sidecars/";
+
+    /// <summary>
     /// Attempts to parse a version number from a commit file name
     /// (e.g., <c>00000000000000000005.json</c>).
     /// </summary>
@@ -56,6 +67,27 @@ public static class DeltaVersion
         version = -1;
 
         if (!fileName.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string stem = Path.GetFileNameWithoutExtension(fileName);
+        return stem.Length == VersionDigits &&
+               long.TryParse(stem, NumberStyles.None, CultureInfo.InvariantCulture, out version);
+    }
+
+    /// <summary>
+    /// Attempts to parse a version number from a version-checksum file name
+    /// (e.g., <c>00000000000000000005.crc</c>).
+    /// </summary>
+    /// <remarks>
+    /// This library writes no checksum files, but delta-spark writes one beside every commit by default,
+    /// so any table shared with it carries them — which makes them something log cleanup has to recognise
+    /// even though nothing here produces them.
+    /// </remarks>
+    public static bool TryParseChecksumVersion(string fileName, out long version)
+    {
+        version = -1;
+
+        if (!fileName.EndsWith(".crc", StringComparison.OrdinalIgnoreCase))
             return false;
 
         string stem = Path.GetFileNameWithoutExtension(fileName);

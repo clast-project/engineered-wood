@@ -516,6 +516,86 @@ public for a host that genuinely needs to own the retry loop — one driving its
 protocol, say. If you are using them to do what the table above describes, use the transaction instead: the
 ordering, the read-set bookkeeping, and the row-id arithmetic are invariants the loop already enforces.
 
+## Going lower still: committing without the table layer
+
+Everything above uses `DeltaTable`, which means taking `EngineeredWood.DeltaLake.Table` and the Arrow
+read/write path inside it. A host that reads and writes its own parquet, interprets its own schemas, and
+applies its own statistics pruning does not need any of that — and since the optimistic-concurrency loop
+moved down, it does not have to. `EngineeredWood.DeltaLake` alone can snapshot, commit, and checkpoint:
+
+```csharp
+var log = new TransactionLog(fs);
+var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
+
+var committer = new LogCommitter(log, new LogCommitOptions { CheckpointInterval = 10 });
+
+var result = await committer.CommitAsync(new LogCommitRequest
+{
+    BaseSnapshot = snapshot,
+    Actions = [new AddFile { Path = "part-0.parquet", /* your writer's numbers */ }],
+    // What you read, so a concurrent commit can be judged against it. Blind is the default: an append
+    // that read nothing conflicts only with a metadata change, a protocol change, or a delete/delete.
+    Reads = new ReadSet { Predicates = [Ex.LessThan("id", LiteralValue.Of(50L))] },
+    Operation = "WRITE",
+});
+
+// result.Version is where it LANDED — not necessarily snapshot.Version + 1, since a rebase past a
+// non-conflicting concurrent commit lands later. result.Snapshot is the state there.
+```
+
+The committer attempts the commit, and on a collision reads the intervening commits, asks
+`ConflictChecker` whether any of them invalidated what you read or removed, and either aborts (first
+committer wins) or rebases onto the newer version and retries. It also gates on the writer protocol before
+it writes anything — a table declaring writer features this library does not implement is refused, which
+matters more here than through `DeltaTable`, since there is no other layer performing that check for you.
+
+Two things to get right:
+
+- **`Reads` is yours to declare.** Nothing at this layer saw your scan, so an empty read-set means "this
+  commit depended on nothing" and will be taken at its word. Predicates buy precision (a concurrent append
+  is pruned against them via `DeltaFilePruner`); `Files` names exactly what you read; `WholeTable` is the
+  safe blunt answer.
+- **Actions coupled to the version they land at cannot simply be replayed.** If your `add` carries a
+  `baseRowId`, or your deletion vector was computed against a specific file state, a rebase would commit
+  something quietly wrong. Either set `RebaseSafe = false` — a collision then aborts instead — or supply an
+  `ICommitRebaseHandler` that re-derives them. `RecomputeRebaseHandler` covers the common shape: rebuild
+  the whole action list from the newest snapshot, which is also what an overwrite needs.
+
+`DeltaFilePruner` is public at this layer too, so partition + statistics file skipping is available to a
+scan you planned yourself, not only through `PlanFiles`.
+
+### Handling a conflict
+
+`DeltaConflictException` is classified, so a retry loop does not have to guess:
+
+```csharp
+catch (DeltaConflictException e) when (e.Recovery == ConflictRecovery.Replay)
+{
+    // The actions are still valid; only the version they aimed at was taken. Re-attempt them.
+}
+catch (DeltaConflictException e)
+{
+    // Replan: the plan was built against a table state that no longer holds. Re-read, recompute,
+    // commit that. e.ErrorCode says what moved; e.ConflictingVersion says which commit did it.
+}
+```
+
+`Replay` is deliberately rare — `LogCommitter` already does it internally, so it escapes only when
+`MaxAttempts` runs out or when you drive `TransactionLog.WriteCommitAsync` yourself. Everything else is
+`Replan`, and that is the case worth getting right: replaying work whose premise has gone is the failure
+this classification exists to prevent.
+
+`ErrorCode` is a `DELTA_*` constant from `DeltaErrorCodes` (or `DeltaTableErrorCodes`), in the same flat
+namespace as every other Delta failure — so one `switch` on `ErrorCode` covers conflicts and format
+errors alike. Six of the conflict codes are delta-spark's own names for the same conditions, checked
+against its `error/delta-error-classes.json`, so a host bridging engines can treat them as equivalent.
+Match on the code, never on the message: the prose is free to change.
+
+What you give up is everything with a data plane in it: the Arrow read/write path, deletion-vector DML,
+compaction, vacuum, CDF writing, identity columns, and the row-level conflict reconciliation that needs to
+read vectors and remap rows. `DeltaTable` remains the recommended surface unless you are specifically
+avoiding that.
+
 ## CTAS: writing files before the table exists
 
 A host streaming a `CREATE TABLE AS SELECT` wants its data files on storage before commit 0 is written. Under

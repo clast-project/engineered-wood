@@ -39,6 +39,8 @@ public sealed class TransactionLogWriteTests
 
     private sealed class CommitOnlyFileSystem : ITableFileSystem
     {
+        public PathNameConstraints PathConstraints => PathNameConstraints.None;
+
         public bool TryWriteResult { get; init; } = true;
 
         public string? WrittenPath { get; private set; }

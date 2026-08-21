@@ -71,6 +71,28 @@ public static class ProtocolVersions
     };
 
     /// <summary>
+    /// Whether this table has enabled the <c>v2Checkpoint</c> table feature, and so may be given a V2
+    /// spec checkpoint at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>PROTOCOL.md: "To add V2 Checkpoints support to a table, the table must have Reader Version 3
+    /// and Writer Version 7. A feature name <c>v2Checkpoint</c> must exist in the table's
+    /// <c>readerFeatures</c> AND <c>writerFeatures</c>." Both lists, because a V2 checkpoint is a thing
+    /// readers must understand as well as writers — which is why this is not a
+    /// <c>SupportedWriterFeatures</c> lookup.</para>
+    ///
+    /// <para>This asks what the TABLE permits, not what this library implements. Those are separate
+    /// questions and both must hold: <see cref="ValidateWriteSupport"/> answers the other one.</para>
+    /// </remarks>
+    public static bool SupportsV2Checkpoints(Actions.ProtocolAction protocol) =>
+        protocol.MinReaderVersion >= 3 &&
+        protocol.MinWriterVersion >= 7 &&
+        protocol.ReaderFeatures is not null &&
+        protocol.WriterFeatures is not null &&
+        protocol.ReaderFeatures.Contains("v2Checkpoint") &&
+        protocol.WriterFeatures.Contains("v2Checkpoint");
+
+    /// <summary>
     /// Validates that vacuum is safe to run on this table.
     /// When the <c>vacuumProtocolCheck</c> feature is present, all reader
     /// and writer features must be supported — otherwise vacuum might
@@ -106,6 +128,7 @@ public static class ProtocolVersions
         if (protocol.MinReaderVersion > MaxReaderVersion)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidProtocolVersion,
                 $"This table requires reader version {protocol.MinReaderVersion}, " +
                 $"but this implementation only supports up to reader version {MaxReaderVersion}.");
         }
@@ -120,6 +143,7 @@ public static class ProtocolVersions
             if (unsupported.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedFeaturesForRead,
                     $"This table requires unsupported reader features: [{string.Join(", ", unsupported)}].");
             }
         }
@@ -137,6 +161,7 @@ public static class ProtocolVersions
         if (protocol.MinWriterVersion > MaxWriterVersion)
         {
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidProtocolVersion,
                 $"This table requires writer version {protocol.MinWriterVersion}, " +
                 $"but this implementation only supports up to writer version {MaxWriterVersion}.");
         }
@@ -151,6 +176,7 @@ public static class ProtocolVersions
             if (unsupported.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedFeaturesForWrite,
                     $"This table requires unsupported writer features: [{string.Join(", ", unsupported)}].");
             }
         }

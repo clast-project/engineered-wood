@@ -33,6 +33,7 @@ public sealed class DeletionVectorReader
             "u" => await ReadUuidFileAsync(dv, cancellationToken).ConfigureAwait(false),
             "p" => await ReadAbsoluteFileAsync(dv, cancellationToken).ConfigureAwait(false),
             _ => throw new DeltaFormatException(
+                DeltaErrorCodes.UnsupportedDeletionVectorStorageType,
                 $"Unknown deletion vector storage type: '{dv.StorageType}'"),
         };
 
@@ -49,7 +50,8 @@ public sealed class DeletionVectorReader
         string encoded = dv.PathOrInlineDv;
 
         if (encoded.Length == 0)
-            throw new DeltaFormatException("Empty inline deletion vector.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector, "Empty inline deletion vector.");
 
         // The first 4 bytes (encoded as 5 Z85 chars) encode the size
         // But in practice, Delta stores the entire DV as Z85-encoded bytes
@@ -66,6 +68,7 @@ public sealed class DeletionVectorReader
     {
         string filePath = DeletionVectorPath.GetRelativePath(dv)
             ?? throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
                 $"Deletion vector storage type '{dv.StorageType}' has no table-relative path.");
 
         return await ReadDvFileAsync(filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
@@ -113,6 +116,7 @@ public sealed class DeletionVectorReader
         // Extract the relevant slice
         if (offset + size > allBytes.Length)
             throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
                 $"Deletion vector at {path} offset {offset} size {size} " +
                 $"exceeds file length {allBytes.Length}.");
 

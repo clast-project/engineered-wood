@@ -46,7 +46,7 @@ internal sealed class VortexZoneCursor
 /// Unit conversion for temporal columns (<see cref="Date32Type"/>,
 /// <see cref="Date64Type"/>, <see cref="Time32Type"/>, <see cref="Time64Type"/>,
 /// <see cref="TimestampType"/>) happens here so callers can build predicates
-/// against natural .NET types (<see cref="DateOnly"/>, <see cref="TimeOnly"/>,
+/// against natural .NET types (<c>DateOnly</c>, <c>TimeOnly</c>,
 /// <see cref="DateTimeOffset"/>) without knowing each column's storage unit.
 /// </remarks>
 internal sealed class VortexZoneStatsAccessor : IStatisticsAccessor<VortexZoneCursor>
@@ -320,7 +320,7 @@ internal sealed class VortexZoneStatsAccessor : IStatisticsAccessor<VortexZoneCu
     /// constructs a signed <see cref="BigInteger"/>. Apache.Arrow stores
     /// Decimal128/256 values at <c>Data.Buffers[1]</c>, byteWidth bytes per
     /// element, in native (little-endian) form — exactly what
-    /// <see cref="BigInteger(ReadOnlySpan{byte}, bool, bool)"/> consumes
+    /// <see cref="System.Numerics.BigInteger"/> consumes
     /// when <c>isUnsigned: false, isBigEndian: false</c>.
     /// </summary>
     private static BigInteger ReadDecimalBigInteger(

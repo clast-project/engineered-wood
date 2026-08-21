@@ -17,6 +17,7 @@
   <ItemGroup>
     <PackageReference Include="Clast.Alp" Version="0.2.0" />
     <PackageReference Include="Clast.BloomFilter" Version="0.2.0" />
+    <PackageReference Include="Clast.Fsst" Version="0.3.1" />
     <PackageReference Include="System.IO.Hashing" Version="9.*" />
     <!--
       Shredded VARIANT reassembly. Apache.Arrow's VariantArray is storage-level: on a shredded

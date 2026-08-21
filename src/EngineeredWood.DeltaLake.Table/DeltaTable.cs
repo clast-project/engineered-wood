@@ -6,6 +6,7 @@ using Apache.Arrow;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Checkpoint;
+using EngineeredWood.DeltaLake.Concurrency;
 using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
@@ -28,6 +29,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private readonly CheckpointReader _checkpointReader;
     private readonly CheckpointWriter _checkpointWriter;
     private readonly DeletionVectorReader _dvReader;
+
+    /// <summary>
+    /// The optimistic-concurrency commit loop, in the log layer. Every commit this table makes goes through
+    /// it; what stays up here is the part that needs a data plane — re-deriving version-coupled actions on
+    /// a rebase, and collecting the files a losing attempt left behind.
+    /// </summary>
+    private readonly LogCommitter _committer;
+
+    /// <summary>
+    /// The interval THIS table checkpoints at — its own <c>delta.checkpointInterval</c> where it declares
+    /// one, else the caller's option. Resolved once and held, because there are TWO independent checkpoint
+    /// triggers — the commit loop's <see cref="LogCommitOptions"/> and
+    /// <see cref="CheckpointIfDueAsync"/>, which every path that commits outside the committer calls — and
+    /// a value read separately in each is a value that can drift: fixing only one leaves the property
+    /// honoured on some write paths and ignored on others, which is harder to notice than ignoring it
+    /// everywhere.
+    /// </summary>
+    private readonly int _checkpointInterval;
+
     private Snapshot.Snapshot? _currentSnapshot;
     private bool _disposed;
 
@@ -42,8 +62,51 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
         _dvReader = new DeletionVectorReader(fileSystem);
-        _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions);
+        _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions)
+        {
+            Format = options.CheckpointFormat,
+        };
+        _checkpointInterval = ResolveCheckpointInterval(options, snapshot);
+        _committer = new LogCommitter(_log, new LogCommitOptions
+        {
+            CheckpointInterval = _checkpointInterval,
+            // Shared with CheckpointAsync and with CheckpointIfDueAsync, so every checkpoint this table
+            // writes — on the interval, from either commit trigger, or because a caller asked — uses the
+            // caller's parquet options and checkpoint format rather than the committer's defaults.
+            CheckpointWriter = _checkpointWriter,
+            PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
+        });
         _currentSnapshot = snapshot;
+    }
+
+    /// <summary>
+    /// The checkpoint interval this table actually commits at: its own <c>delta.checkpointInterval</c>
+    /// where it declares one, otherwise the caller's <see cref="DeltaTableOptions.CheckpointInterval"/>.
+    ///
+    /// <para>The property is part of the Delta spec and a table's own statement about how often it wants
+    /// checkpointing — a cost it pays per commit and a count another engine may be tuning deliberately.
+    /// Reading only the code-level option meant a table declaring 100 was still checkpointed every 10,
+    /// i.e. ten times the objects its owner asked for. The value is STORED by writers that accept the
+    /// property, so ignoring it is not neutral: it is honouring someone else's declaration incorrectly.</para>
+    ///
+    /// <para><b>⚠ A caller that DISABLED checkpointing keeps it disabled.</b> <c>CheckpointInterval = 0</c>
+    /// means "never checkpoint" and is an absolute caller override — a table property must not switch it
+    /// back on, or a host that deliberately owns checkpointing on its own schedule would start racing one
+    /// it did not ask for.</para>
+    ///
+    /// <para>Resolved once per open, from the snapshot the table was constructed with. A value changed by
+    /// a later <c>set_tblproperties</c> therefore takes effect on the next open, which is the same
+    /// granularity every other configuration read here has.</para>
+    /// </summary>
+    private static int ResolveCheckpointInterval(DeltaTableOptions options, Snapshot.Snapshot? snapshot)
+    {
+        // Checked BEFORE the property is read, not after: zero is the caller taking the decision, so there
+        // is nothing for the table to declare over.
+        if (options.CheckpointInterval <= 0)
+            return options.CheckpointInterval;
+
+        return Checkpoint.CheckpointIntervalProperty.TryGet(snapshot?.Metadata.Configuration)
+            ?? options.CheckpointInterval;
     }
 
     /// <summary>
@@ -95,7 +158,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
 
         if (latestVersion < 0)
-            throw new DeltaFormatException("No Delta table found (no commits in _delta_log/).");
+            throw new DeltaTableNotFoundException("No Delta table found (no commits in _delta_log/).");
 
         var checkpointReader = new CheckpointReader(fileSystem);
         var snapshot = await SnapshotBuilder.BuildAsync(
@@ -247,6 +310,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (clusteringColumns is { Count: > 0 } && partitionColumns is { Count: > 0 })
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.ClusteringWithPartitioning,
                 "Liquid clustering and partitioning are mutually exclusive — a partitioned table cannot "
                 + "declare clustering columns.");
         }
@@ -300,6 +364,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder);
         bool inCommitTimestampsEnabled = Log.InCommitTimestamp.IsEnabled(configurationBuilder);
         bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
+        bool v2CheckpointsEnabled = Checkpoint.CheckpointPolicy.WantsV2(configurationBuilder);
         var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
 
         if (mappingMode != ColumnMappingMode.None)
@@ -317,6 +382,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (maxId == 0)
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.InvalidPreAssignedSchema,
                         "preAssignedSchema declares no column-mapping field ids, but the table is being "
                         + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
                         + "writing the data files, or create without column mapping.");
@@ -457,6 +523,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             minWriterVersion = 7;
             writerFeatures.Add("changeDataFeed");
+        }
+
+        // V2 checkpoints — a READER+WRITER feature ('v2Checkpoint', reader 3 / writer 7), enabled by the
+        // delta.checkpointPolicy=v2 table property exactly as delta-spark does it. Both lists, because a
+        // UUID-named checkpoint is a form readers must understand as well as writers. Declaring it here is
+        // what makes the property mean anything: CheckpointWriter writes V2 only when the policy asks AND
+        // the feature permits, so a table created with the property but without the feature would quietly
+        // keep getting classic checkpoints. Nothing else about the table changes — a V2-checkpointed table
+        // is read and written normally, and the spec's one further obligation (no multi-part checkpoints)
+        // is already met, since this writer never produces them.
+        if (v2CheckpointsEnabled)
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
+            writerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
         }
 
         // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'icebergCompatV2'); readers see
@@ -628,9 +710,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // a second place for it to drift.
         return await provisionalTable.CollectOnFailureAsync(async written =>
         {
+            // Both gates guard a call to ComputeWriteActionsAsync below, which evaluates the
+            // constraints against initialBatches.
             if (previousSnapshot is not null)
-                provisionalTable.ValidateWritable(previousSnapshot, isAppend: false);
-            provisionalTable.ValidateWritable(provisionalSnapshot, isAppend: true);
+            {
+                provisionalTable.ValidateWritable(
+                    previousSnapshot, isAppend: false,
+                    handling: WriteTimeExpressionHandling.ValidatedHere);
+            }
+
+            provisionalTable.ValidateWritable(
+                provisionalSnapshot, isAppend: true,
+                handling: WriteTimeExpressionHandling.ValidatedHere);
             var (writeActions, _) = await provisionalTable.ComputeWriteActionsAsync(
                 provisionalSnapshot,
                 initialBatches,
@@ -794,6 +885,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (ColumnMapping.GetFieldId(field) is int id && id <= previousMaxId)
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.InvalidPreAssignedSchema,
                 $"preAssignedSchema reuses column-mapping id {id}; replacement ids must be greater "
                 + $"than the existing table's maxColumnId ({previousMaxId}).");
         }
@@ -984,7 +1076,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         StructType NewSchema);
 
     /// <summary>
-    /// The compute-only counterpart of <see cref="AddColumnAsync"/>: builds the metaData (+ protocol upgrade)
+    /// The compute-only counterpart of <see cref="AddColumnAsync(StructField, CancellationToken)"/>: builds the metaData (+ protocol upgrade)
     /// actions for appending a nullable column WITHOUT committing. For CHAINED adds in one transaction pass the
     /// previous change's <paramref name="baseMetadata"/> / <paramref name="baseProtocol"/> so the second column
     /// composes on the first's pending schema/protocol. Pure computation, no IO.
@@ -1338,7 +1430,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Replaces the table's schema wholesale with <paramref name="newSchema"/> as a metadata-only commit (a new
-    /// <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync"/> this can add,
+    /// <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync(StructField, CancellationToken)"/> this can add,
     /// drop, or retype columns — the "schema overwrite" primitive a CREATE OR REPLACE uses (adopt exactly the
     /// incoming schema). Callers align the data (typically a paired <c>Overwrite</c> write that removes the
     /// old-schema files). On a column-mapping table fresh field ids are assigned (continuing past the current
@@ -1548,7 +1640,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Adds a nullable field INSIDE a nested struct column as a metadata-only commit — the nested analog of
-    /// <see cref="AddColumnAsync"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
+    /// <see cref="AddColumnAsync(StructField, CancellationToken)"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
     /// column first, e.g. <c>["s", "inner"]</c> adds a member to <c>s.inner</c>); every segment must resolve to
     /// a STRUCT. Old files lack the member — the read path reconciles it to a typed NULL child. On a
     /// column-mapping table the new field is assigned a fresh column id + physical name RECURSIVELY (a
@@ -1745,6 +1837,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             snapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -1774,6 +1868,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (snapshot.Metadata.PartitionColumns.Count > 0)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ClusteringWithPartitioning,
                     "Liquid clustering and partitioning are mutually exclusive — a partitioned table "
                     + "cannot declare clustering columns.");
             }
@@ -1809,6 +1904,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
             .ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
         return newVersion;
     }
 
@@ -1833,6 +1930,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (field is null)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ColumnNotFound,
                     $"Clustering column '{clusteringColumns[i]}' is not a column of the table.");
             }
             string physical = ColumnMapping.GetPhysicalName(field, mode);
@@ -2079,6 +2177,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
 
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+
         return newVersion;
     }
 
@@ -2117,6 +2217,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _currentSnapshot = await SnapshotBuilder.UpdateAsync(
             CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -2166,6 +2268,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         if (bestVersion is null)
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.NoCommitAtTimestamp,
                 "No commit found at or before the specified timestamp. " +
                 "Ensure the table has in-commit timestamps enabled.");
 
@@ -2246,7 +2349,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// this call. If none of them invalidated its reads it commits (rebasing onto the newer version if
     /// necessary); otherwise it aborts with a <see cref="DeltaConflictException"/> — first committer
     /// wins. Use this when a write depends on a read that a concurrent writer could invalidate; the
-    /// auto-committing <see cref="DeleteAsync"/> / write methods are the single-shot equivalent.</para>
+    /// auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> / write methods are the single-shot equivalent.</para>
     /// </summary>
     public DeltaTransaction StartTransaction(
         IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
@@ -2354,14 +2457,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // or an UPDATE's copy-on-write rewrite is a fresh (post-image) add whose baseRowId CommitOccAsync
         // re-derives against the advanced high-water mark on rebase. Overwrite modes are not stageable on a
         // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
-        var reads = new Concurrency.ReadSet
+        var reads = new ReadSet
         {
             // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read
-            // (DeclareFilesRead). A NEW set when there are declared paths — never transaction.RemovedPaths
-            // itself, which is ALSO passed below as plannedRemovePaths and drives the delete/delete check.
-            // Adding a merely-read file to that object would make a concurrent delete of it report as
-            // ConcurrentDeleteDelete ("this transaction also removes it") for a file this transaction never
-            // removes, instead of the ConcurrentDeleteRead it is.
+            // (DeclareFilesRead). A NEW set when there are declared paths, so the union never mutates
+            // transaction.RemovedPaths — the transaction goes on using it, and a merely-read path added to
+            // it would be a file the transaction believes it removes.
             Files = UnionReadFiles(transaction),
             Predicates = transaction.ReadPredicates,
             // What the HOST declared it read (DeclareWholeTableRead), which the loop cannot infer — it never
@@ -2391,14 +2492,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return CommitOccAsync(
-            baseSnapshot, actions, reads, transaction.RemovedPaths,
+            baseSnapshot, actions, reads,
             transaction.IsolationLevel, transaction.EffectiveOperation, rebaseSafe: true,
             cancellationToken,
             rowLevelDeletes: transaction.DvEdits,
             appTransactions: required,
             // Keep recording through the commit: a rebase attempt writes deletion vectors of its own, and an
             // attempt that then loses the conflict check leaves them behind exactly as a staging call would.
-            written: transaction.Written);
+            written: transaction.Written,
+            // The host's claim, passed through verbatim. NOT derived from `reads` above: a transaction
+            // records the reads made THROUGH it, and a host that scanned the table itself and staged the
+            // result made one this library never saw.
+            isBlindAppend: transaction.EffectiveIsBlindAppend);
     }
 
     /// <summary>
@@ -2537,8 +2642,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// The read-set's file half: what the transaction rewrites, unioned with what its host declared it read.
     /// Returns the transaction's own removed-path set unchanged when nothing was declared — the common case,
-    /// and one copy fewer — and a fresh set otherwise, because that object is also the commit loop's
-    /// <c>plannedRemovePaths</c> and must keep meaning ONLY what this transaction removes.
+    /// and one copy fewer — and a fresh set otherwise, so the union is never written back into the
+    /// transaction's own state.
+    ///
+    /// <para>Sharing the object is safe now that the delete/delete check reads removed paths off the ACTIONS
+    /// rather than taking a parallel set: there is no longer a second parameter this one could contradict.</para>
     /// </summary>
     private static ISet<string> UnionReadFiles(DeltaTransaction transaction)
     {
@@ -2550,15 +2658,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return union;
     }
 
-    /// <summary>Shared by blind-append commits, which plan no removes.</summary>
-    private static readonly HashSet<string> NoRemovedPaths = new(StringComparer.Ordinal);
-
     /// <summary>
     /// The optimistic-concurrency commit loop shared by the transactional path, the auto-committing
-    /// <see cref="DeleteAsync"/>, and single-shot appends. Attempts the commit at the version after
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>, and single-shot appends. Attempts the commit at the version after
     /// <paramref name="baseSnapshot"/>; on a collision it reads the intervening commits, runs the
-    /// <see cref="Concurrency.ConflictChecker"/> against <paramref name="reads"/> /
-    /// <paramref name="plannedRemovePaths"/>, and either aborts (a real conflict) or — when
+    /// <see cref="ConflictChecker"/> against <paramref name="reads"/> and the removes it reads off
+    /// <paramref name="dataActions"/>, and either aborts (a real conflict) or — when
     /// <paramref name="rebaseSafe"/> — rebases onto the latest version and retries. A no-conflict rebase
     /// re-commits the staged actions verbatim, valid precisely because nothing the commit read or removed
     /// was touched.
@@ -2566,171 +2671,193 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para><paramref name="rebaseSafe"/> is <c>false</c> when the staged actions embed the attempted
     /// version — row tracking's <c>baseRowId</c> / <c>defaultRowCommitVersion</c> would be wrong after a
     /// rebase — so such a commit succeeds only uncontended and otherwise aborts rather than corrupt.</para>
+    ///
+    /// <para>The loop itself is <see cref="LogCommitter"/>, in the log layer. What stays here is what only
+    /// the table can supply: the two rebases that re-derive version-coupled actions
+    /// (<see cref="OccRebaseHandler"/>), the app-transaction preconditions, and the ledger of files a losing
+    /// attempt leaves behind.</para>
     /// </summary>
     internal async ValueTask<long> CommitOccAsync(
         Snapshot.Snapshot baseSnapshot,
         IReadOnlyList<DeltaAction> dataActions,
-        Concurrency.ReadSet reads,
-        ISet<string> plannedRemovePaths,
+        ReadSet reads,
         IsolationLevel isolationLevel,
         string operation,
         bool rebaseSafe,
         CancellationToken cancellationToken,
         IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
 
-        // Once against the base version, before anything is attempted: a precondition already false is worth
-        // reporting before writing files or burning an attempt.
-        if (appTransactions is { Count: > 0 })
-            ValidateAppTransactions(appTransactions, baseSnapshot, concurrent: null);
-
-        if (dataActions.Count == 0)
-            return baseSnapshot.Version; // nothing staged — no commit
-
-        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
-            _options.PreferTypedCheckpointStats);
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
 
-        // The actions actually written this attempt. Starts as the actions computed against the base
-        // snapshot; a rebase replaces it with actions computed against the latest snapshot — a row-level
-        // delete's deletion-vector-union/remap actions, and/or a re-derivation of row-tracking post-image ids.
-        // Always sourced from the original `dataActions` (or the row-level resolution of them), never from a
-        // prior rebase, so each retry rebases the STABLE staged work onto whatever the newest snapshot holds.
-        var currentActions = dataActions;
-        // The files the PREVIOUS retry's row-level resolution re-touched. Only the remap arm produces paths
-        // this delete's own edit list does not already name, so this is how those stay recognisable as ours
-        // one retry later — see CollectSupersededVectorsAsync.
-        ISet<string>? priorResolvedPaths = null;
+        var result = await _committer.CommitAsync(
+            new LogCommitRequest
+            {
+                BaseSnapshot = baseSnapshot,
+                Actions = dataActions,
+                Reads = reads,
+                Isolation = isolationLevel,
+                Operation = operation,
+                RebaseSafe = rebaseSafe,
+                // Only the version-coupled commits need one. A plain append or a metadata change means the
+                // same thing at whatever version it lands on, so it is re-committed verbatim.
+                Rebase = rowLevel || rowTrackingEnabled
+                    ? new OccRebaseHandler(this, rowLevelDeletes, rowTrackingEnabled, written)
+                    : null,
+                Precondition = appTransactions is { Count: > 0 }
+                    ? (snapshot, concurrent) =>
+                        ValidateAppTransactions(appTransactions, snapshot, concurrent)
+                    : null,
+                OnCommitDurable = written is null ? null : written.Clear,
+                IsBlindAppend = isBlindAppend,
+                // Checkpoint here too. This line used to be `false`, with a comment calling it "an
+                // accident of where the call happened to sit rather than a decision" — see #86.
+                //
+                // This loop carries the transaction commit, both DELETE paths (deletion-vector and
+                // copy-on-write), UpdateAsync, UpdateRowsAsync, and the blind append. Opting out here meant
+                // a table written through anything but a plain batch append never got a checkpoint, and so
+                // never published a `_last_checkpoint` either. Three consequences, compounding: every open
+                // replays the log from v0; foreign readers get no resume hint; and commits accumulate
+                // without bound, because log cleanup is defined in terms of what a checkpoint subsumes, so
+                // with no checkpoint nothing can ever be reclaimed.
+                //
+                // OPTIMIZE and the metadata-only changes do NOT come through here — they commit through
+                // TransactionLog directly and get the same interval check from CheckpointIfDueAsync.
+                //
+                // No new mechanism — the condition (interval reached, writer present) and the ordering
+                // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
+                // own, identical to the batch write path that already sets this. LogCommitRequest's default
+                // is already true; this stops opting out.
+                WriteCheckpointOnInterval = true,
+                // Incremental: this handle's snapshot is usually newer than the transaction's base, so
+                // refreshing from it replays fewer versions for the same result.
+                RefreshFrom = CurrentSnapshot,
+            },
+            cancellationToken).ConfigureAwait(false);
 
-        long attemptVersion = baseSnapshot.Version + 1;
-        const int maxAttempts = 100;
-        for (int attempt = 0; ; attempt++)
+        // Only on a real commit. An empty action list is a no-op that returns the BASE version, and
+        // assigning its snapshot would walk this handle backwards to a version it has already moved past.
+        if (result.Committed)
+            _currentSnapshot = result.Snapshot;
+        return result.Version;
+    }
+
+    /// <summary>
+    /// The table's half of the commit loop: re-derives the actions whose CONTENT is coupled to the version
+    /// they land at, on each collision, before the conflict checker delivers its verdict.
+    ///
+    /// <para>Two mechanisms, and a commit may need either or both:</para>
+    /// <list type="number">
+    /// <item><b>Row-level delete resolution</b> — rebase each staged delete's deletion vector onto the
+    /// file's current one (union the rows), or remap its rows by stable id onto the file a concurrent
+    /// rewrite produced. The paths it reconciles come back as
+    /// <see cref="CommitRebase.RowLevelResolvedPaths"/>, which is what stops the checker from judging them
+    /// again at file granularity.</item>
+    /// <item><b>Row-tracking id rebase</b> — re-derive post-image <c>baseRowId</c>s against the advanced
+    /// high-water mark, because a concurrent commit may have consumed the id range this one reserved.</item>
+    /// </list>
+    ///
+    /// <para>Stateful across retries by necessity: <see cref="_priorResolvedPaths"/> carries the files the
+    /// PREVIOUS resolution re-touched, which is the only way the next pass recognises a remap's vectors —
+    /// written onto a concurrent rewrite's output — as this operation's own.</para>
+    /// </summary>
+    private sealed class OccRebaseHandler : ICommitRebaseHandler
+    {
+        private readonly DeltaTable _table;
+        private readonly IReadOnlyList<DeleteDvEdit>? _rowLevelDeletes;
+        private readonly bool _rowTrackingEnabled;
+        private readonly WrittenFileLedger? _written;
+        private ISet<string>? _priorResolvedPaths;
+
+        public OccRebaseHandler(
+            DeltaTable table,
+            IReadOnlyList<DeleteDvEdit>? rowLevelDeletes,
+            bool rowTrackingEnabled,
+            WrittenFileLedger? written)
         {
-            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                currentActions, baseSnapshot.Metadata.Configuration, operation);
-            try
+            _table = table;
+            _rowLevelDeletes = rowLevelDeletes;
+            _rowTrackingEnabled = rowTrackingEnabled;
+            _written = written;
+        }
+
+        private bool RowLevel => _rowLevelDeletes is { Count: > 0 };
+
+        /// <summary>
+        /// Both mechanisms need the newest table STATE, not just its version: the union reads the
+        /// concurrent files' current deletion vectors, and the id rebase reads the advanced high-water mark.
+        /// </summary>
+        public bool NeedsLatestSnapshot => true;
+
+        public async ValueTask<CommitRebase> RebaseAsync(
+            CommitRebaseContext context, CancellationToken cancellationToken)
+        {
+            // Always from the ORIGINAL staged actions, never from a prior rebase, so each retry rebases the
+            // stable staged work onto whatever the newest snapshot holds.
+            var actions = context.StagedActions;
+            ISet<string>? resolvedPaths = null;
+
+            if (RowLevel)
             {
-                await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
-                    .ConfigureAwait(false);
+                // The vectors the LAST attempt named for the files this delete touches are about to be
+                // replaced by the resolution below, so this is the moment they become garbage — and the only
+                // moment anything knows it. Collect them now; a commit that eventually SUCCEEDS clears the
+                // ledger wholesale and would otherwise forget every losing attempt's.
+                await _table.CollectSupersededVectorsAsync(
+                    context.AttemptedActions, _rowLevelDeletes!, _priorResolvedPaths, _written,
+                    cancellationToken).ConfigureAwait(false);
 
-                // THE INSTANT the commit is durable, the files it names stop being this operation's to
-                // collect: they are the table's data, and a version that references them is readable by
-                // everyone. Cleared HERE rather than where the commit call returns, because what follows can
-                // still throw — the snapshot refresh reads the log, and a token cancelled between the two
-                // lines is enough. The caller would then see a failed commit, still holding a ledger naming
-                // LIVE files, and its cleanup would delete data a committed add points at.
-                written?.Clear();
-
-                _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-                    CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-                return attemptVersion;
-            }
-            catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
-            {
-                // Row-level DELETE/DELETE reconciliation needs the concurrent files' current deletion vectors,
-                // and a row-tracking rebase needs the advanced high-water mark, so both build the latest
-                // snapshot; a plain (non-tracking) append/update rebase only needs the version.
-                long latest;
-                Snapshot.Snapshot? latestSnapshot = null;
-                if (rowLevel || rowTrackingEnabled)
-                {
-                    latestSnapshot = await SnapshotBuilder.UpdateAsync(
-                        baseSnapshot, _log, cancellationToken).ConfigureAwait(false);
-                    latest = latestSnapshot.Version;
-                }
-                else
-                {
-                    latest = await _log.GetLatestVersionAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                var concurrent = new List<(long, IReadOnlyList<DeltaAction>)>();
-                for (long v = baseSnapshot.Version + 1; v <= latest; v++)
-                {
-                    concurrent.Add((v,
-                        await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false)));
-                }
-
-                // Row-level resolution runs BEFORE the checker so its verdict can ignore the reconciled
-                // files: rebase each staged delete's deletion vector onto the file's current one (union the
-                // rows). A null result is a genuine conflict — the same row was deleted concurrently, or the
-                // file was rewritten away (compaction/update, out of scope for pure DV resolution).
-                ISet<string>? resolvedPaths = null;
-                if (rowLevel)
-                {
-                    // The vectors `currentActions` names for the files this delete touches are about to be
-                    // replaced by the resolution below, so this is the moment they become garbage — and the
-                    // only moment anything knows it. Collect them now; a commit that eventually SUCCEEDS
-                    // clears the ledger wholesale and would otherwise forget every losing attempt's.
-                    await CollectSupersededVectorsAsync(
-                        currentActions, rowLevelDeletes!, priorResolvedPaths, written, cancellationToken)
-                        .ConfigureAwait(false);
-
-                    var resolution = await ResolveRowLevelDeletesAsync(
-                        baseSnapshot, latestSnapshot!, dataActions, rowLevelDeletes!, cancellationToken,
-                        written)
-                        .ConfigureAwait(false);
-                    if (resolution is null)
-                        throw new DeltaConflictException(
-                            "A concurrent commit deleted a row this delete also removed, or rewrote a file "
-                            + "it targeted such that a row cannot be remapped; the delete conflicts at row "
-                            + "level and must be retried.");
-
-                    currentActions = resolution.Value.Actions;
-                    resolvedPaths = resolution.Value.ResolvedPaths;
-                    // Carried to the NEXT retry: a remap writes vectors on files that are not in this delete's
-                    // own edit list (the concurrent rewrite's output), so without this the next supersede pass
-                    // would not recognise them as ours.
-                    priorResolvedPaths = resolvedPaths;
-
-                    // Under Serializable, commit order IS the logical order: a concurrent commit that CHANGED
-                    // DATA in a file this delete read may not be reconciled away, however disjoint the rows —
-                    // that is the interleaving the stricter level exists to forbid, and the level's own rule
-                    // (IsolationLevel) is that a dataChange=true remove of a file we read conflicts at BOTH
-                    // levels. So the reconciliation survives here only where the concurrent commit did not
-                    // change data: a compaction's dataChange=false rewrite rearranges bytes without changing
-                    // which rows the table contains, so remapping our rows onto the new file admits no
-                    // interleaving the level forbids. Dropping a path from the resolved set does not force a
-                    // conflict — it just restores the normal checks for it, so a delete whose files nobody
-                    // touched still rebases and lands.
-                    if (isolationLevel == IsolationLevel.Serializable)
-                        resolvedPaths = KeepOnlyDataPreservingResolutions(resolvedPaths, concurrent);
-                }
-                else
-                {
-                    currentActions = dataActions; // stable source; row-tracking ids re-derived below
-                }
-
-                // Before the conflict verdict: a violated precondition is not a conflict and must not be
-                // reported as one, whatever the checker would have said.
-                if (appTransactions is { Count: > 0 })
-                    ValidateAppTransactions(appTransactions, baseSnapshot, concurrent);
-
-                var verdict = Concurrency.ConflictChecker.Check(
-                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
-                if (verdict.HasConflict)
-                    throw new DeltaConflictException(verdict.Message!);
-
-                if (!rebaseSafe)
-                {
+                // A null result is a genuine conflict — the same row was deleted concurrently, or the file
+                // was rewritten away such that a row cannot be remapped.
+                var resolution = await _table.ResolveRowLevelDeletesAsync(
+                    context.BaseSnapshot, context.LatestSnapshot!, context.StagedActions,
+                    _rowLevelDeletes!, cancellationToken, _written).ConfigureAwait(false);
+                if (resolution is null)
                     throw new DeltaConflictException(
-                        "A concurrent commit landed and this operation cannot be safely rebased onto it; "
-                        + "retry the operation.");
-                }
+                        DeltaTableErrorCodes.RowLevelConflict,
+                        "A concurrent commit deleted a row this delete also removed, or rewrote a file "
+                        + "it targeted such that a row cannot be remapped; the delete conflicts at row "
+                        + "level and must be retried.");
 
-                // Re-derive row-tracking post-image ids against the snapshot we now land on (a concurrent
-                // commit may have consumed row-id space). No-op for the row-level delete's own re-adds — they
-                // keep their existing baseRowId (excluded by resolvedPaths / base-active membership).
-                if (rowTrackingEnabled)
-                    currentActions = RebaseRowTrackingAddIds(
-                        currentActions, baseSnapshot, latestSnapshot!, latest + 1, resolvedPaths);
+                actions = resolution.Value.Actions;
+                resolvedPaths = resolution.Value.ResolvedPaths;
+                // Carried to the NEXT retry: a remap writes vectors on files that are not in this delete's
+                // own edit list (the concurrent rewrite's output), so without this the next supersede pass
+                // would not recognise them as ours. Recorded BEFORE the isolation-level narrowing below —
+                // this is about provenance, not about what the checker is allowed to forgive.
+                _priorResolvedPaths = resolvedPaths;
 
-                attemptVersion = latest + 1; // no conflict — rebase and retry
+                // Under Serializable, commit order IS the logical order: a concurrent commit that CHANGED
+                // DATA in a file this delete read may not be reconciled away, however disjoint the rows —
+                // that is the interleaving the stricter level exists to forbid, and the level's own rule
+                // (IsolationLevel) is that a dataChange=true remove of a file we read conflicts at BOTH
+                // levels. So the reconciliation survives here only where the concurrent commit did not
+                // change data: a compaction's dataChange=false rewrite rearranges bytes without changing
+                // which rows the table contains, so remapping our rows onto the new file admits no
+                // interleaving the level forbids. Dropping a path from the resolved set does not force a
+                // conflict — it just restores the normal checks for it, so a delete whose files nobody
+                // touched still rebases and lands.
+                if (context.Isolation == IsolationLevel.Serializable)
+                    resolvedPaths = KeepOnlyDataPreservingResolutions(resolvedPaths, context.Concurrent);
             }
+
+            // Re-derive row-tracking post-image ids against the snapshot we now land on (a concurrent commit
+            // may have consumed row-id space). No-op for the row-level delete's own re-adds — they keep
+            // their existing baseRowId (excluded by resolvedPaths / base-active membership).
+            if (_rowTrackingEnabled)
+            {
+                actions = RebaseRowTrackingAddIds(
+                    actions, context.BaseSnapshot, context.LatestSnapshot!,
+                    context.NextAttemptVersion, resolvedPaths);
+            }
+
+            return new CommitRebase(actions, resolvedPaths);
         }
     }
 
@@ -3259,7 +3386,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
-    /// by the auto-committing <see cref="DeleteAsync"/> and the transactional <see cref="DeltaTransaction"/>
+    /// by the auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/>
     /// path.</summary>
     internal sealed record DeleteActions(
         IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted,
@@ -3496,7 +3623,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
-        ValidateWritable(snapshot, isAppend: false); // UPDATE is a data change
+        // UPDATE is a data change, and its post-image is re-validated below, so a constrained
+        // table is writable here rather than refused.
+        ValidateWritable(
+            snapshot, isAppend: false,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         // The rewrite's post-image files are written before the commit is attempted, and there is no
         // transaction here for a host to abort — so a conflict takes them back rather than orphaning them.
@@ -3514,9 +3645,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // rebase (a conflict on any file it rewrote aborts first, so the survivors' ids stay valid).
             long committed = await CommitOccAsync(
                 snapshot, plan.Actions,
-                new Concurrency.ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
-                plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
-                rebaseSafe: true, cancellationToken, written: written).ConfigureAwait(false);
+                new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
+                IsolationLevel.WriteSerializable, "UPDATE",
+                rebaseSafe: true, cancellationToken, written: written,
+                isBlindAppend: false).ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
         }, cancellationToken).ConfigureAwait(false);
@@ -3524,7 +3656,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
     /// count — everything a commit needs, without committing. Shared by the auto-committing
-    /// <see cref="UpdateAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
     internal sealed record UpdateActions(
         IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated, long NextRowId);
 
@@ -3553,6 +3685,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;
+
+        // Parsed once for the whole rewrite rather than per batch. Create refuses an expression
+        // this writer cannot read, which is what keeps the UPDATE fail-closed on a table whose
+        // constraint is outside the grammar.
+        var constraints = DeltaConstraintEnforcer.Create(snapshot);
+        var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
+
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
@@ -3642,6 +3781,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     var matchBatch = TakeRowsFromBatch(batch, matchRows);
                     var updatedBatch = updater(matchBatch);
+
+                    // Only the post-image. Rows the predicate did not match are copied through
+                    // untouched: they were already in the table, so re-checking them would refuse
+                    // an unrelated UPDATE over data another engine wrote under semantics we do not
+                    // share, and would be work with nothing to find.
+                    updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+                    constraints?.Validate(updatedBatch);
+
                     outputBatches.Add(updatedBatch);
                     // Matched rows keep their id; their commit version advances to this commit (they changed).
                     outTracking?.Add(batchIds is not null
@@ -3869,6 +4016,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return count;
     }
 
+    // The Hive-style directory a file with these partition values belongs under. Spelled per this table's
+    // configured PartitionPathSpelling, with the escape decision that Spark makes from Shell.WINDOWS taken
+    // from what THIS table's storage declares it cannot hold — see PartitionPathSpelling for why the
+    // storage rather than the writing process. Funnelled through one helper so the write paths cannot
+    // drift apart: two sites spelling one partition differently would scatter a partition across two
+    // directories, which readers tolerate but nobody wants to debug.
+    private string BuildPartitionPath(IReadOnlyDictionary<string, string> partitionValues) =>
+        DeltaPath.BuildPartitionPath(
+            partitionValues, _options.PartitionPathSpelling, _fs.PathConstraints);
+
     // The canonical identity of ONE partition (for dynamic partition overwrite set membership): the
     // sorted "key=value" pairs joined with U+0001, with every key translated to its PHYSICAL name when the
     // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
@@ -4032,7 +4189,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>, so a multi-statement transaction that captures its
     /// change rows eagerly (they are in hand at statement time) lands them in the SAME atomic version as its data
     /// files. <paramref name="changeType"/> must be one of <c>insert</c> / <c>delete</c> / <c>update_preimage</c> /
-    /// <c>update_postimage</c> (see <see cref="ChangeDataFeed.CdfConfig"/>); the <c>_change_type</c> column is
+    /// <c>update_postimage</c> (see <see cref="DeltaLake.ChangeDataFeed.CdfConfig"/>); the <c>_change_type</c> column is
     /// added for you. <paramref name="rows"/> carry the feed's user columns (a partitioned table's partition
     /// values ride on <paramref name="partitionValues"/>, physical-keyed like a data file). Requires the table to
     /// have Change Data Feed enabled — a CDC file on a non-CDF table would be dead weight no reader consults.
@@ -4090,6 +4247,44 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var logCompaction = new Log.LogCompaction(_fs, _log);
         await logCompaction.CompactRangeAsync(startVersion, endVersion, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes a checkpoint for the table's current version, now, whatever the interval would have said —
+    /// and publishes the <c>_last_checkpoint</c> hint that points readers at it.
+    ///
+    /// <para>Every commit path already checkpoints on
+    /// <see cref="DeltaTableOptions.CheckpointInterval"/>, so this is not needed to keep a table
+    /// checkpointed. It is for a host with a cadence of its own: one that sets
+    /// <c>CheckpointInterval = 0</c> to take the decision entirely, or that wants a checkpoint at a moment
+    /// it knows to be a good one — after a bulk load, before handing the table to another engine — rather
+    /// than at whichever commit happens to land on a multiple.</para>
+    ///
+    /// <para>The checkpoint is written under the table's own
+    /// <see cref="DeltaTableOptions.ParquetWriteOptions"/> and
+    /// <see cref="DeltaTableOptions.CheckpointFormat"/>, which is the reason for having this rather than
+    /// constructing a <see cref="Checkpoint.CheckpointWriter"/> at the call site: that duplicates the
+    /// table's configuration, and a copy of a policy is a copy that drifts.</para>
+    ///
+    /// <para>Writing a checkpoint is not free — it materialises the whole active-file set — and it is
+    /// idempotent in effect but not in cost, so calling it per commit is a way to pay for checkpointing
+    /// twice. Concurrent writers are safe: a classic checkpoint overwrites one fixed path with identical
+    /// content, and a V2 one is UUID-named, so neither can corrupt the other.</para>
+    ///
+    /// <para><b>⚠ This also runs log cleanup</b>, deleting commits the new checkpoint covers that are older
+    /// than the table's <c>delta.logRetentionDuration</c> — the same thing an automatic checkpoint does,
+    /// because it is the checkpoint that makes those files redundant and not the reason it was written.
+    /// A table that wants the checkpoint without the reclaim sets
+    /// <c>delta.enableExpiredLogCleanup = false</c>.</para>
+    /// </summary>
+    /// <returns>The version checkpointed.</returns>
+    public async ValueTask<long> CheckpointAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        var snapshot = CurrentSnapshot;
+        await WriteCheckpointAndCleanUpLogAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        return snapshot.Version;
     }
 
     /// <summary>
@@ -4475,7 +4670,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// writer features must be honored. Kept together so a transactional append/update/delete runs the same
     /// gate as its single-shot equivalent instead of skipping it.
     /// </summary>
-    internal void ValidateWritable(Snapshot.Snapshot snapshot, bool isAppend)
+    /// <param name="handling">
+    /// How this path accounts for the table's write-time expressions. Defaults to
+    /// <see cref="WriteTimeExpressionHandling.Refuse"/>, so a path that cannot see the rows keeps
+    /// refusing a table that declares any rather than committing it unchecked.
+    /// </param>
+    internal void ValidateWritable(
+        Snapshot.Snapshot snapshot,
+        bool isAppend,
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
     {
         ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
@@ -4484,7 +4687,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // row-tracking table missing them (spec-invalid) cannot materialize, so a rewrite is still refused.
         if (!isAppend)
             RejectRowTrackingWrite(snapshot);
-        HonorWriterFeatures(snapshot, isAppend);
+        HonorWriterFeatures(snapshot, isAppend, handling);
     }
 
     /// <summary>
@@ -4519,7 +4722,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// carry arbitrary SQL this writer cannot evaluate, so an ACTIVE one rejects the write. A table that merely
     /// LISTS these features in its writer-v7 protocol (the common case) is unaffected.
     /// </summary>
-    private static void HonorWriterFeatures(Snapshot.Snapshot snapshot, bool isAppend)
+    private static void HonorWriterFeatures(
+        Snapshot.Snapshot snapshot,
+        bool isAppend,
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
     {
         var cfg = snapshot.Metadata.Configuration;
         if (cfg is not null)
@@ -4528,28 +4734,47 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.CannotModifyAppendOnly,
                     "Table is append-only (delta.appendOnly=true): overwrite/delete/update are not permitted.");
             }
             foreach (var key in cfg.Keys)
             {
+                // Only refused when the caller is not going to check the rows. A path that hands
+                // us batches evaluates the constraint instead (DeltaConstraintEnforcer); a path
+                // that does not — the host-engine commit seam most of all — has nothing to check
+                // against, and refusing is the only honest answer. Enforcement is write-time
+                // only in Delta, so one unvalidated commit poisons the table for every reader
+                // after it.
+                if (handling != WriteTimeExpressionHandling.Refuse)
+                    break;
+
                 if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
                 {
                     throw new DeltaFormatException(
-                        $"Table declares CHECK constraint '{key}' which this writer cannot evaluate; write rejected.");
+                        DeltaTableErrorCodes.UnevaluableTableExpression,
+                        $"Table declares CHECK constraint '{key}' and this write path cannot evaluate it "
+                        + "against the rows; write rejected.");
                 }
             }
         }
         foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
-            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
+            if (handling == WriteTimeExpressionHandling.Refuse
+                && field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
             {
                 throw new DeltaFormatException(
-                    $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
+                    DeltaTableErrorCodes.UnevaluableTableExpression,
+                    $"Column '{field.Name}' declares an invariant expression and this write path cannot "
+                    + "evaluate it against the rows; write rejected.");
             }
-            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
+            if (handling == WriteTimeExpressionHandling.Refuse
+                && field.Metadata is not null
+                && field.Metadata.ContainsKey("delta.generationExpression"))
             {
                 throw new DeltaFormatException(
-                    $"Column '{field.Name}' declares a generation expression this writer cannot evaluate; write rejected.");
+                    DeltaTableErrorCodes.UnevaluableTableExpression,
+                    $"Column '{field.Name}' declares a generation expression and this write path cannot "
+                    + "compute it for the rows; write rejected.");
             }
         }
     }
@@ -4565,12 +4790,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>partitionBy</c>). The new data is Hive-split by the NEW columns. Ignored when equal to the current
     /// partitioning; empty list = departition.</para>
     /// </summary>
+    /// <param name="isBlindAppend">
+    /// The caller's claim about its own transaction, recorded verbatim in
+    /// <c>commitInfo.isBlindAppend</c> on a plain append; null (the default) writes no field. A host that
+    /// scanned this table and staged the result must pass <c>false</c>; only a host that genuinely read
+    /// nothing may pass <c>true</c>. See <see cref="DeltaTransaction.IsBlindAppend"/>, whose contract this
+    /// mirrors on the auto-committing surface, and the note in <c>CommitWriteAsync</c> for why the library
+    /// must not answer this itself.
+    /// </param>
     public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
-        IReadOnlyList<string>? repartitionTo = null)
-        => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo);
+        IReadOnlyList<string>? repartitionTo = null,
+        bool? isBlindAppend = null)
+        => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo,
+            isBlindAppend: isBlindAppend);
 
     /// <summary>
     /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
@@ -4606,12 +4841,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<string, string>? overwritePartitions,
         CancellationToken cancellationToken,
         bool dynamicPartitionOverwrite = false,
-        IReadOnlyList<string>? repartitionTo = null)
+        IReadOnlyList<string>? repartitionTo = null,
+        bool? isBlindAppend = null)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
-        ValidateWritable(snapshot, isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
+        // Declares rather than Create: the gate only needs to know a rule exists, and parsing it
+        // belongs where the rows are, in ComputeWriteActionsAsync below.
+        ValidateWritable(
+            snapshot,
+            isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
@@ -4625,7 +4866,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long newVersion = snapshot.Version + 1;
             return await CommitWriteAsync(
                 snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
-                cancellationToken, written).ConfigureAwait(false);
+                cancellationToken, written, isBlindAppend).ConfigureAwait(false);
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -4666,6 +4907,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
 
+        // Generated columns first, because a CHECK constraint may reference one: validating before
+        // the column exists would read a null the table never stores.
+        var generated = DeltaGeneratedColumns.Create(snapshot);
+        if (generated is not null)
+        {
+            var materialized = new List<RecordBatch>(batches.Count);
+            foreach (var batch in batches)
+                materialized.Add(generated.Apply(batch));
+
+            batches = materialized;
+        }
+
+        // Beside the other per-batch guard, and before anything is written: a constraint
+        // violation must leave the table untouched rather than half-written. Create parses, so an
+        // expression this writer cannot read refuses here exactly as it did before evaluation
+        // existed.
+        var enforcer = DeltaConstraintEnforcer.Create(snapshot);
+        if (enforcer is not null)
+        {
+            foreach (var batch in batches)
+                enforcer.Validate(batch);
+        }
+
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
         // keeps files that would no longer conform to the new partition schema).
@@ -4675,6 +4939,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (mode != DeltaWriteMode.Overwrite || overwritePartitions is { Count: > 0 } || dynamicPartitionOverwrite)
             {
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Repartitioning requires a FULL overwrite (the new partition schema is only valid when "
                     + "every active file is replaced in the same commit).");
             }
@@ -4683,6 +4948,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (!snapshot.Schema.Fields.Any(f => f.Name == col))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.ColumnNotFound,
                         $"Repartition: '{col}' is not a column of the table.");
                 }
             }
@@ -4692,6 +4958,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (dynamicPartitionOverwrite && snapshot.Metadata.PartitionColumns.Count == 0)
         {
             throw new DeltaFormatException(
+                DeltaTableErrorCodes.InvalidWriteMode,
                 "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
         }
 
@@ -4704,6 +4971,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (!snapshot.Metadata.PartitionColumns.Contains(key))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.InvalidPartitionColumn,
                         $"OverwritePartitions: '{key}' is not a partition column of the table " +
                         $"(partition columns: {string.Join(", ", snapshot.Metadata.PartitionColumns)}).");
                 }
@@ -4806,6 +5074,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (overwritePartitions is { Count: > 0 } && !PartitionValuesMatch(partValues, overwritePartitions))
                 {
                     throw new DeltaFormatException(
+                        DeltaTableErrorCodes.DataOutsideTargetPartitions,
                         "OverwritePartitions: input data falls outside the target partition(s) " +
                         $"({string.Join(", ", overwritePartitions.Select(kv => kv.Key + "=" + kv.Value))}).");
                 }
@@ -4855,7 +5124,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, logicalToPhysical));
 
                 // Build file path: partition subdirectory + UUID filename
-                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
+                string partDir = BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
                     ? $"{Guid.NewGuid():N}.parquet"
                     : $"{partDir}/{Guid.NewGuid():N}.parquet";
@@ -5002,22 +5271,58 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool dynamicPartitionOverwrite,
         long newVersion,
         CancellationToken cancellationToken,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool? isBlindAppend = null)
     {
         long committedVersion;
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)
         {
+            // The claim is the CALLER's, not ours. This branch used to
+            // hardcode `isBlindAppend: true`, reasoning that "a plain append takes its rows from the caller
+            // and reads no file of this table to decide what to write". That is true of what THIS library
+            // does and false of what the field means: Delta's `isBlindAppend` describes the TRANSACTION
+            // (`readPredicates.isEmpty && readFiles.isEmpty`), and a host with its own data plane that
+            // scanned the table and handed us the resulting rows has made a read we never saw.
+            // DeltaTransaction.IsBlindAppend says exactly this one file away — "This library cannot derive
+            // it for a host with its own data plane" — and WriteAsync IS that host-facing surface.
+            //
+            // MEASURED against fabricator: an autocommit `INSERT INTO t SELECT max(id)+1 FROM t` — the
+            // anti-join incremental shape, which reads the target and emits nothing but adds — arrives here
+            // as a plain Append and recorded `isBlindAppend: true`. That is the UNSAFE direction and the
+            // exact commit shape the interop tier singled out as the one the flag alone can tell apart:
+            // another engine then SKIPS the concurrentAppend check it owed. Null (absent) costs only
+            // spurious conflicts, which is what this recorded before the flag existed.
+            //
+            // And the claim governs the RETRY, not only the record. CommitOccAsync rebases a collision
+            // onto the newer version and re-commits the staged actions verbatim, "valid precisely
+            // because nothing the commit read or removed was touched" — a precondition a caller
+            // declaring `false` has just told us does not hold. Rebasing anyway would re-commit rows
+            // computed from a snapshot that moved: for `INSERT INTO t SELECT max(id) + 1 FROM t`, the
+            // old max, with no error raised. So a declared-false append is not rebase-safe, and a
+            // collision surfaces as RebaseUnsafe/Replan — recompute and try again — which is the same
+            // treatment the overwrite family below gets for the same reason.
+            //
+            // Null keeps the rebase. It means "the caller said nothing", not "the caller read
+            // something", and #125 chose to read absence permissively rather than make every silent
+            // caller pay conflicts.
+            //
+            // ReadSet.Blind stays as it is: with the rebase disabled, any collision aborts either way,
+            // so the read set no longer gates safety — and we know the caller read SOMETHING, not what,
+            // so claiming WholeTable would be inventing detail we do not have.
             committedVersion = await CommitOccAsync(
-                snapshot, actions, Concurrency.ReadSet.Blind, NoRemovedPaths,
-                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
-                cancellationToken, written: written).ConfigureAwait(false);
+                snapshot, actions, ReadSet.Blind,
+                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: isBlindAppend != false,
+                cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
         else
         {
             // Overwrite family: a single atomic attempt at the read version + 1 (unchanged behavior).
+            // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
+            // on files. Recording that is what lets another engine's checker examine it rather than fall
+            // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, snapshot.Metadata.Configuration, "WRITE");
+                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false);
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
@@ -5031,15 +5336,70 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Auto-checkpoint on the version that actually committed (a rebased append may differ from the
         // read version + 1). Skipped when nothing was staged (an all-empty append returns the read
         // version without committing).
-        if (committedVersion > snapshot.Version &&
-            _options.CheckpointInterval > 0 &&
-            committedVersion % _options.CheckpointInterval == 0)
-        {
-            await _checkpointWriter.WriteCheckpointAsync(
-                CurrentSnapshot, cancellationToken).ConfigureAwait(false);
-        }
+        //
+        // The OVERWRITE family only: a blind append goes through the OCC loop above, which checkpoints on
+        // the interval itself. Running both would write the interval's checkpoint TWICE — harmless
+        // duplicated work under the classic form, which overwrites one fixed path, but a V2 checkpoint is
+        // UUID-named, so the second write leaves the first behind as a file nothing references and nothing
+        // collects (VacuumExecutor excludes _delta_log).
+        if (!blindAppend && committedVersion > snapshot.Version)
+            await CheckpointIfDueAsync(committedVersion, cancellationToken).ConfigureAwait(false);
 
         return committedVersion;
+    }
+
+    /// <summary>
+    /// Writes the interval checkpoint for a version that has just committed, if that version is one the
+    /// interval falls on. The commit paths that do NOT go through <see cref="LogCommitter"/> — the
+    /// overwrite family, OPTIMIZE, and the metadata-only changes — each call this; the ones that do get
+    /// the same check from the committer instead, and must not call it as well.
+    /// </summary>
+    /// <remarks>
+    /// <para>Call only AFTER the post-commit snapshot refresh: the checkpoint is written from
+    /// <see cref="CurrentSnapshot"/>, and is named for the version that snapshot is at. Under a concurrent
+    /// writer that can be a LATER version than <paramref name="committedVersion"/> — which is fine, since
+    /// what gets written is a real checkpoint of a real version either way, and it is the behaviour the
+    /// batch write path has always had.</para>
+    ///
+    /// <para><c>CheckpointInterval = 0</c> is "never checkpoint", an absolute caller override — a host may
+    /// be driving checkpoints on a cadence of its own and must not have one appear underneath it.</para>
+    /// </remarks>
+    private ValueTask CheckpointIfDueAsync(long committedVersion, CancellationToken cancellationToken)
+    {
+        if (_checkpointInterval <= 0
+            || committedVersion % _checkpointInterval != 0)
+        {
+            return default;
+        }
+
+        return WriteCheckpointAndCleanUpLogAsync(CurrentSnapshot, cancellationToken);
+    }
+
+    /// <summary>
+    /// Writes a checkpoint and then reclaims what it made redundant. The single place a checkpoint is
+    /// written from this layer, so the two cannot come apart.
+    /// </summary>
+    /// <remarks>
+    /// <para>The pairing is the point. Log cleanup deletes only what a checkpoint covers, so a checkpoint
+    /// becoming durable is the one moment the work is both legitimate and worth doing — which means every
+    /// checkpoint trigger owes a cleanup, and a trigger that writes one without the other quietly stops
+    /// reclaiming on whichever commit paths reach it. There are two triggers left in this class
+    /// (<see cref="CheckpointIfDueAsync"/> and <see cref="CheckpointAsync"/>) and one in
+    /// <see cref="LogCommitter"/>; that is three chances to wire a checkpoint and forget the cleanup, and
+    /// it has already happened once — the interval itself drifted the same way twice, which is why the
+    /// tests assert cleanup per trigger rather than once.</para>
+    ///
+    /// <para>Ordering: the checkpoint must be DURABLE before anything is deleted, or a failure between the
+    /// two leaves commits removed with nothing covering them.</para>
+    /// </remarks>
+    private async ValueTask WriteCheckpointAndCleanUpLogAsync(
+        Snapshot.Snapshot snapshot, CancellationToken cancellationToken)
+    {
+        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
+
+        await Log.LogCleanup.RunAsync(
+            _log, snapshot.Metadata.Configuration, snapshot.Version,
+            DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
     }
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────
@@ -5078,19 +5438,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// processing). A caller checks this BEFORE writing files externally so it can fall back to the batch path
     /// without leaving an orphan. (Partitioning is a separate check — inspect
     /// <c>CurrentSnapshot.Metadata.PartitionColumns</c>.)
+    ///
+    /// <para>A table declaring CHECK constraints, invariants or generated columns also reports false, because
+    /// this seam is handed finished files and has no rows to check them against. Such a table is still
+    /// committable, but only by a caller willing to say it enforced them itself —
+    /// <c>constraintsEnforcedByCaller</c> on <see cref="CommitDataFilesAsync"/>. The property answers the
+    /// unqualified question, since a caller that acts on it before writing files is exactly the caller a
+    /// half-true answer would leave holding orphans.</para>
     /// </summary>
-    public bool SupportsExternalDataFileCommit
+    public bool SupportsExternalDataFileCommit =>
+        !RequiresOwnWriterForPerRowProcessing && !WriteTimeExpressions.Declares(CurrentSnapshot);
+
+    /// <summary>
+    /// Whether the table needs engineered-wood's own writer for per-row work an outside writer cannot do.
+    /// </summary>
+    /// <remarks>
+    /// Narrower than <see cref="SupportsExternalDataFileCommit"/> on purpose: identity values and IcebergCompat
+    /// cannot be supplied by a caller's assertion, while constraint enforcement can.
+    /// </remarks>
+    private bool RequiresOwnWriterForPerRowProcessing
     {
         get
         {
             if (IsIcebergCompat)
-                return false;
+                return true;
             foreach (var f in CurrentSnapshot.Schema.Fields)
             {
                 if (IdentityColumn.GetConfig(f) is not null)
-                    return false;
+                    return true;
             }
-            return true;
+            return false;
         }
     }
 
@@ -5404,7 +5781,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
+                string partDir = BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
                     ? $"{Guid.NewGuid():N}.parquet"
                     : $"{partDir}/{Guid.NewGuid():N}.parquet";
@@ -5530,11 +5907,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// file, and <paramref name="dynamicPartitionOverwrite"/> removes only the active files in partitions the
     /// written files touch. Row-tracking <c>baseRowId</c> / <c>defaultRowCommitVersion</c> + the high-water-mark
     /// domain are assigned here.
+    ///
+    /// <para>A call that would commit NOTHING — no files, no <paramref name="extraActions"/>, and no removes
+    /// to derive — commits nothing and returns the current version rather than minting an empty one. Same
+    /// rule as every other commit path here.</para>
     /// </summary>
+    /// <returns>The version the commit landed at, which after rebasing past a concurrent commit is not
+    /// necessarily the read version + 1.</returns>
     /// <param name="expectedVersion">When set, the commit ABORTS (first-committer-wins) if the table has moved off
     /// this version — the caller's snapshot-coupled <paramref name="extraActions"/> (deletion-vector ordinals /
     /// positions computed against it) would be invalidated by a concurrent commit. When null, an append rebases
     /// past a non-conflicting concurrent commit (bounded retry), reusing the already-written files as-is.</param>
+    /// <param name="constraintsEnforcedByCaller">
+    /// Declares that the caller has already enforced the table's CHECK constraints, invariants and generated
+    /// columns over the rows in <paramref name="files"/>. This seam is handed finished files, so nothing here
+    /// can check them — the flag is an assertion, and a false one commits rows every later reader will trust,
+    /// which is why it is spelled as a claim rather than as a way to skip validation. Left false, a table
+    /// declaring any of those is refused, and <see cref="SupportsExternalDataFileCommit"/> reports false for it.
+    /// </param>
     /// <param name="dataChange">False for a REWRITE commit (compaction / clustering OPTIMIZE): removes and adds
     /// carry <c>dataChange=false</c> — CDF readers exclude the commit, concurrent readers' dataChange checks
     /// ignore it, and (per the spec) it is legal on an <c>appendOnly</c> table.</param>
@@ -5554,7 +5944,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool identityValuesPreGenerated = false,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
         bool dataChange = true,
-        string? clusteringProvider = null)
+        string? clusteringProvider = null,
+        bool? isBlindAppend = null,
+        bool constraintsEnforcedByCaller = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -5564,15 +5956,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // ROWS, not reorganizing files.
         bool appendShaped = (mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
                              extraActions is not { Count: > 0 }) || !dataChange;
-        HonorWriterFeatures(CurrentSnapshot, appendShaped);
+        // This seam receives finished files, so there are no rows to check. The caller can still
+        // commit a constrained table by declaring it enforced the rules itself — an assertion,
+        // deliberately spelled as one, because nothing here can verify it and a wrong claim
+        // poisons the table for every later reader.
+        HonorWriterFeatures(
+            CurrentSnapshot,
+            appendShaped,
+            constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
 
         if (dynamicPartitionOverwrite)
         {
             if (mode != DeltaWriteMode.Append)
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Dynamic partition overwrite is append-shaped (a full Overwrite already removes everything).");
             if (CurrentSnapshot.Metadata.PartitionColumns.Count == 0)
                 throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidWriteMode,
                     "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
         }
 
@@ -5581,7 +5984,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // being committed — a deletion-vector-only or metadata-only fused flush (extraActions, no files) involves
         // no write-time processing.
         var cfg = CurrentSnapshot.Metadata.Configuration;
-        if (files.Count > 0 && !SupportsExternalDataFileCommit
+        if (files.Count > 0 && RequiresOwnWriterForPerRowProcessing
             && !(identityValuesPreGenerated && !IsIcebergCompat))
             throw new NotSupportedException(
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
@@ -5589,19 +5992,61 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg);
 
-        for (int attempt = 1; ; attempt++)
+        // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
+        // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —
+        // conflict-ABORT instead of the append retry (first-committer-wins snapshot isolation).
+        if (expectedVersion is { } expected && CurrentSnapshot.Version != expected)
         {
-            var snapshot = CurrentSnapshot;
-            // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
-            // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —
-            // conflict-ABORT instead of the append retry (first-committer-wins snapshot isolation).
-            if (expectedVersion is { } expected && snapshot.Version != expected)
+            throw new DeltaConflictException(
+                DeltaTableErrorCodes.StaleTransactionSnapshot,
+                $"Transaction conflict: the table moved from version {expected} to {CurrentSnapshot.Version} "
+                + "while the transaction was open — the buffered changes were rolled back; retry the "
+                + "transaction.");
+        }
+
+        var baseSnapshot = CurrentSnapshot;
+        var result = await _committer.CommitAsync(
+            new LogCommitRequest
             {
-                throw new DeltaConflictException(
-                    $"Transaction conflict: the table moved from version {expected} to {snapshot.Version} "
-                    + "while the transaction was open — the buffered changes were rolled back; retry the "
-                    + "transaction.");
-            }
+                BaseSnapshot = baseSnapshot,
+                Actions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false),
+                Operation = operation,
+                // The actions are a FUNCTION of the snapshot — an Overwrite's removes name its active set,
+                // and a row-tracking baseRowId is drawn from its high-water mark — so a collision re-derives
+                // them against the version that landed instead of re-committing a stale set. The data files
+                // themselves are reused as-is: they were written before any of this and are still fine.
+                Rebase = new RecomputeRebaseHandler(BuildActionsAsync),
+                // A snapshot-coupled commit gets ONE attempt: its extraActions were computed against
+                // expectedVersion, so there is no version but that one they are correct at. The collision
+                // then propagates unexamined, which is the answer the caller is waiting for.
+                MaxAttempts = expectedVersion is null ? 16 : 1,
+                // Reads nothing and (as far as the checker is concerned) removes nothing: the recompute above
+                // re-derives the Overwrite removes from the newest active set, so there is no stale remove
+                // for the delete/delete rule to catch. What the checker DOES contribute here is the
+                // metadata/protocol rule — this path used to retry straight through a concurrent schema
+                // change and commit files against a schema that had moved, while the Arrow append path
+                // (CommitWriteAsync, same blind read-set) aborted. They now agree.
+                //
+                // NOTE: if a host turns out to depend on the old permissiveness — a producer appending
+                // through this while another process edits table properties will now see conflicts it did
+                // not before — the fix is a public opt-out on the request rather than a quiet revert here.
+                // That reopens a real hole, so it should be asked for rather than offered.
+                Reads = ReadSet.Blind,
+                // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
+                // Reads above: that is hardcoded Blind here because this method has no way to know, which
+                // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
+                IsBlindAppend = isBlindAppend,
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        _currentSnapshot = result.Snapshot;
+        return result.Version;
+
+        // The commit's actions, derived from whichever version they are about to land on. Called once up
+        // front and again per collision — see RecomputeRebaseHandler for what that demands of it.
+        async ValueTask<IReadOnlyList<DeltaAction>> BuildActionsAsync(
+            Snapshot.Snapshot snapshot, CancellationToken ct)
+        {
             var actions = new List<DeltaAction>();
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -5671,8 +6116,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     && deletedPositions.Count > 0)
                 {
                     var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
-                    dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count,
-                        cancellationToken).ConfigureAwait(false);
+                    dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count, ct)
+                        .ConfigureAwait(false);
                     stats = StatsWithLooseBounds(stats);
                 }
                 long fileBaseRowId = nextRowId;
@@ -5706,23 +6151,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (extraActions is { Count: > 0 })
                 actions.AddRange(extraActions);
 
-            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(actions, cfg, operation);
-            try
-            {
-                await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
-            }
-            catch (DeltaConflictException) when (attempt < 16 && expectedVersion is null)
-            {
-                // A concurrent writer took our version — refresh the snapshot (recomputes the Overwrite removes +
-                // the row-tracking high-water mark) and retry. The already-written data files are reused as-is.
-                _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
-            if (_options.CheckpointInterval > 0 && newVersion % _options.CheckpointInterval == 0)
-                await _checkpointWriter.WriteCheckpointAsync(_currentSnapshot, cancellationToken).ConfigureAwait(false);
-            return newVersion;
+            return actions;
         }
     }
 
@@ -5873,7 +6302,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Mirrors CommitDataFilesAsync' gate exactly: identity columns need write-time per-row processing an
         // outside writer did not do, UNLESS the caller generated the values itself (GenerateIdentityValues) —
         // which is what makes an identity table's appends stageable at all. IcebergCompat has no such escape.
-        if (files.Count > 0 && !SupportsExternalDataFileCommit
+        if (files.Count > 0 && RequiresOwnWriterForPerRowProcessing
             && !(identityValuesPreGenerated && !IsIcebergCompat))
         {
             throw new NotSupportedException(
@@ -6376,9 +6805,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         long version = await CommitOccAsync(
             snapshot, actions,
-            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
-            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written).ConfigureAwait(false);
+            rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
+            isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -6532,9 +6962,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // single-attempt (rebaseSafe:false) as the overwrite family does.
         long version = await CommitOccAsync(
             snapshot, actions,
-            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
         return (totalDeleted, version);
     }
@@ -6982,9 +7412,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         return await CommitOccAsync(
             snapshot, actions,
-            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            new ReadSet { Files = removedPaths },
             IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
-            written: written)
+            written: written, isBlindAppend: false)
             .ConfigureAwait(false);
     }
 
@@ -7179,11 +7609,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (!MetadataEquals(from.Metadata, to.Metadata))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.MetadataChanged,
                 "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
         }
         if (!ProtocolEquals(from.Protocol, to.Protocol))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.ProtocolChanged,
                 "concurrent protocol change — cannot rebase the transaction");
         }
 
@@ -7220,6 +7652,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (!rowTrackingEnabled)
             {
                 throw new DeltaConflictException(
+                    DeltaTableErrorCodes.RowLevelConflict,
                     $"concurrent rewrite/compaction of file '{kvp.Key}' this transaction modifies — cannot "
                     + "rebase the buffered transaction (row tracking is disabled, so its rows cannot be "
                     + "remapped by stable id); retry it");
@@ -7262,6 +7695,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     if (overlap > 0)
                     {
                         throw new DeltaConflictException(
+                            DeltaTableErrorCodes.RowLevelConflict,
                             $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
                             + "deletes/updates were concurrently deleted or updated — retry the transaction");
                     }
@@ -7325,6 +7759,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (remapped is null)
             {
                 throw new DeltaConflictException(
+                    DeltaTableErrorCodes.RowLevelConflict,
                     "row-level conflict remapping across a concurrent rewrite/compaction: a row this "
                     + "transaction deletes/updates was concurrently deleted or updated, or its stable id could "
                     + "not be resolved — retry the transaction");
@@ -7366,11 +7801,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (!MetadataEquals(baseSnapshot.Metadata, latest.Metadata))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.MetadataChanged,
                 "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
         }
         if (!ProtocolEquals(baseSnapshot.Protocol, latest.Protocol))
         {
             throw new DeltaConflictException(
+                DeltaErrorCodes.ProtocolChanged,
                 "concurrent protocol change — cannot rebase the transaction");
         }
         // delete/delete: every file the transaction removes (DV remove+add pairs, rewrites) must still be active
@@ -7394,6 +7831,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 || !Equals(current.DeletionVector, remove.DeletionVector))
             {
                 throw new DeltaConflictException(
+                    DeltaErrorCodes.ConcurrentDeleteDelete,
                     $"concurrent delete/rewrite of file '{remove.Path}' this transaction also modifies — "
                     + "cannot rebase the transaction");
             }
@@ -7429,18 +7867,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             baseByPath[f.Path] = f;
         }
+        // A property of THIS transaction, so it is computed once rather than per concurrent commit.
+        bool currentChangesMetadata = Concurrency.ConflictChecker.ChangesMetadata(plannedActions);
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-            bool blindAppend = true;
-            foreach (var a in commitActions)
-            {
-                if (a is RemoveFile or MetadataAction or ProtocolAction)
-                {
-                    blindAppend = false;
-                    break;
-                }
-            }
+
+            // ONE rule, shared with ConflictChecker. This used to be a second copy — starting `true` and
+            // clearing on remove/metaData/protocol — which differed from the checker's in requiring no
+            // add, so an add-less commit was blind here and not there. That disagreement was inert while
+            // both only gated an AddFile branch an add-less commit never reaches; it stopped being inert
+            // the moment the checker learned to believe a declared commitInfo.isBlindAppend and this did
+            // not, because then a Spark commit declaring FALSE on an adds-only commit was correctly
+            // examined by one path and wrongly exempted by the other — which is the whole defect, alive
+            // on the buffered-transaction rebase instead of on the OCC loop.
+            //
+            // The GATE is shared for the same reason, not just the rule it consumes. Sharing only
+            // IsBlindAppend would have left this path deciding for itself what to do with the answer,
+            // which is how the divergence above became live — one call site learning something the other
+            // did not. ExamineConcurrentAdds is the whole decision, third term included.
+            bool examineAdds = Concurrency.ConflictChecker.ExamineConcurrentAdds(
+                serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable,
+                Concurrency.ConflictChecker.IsBlindAppend(commitActions),
+                currentChangesMetadata);
             foreach (var a in commitActions)
             {
                 switch (a)
@@ -7451,16 +7900,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         if (baseByPath.TryGetValue(removed.Path, out var readFile) && ReadsMatch(readFile))
                         {
                             throw new DeltaConflictException(
+                                DeltaErrorCodes.ConcurrentDeleteRead,
                                 $"concurrent delete/rewrite of file '{removed.Path}' this transaction read "
                                 + $"(commit v{v}) — cannot rebase the transaction");
                         }
                         break;
-                    case AddFile added when added.DataChange && (!blindAppend || serializable):
+                    case AddFile added when added.DataChange && examineAdds:
                         // concurrentAppendCheck: rows appeared that the transaction's reads would have consumed.
-                        // Blind appends are exempt under WriteSerializable; under Serializable they conflict.
+                        // Blind appends are exempt under WriteSerializable; under Serializable they conflict,
+                        // and so do they when THIS transaction changes the metadata.
                         if (ReadsMatch(added))
                         {
                             throw new DeltaConflictException(
+                                DeltaErrorCodes.ConcurrentAppend,
                                 $"concurrent append of file '{added.Path}' matching this transaction's reads "
                                 + $"(commit v{v}) — cannot rebase the transaction");
                         }
@@ -7518,7 +7970,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> WriteAsync(
         IAsyncEnumerable<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool? isBlindAppend = null)
     {
         var batchList = new List<RecordBatch>();
         await foreach (var batch in batches.WithCancellation(cancellationToken)
@@ -7526,7 +7979,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             batchList.Add(batch);
         }
-        return await WriteAsync(batchList, mode, cancellationToken).ConfigureAwait(false);
+        return await WriteAsync(batchList, mode, cancellationToken, isBlindAppend: isBlindAppend)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -7556,6 +8010,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             _currentSnapshot = await SnapshotBuilder.UpdateAsync(
                 CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+            // OPTIMIZE is the operation with the most reason to checkpoint: it removes every file it
+            // rewrote, so the commit it writes is the largest the table produces, and a log replay that
+            // cannot start from a checkpoint reads all of it.
+            await CheckpointIfDueAsync(result.Value, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
@@ -7586,7 +8045,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             ?? _options.VacuumRetention;
 
         return await Vacuum.VacuumExecutor.ExecuteAsync(
-            _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
+            _fs, _log, CurrentSnapshot, retention, dryRun,
+            _options.HideIcebergMetadataDirectory, cancellationToken)
             .ConfigureAwait(false);
     }
 

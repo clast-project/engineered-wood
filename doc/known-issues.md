@@ -410,9 +410,55 @@ table's own column is refused rather than shadowed. Background:
 (`CheckpointReader.cs`); write always emits a single
 `.checkpoint.parquet` (`CheckpointWriter.cs`), regardless of table size.
 
+**delta-rs materializes no data from a `v2Checkpoint` table.** Not an EW
+gap, but a consequence of setting `delta.checkpointPolicy=v2` worth
+knowing. deltalake 1.6.2 *reconstructs* such a table correctly — its Rust
+engine is delta-kernel-rs, which reads both V2 bodies and their sidecars,
+so `version()`, `file_uris()` and `get_add_actions()` all work from the
+checkpoint alone (measured against an EW-written and a delta-spark-written
+checkpoint, every commit hidden). What refuses is materializing rows:
+
+- `to_pyarrow_dataset` / `to_pandas` check `SUPPORTED_READER_FEATURES` in
+  deltalake's **Python** layer, which as of 1.6.2 is
+  `{timestampNtz, variantType, variantType-preview}` — it excludes
+  `deletionVectors` and `columnMapping` too, so it is a legacy-path
+  allowlist, not an engine capability.
+- The DataFusion `QueryBuilder` path fails separately in Rust with
+  "Unsupported table features required: [V2Checkpoint]".
+
+Measured 2026-08-08.
+`DeltaRsInteropTests.EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone`
+asserts the reconstruction and pins the materialization refusal, so
+widening either list is what makes it fail.
+
+**delta-kernel-rs is stricter than the spec about V1 checkpoints.** It
+carries `"Kernel does not support writing V1 checkpoints when the table
+supports v2Checkpoint"`, whereas PROTOCOL.md allows a `v2Checkpoint` table
+to use "classic checkpoints which can follow V1 or V2 spec". Observed in
+the delta-kernel-rs build bundled with deltalake 1.6.2.
+
+EW's default (`CheckpointFormat.Automatic`) follows the spec and
+delta-spark — feature enabled but `delta.checkpointPolicy` not `v2` gets a
+classic V1 checkpoint. Kernel READS that without complaint; its
+restriction is on writing, so this is not a compatibility gap.
+`CheckpointFormat.V2WhenSupported` adopts kernel's rule for hosts that
+want it. It is opt-in rather than the default because the trade runs both
+ways: it makes EW disagree with delta-spark on a table both maintain, and
+it overrides an explicit `delta.checkpointPolicy=classic`.
+
+**`_last_checkpoint` `checksum` is not written.** The spec's optional MD5
+over a canonicalized form of the file. Readers "are encouraged to
+validate the checksum, if present", and a wrong one is worse than an
+absent one — a reader that validates would reject a good hint — so it is
+omitted rather than approximated. delta-spark writes it.
+
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
-checksum, sidecar counts) are ignored. Missing validation.
+`checkpointSchema`, `checksum`, `v2Checkpoint.nonFileActions`,
+`v2Checkpoint.sidecarFiles`) are ignored. delta-spark writes all of them,
+and the last two exist precisely so a reader need not open the checkpoint
+at all — so this is left performance and validation on the table, not a
+correctness gap. Measured against delta-spark 4.0.0, 2026-08-08.
 
 **Absolute-path deletion vectors (storage type `p`).**
 `DeletionVectorWriter` emits only inline (`i`) and UUID-relative (`u`)
@@ -450,14 +496,35 @@ is deliberately deferred; refusing is the cheap, safe interim. `Millisecond`
 already round-trips exactly and is unaffected.
 
 The underlying cause was a **Parquet-writer** bug rather than a Delta one, and
-is now fixed there too: `ArrowToSchemaConverter.MapTimeUnit` fell through to
-MICROS for any unmapped unit, relabelling values instead of rescaling them. It
-throws instead, which covers nested columns for free since `MapArrowType` is
-reached per leaf while building the schema tree. That also closed a second,
-worse case — `Time32(Second)` was written as INT32 annotated TIME(MICROS), an
-illegal pairing (micros requires INT64) whose file could not be read back at
-all. `Timestamp(Nanosecond)` stays valid at the Parquet level; NANOS is a real
-Parquet unit, and only Delta cannot carry it.
+that layer is now fully fixed. `ArrowToSchemaConverter.MapTimeUnit` first fell
+through to MICROS for any unmapped unit, relabelling values instead of rescaling
+them; it then threw instead, which was honest but left a whole Arrow type
+unwritable. `TimeUnitRescaler` now multiplies a second-precision column into
+milliseconds before any schema is derived from it, so the Parquet writer accepts
+all four Arrow units and preserves every instant exactly. Only a value too large
+to fit milliseconds is still refused, which is what PyArrow does with the same
+input. That also closed a second, worse case — `Time32(Second)` was written as
+INT32 annotated TIME(MICROS), an illegal pairing (micros requires INT64) whose
+file could not be read back at all. `Timestamp(Nanosecond)` stays valid at the
+Parquet level; NANOS is a real Parquet unit, and only Delta cannot carry it.
+
+The Delta layer above still refuses both units, and the TODO above still stands
+for it.
+
+**Second precision does not survive a Parquet round trip, by design.** A column
+written as `timestamp[s]` reads back as `timestamp[ms]`. The unit is recorded in
+the `ARROW:schema` footer entry EngineeredWood now writes, but the reader
+deliberately does not restore it, because PyArrow — which defines that
+convention — does not either: measured, it reads its own `timestamp[s]` column
+back as `timestamp[ms]` while restoring `tz=America/New_York` faithfully.
+EngineeredWood restores the zone and leaves the unit, so it behaves the same way.
+
+The reader also declines to restore a **fixed-size list's width** from
+`ARROW:schema`, though PyArrow does. The width is not verifiable against the
+data, and PyArrow's attempt to rebuild it is a live source of read failures on
+files whose lists are not uniform — reproduced as `Expected all lists to be of
+size=2 but index 1 had size=0` on PyArrow's own output. A fixed-size list
+therefore reads back as an ordinary list, which is what DuckDB also returns.
 
 **Stats collection gaps.**
 
@@ -583,13 +650,6 @@ and a `TransactionId` can be fused into a commit via `CommitDataFilesAsync`'
 …)` overload that packages the idempotency check + `txn` action for a streaming
 writer, so today the caller must wire those primitives together by hand.
 
-**File pruning is not reachable by an embedding host.** `DeltaFilePruner` —
-the unified partition + stats pruner — is `internal`. A host that owns its
-own execution engine can get a pruned file list from `PlanFiles`, but
-cannot apply EW's pruning to a candidate set it assembled itself. Making the
-type public is the whole change; the constraint is API surface, not
-capability.
-
 **High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
 feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
@@ -686,15 +746,41 @@ rebuilds sidecar paths as `_delta_log/_sidecars/{name}` by a slash
 check, which is fragile for paths that contain slashes in unexpected
 places.
 
-**Non-ASCII characters left literal in `add.path`.** `DeltaPath.Encode`
-escapes only `% space # ?` and control characters. Measured against
-delta-rs 1.6.2, the reference encoding is TWO layers: the on-disk Hive
-directory percent-encodes non-ASCII as UTF-8 bytes (`region=caf%C3%A9`),
-and `add.path` then percent-encodes that again (`region=caf%25C3%25A9`).
-EW's output diverges from both. Low severity in practice — delta-rs reads
-EW's literal form fine (`EwWritten_NonAsciiPartition_DeltaRsReadsSameRows`
-passes) — but it is a producer-side divergence from Spark. Ground truth is
-pinned by `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`.
+**Non-ASCII partition paths: Spark and delta-rs disagree, and we follow
+Spark.** Not an EW defect — recorded here because the ecosystem split is
+real and this entry previously got it backwards.
+
+Partition path encoding is TWO layers: the on-disk Hive directory, and
+`add.path` as a URL-encoding of that directory-relative path (so a `%` the
+first layer produced appears as `%25` in the log). The two reference
+implementations differ at layer 1 for non-ASCII:
+
+| value | Spark 4.0 / delta-spark 4.0.0 | delta-rs 1.6.2 |
+| --- | --- | --- |
+| directory | `region=café` | `region=caf%C3%A9` |
+| `add.path` | `region=café` | `region=caf%25C3%25A9` |
+
+Spark leaves non-ASCII literal at both layers, because
+`ExternalCatalogUtils.escapePathName` bounds its escape table at `c < 128`
+and so never escapes anything above ASCII. delta-rs percent-encodes it as
+UTF-8 bytes. Both are self-consistent: each engine's reader decodes what
+its writer produced.
+
+**EW is byte-identical to Spark**, at both layers, including the cases
+Spark does escape (`#`→`%23`, `?`→`%3F`, and space escaped at layer 2 only
+— `region=a b%23c%3Fd` on disk, `region=a%20b%2523c%253Fd` in the log).
+Measured, not assumed: `Spark_NonAsciiPartition_PathEncodingGroundTruth`
+pins Spark's output and `EwPartitionPaths_AreIdenticalToSparks` asserts
+equality against that same run rather than against literals.
+`DeltaRs_NonAsciiPartition_PathEncodingGroundTruth` pins delta-rs's
+different answer.
+
+Consequence to be aware of: a table written by BOTH Spark (or EW) and
+delta-rs gets two different directories for one logical partition value.
+That is an ecosystem wart, not something either engine can fix
+unilaterally. Reading is unaffected in every direction — partition values
+come from `add.partitionValues`, not from parsing the path — and delta-rs
+reads EW's form fine (`EwWritten_NonAsciiPartition_DeltaRsReadsSameRows`).
 
 **Column-mapping protocol shape differs from Spark's.** EW emits the
 legacy `minReader=2`/`minWriter=5` pair; Spark emits a hybrid
@@ -824,18 +910,50 @@ in Parquet, and no Iceberg-side schema bridge to Arrow or Parquet.
 
 ### Missing features
 
-**Spark SQL parser.** `EngineeredWood.SparkSql` (Phase 9 of the
-predicate-pushdown design) is not implemented. `Expression` /
-`Predicate` trees must be built in code via the `Expressions` static
-factory. This blocks any feature that needs to parse SQL expression
-strings from table metadata — notably Delta CHECK constraints and
-generated columns.
+**Write-time expressions are enforced.** `DeltaConstraintEnforcer`
+evaluates `delta.constraints.*` and `delta.invariants` against the rows
+being written, and `DeltaGeneratedColumns` computes a
+`delta.generationExpression` column the caller omitted or checks one it
+supplied — the protocol's `(<value> <=> <generation expression>) IS
+TRUE`. All three refuse the commit on a violation, on an expression that
+cannot be parsed, or on one that cannot be evaluated. Phase 10 /
+[#102](https://github.com/clast-project/engineered-wood/issues/102).
 
-**Built-in function registry.** `ArrowRowEvaluator` accepts an optional
-`IFunctionRegistry`, but the library ships no implementations.
-`FunctionCall` expressions throw at evaluation time unless the caller
-supplies a registry. A Spark function registry is planned alongside the
-SparkSql parser.
+**Constraint enforcement is per write path, not global.** Only paths
+that hand us the batches evaluate anything: `WriteAsync`, the
+transactional append, and create-with-data. `StageDataFiles`,
+`StageDataFilesAsync` and `CommitDataFilesAsync` take finished Parquet
+files and refuse a constrained table by default — there is nothing to
+check the rows against. A host that enforced the rules itself can say so
+with `constraintsEnforcedByCaller`, which is an assertion nothing
+verifies: a false claim commits rows every later reader will trust.
+`SupportsExternalDataFileCommit` reports false for such a table, so a
+host that checks before writing files is not sent off to produce
+orphans. `UPDATE` now re-validates: its post-image is checked against the
+constraints and its generated columns are recomputed, so a table
+carrying either is updatable. Only the post-image — rows the predicate
+did not match are copied through unchecked, since they were already in
+the table and re-validating them would refuse an unrelated `UPDATE` over
+data another engine wrote under semantics we do not share. `DELETE`
+still refuses, which costs nothing to fix but has not been done: a
+delete removes rows and cannot newly violate a row-level rule.
+
+**Gaps inside the parser and registry**, each of which refuses by name
+rather than producing a wrong answer:
+
+- Decimal arithmetic is computed in `System.Decimal`, so values past its
+  range — Spark reaches precision 38 — cannot be evaluated exactly and
+  are refused
+  ([#131](https://github.com/clast-project/engineered-wood/issues/131)).
+- The timezone for temporal conversions is fixed at UTC. Honouring a
+  session timezone needs the parser to carry a zone-less temporal form,
+  which is also what `TIMESTAMP_NTZ` would need
+  ([#133](https://github.com/clast-project/engineered-wood/issues/133)).
+- `INTERVAL` literals, the `Y` and `S` literal suffixes, subqueries,
+  window functions and `*` are outside the parser's grammar, and
+  `current_date` / `current_timestamp` are deliberately absent because
+  they are non-deterministic — which Delta forbids in a constraint or
+  generated column anyway.
 
 **No table layer can push a predicate into the Parquet reader.** Row-group
 pruning and bloom probing are implemented and tested, but nothing in `src/` sets

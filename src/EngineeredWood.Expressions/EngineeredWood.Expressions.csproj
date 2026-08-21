@@ -22,7 +22,6 @@
   <ItemGroup>
     <InternalsVisibleTo Include="EngineeredWood.Expressions.Tests" />
     <InternalsVisibleTo Include="EngineeredWood.Expressions.Arrow" />
-    <InternalsVisibleTo Include="EngineeredWood.SparkSql" />
   </ItemGroup>
 
 </Project>

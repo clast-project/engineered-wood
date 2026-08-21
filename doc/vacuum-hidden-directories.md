@@ -74,34 +74,48 @@ makes the whole case low-stakes.
 
 ## Our divergences
 
+As of #92 there is **one**, and it is deliberate.
+
 **`_change_data/` — deliberate, safe direction.** The spec sweeps it and relies on the
 keep-set containing live CDF files. We cannot build that set: the snapshot does not track
 `cdc` actions. So we protect the directory instead, which under-deletes (expired CDF is
-never collected) but cannot destroy readable history. Documented at
-`VacuumExecutor.cs:169-174`. Revisit when the snapshot learns about `cdc`.
+never collected) but cannot destroy readable history. Revisit when the snapshot learns
+about `cdc`. It now falls out of the general hidden rule rather than being a named
+exclusion, so matching the spec exactly is one `continue` away — the same shape
+`_delta_index` already uses.
 
-**Unknown hidden directories — a real gap.** We sweep any `.foo/` or `_foo/` the spec would
-protect. This is the substance of #54.
+## Closed
 
-**`metadata/` — a real gap.** We sweep it; the spec hides it by default, specifically
-because of UniForm. Note that upstream's answer is a literal `pathName.equals("metadata")`
-plus a toggle, not a naming rule — no prefix convention would have caught this one, and we
-enable `icebergCompatV1`/`V2` ourselves (`DeltaTable.cs:369`).
+**Unknown hidden directories.** Was the substance of #54: we swept any `.foo/` or `_foo/`
+the spec protects. Now protected, **per path component** rather than on the leading one
+(see the ambiguity note below), and applied to files as well as directories, which is what
+`DeltaFileOperations.recursiveListDirs` does — a recursive listing would otherwise reach a
+hidden directory's contents by their full path and collect them one level down.
 
-**`_delta_index/` — we match the spec by accident.** We sweep it because we sweep
-everything unnamed. Adding it to an exclusion list, which was the first instinct, would
-have introduced a divergence rather than closing one.
+**`metadata/`.** Was a real gap: we swept UniForm's converted Iceberg metadata, which
+nothing in the log references and no keep-set can protect. Now hidden by name, matching
+upstream's literal `pathName.equals("metadata")` rather than any naming rule — no prefix
+convention reaches it. The toggle is `DeltaTableOptions.HideIcebergMetadataDirectory`,
+defaulting to hidden, which is upstream's default for `shouldIcebergMetadataDirBeHidden`.
+Scoped to a directory component, since upstream's predicate is `isHiddenDirectory` and a
+data file named `metadata` is not what is being protected.
+
+**`_delta_index/` — still swept, now on purpose.** We used to sweep it because we swept
+everything unnamed; it is now an explicit carve-out from the hidden rule, which is what
+both references do. This is the trap worth remembering: the instinct when generalising the
+rule is to protect it, and that would introduce a divergence rather than close one.
 
 ## One ambiguity between the two references
 
 Whether the predicate applies to each path *segment* or only the leading one. Spark applies
 it to directory names during recursive descent, so it holds at every level. delta-rs calls
 `starts_with` on the whole relative path, so in practice only the first segment is tested —
-a nested `data/_foo/x.parquet` is unprotected there. Ours is currently top-level-only,
-matching delta-rs.
+a nested `data/_foo/x.parquet` is unprotected there.
 
-Per-segment is the safer read: the cost of the extra protection is under-deletion, which is
-the direction vacuum already prefers everywhere else.
+**We follow Spark and apply it per segment.** The cost of the extra protection is
+under-deletion, which is the direction vacuum already prefers everywhere else — and the
+alternative is not stable under a recursive listing, which `LocalTableFileSystem` performs
+(`SearchOption.AllDirectories`).
 
 ## Reading upstream
 

@@ -171,7 +171,7 @@ internal static class ArrayEncoderDispatch
     }
 
     /// <summary>
-    /// Reinterprets a <see cref="FixedSizeBinaryArray"/> as the corresponding
+    /// Reinterprets a <see cref="Apache.Arrow.Arrays.FixedSizeBinaryArray"/> as the corresponding
     /// <c>FixedSizeList&lt;UInt8, byteWidth&gt;</c> needed for vortex.uuid
     /// storage. FSB lays out <c>n × byteWidth</c> contiguous bytes in
     /// <c>Buffers[1]</c> exactly the way an FSL of u8 would, so the

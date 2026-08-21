@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Diagnostics;
@@ -392,6 +392,62 @@ public class CrossValidationTests : IDisposable
         var buffer = new int[values.Length];
         col.ReadBatch(buffer);
         Assert.Equal(values, buffer);
+    }
+
+    // The signed-zero defect of issue #154 was in the bytes we wrote, so the check that settles it is an
+    // INDEPENDENT reader seeing both signs. Compared on raw bits — -0.0 == 0.0 compares true, so an
+    // equality assertion passes against the corrupt file too.
+    [Fact]
+    public async Task EWWrite_PSRead_DictionaryKeepsSignedZerosApart()
+    {
+        var path = TempPath("ew-signed-zeros.parquet");
+        const int rows = 200;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", DoubleType.Default, nullable: false))
+            .Field(new Field("f", FloatType.Default, nullable: false))
+            .Build();
+
+        var doubles = new DoubleArray.Builder();
+        var floats = new FloatArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            doubles.Append(i % 2 == 0 ? 0.0 : -0.0);
+            floats.Append(i % 2 == 0 ? 0.0f : -0.0f);
+        }
+
+        await WriteEW(path, new RecordBatch(schema, [doubles.Build(), floats.Build()], rows));
+
+        using var reader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = reader.RowGroup(0);
+
+        // The defect lives in the DICTIONARY, so the test is worthless unless the dictionary was actually
+        // chosen — and that is a heuristic, not a guarantee. Two distinct values over 200 rows sits far
+        // inside the 20% cardinality threshold, but asserting it here means a future change to the
+        // heuristic or the defaults fails loudly instead of quietly writing plain and still passing.
+        // Read through ParquetSharp rather than our own metadata, since the independent reader is the point.
+        for (int c = 0; c < 2; c++)
+        {
+            Assert.Contains(
+                ParquetSharp.Encoding.RleDictionary,
+                rg.MetaData.GetColumnChunkMetaData(c).Encodings);
+        }
+
+        var readDoubles = new double[rows];
+        using (var col = rg.Column(0).LogicalReader<double>())
+            col.ReadBatch(readDoubles);
+
+        var readFloats = new float[rows];
+        using (var col = rg.Column(1).LogicalReader<float>())
+            col.ReadBatch(readFloats);
+
+        for (int i = 0; i < rows; i++)
+        {
+            Assert.Equal(BitPatterns.Of(i % 2 == 0 ? 0.0 : -0.0),
+                BitPatterns.Of(readDoubles[i]));
+            Assert.Equal(BitPatterns.Of(i % 2 == 0 ? 0.0f : -0.0f),
+                BitPatterns.Of(readFloats[i]));
+        }
     }
 
     [Fact]
@@ -927,6 +983,65 @@ public class CrossValidationTests : IDisposable
 
         Assert.Single(meta.RowGroups);
         Assert.Equal(500, meta.RowGroups[0].NumRows);
+    }
+
+    // The auto-split validity defect of issue #155 was in the bytes on disk, not in our reader — so the
+    // check that matters is an INDEPENDENT reader agreeing. Nulls fall on every third row, and
+    // RowGroupMaxRows splits them across four groups, so the boundary lands on a valid row whose
+    // corresponding leading bit is null.
+    [Fact]
+    public async Task AutoSplit_NullableColumns_PSReadsSameNullPositions()
+    {
+        var path = TempPath("auto-split-nullable.parquet");
+        const int totalRows = 350;
+        const int maxRowsPerGroup = 100;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: true))
+            .Field(new Field("s", StringType.Default, nullable: true))
+            .Build();
+
+        var ints = new Int32Array.Builder();
+        var strings = new StringArray.Builder();
+        for (int i = 0; i < totalRows; i++)
+        {
+            if (i % 3 == 0) { ints.AppendNull(); strings.AppendNull(); }
+            else { ints.Append(i); strings.Append($"v{i}"); }
+        }
+
+        var batch = new RecordBatch(schema, [ints.Build(), strings.Build()], totalRows);
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = maxRowsPerGroup });
+
+        var expectedInts = Enumerable.Range(0, totalRows).Select(i => i % 3 == 0 ? (int?)null : i).ToArray();
+        var expectedStrings = Enumerable.Range(0, totalRows).Select(i => i % 3 == 0 ? null : $"v{i}").ToArray();
+
+        using var reader = new ParquetSharp.ParquetFileReader(path);
+        Assert.Equal(4, reader.FileMetaData.NumRowGroups);
+
+        var seenInts = new List<int?>();
+        var seenStrings = new List<string?>();
+        for (int g = 0; g < reader.FileMetaData.NumRowGroups; g++)
+        {
+            using var rg = reader.RowGroup(g);
+            int rows = checked((int)rg.MetaData.NumRows);
+
+            using (var col = rg.Column(0).LogicalReader<int?>())
+            {
+                var buffer = new int?[rows];
+                col.ReadBatch(buffer);
+                seenInts.AddRange(buffer);
+            }
+
+            using (var col = rg.Column(1).LogicalReader<string?>())
+            {
+                var buffer = new string?[rows];
+                col.ReadBatch(buffer);
+                seenStrings.AddRange(buffer);
+            }
+        }
+
+        Assert.Equal(expectedInts, seenInts);
+        Assert.Equal(expectedStrings, seenStrings);
     }
 
     [Fact]

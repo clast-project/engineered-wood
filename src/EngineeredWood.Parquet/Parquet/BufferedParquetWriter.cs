@@ -166,7 +166,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             {
                 // Dictionary encoding: cardinality is within threshold
                 columnResults[i] = ColumnChunkWriter.WriteDictionaryColumnFromResult(
-                    dictResults[i]!.Value, numRows, s.PathInSchema, s.PhysicalType,
+                    dictResults[i]!.Value, numRows, s.NonNullCount, s.PathInSchema, s.PhysicalType,
+                    s.TypeLength, s.ArrowType,
                     s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], null, _options);
             }
             else if (dictResults[i] != null && useNonDictionary[i])
@@ -188,7 +189,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             }
             else
             {
-                columnResults[i] = WriteNullOnlyColumn(s, numRows);
+                columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], numRows);
             }
         });
 
@@ -204,8 +205,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
 
-            long dataPageOffset = chunkStart + result.DictionaryPageSize;
+            // A dictionary page or an FSST symbol table page precedes the data pages; a chunk
+            // has at most one of the two, since FSST is a non-dictionary encoding.
+            long dataPageOffset = chunkStart + result.DictionaryPageSize + result.SymbolTablePageSize;
             long? dictionaryPageOffset = result.DictionaryPageSize > 0 ? chunkStart : null;
+            long? symbolTablePageOffset = result.SymbolTablePageSize > 0 ? chunkStart : null;
 
             // Write Bloom filter block if present.
             long? bloomFilterOffset = null;
@@ -231,6 +235,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 Statistics = result.MetaData.Statistics,
                 BloomFilterOffset = bloomFilterOffset,
                 BloomFilterLength = bloomFilterLength,
+                SymbolTablePageOffset = symbolTablePageOffset,
+                SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
             };
 
             columnChunks[i] = new ColumnChunk { FileOffset = chunkStart, MetaData = meta };
@@ -608,32 +614,47 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         return builder.Build();
     }
 
-    // ───── Fallback for non-dictionary columns ─────
+    // ───── Fallback for columns with no dictionary ─────
 
-    private ColumnChunkWriter.ColumnChunkResult WriteNullOnlyColumn(
-        BufferedColumnState state, int numRows)
+    /// <summary>
+    /// Writes a column that accumulated no dictionary entry at all — an all-null column, since every
+    /// non-null value of a supported type goes into the dictionary as it arrives.
+    /// </summary>
+    /// <remarks>
+    /// It goes through <c>ColumnChunkWriter.WriteColumn</c> on a reconstructed all-null array
+    /// rather than hand-building a <see cref="ColumnMetaData"/>: hand-building it produced a chunk that
+    /// declared <c>NumValues = numRows</c> and then wrote NO PAGES, which our own reader rejects as
+    /// truncated. Reconstructing costs one all-null array — the same shape the Boolean fallback and the
+    /// high-cardinality fallback already pay — and in exchange the pages, the encodings and the
+    /// statistics all come from the one path that gets them right.
+    /// </remarks>
+    private ColumnChunkWriter.ColumnChunkResult WriteValuelessColumn(
+        BufferedColumnState state, int[]? defLevels, int numRows)
     {
-        // Write a column with all nulls — this is a fallback for columns that
-        // couldn't be dictionary-encoded (e.g. Boolean)
-        var output = new MemoryStream(64);
-        var metadata = new ColumnMetaData
+        if (state.NonNullCount > 0)
         {
-            Type = state.PhysicalType,
-            Encodings = [Encoding.Plain, Encoding.Rle],
-            PathInSchema = state.PathInSchema,
-            Codec = _options.Compression,
-            NumValues = numRows,
-            TotalUncompressedSize = 0,
-            TotalCompressedSize = 0,
-            DataPageOffset = 0,
-        };
+            // Non-null values that never reached the dictionary: DictionaryEncodeArray has no arm for
+            // this Arrow type and silently dropped them. Refusing beats writing a file whose values are
+            // gone with nothing to say so.
+            throw new NotSupportedException(
+                $"Column '{string.Join(".", state.PathInSchema)}' has Arrow type {state.ArrowType.Name}, " +
+                "which BufferedParquetWriter cannot buffer. Write it with ParquetFileWriter instead.");
+        }
 
-        output.TryGetBuffer(out var buffer);
-        return new ColumnChunkWriter.ColumnChunkResult
-        {
-            Data = buffer,
-            MetaData = metadata,
-        };
+        var array = ReconstructArrowArray(
+            state,
+            new DictionaryEncoder.DictionaryResult
+            {
+                DictionaryPageData = [],
+                DictionaryCount = 0,
+                Indices = [],
+            },
+            defLevels,
+            numRows);
+
+        return ColumnChunkWriter.WriteColumn(
+            array, state.PathInSchema, state.PhysicalType, state.TypeLength,
+            state.IsNullable, _options);
     }
 
     private static SchemaElement FindLeafElement(IReadOnlyList<SchemaElement> schema, string fieldName)
@@ -662,11 +683,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public required Apache.Arrow.Types.IArrowType ArrowType { get; init; }
         public required bool IsNullable { get; init; }
 
-        // Running dictionary: maps values → index
+        // Running dictionary: maps a value's BIT PATTERN → index. The float and double dictionaries are
+        // keyed on uint/ulong rather than on the value because a dictionary entry is a set of BYTES, and
+        // value equality is looser than that: IEquatable<double>.Equals(-0.0, 0.0) is true, which merged
+        // the two zeros into one entry and silently rewrote whichever came second (issue #154).
         private Dictionary<int, int>? _fixedDict;
         private Dictionary<long, int>? _longDict;
-        private Dictionary<float, int>? _floatDict;
-        private Dictionary<double, int>? _doubleDict;
+        private Dictionary<uint, int>? _floatDict;
+        private Dictionary<ulong, int>? _doubleDict;
         private BytesDictionary? _bytesDict;
 
         // Accumulated indices (compact, non-null only)
@@ -867,24 +891,21 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         private void EncodeFixedFloat(ReadOnlySpan<float> valueBuffer, int srcOffset, int rowCount)
         {
-            _floatDict ??= new Dictionary<float, int>();
+            _floatDict ??= new Dictionary<uint, int>();
             _dictEntries ??= new List<byte[]>();
+
+            var bitBuffer = MemoryMarshal.Cast<float, uint>(valueBuffer);
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
-                float val = valueBuffer[srcOffset + i];
-                if (!_floatDict.TryGetValue(val, out int idx))
+                uint bits = bitBuffer[srcOffset + i];
+                if (!_floatDict.TryGetValue(bits, out int idx))
                 {
                     idx = DictionaryCount++;
-                    _floatDict[val] = idx;
+                    _floatDict[bits] = idx;
                     var bytes = new byte[4];
-
-#if NET8_0_OR_GREATER
-                    MemoryMarshal.Write(bytes, in val);
-#else
-                    MemoryMarshal.Write(bytes, ref val);
-#endif
+                    BinaryPrimitives.WriteUInt32LittleEndian(bytes, bits);
                     _dictEntries.Add(bytes);
                     _dictPageSize += 4;
                 }
@@ -894,24 +915,21 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         private void EncodeFixedDouble(ReadOnlySpan<double> valueBuffer, int srcOffset, int rowCount)
         {
-            _doubleDict ??= new Dictionary<double, int>();
+            _doubleDict ??= new Dictionary<ulong, int>();
             _dictEntries ??= new List<byte[]>();
+
+            var bitBuffer = MemoryMarshal.Cast<double, ulong>(valueBuffer);
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
-                double val = valueBuffer[srcOffset + i];
-                if (!_doubleDict.TryGetValue(val, out int idx))
+                ulong bits = bitBuffer[srcOffset + i];
+                if (!_doubleDict.TryGetValue(bits, out int idx))
                 {
                     idx = DictionaryCount++;
-                    _doubleDict[val] = idx;
+                    _doubleDict[bits] = idx;
                     var bytes = new byte[8];
-
-#if NET8_0_OR_GREATER
-                    MemoryMarshal.Write(bytes, in val);
-#else
-                    MemoryMarshal.Write(bytes, ref val);
-#endif
+                    BinaryPrimitives.WriteUInt64LittleEndian(bytes, bits);
                     _dictEntries.Add(bytes);
                     _dictPageSize += 8;
                 }

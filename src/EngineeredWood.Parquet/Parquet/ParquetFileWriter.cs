@@ -23,6 +23,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     private readonly List<RowGroup> _rowGroups = new();
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
+    private Apache.Arrow.Schema? _declaredSchema;
     private Dictionary<string, ShredSchema?>? _variantShredDecisions;
     private bool _headerWritten;
     private bool _closed;
@@ -39,6 +40,31 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _file = file;
         _ownsFile = ownsFile;
         _options = options ?? ParquetWriteOptions.Default;
+    }
+
+    /// <summary>
+    /// Declares the schema to record when no row group is ever written, so that a zero-row table
+    /// keeps its columns instead of producing a file whose footer declares an empty schema.
+    /// </summary>
+    /// <remarks>
+    /// This is a footer fallback only. The moment a row group is written, the schema captured from
+    /// that batch — after any variant shredding, which changes column types — wins and this
+    /// declaration is ignored. It therefore cannot desynchronize the footer from the encoded data.
+    /// </remarks>
+    /// <param name="schema">The Arrow schema the empty file should declare.</param>
+    public void DeclareSchema(Apache.Arrow.Schema schema)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(schema);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+        if (schema is null) throw new ArgumentNullException(nameof(schema));
+#endif
+        if (_closed)
+            throw new InvalidOperationException("Writer has been closed.");
+
+        _declaredSchema = schema;
     }
 
     /// <summary>
@@ -67,6 +93,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // from the offset-aware IsNull, stay correct, so the file is well-formed and merely holds the wrong
         // rows. Only paid when a column actually carries an offset.
         batch = CompactSlicedColumns(batch);
+
+        // Parquet has no second-precision unit, so such a column is rescaled to milliseconds here —
+        // before the schema is captured, so what the footer declares and what the encoders write are
+        // the same thing. The caller's original units are preserved separately, in ARROW:schema, and
+        // that is what lets the reader hand them back.
+        _declaredSchema ??= batch.Schema;
+        batch = CoerceTimeUnits(batch);
 
         // Variant shredding, if enabled, changes each shredded column's storage TYPE — so the layout
         // has to be decided before the schema is captured, and from the same batch. Decided once and
@@ -183,9 +216,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
             await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
 
-            // Calculate offsets: dictionary page comes first if present
-            long dataPageOffset = chunkStart + result.DictionaryPageSize;
+            // Calculate offsets: a dictionary page or an FSST symbol table page comes first if
+            // present. A chunk has at most one of the two — FSST is a non-dictionary encoding.
+            long dataPageOffset = chunkStart + result.DictionaryPageSize + result.SymbolTablePageSize;
             long? dictionaryPageOffset = result.DictionaryPageSize > 0 ? chunkStart : null;
+            long? symbolTablePageOffset = result.SymbolTablePageSize > 0 ? chunkStart : null;
 
             // Write Bloom filter block if present.
             long? bloomFilterOffset = null;
@@ -212,6 +247,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 Statistics = result.MetaData.Statistics,
                 BloomFilterOffset = bloomFilterOffset,
                 BloomFilterLength = bloomFilterLength,
+                SymbolTablePageOffset = symbolTablePageOffset,
+                SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
             };
 
             columnChunks[i] = new ColumnChunk
@@ -435,13 +472,20 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         // For fixed-width types: copy value buffer, bitmap
         // For variable-width types: copy offsets + data buffer, bitmap
-        int nullCount = data.NullCount;
         int srcOffset = data.Offset;
 
-        ArrowBuffer newBitmap;
-        if (data.Buffers.Length > 0 && data.Buffers[0].Length > 0 && nullCount > 0)
+        // The branch is decided by whether a validity bitmap EXISTS, never by the slice's null count.
+        // `data` is a slice, and a slice whose parent had nulls carries an UNKNOWN (negative) count — so a
+        // `nullCount > 0` test silently fails for exactly the arrays that need the copy, and the bitmap was
+        // taken unshifted: row group N then read its validity from bit 0 instead of bit srcOffset, and every
+        // row from the first row-group boundary onward was aligned against the wrong mask (issue #155).
+        //
+        // The copy walks the slice's bits anyway, so it counts the nulls on the way through rather than
+        // asking Arrow to recompute them afterwards.
+        ArrowBuffer newBitmap = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (data.Buffers.Length > 0 && data.Buffers[0].Length > 0)
         {
-            // Copy null bitmap
             var bitmapBytes = new byte[(length + 7) / 8];
             var srcBitmap = data.Buffers[0].Span;
             for (int i = 0; i < length; i++)
@@ -449,16 +493,15 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 bool isSet = (srcBitmap[(srcOffset + i) / 8] & (1 << ((srcOffset + i) % 8))) != 0;
                 if (isSet)
                     bitmapBytes[i / 8] |= (byte)(1 << (i % 8));
+                else
+                    nullCount++;
             }
-            newBitmap = new ArrowBuffer(bitmapBytes);
-        }
-        else if (nullCount == 0)
-        {
-            newBitmap = ArrowBuffer.Empty;
-        }
-        else
-        {
-            newBitmap = data.Buffers.Length > 0 ? data.Buffers[0] : ArrowBuffer.Empty;
+
+            // A null-free slice of a nullable column keeps no bitmap: absent validity means all-valid in
+            // Arrow, and it is what the rest of the write path already sees for a column with no nulls.
+            // This is reachable on its own — a column whose nulls all fall in EARLIER row groups.
+            if (nullCount > 0)
+                newBitmap = new ArrowBuffer(bitmapBytes);
         }
 
         switch (type)
@@ -553,7 +596,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         // The header is written before the first row group but the schema is captured during it, so a
         // row group that throws leaves this null. Falling back here keeps dispose from replacing that
-        // exception with an NRE out of the footer.
+        // exception with an NRE out of the footer. A caller that wrote no rows at all can supply the
+        // schema through DeclareSchema so the empty file still describes its columns.
+        // Coerced here too: a table with no rows never passes a batch through the write path, so
+        // this is the only place a second-precision column in it would be seen.
+        if (_parquetSchema is null && _declaredSchema is not null)
+        {
+            _parquetSchema = ArrowToSchemaConverter.Convert(
+                Data.TimeUnitRescaler.ToParquetUnits(_declaredSchema));
+        }
+
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
         // Calculate total rows
@@ -569,7 +621,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             NumRows = totalRows,
             RowGroups = _rowGroups,
             CreatedBy = _options.CreatedBy,
-            KeyValueMetadata = _options.KeyValueMetadata,
+            KeyValueMetadata = BuildKeyValueMetadata(),
             ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
         };
 
@@ -614,13 +666,86 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             _file.Dispose();
     }
 
+    /// <summary>
+    /// Adds the <c>ARROW:schema</c> entry to whatever the caller supplied, so that units and zone
+    /// names Parquet cannot express survive a round trip the way they do through PyArrow and Polars.
+    /// A caller who sets the key explicitly keeps their own value.
+    /// </summary>
+    private IReadOnlyList<Metadata.KeyValue>? BuildKeyValueMetadata()
+    {
+        var supplied = _options.KeyValueMetadata;
+        if (!_options.WriteArrowSchema || _declaredSchema is null)
+            return supplied;
+
+        if (supplied is not null)
+        {
+            foreach (var entry in supplied)
+            {
+                if (string.Equals(entry.Key, Data.ArrowSchemaMetadata.Key, StringComparison.Ordinal))
+                    return supplied;
+            }
+        }
+
+        var merged = new List<Metadata.KeyValue>(supplied?.Count + 1 ?? 1);
+        if (supplied is not null)
+            merged.AddRange(supplied);
+
+        merged.Add(new Metadata.KeyValue
+        {
+            Key = Data.ArrowSchemaMetadata.Key,
+            Value = Data.ArrowSchemaMetadata.Encode(_declaredSchema),
+        });
+        return merged;
+    }
+
+    /// <summary>
+    /// Rescales any second-precision temporal column, at any depth, into the milliseconds Parquet
+    /// can annotate. Returns the same batch when there is nothing to rescale, which is the usual case.
+    /// </summary>
+    private static RecordBatch CoerceTimeUnits(RecordBatch batch)
+    {
+        IArrowArray[]? columns = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var original = batch.Column(i);
+            var coerced = Data.TimeUnitRescaler.ToParquetUnits(original);
+            if (!ReferenceEquals(coerced, original))
+            {
+                if (columns is null)
+                {
+                    columns = new IArrowArray[batch.ColumnCount];
+                    for (int c = 0; c < columns.Length; c++)
+                        columns[c] = batch.Column(c);
+                }
+
+                columns[i] = coerced;
+            }
+        }
+
+        if (columns is null)
+            return batch;
+
+        var fields = new Apache.Arrow.Field[columns.Length];
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            fields[i] = new Apache.Arrow.Field(
+                field.Name, columns[i].Data.DataType, field.IsNullable, field.Metadata);
+        }
+
+        return new RecordBatch(
+            new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
     private static bool IsNestedType(Apache.Arrow.Types.IArrowType type) =>
         type is Apache.Arrow.Types.StructType
             or Apache.Arrow.Types.ListType
+            or Apache.Arrow.Types.FixedSizeListType
             or Apache.Arrow.Types.MapType
             // VariantType / any extension whose storage is itself nested.
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.StructType }
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.ListType }
+            or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.FixedSizeListType }
             or Apache.Arrow.ExtensionType { StorageType: Apache.Arrow.Types.MapType };
 
     /// <summary>

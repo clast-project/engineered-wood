@@ -8,7 +8,7 @@ namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
 /// An optimistic-concurrency transaction over a <see cref="DeltaTable"/>, pinned to the table version
-/// it was started at (see <see cref="DeltaTable.StartTransaction"/>).
+/// it was started at (see <see cref="DeltaTable.StartTransaction(IsolationLevel)"/>).
 ///
 /// <para>Stage read-dependent operations on it, then <see cref="CommitAsync"/>. At commit the
 /// transaction is validated against every commit that landed since it started: if none invalidated
@@ -31,8 +31,8 @@ namespace EngineeredWood.DeltaLake.Table;
 /// one of the two, every abandoned transaction's files sit on storage until VACUUM's retention horizon
 /// passes — a crash-looping producer's whole batch, on every restart.</para>
 ///
-/// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync"/>), and
-/// updates (<see cref="UpdateAsync"/>) can be staged, including several on one transaction. An append is
+/// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>), and
+/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>) can be staged, including several on one transaction. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
 /// delete/update reads the files it rewrites, so it aborts only if a concurrent commit removed one of
 /// them — and a delete of DIFFERENT rows in a file someone else also deleted from reconciles row-by-row
@@ -174,6 +174,55 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal string EffectiveOperation =>
         _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
 
+    /// <summary>
+    /// This transaction's own claim about whether it READ anything, recorded as
+    /// <c>commitInfo.isBlindAppend</c> for later writers to consult. Null — the default — records NOTHING.
+    ///
+    /// <para>A property rather than a per-call argument for the same reason as <see cref="Operation"/>: it
+    /// describes the TRANSACTION, and several staging calls cannot each answer for the commit.</para>
+    ///
+    /// <para><b>⚠ Null is not false, and the difference is not uniform across readers.</b> delta-spark
+    /// takes an absent flag as "not blind" and examines the commit, so against it silence costs only
+    /// spurious conflicts. This library's own <see cref="Concurrency.ConflictChecker"/> instead infers from
+    /// the commit's shape when the flag is absent, and an adds-only commit infers as BLIND — so against a
+    /// later EW reader, silence on a staged append is read as a claim this transaction never made. <b>A
+    /// host that knows it read should set <c>false</c> rather than leave this null</b>; null is for a host
+    /// that genuinely does not know.</para>
+    ///
+    /// <para>Claiming <c>true</c> wrongly is the UNSAFE direction whichever reader sees it: the concurrent-
+    /// append check is skipped and the conflict that was owed silently does not happen. Declare
+    /// <c>true</c> only where the transaction genuinely read nothing.</para>
+    ///
+    /// <para>This library cannot derive it for a host with its own data plane. A transaction records the
+    /// reads made THROUGH it, but a host that scanned the table itself and then staged the result has made
+    /// a read this library never saw — which is exactly the case the claim exists for.</para>
+    /// </summary>
+    public bool? IsBlindAppend { get; set; }
+
+    /// <summary>
+    /// What the commit records: the host's claim if it made one, else <c>false</c> when this transaction
+    /// itself recorded a read, else nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The derivation runs in ONE direction only, and that asymmetry is the whole design.</b> A
+    /// read recorded through this transaction — a staged DELETE or UPDATE, a declared whole-table read, a
+    /// read predicate — proves the transaction was not blind, so <c>false</c> is a fact rather than a
+    /// guess. The converse does not hold: having recorded no read proves only that none came through THIS
+    /// object, and a host that scanned the table itself and staged the result read something we never saw.
+    /// So the absence of recorded reads stays silent rather than becoming <c>true</c>.</para>
+    ///
+    /// <para>Which is what makes the autocommit DML surface honest for free: <c>DeleteAsync</c> and
+    /// <c>UpdateAsync</c> stage their work through a transaction, so their commits declare <c>false</c>
+    /// without anyone passing anything, while a bare staged append — where only the host knows — declares
+    /// nothing until the host says otherwise.</para>
+    /// </remarks>
+    internal bool? EffectiveIsBlindAppend =>
+        IsBlindAppend
+        ?? (_declaredWholeTableRead || _removedPaths.Count > 0 || _dvEdits.Count > 0
+                || _readPredicates.Count > 0
+            ? false
+            : null);
+
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
 
@@ -205,7 +254,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        // ComputeWriteActionsAsync below evaluates the table's constraints against these batches,
+        // so the gate must not refuse the table first. The staging and DML paths deliberately do
+        // not say this: none of them route through that method, so none of them validate.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: true,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
@@ -293,7 +348,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
+        // columns, so a constrained table is writable here.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
@@ -320,7 +380,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
+        // columns, so a constrained table is writable here.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
 
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
@@ -355,12 +420,27 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// IcebergCompat, which need write-time per-row processing an outside writer did not do — check
     /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> first.</para>
     /// </summary>
-    public void StageDataFiles(IReadOnlyList<WrittenDataFile> files)
+    /// <param name="constraintsEnforcedByCaller">
+    /// Declares that the caller has already enforced the table's CHECK constraints, invariants and
+    /// generated columns over the rows in <paramref name="files"/>. Nothing here can verify it —
+    /// the files are finished — so it is an assertion, and a false one commits rows every later
+    /// reader will trust. Left false, a table declaring any of those is refused, and
+    /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> reports false for it.
+    /// </param>
+    public void StageDataFiles(
+        IReadOnlyList<WrittenDataFile> files, bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
+
         if (files.Count == 0)
             return;
 
@@ -393,12 +473,19 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<WrittenDataFile> files,
         RowSelection? bornDeleted = null,
         bool identityValuesPreGenerated = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool constraintsEnforcedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
             throw new ArgumentNullException(nameof(files));
-        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        _table.ValidateWritable(
+            _baseSnapshot,
+            isAppend: true,
+            handling: constraintsEnforcedByCaller
+                ? WriteTimeExpressionHandling.AssertedByCaller
+                : WriteTimeExpressionHandling.Refuse);
         if (files.Count == 0)
             return 0;
 
@@ -454,7 +541,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
     /// <summary>
     /// Stages a schema change computed by one of <see cref="DeltaTable"/>'s <c>Compute*</c> methods
-    /// (<see cref="DeltaTable.ComputeAddColumn"/>, <see cref="DeltaTable.ComputeRenameColumn"/>, …), so an
+    /// (<see cref="DeltaTable.ComputeAddColumn(Schema.StructField, MetadataAction, ProtocolAction)"/>, <see cref="DeltaTable.ComputeRenameColumn"/>, …), so an
     /// ALTER lands in the SAME version as the data written under it. Compute the change against this
     /// transaction's <see cref="Snapshot"/>; a concurrent commit that changes metadata or protocol aborts the
     /// transaction rather than silently overwriting it.

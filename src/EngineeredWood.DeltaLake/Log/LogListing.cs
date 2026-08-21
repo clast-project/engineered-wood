@@ -26,8 +26,23 @@ internal sealed class LogListing
     /// <summary>Versions with a <c>&lt;version&gt;.checkpoint.parquet</c>.</summary>
     public HashSet<long> ClassicCheckpoints { get; } = [];
 
-    /// <summary>Version to the path of its <c>&lt;version&gt;.checkpoint.&lt;uuid&gt;.json</c>.</summary>
+    /// <summary>
+    /// Version to the path of its <c>&lt;version&gt;.checkpoint.&lt;uuid&gt;.{json,parquet}</c> — the two
+    /// bodies PROTOCOL.md defines for a UUID-named V2 checkpoint, both of which are decoded.
+    /// </summary>
     public Dictionary<long, string> V2Checkpoints { get; } = [];
+
+    /// <summary>
+    /// Version to the path of a checkpoint this reader RECOGNISES but cannot decode — a UUID-named V2
+    /// checkpoint whose body is neither of the two the spec defines.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately kept out of <see cref="V2Checkpoints"/> and out of checkpoint SELECTION: a table
+    /// carrying one may still be perfectly readable from an older checkpoint or from its commits, and
+    /// refusing it would be wrong. Recorded only so that a replay which fails for want of the versions
+    /// this checkpoint covers can name the real cause instead of blaming the log.
+    /// </remarks>
+    public Dictionary<long, string> UndecodableCheckpoints { get; } = [];
 
     /// <summary>Version to declared part count to the part numbers actually present.</summary>
     public Dictionary<long, Dictionary<int, HashSet<int>>> MultiPartCheckpoints { get; } = [];
@@ -97,11 +112,46 @@ internal sealed class LogListing
                 byTotal[total] = seen = [];
             seen.Add(part);
         }
-        // <version>.checkpoint.<uuid>.json. The parquet-bodied V2 form is deliberately not claimed:
-        // CheckpointReader only decodes NDJSON, so claiming it would just fail the read.
-        else if (suffix is [_, "json"])
+        // <version>.checkpoint.<uuid>.{json,parquet} — a UUID-named V2 checkpoint, in either of the two
+        // bodies the spec defines. A UUID name is the only 2-part suffix: classic is 1 part and
+        // multi-part is 3.
+        else if (suffix is [_, "json" or "parquet"])
         {
-            V2Checkpoints[version] = DeltaVersion.LogPrefix + fileName;
+            AddV2Checkpoint(version, fileName);
+        }
+        // <version>.checkpoint.<uuid>.<anything else> — named like a UUID-named V2 checkpoint, in a body
+        // the spec does not define and this reader has no decoder for. Recognised rather than ignored so
+        // that a replay which fails for want of the versions it covers can name it, instead of blaming
+        // log retention for a decoding limitation.
+        else if (suffix.Length == 2)
+        {
+            UndecodableCheckpoints[version] = DeltaVersion.LogPrefix + fileName;
+        }
+    }
+
+    /// <summary>
+    /// Records a UUID-named V2 checkpoint, keeping one deterministic choice per version.
+    /// </summary>
+    /// <remarks>
+    /// Two writers racing to checkpoint the same version produce two UUID names, and both are valid —
+    /// the spec has them carrying the same information, so a reader may use either. Which one arrives
+    /// first is filesystem-dependent, though, so the choice is pinned rather than left to listing order:
+    /// a JSON body wins over a Parquet one (it is read without a Parquet footer round-trip), and
+    /// otherwise the ordinally smallest name wins. Snapshots then do not vary between two reads of an
+    /// unchanged table.
+    /// </remarks>
+    private void AddV2Checkpoint(long version, string fileName)
+    {
+        string path = DeltaVersion.LogPrefix + fileName;
+        if (!V2Checkpoints.TryGetValue(version, out string? existing) || Beats(path, existing))
+            V2Checkpoints[version] = path;
+
+        static bool Beats(string candidate, string incumbent)
+        {
+            bool candidateIsJson = candidate.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+            if (candidateIsJson != incumbent.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                return candidateIsJson;
+            return string.CompareOrdinal(candidate, incumbent) < 0;
         }
     }
 
@@ -122,11 +172,91 @@ internal sealed class LogListing
     }
 
     /// <summary>Every version that carries a checkpoint of any form, descending.</summary>
+    /// <remarks>
+    /// Includes multi-part versions whose parts are INCOMPLETE — callers that intend to read the
+    /// checkpoint must confirm with <see cref="CompleteMultiPartCount"/>. This exists as the candidate
+    /// order for <c>SelectLatestCheckpoint</c>, which does exactly that as it walks.
+    /// </remarks>
     public IEnumerable<long> CheckpointVersionsDescending()
     {
         var all = new SortedSet<long>(ClassicCheckpoints);
         all.UnionWith(V2Checkpoints.Keys);
         all.UnionWith(MultiPartCheckpoints.Keys);
         return all.Reverse();
+    }
+
+    /// <summary>
+    /// The part count of a COMPLETE multi-part checkpoint at this version, or null when there is none.
+    /// </summary>
+    /// <remarks>
+    /// A writer that died midway leaves a prefix of the parts, and bootstrapping from that would
+    /// silently drop the files in the missing ones — so a multi-part checkpoint counts only when every
+    /// part is present. One version can declare more than one part count (a re-checkpoint that split
+    /// differently); any complete one will do.
+    /// </remarks>
+    public int? CompleteMultiPartCount(long version)
+    {
+        if (!MultiPartCheckpoints.TryGetValue(version, out var byTotal))
+            return null;
+
+        foreach (var (total, seen) in byTotal)
+        {
+            if (seen.Count == total)
+                return total;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// A multi-part checkpoint inside <c>[from, through]</c> that has SOME of its parts but not all, and
+    /// which nothing else at that version covers — or null when there is none.
+    /// </summary>
+    /// <remarks>
+    /// The other way a replay ends up with a hole nothing accounts for. A writer that died midway leaves
+    /// a prefix of the parts, and that prefix is skipped for bootstrapping because loading it would
+    /// silently drop the files in the parts that never landed. If the commits it was meant to subsume
+    /// have since been cleaned away, the history really is gone — so this is still a truncated log rather
+    /// than an unsupported format — but the torn checkpoint is the cause, and saying so is the difference
+    /// between "your retention is too aggressive" and "a checkpoint write did not finish".
+    /// </remarks>
+    public (long Version, int Present, int Declared)? TornMultiPartCheckpoint(long from, long through)
+    {
+        foreach (var (version, byTotal) in MultiPartCheckpoints)
+        {
+            if (version < from || version > through)
+                continue;
+            if (CompleteMultiPartCount(version) is not null)
+                continue;
+            if (ClassicCheckpoints.Contains(version) || V2Checkpoints.ContainsKey(version))
+                continue;
+
+            // The most nearly complete declaration, when a version somehow carries more than one.
+            int bestTotal = 0, bestPresent = -1;
+            foreach (var (total, seen) in byTotal)
+            {
+                if (seen.Count > bestPresent)
+                    (bestTotal, bestPresent) = (total, seen.Count);
+            }
+
+            return (version, bestPresent, bestTotal);
+        }
+
+        return null;
+    }
+
+    /// <summary>Every version carrying a checkpoint that can actually be read, ascending.</summary>
+    public IEnumerable<long> UsableCheckpointVersionsAscending()
+    {
+        var all = new SortedSet<long>(ClassicCheckpoints);
+        all.UnionWith(V2Checkpoints.Keys);
+
+        foreach (long version in MultiPartCheckpoints.Keys)
+        {
+            if (CompleteMultiPartCount(version) is not null)
+                all.Add(version);
+        }
+
+        return all;
     }
 }

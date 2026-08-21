@@ -57,4 +57,16 @@ public sealed class ColumnMetaData
 
     /// <summary>Length of the Bloom filter block in bytes, if present.</summary>
     public int? BloomFilterLength { get; init; }
+
+    /// <summary>
+    /// Byte offset of the FSST symbol table page in the file, if this column chunk has
+    /// FSST-encoded data pages. Part of the unratified FSST proposal.
+    /// </summary>
+    public long? SymbolTablePageOffset { get; init; }
+
+    /// <summary>
+    /// Length of the FSST symbol table page in bytes (header included), if present.
+    /// Part of the unratified FSST proposal.
+    /// </summary>
+    public int? SymbolTablePageLength { get; init; }
 }

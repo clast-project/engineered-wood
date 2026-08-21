@@ -311,6 +311,79 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
     }
 
+    /// <summary>
+    /// delta-rs rebuilding state from a V2 checkpoint EW wrote — a second, independent implementation
+    /// beside Spark, and one whose log replay is delta-kernel-rs.
+    /// </summary>
+    /// <remarks>
+    /// <para>Reconstruction and materialization go through different layers here, and only the second
+    /// has a limit. The Rust engine reads V2 checkpoints, sidecars included: with every commit hidden it
+    /// recovers the version, the file list and the add actions. What refuses is
+    /// <c>to_pyarrow_dataset</c>, whose reader-feature allowlist lives in deltalake's PYTHON layer
+    /// (<c>SUPPORTED_READER_FEATURES</c>, which as of 1.6.2 is
+    /// <c>{timestampNtz, variantType, variantType-preview}</c> — it excludes <c>deletionVectors</c> and
+    /// <c>columnMapping</c> too, so it is a legacy-path allowlist rather than an engine capability).</para>
+    ///
+    /// <para>So this asserts the reconstruction, which is what a checkpoint is FOR, and pins the
+    /// materialization refusal separately as the thing that would change if delta-rs widened that list.
+    /// The tombstone-level assertion the checkpoint also needs lives on the Spark side, which exposes
+    /// its reconstructed removes — delta-rs has no tombstone API to ask.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
+    [InlineData(1, 1)]      // threshold below → one sidecar
+    [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
+    public async Task EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone(
+        int sidecarThreshold, int expectedSidecars)
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointPolicy"] = "v2" },
+            options: new DeltaTableOptions { CheckpointInterval = 0 });
+
+        for (long i = 1; i <= 6; i++)
+            await table.WriteAsync([IdRegionBatch([i], [i % 2 == 0 ? "us" : "eu"])]);
+
+        await new EngineeredWood.DeltaLake.Checkpoint.CheckpointWriter(fs)
+        {
+            V2Writer = new EngineeredWood.DeltaLake.Checkpoint.V2CheckpointWriter(fs)
+            {
+                SidecarThreshold = sidecarThreshold,
+                MaxActionsPerSidecar = expectedSidecars > 1 ? 4 : int.MaxValue,
+            },
+        }.WriteCheckpointAsync(table.CurrentSnapshot);
+
+        var expectedFiles = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path.Split('/')[^1])
+            .OrderBy(p => p, StringComparer.Ordinal)
+            .ToList();
+
+        var result = DeltaRs.Invoke("checkpoint_only_read", new { path = _tempDir });
+
+        // A UUID-named V2 checkpoint really was what delta-rs found, and the commits really are gone.
+        string checkpointFile = result.GetProperty("checkpoint_file").GetString()!;
+        Assert.Contains(".checkpoint.", checkpointFile, StringComparison.Ordinal);
+        Assert.EndsWith(".json", checkpointFile, StringComparison.Ordinal);
+        Assert.Equal(expectedSidecars, result.GetProperty("sidecars").GetArrayLength());
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+
+        // The reconstruction itself, from the checkpoint and its sidecars alone.
+        Assert.Equal(table.CurrentSnapshot.Version, result.GetProperty("version").GetInt64());
+        Assert.Equal(expectedFiles.Count, result.GetProperty("num_add_actions").GetInt32());
+        Assert.Equal(
+            expectedFiles,
+            result.GetProperty("file_names").EnumerateArray().Select(f => f.GetString()!).ToList());
+
+        // And the ceiling, pinned so that widening the Python allowlist is what makes this line fail.
+        Assert.False(result.TryGetProperty("rows", out _));
+        string rowsError = result.GetProperty("rows_error").GetString()!;
+        Assert.Contains("v2Checkpoint", rowsError, StringComparison.Ordinal);
+        Assert.Contains("not yet supported", rowsError, StringComparison.Ordinal);
+    }
+
     // ── Statistics and pruning. ──
 
     /// <summary>

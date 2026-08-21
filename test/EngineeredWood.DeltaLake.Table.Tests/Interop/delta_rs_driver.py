@@ -135,32 +135,68 @@ def cmd_checkpoint_only_read(args):
     Moves every commit JSON at or below the checkpoint version out of the way, so a
     successful read proves the CHECKPOINT carried the state -- not the JSON commits.
     Renames rather than deletes so a failure leaves the table diagnosable.
+
+    Reports the reconstructed state (version, file list, add-action count) and, separately, the
+    materialized rows -- because those go through different layers with different limits. See below.
+
+    Finds a checkpoint of ANY naming scheme. Globbing `*.checkpoint.parquet` matched only the
+    classic name, which a `<n>.checkpoint.<uuid>.json` never does -- so every checkpoint assertion
+    reached through here silently applied to V1 only, and a V2 table would have reported "no
+    checkpoint file was written" rather than testing anything.
+
+    The `.checkpoint.` guard in the hide loop is not cosmetic either: a UUID-named V2 checkpoint IS
+    a `.json` file in the log directory whose name starts with the version, so without it the loop
+    hides the very checkpoint the test is trying to read from.
     """
     from deltalake import DeltaTable
     path = args["path"]
     logdir = os.path.join(path, "_delta_log")
 
-    checkpoints = sorted(glob.glob(os.path.join(logdir, "*.checkpoint.parquet")))
+    checkpoints = sorted(
+        p for p in glob.glob(os.path.join(logdir, "*.checkpoint.*"))
+        if os.path.isfile(p))
     if not checkpoints:
         return {"ok": False, "error": "no checkpoint file was written"}
-    cp_version = int(os.path.basename(checkpoints[-1]).split(".")[0])
+    newest = os.path.basename(checkpoints[-1])
+    cp_version = int(newest.split(".")[0])
 
     moved = []
     for f in sorted(glob.glob(os.path.join(logdir, "*.json"))):
         base = os.path.basename(f)
+        if ".checkpoint." in base:
+            continue
         if base[0].isdigit() and int(base.split(".")[0]) <= cp_version:
             os.rename(f, f + ".hidden")
             moved.append(base)
 
     dt = DeltaTable(path)
-    tbl = dt.to_pyarrow_table()
-    return {
+
+    # State reconstruction, which is the Rust engine (delta-kernel-rs) and works for every checkpoint
+    # form delta-rs understands.
+    result = {
         "checkpoint_version": cp_version,
+        "checkpoint_file": newest,
+        "sidecars": sorted(os.path.basename(p)
+                           for p in glob.glob(os.path.join(logdir, "_sidecars", "*"))),
         "hidden_commits": moved,
         "version": dt.version(),
-        "row_count": tbl.num_rows,
-        "rows": _rows(tbl),
+        "file_names": sorted(u.replace("\\", "/").split("/")[-1] for u in dt.file_uris()),
+        "num_add_actions": dt.get_add_actions().num_rows,
     }
+
+    # Materializing the DATA is a separate matter: `to_pyarrow_dataset` carries its own reader-feature
+    # allowlist in the PYTHON layer -- `SUPPORTED_READER_FEATURES` in deltalake/table.py, which as of
+    # 1.6.2 is {timestampNtz, variantType, variantType-preview} and so excludes deletionVectors and
+    # columnMapping as well. Reported rather than raised, so a table it declines still yields the
+    # state-level answers above instead of failing the whole command.
+    try:
+        tbl = dt.to_pyarrow_table()
+        result["row_count"] = tbl.num_rows
+        result["rows"] = _rows(tbl)
+    except Exception as exc:  # noqa: BLE001 - the message is the finding
+        result["rows_error"] = "{0}: {1}".format(type(exc).__name__, exc)
+
+    return result
 
 
 def cmd_raw_log(args):
@@ -197,6 +233,81 @@ def cmd_write(args):
         mode=args.get("mode", "error"),
     )
     return {"written": tbl.num_rows, "columns": names}
+
+
+def cmd_blind_append_ground_truth(args):
+    """Per commit shape on a CDF table: what delta-rs declares, and what it emits.
+
+    The C# side asserts on the pair. Deliberately reports the raw shape (which action
+    kinds appear, whether isBlindAppend was written at all) rather than a verdict.
+    """
+    import pyarrow as pa
+    from deltalake import DeltaTable, write_deltalake
+
+    base = pa.table({"id": pa.array([1, 2, 3], pa.int64()),
+                     "val": pa.array(["a", "b", "c"])})
+
+    def fresh(name):
+        path = os.path.join(args["path"], name)
+        write_deltalake(path, base, mode="overwrite",
+                        configuration={"delta.enableChangeDataFeed": "true"})
+        return path
+
+    def append(path):
+        write_deltalake(path, pa.table({"id": pa.array([4], pa.int64()),
+                                        "val": pa.array(["d"])}), mode="append")
+
+    def update(path):
+        DeltaTable(path).update(updates={"val": "'X'"}, predicate="id = 2")
+
+    def delete(path):
+        DeltaTable(path).delete(predicate="id = 3")
+
+    def merge_insert_only(path):
+        src = pa.table({"id": pa.array([99], pa.int64()), "val": pa.array(["z"])})
+        (DeltaTable(path).merge(source=src, predicate="t.id = s.id",
+                                source_alias="s", target_alias="t")
+         .when_not_matched_insert_all().execute())
+
+    def merge_matched_update(path):
+        src = pa.table({"id": pa.array([2], pa.int64()), "val": pa.array(["Y"])})
+        (DeltaTable(path).merge(source=src, predicate="t.id = s.id",
+                                source_alias="s", target_alias="t")
+         .when_matched_update_all().execute())
+
+    scenarios = []
+    for name, run in [("append", append),
+                      ("update", update),
+                      ("delete", delete),
+                      ("merge_insert_only", merge_insert_only),
+                      ("merge_matched_update", merge_matched_update)]:
+        path = fresh(name)
+        run(path)
+        # The LAST commit is the operation under test; earlier ones are table setup.
+        log = _raw_log_actions(path)
+        last = max(int(a["version"]) for a in log)
+        actions = [a["action"] for a in log if int(a["version"]) == last]
+        kinds = sorted({next(iter(a)) for a in actions})
+        info = next((a["commitInfo"] for a in actions if "commitInfo" in a), {})
+        # only_adds characterizes the FILE actions, so a bookkeeping action the commit happens to
+        # carry (txn, domainMetadata, commitInfo itself) does not make an adds-only commit look
+        # otherwise. Same definition as spark_driver.py's, deliberately: the two ground-truth suites
+        # are a pair, and a field that meant subtly different things in each would be worse than
+        # useless.
+        file_kinds = [k for k in kinds if k in ("add", "remove", "cdc")]
+        scenarios.append({
+            "name": name,
+            "operation": info.get("operation"),
+            "field_present": "isBlindAppend" in info,
+            "is_blind_append": info.get("isBlindAppend"),
+            "action_kinds": kinds,
+            "only_adds": len(file_kinds) > 0 and set(file_kinds) == {"add"},
+            "has_cdc": "cdc" in kinds,
+            "has_remove": "remove" in kinds,
+        })
+
+    import deltalake
+    return {"deltalake": deltalake.__version__, "scenarios": scenarios}
 
 
 def cmd_read_epoch_micros(args):
@@ -344,6 +455,7 @@ COMMANDS = {
     "raw_log": cmd_raw_log,
     "add_stats": cmd_add_stats,
     "write": cmd_write,
+    "blind_append_ground_truth": cmd_blind_append_ground_truth,
 }
 
 

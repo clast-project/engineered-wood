@@ -35,9 +35,14 @@ internal static class EncodingStrategyResolver
                 FloatingPointEncoding.Plain => Encoding.Plain,
                 _ => Encoding.ByteStreamSplit,
             },
-            PhysicalType.ByteArray => byteArrayEncoding == ByteArrayEncoding.DeltaByteArray
-                ? Encoding.DeltaByteArray
-                : Encoding.DeltaLengthByteArray,
+            PhysicalType.ByteArray => byteArrayEncoding switch
+            {
+                ByteArrayEncoding.DeltaByteArray => Encoding.DeltaByteArray,
+#pragma warning disable EWPARQUET0003 // FSST is intentionally selectable; the experimental signal lives on the enum values, not internal dispatch.
+                ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16 => Encoding.Fsst,
+#pragma warning restore EWPARQUET0003
+                _ => Encoding.DeltaLengthByteArray,
+            },
             PhysicalType.FixedLenByteArray when byteArrayEncoding == ByteArrayEncoding.DeltaByteArray
                 => Encoding.DeltaByteArray,
             _ => Encoding.Plain,

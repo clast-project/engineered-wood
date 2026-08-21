@@ -62,6 +62,16 @@ public sealed class GcsTableFileSystem : ITableFileSystem
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
     }
 
+    /// <summary>
+    /// GCS's documented object-name rules: CR and LF are forbidden outright, and an object may not be
+    /// named exactly <c>.</c> or <c>..</c>. Everything else GCS merely "strongly discourages"
+    /// (<c># [ ] * ? : " &lt; &gt; |</c>) and accepts — MEASURED against fake-gcs-server with an
+    /// in-memory backend, which round-trips all of them byte-identically. Discouraged is not a
+    /// constraint, so it is not reported here.
+    /// </summary>
+    public PathNameConstraints PathConstraints =>
+        PathNameConstraints.NoControlCharacters | PathNameConstraints.NoDotOnlySegments;
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix,

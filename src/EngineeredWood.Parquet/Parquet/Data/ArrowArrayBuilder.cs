@@ -28,6 +28,7 @@ internal static class ArrowArrayBuilder
         // For repeated columns, the leaf field type may be wrapped in ListType/MapType.
         // We need the element type for building the flat array.
         var arrowType = field.DataType;
+        MaybeConvertInt96(state, arrowType);
 
         // The number of non-null values is state.ValueCount.
         // If there are no def levels (required leaf), all values are present — build directly.
@@ -289,6 +290,7 @@ internal static class ArrowArrayBuilder
     public static IArrowArray Build(ColumnBuildState state, Field field, int rowCount)
     {
         var arrowType = field.DataType;
+        MaybeConvertInt96(state, arrowType);
 
         return arrowType switch
         {
@@ -321,6 +323,20 @@ internal static class ArrowArrayBuilder
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for array building."),
         };
+    }
+
+    /// <summary>
+    /// Narrows accumulated INT96 values to 64-bit timestamps when the column's Arrow type asks for
+    /// one. A no-op for every other physical type, and for an INT96 column left as raw bytes.
+    /// </summary>
+    /// <remarks>
+    /// The decoders write INT96 into the value buffer as 12 opaque bytes, so the conversion happens
+    /// once here rather than in each of the plain/dictionary/page paths that fill it.
+    /// </remarks>
+    private static void MaybeConvertInt96(ColumnBuildState state, IArrowType arrowType)
+    {
+        if (state.PhysicalType == PhysicalType.Int96 && arrowType is TimestampType ts)
+            state.ConvertInt96ToTimestamp(ts.Unit);
     }
 
     private static IArrowArray BuildNullArray(int length)
@@ -1042,13 +1058,19 @@ internal sealed class ColumnBuildState : IDisposable
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
 
+    // Dotted column path, for the diagnostics in ByteArrayCapacity. Null when the caller had none to give.
+    private readonly string? _columnPath;
+
     // For ByteArray/String (view mode): 16-byte views buffer + overflow data buffer
     private readonly ByteArrayOutputKind _byteArrayOutput;
     private NativeBuffer<byte>? _viewsBuffer;   // 16 bytes per non-null value (dense)
     private int _viewsCount;
 
+    // Set once ConvertInt96ToTimestamp has narrowed the buffer, so a second Build cannot redo it.
+    private bool _int96Converted;
+
     private readonly int _capacity;
-    private readonly int _elementSize; // bytes per element for fixed-width types
+    private int _elementSize; // bytes per element for fixed-width types (12 → 8 once INT96 is narrowed)
 
     // View entry layout (16 bytes):
     //   [0..3]  int32 Length
@@ -1078,13 +1100,14 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
-        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default)
+        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null)
     {
         _physicalType = physicalType;
         MaxDefLevel = maxDefLevel;
         MaxRepLevel = maxRepLevel;
         _capacity = capacity;
         _byteArrayOutput = byteArrayOutput;
+        _columnPath = columnPath;
 
         if (maxDefLevel > 0)
         {
@@ -1200,7 +1223,7 @@ internal sealed class ColumnBuildState : IDisposable
     }
 
     /// <summary>
-    /// Reserves space for <paramref name="count"/> boolean values (bit-packed).
+    /// Reserves space for every element of <paramref name="values"/> (bit-packed).
     /// Writes the decoded booleans into the native bit buffer.
     /// </summary>
     public void AddBoolValues(ReadOnlySpan<bool> values)
@@ -1251,7 +1274,7 @@ internal sealed class ColumnBuildState : IDisposable
         }
 
         // Ensure data buffer has enough space
-        int dataNeeded = _dataByteOffset + sourceData.Length;
+        int dataNeeded = CheckedDataBytes(sourceData.Length);
         if (dataNeeded > _dataBuffer!.ByteSpan.Length)
             _dataBuffer.Grow(dataNeeded);
 
@@ -1283,10 +1306,27 @@ internal sealed class ColumnBuildState : IDisposable
     /// </summary>
     internal Span<byte> ReserveByteArrayData(int byteCount)
     {
-        int needed = _dataByteOffset + byteCount;
+        int needed = CheckedDataBytes(byteCount);
         if (needed > _dataBuffer!.ByteSpan.Length)
             _dataBuffer.Grow(needed);
         return _dataBuffer.ByteSpan.Slice(_dataByteOffset, byteCount);
+    }
+
+    /// <summary>
+    /// The data-buffer write position after <paramref name="byteCount"/> more bytes, refusing rather than
+    /// wrapping when that exceeds what one Arrow array can address.
+    /// </summary>
+    /// <remarks>
+    /// The backstop for every decode path. The PLAIN decoder catches its own overflow earlier and more
+    /// precisely — it can still see the individual value lengths — but the dictionary, delta and FSST paths
+    /// all arrive here, and this is the one place they share. See <see cref="ByteArrayCapacity"/>.
+    /// </remarks>
+    private int CheckedDataBytes(int byteCount)
+    {
+        long needed = (long)_dataByteOffset + byteCount;
+        if (needed > ByteArrayCapacity.MaxBytes)
+            throw ByteArrayCapacity.ChunkTooLarge(_columnPath, needed);
+        return (int)needed;
     }
 
     /// <summary>
@@ -1356,7 +1396,7 @@ internal sealed class ColumnBuildState : IDisposable
 #endif
 
             // Append to overflow buffer
-            int needed = _dataByteOffset + len;
+            int needed = CheckedDataBytes(len);
             if (needed > _dataBuffer!.ByteSpan.Length)
                 _dataBuffer.Grow(needed);
             value.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
@@ -1473,6 +1513,87 @@ internal sealed class ColumnBuildState : IDisposable
         : _valueBuffer.ByteSpan.Slice(0, _physicalType == PhysicalType.Boolean
             ? (_boolBitOffset + 7) / 8
             : _valueByteOffset);
+
+    /// <summary>
+    /// Rewrites the accumulated INT96 values in place as 64-bit timestamps of <paramref name="unit"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>An INT96 is 8 bytes of nanoseconds-within-day followed by a 4-byte Julian day, both
+    /// little-endian. The rewrite runs forward over the same buffer: element <c>i</c> is read from
+    /// <c>[12i, 12i+12)</c> into locals before its 8 bytes are written at <c>[8i, 8i+8)</c>, and
+    /// that write always ends at or before <c>12(i+1)</c>, so it can never clobber a value still to
+    /// be read.</para>
+    /// <para>The day is read as a <em>signed</em> int32 and the microsecond arithmetic is allowed to
+    /// wrap, which together are what make a Spark-written file round-trip. Spark forms an INT96 as
+    /// <c>micros + 2440588 * MICROS_PER_DAY</c>, which overflows for a date far enough out and
+    /// stores a negative day; reading it back with the same modular arithmetic is the exact inverse
+    /// and recovers the microseconds Spark started from. parquet-testing's
+    /// <c>int96_from_spark.parquet</c> is the case in point — its year-290000 value comes back
+    /// exactly, where a reader that treats the day as unsigned (Arrow C++ does) returns garbage for
+    /// it. Nothing a non-overflowed writer can produce comes anywhere near the microsecond range,
+    /// so the wrap costs nothing elsewhere.</para>
+    /// <para>Nanoseconds are different: <c>timestamp[ns]</c> stops around 1677 and 2262, well
+    /// inside the range of dates a correct writer emits — 9999-12-31 is a Spark commonplace. There
+    /// the loss would be ours rather than the file's, and there is a remedy to point at, so an
+    /// out-of-range value is reported instead of wrapped into a plausible-looking date.</para>
+    /// </remarks>
+    public void ConvertInt96ToTimestamp(Apache.Arrow.Types.TimeUnit unit)
+    {
+        if (_int96Converted || _valueBuffer == null)
+            return;
+        _int96Converted = true;
+
+        const long JulianDayOfUnixEpoch = 2_440_588;
+        const long NanosPerDay = 86_400_000_000_000;
+        const long MicrosPerDay = 86_400_000_000;
+
+        bool nanoseconds = unit == Apache.Arrow.Types.TimeUnit.Nanosecond;
+        var bytes = _valueBuffer.ByteSpan;
+        for (int i = 0; i < _valueCount; i++)
+        {
+            var source = bytes.Slice(i * 12, 12);
+            long nanosOfDay = BinaryPrimitives.ReadInt64LittleEndian(source);
+            long julianDay = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(8));
+            long day = julianDay - JulianDayOfUnixEpoch;
+
+            long value;
+            if (nanoseconds)
+            {
+                try
+                {
+                    value = checked(day * NanosPerDay + nanosOfDay);
+                }
+                catch (OverflowException)
+                {
+                    throw new ParquetFormatException(Int96NanosecondRangeMessage(i, julianDay, nanosOfDay));
+                }
+            }
+            else
+            {
+                // Floor, not truncate-toward-zero: the negative part of a pre-1970 timestamp lives
+                // entirely in `day`, so flooring the (normally non-negative) intra-day remainder
+                // keeps the result monotonic in the value it came from.
+                long micros = nanosOfDay / 1000;
+                if (nanosOfDay < 0 && nanosOfDay % 1000 != 0)
+                    micros--;
+                value = unchecked(day * MicrosPerDay + micros);
+            }
+
+            BinaryPrimitives.WriteInt64LittleEndian(bytes.Slice(i * 8, 8), value);
+        }
+
+        _elementSize = sizeof(long);
+        _valueByteOffset = _valueCount * sizeof(long);
+    }
+
+    private string Int96NanosecondRangeMessage(int index, long julianDay, long nanosOfDay)
+    {
+        string where = _columnPath == null ? string.Empty : $" of column '{_columnPath}'";
+        return $"INT96 value at index {index}{where} (Julian day {julianDay}, {nanosOfDay} ns into " +
+            "the day) is outside the range of timestamp[ns] (1677-09-21 to 2262-04-11). Read the " +
+            "file with ParquetReadOptions { Int96Output = Int96OutputKind.TimestampMicroseconds } " +
+            "for a timestamp, or Int96OutputKind.FixedSizeBinary for the raw bytes.";
+    }
 
     /// <summary>Transfers the value buffer to an ArrowBuffer.</summary>
     public ArrowBuffer BuildValueBuffer()

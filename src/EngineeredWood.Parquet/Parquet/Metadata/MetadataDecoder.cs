@@ -571,6 +571,8 @@ internal static class MetadataDecoder
         Statistics? statistics = null;
         long? bloomFilterOffset = null;
         int? bloomFilterLength = null;
+        long? symbolTablePageOffset = null;
+        int? symbolTablePageLength = null;
 
         while (true)
         {
@@ -624,6 +626,12 @@ internal static class MetadataDecoder
                 case 15 when type == ThriftType.I32: // bloom_filter_length: i32
                     bloomFilterLength = checked((int)reader.ReadZigZagInt32());
                     break;
+                case 18 when type == ThriftType.I64: // symbol_table_page_offset: i64 (FSST proposal)
+                    symbolTablePageOffset = reader.ReadZigZagInt64();
+                    break;
+                case 19 when type == ThriftType.I32: // symbol_table_page_length: i32 (FSST proposal)
+                    symbolTablePageLength = checked((int)reader.ReadZigZagInt32());
+                    break;
                 default:
                     reader.Skip(type);
                     break;
@@ -650,6 +658,8 @@ internal static class MetadataDecoder
             Statistics = statistics,
             BloomFilterOffset = bloomFilterOffset,
             BloomFilterLength = bloomFilterLength,
+            SymbolTablePageOffset = symbolTablePageOffset,
+            SymbolTablePageLength = symbolTablePageLength,
         };
     }
 

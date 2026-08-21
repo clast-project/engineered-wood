@@ -1,7 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-namespace EngineeredWood.DeltaLake.Table;
+namespace EngineeredWood.DeltaLake;
 
 /// <summary>
 /// The isolation level a transaction is validated at when it commits concurrently with others.

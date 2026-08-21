@@ -127,6 +127,8 @@ public class LogListingCountTests : IDisposable
     {
         private int _listCalls;
 
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
         public int ListCalls => _listCalls;
 
         public void Reset() => _listCalls = 0;

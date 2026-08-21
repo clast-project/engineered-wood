@@ -43,7 +43,7 @@ public sealed class SnapshotBuilder
         long targetVersion = atVersion ?? listing.LatestVersion;
 
         if (targetVersion < 0)
-            throw new DeltaFormatException("Table has no commits.");
+            throw new DeltaTableNotFoundException("Table has no commits.");
 
         // Try to bootstrap from a checkpoint
         long replayFrom = 0;
@@ -64,8 +64,11 @@ public sealed class SnapshotBuilder
             {
                 var listed = CheckpointReader.SelectLatestCheckpoint(listing, targetVersion);
 
-                // Skip the re-read when listing just found the checkpoint that already failed.
-                if (listed is not null && listed.Version != hint?.Version)
+                // Skip the re-read only when listing found the SAME checkpoint that already failed —
+                // same version AND same file. Comparing versions alone was too coarse: a hint whose
+                // path is wrong names the version correctly, so the listing's candidate (which has
+                // the right path) was discarded as a duplicate and the table failed to open at all.
+                if (listed is not null && !SameCandidate(listed, hint))
                     await TryBootstrapAsync(listed).ConfigureAwait(false);
             }
 
@@ -149,21 +152,38 @@ public sealed class SnapshotBuilder
         // Read remaining commits after the compacted range. Already ascending from the one listing.
         var versions = listing.CommitsInRange(replayFrom, targetVersion).ToList();
 
-        // Read commits concurrently for performance
-        var commitTasks = versions.Select(v =>
-            new { Version = v, Task = log.ReadCommitAsync(v, cancellationToken) })
-            .ToList();
+        // Reads run ahead of application so a long tail is not one serial round-trip per commit — but the
+        // look-ahead is BOUNDED. Starting every read at once put one request per commit in flight
+        // simultaneously, which on a table whose log cleanup has not run is thousands against the object
+        // store (the throttling response to which is a 503, not faster reads), and held every commit's
+        // decoded actions in memory until the last one landed. A window makes both proportional to the
+        // window rather than to the tail. It never binds in the normal case: the tail is the commits since
+        // the last checkpoint, which delta.checkpointInterval keeps at ~10.
+        const int ReplayLookAhead = 32;
 
-        var commits = new (long Version, IReadOnlyList<DeltaAction> Actions)[commitTasks.Count];
-        for (int i = 0; i < commitTasks.Count; i++)
+        // AsTask because these are held in a queue rather than awaited where produced — a ValueTask is
+        // only valid to consume once, and storing one is exactly the pattern that makes that hard to see.
+        var inFlight = new Queue<(long Version, Task<IReadOnlyList<DeltaAction>> Read)>(ReplayLookAhead);
+        int nextToStart = 0;
+
+        void StartNext()
         {
-            commits[i] = (commitTasks[i].Version,
-                await commitTasks[i].Task.ConfigureAwait(false));
+            long v = versions[nextToStart++];
+            inFlight.Enqueue((v, log.ReadCommitAsync(v, cancellationToken).AsTask()));
         }
 
-        // Apply in version order
-        foreach (var (version, actions) in commits.OrderBy(c => c.Version))
+        while (nextToStart < versions.Count && inFlight.Count < ReplayLookAhead)
+            StartNext();
+
+        // Applied in dequeue order, which is `versions` order, which the one listing already sorted.
+        while (inFlight.Count > 0)
         {
+            var (version, read) = inFlight.Dequeue();
+            var actions = await read.ConfigureAwait(false);
+
+            if (nextToStart < versions.Count)
+                StartNext();
+
             if (version != nextNeeded)
                 firstMissing ??= nextNeeded;
             nextNeeded = version + 1;
@@ -174,9 +194,62 @@ public sealed class SnapshotBuilder
             firstMissing ??= nextNeeded;
 
         if (firstMissing is long missing)
-            throw IncompleteLog(missing, firstNeeded, targetVersion);
+            throw ReplayGap(listing, missing, firstNeeded, targetVersion);
 
         return builder.Build();
+    }
+
+    /// <summary>
+    /// Whether two checkpoint candidates name the same file, so that retrying the second after the
+    /// first failed would only repeat the same read.
+    /// </summary>
+    private static bool SameCandidate(LastCheckpointInfo listed, LastCheckpointInfo? hint) =>
+        hint is not null
+        && listed.Version == hint.Version
+        && listed.Parts == hint.Parts
+        && string.Equals(listed.V2CheckpointPath, hint.V2CheckpointPath, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The exception for a replay that could not cover its whole range — which is two different
+    /// failures wearing the same symptom, and this decides which one it was.
+    /// </summary>
+    /// <remarks>
+    /// A checkpoint that would have covered the hole, but which this reader passed over, leaves exactly
+    /// the same hole in the replay as a deleted commit. Reporting both as "the log is incomplete" sent a
+    /// user to look at retention settings for what is really a property of the checkpoint, so the
+    /// checkpoint is named as the cause instead. Two shapes of that: a body this reader has no decoder
+    /// for, and a multi-part checkpoint whose parts did not all land.
+    /// </remarks>
+    private static DeltaFormatException ReplayGap(
+        LogListing listing, long missing, long from, long through)
+    {
+        foreach (var (version, path) in listing.UndecodableCheckpoints)
+        {
+            // Only a checkpoint inside the hole is an explanation for it: one below `missing` was
+            // never needed, and one above `through` is not on the path to the requested version.
+            if (version >= missing && version <= through)
+            {
+                return new DeltaFormatException(
+                    DeltaErrorCodes.UnsupportedCheckpointFormat,
+                    $"Version {through} needs the checkpoint at version {version} ('{path}'), whose " +
+                    "body is neither of the two forms a UUID-named V2 checkpoint may take (JSON or " +
+                    "Parquet), so the versions it covers cannot be reconstructed. The log is intact — " +
+                    "this is a limitation of this reader, not missing history.");
+            }
+        }
+
+        if (listing.TornMultiPartCheckpoint(missing, through) is var (torn, present, declared))
+        {
+            return new DeltaFormatException(
+                DeltaErrorCodes.TruncatedTransactionLog,
+                $"Delta log is incomplete: version {missing} is missing, and the multi-part checkpoint " +
+                $"at version {torn} that would have covered it has only {present} of its {declared} " +
+                "parts. A checkpoint write that did not finish leaves a prefix like this, and loading " +
+                "it would silently drop the files in the parts that never landed. Building a snapshot " +
+                $"at version {through} requires every version in [{from}..{through}].");
+        }
+
+        return IncompleteLog(missing, from, through);
     }
 
     /// <summary>
@@ -185,7 +258,8 @@ public sealed class SnapshotBuilder
     /// table whose log has been cleaned it points at the checkpoint that should have been found.
     /// </summary>
     private static DeltaFormatException IncompleteLog(long missing, long from, long through) =>
-        new($"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
+        new(DeltaErrorCodes.TruncatedTransactionLog,
+            $"Delta log is incomplete: version {missing} is missing or unreadable and no checkpoint " +
             $"covers it. Building a snapshot at version {through} requires every version in " +
             $"[{from}..{through}].");
 
@@ -314,9 +388,11 @@ public sealed class SnapshotBuilder
     public Snapshot Build()
     {
         if (_metadata is null)
-            throw new DeltaFormatException("Table has no metadata action.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError, "Table has no metadata action.");
         if (_protocol is null)
-            throw new DeltaFormatException("Table has no protocol action.");
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError, "Table has no protocol action.");
 
         var deltaSchema = DeltaSchemaSerializer.Parse(_metadata.SchemaString);
         var arrowSchema = SchemaConverter.ToArrowSchema(deltaSchema);

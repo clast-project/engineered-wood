@@ -87,6 +87,8 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 - **Deeply nested**: list-of-list, map-of-map, list-of-map, etc.
 - **Decimal**: INT32→Decimal32, INT64→Decimal64, FLBA→Decimal128/256 with big-endian↔little-endian conversion
 - **Temporal**: Timestamp (millis/micros/nanos), Date, Time
+- **INT96**: decoded to a naive `timestamp[us]` by default; `ParquetReadOptions.Int96Output`
+  selects `timestamp[ns]` or the raw `fixed_size_binary[12]` instead
 
 ### Encodings
 
@@ -100,6 +102,31 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | BYTE_STREAM_SPLIT | yes | yes |
 | RLE (levels) | yes | yes |
 | BIT_PACKED (deprecated, levels) | yes | — |
+| ALP (experimental) | yes | opt-in |
+| FSST (experimental) | yes | opt-in |
+
+The last two are **unratified parquet-format proposals**, gated behind
+`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0003` for FSST) and
+off by default. Opt in per column or per file with
+`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
+`ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
+
+FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
+codes drawn from a symbol table trained per column chunk and stored in its own
+`SYMBOL_TABLE_PAGE`, which is what keeps per-value random access. It pays off on
+high-cardinality machine-generated text — URLs, UUIDs, log lines, identifiers — where a
+dictionary cannot help but the values still share substrings. The writer measures the
+result and falls back to `DELTA_LENGTH_BYTE_ARRAY` for any column chunk FSST did not
+actually shrink, so enabling it cannot make a file bigger.
+
+> **Encoding numbers.** ALP and FSST are both unratified proposals that claim encoding
+> 10. ALP shipped here first and keeps it, so **this library writes FSST as 11** — which
+> is also what the arrow-rs proof-of-concept expects to happen once ALP lands. Files
+> written here are self-consistent, but will not interoperate with an implementation that
+> settles on 10 for FSST until the spec picks a winner. Only the 8-bit code variant
+> (the spec's `FSST` symbol table type) is implemented; `FSST_16` is recognized and rejected with a
+> clear error rather than misread. See [doc/parquet-fsst.md](doc/parquet-fsst.md), which
+> also records how the arrow-rs and arrow-cpp proofs-of-concept differ from the spec.
 
 ## Features — ORC
 

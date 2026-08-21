@@ -1,0 +1,121 @@
+name: Interop (nightly)
+
+# The full external-validation matrix, including the Spark tier that the per-commit
+# build cannot afford: every Spark command starts a JVM, and a cold run also pays Ivy
+# resolution of the Delta jars.
+#
+# This is where the conformance guarantees actually live. Round-trip tests prove EW
+# agrees with itself; only these prove EW agrees with the Delta reference
+# implementation — and the bugs they have caught (partition-path escaping that made
+# Spark fail a whole table, a V2 checkpoint that dropped every tombstone) are all of
+# the kind that leave a round-trip test perfectly green.
+on:
+  schedule:
+    # 06:00 UTC daily. Nothing depends on the hour; it is simply off-peak.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  # This job and the drivers it runs are validated on any PR that CHANGES them.
+  # Without it the first proof that an edit works is a nightly failing at 06:00 with
+  # nobody watching — and `workflow_dispatch` cannot help, since it only appears once
+  # a workflow is on the default branch, i.e. after the change has already landed.
+  # Narrow enough that ordinary PRs never pay for it.
+  pull_request:
+    paths:
+      - '.github/workflows/interop-nightly.yml'
+      - 'test/EngineeredWood.DeltaLake.Table.Tests/Interop/**'
+
+jobs:
+  interop:
+    # Linux, not Windows, purely to avoid winutils.exe: Hadoop's Windows shim needs
+    # winutils.exe + hadoop.dll on PATH or it throws UnsatisfiedLinkError on the first
+    # directory listing. `Spark.Preflight` gates that requirement on Windows only, so
+    # on Linux a JDK is the whole prerequisite.
+    #
+    # The cost is that net472 cannot be built here (no .NET Framework reference
+    # assemblies), so this runs net10.0 only. That is not a real gap: the interop
+    # drivers are subprocesses and the assertions are framework-independent — net472
+    # coverage of the same tests comes from the per-commit build on Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # Spark 4.0 needs Java 17+.
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Pinned deliberately — see Spark.ValidatedAgainstVersion / DeltaRs /
+      # DuckDb.ValidatedAgainstVersion. These packages are the ORACLES the assertions
+      # were established against, so a behaviour change in one of them must arrive as
+      # a considered bump here rather than as a nightly that turned red on its own.
+      #
+      # delta-spark's major version must match pyspark's: 4.x pairs with Spark 4.0.
+      #
+      # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
+      # without it every delta-rs read raises "Pyarrow is required" — invisible on a
+      # dev box, which has pyarrow for the ORC cross-validation.
+      - name: Install interop oracles (Spark, delta-rs, DuckDB)
+        run: |
+          python -m pip install --disable-pip-version-check \
+            pyspark==4.0.1 delta-spark==4.0.0 \
+            deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
+
+      # Warms the Ivy cache so the first test does not pay jar resolution inside its
+      # own timeout, and fails here — with a readable error — rather than deep inside
+      # a test if the Delta jars cannot be resolved at all.
+      - name: Warm the Delta jar cache
+        run: |
+          python - <<'PY'
+          from pyspark.sql import SparkSession
+          from delta import configure_spark_with_delta_pip
+          builder = (SparkSession.builder.master("local[1]").appName("warm")
+                     .config("spark.sql.extensions",
+                             "io.delta.sql.DeltaSparkSessionExtension")
+                     .config("spark.sql.catalog.spark_catalog",
+                             "org.apache.spark.sql.delta.catalog.DeltaCatalog"))
+          configure_spark_with_delta_pip(builder).getOrCreate().stop()
+          PY
+
+      - name: Build
+        run: dotnet build test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj -f net10.0 --configuration Release
+
+      # EW_REQUIRE_* makes an unreachable toolchain a FAILURE rather than a silent
+      # no-op. Without them an interop test whose tier is missing returns early and
+      # xUnit reports it PASSED, so the nightly would go green having validated
+      # nothing — the exact failure mode this job exists to prevent.
+      - name: Interop tests
+        env:
+          EW_REQUIRE_SPARK_INTEROP: '1'
+          EW_REQUIRE_DELTA_INTEROP: '1'
+          EW_REQUIRE_DUCKDB_INTEROP: '1'
+        run: |
+          dotnet test test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj \
+            -f net10.0 --no-build --configuration Release \
+            --filter "FullyQualifiedName~Interop" \
+            --logger "trx;LogFileName=interop-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results
+          path: '**/interop-results.trx'

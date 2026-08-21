@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -209,6 +209,36 @@ public class BufferedTransactionTests : IDisposable
 
         // both deletes composed: id 2 (this transaction) and id 7 (the racer) are gone
         Assert.Equal(new long[] { 1, 3, 4, 5, 6, 8, 9, 10 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>
+    /// A snapshot-coupled commit whose pin went stale reports it as its OWN condition, not as a generic
+    /// concurrent write. The distinction is load-bearing for a host: everything else that collides here
+    /// leaves the staged actions valid at a later version, and this does not — the deletion-vector
+    /// ordinals and row positions in <c>extraActions</c> resolve against one exact active-file set.
+    /// </summary>
+    [Fact]
+    public async Task StaleExpectedVersion_ReportsStaleTransactionSnapshot_AndDemandsAReplan()
+    {
+        await using var table = await CreateTableAsync();
+        long pinned = table.CurrentSnapshot.Version;
+
+        // Someone else commits, moving the table off the version this commit is pinned to.
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([BuildBatch(100, 3)]);
+        }
+
+        await using var stale = await OpenAsync();
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await stale.CommitDataFilesAsync(
+                System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+                extraActions: [new TransactionId { AppId = "p", Version = 1, LastUpdated = 0 }],
+                expectedVersion: pinned, operation: "WRITE"));
+
+        Assert.Equal(DeltaTableErrorCodes.StaleTransactionSnapshot, ex.ErrorCode);
+        // NOT Replay: re-attempting these actions at a newer version is precisely what is unsafe.
+        Assert.Equal(ConflictRecovery.Replan, ex.Recovery);
     }
 
     /// <summary>A Delta application transaction (the <c>txn</c> action): an idempotent producer commits its

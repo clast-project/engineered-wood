@@ -26,13 +26,16 @@ internal static class NestedAssembler
     /// <param name="leafDefLevels">Raw definition levels per leaf (null for required leaves).</param>
     /// <param name="leafRepLevels">Raw repetition levels per leaf (null for non-repeated leaves).</param>
     /// <param name="rowCount">Number of rows in the row group.</param>
-    /// <param name="leafFixedListLengths">
+    /// <param name="leafFixedLengths">
     /// Optional per-leaf fixed list lengths from <see cref="FixedListDetector"/>. A non-zero entry
     /// means that leaf's levels were proven to describe fully-defined lists of that exact length
     /// and were therefore never materialised; the list offsets are derived arithmetically.
     /// </param>
-    /// <param name="extensionRegistry">
-    /// Optional Arrow extension registry. When supplied and the registry knows
+    /// <param name="options">
+    /// Optional read options. Every Arrow type this assembler derives for a nested field —
+    /// list element, map key/value, struct child — has to come from the same options that
+    /// produced the leaf arrays, or a wrapper would declare a type its own data does not have.
+    /// <see cref="ParquetReadOptions.ExtensionRegistry"/> is also read from here: when it knows
     /// <c>arrow.parquet.variant</c>, top-level groups annotated with the
     /// Parquet <c>VARIANT</c> logical type are returned as
     /// <see cref="VariantArray"/> rather than the bare storage
@@ -47,7 +50,7 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int rowCount,
-        ExtensionTypeRegistry? extensionRegistry = null)
+        ParquetReadOptions? options = null)
     {
         var result = new IArrowArray[root.Children.Count];
         int leafIndex = 0;
@@ -55,8 +58,8 @@ internal static class NestedAssembler
         for (int i = 0; i < root.Children.Count; i++)
         {
             var child = root.Children[i];
-            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,rowCount, ref leafIndex);
-            result[i] = WrapTopLevelExtension(array, child, extensionRegistry);
+            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,rowCount, ref leafIndex, options);
+            result[i] = WrapTopLevelExtension(array, child, options?.ExtensionRegistry);
         }
 
         return result;
@@ -87,23 +90,24 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         if (node.IsLeaf)
         {
             // Bare repeated primitive: leaf with Repeated → wrap in list
             if (node.Element.RepetitionType == FieldRepetitionType.Repeated)
-                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
             return leafArrays[leafIndex++];
         }
 
         if (ArrowSchemaConverter.IsListNode(node))
-            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
         if (ArrowSchemaConverter.IsMapNode(node))
-            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
-        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
     }
 
     private static IArrowArray AssembleStruct(
@@ -113,30 +117,34 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         int firstLeafIndex = leafIndex;
 
         var childArrays = new IArrowArray[node.Children.Count];
         for (int i = 0; i < node.Children.Count; i++)
-            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
         int lastLeafIndex = leafIndex;
 
-        var childFields = BuildChildFields(node);
+        var childFields = BuildChildFields(node, options);
         var structType = new StructType(childFields);
 
         if (node.Element.RepetitionType != FieldRepetitionType.Optional)
             return new StructArray(structType, parentCount, childArrays, ArrowBuffer.Empty, nullCount: 0);
 
         int structDefLevel = ComputeAccumulatedDefLevel(node);
+        int structRepLevel = ComputeAccumulatedRepLevel(node);
 
         int[]? defLevels = null;
+        int[]? repLevels = null;
         for (int i = firstLeafIndex; i < lastLeafIndex; i++)
         {
             if (leafDefLevels[i] != null)
             {
                 defLevels = leafDefLevels[i];
+                repLevels = leafRepLevels[i];
                 break;
             }
         }
@@ -147,13 +155,27 @@ internal static class NestedAssembler
         int nullCount = 0;
         var bitmapBytes = new byte[(parentCount + 7) / 8];
 
-        for (int i = 0; i < parentCount; i++)
+        // The level entries are NOT one per struct slot whenever the chosen leaf sits under a
+        // repeated node: a list child emits one entry per element, so a struct slot holding two
+        // list items contributes two entries and indexing them by slot reads the next slot's
+        // validity. An entry whose repetition level exceeds the struct's own continues the slot
+        // already open; the first entry at or below it opens the next one.
+        int slot = 0;
+        for (int i = 0; i < defLevels.Length && slot < parentCount; i++)
         {
+            if (repLevels != null && repLevels[i] > structRepLevel)
+                continue;
+
             if (defLevels[i] >= structDefLevel)
-                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
+                bitmapBytes[slot >> 3] |= (byte)(1 << (slot & 7));
             else
                 nullCount++;
+            slot++;
         }
+
+        // Defensive: levels that describe fewer slots than the parent claims leave the remainder
+        // unset, which reads as null. Counting them keeps the bitmap and null count consistent.
+        nullCount += parentCount - slot;
 
         var bitmapBuffer = new ArrowBuffer(bitmapBytes);
         return new StructArray(structType, parentCount, childArrays, bitmapBuffer, nullCount);
@@ -166,7 +188,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         int li = leafIndex++;
         var elementArray = leafArrays[li];
@@ -191,9 +214,11 @@ internal static class NestedAssembler
         // Filter out phantom entries from the element array
         elementArray = FilterElementArray(elementArray, defLevels, nodeDefLevel);
 
-        var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node)).DataType;
+        var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node), options).DataType;
         var elementField = new Apache.Arrow.Field("element", elementType, nullable: false);
         var listType = new ListType(elementField);
+
+        ValidateListExtent(node, offsets, parentCount, elementArray.Length, "element");
 
         var offsetsBuffer = ToArrowBuffer(offsets);
         var bitmapBuffer = nullCount > 0 ? new ArrowBuffer(bitmap!) : ArrowBuffer.Empty;
@@ -208,7 +233,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         var repeatedChild = node.Children[0];
 
@@ -236,13 +262,8 @@ internal static class NestedAssembler
                 repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty list markers) before inner recursive assembly
-        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
-        if (keepIndices != null)
-        {
-            int subtreeLeafEnd = firstLeafIndex + CountLeaves(repeatedChild);
-            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
-                keepIndices, firstLeafIndex, subtreeLeafEnd);
-        }
+        FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+            emptyDefThreshold, firstLeafIndex, firstLeafIndex + CountLeaves(repeatedChild));
 
         // Determine element node and assemble element array
         IArrowArray elementArray;
@@ -252,20 +273,20 @@ internal static class NestedAssembler
         {
             // 2-level: repeated leaf is the element
             elementArray = leafArrays[leafIndex++];
-            var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(repeatedChild)).DataType;
+            var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(repeatedChild), options).DataType;
             elementField = new Apache.Arrow.Field(repeatedChild.Name, elementType, nullable: false);
         }
         else if (ArrowSchemaConverter.IsListNode(repeatedChild))
         {
             // Nested list: repeated child is itself a LIST → recurse with elementCount
-            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-            elementField = NodeToField(repeatedChild);
+            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
+            elementField = NodeToField(repeatedChild, options);
         }
         else if (ArrowSchemaConverter.IsMapNode(repeatedChild))
         {
             // Nested map: repeated child is itself a MAP → recurse with elementCount
-            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-            elementField = NodeToField(repeatedChild);
+            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
+            elementField = NodeToField(repeatedChild, options);
         }
         else if (repeatedChild.Children.Count == 1)
         {
@@ -275,27 +296,27 @@ internal static class NestedAssembler
             if (ArrowSchemaConverter.IsListNode(elementNode))
             {
                 // Element is itself a LIST → recurse with elementCount
-                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
             else if (ArrowSchemaConverter.IsMapNode(elementNode))
             {
                 // Element is itself a MAP → recurse with elementCount
-                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
             else
             {
-                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
-            elementField = NodeToField(elementNode);
+            elementField = NodeToField(elementNode, options);
         }
         else
         {
             // 3-level with multiple children → struct element
             var structChildArrays = new IArrowArray[repeatedChild.Children.Count];
             for (int i = 0; i < repeatedChild.Children.Count; i++)
-                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
-            var structChildFields = BuildChildFields(repeatedChild);
+            var structChildFields = BuildChildFields(repeatedChild, options);
             var structType = new StructType(structChildFields);
             elementArray = new StructArray(structType, elementCount, structChildArrays, ArrowBuffer.Empty, nullCount: 0);
             elementField = new Apache.Arrow.Field(repeatedChild.Name, structType, nullable: false);
@@ -303,6 +324,8 @@ internal static class NestedAssembler
 
         // Filter out phantom entries (null/empty list markers) from the element array
         elementArray = FilterElementArray(elementArray, defLevels, emptyDefThreshold);
+
+        ValidateListExtent(node, offsets, parentCount, elementArray.Length, "element");
 
         var listType = new ListType(elementField);
         var offsetsBuffer = ToArrowBuffer(offsets);
@@ -318,7 +341,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         var keyValueGroup = node.Children[0]; // repeated key_value group
         int firstLeafIndex = leafIndex;
@@ -336,47 +360,34 @@ internal static class NestedAssembler
             repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty map markers) before inner recursive assembly
-        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
-        if (keepIndices != null)
-        {
-            int subtreeLeafEnd = firstLeafIndex + CountLeaves(keyValueGroup);
-            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
-                keepIndices, firstLeafIndex, subtreeLeafEnd);
-        }
+        FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+            emptyDefThreshold, firstLeafIndex, firstLeafIndex + CountLeaves(keyValueGroup));
 
         // Assemble key and value arrays with elementCount as parentCount
         var keyNode = keyValueGroup.Children[0];
-        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
-        IArrowArray? valueArray = null;
-        if (keyValueGroup.Children.Count > 1)
-        {
-            var valueNode = keyValueGroup.Children[1];
-            valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-        }
+        // Assembling the key advanced leafIndex past the key's whole subtree, so this is exactly where the
+        // value's leaves begin. `firstLeafIndex + 1` would say the same thing only for a single-leaf key,
+        // and would land INSIDE the key's own subtree for a struct-typed one — filtering the value against
+        // another column's definition levels.
+        int valueFirstLeafIndex = leafIndex;
+
+        // IsMapNode has already established that key_value carries exactly a key and a value; a group that
+        // does not is classified as a list and assembled by AssembleList instead.
+        var valueNode = keyValueGroup.Children[1];
+        var valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
         // Filter out phantom entries from key and value arrays
         keyArray = FilterElementArray(keyArray, defLevels, emptyDefThreshold);
-        if (valueArray != null)
-            valueArray = FilterElementArray(valueArray, leafDefLevels[firstLeafIndex + 1] ?? defLevels, emptyDefThreshold);
+        valueArray = FilterElementArray(valueArray, leafDefLevels[valueFirstLeafIndex] ?? defLevels, emptyDefThreshold);
 
         // Build the key_value struct array
-        var keyField = NodeToField(keyNode);
+        var keyField = NodeToField(keyNode, options);
         keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false); // keys are non-nullable
 
-        Apache.Arrow.Field valueField;
-        IArrowArray[] structChildren;
-        if (valueArray != null)
-        {
-            var valueNode = keyValueGroup.Children[1];
-            valueField = NodeToField(valueNode);
-            structChildren = [keyArray, valueArray];
-        }
-        else
-        {
-            valueField = new Apache.Arrow.Field("value", Apache.Arrow.Types.StringType.Default, nullable: true);
-            structChildren = [keyArray];
-        }
+        var valueField = NodeToField(valueNode, options);
+        IArrowArray[] structChildren = [keyArray, valueArray];
 
         var mapType = new MapType(keyField, valueField);
 
@@ -384,6 +395,8 @@ internal static class NestedAssembler
         int entryCount = keyArray.Length;
         var kvStructType = new StructType(new[] { keyField, valueField });
         var kvStruct = new StructArray(kvStructType, entryCount, structChildren, ArrowBuffer.Empty, nullCount: 0);
+
+        ValidateListExtent(node, offsets, parentCount, entryCount, "key/value entry");
 
         var offsetsBuffer = ToArrowBuffer(offsets);
         var bitmapBuffer = nullCount > 0 ? new ArrowBuffer(bitmap!) : ArrowBuffer.Empty;
@@ -511,40 +524,36 @@ internal static class NestedAssembler
         return bitmap;
     }
 
-    private static Apache.Arrow.Field NodeToField(SchemaNode node)
+    private static Apache.Arrow.Field NodeToField(SchemaNode node, ParquetReadOptions? options)
     {
         bool nullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
 
         if (node.IsLeaf)
         {
-            var arrowType = ArrowSchemaConverter.ToArrowType(BuildTempDescriptor(node));
+            // ToArrowField, not ToArrowType: only the former applies ByteArrayOutput, and a wrapper
+            // that skips it declares `utf8` over a LargeStringArray the leaf builder already made.
+            var arrowType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node), options).DataType;
             return new Apache.Arrow.Field(node.Name, arrowType, nullable);
         }
 
-        if (ArrowSchemaConverter.IsListNode(node))
-        {
-            var fields = ArrowSchemaConverter.ToArrowFields(
-                new SchemaNode { Element = node.Element, Children = node.Children, Parent = node.Parent });
-            // ToArrowFields returns fields for children; we need the list field for this node itself
-            // Use the converter's field-building instead
-        }
-
-        // Delegate to the ArrowSchemaConverter for full recursive handling
+        // Delegate to the ArrowSchemaConverter for full recursive handling. A list node needs no
+        // special case here: ToArrowFields returns fields for a root's CHILDREN, so the list field
+        // for this node comes from wrapping it in the dummy root below, exactly like any other group.
         var dummyRoot = new SchemaNode
         {
             Element = new SchemaElement { Name = "__root__", NumChildren = 1 },
             Children = [node],
             Parent = null,
         };
-        return ArrowSchemaConverter.ToArrowFields(dummyRoot)[0];
+        return ArrowSchemaConverter.ToArrowFields(dummyRoot, options)[0];
     }
 
-    private static Field[] BuildChildFields(SchemaNode groupNode)
+    private static Field[] BuildChildFields(SchemaNode groupNode, ParquetReadOptions? options)
     {
         // Delegate to ArrowSchemaConverter for correct list/map/struct field building
         var fields = new Field[groupNode.Children.Count];
         for (int i = 0; i < groupNode.Children.Count; i++)
-            fields[i] = NodeToField(groupNode.Children[i]);
+            fields[i] = NodeToField(groupNode.Children[i], options);
         return fields;
     }
 
@@ -649,22 +658,22 @@ internal static class NestedAssembler
     /// Returns indices where defLevels[i] >= threshold (entries that belong to actual elements,
     /// not phantom null/empty markers from an outer list). Returns null if all entries qualify.
     /// </summary>
-    private static int[]? ComputeKeepIndices(int[]? defLevels, int threshold, int numValues)
+    private static int[]? ComputeKeepIndices(int[]? defLevels, int threshold)
     {
         if (defLevels == null) return null;
 
         int keepCount = 0;
-        for (int i = 0; i < numValues; i++)
+        for (int i = 0; i < defLevels.Length; i++)
         {
             if (defLevels[i] >= threshold)
                 keepCount++;
         }
 
-        if (keepCount == numValues) return null; // No phantoms
+        if (keepCount == defLevels.Length) return null; // No phantoms
 
         var indices = new int[keepCount];
         int idx = 0;
-        for (int i = 0; i < numValues; i++)
+        for (int i = 0; i < defLevels.Length; i++)
         {
             if (defLevels[i] >= threshold)
                 indices[idx++] = i;
@@ -687,26 +696,100 @@ internal static class NestedAssembler
 
     /// <summary>
     /// Filters leaf arrays, def levels, and rep levels for leaves in [startLeaf, endLeaf)
-    /// by removing phantom entries (positions not in keepIndices). Creates shallow clones
-    /// of the arrays so that the caller's originals are not modified.
+    /// by removing phantom entries — the level entries that mark a null or empty list/map rather
+    /// than an element of one. Creates shallow clones of the arrays so that the caller's originals
+    /// are not modified.
     /// </summary>
+    /// <remarks>
+    /// Each leaf is filtered against its OWN definition levels. Sibling leaves under one repeated
+    /// group do not share a level index space: a leaf with a deeper repeated ancestor emits one
+    /// entry per element of that inner repetition, so it holds more entries than a sibling without
+    /// one. Deriving a single keep-list from the subtree's first leaf and applying it to all of them
+    /// therefore drops the wrong entries from every leaf that repeats more deeply — silently, since
+    /// the shorter list is still a valid set of indices into the longer array. The threshold is a
+    /// property of the schema path down to the repeated group, so it is the same in every leaf's
+    /// level space even though the indices are not.
+    /// </remarks>
     private static void FilterSubtree(
         ref IArrowArray[] leafArrays,
         ref int[]?[] leafDefLevels,
         ref int[]?[] leafRepLevels,
-        int[] keepIndices,
+        int emptyDefThreshold,
         int startLeaf, int endLeaf)
     {
+        int[]?[]? keepPerLeaf = null;
+        for (int i = startLeaf; i < endLeaf; i++)
+        {
+            if (ComputeKeepIndices(leafDefLevels[i], emptyDefThreshold) is not { } keep)
+                continue;
+
+            (keepPerLeaf ??= new int[]?[endLeaf - startLeaf])[i - startLeaf] = keep;
+        }
+
+        // Nothing in this subtree carries a phantom entry, so leave the caller's arrays alone.
+        if (keepPerLeaf is null)
+            return;
+
         leafArrays = (IArrowArray[])leafArrays.Clone();
         leafDefLevels = (int[]?[])leafDefLevels.Clone();
         leafRepLevels = (int[]?[])leafRepLevels.Clone();
 
         for (int i = startLeaf; i < endLeaf; i++)
         {
+            if (keepPerLeaf[i - startLeaf] is not { } keepIndices)
+                continue;
+
             leafDefLevels[i] = FilterLevelArray(leafDefLevels[i], keepIndices);
             leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
             leafArrays[i] = ArrowCompute.Take(leafArrays[i], keepIndices);
         }
+    }
+
+    /// <summary>
+    /// Verifies that the list offsets just built stay inside the child array they index.
+    /// </summary>
+    /// <remarks>
+    /// <para>Offsets come from the repetition levels; the child's length comes from the definition
+    /// levels. A file whose two level streams disagree produces a <see cref="ListArray"/> that
+    /// Arrow's own <c>Validate(full)</c> rejects — "offset for slot N out of bounds" — and that any
+    /// consumer indexing the offending row reads past the end of. Writers do emit such files:
+    /// DuckDB 1.5.5 writes one level entry per declared slot for a NULL fixed-size-list row where
+    /// the format allows exactly one, so its repetition levels claim elements the definition levels
+    /// never define. Handing the array back regardless would propagate the corruption far from the
+    /// file that caused it, so refuse it here instead — the same answer PyArrow gives.</para>
+    /// <para>The check is O(1) per nested level: only the terminal offset can exceed the child, since
+    /// the offsets this assembler builds are non-decreasing by construction. A child LONGER than the
+    /// terminal offset is not a violation — every offset still resolves — so it is left alone rather
+    /// than risking a false refusal of a file that reads correctly today.</para>
+    /// </remarks>
+    private static void ValidateListExtent(
+        SchemaNode node, int[] offsets, int parentCount, int childLength, string elementNoun)
+    {
+        int required = offsets[parentCount];
+        if (required <= childLength)
+            return;
+
+        ThrowInconsistentLevels(node, required, childLength, elementNoun);
+    }
+
+    private static void ThrowInconsistentLevels(
+        SchemaNode node, int required, int available, string elementNoun)
+        => throw new ParquetFormatException(
+            $"Malformed Parquet file: column '{ColumnPath(node)}' needs {required} {elementNoun}(s) " +
+            $"but the column chunk only defines {available}. Its repetition and definition levels " +
+            "disagree about how many values the column holds, so the decoded data cannot be " +
+            "represented as a valid Arrow array.");
+
+    /// <summary>
+    /// Builds the dotted schema path of a node, excluding the unnamed root.
+    /// </summary>
+    private static string ColumnPath(SchemaNode node)
+    {
+        var parts = new List<string>();
+        for (var current = node; current?.Parent != null; current = current.Parent)
+            parts.Add(current.Name);
+        parts.Reverse();
+        return string.Join(".", parts);
     }
 
     /// <summary>

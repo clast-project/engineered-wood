@@ -23,4 +23,13 @@
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- System.Text.Json ships in the shared framework from net8.0 on; net472 needs the package. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
+  </ItemGroup>
+
 </Project>

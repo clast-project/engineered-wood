@@ -181,6 +181,197 @@ def cmd_write(args):
             "rows": _rows(spark.read.format("delta").load(path))}
 
 
+def cmd_partition_paths(args):
+    """Write a partitioned table with Spark and report the RAW names it chose, uninterpreted.
+
+    This is the measurement that settles how the REFERENCE implementation encodes a partition
+    value, which is two distinct layers: the physical directory (Hive escaping) and the `add.path`
+    recorded in the log (a URL-encoding of that directory-relative path). Both are reported
+    verbatim -- nothing here decodes, normalises or compares them, because the whole point is to
+    capture what Spark actually wrote rather than what we believe it writes.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    df = spark.createDataFrame(args["rows"], args["schema"])
+    (df.write.format("delta")
+        .partitionBy(*args["partition_by"])
+        .mode(args.get("mode", "errorifexists"))
+        .save(path))
+
+    dirs = []
+    for root, dirnames, _ in os.walk(args["path"]):
+        for d in dirnames:
+            if d != "_delta_log":
+                dirs.append(
+                    os.path.relpath(os.path.join(root, d), args["path"]).replace("\\", "/"))
+
+    add_paths = []
+    for commit in sorted(glob.glob(os.path.join(args["path"], "_delta_log", "*.json"))):
+        with open(commit, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                action = json.loads(line)
+                if "add" in action:
+                    add_paths.append(action["add"]["path"])
+
+    return {"directories": sorted(dirs), "add_paths": sorted(add_paths)}
+
+
+def cmd_v2_checkpoint(args):
+    """Write a table whose checkpoints follow the V2 spec, and report the raw log layout.
+
+    `delta.checkpointPolicy=v2` selects the UUID-named checkpoint form and pulls in the
+    v2Checkpoint table feature; `delta.checkpointInterval=1` makes every commit checkpoint so the
+    scenario does not depend on how many commits it takes to trip the default interval.
+
+    The DELETE is deliberate: it leaves remove tombstones, which a checkpoint must carry and which
+    no file-set comparison would notice were missing.
+
+    `top_level_file_format` selects the checkpoint's BODY. PROTOCOL.md defines two --
+    `n.checkpoint.u.{json/parquet}` -- and this is a session config rather than anything Spark
+    derives from the table, so it is the only way to make the reference implementation emit the
+    parquet-bodied form. Default (unset) is json, which is what makes that the form seen in practice.
+
+    Nothing here interprets the log -- the file names, the sidecar listing and the raw
+    `_last_checkpoint` bytes are reported as-is, because the point is to see what the reference
+    implementation actually wrote.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+
+    # The session outlives this command -- one JVM serves the whole test run -- so a conf set here
+    # would silently change the checkpoint body for every later case. Restored in a finally.
+    body_conf = "spark.databricks.delta.checkpointV2.topLevelFileFormat"
+    body = args.get("top_level_file_format")
+    try:
+        if body:
+            spark.conf.set(body_conf, body)
+
+        df = spark.createDataFrame(args["rows"], args["schema"])
+        writer = (df.write.format("delta")
+                  .option("delta.checkpointPolicy", "v2")
+                  .option("delta.checkpointInterval", "1"))
+        if args.get("partition_by"):
+            writer = writer.partitionBy(*args["partition_by"])
+        writer.mode("errorifexists").save(path)
+
+        for stmt in args.get("sql") or []:
+            spark.sql(stmt.format(path=path))
+    finally:
+        if body:
+            spark.conf.unset(body_conf)
+
+    log_dir = os.path.join(args["path"], "_delta_log")
+    log_files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(log_dir, "*"))
+                       if os.path.isfile(p))
+    sidecars = sorted(os.path.basename(p)
+                      for p in glob.glob(os.path.join(log_dir, "_sidecars", "*")))
+
+    last_checkpoint = None
+    lc_path = os.path.join(log_dir, "_last_checkpoint")
+    if os.path.exists(lc_path):
+        with open(lc_path, "r", encoding="utf-8") as handle:
+            last_checkpoint = handle.read()
+
+    return {
+        "log_files": log_files,
+        "sidecars": sidecars,
+        "last_checkpoint": last_checkpoint,
+        "detail": _detail(spark, args["path"]),
+        "rows": _rows(spark.read.format("delta").load(path)),
+    }
+
+
+def cmd_checkpoint_only_read(args):
+    """Read an EW-written table with the commits its checkpoint subsumes moved out of the way.
+
+    The mirror of the EW-reads-Spark direction. A round trip through one implementation validates
+    that implementation's assumptions, not the format, so this is the only thing that says a
+    checkpoint EW wrote is one the reference implementation can actually rebuild state from.
+
+    Two things make it a real test rather than a shape check:
+
+    1. The commits at or below the checkpoint version are RENAMED away first, so a successful read
+       came from the checkpoint. Names containing `.checkpoint.` are skipped -- a UUID-named V2
+       checkpoint is itself a `.json` file in the log directory whose name starts with the version,
+       so without that guard this hides the very file it is trying to test.
+
+    2. Spark's own reconstructed TOMBSTONES are reported, twice -- once against the full log, once
+       from the checkpoint -- via `DeltaLog.unsafeVolatileSnapshot.tombstones`. Rows alone cannot
+       catch a checkpoint that dropped its unexpired removes: the ACTIVE file set is identical
+       either way, and what breaks is VACUUM retention safety and streaming/CDF removal detection.
+       Comparing the two lists is what makes the loss visible.
+
+       (VACUUM ... DRY RUN was tried first and is NOT a discriminator: MEASURED 2026-08-08, Spark
+       lists a file whose only reference is an unexpired tombstone as vacuumable even with the whole
+       log present, so the tombstone changes nothing about that answer.)
+
+    CALLER REQUIREMENT: at least one commit must exist ABOVE the checkpoint version. Spark builds a
+    log segment as "a checkpoint plus the commits after it" and fails with "Could not find any delta
+    files for version N" when the newest version is the checkpoint's own and its commit is gone. So a
+    table meant for this command should be checkpointed and then committed to once more -- which also
+    makes the test sharper, since everything at or below the checkpoint can then only have come from
+    the checkpoint.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    log_dir = os.path.join(args["path"], "_delta_log")
+
+    checkpoints = sorted(p for p in glob.glob(os.path.join(log_dir, "*.checkpoint.*"))
+                         if os.path.isfile(p))
+    if not checkpoints:
+        return {"ok": False, "error": "no checkpoint file was written"}
+    newest = os.path.basename(checkpoints[-1])
+    cp_version = int(newest.split(".")[0])
+
+    def tombstones():
+        # Spark caches a DeltaLog per path, so without clearing it the second call would report the
+        # first snapshot -- built from a log segment that no longer exists on disk.
+        jvm = spark._jvm
+        jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+        log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, path)
+        # `update()` takes Scala default arguments, which py4j cannot supply; forTable has just
+        # loaded a fresh snapshot, so the volatile one IS the current one. Collected as RemoveFile
+        # case classes and read through the `path()` accessor -- `select("path")` is varargs in
+        # Scala, which py4j cannot call with a single argument.
+        removes = log.unsafeVolatileSnapshot().tombstones().collect()
+        return sorted(r.path() for r in removes)
+
+    # The control, taken while every commit is still present.
+    with_commits = tombstones()
+
+    hidden = []
+    for f in sorted(glob.glob(os.path.join(log_dir, "*.json"))):
+        base = os.path.basename(f)
+        if ".checkpoint." in base:
+            continue
+        if base[0].isdigit() and int(base.split(".")[0]) <= cp_version:
+            os.rename(f, f + ".hidden")
+            hidden.append(base)
+
+    spark._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+    df = spark.read.format("delta").load(path)
+    rows = _rows(df)
+
+    from_checkpoint = tombstones()
+
+    return {
+        "checkpoint_file": newest,
+        "checkpoint_version": cp_version,
+        "sidecars": sorted(os.path.basename(p)
+                           for p in glob.glob(os.path.join(log_dir, "_sidecars", "*"))),
+        "hidden_commits": hidden,
+        "row_count": len(rows),
+        "rows": rows,
+        # Equal lists mean the checkpoint reproduced the log's remove actions, not just its adds.
+        "tombstones_with_commits": with_commits,
+        "tombstones_from_checkpoint": from_checkpoint,
+        "detail": _detail(spark, args["path"]),
+    }
+
+
 def cmd_sql(args):
     """Run statements against an existing EW-written table, then report the result.
 
@@ -602,8 +793,208 @@ def cmd_conflict_semantics(args):
     return {"isolation_levels": levels, "scenarios": [run(sc) for sc in scenarios]}
 
 
+def cmd_expr_oracle(args):
+    """Ask Spark what an expression MEANS, for differential-testing the EW parser and registry.
+
+    Phase 9 of the predicate-pushdown design replaces a generated grammar with a hand-written
+    one, which is only sound if something independent checks it. This is that something. Three
+    answers per expression, deliberately separated because they cost different things:
+
+      parse  -- sessionState.sqlParser.parseExpression, the SAME entry point Delta uses on
+                delta.constraints.* and delta.generationExpression (verified in the 4.0.0 jar:
+                Constraints$$anonfun$getCheckConstraints$1 calls it directly). `sql` comes back
+                fully parenthesised, so diffing it against our own rendering tests precedence
+                and associativity with no data and no evaluation.
+      type   -- resolved output type against an EMPTY frame carrying `schema`. Resolution and
+                type-checking still run, so this measures Spark's coercion rules -- decimal
+                promotion above all -- without evaluating a single row.
+      eval   -- per-row values over `rows`, which is what catches three-valued logic.
+
+    `parse` and `type` need no data, so a corpus can be harvested from `expressions` alone.
+
+    CONFIG IS PART OF THE ANSWER, not a detail. Delta pins nothing: CheckDeltaInvariant carries
+    no SQLConf reference, and a constraint is evaluated under whatever session writes the row --
+    measured, `a + b < 0` over (2147483647, 1) is ACCEPTED with ansi off and ARITHMETIC_OVERFLOW
+    with it on. So `conf` is echoed back in the result; record it with any expectation derived
+    from it, and never compare two corpora gathered under different settings.
+
+    args: {expressions: [str], schema?: [{name, type}], rows?: [[sql-literal]], conf?: {k: v}}
+
+    `rows` entries are SQL literal TEXT, one per schema field, each cast to the declared type --
+    see the comment at the construction site for why they are not JSON scalars.
+    """
+    spark = _spark()
+
+    applied = {}
+    for key, value in (args.get("conf") or {}).items():
+        applied[key] = value
+        spark.conf.set(key, value)
+    # Report what is actually in force, not merely what was asked for.
+    for key in ("spark.sql.ansi.enabled", "spark.sql.session.timeZone",
+                "spark.sql.storeAssignmentPolicy"):
+        applied.setdefault(key, spark.conf.get(key))
+
+    schema = args.get("schema") or []
+    ddl = ", ".join(f"{f['name']} {f['type']}" for f in schema)
+    frame = spark.createDataFrame([], ddl) if ddl else None
+
+    # Rows are SQL literal TEXT, not JSON scalars, and each is cast to its declared type. JSON
+    # has no faithful form for a decimal, a timestamp or a struct, so routing them through
+    # createDataFrame would need a type-mapping layer that has to grow with every type Spark
+    # adds. Spark's own literal syntax already covers all of them:
+    #   "CAST('12.34' AS decimal(10,2))", "named_struct('a', array(1,2))", "NULL"
+    rows = args.get("rows")
+    data = None
+    if ddl and rows:
+        selects = [
+            "SELECT " + ", ".join(
+                f"CAST({value} AS {field['type']}) AS {field['name']}"
+                for value, field in zip(row, schema))
+            for row in rows
+        ]
+        data = spark.sql(" UNION ALL ".join(selects))
+
+    parser = spark._jsparkSession.sessionState().sqlParser()
+    results = []
+    for expr in args["expressions"]:
+        entry = {"expression": expr}
+
+        try:
+            tree = parser.parseExpression(expr)
+            entry["parse"] = {"ok": True, "node": tree.getClass().getSimpleName(),
+                              "sql": tree.sql()}
+        except Exception as exc:
+            entry["parse"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        if frame is not None:
+            try:
+                entry["type"] = {"ok": True,
+                                 "type": frame.selectExpr(f"({expr}) AS r")
+                                              .schema[0].dataType.simpleString()}
+            except Exception as exc:
+                entry["type"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        if data is not None:
+            try:
+                entry["eval"] = {"ok": True,
+                                 "values": [r[0] for r in
+                                            data.selectExpr(f"({expr}) AS r").collect()]}
+            except Exception as exc:
+                entry["eval"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+
+        results.append(entry)
+
+    return {"conf": applied, "results": results}
+
+
+def cmd_blind_append_ground_truth(args):
+    """What delta-spark actually records in `commitInfo.isBlindAppend`, per operation shape.
+
+    EW infers blind-append from a commit's ACTIONS -- at least one add and no remove/metaData/protocol.
+    Delta does not infer: it records `readPredicates.isEmpty && readFiles.isEmpty` at commit time and
+    reads the recorded answer back. The claim in issue #88 is that those two disagree on a real and
+    common shape, and that the disagreement is in the UNSAFE direction: a statement that READ the table
+    and emitted nothing but adds looks blind to EW and is not.
+
+    This measures the disagreement instead of arguing it. Five commits, each a different shape:
+
+      seed                 INSERT INTO ... VALUES        -- writes nothing it read
+      append               DataFrame append              -- the genuine blind append
+      merge_insert_only    MERGE ... WHEN NOT MATCHED    -- reads the target to decide what to insert
+      insert_select_self   INSERT INTO t SELECT FROM t   -- the dedupe anti-join
+      delete               DELETE FROM                   -- reads and removes
+
+    For each it reports what Spark recorded AND whether the commit's file actions are adds only, which
+    is what EW's inference would conclude. A row where `only_adds` is true and `is_blind_append` is
+    false is a commit EW would exempt and Spark would not.
+
+    Read from the raw commit JSON rather than from DESCRIBE HISTORY: the field this is about is the one
+    on disk, and a reader consuming it sees the JSON. The history view is reported alongside so the two
+    can be compared if they ever disagree.
+    """
+    spark = _spark()
+    base = args["path"]
+    uri = _uri(os.path.join(base, "blind_append"))
+    local = os.path.join(base, "blind_append")
+
+    spark.sql(f"CREATE TABLE delta.`{uri}` (id BIGINT, v STRING) USING DELTA")
+
+    labels = {}
+
+    def label(name):
+        labels[_latest_version(local)] = name
+
+    spark.sql(f"INSERT INTO delta.`{uri}` VALUES (1, 'a'), (2, 'b')")
+    label("seed")
+
+    spark.createDataFrame([(10, "x"), (11, "y")], "id BIGINT, v STRING")         .write.format("delta").mode("append").save(uri)
+    label("append")
+
+    # Insert-only MERGE: reads the target to decide what is missing. The canonical case in #88.
+    spark.createDataFrame([(2, "b2"), (3, "c")], "id BIGINT, v STRING").createOrReplaceTempView("src")
+    spark.sql(
+        f"MERGE INTO delta.`{uri}` t USING src s ON t.id = s.id "
+        f"WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)")
+    label("merge_insert_only")
+
+    # The dedupe anti-join, in plain SQL: reads the table it appends to.
+    spark.sql(
+        f"INSERT INTO delta.`{uri}` SELECT id + 1000, v FROM delta.`{uri}` WHERE id < 3")
+    label("insert_select_self")
+
+    spark.sql(f"DELETE FROM delta.`{uri}` WHERE id = 1")
+    label("delete")
+
+    scenarios = []
+    for version, name in sorted(labels.items()):
+        commit = os.path.join(local, "_delta_log", "%020d.json" % version)
+        info, kinds = None, []
+        with open(commit, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                action = json.loads(line)
+                for key in action:
+                    kinds.append(key)
+                    if key == "commitInfo":
+                        info = action[key]
+        file_kinds = [k for k in kinds if k in ("add", "remove", "cdc")]
+        scenarios.append({
+            "name": name,
+            "version": version,
+            "operation": (info or {}).get("operation"),
+            "field_present": info is not None and "isBlindAppend" in info,
+            "is_blind_append": (info or {}).get("isBlindAppend"),
+            "action_kinds": sorted(set(kinds)),
+            # What EW's reader-side inference concludes from the shape alone.
+            "only_adds": len(file_kinds) > 0 and set(file_kinds) == {"add"},
+        })
+
+    history = [
+        {"version": row["version"], "operation": row["operation"],
+         "isBlindAppend": row["isBlindAppend"]}
+        for row in (r.asDict() for r in spark.sql(
+            f"DESCRIBE HISTORY delta.`{uri}`").select(
+                "version", "operation", "isBlindAppend").collect())
+    ]
+
+    return {"scenarios": scenarios, "history": sorted(history, key=lambda r: r["version"])}
+
+
+def _latest_version(local_path):
+    """The newest committed version, from the log directory."""
+    versions = []
+    for entry in glob.glob(os.path.join(local_path, "_delta_log", "*.json")):
+        stem = os.path.basename(entry)[:-len(".json")]
+        if stem.isdigit():
+            versions.append(int(stem))
+    return max(versions)
+
+
 COMMANDS = {
     "probe": cmd_probe,
+    "expr_oracle": cmd_expr_oracle,
     "read": cmd_read,
     "read_row_ids": cmd_read_row_ids,
     "read_changes": cmd_read_changes,
@@ -612,12 +1003,16 @@ COMMANDS = {
     "write_variant": cmd_write_variant,
     "write_nested_variant": cmd_write_nested_variant,
     "write": cmd_write,
+    "partition_paths": cmd_partition_paths,
+    "v2_checkpoint": cmd_v2_checkpoint,
+    "checkpoint_only_read": cmd_checkpoint_only_read,
     "sql": cmd_sql,
     "scan": cmd_scan,
     "checkpoint_stats": cmd_checkpoint_stats,
     "reference_checkpoint_schema": cmd_reference_checkpoint_schema,
     "create": cmd_create,
     "conflict_semantics": cmd_conflict_semantics,
+    "blind_append_ground_truth": cmd_blind_append_ground_truth,
 }
 
 

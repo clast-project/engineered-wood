@@ -131,6 +131,134 @@ internal static class StatisticsCollector
         };
     }
 
+    /// <summary>
+    /// Computes statistics for a dictionary-encoded FLOAT/DOUBLE column from its dictionary entries and
+    /// its per-row indices — the shape <see cref="BufferedParquetWriter"/> has at flush time, where the
+    /// column's Arrow values are long gone and <see cref="Compute"/>'s full scan is not available.
+    /// </summary>
+    /// <remarks>
+    /// The bounds come from the entries alone, which is exact because every entry of a dictionary is a
+    /// value some row holds: min/max over the distinct values IS min/max over the values.
+    /// <para>
+    /// <c>nan_count</c> is the one part that cannot come from the entries, because it counts VALUES and
+    /// not distinct values — so it is derived from the indices. That scan is skipped entirely when no
+    /// entry is NaN, which is the ordinary case; the cost is only paid by a column that actually has
+    /// NaNs in it. The count is exact either way, which is the point: a wrong nan_count is worse than an
+    /// absent one, and the field is mandatory for FLOAT/DOUBLE.
+    /// </para>
+    /// </remarks>
+    public static Statistics ComputeFloatingPointFromDictEntries(
+        in DictionaryEncoder.DictionaryResult dictResult,
+        PhysicalType physicalType,
+        long nullCount,
+        bool floatingPointTotalOrder)
+    {
+        int dictCount = dictResult.DictionaryCount;
+        if (dictCount == 0)
+        {
+            // No values ⇒ no NaN. nan_count is mandatory for FP columns even at zero.
+            return new Statistics { NullCount = nullCount, NanCount = 0L };
+        }
+
+        bool isFloat = physicalType == PhysicalType.Float;
+        int elementSize = isFloat ? 4 : 8;
+        var span = dictResult.DictionaryPageData.AsSpan();
+
+        // NaN is excluded from the bounds, exactly as the full scan excludes it.
+        var (minBytes, maxBytes, _, _) = isFloat
+            ? ComputeFixedMinMaxTypedFloat(span, dictCount, elementSize)
+            : ComputeFixedMinMaxTypedDouble(span, dictCount, elementSize);
+
+        var nanEntries = FindNaNEntries(span, dictCount, isFloat);
+        long nanCount = 0;
+        int firstNaNEntry = -1;
+        if (nanEntries != null)
+            nanCount = CountNaNRows(dictResult, nanEntries, out firstNaNEntry);
+
+        if (minBytes is null && floatingPointTotalOrder && nanCount > 0)
+        {
+            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk records the NaN as both
+            // bounds; under TYPE_ORDER, min/max are omitted. Which NaN is not arbitrary — payloads differ
+            // — so it is the first in ROW order, the one the full scan would have picked.
+            minBytes = maxBytes = span.Slice(firstNaNEntry * elementSize, elementSize).ToArray();
+        }
+
+        return new Statistics
+        {
+            NullCount = nullCount,
+            Min = minBytes,
+            Max = maxBytes,
+            MinValue = minBytes,
+            MaxValue = maxBytes,
+            IsMinValueExact = minBytes != null ? true : (bool?)null,
+            IsMaxValueExact = maxBytes != null ? true : (bool?)null,
+            NanCount = nanCount,
+        };
+    }
+
+    /// <summary>
+    /// Flags which dictionary entries are NaN, or returns <see langword="null"/> when none is — the
+    /// signal to the caller that no index scan is needed at all.
+    /// </summary>
+    private static bool[]? FindNaNEntries(ReadOnlySpan<byte> dictPage, int dictCount, bool isFloat)
+    {
+        bool[]? flags = null;
+        if (isFloat)
+        {
+            var values = MemoryMarshal.Cast<byte, float>(dictPage[..(dictCount * 4)]);
+            for (int i = 0; i < dictCount; i++)
+            {
+                if (!float.IsNaN(values[i])) continue;
+                flags ??= new bool[dictCount];
+                flags[i] = true;
+            }
+        }
+        else
+        {
+            var values = MemoryMarshal.Cast<byte, double>(dictPage[..(dictCount * 8)]);
+            for (int i = 0; i < dictCount; i++)
+            {
+                if (!double.IsNaN(values[i])) continue;
+                flags ??= new bool[dictCount];
+                flags[i] = true;
+            }
+        }
+
+        return flags;
+    }
+
+    /// <summary>
+    /// Counts the rows whose index points at a NaN entry, and reports the entry the FIRST such row
+    /// points at. Reads whichever index form the dictionary result carries.
+    /// </summary>
+    private static long CountNaNRows(
+        in DictionaryEncoder.DictionaryResult dictResult, bool[] nanEntries, out int firstNaNEntry)
+    {
+        long nanCount = 0;
+        firstNaNEntry = -1;
+
+        if (dictResult.Indices is { } indices)
+        {
+            foreach (int index in indices)
+            {
+                if (!nanEntries[index]) continue;
+                if (nanCount == 0) firstNaNEntry = index;
+                nanCount++;
+            }
+        }
+        else if (dictResult.IndexRuns is { } runs)
+        {
+            for (int r = 0; r < runs.Values.Length; r++)
+            {
+                if (!nanEntries[runs.Values[r]]) continue;
+                if (nanCount == 0) firstNaNEntry = runs.Values[r];
+                nanCount += runs.Lengths[r];
+            }
+        }
+
+        return nanCount;
+    }
+
     private static (byte[]?, byte[]?, bool, bool) WithExact((byte[]? min, byte[]? max) result)
         => (result.min, result.max, true, true);
 

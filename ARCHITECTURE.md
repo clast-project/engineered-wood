@@ -114,16 +114,19 @@ src/
     VortexFileFormat.cs                 Magic / EndOfFile constants
   EngineeredWood.DeltaLake/             Delta transaction log (low-level)
     Actions/                            AddFile, RemoveFile, MetadataAction, Protocol, etc.
-    Log/                                NDJSON commit read/write, log compaction, in-commit timestamps
+    Log/                                NDJSON commit read/write, log compaction, in-commit timestamps,
+                                          LogCommitter (the optimistic-concurrency commit loop)
+    Concurrency/                        ConflictChecker + ReadSet — the pure OCC verdict function
     Checkpoint/                         V1 (Parquet) and V2 (JSON + sidecar) checkpoint reader/writer
     Snapshot/                           Snapshot reconstruction
     Schema/                             Delta schema model, ColumnMapping, TypeWidening, IcebergCompat
     DeletionVectors/                    RoaringBitmap reader/writer, Base85 codec
     RowTracking/                        Row tracking config + writer
     ChangeDataFeed/                     CDF config
+    DeltaFilePruner.cs                  Partition + stats predicate pushdown
+    IsolationLevel.cs                   WriteSerializable / Serializable
   EngineeredWood.DeltaLake.Table/       Delta table API (high-level Arrow I/O)
     DeltaTable.cs                       Open / Read / Write / Update / Delete / Compact / Vacuum
-    DeltaFilePruner.cs                  Partition + stats predicate pushdown
     Partitioning/, Compaction/, Vacuum/, ChangeDataFeed/, IdentityColumns/, RowTracking/, Stats/, TypeWidening/
   EngineeredWood.Iceberg/               Iceberg metadata + scan planning
     Manifest/                           Manifest file/list types and Avro-encoded I/O
@@ -286,6 +289,8 @@ ParquetFileReader.ReadRowGroupAsync()
 | DELTA_LENGTH_BYTE_ARRAY | `DeltaLengthByteArrayDecoder` | Delta-encoded lengths + raw data |
 | DELTA_BYTE_ARRAY | `DeltaByteArrayDecoder` | Delta-encoded prefix lengths + suffix lengths + suffix data |
 | BYTE_STREAM_SPLIT | `ByteStreamSplitDecoder` | AVX2 SIMD with scalar fallback; interleaved byte streams for float/double |
+| ALP (experimental, 10) | `AlpDecoder` | Unratified proposal; decimal-aware integer encoding + FOR + bit-packing, per 1024-value vector |
+| FSST (experimental, 11) | `FsstPageDecoder` + `FsstSymbolTable` | Unratified proposal; symbol table lives in a chunk-level `SYMBOL_TABLE_PAGE`, data pages carry a 9-byte header + end-offset array + code stream |
 
 **Arrow array construction** — `ArrowArrayBuilder` dispatches by Arrow type. For nullable flat columns, it scatters non-null values right-to-left in-place to open gaps for nulls, avoiding a temporary buffer. Validity bitmaps are built from definition levels with SIMD (`Vector256`/`Vector128`) when available.
 
@@ -327,10 +332,12 @@ ParquetFileWriter.WriteRowGroupAsync(RecordBatch)
 | Boolean | RLE (1-bit) | PLAIN |
 | Int32, Int64 | DELTA_BINARY_PACKED | PLAIN |
 | Float, Double | BYTE_STREAM_SPLIT | PLAIN |
-| ByteArray | DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY | PLAIN |
+| ByteArray | DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, or FSST | PLAIN |
 | FixedLenByteArray | DELTA_BYTE_ARRAY | PLAIN |
 
 Dictionary encoding is attempted first (unless disabled or Boolean). Cardinality threshold: 20% of non-null values. The `DictionaryEncoder` uses an open-addressing hash table with FNV-1a hashing for ByteArray/FLBA to avoid GC pressure from collision chains.
+
+**FSST** inverts the usual page-at-a-time flow, because its symbol table is shared by the whole column chunk and so cannot be known until every value has been seen. `FsstCompressedColumn.TryCompress` trains the table and compresses the chunk's non-null values once, up front; the data pages that follow are slices of that one payload, with their end offsets rebased onto each page's own data section. Compressing eagerly is also what makes the proposal's "fall back if FSST did not help" rule answerable before any page is written — `TryCompress` returns null and the chunk reverts to `DELTA_LENGTH_BYTE_ARRAY`. Two details are load-bearing: codes are renumbered into ascending-length order (the wire format stores a length histogram, not per-symbol lengths, so code order *is* the length information), and the symbol table page is written before the data pages with its offset recorded in `ColumnMetaData.symbol_table_page_offset`, which the reader uses as the chunk's start the way it uses the dictionary page offset.
 
 **Write options** — `ParquetWriteOptions` controls compression (per-column overrides), page version, page size, dictionary limits, row group splitting, byte array encoding strategy, key-value metadata, and application identifier.
 
@@ -810,9 +817,9 @@ Function calls dispatch to an optional `IFunctionRegistry`. The library ships no
 
 Two-layer API:
 
-- **`EngineeredWood.DeltaLake`** — Transaction log: actions (`AddFile`, `RemoveFile`, `MetadataAction`, `ProtocolAction`, `CommitInfo`, `DomainMetadata`, `DeletionVector`, etc.), NDJSON commit reader/writer (`TransactionLog`), V1/V2 checkpoint reader/writer, snapshot reconstruction, log compaction, in-commit timestamps. Also: schema model (`StructType`/`StructField`/`PrimitiveType`), column mapping (id and name modes), type widening, identity columns, Iceberg compatibility validation, deletion vectors (RoaringBitmap reader/writer with Base85 codec), row tracking, change data feed config.
+- **`EngineeredWood.DeltaLake`** — Transaction log: actions (`AddFile`, `RemoveFile`, `MetadataAction`, `ProtocolAction`, `CommitInfo`, `DomainMetadata`, `DeletionVector`, etc.), NDJSON commit reader/writer (`TransactionLog`), V1/V2 checkpoint reader/writer, snapshot reconstruction, log compaction, in-commit timestamps. **Reading and updating a log is complete here**: `LogCommitter` runs the optimistic-concurrency commit loop — attempt, conflict-check via `ConflictChecker`, rebase, retry, checkpoint on interval — so a host with its own data plane never needs the table layer to commit. Also: schema model (`StructType`/`StructField`/`PrimitiveType`), column mapping (id and name modes), type widening, identity columns, Iceberg compatibility validation, deletion vectors (RoaringBitmap reader/writer with Base85 codec), row tracking, change data feed config, and `DeltaFilePruner` (partition + statistics file skipping).
 
-- **`EngineeredWood.DeltaLake.Table`** — Arrow-based table API: `DeltaTable.OpenAsync` / `CreateAsync`, `WriteAsync` / `ReadAllAsync` / `ReadAtVersionAsync` / `ReadAtTimestampAsync`, `UpdateAsync` / `DeleteAsync`, `CompactAsync`, `VacuumAsync`. Also: identity column generation, partition splitting/path encoding, change data feed reader/writer, type widening on read, stats collection, deletion vector filtering on read.
+- **`EngineeredWood.DeltaLake.Table`** — Arrow-based table API: `DeltaTable.OpenAsync` / `CreateAsync`, `WriteAsync` / `ReadAllAsync` / `ReadAtVersionAsync` / `ReadAtTimestampAsync`, `UpdateAsync` / `DeleteAsync`, `CompactAsync`, `VacuumAsync`. Also: identity column generation, partition splitting/path encoding, change data feed reader/writer, type widening on read, stats collection, deletion vector filtering on read. It commits through the log layer's `LogCommitter`, supplying the two rebases that only a data plane can do (deletion-vector union / row-id remap, and row-tracking id re-derivation) as an `ICommitRebaseHandler`.
 
 ### Read pipeline
 
@@ -847,22 +854,33 @@ DeltaTable.WriteAsync(batches)
   │    │   id + commit version into the declared hidden columns
   │    └─ ParquetFileWriter.WriteRowGroupAsync
   ├─ Build AddFile actions (Stats, BaseRowId, DefaultRowCommitVersion, etc.)
-  ├─ CommitOccAsync — the optimistic-concurrency loop
+  ├─ CommitOccAsync → LogCommitter.CommitAsync — the optimistic-concurrency loop
+  │    ├─ ProtocolVersions.ValidateWriteSupport (the gate travels with the commit)
   │    ├─ TransactionLog.WriteCommitAsync (NDJSON, atomic create-if-absent)
-  │    └─ on collision: read readVersion+1..latest, run ConflictChecker,
-  │       rebase and retry if nothing we read was invalidated, else abort
+  │    └─ on collision: read readVersion+1..latest, run the table's
+  │       ICommitRebaseHandler, run ConflictChecker, rebase and retry if
+  │       nothing we read was invalidated, else abort
   └─ Auto-checkpoint at CheckpointInterval
 ```
 
 ### Concurrency and the transaction surface
 
 Commits go through an optimistic-concurrency loop rather than failing on any
-collision. `DeltaTransaction` (public, via `StartTransaction`) records a read
-version plus staged actions, and `ConflictChecker` is a pure verdict function
-over the commits that landed in between. Conflicts are resolved at row
-granularity where possible: two deletes of disjoint rows in one file union their
-deletion vectors, and a delete whose file was concurrently compacted is remapped
-by stable row id. Details in [`doc/delta-concurrency.md`](doc/delta-concurrency.md).
+collision. The loop itself is `LogCommitter`, in the **log** layer: it owns the
+protocol gate, the retry, the conflict verdict, the post-commit snapshot
+refresh, and checkpoint-on-interval, and it never inspects the actions beyond
+handing them to the log — so a host with its own Parquet, statistics and
+deletion vectors can commit with real OCC without taking the Arrow data plane.
+
+`DeltaTransaction` (public, via `StartTransaction`) records a read version plus
+staged actions, and `ConflictChecker` is a pure verdict function over the
+commits that landed in between. What the table layer adds is an
+`ICommitRebaseHandler`, for the actions whose CONTENT is coupled to the version
+they land at. That is where conflicts get resolved at row granularity: two
+deletes of disjoint rows in one file union their deletion vectors, a delete
+whose file was concurrently compacted is remapped by stable row id, and
+row-tracking `baseRowId`s are re-derived against the advanced high-water mark.
+Details in [`doc/delta-concurrency.md`](doc/delta-concurrency.md).
 
 ### Embedding seam
 

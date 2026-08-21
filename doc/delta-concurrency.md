@@ -70,7 +70,99 @@ exempts a concurrent *blind append* and nothing else; blinding also drops the `P
 unrelated statements in the same transaction, admitting a concurrentAppend that both levels catch —
 pinned by `StagedRowDelete_DoesNotExemptTheTransactionsReadPredicates`.
 
+## Derived from the actions, or declared
+
+`ConflictChecker.Check` takes the actions the transaction is about to commit, and reads two things off
+them: whether it changes the metadata, and which paths it removes. Both used to be stated separately —
+`plannedRemovePaths` as a parameter, `metadataChanged` not at all.
+
+The test for which way a fact should travel is whether the actions record it:
+
+| fact | source | why |
+|---|---|---|
+| removes | derived | a `RemoveFile` *is* the removal |
+| metadata change | derived | a `MetadataAction` *is* the change |
+| reads | **declared** (`ReadSet`) | a commit does not record what it looked at |
+| `isBlindAppend` | **declared** | a property of the transaction's reads, same reason |
+
+Deriving is not merely tidier. A restated fact can contradict the thing it restates, and this one did:
+`plannedRemovePaths`'s documentation had to warn that naming a merely-*read* path there would report a
+concurrent delete of it as delete/delete rather than the concurrentDeleteRead it is. The table layer
+carried a paragraph explaining that its read-set had to be a *different object* from the removed-path set
+for that reason. Derived from the actions, the mistake is unrepresentable — a read path is not a
+`RemoveFile` — and both the warning and the paragraph are gone.
+
+The converse holds for reads. `ReadSet.Blind` is the *default*, so it means "this caller said nothing",
+not "this caller declares it read nothing"; sourcing a spec field off it would turn every silent caller
+into an assertive one. That is why `isBlindAppend` is asked for rather than inferred here, even though a
+later reader may end up inferring it (below).
+
+## How "blind append" is decided
+
+Blind-append is a property of the *writer's transaction* — `readPredicates.isEmpty &&
+readFiles.isEmpty` — not of the actions it emitted, so only the writer knows it, and Delta records the
+answer in `commitInfo.isBlindAppend`. `ConflictChecker.IsBlindAppend` answers in three steps:
+
+1. **A declared boolean flag wins**, including a `false` on a commit that contains nothing but adds.
+   Delta itself only ever reads the flag.
+2. **Absent or malformed, a `cdc` action means not blind.** A change-data file records row-level
+   changes, so the statement located those rows and therefore read. This is the only *positive*
+   evidence in the fallback; everything else is an absence.
+3. **Otherwise infer from the shape**: at least one add, and no remove, metadata, or protocol action.
+
+Step 3 errs unsafely on its own — `INSERT INTO t SELECT … FROM t` and an insert-only `MERGE` both emit
+adds only and both plainly read — which is why step 1 exists and why Delta makes no inference at all.
+We keep the fallback rather than following Delta into `getOrElse(false)` because two populations of
+unflagged commit are not going away: everything committed before this library emitted the flag, and
+**everything delta-rs writes**. delta-rs declares `isBlindAppend` on no commit shape at all —
+measured, not read off its source, by `DeltaRsBlindAppendGroundTruthTests` — so on a table it maintains
+the fallback is the whole answer, and step 2 is what keeps an insert-only `MERGE` there from being
+exempted from a concurrent-append check.
+
+The rule has exactly one implementation. `DeltaTable.CheckLogicalRebaseAsync` calls the same method,
+after a period where it kept a second copy that disagreed.
+
+### And one term that judges *us*
+
+Being a blind append is not enough to earn the exemption; **this** transaction has to qualify for it too.
+Delta's gate:
+
+```scala
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  case SnapshotIsolation =>
+    Seq.empty
+}
+```
+
+Under `WriteSerializable`, a transaction that itself changes the metadata falls through to the
+`Serializable` branch and examines concurrent blind appends too. The exemption is justified by a blind
+append not having depended on anything we did — but a schema change is not local to the files we read,
+and an append written against the *old* schema need not still be valid under the new one.
+
+This is a different rule from "a concurrent `metaData` action conflicts unconditionally" (rules 1 and 2
+above), which judges the *winning* commit. This one judges ours, and only widens which adds get examined
+— it never manufactures a conflict on its own.
+
+**Metadata, not protocol.** Delta's `metadataChanged` is `newMetadata.nonEmpty`, assigned by a loop whose
+only case is `case m: Metadata`; a `Protocol` action never sets it (checked at `v4.0.0`). Including
+protocol would be *stricter* than Delta — a transaction that only enables a table feature would start
+conflicting with concurrent appends — and gratuitous strictness about concurrency is its own defect.
+
+`ConflictChecker.ExamineConcurrentAdds` is the whole gate, and both paths call it. Sharing only the
+blind-append *rule* while each path decided what to do with the answer is precisely how the previous
+divergence went live, so the gate is shared too. `BlindAppendRebaseParityTests` pins the agreement.
+
+`SnapshotIsolation` has no counterpart in our `IsolationLevel`, which is why the Scala reads as three
+cases and ours as two.
+
 ## Entry points
+
+All of the OCC core lives in **`EngineeredWood.DeltaLake`** (the log layer), and is public: a host with
+its own data plane can commit with real optimistic concurrency without taking the table layer.
 
 - `Concurrency/ConflictChecker.cs` — pure, no I/O. Rules in order: metadata change, protocol change,
   delete/delete, concurrentDeleteRead (`dataChange=false` compaction exempt), concurrentAppend (blind
@@ -78,12 +170,29 @@ pinned by `StagedRowDelete_DoesNotExemptTheTransactionsReadPredicates`.
 - `IsolationLevel.cs` — public enum, `WriteSerializable` (default) / `Serializable`. The two differ in
   exactly two places: whether a concurrent blind append matching read predicates conflicts, and the
   row-level reconciliation narrowing above.
+- `Log/LogCommitter.cs` — the loop itself. Protocol gate, attempt, read `readVersion+1..latest` on a
+  collision, rebase hook, conflict verdict, retry, post-commit snapshot refresh, checkpoint on
+  interval. It never inspects the actions beyond handing them to the log.
+- `Log/ICommitRebaseHandler.cs` — the seam for actions whose CONTENT is coupled to the version they
+  land at. `RecomputeRebaseHandler` covers the common shape (re-derive from the newest snapshot); the
+  table layer's `DeltaTable.OccRebaseHandler` implements the two hard ones, DV union/remap and
+  row-tracking id re-derivation.
+- `DeltaConflictException.cs` / `ConflictRecovery.cs` — what a conflict TELLS a caller.
+  `ErrorCode` names the condition as a `DELTA_*` constant (six of them delta-spark's own names, checked
+  against `error/delta-error-classes.json` in delta-spark 4.0.0); `Recovery` says whether the staged
+  actions survive (`Replay`, only the lost version slot) or the plan has to be rebuilt (`Replan`,
+  everything else); `ConflictingVersion` names the commit responsible, which the checker always knew
+  and used to discard. `ConflictType` stays the checker's own closed vocabulary and is mapped to a code
+  at one point, `ConflictResult.ErrorCode`.
+
+In **`EngineeredWood.DeltaLake.Table`**:
+
 - `DeltaTransaction.cs` — public; a thin recorder of staged actions plus the read-set. Several
   operations can be staged on one transaction; the accumulated `_operations` drives the commitInfo
   label (single-op → that op, mixed → `WRITE`).
-- `DeltaTable.cs` — `StartTransaction()`, `CommitTransactionAsync` → `CommitOccAsync` (the OCC loop),
-  and the compute halves each shared by an auto-committer and the transaction:
-  `ComputeDeleteActionsAsync`, `ComputeWriteActionsAsync`, `ComputeUpdateActionsAsync`.
+- `DeltaTable.cs` — `StartTransaction()`, `CommitTransactionAsync` → `CommitOccAsync` (which builds the
+  request and hands it to `LogCommitter`), and the compute halves each shared by an auto-committer and
+  the transaction: `ComputeDeleteActionsAsync`, `ComputeWriteActionsAsync`, `ComputeUpdateActionsAsync`.
   `ValidateWritable(snapshot, isAppend)` is the shared write-precondition gate.
 
 ## Design facts worth keeping
@@ -136,7 +245,8 @@ rule, which lives in the checker.
 ## Running the tests
 
 - The concurrency unit and integration tests are pure and local — no external toolchain:
-  `dotnet test test/EngineeredWood.DeltaLake.Table.Tests -f net10.0 --filter "FullyQualifiedName~ConflictCheckerTests|FullyQualifiedName~DeltaTransactionTests"`
+  `dotnet test test/EngineeredWood.DeltaLake.Tests -f net10.0 --filter "FullyQualifiedName~ConflictCheckerTests|FullyQualifiedName~LogCommitterTests"` (the verdicts and the loop, both log-layer)
+  and `dotnet test test/EngineeredWood.DeltaLake.Table.Tests -f net10.0 --filter "FullyQualifiedName~DeltaTransactionTests"`
 - Full validation uses the Delta interop tiers (delta-rs + PySpark). Setup and the
   `EW_REQUIRE_DELTA_INTEROP` / `EW_REQUIRE_SPARK_INTEROP` flags are in [`running-tests.md`](running-tests.md).
   Tier 3 needs `JAVA_HOME` (JDK 17+) and, on Windows, `HADOOP_HOME` with winutils on `PATH`.

@@ -11,6 +11,25 @@ namespace EngineeredWood.IO;
 public interface ITableFileSystem
 {
     /// <summary>
+    /// <para>The naming rules this backend imposes on path components written under it, so that a table
+    /// format deriving a directory name from DATA — Hive-style partition directories — can spell it in a
+    /// way this storage will actually hold.</para>
+    ///
+    /// <para>Report what the STORAGE cannot hold, not what the writer's operating system cannot. A
+    /// backend reachable from anywhere reports the same constraints from every machine; only a backend
+    /// whose constraints genuinely depend on where it is running (a local volume) varies its answer. An
+    /// implementation that cannot determine its constraints should report
+    /// <see cref="PathNameConstraints.None"/>, which is also the right answer for the cloud object stores:
+    /// MEASURED, all three accept <c>&lt; &gt; |</c> and a trailing space literally and round-trip the
+    /// name byte-identically.</para>
+    ///
+    /// <para>Over-reporting is the safe direction. A caller that escapes a character this backend would
+    /// have accepted produces an uglier name; a caller that does not escape one the backend rejects fails
+    /// the write, or worse, silently writes under a normalised name and then cannot find it again.</para>
+    /// </summary>
+    PathNameConstraints PathConstraints { get; }
+
+    /// <summary>
     /// Lists files matching the given prefix, returning paths relative to the root.
     /// Results are ordered lexicographically.
     /// </summary>

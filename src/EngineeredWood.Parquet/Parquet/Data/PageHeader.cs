@@ -28,6 +28,27 @@ internal sealed class PageHeader
 
     /// <summary>Data page header V2. Null for non-V2 data pages.</summary>
     public DataPageHeaderV2? DataPageHeaderV2 { get; init; }
+
+    /// <summary>Symbol table page header. Null for non-symbol-table pages.</summary>
+    public SymbolTablePageHeader? SymbolTablePageHeader { get; init; }
+}
+
+/// <summary>
+/// Header for an FSST symbol table page.
+/// </summary>
+/// <remarks>
+/// The proposal does not assign this struct a <c>PageHeader</c> field id; 9 is the next
+/// free one after <c>data_page_header_v2</c> and is what this library writes.
+/// </remarks>
+internal sealed class SymbolTablePageHeader
+{
+    /// <summary>Which symbol table representation the page body uses.</summary>
+#pragma warning disable EWPARQUET0003 // The header type is inherently part of the experimental surface.
+    public required SymbolTableType Type { get; init; }
+#pragma warning restore EWPARQUET0003
+
+    /// <summary>Whether the page body is compressed with the column chunk's codec.</summary>
+    public required bool IsCompressed { get; init; }
 }
 
 /// <summary>

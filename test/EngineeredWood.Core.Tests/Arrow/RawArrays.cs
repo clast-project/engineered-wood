@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
@@ -82,6 +83,83 @@ internal static class RawArrays
         return ArrowArrayFactory.BuildArray(new ArrayData(
             type, physical - offset, CountNulls(physicalValid, offset, physical), offset,
             new[] { Validity(physicalValid, physical), offsets, new ArrowBuffer(data.ToArray()) }));
+    }
+
+    /// <summary>
+    /// A StringView/BinaryView array, built as its raw buffers: a validity bitmap, one 16-byte view entry per
+    /// physical slot, and <paramref name="dataBufferCount"/> variadic data buffers after them.
+    ///
+    /// <para>A value of 12 bytes or fewer is stored INLINE in its own view entry and reaches no data buffer at
+    /// all; a longer one is appended to a data buffer, and the entry records the value's length, its first four
+    /// bytes as a prefix, the buffer's index and the offset within it. Out-of-line values are spread round-robin
+    /// across the data buffers deliberately, so a gather that dropped, reordered or renumbered them produces
+    /// wrong VALUES rather than only a different buffer count.</para>
+    ///
+    /// <para>A <paramref name="dataBufferCount"/> of ZERO is legal and meaningful rather than a mistake: it is
+    /// the shape Arrow's own builder emits when nothing spills, and the one MakeNullArray and a short Repeat
+    /// constant produce. It requires every value to fit inline, which is checked rather than left to fail as a
+    /// divide-by-zero further down.</para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="dataBufferCount"/> is negative.</exception>
+    /// <exception cref="ArgumentException">
+    /// A value is too long to sit inline but <paramref name="dataBufferCount"/> is zero, so there is no buffer
+    /// to put it in.
+    /// </exception>
+    public static IArrowArray VarBinaryView(
+        IArrowType type, string[] physicalValues, bool[]? physicalValid = null, int offset = 0,
+        int dataBufferCount = 2)
+    {
+        const int viewBytes = 16;
+        const int maxInline = 12;
+
+        if (dataBufferCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(dataBufferCount), dataBufferCount, "A view array cannot have negative data buffers.");
+        }
+
+        int physical = physicalValues.Length;
+        var views = new byte[physical * viewBytes];
+        var data = new List<byte>[dataBufferCount];
+        for (int i = 0; i < dataBufferCount; i++)
+            data[i] = new List<byte>();
+
+        int spilled = 0;
+        for (int i = 0; i < physical; i++)
+        {
+            byte[] value = System.Text.Encoding.UTF8.GetBytes(physicalValues[i]);
+            var view = views.AsSpan(i * viewBytes, viewBytes);
+            BinaryPrimitives.WriteInt32LittleEndian(view, value.Length);
+
+            if (value.Length <= maxInline)
+            {
+                value.CopyTo(view.Slice(4));
+                continue;
+            }
+
+            if (dataBufferCount == 0)
+            {
+                throw new ArgumentException(
+                    $"Value {i} is {value.Length} bytes, so it cannot sit inline, but this array was asked "
+                    + $"for no data buffers to put it in. Pass dataBufferCount: 0 only when every value is "
+                    + $"{maxInline} bytes or fewer.", nameof(dataBufferCount));
+            }
+
+            int buffer = spilled++ % dataBufferCount;
+            value.AsSpan(0, 4).CopyTo(view.Slice(4));
+            BinaryPrimitives.WriteInt32LittleEndian(view.Slice(8), buffer);
+            BinaryPrimitives.WriteInt32LittleEndian(view.Slice(12), data[buffer].Count);
+            data[buffer].AddRange(value);
+        }
+
+        var buffers = new ArrowBuffer[2 + dataBufferCount];
+        buffers[0] = Validity(physicalValid, physical);
+        buffers[1] = new ArrowBuffer(views);
+        for (int i = 0; i < dataBufferCount; i++)
+            buffers[2 + i] = new ArrowBuffer(data[i].ToArray());
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            type, physical - offset, CountNulls(physicalValid, offset, physical), offset, buffers));
     }
 
     /// <summary>A boolean array; values and validity are both indexed by physical slot.</summary>

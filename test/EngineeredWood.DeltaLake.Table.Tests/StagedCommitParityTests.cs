@@ -71,6 +71,9 @@ public class StagedCommitParityTests : IDisposable
         // What commitInfo records. A PROPERTY since slice 4, not a per-call argument: Delta's operation
         // field is one string per commit, so it describes the transaction rather than any one staged thing.
         ["operation"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.Operation)),
+        // The other commitInfo claim, and a property for exactly the same reason: whether the transaction
+        // READ anything is one answer per commit, not one per staging call.
+        ["isBlindAppend"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.IsBlindAppend)),
         // First-committer-wins pinning. A transaction is pinned by construction — and, since slice 3, to a
         // version the host chooses rather than always to CurrentSnapshot, which is what makes the pinning
         // mean the same thing on both surfaces.
@@ -78,6 +81,12 @@ public class StagedCommitParityTests : IDisposable
             typeof(DeltaTable), nameof(DeltaTable.StartTransactionAsync), "baseVersion"),
         ["cancellationToken"] = new(
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync), "cancellationToken"),
+        // The host's assertion that it enforced the table's write-time expressions itself. Stageable
+        // because it says something about the ROWS in this call's files, which a rebase carries
+        // unchanged — unlike the overwrite family below, whose meaning depends on the base snapshot.
+        ["constraintsEnforcedByCaller"] = new(
+            typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync),
+            "constraintsEnforcedByCaller"),
     };
 
     /// <summary>

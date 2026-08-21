@@ -139,6 +139,53 @@ public class MakeNullArrayTests
     }
 
     [Fact]
+    public void StringView_AllRowsNullOverZeroedViewEntries()
+    {
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.MakeNullArray(StringViewType.Default, 4));
+
+        AssertAllNull(result, 4);
+        for (int i = 0; i < 4; i++)
+            Assert.Null(result.GetString(i));
+
+        // Two buffers, not three: an all-zero view entry is a length-0 INLINE value, so there is no data
+        // buffer for it to point into. Two is also the minimum Arrow accepts for a view array — a single
+        // buffer would make the array throw on construction rather than read as null.
+        Assert.Equal(2, result.Data.Buffers.Length);
+        Assert.Equal(0, result.DataBufferCount);
+
+        // One 16-byte entry per row, every byte of it zero.
+        Assert.Equal(4 * 16, result.Data.Buffers[1].Length);
+        foreach (byte b in result.Data.Buffers[1].Span.ToArray())
+            Assert.Equal(0, b);
+    }
+
+    [Fact]
+    public void BinaryView_IsNotRetaggedAsStringView()
+    {
+        var result = ArrowCompute.MakeNullArray(BinaryViewType.Default, 3);
+
+        // The two view types share a layout, so the built array has to carry the type it was ASKED for —
+        // substituting the other one is the silent schema mismatch this method exists to avoid.
+        Assert.IsType<BinaryViewArray>(result);
+        Assert.Same(BinaryViewType.Default, result.Data.DataType);
+        AssertAllNull(result, 3);
+        Assert.Equal(3 * 16, result.Data.Buffers[1].Length);
+    }
+
+    [Fact]
+    public void StringView_ZeroLengthIsWellFormed()
+    {
+        var result = Assert.IsType<StringViewArray>(
+            ArrowCompute.MakeNullArray(StringViewType.Default, 0));
+
+        // A zero-row column still has to be constructible: Arrow requires the two buffers to be PRESENT
+        // even when the views buffer is empty, so this would throw if the arm skipped them.
+        Assert.Equal(0, result.Length);
+        Assert.Equal(2, result.Data.Buffers.Length);
+    }
+
+    [Fact]
     public void LargeBinary_IsNotNarrowedToBinary()
     {
         var result = ArrowCompute.MakeNullArray(LargeBinaryType.Default, 3);

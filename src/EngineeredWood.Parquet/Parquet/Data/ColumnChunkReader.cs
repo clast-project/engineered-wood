@@ -72,8 +72,9 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
         DictionaryDecoder? dictionary = null;
+        FsstSymbolTable? symbolTable = null;
 
         int pos = 0;
         long valuesRead = 0;
@@ -117,14 +118,18 @@ internal static class ColumnChunkReader
                     dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
+                case PageType.SymbolTablePage:
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                    break;
+
                 case PageType.DataPage:
                     valuesRead += ReadDataPageV1(
-                        pageHeader, pageData, column, columnMeta, dictionary, state);
+                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
                     break;
 
                 case PageType.DataPageV2:
                     valuesRead += ReadDataPageV2(
-                        pageHeader, pageData, column, columnMeta, dictionary, state);
+                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
                     break;
 
                 default:
@@ -159,6 +164,8 @@ internal static class ColumnChunkReader
                 repLevels[i] = src[i];
         }
 
+        EnsureFullRowCoverage(state, column, rowCount);
+
         IArrowArray array;
         if (isRepeated)
         {
@@ -171,6 +178,31 @@ internal static class ColumnChunkReader
         }
 
         return new ColumnResult(array, defLevels, repLevels);
+    }
+
+    /// <summary>
+    /// Verifies that a non-repeated column decoded one entry per row before its array is built.
+    /// </summary>
+    /// <remarks>
+    /// The array builders index the level (or value) buffer by row, so a chunk that decoded fewer
+    /// entries than the row group declares reads off the end of its own buffer — surfacing as an
+    /// <see cref="IndexOutOfRangeException"/> from deep inside the builder, naming nothing useful.
+    /// A malformed file deserves to be reported as one (issue #165). Over-long chunks are left
+    /// alone: the surplus entries are simply ignored, which harms nothing.
+    /// </remarks>
+    private static void EnsureFullRowCoverage(ColumnBuildState state, ColumnDescriptor column, int rowCount)
+    {
+        if (column.MaxRepetitionLevel > 0)
+            return;
+
+        int decoded = column.MaxDefinitionLevel > 0 ? state.DefLevelSpan.Length : state.ValueCount;
+        if (decoded >= rowCount)
+            return;
+
+        throw new ParquetFormatException(
+            $"Malformed Parquet file: column '{string.Join(".", column.Path)}' holds {decoded} " +
+            $"value(s) but the row group declares {rowCount} row(s). A non-repeated column must " +
+            "carry one entry per row.");
     }
 
     /// <summary>
@@ -214,9 +246,11 @@ internal static class ColumnChunkReader
         // maxDefLevel/maxRepLevel are declared as 0: no level arrays are rented or filled, and the
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
         using var state = new ColumnBuildState(
-            column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput);
+            column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
+            column.DottedPath);
 
         DictionaryDecoder? dictionary = null;
+        FsstSymbolTable? symbolTable = null;
         int listLength = 0;
         int pos = 0;
         long valuesRead = 0;
@@ -251,9 +285,13 @@ internal static class ColumnChunkReader
                     dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
+                case PageType.SymbolTablePage:
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                    break;
+
                 case PageType.DataPage:
                     if (!TryReadFixedListPageV1(
-                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
                             ref listLength, valuesRead))
                         return null;
                     valuesRead += pageHeader.DataPageHeader!.NumValues;
@@ -261,7 +299,7 @@ internal static class ColumnChunkReader
 
                 case PageType.DataPageV2:
                     if (!TryReadFixedListPageV2(
-                            pageHeader, pageData, column, columnMeta, dictionary, state,
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
                             ref listLength, valuesRead))
                         return null;
                     valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
@@ -290,6 +328,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state,
         ref int listLength,
         long startIndex)
@@ -332,7 +371,7 @@ internal static class ColumnChunkReader
                 return false;
 
             var valueData = pageData.Slice(afterRep + afterDef);
-            DecodeValues(valueData, dataHeader.Encoding, column, dictionary, numValues, state);
+            DecodeValues(valueData, dataHeader.Encoding, column, dictionary, symbolTable, numValues, state);
             return true;
         }
         finally
@@ -348,6 +387,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state,
         ref int listLength,
         long startIndex)
@@ -387,7 +427,7 @@ internal static class ColumnChunkReader
 
         try
         {
-            DecodeValues(valueData, v2Header.Encoding, column, dictionary, numValues, state);
+            DecodeValues(valueData, v2Header.Encoding, column, dictionary, symbolTable, numValues, state);
             return true;
         }
         finally
@@ -430,7 +470,6 @@ internal static class ColumnChunkReader
     /// <param name="pageMap">Pre-scanned page map for this column chunk.</param>
     /// <param name="startPage">First page index (inclusive) to decode.</param>
     /// <param name="endPage">Last page index (inclusive) to decode.</param>
-    /// <param name="batchRowCount">Number of rows in the resulting batch.</param>
     /// <param name="arrowField">Arrow field for this column.</param>
     /// <param name="preserveDefLevels">
     /// If true, raw definition levels are returned for nested assembly.
@@ -461,7 +500,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
 
         for (int p = startPage; p <= endPage; p++)
         {
@@ -470,11 +509,11 @@ internal static class ColumnChunkReader
 
             if (entry.Type == PageType.DataPage)
             {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
             else if (entry.Type == PageType.DataPageV2)
             {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
         }
 
@@ -495,6 +534,8 @@ internal static class ColumnChunkReader
             for (int i = 0; i < src.Length; i++)
                 repLevels[i] = src[i];
         }
+
+        EnsureFullRowCoverage(state, column, pageRowCount);
 
         IArrowArray array;
         if (isRepeated)
@@ -542,7 +583,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput);
+            byteArrayOutput, column.DottedPath);
 
         for (int p = startPage; p <= endPage; p++)
         {
@@ -552,11 +593,11 @@ internal static class ColumnChunkReader
 
             if (entry.Type == PageType.DataPage)
             {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
             else if (entry.Type == PageType.DataPageV2)
             {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, state);
+                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
             }
         }
 
@@ -577,6 +618,8 @@ internal static class ColumnChunkReader
             for (int i = 0; i < src.Length; i++)
                 repLevels[i] = src[i];
         }
+
+        EnsureFullRowCoverage(state, column, pageRowCount);
 
         IArrowArray array;
         if (isRepeated)
@@ -600,6 +643,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         int numValues = entry.NumValues;
@@ -643,7 +687,7 @@ internal static class ColumnChunkReader
             }
 
             var valueData = pageData.Slice(offset);
-            DecodeValues(valueData, entry.Encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, entry.Encoding, column, dictionary, symbolTable, nonNullCount, state);
         }
         finally
         {
@@ -661,6 +705,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         int numValues = entry.NumValues;
@@ -726,7 +771,7 @@ internal static class ColumnChunkReader
 
         try
         {
-            DecodeValues(valueData, entry.Encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, entry.Encoding, column, dictionary, symbolTable, nonNullCount, state);
         }
         finally
         {
@@ -778,6 +823,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         var dataHeader = header.DataPageHeader
@@ -830,7 +876,7 @@ internal static class ColumnChunkReader
             // Decode values
             var valueData = pageData.Slice(offset);
             var encoding = dataHeader.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -847,6 +893,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         ColumnBuildState state)
     {
         var v2Header = header.DataPageHeaderV2
@@ -921,7 +968,7 @@ internal static class ColumnChunkReader
         try
         {
             var encoding = v2Header.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, nonNullCount, state);
+            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -937,6 +984,7 @@ internal static class ColumnChunkReader
         Encoding encoding,
         ColumnDescriptor column,
         DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
         int nonNullCount,
         ColumnBuildState state)
     {
@@ -976,6 +1024,20 @@ internal static class ColumnChunkReader
             DecodeAlpValues(data, column, nonNullCount, state);
         }
 #pragma warning restore EWPARQUET0001
+#pragma warning disable EWPARQUET0003 // The reader must accept FSST-encoded pages produced by other writers regardless of our experimental marking.
+        else if (encoding == Encoding.Fsst)
+        {
+            if (column.PhysicalType != PhysicalType.ByteArray)
+                throw new NotSupportedException(
+                    $"Physical type '{column.PhysicalType}' is not supported for FSST decoding.");
+            if (symbolTable == null)
+                throw new ParquetFormatException(
+                    $"FSST-encoded data page but no symbol table page found for column " +
+                    $"'{column.DottedPath}'.");
+
+            FsstPageDecoder.Decode(data, symbolTable, nonNullCount, state);
+        }
+#pragma warning restore EWPARQUET0003
         else if (encoding == Encoding.Rle)
         {
             DecodeRleBooleanValues(data, column, nonNullCount, state);
@@ -1051,7 +1113,7 @@ internal static class ColumnChunkReader
                     var offsets = ArrayPool<int>.Shared.Rent(count + 1);
                     try
                     {
-                        int totalLen = PlainDecoder.MeasureByteArrays(data, offsets, count);
+                        int totalLen = PlainDecoder.MeasureByteArrays(data, offsets, count, column.DottedPath);
                         Span<byte> dest = state.ReserveByteArrayData(totalLen);
                         PlainDecoder.CopyByteArrayData(data, offsets, dest, count);
                         state.CommitByteArrayData(offsets.AsSpan(0, count + 1), count, totalLen);

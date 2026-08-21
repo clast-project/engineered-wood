@@ -351,11 +351,6 @@ internal static class FixedListDetector
     }
 
     /// <summary>
-    /// Expected bit-packed byte for eight repetition levels starting at offset <paramref name="r"/>
-    /// within a record of <paramref name="length"/> elements, for <c>length &gt;= 8</c>
-    /// (so at most one record boundary can fall inside the byte).
-    /// </summary>
-    /// <summary>
     /// Compares a contiguous bit-packed block (one byte per eight repetition levels) against the
     /// pattern for lists of <paramref name="length"/> elements (with <c>length &lt; 8</c>), where the
     /// first byte begins at record offset <paramref name="r0"/>. Uses a tiled
@@ -394,6 +389,11 @@ internal static class FixedListDetector
         return a;
     }
 
+    /// <summary>
+    /// Expected bit-packed byte for eight repetition levels starting at offset <paramref name="r"/>
+    /// within a record of <paramref name="length"/> elements, for <c>length &gt;= 8</c>
+    /// (so at most one record boundary can fall inside the byte).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte ExpectedByte(int r, int length)
     {

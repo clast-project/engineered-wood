@@ -79,7 +79,7 @@ internal static class ArrayStatsComputer
 
     /// <summary>
     /// Sets <c>IsSorted</c> and <c>IsStrictSorted</c> for integer primitives.
-    /// Caller has guaranteed <c>nullCount == 0 && rowCount > 0</c>. Floats are
+    /// Caller has guaranteed <c>nullCount == 0 &amp;&amp; rowCount &gt; 0</c>. Floats are
     /// intentionally excluded (NaN handling).
     /// </summary>
     private static void ComputeIntOrdering(IArrowArray array, ref ArrayStatsValues values)

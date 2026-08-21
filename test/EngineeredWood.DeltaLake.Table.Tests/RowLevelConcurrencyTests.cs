@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -124,7 +124,10 @@ public class RowLevelConcurrencyTests : IDisposable
         // B (stale) also deletes row 5 — the same row A just removed.
         var ex = await Assert.ThrowsAsync<DeltaConflictException>(
             async () => await tableB.DeleteAsync(IdEquals(5)));
-        Assert.Contains("row level", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // The CODE rather than the prose: a row-level collision is not a file-granularity
+        // delete/delete, and matching on the message would freeze the wording as API.
+        Assert.Equal(DeltaTableErrorCodes.RowLevelConflict, ex.ErrorCode);
+        Assert.Equal(ConflictRecovery.Replan, ex.Recovery);
 
         Assert.Equal([7L], await ReadIdsFresh()); // only A's delete landed
     }
@@ -329,7 +332,10 @@ public class RowLevelConcurrencyTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<DeltaConflictException>(
             async () => await tableB.DeleteAsync(RtIdEquals(2)));
-        Assert.Contains("row level", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // The CODE rather than the prose: a row-level collision is not a file-granularity
+        // delete/delete, and matching on the message would freeze the wording as API.
+        Assert.Equal(DeltaTableErrorCodes.RowLevelConflict, ex.ErrorCode);
+        Assert.Equal(ConflictRecovery.Replan, ex.Recovery);
 
         var rows = await ReadRowsFresh();
         Assert.Equal(new long[] { 1, 3, 4, 5 }, rows.ConvertAll(r => r.Id).ToArray()); // deleted exactly once
