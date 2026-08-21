@@ -119,6 +119,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Gets the file's schema as an Arrow <see cref="Apache.Arrow.Schema"/>, without reading
+    /// any data. This is the schema every <see cref="RecordBatch"/> from
+    /// <see cref="ReadAllAsync"/> carries — and the only way to observe it for a file with no
+    /// row groups, which yields no batches at all.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async ValueTask<Apache.Arrow.Schema> GetArrowSchemaAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in ArrowSchemaConverter.ToArrowFields(schema.Root, _options))
+            builder.Field(field);
+
+        return builder.Build();
+    }
+
+    /// <summary>
     /// Reads a single row group and returns the data as an Arrow <see cref="RecordBatch"/>.
     /// </summary>
     /// <param name="rowGroupIndex">Zero-based index of the row group to read.</param>
