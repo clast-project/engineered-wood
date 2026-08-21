@@ -34,6 +34,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     private readonly ParquetReadOptions _options;
     private FileMetaData? _metadata;
     private SchemaDescriptor? _schema;
+    private Apache.Arrow.Schema? _declaredArrowSchema;
+    private bool _declaredArrowSchemaResolved;
     private long _fileLength;
     private bool _disposed;
 
@@ -129,9 +131,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var declared = DeclaredArrowSchema(metadata);
         var builder = new Apache.Arrow.Schema.Builder();
         foreach (var field in ArrowSchemaConverter.ToArrowFields(schema.Root, _options))
-            builder.Field(field);
+            builder.Field(RestoreDeclaredUnits(field, declared));
 
         return builder.Build();
     }
@@ -870,7 +874,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             for (int i = 0; i < results.Length; i++)
                 arrowArrays[i] = results[i].Array;
 
-            return BuildRecordBatch(ctx.LeafArrowFields, arrowArrays, ctx.RowCount);
+            var leafFields = (Field[])ctx.LeafArrowFields.Clone();
+            RestoreDeclaredUnits(leafFields, arrowArrays);
+            return BuildRecordBatch(leafFields, arrowArrays, ctx.RowCount);
         }
 
         // Nested path: group leaf arrays into Struct/List/Map arrays
@@ -901,7 +907,81 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     topLevelArrays[i], ctx.TopLevelFields![i].DataType);
         }
 
-        return BuildRecordBatch(ctx.TopLevelFields!, topLevelArrays, ctx.RowCount);
+        var topLevelFields = (Field[])ctx.TopLevelFields!.Clone();
+        RestoreDeclaredUnits(topLevelFields, topLevelArrays);
+        return BuildRecordBatch(topLevelFields, topLevelArrays, ctx.RowCount);
+    }
+
+    /// <summary>
+    /// The Arrow schema the writer recorded under <c>ARROW:schema</c>, decoded once per file.
+    /// Absent for a file no Arrow-aware writer produced, and for anything DuckDB wrote.
+    /// </summary>
+    private Apache.Arrow.Schema? DeclaredArrowSchema(Metadata.FileMetaData metadata)
+    {
+        if (!_declaredArrowSchemaResolved)
+        {
+            _declaredArrowSchema = Data.ArrowSchemaMetadata.Decode(metadata.KeyValueMetadata);
+            _declaredArrowSchemaResolved = true;
+        }
+
+        return _declaredArrowSchema;
+    }
+
+    /// <summary>
+    /// Restores the units and zone names the declared schema carries for <paramref name="field"/>,
+    /// matched by name so that a projected read still finds its own field.
+    /// </summary>
+    private static Field RestoreDeclaredUnits(Field field, Apache.Arrow.Schema? declared)
+    {
+        var target = DeclaredField(field.Name, declared);
+        if (target is null)
+            return field;
+
+        var type = Data.TimeUnitRescaler.ToDeclaredUnits(field.DataType, target.DataType);
+        return ReferenceEquals(type, field.DataType)
+            ? field
+            : new Field(field.Name, type, field.IsNullable);
+    }
+
+    private static Field? DeclaredField(string name, Apache.Arrow.Schema? declared)
+    {
+        if (declared is null)
+            return null;
+
+        foreach (var candidate in declared.FieldsList)
+        {
+            if (string.Equals(candidate.Name, name, StringComparison.Ordinal))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Rewrites each assembled column into the units the writer originally declared. Parquet keeps
+    /// only MILLIS, MICROS or NANOS and no zone name, so without this a <c>timestamp[s]</c> reads
+    /// back as milliseconds and every zone reads back as UTC.
+    /// </summary>
+    private void RestoreDeclaredUnits(Field[] fields, IArrowArray[] arrays)
+    {
+        // Assembly always follows a metadata read, so the footer is cached by now.
+        var declared = _metadata is null ? null : DeclaredArrowSchema(_metadata);
+        if (declared is null)
+            return;
+
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var target = DeclaredField(fields[i].Name, declared);
+            if (target is null)
+                continue;
+
+            var restored = Data.TimeUnitRescaler.ToDeclaredUnits(arrays[i], target.DataType);
+            if (ReferenceEquals(restored, arrays[i]))
+                continue;
+
+            arrays[i] = restored;
+            fields[i] = new Field(fields[i].Name, restored.Data.DataType, fields[i].IsNullable);
+        }
     }
 
     private static RecordBatch BuildRecordBatch(

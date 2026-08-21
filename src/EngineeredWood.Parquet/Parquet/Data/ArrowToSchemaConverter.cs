@@ -339,20 +339,14 @@ internal static class ArrowToSchemaConverter
         Apache.Arrow.Types.TimeUnit.Nanosecond => Metadata.TimeUnit.Nanos,
 
         // Parquet's TIMESTAMP and TIME annotations have only MILLIS, MICROS and NANOS — there is no
-        // SECOND unit to map onto. The former `_ => Micros` fallback did not rescale the values, it
-        // just relabelled them, and both ways that plays out are silent:
-        //
-        //   Timestamp(Second) holding 1700000000 (2023-11-14T22:13:20Z) was written as INT64 annotated
-        //   TIMESTAMP(MICROS) and read back as 1970-01-01T00:28:20Z — every value a million times small.
-        //
-        //   Time32(Second) was written as INT32 annotated TIME(MICROS), which is not a legal pairing
-        //   (micros requires INT64); the resulting file cannot be read back at all.
-        //
-        // Refuse rather than corrupt. Rescaling to microseconds instead is tracked in
-        // doc/known-issues.md — it needs a value-converting pass, not a schema decision.
+        // SECOND unit to map onto. The original `_ => Micros` fallback relabelled the values without
+        // rescaling them, which was silent corruption; refusing outright made a whole Arrow type
+        // unwritable. Both are now moot: TimeUnitRescaler has already multiplied a second-precision
+        // column into milliseconds by the time any schema is derived from it, and the caller's
+        // original unit is preserved in ARROW:schema. Reaching this arm therefore means a unit that
+        // pass does not know about, which is a mapping bug rather than a caller error.
         _ => throw new NotSupportedException(
             $"Parquet timestamps and times have no {unit}-precision unit (only milliseconds, "
-            + "microseconds and nanoseconds). Cast the column to a supported unit before writing; "
-            + "TimeUnit.Microsecond preserves every value exactly."),
+            + "microseconds and nanoseconds), and it was not rescaled before the schema was built."),
     };
 }

@@ -94,6 +94,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // rows. Only paid when a column actually carries an offset.
         batch = CompactSlicedColumns(batch);
 
+        // Parquet has no second-precision unit, so such a column is rescaled to milliseconds here —
+        // before the schema is captured, so what the footer declares and what the encoders write are
+        // the same thing. The caller's original units are preserved separately, in ARROW:schema, and
+        // that is what lets the reader hand them back.
+        _declaredSchema ??= batch.Schema;
+        batch = CoerceTimeUnits(batch);
+
         // Variant shredding, if enabled, changes each shredded column's storage TYPE — so the layout
         // has to be decided before the schema is captured, and from the same batch. Decided once and
         // reused: a parquet file has one schema, and a later batch that re-inferred a different shape
@@ -591,8 +598,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // row group that throws leaves this null. Falling back here keeps dispose from replacing that
         // exception with an NRE out of the footer. A caller that wrote no rows at all can supply the
         // schema through DeclareSchema so the empty file still describes its columns.
+        // Coerced here too: a table with no rows never passes a batch through the write path, so
+        // this is the only place a second-precision column in it would be seen.
         if (_parquetSchema is null && _declaredSchema is not null)
-            _parquetSchema = ArrowToSchemaConverter.Convert(_declaredSchema);
+        {
+            _parquetSchema = ArrowToSchemaConverter.Convert(
+                Data.TimeUnitRescaler.ToParquetUnits(_declaredSchema));
+        }
 
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
@@ -609,7 +621,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             NumRows = totalRows,
             RowGroups = _rowGroups,
             CreatedBy = _options.CreatedBy,
-            KeyValueMetadata = _options.KeyValueMetadata,
+            KeyValueMetadata = BuildKeyValueMetadata(),
             ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
         };
 
@@ -652,6 +664,70 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         if (_ownsFile)
             _file.Dispose();
+    }
+
+    /// <summary>
+    /// Adds the <c>ARROW:schema</c> entry to whatever the caller supplied, so that units and zone
+    /// names Parquet cannot express survive a round trip the way they do through PyArrow and Polars.
+    /// A caller who sets the key explicitly keeps their own value.
+    /// </summary>
+    private IReadOnlyList<Metadata.KeyValue>? BuildKeyValueMetadata()
+    {
+        var supplied = _options.KeyValueMetadata;
+        if (!_options.WriteArrowSchema || _declaredSchema is null)
+            return supplied;
+
+        if (supplied is not null)
+        {
+            foreach (var entry in supplied)
+            {
+                if (string.Equals(entry.Key, Data.ArrowSchemaMetadata.Key, StringComparison.Ordinal))
+                    return supplied;
+            }
+        }
+
+        var merged = new List<Metadata.KeyValue>(supplied?.Count + 1 ?? 1);
+        if (supplied is not null)
+            merged.AddRange(supplied);
+
+        merged.Add(new Metadata.KeyValue
+        {
+            Key = Data.ArrowSchemaMetadata.Key,
+            Value = Data.ArrowSchemaMetadata.Encode(_declaredSchema),
+        });
+        return merged;
+    }
+
+    /// <summary>
+    /// Rescales any second-precision temporal column, at any depth, into the milliseconds Parquet
+    /// can annotate. Returns the same batch when there is nothing to rescale, which is the usual case.
+    /// </summary>
+    private static RecordBatch CoerceTimeUnits(RecordBatch batch)
+    {
+        IArrowArray[]? columns = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var original = batch.Column(i);
+            var coerced = Data.TimeUnitRescaler.ToParquetUnits(original);
+            if (!ReferenceEquals(coerced, original))
+            {
+                columns ??= [.. Enumerable.Range(0, batch.ColumnCount).Select(batch.Column)];
+                columns[i] = coerced;
+            }
+        }
+
+        if (columns is null)
+            return batch;
+
+        var fields = new Apache.Arrow.Field[columns.Length];
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            fields[i] = new Apache.Arrow.Field(field.Name, columns[i].Data.DataType, field.IsNullable);
+        }
+
+        return new RecordBatch(
+            new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
     }
 
     private static bool IsNestedType(Apache.Arrow.Types.IArrowType type) =>

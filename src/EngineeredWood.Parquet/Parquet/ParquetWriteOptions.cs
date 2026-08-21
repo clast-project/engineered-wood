@@ -340,6 +340,19 @@ public sealed record ParquetWriteOptions
     public IReadOnlyList<Metadata.KeyValue>? KeyValueMetadata { get; init; }
 
     /// <summary>
+    /// Records the written Arrow schema in the footer under <c>ARROW:schema</c>, the convention
+    /// PyArrow and Polars use. Default true.
+    /// </summary>
+    /// <remarks>
+    /// Parquet stores an instant and a unit of MILLIS, MICROS or NANOS, with no room for a zone
+    /// NAME or for second precision. Without this entry a <c>timestamp[us, tz=America/New_York]</c>
+    /// comes back as UTC and a <c>timestamp[s]</c> comes back as milliseconds — which is exactly
+    /// what DuckDB, the one mainstream writer that omits it, does. Set false to write a footer
+    /// carrying nothing Arrow-specific.
+    /// </remarks>
+    public bool WriteArrowSchema { get; init; } = true;
+
+    /// <summary>
     /// Whether to compute and write CRC-32C checksums for each data and dictionary page.
     /// When enabled, each page header includes a <c>crc</c> field covering the compressed
     /// page data (excluding the header itself). Default is <see langword="false"/>.
