@@ -242,7 +242,7 @@ internal static class ArrowSchemaConverter
                 return ApplyOutputKind(result, kind);
         }
 
-        var physical = FromPhysicalType(BuildTempDescriptor(node));
+        var physical = FromPhysicalType(BuildTempDescriptor(node), options);
         return ApplyOutputKind(physical, kind);
     }
 
@@ -282,7 +282,7 @@ internal static class ArrowSchemaConverter
         }
 
         // Third: fall back to PhysicalType
-        return FromPhysicalType(column);
+        return FromPhysicalType(column, options);
     }
 
     private static IArrowType? FromLogicalType(LogicalType logicalType, ColumnDescriptor column, ParquetReadOptions? options = null)
@@ -408,7 +408,21 @@ internal static class ArrowSchemaConverter
         return storage;
     }
 
-    private static IArrowType FromPhysicalType(ColumnDescriptor column)
+    /// <summary>
+    /// Maps an INT96 column per <see cref="ParquetReadOptions.Int96Output"/>. The default reads it
+    /// as a naive <c>timestamp[us]</c>; INT96 carries no timezone and the readers that decode it
+    /// (PyArrow, Polars, DuckDB) all present it as naive, so no zone is attached.
+    /// </summary>
+    private static IArrowType MakeInt96ArrowType(ParquetReadOptions? options) =>
+        (options?.Int96Output ?? Int96OutputKind.TimestampMicroseconds) switch
+        {
+            Int96OutputKind.FixedSizeBinary => new FixedSizeBinaryType(12),
+            Int96OutputKind.TimestampNanoseconds
+                => new TimestampType(Apache.Arrow.Types.TimeUnit.Nanosecond, (TimeZoneInfo?)null),
+            _ => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, (TimeZoneInfo?)null),
+        };
+
+    private static IArrowType FromPhysicalType(ColumnDescriptor column, ParquetReadOptions? options)
     {
         return column.PhysicalType switch
         {
@@ -419,7 +433,7 @@ internal static class ArrowSchemaConverter
             PhysicalType.Double => DoubleType.Default,
             PhysicalType.ByteArray => BinaryType.Default,
             PhysicalType.FixedLenByteArray => new FixedSizeBinaryType(column.TypeLength ?? 0),
-            PhysicalType.Int96 => new FixedSizeBinaryType(12),
+            PhysicalType.Int96 => MakeInt96ArrowType(options),
             _ => throw new NotSupportedException(
                 $"Unsupported physical type '{column.PhysicalType}' for Arrow conversion."),
         };

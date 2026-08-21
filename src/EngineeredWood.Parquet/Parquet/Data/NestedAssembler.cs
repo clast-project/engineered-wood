@@ -31,8 +31,11 @@ internal static class NestedAssembler
     /// means that leaf's levels were proven to describe fully-defined lists of that exact length
     /// and were therefore never materialised; the list offsets are derived arithmetically.
     /// </param>
-    /// <param name="extensionRegistry">
-    /// Optional Arrow extension registry. When supplied and the registry knows
+    /// <param name="options">
+    /// Optional read options. Every Arrow type this assembler derives for a nested field —
+    /// list element, map key/value, struct child — has to come from the same options that
+    /// produced the leaf arrays, or a wrapper would declare a type its own data does not have.
+    /// <see cref="ParquetReadOptions.ExtensionRegistry"/> is also read from here: when it knows
     /// <c>arrow.parquet.variant</c>, top-level groups annotated with the
     /// Parquet <c>VARIANT</c> logical type are returned as
     /// <see cref="VariantArray"/> rather than the bare storage
@@ -47,7 +50,7 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int rowCount,
-        ExtensionTypeRegistry? extensionRegistry = null)
+        ParquetReadOptions? options = null)
     {
         var result = new IArrowArray[root.Children.Count];
         int leafIndex = 0;
@@ -55,8 +58,8 @@ internal static class NestedAssembler
         for (int i = 0; i < root.Children.Count; i++)
         {
             var child = root.Children[i];
-            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,rowCount, ref leafIndex);
-            result[i] = WrapTopLevelExtension(array, child, extensionRegistry);
+            var array = AssembleNode(child, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,rowCount, ref leafIndex, options);
+            result[i] = WrapTopLevelExtension(array, child, options?.ExtensionRegistry);
         }
 
         return result;
@@ -87,23 +90,24 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         if (node.IsLeaf)
         {
             // Bare repeated primitive: leaf with Repeated → wrap in list
             if (node.Element.RepetitionType == FieldRepetitionType.Repeated)
-                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+                return AssembleBareRepeatedLeaf(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
             return leafArrays[leafIndex++];
         }
 
         if (ArrowSchemaConverter.IsListNode(node))
-            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            return AssembleList(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
         if (ArrowSchemaConverter.IsMapNode(node))
-            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            return AssembleMap(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
-        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+        return AssembleStruct(node, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
     }
 
     private static IArrowArray AssembleStruct(
@@ -113,17 +117,18 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         int firstLeafIndex = leafIndex;
 
         var childArrays = new IArrowArray[node.Children.Count];
         for (int i = 0; i < node.Children.Count; i++)
-            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex);
+            childArrays[i] = AssembleNode(node.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,parentCount, ref leafIndex, options);
 
         int lastLeafIndex = leafIndex;
 
-        var childFields = BuildChildFields(node);
+        var childFields = BuildChildFields(node, options);
         var structType = new StructType(childFields);
 
         if (node.Element.RepetitionType != FieldRepetitionType.Optional)
@@ -183,7 +188,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         int li = leafIndex++;
         var elementArray = leafArrays[li];
@@ -208,7 +214,7 @@ internal static class NestedAssembler
         // Filter out phantom entries from the element array
         elementArray = FilterElementArray(elementArray, defLevels, nodeDefLevel);
 
-        var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node)).DataType;
+        var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node), options).DataType;
         var elementField = new Apache.Arrow.Field("element", elementType, nullable: false);
         var listType = new ListType(elementField);
 
@@ -227,7 +233,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         var repeatedChild = node.Children[0];
 
@@ -266,20 +273,20 @@ internal static class NestedAssembler
         {
             // 2-level: repeated leaf is the element
             elementArray = leafArrays[leafIndex++];
-            var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(repeatedChild)).DataType;
+            var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(repeatedChild), options).DataType;
             elementField = new Apache.Arrow.Field(repeatedChild.Name, elementType, nullable: false);
         }
         else if (ArrowSchemaConverter.IsListNode(repeatedChild))
         {
             // Nested list: repeated child is itself a LIST → recurse with elementCount
-            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-            elementField = NodeToField(repeatedChild);
+            elementArray = AssembleList(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
+            elementField = NodeToField(repeatedChild, options);
         }
         else if (ArrowSchemaConverter.IsMapNode(repeatedChild))
         {
             // Nested map: repeated child is itself a MAP → recurse with elementCount
-            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
-            elementField = NodeToField(repeatedChild);
+            elementArray = AssembleMap(repeatedChild, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
+            elementField = NodeToField(repeatedChild, options);
         }
         else if (repeatedChild.Children.Count == 1)
         {
@@ -289,27 +296,27 @@ internal static class NestedAssembler
             if (ArrowSchemaConverter.IsListNode(elementNode))
             {
                 // Element is itself a LIST → recurse with elementCount
-                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleList(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
             else if (ArrowSchemaConverter.IsMapNode(elementNode))
             {
                 // Element is itself a MAP → recurse with elementCount
-                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleMap(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
             else
             {
-                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                elementArray = AssembleNode(elementNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
             }
-            elementField = NodeToField(elementNode);
+            elementField = NodeToField(elementNode, options);
         }
         else
         {
             // 3-level with multiple children → struct element
             var structChildArrays = new IArrowArray[repeatedChild.Children.Count];
             for (int i = 0; i < repeatedChild.Children.Count; i++)
-                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+                structChildArrays[i] = AssembleNode(repeatedChild.Children[i], leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
-            var structChildFields = BuildChildFields(repeatedChild);
+            var structChildFields = BuildChildFields(repeatedChild, options);
             var structType = new StructType(structChildFields);
             elementArray = new StructArray(structType, elementCount, structChildArrays, ArrowBuffer.Empty, nullCount: 0);
             elementField = new Apache.Arrow.Field(repeatedChild.Name, structType, nullable: false);
@@ -334,7 +341,8 @@ internal static class NestedAssembler
         int[]?[] leafRepLevels,
         int[]? leafFixedLengths,
         int parentCount,
-        ref int leafIndex)
+        ref int leafIndex,
+        ParquetReadOptions? options)
     {
         var keyValueGroup = node.Children[0]; // repeated key_value group
         int firstLeafIndex = leafIndex;
@@ -357,7 +365,7 @@ internal static class NestedAssembler
 
         // Assemble key and value arrays with elementCount as parentCount
         var keyNode = keyValueGroup.Children[0];
-        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+        var keyArray = AssembleNode(keyNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
         // Assembling the key advanced leafIndex past the key's whole subtree, so this is exactly where the
         // value's leaves begin. `firstLeafIndex + 1` would say the same thing only for a single-leaf key,
@@ -368,17 +376,17 @@ internal static class NestedAssembler
         // IsMapNode has already established that key_value carries exactly a key and a value; a group that
         // does not is classified as a list and assembled by AssembleList instead.
         var valueNode = keyValueGroup.Children[1];
-        var valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex);
+        var valueArray = AssembleNode(valueNode, leafArrays, leafDefLevels, leafRepLevels, leafFixedLengths,elementCount, ref leafIndex, options);
 
         // Filter out phantom entries from key and value arrays
         keyArray = FilterElementArray(keyArray, defLevels, emptyDefThreshold);
         valueArray = FilterElementArray(valueArray, leafDefLevels[valueFirstLeafIndex] ?? defLevels, emptyDefThreshold);
 
         // Build the key_value struct array
-        var keyField = NodeToField(keyNode);
+        var keyField = NodeToField(keyNode, options);
         keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false); // keys are non-nullable
 
-        var valueField = NodeToField(valueNode);
+        var valueField = NodeToField(valueNode, options);
         IArrowArray[] structChildren = [keyArray, valueArray];
 
         var mapType = new MapType(keyField, valueField);
@@ -516,20 +524,22 @@ internal static class NestedAssembler
         return bitmap;
     }
 
-    private static Apache.Arrow.Field NodeToField(SchemaNode node)
+    private static Apache.Arrow.Field NodeToField(SchemaNode node, ParquetReadOptions? options)
     {
         bool nullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
 
         if (node.IsLeaf)
         {
-            var arrowType = ArrowSchemaConverter.ToArrowType(BuildTempDescriptor(node));
+            // ToArrowField, not ToArrowType: only the former applies ByteArrayOutput, and a wrapper
+            // that skips it declares `utf8` over a LargeStringArray the leaf builder already made.
+            var arrowType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node), options).DataType;
             return new Apache.Arrow.Field(node.Name, arrowType, nullable);
         }
 
         if (ArrowSchemaConverter.IsListNode(node))
         {
             var fields = ArrowSchemaConverter.ToArrowFields(
-                new SchemaNode { Element = node.Element, Children = node.Children, Parent = node.Parent });
+                new SchemaNode { Element = node.Element, Children = node.Children, Parent = node.Parent }, options);
             // ToArrowFields returns fields for children; we need the list field for this node itself
             // Use the converter's field-building instead
         }
@@ -541,15 +551,15 @@ internal static class NestedAssembler
             Children = [node],
             Parent = null,
         };
-        return ArrowSchemaConverter.ToArrowFields(dummyRoot)[0];
+        return ArrowSchemaConverter.ToArrowFields(dummyRoot, options)[0];
     }
 
-    private static Field[] BuildChildFields(SchemaNode groupNode)
+    private static Field[] BuildChildFields(SchemaNode groupNode, ParquetReadOptions? options)
     {
         // Delegate to ArrowSchemaConverter for correct list/map/struct field building
         var fields = new Field[groupNode.Children.Count];
         for (int i = 0; i < groupNode.Children.Count; i++)
-            fields[i] = NodeToField(groupNode.Children[i]);
+            fields[i] = NodeToField(groupNode.Children[i], options);
         return fields;
     }
 
