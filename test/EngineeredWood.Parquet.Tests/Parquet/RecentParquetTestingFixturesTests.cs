@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
+using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Metadata;
@@ -65,7 +66,7 @@ public sealed class RecentParquetTestingFixturesTests
     }
 
     [Fact]
-    public async Task Int96TimestampOrder_IsSafelyTreatedAsUnknown()
+    public async Task Int96TimestampOrder_IsUnknownAndValuesReadAsTimestamps()
     {
         await using var file = new LocalRandomAccessFile(TestData.GetPath("int96_timestamp_order.parquet"));
         await using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -74,9 +75,13 @@ public sealed class RecentParquetTestingFixturesTests
         var batch = await reader.ReadRowGroupAsync(0);
 
         Assert.Equal([ColumnOrder.Undefined], metadata.ColumnOrders);
-        var values = Assert.IsType<FixedSizeBinaryArray>(batch.Column(0));
-        Assert.Equal(4, values.Length);
-        Assert.All(Enumerable.Range(0, values.Length), i => Assert.Equal(12, values.GetBytes(i).Length));
+        var values = Assert.IsType<TimestampArray>(batch.Column(0));
+        var type = Assert.IsType<TimestampType>(values.Data.DataType);
+        Assert.Equal(Apache.Arrow.Types.TimeUnit.Microsecond, type.Unit);
+        Assert.Null(type.Timezone);
+        Assert.Equal(
+            [86_399_999_999L, 86_400_000_000L, -50_803_200_000_000L, 1L],
+            values.Values.ToArray());
     }
 
     [Theory]
