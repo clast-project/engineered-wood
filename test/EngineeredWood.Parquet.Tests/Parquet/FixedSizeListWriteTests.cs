@@ -40,9 +40,8 @@ public class FixedSizeListWriteTests : IDisposable
         new() { Compression = CompressionCodec.Uncompressed };
 
     /// <summary>Builds a fixed-size list of int32, where a null slot is written as null.</summary>
-    private static FixedSizeListArray Build(int width, params int?[][]? slots)
+    private static FixedSizeListArray Build(int width, params int?[]?[] slots)
     {
-        slots ??= [];
         var type = new FixedSizeListType(new Field("item", Int32Type.Default, nullable: true), width);
         var values = new Int32Array.Builder();
         var validity = new ArrowBuffer.BitmapBuilder();
@@ -62,7 +61,7 @@ public class FixedSizeListWriteTests : IDisposable
             type, slots.Length, values.Build(), validity.Build(), validity.UnsetBitCount);
     }
 
-    private async Task<IReadOnlyList<int?[]?>> RoundTripAsync(int width, params int?[][] slots)
+    private async Task<IReadOnlyList<int?[]?>> RoundTripAsync(int width, params int?[]?[] slots)
     {
         string path = Path.Combine(_tempDir, $"fsl-{Guid.NewGuid().ToString("N")[..8]}.parquet");
         var array = Build(width, slots);
@@ -81,9 +80,7 @@ public class FixedSizeListWriteTests : IDisposable
         await using var reader = new ParquetFileReader(readFile, ownsFile: false);
         var read = (ListArray)(await reader.ReadRowGroupAsync(0)).Column(0);
         var items = (Int32Array)read.Values;
-        ReadOnlySpan<int> offsets =
-            System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(read.Data.Buffers[1].Span);
-        int arrayOffset = read.Data.Offset;
+        var offsets = read.ValueOffsets;
 
         var observed = new List<int?[]?>();
         for (int slot = 0; slot < read.Length; slot++)
@@ -94,8 +91,8 @@ public class FixedSizeListWriteTests : IDisposable
                 continue;
             }
 
-            int start = offsets[arrayOffset + slot];
-            int length = offsets[arrayOffset + slot + 1] - start;
+            int start = offsets[slot];
+            int length = offsets[slot + 1] - start;
             observed.Add([.. Enumerable.Range(start, length).Select(items.GetValue)]);
         }
 
@@ -133,7 +130,7 @@ public class FixedSizeListWriteTests : IDisposable
     {
         // The whole point. A null slot occupies its full width of child positions, so a writer that
         // consumes the child sequentially puts 5 and 6 where 3 and 4 belong.
-        var observed = await RoundTripAsync(2, [1, 2], null!, [5, 6]);
+        var observed = await RoundTripAsync(2, [1, 2], null, [5, 6]);
 
         Assert.Equal(3, observed.Count);
         Assert.Equal([1, 2], observed[0]);
@@ -144,7 +141,7 @@ public class FixedSizeListWriteTests : IDisposable
     [Fact]
     public async Task ALeadingNullSlotDoesNotShiftEither()
     {
-        var observed = await RoundTripAsync(2, null!, [3, 4]);
+        var observed = await RoundTripAsync(2, null, [3, 4]);
 
         Assert.Null(observed[0]);
         Assert.Equal([3, 4], observed[1]);
@@ -153,7 +150,7 @@ public class FixedSizeListWriteTests : IDisposable
     [Fact]
     public async Task ConsecutiveNullSlotsAccumulateTheirFullWidth()
     {
-        var observed = await RoundTripAsync(3, null!, null!, [7, 8, 9]);
+        var observed = await RoundTripAsync(3, null, null, [7, 8, 9]);
 
         Assert.Null(observed[0]);
         Assert.Null(observed[1]);
@@ -177,7 +174,7 @@ public class FixedSizeListWriteTests : IDisposable
     public async Task TheWidthDoesNotHaveToBeTwo(int width)
     {
         int?[] slot = [.. Enumerable.Range(10, width).Select(value => (int?)value)];
-        var observed = await RoundTripAsync(width, slot, null!, slot);
+        var observed = await RoundTripAsync(width, slot, null, slot);
 
         Assert.Equal(slot, observed[0]);
         Assert.Null(observed[1]);
