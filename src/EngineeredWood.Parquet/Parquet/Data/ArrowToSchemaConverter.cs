@@ -49,7 +49,13 @@ internal static class ArrowToSchemaConverter
                 return;
 
             case ListType listType:
-                AddListField(elements, field.Name, repetition, listType, fieldId);
+                AddListField(elements, field.Name, repetition, listType.ValueField, fieldId);
+                return;
+
+            // Parquet has no fixed-size list, so it writes as an ordinary LIST — the same thing
+            // PyArrow, Polars, and DuckDB put on disk. The width lives only in Arrow, and is lost.
+            case FixedSizeListType fixedListType:
+                AddListField(elements, field.Name, repetition, fixedListType.ValueField, fieldId);
                 return;
 
             case MapType mapType:
@@ -135,7 +141,7 @@ internal static class ArrowToSchemaConverter
 
     private static void AddListField(
         List<SchemaElement> elements, string name,
-        FieldRepetitionType repetition, ListType listType, int? fieldId = null)
+        FieldRepetitionType repetition, Field elementField, int? fieldId = null)
     {
         // 3-level encoding: optional/required group (LIST) → repeated group "list" → element
         elements.Add(new SchemaElement
@@ -157,7 +163,6 @@ internal static class ArrowToSchemaConverter
         });
 
         // Element field
-        var elementField = listType.ValueField;
         AddField(elements, elementField);
     }
 
