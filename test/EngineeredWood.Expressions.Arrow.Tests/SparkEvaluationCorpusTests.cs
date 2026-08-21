@@ -525,13 +525,44 @@ public sealed class SparkEvaluationCorpusTests
 
     private static bool NearlyEqual(double expected, double actual)
     {
+        // Exact first. This is also the only route by which two infinities of the same sign
+        // compare equal, and it settles NaN against NaN — double.Equals calls those equal where
+        // == does not, which is the answer a value oracle wants.
         if (expected.Equals(actual)) return true;
+
+        // Anything non-finite that did not match exactly is a real difference, and must not reach
+        // the tolerance below: with either side infinite, `scale` is infinite, the tolerance is
+        // infinite, and every mismatch would compare equal. That fails in the dangerous
+        // direction, because `actual` is OUR value — an overflow to infinity where Spark answered
+        // a finite number is exactly the defect this harness exists to catch.
+        //
+        // double.IsFinite would say this in one call, and does not exist on net472.
         if (double.IsNaN(expected) || double.IsNaN(actual)) return false;
+        if (double.IsInfinity(expected) || double.IsInfinity(actual)) return false;
 
         // Spark's answer arrives through Python's repr of a float, so the last bit can differ.
         var scale = Math.Max(Math.Abs(expected), Math.Abs(actual));
         return Math.Abs(expected - actual) <= scale * 1e-12;
     }
+
+    [Theory]
+    // The comparison oracle needs its own test: a wrong `true` here is silent, and silence is the
+    // failure mode this whole file exists to remove.
+    [InlineData(1.0, 1.0, true)]
+    [InlineData(0.1 + 0.2, 0.3, true)]                       // last-bit drift, which is the point
+    [InlineData(1.0, 1.5, false)]
+    [InlineData(0.0, 0.0, true)]
+    [InlineData(double.NaN, double.NaN, true)]
+    [InlineData(double.NaN, 1.0, false)]
+    [InlineData(double.PositiveInfinity, double.PositiveInfinity, true)]
+    [InlineData(double.NegativeInfinity, double.NegativeInfinity, true)]
+    // The cases that were wrong: an infinite tolerance swallowed all of them.
+    [InlineData(double.PositiveInfinity, 1.0, false)]
+    [InlineData(1.0, double.PositiveInfinity, false)]
+    [InlineData(double.PositiveInfinity, double.NegativeInfinity, false)]
+    [InlineData(double.NegativeInfinity, 0.0, false)]
+    public void TheFloatComparisonToleratesDriftButNotInfinity(double expected, double actual, bool equal) =>
+        Assert.Equal(equal, NearlyEqual(expected, actual));
 
     private static string Show(IArrowArray array, int row) => array switch
     {
