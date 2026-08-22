@@ -75,10 +75,10 @@ public class CreateOrReplaceInteropTests : IDisposable
     /// matching removes would show BOTH generations here — the table silently doubling instead of being
     /// replaced — which is invisible to a reader that trusts EW's own snapshot.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreateOrReplace_DeltaRsSeesOnlyReplacementRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var original = await DeltaTable.CreateOrReplaceAsync(
@@ -109,10 +109,10 @@ public class CreateOrReplaceInteropTests : IDisposable
     /// (3, 7), where nothing is implied any more, so columnMapping has to appear in both feature lists or
     /// the protocol contradicts its own metadata.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreateOrReplace_LegacyFeatureOverModernTable_DeltaRsSeesConsistentProtocol()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var original = await DeltaTable.CreateOrReplaceAsync(
@@ -164,10 +164,10 @@ public class CreateOrReplaceInteropTests : IDisposable
     /// merged protocol omitted the feature would be written happily by EW, read happily back by EW, and
     /// die here — which is exactly why this test exists rather than a round-trip assertion.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreateOrReplace_LegacyFeatureOverModernTable_SparkReadsIt()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var original = await DeltaTable.CreateOrReplaceAsync(
@@ -192,10 +192,10 @@ public class CreateOrReplaceInteropTests : IDisposable
     /// through them, so a replacement that reused the previous table's column ids (rather than continuing
     /// past its maxColumnId) surfaces here as a resolution failure or as rows landing in the wrong column.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreateOrReplace_SparkAppendsThroughReplacementColumnMapping()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var original = await DeltaTable.CreateOrReplaceAsync(

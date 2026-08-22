@@ -103,10 +103,10 @@ public class SparkInteropTests : IDisposable
     /// EW writes, the reference implementation reads. Also asserts the protocol shape as Spark
     /// resolves it, via DESCRIBE DETAIL — a surface tier 1 does not have at all.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_SimpleTable_SparkReadsSameRowsAndProtocol()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using var table = await CreateEwTable([1, 2, 3], ["us", "eu", "us"]);
 
@@ -136,10 +136,10 @@ public class SparkInteropTests : IDisposable
     /// interpret — if a rebase ever mis-numbered a commit or duplicated an action, the row count here
     /// would be wrong. A round-trip through EW alone could not catch that.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwConcurrentAppends_Rebased_SparkReadsAllRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using (var setup = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdRegionSchema))
@@ -177,10 +177,10 @@ public class SparkInteropTests : IDisposable
     /// Spark doesn't know, a DV a foreign reader ignores). Spark 4.0 supports deletion vectors, so the deleted
     /// row being absent here proves the fused DV lands for a foreign reader too.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwFusedAlterInsertDelete_SparkReadsOneAtomicVersion()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var baseSchema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
@@ -252,10 +252,10 @@ public class SparkInteropTests : IDisposable
     /// support them, so this is where the claim "the resulting DV is spec-legal and reads correctly" is
     /// actually measured — the union masks exactly the two deleted positions, not all-or-nothing.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using (var setup = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdRegionSchema, enableDeletionVectors: true))
@@ -290,10 +290,10 @@ public class SparkInteropTests : IDisposable
     /// yet, and it would agree with its own (possibly wrong) convention. Spark computing 0,1,2 with no gaps or
     /// duplicates is the actual measurement.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwAppended_RowTracking_SparkReadsBaseRowIdPositionIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
@@ -324,10 +324,10 @@ public class SparkInteropTests : IDisposable
     /// file's <c>baseRowId + position</c> and read a DIFFERENT, reordered id set. Reading the ORIGINAL ids back
     /// (id 10→0, 20→1, 30→2) proves the materialized column is present, correctly named, and correctly valued.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdated_RowTracking_SparkReadsPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
@@ -377,10 +377,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Spark is the oracle that makes it a conformance claim rather than EW agreeing with itself — it
     /// resolves <c>_metadata.row_id</c> from the declared materialized column independently.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdatedTwice_RowTracking_Partitioned_SparkReadsPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(
@@ -407,10 +407,10 @@ public class SparkInteropTests : IDisposable
     /// translates every other column. Spark reads the ids through both the column mapping and the row-tracking
     /// materialization at once.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdatedTwice_RowTracking_MappedPartitioned_SparkReadsPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(
@@ -442,10 +442,10 @@ public class SparkInteropTests : IDisposable
     /// <c>baseRowId + position</c>. Asserting agreement row by row — rather than against hardcoded 0,1,2 —
     /// is what makes Spark the oracle instead of a second opinion on EW's own convention.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwReadsRowTracking_MatchesSparksRowIdAndCommitVersion()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         var ewTracking = new Dictionary<long, (long? RowId, long? Version)>();
@@ -573,10 +573,10 @@ public class SparkInteropTests : IDisposable
     /// rather than by any convention of its own — and must resolve it in preference to the file's
     /// <c>baseRowId</c>, which after Spark's rewrite points somewhere else entirely.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_RowTracking_EwReadsTheSameStableIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
 
@@ -609,10 +609,10 @@ public class SparkInteropTests : IDisposable
     /// <para>The row EW updates is deliberately NOT the row Spark updated, so the result distinguishes
     /// "carried the materialized column through" from "happened to leave the file alone".</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_RowTracking_EwUpdatePreservesSparksMaterializedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
 
@@ -657,10 +657,10 @@ public class SparkInteropTests : IDisposable
     /// single <c>baseRowId</c> cannot describe the result and the materialized column is the only way the
     /// foreign ids can survive.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_RowTracking_EwCompactionPreservesSparksMaterializedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var sparkIds = await WriteSparkRowTrackingTableWithMaterializedIdsAsync();
 
@@ -724,10 +724,10 @@ public class SparkInteropTests : IDisposable
     /// two survivors, and their ORIGINAL ids (0 and 2) come back — proving the rewrite carried the materialized
     /// id column even on the position-addressed delete path, not just the predicate UPDATE.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwDeletedByRowId_CopyOnWrite_RowTracking_SparkReadsSurvivorsWithPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
@@ -768,10 +768,10 @@ public class SparkInteropTests : IDisposable
     /// from several source files mix into one compacted file, a single <c>baseRowId</c> cannot represent them —
     /// the compacted file MUST carry the materialized id column. Reading 10→0, 20→1, 30→2 proves it does.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCompacted_RowTracking_SparkReadsPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
@@ -804,10 +804,10 @@ public class SparkInteropTests : IDisposable
     /// round-trip through EW alone would agree with its own convention; Spark computing 10→0, 30→2, 40→3, 50→4
     /// with id 20 absent is the actual cross-engine confirmation.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwDeleteRemappedThroughCompaction_SparkReadsSurvivorsWithPreservedIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var setup = await DeltaTable.CreateAsync(
@@ -845,10 +845,10 @@ public class SparkInteropTests : IDisposable
     /// "limitation 2"'s append half — a wrong re-derivation would surface as a DUPLICATE row id (the loser
     /// reusing the winner's space) or a gap, which a round-trip through EW alone could not detect.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwConcurrentAppends_RowTracking_Rebased_SparkReadsContiguousIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var setup = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
@@ -886,10 +886,10 @@ public class SparkInteropTests : IDisposable
     /// scan touches exactly the two partition files (us + eu) and returns the updated us rows — proving the
     /// rewritten file landed where Spark's planner finds it for a <c>region='us'</c> query.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdated_PartitionedTable_SparkReadsRewrittenFile()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -922,10 +922,10 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>The reference implementation writes, EW reads.</summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_SimpleTable_EwReadsSameRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write", new
         {
@@ -956,10 +956,10 @@ public class SparkInteropTests : IDisposable
     /// physical column names, and the engine must resolve them back to logical ones through the
     /// schema metadata. A round-trip cannot test this: EW resolves against its own mapping either way.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_ColumnMapping_SparkResolvesPhysicalNamesToLogical()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using var table = await CreateEwTable(
             [1, 2, 3], ["us", "eu", "apac"], columnMapping: ColumnMappingMode.Name);
@@ -986,10 +986,10 @@ public class SparkInteropTests : IDisposable
     /// <para>DESCRIBE DETAIL's <c>clusteringColumns</c> is the only external surface that reports what
     /// an engine resolved the domain to, so tier 3 is the only tier that can check it.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_Clustered_SparkResolvesClusteringColumns()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using var table = await CreateEwTable([1, 2, 3], ["us", "eu", "apac"],
             clusteringColumns: ["region"]);
@@ -1013,10 +1013,10 @@ public class SparkInteropTests : IDisposable
     ///
     /// <para>The row set must be identical afterwards — OPTIMIZE is purely a layout change.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_SparkOptimize_PreservesRowsAndEwReadsBack()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -1049,10 +1049,10 @@ public class SparkInteropTests : IDisposable
     /// rewriting the file, so EW must apply the DV to get the right rows — a reader that ignored it
     /// entirely would return the deleted row and pass every round-trip test EW has.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_DeletionVector_EwAppliesItOnRead()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write", new
         {
@@ -1085,10 +1085,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Asserting <c>files_scanned &lt; files_total</c> is what keeps this honest: row
     /// correctness alone would also pass on an engine that never pruned, proving nothing.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_MinMaxStats_SparkSkipsFilesWithoutLosingRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -1110,10 +1110,10 @@ public class SparkInteropTests : IDisposable
     /// years and asserts Spark skips the out-of-range one under a date predicate — proving EW's date stats
     /// are in the format a foreign reader actually prunes on.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_DateStats_SparkSkipsFilesWithoutLosingRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
@@ -1147,10 +1147,10 @@ public class SparkInteropTests : IDisposable
     /// nothing. This writes three single-row files and asserts Spark skips the out-of-range one under a
     /// decimal predicate — proving EW's decimal stats are in the numeric form a foreign reader prunes on.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_DecimalStats_SparkSkipsFilesWithoutLosingRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var type = new Decimal128Type(12, 2);
         var schema = new Apache.Arrow.Schema.Builder()
@@ -1179,10 +1179,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Nested stats are the easier ones to get wrong: the paths have to be built recursively and
     /// a struct that is skipped or mis-keyed produces a log that still parses and still round-trips.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, NestedSchema);
@@ -1214,10 +1214,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Asserting <c>files_scanned &lt; files_total</c> is what keeps this honest, exactly as in
     /// the commit-JSON cases: correct rows alone would also pass on an engine that never pruned.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCheckpointed_MinMaxStats_SparkSkipsFilesReadingTheCheckpointAlone()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         // A checkpoint per commit, so the last one summarises all three files.
@@ -1247,10 +1247,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Hence a decimal table specifically, read through its checkpoint: this fails on the read,
     /// not on the pruning, if checkpoints ever go back to an exotic encoding.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCheckpointed_DecimalStats_SparkReadsTheCheckpointAndPrunes()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var type = new Decimal128Type(12, 2);
         var schema = new Apache.Arrow.Schema.Builder()
@@ -1284,10 +1284,10 @@ public class SparkInteropTests : IDisposable
     /// at all — a table read cannot, because Delta prefers the JSON string when a checkpoint carries
     /// both. The reference's own checkpoint is captured alongside to record what it carries.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCheckpoint_TypedStats_AgreeWithTheJsonStatsSparkReads()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         string ewDir = Path.Combine(_tempDir, "ew");
         string referenceDir = Path.Combine(_tempDir, "reference");
@@ -1352,11 +1352,13 @@ public class SparkInteropTests : IDisposable
     /// <c>loadActions</c> maps <c>add.stats</c> and nothing else), so on the pinned 4.0 pairing this
     /// self-skips rather than asserting something the build cannot do.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCheckpointed_StructStatsOnly_SparkPrunesFromTheTypedStats()
     {
-        if (!Spark.EnsureAvailable()) return;
-        if (!SparkReadsStructStats()) return;
+        Spark.Require();
+        Skip.IfNot(SparkReadsStructStats(),
+            "delta-spark behind this tier does not read add.stats_parsed (needs 4.1+); "
+            + $"resolved {Spark.Version}");
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -1431,10 +1433,10 @@ public class SparkInteropTests : IDisposable
     /// silently returns as live data. EW's own reader would report the same wrong answer, so only a
     /// foreign reader can catch it — and only after a vacuum that actually deleted something.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void SparkWrittenDeletionVector_SurvivesEwVacuum()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write", new
         {
@@ -1467,10 +1469,10 @@ public class SparkInteropTests : IDisposable
     /// implementation must still read the table. A vacuum that deletes one file too many shows up here
     /// as a read failure rather than as wrong data.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwVacuumed_SparkStillReadsTable()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema))
@@ -1512,10 +1514,10 @@ public class SparkInteropTests : IDisposable
     /// never fire and EW would write straight through it. This pins the assumption against a
     /// constraint Spark actually created.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_CheckConstraint_EwRefusesToWrite()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write", new
         {
@@ -1548,10 +1550,10 @@ public class SparkInteropTests : IDisposable
     /// (<c>delta.generationExpression</c>). Writing without computing the generated value would
     /// produce a column that silently disagrees with its own definition.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_GeneratedColumn_EwRefusesToWrite()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("create", new
         {
@@ -1643,10 +1645,10 @@ public class SparkInteropTests : IDisposable
     /// types. If EW wrote the feed with logical names (the old behavior), Spark would fail to resolve the
     /// physical layout or surface the wrong columns — an EW-only round-trip could never catch that.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_ChangeDataFeed_MappedPartitioned_SparkReadsLogicalNamesAndPartition()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long insertVersion, updateVersion;
         await using (var table = await CreateMappedPartitionedCdfTableAsync())
@@ -1713,10 +1715,10 @@ public class SparkInteropTests : IDisposable
     /// never asked for. A reader that resolved the change file against the table schema positionally, rather
     /// than by name, would surface them as data.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_RowTrackingChangeDataFeed_SparkReadsTheFeedWithoutTheHiddenColumns()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long insertVersion, updateVersion;
         string matRowIdName, matRowVerName;
@@ -1794,10 +1796,10 @@ public class SparkInteropTests : IDisposable
     /// "helpfully" invents an id for them fails here rather than in a foreign reader.</item>
     /// </list>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdated_RowTracking_IdModeColumnMapping_SparkResolvesIdsAndFeed()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long insertVersion, updateVersion;
         string matRowIdName, matRowVerName;
@@ -1928,10 +1930,10 @@ public class SparkInteropTests : IDisposable
     /// that reported that null verbatim would say the post-image row has no version, when it plainly belongs
     /// to the commit that produced it.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_RowTrackingChangeDataFeed_EwResolvesSparksIds()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write", new
         {
@@ -2038,10 +2040,10 @@ public class SparkInteropTests : IDisposable
     /// actions make the rewrite commit read as three row-level changes instead of an inferred whole-file
     /// delete + insert.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwRowIdDml_CopyOnWrite_ChangeDataFeed_SparkReadsPreImagePostImageAndDelete()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long updateVersion, deleteVersion;
         await using (var table = await CreatePartitionedCdfTableAsync())
@@ -2133,10 +2135,10 @@ public class SparkInteropTests : IDisposable
     /// or not EW's own reader honors the DV. Measured against Spark 4.0 — before the DV-aware inference fix EW
     /// reported five deletes at v4 where Spark reported four.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long appendVersion, deleteVersion, overwriteVersion;
         await using (var table = await CreateCdfDvTableAsync())
@@ -2198,10 +2200,10 @@ public class SparkInteropTests : IDisposable
     /// <para>Compaction is a pure reorganization (<c>dataChange: false</c>), so Spark must see exactly the
     /// rows it saw before — asserted here against the same query run on both sides of the compaction.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCompacted_SchemaEvolvedMappedTable_SparkReadsSameRows()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         var v1Schema = new Apache.Arrow.Schema.Builder()
@@ -2331,10 +2333,10 @@ public class SparkInteropTests : IDisposable
     /// back to commitInfo's informational <c>timestamp</c> field — so a snapshot value proves nothing about
     /// whether the feature is live. The key's presence in the JSON does.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreated_InCommitTimestampsProperty_SparkWritesThroughAndStampsItsOwnCommit()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long ewVersion;
         await using (var table = await DeltaTable.CreateAsync(
@@ -2371,13 +2373,13 @@ public class SparkInteropTests : IDisposable
     /// feature lists — if it were not, Spark would read the table as unmapped and fail to resolve the
     /// physical <c>col-&lt;guid&gt;</c> column names in the data files.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(IcebergCompat.EnableV1Key, "icebergCompatV1")]
     [InlineData(IcebergCompat.EnableV2Key, "icebergCompatV2")]
     public async Task EwCreated_IcebergCompatProperty_SparkResolvesFeatureAndReadsRows(
         string enableKey, string feature)
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdRegionSchema,
@@ -2402,10 +2404,10 @@ public class SparkInteropTests : IDisposable
     /// its dependency: <c>rowTracking</c> needs <c>domainMetadata</c>). EW then reads Spark's result,
     /// and its own change feed for the version it wrote.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreated_AllFeaturesViaProperties_SparkDeletesThroughItAndEwReadsBack()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         long insertVersion;
         await using (var table = await DeltaTable.CreateAsync(
@@ -2467,10 +2469,10 @@ public class SparkInteropTests : IDisposable
     /// SILENTLY (no exception, and no new table version — the skip is total), a GAP is applied, and the skip
     /// is by <c>&gt;=</c> rather than by equality, so an older batch is skipped too.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Spark_IdempotentWrite_SkipsAtOrBelowTheRecordedVersion_AndToleratesAGap()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         // Records version 5 for the producer.
         Spark.Invoke("write", new
@@ -2505,10 +2507,10 @@ public class SparkInteropTests : IDisposable
     /// application's own counter, so every long is legitimate" true of the FORMAT but false of the reference
     /// implementation — and therefore the reason EW does not reserve a negative as a sentinel.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Spark_IdempotentWrite_RefusesANegativeVersion()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var rejected = Spark.InvokeRaw("write", new
         {
@@ -2628,10 +2630,10 @@ public class SparkInteropTests : IDisposable
     /// Windows-only measurement cannot tell the two encodings apart. It is still the non-ASCII case
     /// that separates them, on every platform.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Spark_NonAsciiPartition_PathEncodingGroundTruth()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var written = Spark.Invoke("partition_paths", new
         {
@@ -2687,10 +2689,10 @@ public class SparkInteropTests : IDisposable
     /// and Win32 rejected them, and a trailing space created a stripped-name directory and then threw.
     /// So on Windows this test now also covers "EW can write these", not only "EW agrees with Spark".</para>
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public async Task EwPartitionPaths_AreIdenticalToSparks()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         string sparkDir = Path.Combine(_tempDir, "spark");
         string ewDir = Path.Combine(_tempDir, "ew");
@@ -2759,12 +2761,12 @@ public class SparkInteropTests : IDisposable
     /// unexercised for so long — and why "EW reads Spark's V2 output" was true of only half the
     /// format.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("json")]
     [InlineData("parquet")]
     public async Task SparkWrittenV2Checkpoint_EwReadsFromTheCheckpointAlone(string body)
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var written = Spark.Invoke("v2_checkpoint", new
         {
@@ -2851,14 +2853,14 @@ public class SparkInteropTests : IDisposable
     /// alone. See
     /// <c>DeltaRsInteropTests.EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone</c>.</para>
     /// </remarks>
-    [Theory]
+    [SkippableTheory]
     [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
     [InlineData(1, 1)]      // threshold below → one sidecar
     [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
     public async Task EwWrittenV2Checkpoint_SparkReadsFromTheCheckpointAlone(
         int sidecarThreshold, int expectedSidecars)
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
 

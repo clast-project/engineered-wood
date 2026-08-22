@@ -216,10 +216,10 @@ have to.
 
 #### Making a missing toolchain fail loudly
 
-Like the ORC/Avro tests, these no-op when their toolchain is absent. At this
-scale that is a hazard: a whole tier can go dark in CI and quietly leave the
-suite back at round-trip-only, with nothing red to show for it. **Set these
-in CI:**
+Like the ORC/Avro tests, these skip when their toolchain is absent. At this
+scale a skip is not enough on its own: a whole tier can go dark in CI and
+quietly leave the suite back at round-trip-only, with nothing red to show
+for it. **Set these in CI:**
 
 ```
 EW_REQUIRE_DELTA_INTEROP=1
@@ -227,8 +227,10 @@ EW_REQUIRE_SPARK_INTEROP=1
 EW_REQUIRE_DUCKDB_INTEROP=1
 ```
 
-With either set, an unavailable toolchain becomes a hard failure naming the
-exact missing prerequisite instead of a silent skip.
+With one set, an unavailable toolchain becomes a hard failure naming the
+exact missing prerequisite instead of a skip. They are per tier on purpose:
+the per-commit build requires delta-rs and DuckDB but not Spark, because
+windows-latest has no JDK, while the nightly requires all three.
 
 #### Reaching Delta's internals, not just its SQL
 
@@ -372,29 +374,57 @@ Passed!  - Failed: 0, Passed: 194, Skipped: 10, Total: 204
 `Skipped: 0` for ORC/Avro means the Python tests **are running** (they
 passed); a non-zero count means the package is not installed.
 
-### The Delta interop tiers do NOT skip — they report Passed
+### The Delta interop tiers skip, and the skip count is the number to read
 
-**This is the one number in the output you cannot take at face value.**
-The Delta interop tests are gated by `if (!Spark.EnsureAvailable()) return;`,
-which returns *normally* — so a test whose tier is unreachable is counted
-**Passed**, not Skipped. Measured on a machine with no JDK:
+The Delta interop tests are `[SkippableFact]`/`[SkippableTheory]` and open
+with `Spark.Require();` (or `DeltaRs`/`DuckDb`), so an unreachable tier
+reports **Skipped**, with the reason attached:
 
 ```
-dotnet test --filter "FullyQualifiedName~SparkInteropTests"
+Skipped ...SparkInteropTests.EwWritten_SimpleTable_SparkReadsSameRowsAndProtocol [1 ms]
+  spark_driver.py toolchain unavailable: no python interpreter satisfying
+  `import pyspark, delta.tables, json; ...` on PATH
+```
+
+**This used to be the one number you could not take at face value.** The
+gate was `if (!Spark.EnsureAvailable()) return;`, which returns *normally* —
+so an unreachable tier was counted **Passed**. Measured on a machine with no
+JDK, before the change:
+
+```
 Passed!  - Failed: 0, Passed: 54, Skipped: 0, Total: 54, Duration: 94 ms
 ```
 
-54 green tests in 94 milliseconds, having validated nothing. Nothing in
-that line distinguishes it from real coverage, and a whole tier can go dark
-without anyone noticing.
+54 green tests in 94 milliseconds, having validated nothing, and nothing in
+that line to distinguish it from real coverage.
 
-Two defences, and you want both:
+A skip is honest, but an honest green is still a green — a job can skip an
+entire tier and pass. So you still want both defences:
 
-- **Set the `EW_REQUIRE_*` variables** (below). They turn an unreachable
-  tier into a loud failure, which is the only way a green run *proves* the
-  tier ran.
-- **Watch the duration.** The Spark tier cannot complete in under a second;
-  if `SparkInteropTests` finishes instantly, it did nothing.
+- **Read `Skipped:`.** It now tells you *which* tests did not run and why,
+  instead of hiding them in the Passed column. On the pinned oracles the
+  expected count is **5**, not 0 — see the note below. More than that means
+  something went dark.
+- **Set the `EW_REQUIRE_*` variables** ([above](#making-a-missing-toolchain-fail-loudly)). They turn an unreachable
+  tier into a loud failure, which is the only thing that makes a green run
+  *prove* the tier ran. The skip says what happened; the variable says
+  whether this job was allowed to tolerate it.
+
+Skips are not only about a missing toolchain, and this is the part worth
+internalising: **five tests skip on a fully-configured machine**, because
+the *feature* is newer than the pinned oracle — GA `VARIANT` needs Spark
+4.1+ and DuckDB 1.4+, and `add.stats_parsed` needs delta-spark 4.1+. So the
+healthy result on the pinned 4.0 pairing is:
+
+```
+Passed!  - Failed: 0, Passed: 104, Skipped: 5, Total: 109
+```
+
+`EW_REQUIRE_*` does **not** turn these into failures, and should not: the
+toolchain is present and working, the feature simply does not exist in it.
+Those five used to report Passed as well, which is why "109/109" on the 4.0
+pairing never meant what it appeared to. Point the Spark tier at a 4.1 venv
+(above) and they run.
 
 CI does this for you now: the delta-rs and DuckDB tiers run on every commit
 with their require-variables set, and the full matrix including Spark runs
@@ -427,7 +457,10 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 
 Counts move with every feature, so treat these as an order-of-magnitude
 check rather than a target — the useful signal is `Failed: 0` and, for the
-suites above that have optional tiers, `Skipped: 0`.
+suites above that have optional tiers, `Skipped: 0`. The one exception is
+`DeltaLake.Table`, where 5 skips are expected on the pinned oracles because
+the features they cover postdate those versions; see [Skipped
+tests](#skipped-tests).
 
 Of `DeltaLake.Table`'s 98 interop tests, **68 need PySpark** and **2 need
 DuckDB**; the remaining 28 need delta-rs. Measured by making each tier

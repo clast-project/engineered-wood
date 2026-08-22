@@ -177,23 +177,21 @@ jobs:
 
       - name: Test
         if: steps.changes.outputs.code == 'true'
-        # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a
-        # silent no-op, which is the whole point of setting them here.
+        # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a skip,
+        # which is the whole point of setting them here.
         #
-        # A DELTA interop test that cannot reach its toolchain does not report Skipped —
-        # `if (!X.EnsureAvailable()) return;` returns normally, so xUnit counts it
-        # PASSED. Measured: with no JDK present the 54 Spark interop tests report
-        # "Passed: 54, Skipped: 0" in 94ms. Nothing in a CI summary distinguishes
-        # that from real coverage, so a tier can go dark and take its conformance
-        # guarantees with it while the build stays green.
+        # An unreachable tier does report Skipped now — the interop tests are
+        # [SkippableFact] and open with `X.Require();`, matching the ORC and Avro
+        # cross-validation suites. But a skip only makes the run honest, it does not
+        # make it a gate: a job can skip a whole tier and still go green, taking that
+        # tier's conformance guarantees with it. These variables are what turn "the
+        # toolchain was missing" into a red build.
         #
-        # This is specific to EngineeredWood.DeltaLake.Table.Tests. The Avro and ORC
-        # cross-validation tests already report real skips: both projects reference
-        # Xunit.SkippableFact and gate on `Skip.If(!IsFastavroAvailable(), ...)` /
-        # `Skip.If(!IsPyArrowAvailable(), ...)`. So the pattern is established in this
-        # repo — what makes it a poor fit HERE is the ~100 Delta interop tests that
-        # would need converting, not the dependency. (xUnit 2.9.3 itself has no
-        # Assert.Skip, which is why SkippableFact is the mechanism in the first place.)
+        # Historically the gate was `if (!X.EnsureAvailable()) return;`, which returns
+        # normally, so xUnit counted an unreachable test PASSED — with no JDK present
+        # the 54 Spark interop tests reported "Passed: 54, Skipped: 0" in 94ms, which
+        # no CI summary could distinguish from real coverage. That is fixed, but the
+        # variables still earn their place for the reason above.
         #
         # The Spark tier stays unset here and is exercised by interop-nightly.yml.
         env:

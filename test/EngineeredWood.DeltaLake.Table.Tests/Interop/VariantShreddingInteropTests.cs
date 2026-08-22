@@ -110,13 +110,14 @@ public class VariantShreddingInteropTests : IDisposable
         return parts.Length >= 2 && int.TryParse(parts[1], out int minor) && minor >= 1;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(true)]   // shredded — the layout this suite exists for
     [InlineData(false)]  // canonical — the control: same values, different layout
     public async Task EwWritten_SparkReadsVariant(bool shredded)
     {
-        if (!Spark.EnsureAvailable()) return;
-        if (!SparkHasGaVariant()) return; // 4.0.x predates the VARIANT logical type entirely
+        Spark.Require();
+        // 4.0.x predates the VARIANT logical type entirely.
+        Skip.IfNot(SparkHasGaVariant(), $"GA VARIANT needs Spark 4.1+; resolved {Spark.Version}");
 
         string path = await WriteAsync(shredded);
         var result = Spark.Invoke("read_parquet_variant", new { path, col = "v", id_col = "id" });
@@ -141,13 +142,14 @@ public class VariantShreddingInteropTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task EwWritten_DuckDbReadsVariant(bool shredded)
     {
-        if (!DuckDb.EnsureAvailable()) return;
-        if (!DuckDb.HasVariantType) return; // < 1.4 has no VARIANT; it would read a bare struct
+        DuckDb.Require();
+        // < 1.4 has no VARIANT; it would read a bare struct.
+        Skip.IfNot(DuckDb.HasVariantType, $"DuckDB VARIANT needs 1.4+; resolved {DuckDb.Version}");
 
         string path = await WriteAsync(shredded);
         var result = DuckDb.Invoke("read_parquet_variant", new { path, col = "v", order_by = "id" });
@@ -173,10 +175,10 @@ public class VariantShreddingInteropTests : IDisposable
     /// <c>metadata</c> required, <c>value</c> optional and NULL on a row that shredded cleanly, and
     /// one <c>value</c>/<c>typed_value</c> pair per hoisted field under <c>typed_value</c>.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWrittenShredded_MatchesTheSpecLayout()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         string path = await WriteAsync(shredded: true);
         var result = DeltaRs.Invoke("parquet_variant_layout", new { path, col = "v" });
@@ -213,10 +215,10 @@ public class VariantShreddingInteropTests : IDisposable
     /// The control for the layout assertions: the same values written canonically have no
     /// <c>typed_value</c> at all, so the differences above are layout and not content.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWrittenCanonical_HasNoTypedValue()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         string path = await WriteAsync(shredded: false);
         var result = DeltaRs.Invoke("parquet_variant_layout", new { path, col = "v" });

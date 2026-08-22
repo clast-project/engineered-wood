@@ -87,10 +87,10 @@ public class DeltaRsInteropTests : IDisposable
     /// valued on the new file. A mis-shaped fused commit (a stray second metaData, an add referencing a schema
     /// the reader doesn't have) would surface here as wrong columns or a read failure.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwFusedAlterInsert_DeltaRsReadsSchemaEvolvedCommit()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var baseSchema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
@@ -137,10 +137,10 @@ public class DeltaRsInteropTests : IDisposable
     }
 
     /// <summary>EW writes, delta-rs reads: the same rows, the same schema.</summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_SimpleTable_DeltaRsReadsSameRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -160,10 +160,10 @@ public class DeltaRsInteropTests : IDisposable
     /// the user rows/columns, with the updated value applied. (Row tracking is a writer-only feature, so
     /// delta-rs reads the table without needing to understand it.)
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdated_RowTracking_DeltaRsReadsUserColumnsOnly()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true);
@@ -194,10 +194,10 @@ public class DeltaRsInteropTests : IDisposable
 
     /// <summary>delta-rs writes, EW reads. The reverse direction is what catches EW's reader
     /// quietly accepting only the dialect EW's own writer emits.</summary>
-    [Fact]
+    [SkippableFact]
     public async Task DeltaRsWritten_SimpleTable_EwReadsSameRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         DeltaRs.Invoke("write", new
         {
@@ -228,10 +228,10 @@ public class DeltaRsInteropTests : IDisposable
     /// UTF-8 bytes), and then <c>add.path</c> percent-encodes <i>that</i> again — so a literal
     /// <c>%</c> in the directory name appears as <c>%25</c> in the log.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeltaRs_NonAsciiPartition_PathEncodingGroundTruth()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         DeltaRs.Invoke("write", new
         {
@@ -268,10 +268,10 @@ public class DeltaRsInteropTests : IDisposable
     /// round-trips it fine (<c>Uri.UnescapeDataString</c> is a no-op on literals), which is exactly
     /// why round-trip tests never caught this.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_NonAsciiPartition_DeltaRsReadsSameRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -292,10 +292,10 @@ public class DeltaRsInteropTests : IDisposable
     /// identically to a correct one as long as the commits are still there — which they always are in
     /// a round-trip test.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_Checkpointed_DeltaRsReadsFromCheckpointOnly()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -329,14 +329,14 @@ public class DeltaRsInteropTests : IDisposable
     /// The tombstone-level assertion the checkpoint also needs lives on the Spark side, which exposes
     /// its reconstructed removes — delta-rs has no tombstone API to ask.</para>
     /// </remarks>
-    [Theory]
+    [SkippableTheory]
     [InlineData(10_000, 0)] // threshold above the file count → all file actions inline
     [InlineData(1, 1)]      // threshold below → one sidecar
     [InlineData(1, 2)]      // split across two, so multi-sidecar resolution is exercised
     public async Task EwWrittenV2Checkpoint_DeltaRsRebuildsStateFromTheCheckpointAlone(
         int sidecarThreshold, int expectedSidecars)
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
 
@@ -396,10 +396,10 @@ public class DeltaRsInteropTests : IDisposable
     /// all — so nothing external has ever checked them. Here delta-rs parses the stats out of the log
     /// and we compare them against the values EW wrote.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_PerFileStats_DescribeTheFilesTheyBelongTo()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -438,10 +438,10 @@ public class DeltaRsInteropTests : IDisposable
     /// before opening them, so an over-tight min/max shows up here as missing rows — the failure mode
     /// <see cref="EwWritten_PerFileStats_DescribeTheFilesTheyBelongTo"/> guards from the other side.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_FilteredRead_PrunesWithoutLosingRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
@@ -465,10 +465,10 @@ public class DeltaRsInteropTests : IDisposable
     /// names, so this also exercises the <c>DeltaPath</c> encoding from the query side rather than the
     /// write side.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_PartitionFilteredRead_ReturnsAllMatchingRows()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -492,10 +492,10 @@ public class DeltaRsInteropTests : IDisposable
     /// <c>DeleteUpdateTests.Update_PartitionedTable_WritesRewrittenFileIntoPartitionDir</c>). Its value is
     /// confirming the fixed layout still reads correctly cross-engine.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUpdated_PartitionedTable_DeltaRsReadsRewrittenFile()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -557,13 +557,13 @@ public class DeltaRsInteropTests : IDisposable
     /// row 1 plus a NULL at row 3: a gather that mixed up row order or lost the validity bitmap fails here
     /// too, not just one that mis-scales the unit.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(TimeUnit.Microsecond)]
     [InlineData(TimeUnit.Millisecond)]
     public async Task EwWritten_PartitionedTableWithTimestampDataColumn_DeltaRsReadsExactMicroseconds(
         TimeUnit unit)
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         // Deliberately not whole multiples of the next coarser unit — 123 microseconds is exactly what a
         // millisecond-resolution round-trip destroys.
@@ -627,14 +627,14 @@ public class DeltaRsInteropTests : IDisposable
     /// fraction omitted when zero — both forms appear below, and the millisecond case must be widened to six
     /// fractional digits rather than emitted as its stored value.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(TimeUnit.Microsecond, "UTC")]
     [InlineData(TimeUnit.Millisecond, "UTC")]
     [InlineData(TimeUnit.Microsecond, null)] // timestamp_ntz
     public async Task EwWritten_TimestampPartitionColumn_DeltaRsRecoversExactInstant(
         TimeUnit unit, string? timezone)
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         // One value with a sub-second fraction, one landing exactly on the second.
         long[] raw = unit == TimeUnit.Microsecond
@@ -703,10 +703,10 @@ public class DeltaRsInteropTests : IDisposable
     /// a DV-capable engine reads the union correctly needs tier 3</b> (see
     /// <c>SparkInteropTests.EwWritten_UnionedDeletionVector_SparkReadsSurvivingRow</c>).</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwUnionedDeletionVector_EwApplies_DeltaRsSafelyRefusesUnsupportedFeature()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         await using (var setup = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdRegionSchema, enableDeletionVectors: true))
@@ -764,10 +764,10 @@ public class DeltaRsInteropTests : IDisposable
     /// considering separately: emitting v3/v7 with a <c>columnMapping</c> reader feature instead of
     /// the legacy numbering would make the table readable by delta-rs and DuckDB too.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
@@ -811,10 +811,10 @@ public class DeltaRsInteropTests : IDisposable
     /// would fail — which is the point. Deletion vectors are deliberately absent: they are a reader
     /// feature, and delta-rs 1.6.2 correctly declines those (see the deletion-vector test above).</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task EwCreated_WriterOnlyFeatureProperties_DeltaRsStillReadsAndSeesDeclarations()
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), IdRegionSchema,

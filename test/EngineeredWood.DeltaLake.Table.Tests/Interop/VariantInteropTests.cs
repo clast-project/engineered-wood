@@ -100,12 +100,12 @@ public class VariantInteropTests : IDisposable
 
     // ── Tier 1: delta-rs reads BOTH physical layouts (it ignores the annotation, keys off the schema). ──
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(true)]   // annotated  (default)
     [InlineData(false)]  // unannotated (Spark-4.0 compatible)
     public async Task EwWritten_DeltaRsReadsVariantBytes(bool annotated)
     {
-        if (!DeltaRs.EnsureAvailable()) return;
+        DeltaRs.Require();
 
         await WriteVariantTable(emitAnnotation: annotated);
 
@@ -138,10 +138,10 @@ public class VariantInteropTests : IDisposable
         return parts.Length >= 2 && int.TryParse(parts[1], out int minor) && minor >= 1;
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task EwWritten_SparkReadsVariant()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         // Write the layout THIS Spark can read: annotated for 4.1+ (GA), unannotated for 4.0.x.
         bool ga = SparkHasGaVariant(out _);
@@ -157,10 +157,10 @@ public class VariantInteropTests : IDisposable
             || rows[2].GetProperty("vjson").GetString() is null);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task SparkWritten_EwReadsVariant()
     {
-        if (!Spark.EnsureAvailable()) return;
+        Spark.Require();
 
         Spark.Invoke("write_variant", new
         {
@@ -203,11 +203,12 @@ public class VariantInteropTests : IDisposable
     // nested group (StripAnnotation is top-level only) and Spark 4.0.x's reader NPEs on the annotation.
     // On a 4.0.x Spark these silently no-op — a version gate, not a missing toolchain.
 
-    [Fact]
+    [SkippableFact]
     public async Task EwWrittenNestedVariant_SparkReadsVariant()
     {
-        if (!Spark.EnsureAvailable()) return;
-        if (!SparkHasGaVariant(out _)) return;
+        Spark.Require();
+        Skip.IfNot(SparkHasGaVariant(out string sparkVersion),
+            $"GA VARIANT needs Spark 4.1+; resolved {sparkVersion}");
 
         await WriteNestedVariantTable();
 
@@ -221,11 +222,12 @@ public class VariantInteropTests : IDisposable
             || rows[2].GetProperty("vjson").GetString() is null);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task SparkWrittenNestedVariant_EwReadsVariant()
     {
-        if (!Spark.EnsureAvailable()) return;
-        if (!SparkHasGaVariant(out _)) return;
+        Spark.Require();
+        Skip.IfNot(SparkHasGaVariant(out string sparkVersion),
+            $"GA VARIANT needs Spark 4.1+; resolved {sparkVersion}");
 
         Spark.Invoke("write_nested_variant", new
         {
