@@ -58,10 +58,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # See ci.yml for why this was pinned at 3.11 until 2026-08: SPARK-53759 broke
+      # the PySpark worker on WINDOWS under Python 3.12+. This job runs on Linux,
+      # where Spark forks workers via pyspark.daemon rather than spawn-and-connect-
+      # back, so the bug never reached it — but a nightly that only passes on a
+      # Python the dev boxes cannot use is not validating what anyone runs.
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       # Pinned deliberately — see Spark.ValidatedAgainstVersion / DeltaRs /
       # DuckDb.ValidatedAgainstVersion. These packages are the ORACLES the assertions
@@ -70,13 +75,20 @@ jobs:
       #
       # delta-spark's major version must match pyspark's: 4.x pairs with Spark 4.0.
       #
+      # pyspark is 4.0.4 rather than 4.0.1 because 4.0.1 predates the SPARK-53759
+      # fix (see the Setup Python step). The bug is Windows-only, so 4.0.1 would
+      # still pass HERE — but the dev-box instructions have to name a version that
+      # works on Windows, and there is no reason for the oracle this job pins and
+      # the oracle a contributor installs to be different builds. 4.0.4 is the
+      # latest 4.0.x and the pairing measured against the full tier.
+      #
       # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
       # without it every delta-rs read raises "Pyarrow is required" — invisible on a
       # dev box, which has pyarrow for the ORC cross-validation.
       - name: Install interop oracles (Spark, delta-rs, DuckDB)
         run: |
           python -m pip install --disable-pip-version-check \
-            pyspark==4.0.1 delta-spark==4.0.0 \
+            pyspark==4.0.4 delta-spark==4.0.0 \
             deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
 
       # Warms the Ivy cache so the first test does not pay jar resolution inside its

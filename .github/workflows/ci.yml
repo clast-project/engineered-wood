@@ -107,11 +107,19 @@ jobs:
             8.0.x
             10.0.x
 
+      # 3.11 until 2026-08: PySpark could not run on Windows under Python 3.12+
+      # (SPARK-53759, a missing flush in the simple-worker path — the worker died
+      # mid-handshake). Fixed upstream in pyspark 4.0.3 / 4.1.2 / 3.5.9. This job
+      # never ran the Spark tier, but it was held at 3.11 to match the nightly and
+      # the dev-box instructions rather than diverge from them.
+      #
+      # 3.11.9 (Apr 2024) is also the last 3.11 with a Windows installer; the branch
+      # is security-only and EOL Oct 2027, so staying there had a shelf life.
       - name: Setup Python
         if: steps.changes.outputs.code == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       # The two interop tiers cheap enough to gate every commit on. Both are pure
       # Python — no JDK, no JVM — and add seconds. The Spark tier is the expensive
