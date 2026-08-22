@@ -106,13 +106,13 @@ public sealed class ParquetStatisticsAccessor
     private static LiteralValue? DecodeMin(ColumnDescriptor desc, Statistics stats)
     {
         var bytes = stats.MinValue ?? FallbackBytes(desc, stats.Min);
-        return bytes is null ? null : Decode(desc, bytes);
+        return bytes is null ? null : Decode(desc, bytes, isMax: false);
     }
 
     private static LiteralValue? DecodeMax(ColumnDescriptor desc, Statistics stats)
     {
         var bytes = stats.MaxValue ?? FallbackBytes(desc, stats.Max);
-        return bytes is null ? null : Decode(desc, bytes);
+        return bytes is null ? null : Decode(desc, bytes, isMax: true);
     }
 
     /// <summary>
@@ -134,7 +134,12 @@ public sealed class ParquetStatisticsAccessor
         };
     }
 
-    private static LiteralValue? Decode(ColumnDescriptor desc, byte[] bytes)
+    /// <param name="isMax">
+    /// Which end of the range this bound is. It matters wherever the decode cannot be exact: a bound
+    /// must only ever move OUTWARD. Rounding a max down, or a min up, narrows the range the file claims
+    /// and lets a row group be pruned that genuinely contains matching rows.
+    /// </param>
+    private static LiteralValue? Decode(ColumnDescriptor desc, byte[] bytes, bool isMax)
     {
         var logical = desc.SchemaElement.LogicalType;
 
@@ -143,11 +148,11 @@ public sealed class ParquetStatisticsAccessor
             PhysicalType.Boolean => bytes.Length >= 1
                 ? (LiteralValue?)LiteralValue.Of(bytes[0] != 0) : null,
             PhysicalType.Int32 => DecodeInt32(bytes, logical),
-            PhysicalType.Int64 => DecodeInt64(bytes, logical),
+            PhysicalType.Int64 => DecodeInt64(bytes, logical, isMax),
             PhysicalType.Float => DecodeFloat(bytes),
             PhysicalType.Double => DecodeDouble(bytes),
             PhysicalType.ByteArray => DecodeByteArray(bytes, logical),
-            PhysicalType.FixedLenByteArray => DecodeFixedLenByteArray(desc, bytes, logical),
+            PhysicalType.FixedLenByteArray => DecodeFixedLenByteArray(desc, bytes, logical, isMax),
             // INT96 sort order is undefined per the Parquet spec.
             PhysicalType.Int96 => null,
             _ => null,
@@ -203,7 +208,7 @@ public sealed class ParquetStatisticsAccessor
         }
     }
 
-    private static LiteralValue? DecodeInt64(byte[] bytes, LogicalType? logical)
+    private static LiteralValue? DecodeInt64(byte[] bytes, LogicalType? logical, bool isMax)
     {
         if (bytes.Length < 8) return null;
         long v = BinaryPrimitives.ReadInt64LittleEndian(bytes);
@@ -215,24 +220,18 @@ public sealed class ParquetStatisticsAccessor
             case LogicalType.DecimalType d:
                 return LiteralValue.HighPrecisionDecimalOf(new BigInteger(v), d.Scale);
             case LogicalType.TimestampType ts:
-                long unixMs = ts.Unit switch
-                {
-                    TimeUnit.Millis => v,
-                    TimeUnit.Micros => v / 1000,
-                    TimeUnit.Nanos => v / 1_000_000,
-                    _ => v,
-                };
-                var dto = ts.IsAdjustedToUtc
-                    ? DateTimeOffset.FromUnixTimeMilliseconds(unixMs)
-                    : new DateTimeOffset(
-                        DateTimeOffset.FromUnixTimeMilliseconds(unixMs).Ticks,
-                        TimeSpan.Zero);
-                return LiteralValue.Of(dto);
+                return TimestampLiteral(new BigInteger(v), ts, isMax);
 #if NET6_0_OR_GREATER
             case LogicalType.TimeType t when t.Unit == TimeUnit.Micros:
-                return LiteralValue.Of(new TimeOnly(v * 10)); // micros → ticks (10 ticks per us)
+                return LiteralValue.Of(new TimeOnly(v * 10)); // micros → ticks (10 ticks per us), exact
             case LogicalType.TimeType t when t.Unit == TimeUnit.Nanos:
-                return LiteralValue.Of(new TimeOnly(v / 100)); // 100 ns per tick
+                // 100 ns per tick, so this is the one TIME unit that cannot be exact. Round outward, then
+                // clamp: rounding the last nanoseconds of a day up would leave TimeOnly's range, and its
+                // maximum is still a sound outward bound.
+                long timeTicks = (long)DivideOutward(v, 100, isMax);
+                if (timeTicks < 0 || timeTicks > TimeOnly.MaxValue.Ticks)
+                    timeTicks = Math.Clamp(timeTicks, 0, TimeOnly.MaxValue.Ticks);
+                return LiteralValue.Of(new TimeOnly(timeTicks));
 #endif
             default:
                 return LiteralValue.Of(v);
@@ -254,7 +253,7 @@ public sealed class ParquetStatisticsAccessor
     }
 
     private static LiteralValue? DecodeFixedLenByteArray(
-        ColumnDescriptor desc, byte[] bytes, LogicalType? logical)
+        ColumnDescriptor desc, byte[] bytes, LogicalType? logical, bool isMax)
     {
         switch (logical)
         {
@@ -272,6 +271,58 @@ public sealed class ParquetStatisticsAccessor
             default:
                 return LiteralValue.Of(bytes);
         }
+    }
+
+    /// <summary>Ticks (100 ns) from .NET's epoch (0001-01-01) to the Unix epoch.</summary>
+    private const long UnixEpochTicks = 621_355_968_000_000_000L;
+
+    /// <summary>
+    /// Builds a timestamp bound from a count of <paramref name="ts"/>'s unit since the Unix epoch.
+    /// </summary>
+    /// <remarks>
+    /// <para>Goes through TICKS rather than milliseconds. A <see cref="DateTimeOffset"/> holds 100 ns,
+    /// so MILLIS and MICROS convert exactly and only NANOS has to round -- where the previous
+    /// millisecond conversion threw away everything below a millisecond for all three. That was not
+    /// merely imprecise: it truncated toward zero, so a max bound of 1500 us came back as 0 ms, and a
+    /// row group whose rows genuinely matched `t > 0.5ms` could be pruned on the strength of it.</para>
+    ///
+    /// <para>Returns <see langword="null"/> outside <see cref="DateTimeOffset"/>'s range. A bound that
+    /// cannot be represented is not a bound; clamping one would be indistinguishable from a real
+    /// endpoint and would prune on a value the file never contained.</para>
+    /// </remarks>
+    private static LiteralValue? TimestampLiteral(BigInteger value, LogicalType.TimestampType ts, bool isMax)
+    {
+        BigInteger unixTicks = ts.Unit switch
+        {
+            TimeUnit.Millis => value * 10_000,
+            TimeUnit.Micros => value * 10,
+            TimeUnit.Nanos => DivideOutward(value, 100, isMax),
+            _ => value * 10,
+        };
+
+        BigInteger ticks = unixTicks + UnixEpochTicks;
+        if (ticks < BigInteger.Zero || ticks > DateTime.MaxValue.Ticks)
+            return null;
+
+        return LiteralValue.Of(new DateTimeOffset((long)ticks, TimeSpan.Zero));
+    }
+
+    /// <summary>
+    /// Divides so the result moves AWAY from zero-error: a max bound rounds up, a min bound rounds down.
+    /// Both widen the range the bound describes, which is the only safe direction for pruning.
+    /// </summary>
+    private static BigInteger DivideOutward(BigInteger value, int divisor, bool isMax)
+    {
+        // DivRem truncates toward zero, so which adjustment is needed depends on the sign: for a
+        // positive value the quotient is already the floor, for a negative one it is already the ceiling.
+        BigInteger quotient = BigInteger.DivRem(value, divisor, out BigInteger remainder);
+        if (remainder.IsZero)
+            return quotient;
+
+        if (isMax)
+            return value.Sign > 0 ? quotient + BigInteger.One : quotient;
+
+        return value.Sign < 0 ? quotient - BigInteger.One : quotient;
     }
 
     /// <summary>Days from .NET epoch (0001-01-01) to Unix epoch (1970-01-01).</summary>
