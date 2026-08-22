@@ -525,7 +525,9 @@ public static class StatisticsEvaluator
 
     /// <summary>
     /// Returns the comparison result, or <c>int.MinValue</c> when the answer may not be trusted
-    /// to skip data — sentinel for "treat as Unknown."
+    /// to skip data — sentinel for "treat as Unknown." For comparing a value against a column's
+    /// STATISTICS; constant folding uses <see cref="ConstantCompare"/> instead, for the reason
+    /// given there.
     /// </summary>
     /// <remarks>
     /// Two ways an answer cannot be trusted, and only one of them announces itself. A pair that
@@ -553,6 +555,30 @@ public static class StatisticsEvaluator
         }
     }
 
+    /// <summary>
+    /// Compares two constants, or <c>int.MinValue</c> when they cannot be compared at all.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <see cref="SafeCompare"/>, and the difference is the whole point of the
+    /// split. This folds a constant expression: no row group is being skipped on the strength of a
+    /// value's RANGE, so the answer must be whatever the row-level evaluator will produce for the
+    /// same two constants -- lossy widening included, because that is the dialect's own semantics.
+    /// Refusing a lossy answer here would not be conservative, it would be WRONG in the dangerous
+    /// direction: a constant comparison folds straight to AlwaysTrue or AlwaysFalse, and
+    /// AlwaysFalse skips everything.
+    /// </remarks>
+    private static int ConstantCompare(LiteralValue a, LiteralValue b)
+    {
+        try
+        {
+            return a.CompareTo(b);
+        }
+        catch (InvalidOperationException)
+        {
+            return int.MinValue;
+        }
+    }
+
     private static bool CompareLiterals(LiteralValue a, ComparisonOperator op, LiteralValue b)
     {
         if (op == ComparisonOperator.NullSafeEqual)
@@ -561,7 +587,7 @@ public static class StatisticsEvaluator
         if (a.IsNull || b.IsNull)
             return false; // SQL: comparison with NULL is NULL, treat as false
 
-        int c = SafeCompare(a, b);
+        int c = ConstantCompare(a, b);
         if (c == int.MinValue) return false;
 
         return op switch

@@ -584,4 +584,33 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysFalse,
             Eval(Compare("f", ComparisonOperator.GreaterThan, LiteralValue.Of(10d)), stats));
     }
+
+    [Fact]
+    public void ConstantComparison_KeepsTheDialectsAnswer_EvenWhenLossy()
+    {
+        // Folding two constants is NOT pruning: nothing is being skipped on the strength of a
+        // column's range, so the answer has to be whatever the row-level evaluator produces for
+        // the same two constants -- which widens them to double and calls them equal.
+        //
+        // Refusing the lossy answer here is not conservative, it is wrong in the dangerous
+        // direction: a constant folds straight to AlwaysTrue or AlwaysFalse, so the "safe" sentinel
+        // becomes AlwaysFalse and skips EVERYTHING. Review feedback on #209 caught this.
+        var big = LiteralValue.Of(9007199254740993L);      // 2^53+1
+        var dbl = LiteralValue.Of(9007199254740992d);
+
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(
+            new ComparisonPredicate(
+                new LiteralExpression(big), ComparisonOperator.Equal, new LiteralExpression(dbl)),
+            new TestStats()));
+
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(
+            new ComparisonPredicate(
+                new LiteralExpression(big), ComparisonOperator.NotEqual, new LiteralExpression(dbl)),
+            new TestStats()));
+
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(
+            new ComparisonPredicate(
+                new LiteralExpression(big), ComparisonOperator.GreaterThan, new LiteralExpression(dbl)),
+            new TestStats()));
+    }
 }
