@@ -26,6 +26,7 @@ public class S3TableFileSystemTests : IAsyncLifetime
     private IAmazonS3? _client;
     private string _bucket = "";
     private bool _s3Available;
+    private string? _unavailableReason;
 
     private S3TableFileSystem NewFs(string? root = "table-root") =>
         new(_client!, _bucket, root);
@@ -47,9 +48,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
             await _client.PutBucketAsync(new PutBucketRequest { BucketName = _bucket });
             _s3Available = true;
         }
-        catch
+        catch (Exception ex)
         {
             _s3Available = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -74,16 +76,19 @@ public class S3TableFileSystemTests : IAsyncLifetime
             {
                 // Best-effort cleanup.
             }
-            _client.Dispose();
         }
+
+        // Dispose on EVERY path, not just the reachable one: the probe constructs the client before
+        // the call that fails, so an absent emulator used to leak it for the whole run.
+        _client?.Dispose();
     }
 
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAllBytes_ThenReadAllBytes_Roundtrips()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000000.json", Bytes("hello world"));
@@ -92,10 +97,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
         Assert.Equal("hello world", Encoding.UTF8.GetString(read));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task TryWriteAllBytes_CreatesOnce_AndPreservesExistingContent()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         Assert.True(await fs.TryWriteAllBytesAsync("commit.json", Bytes("winner")));
@@ -106,10 +111,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
             Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("commit.json")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Exists_ReflectsPresence()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         Assert.False(await fs.ExistsAsync("missing.json"));
@@ -118,10 +123,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
         Assert.True(await fs.ExistsAsync("present.json"));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Delete_RemovesFile_AndMissingIsNoOp()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("doomed.json", Bytes("x"));
@@ -135,10 +140,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
         await fs.DeleteAsync("never-existed.json");
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task List_ReturnsRelativePaths_InLexicographicOrder()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000002.json", Bytes("2"));
@@ -157,10 +162,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
         Assert.Equal(1, logFiles[0].Size);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Create_NoOverwrite_ThrowsWhenExists_OverwriteSucceeds()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("file.bin", Bytes("original"));
@@ -178,10 +183,10 @@ public class S3TableFileSystemTests : IAsyncLifetime
         Assert.Equal("replaced", Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("file.bin")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task OpenRead_ReadsBackWrittenContent()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
         var fs = NewFs();
 
         var payload = new byte[1000];

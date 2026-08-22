@@ -23,6 +23,7 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
     private BlobContainerClient? _container;
     private bool _azuriteAvailable;
+    private string? _unavailableReason;
 
     private BlobContainerClient Container => _container ?? throw new InvalidOperationException("Container not initialized");
 
@@ -30,14 +31,21 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
     {
         try
         {
-            var service = new BlobServiceClient(AzuriteConnectionString);
+            // Pin the service version and fail fast — see AzureTableFileSystemTests.InitializeAsync
+            // for why an unpinned BlobClientOptions cannot talk to Azurite at all.
+            var options = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2024_11_04);
+            options.Retry.MaxRetries = 0;
+            options.Retry.NetworkTimeout = TimeSpan.FromSeconds(2);
+
+            var service = new BlobServiceClient(AzuriteConnectionString, options);
             _container = service.GetBlobContainerClient("ew-test-" + Guid.NewGuid().ToString("N")[..8]);
             await _container.CreateIfNotExistsAsync();
             _azuriteAvailable = true;
         }
-        catch
+        catch (Exception ex)
         {
             _azuriteAvailable = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -47,10 +55,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             await _container.DeleteIfExistsAsync();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SimpleParquetFile()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blobName = "test-simple.parquet";
         var blockBlob = _container!.GetBlockBlobClient(blobName);
@@ -84,10 +92,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SmallBlockSize_MultipleBlocks()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-small-blocks.parquet");
 
@@ -120,10 +128,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_WithCompression()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-compressed.parquet");
 
@@ -160,10 +168,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
         Assert.Equal("value-99", col.GetString(99));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Position_TracksWrittenBytes()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-position.parquet");
         await using var file = new AzureBlobSequentialFile(blockBlob);
@@ -177,5 +185,33 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
         Assert.Equal(300, file.Position);
 
         await file.FlushAsync();
+    }
+
+    /// <summary>
+    /// Writing again after an explicit <c>FlushAsync</c> must not lose the second write.
+    ///
+    /// <para>Nothing forbids it — <c>WriteAsync</c> guards on disposed, not on committed — but the
+    /// commit used to be conditional on <c>!_committed</c>, so the trailing block was staged and then
+    /// never referenced by any block list. The blob read back as just the first write, with no error
+    /// anywhere. Both halves matter: the length proves the second write landed, and reading it proves
+    /// the re-commit kept the first block rather than replacing the list with only the new one.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task WriteAfterFlush_IsStillCommitted()
+    {
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
+
+        const string blobName = "test-write-after-flush.bin";
+        var blockBlob = _container!.GetBlockBlobClient(blobName);
+
+        await using (var file = new AzureBlobSequentialFile(blockBlob))
+        {
+            await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("first"));
+            await file.FlushAsync();
+            await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("second"));
+        }
+
+        var downloaded = await Container.GetBlobClient(blobName).DownloadContentAsync();
+        Assert.Equal("firstsecond", downloaded.Value.Content.ToString());
     }
 }

@@ -25,6 +25,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     private StorageClient? _client;
     private string _bucket = "";
     private bool _emulatorAvailable;
+    private string? _unavailableReason;
 
     private GcsTableFileSystem NewFs(string? root = "table-root") =>
         new(_client!, _bucket, root);
@@ -43,9 +44,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
             await _client.CreateBucketAsync(ProjectId, _bucket);
             _emulatorAvailable = true;
         }
-        catch
+        catch (Exception ex)
         {
             _emulatorAvailable = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -62,14 +64,18 @@ public class GcsTableFileSystemTests : IAsyncLifetime
                 // Best-effort cleanup.
             }
         }
+
+        // The GCS suites never disposed their StorageClient at all — not even on the reachable path,
+        // where S3 at least did. Dispose on every path.
+        _client?.Dispose();
     }
 
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAllBytes_ThenReadAllBytes_Roundtrips()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000000.json", Bytes("hello world"));
@@ -78,10 +84,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
         Assert.Equal("hello world", Encoding.UTF8.GetString(read));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task TryWriteAllBytes_CreatesOnce_AndPreservesExistingContent()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.True(await fs.TryWriteAllBytesAsync("commit.json", Bytes("winner")));
@@ -92,10 +98,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
             Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("commit.json")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Exists_ReflectsPresence()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.False(await fs.ExistsAsync("missing.json"));
@@ -104,10 +110,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
         Assert.True(await fs.ExistsAsync("present.json"));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Delete_RemovesFile_AndMissingIsNoOp()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("doomed.json", Bytes("x"));
@@ -121,10 +127,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
         await fs.DeleteAsync("never-existed.json");
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task List_ReturnsRelativePaths_InLexicographicOrder()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000002.json", Bytes("2"));
@@ -143,10 +149,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
         Assert.Equal(1, logFiles[0].Size);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Create_NoOverwrite_ThrowsWhenExists_OverwriteSucceeds()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("file.bin", Bytes("original"));
@@ -164,10 +170,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
         Assert.Equal("replaced", Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("file.bin")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task OpenRead_ReadsBackWrittenContent()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         var payload = new byte[1000];

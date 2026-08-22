@@ -27,6 +27,7 @@ public class GcsFileTests : IAsyncLifetime
     private StorageClient? _client;
     private string _bucket = "";
     private bool _emulatorAvailable;
+    private string? _unavailableReason;
 
     private StorageClient Client => _client ?? throw new InvalidOperationException("Client not initialized");
 
@@ -44,9 +45,10 @@ public class GcsFileTests : IAsyncLifetime
             await _client.CreateBucketAsync(ProjectId, _bucket);
             _emulatorAvailable = true;
         }
-        catch
+        catch (Exception ex)
         {
             _emulatorAvailable = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -63,12 +65,16 @@ public class GcsFileTests : IAsyncLifetime
                 // Best-effort cleanup.
             }
         }
+
+        // The GCS suites never disposed their StorageClient at all — not even on the reachable path,
+        // where S3 at least did. Dispose on every path.
+        _client?.Dispose();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SimpleParquetFile()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-simple.parquet";
 
@@ -98,10 +104,10 @@ public class GcsFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_LargerFile_MultipleRowGroups()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-large.parquet";
 
@@ -131,10 +137,10 @@ public class GcsFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_WithCompression()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-compressed.parquet";
 
@@ -169,10 +175,10 @@ public class GcsFileTests : IAsyncLifetime
         Assert.Equal("value-99", col.GetString(99));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Position_TracksWrittenBytes()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         await using var file = new GcsSequentialFile(Client, _bucket, "test-position.bin");
 
@@ -187,10 +193,10 @@ public class GcsFileTests : IAsyncLifetime
         await file.FlushAsync();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task RandomAccess_ReadRanges_ReturnsCorrectBytes()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-ranges.bin";
 
@@ -226,10 +232,10 @@ public class GcsFileTests : IAsyncLifetime
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task RandomAccess_KnownLength_SkipsMetadataFetch()
     {
-        if (!_emulatorAvailable) return;
+        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-known-length.bin";
 

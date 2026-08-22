@@ -89,12 +89,30 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
 
-        // Stage any remaining buffered data
-        if (_bufferPosition > 0)
-            await StageCurrentBlockAsync(cancellationToken).ConfigureAwait(false);
+        await FinalizeAsync(cancellationToken).ConfigureAwait(false);
+    }
 
-        // Commit the block list
-        if (!_committed)
+    /// <summary>
+    /// Stages whatever is buffered and commits the block list. Unguarded, so the dispose paths can
+    /// reach it: <see cref="FlushAsync"/> keeps the disposed check for external callers, but dispose
+    /// must be able to finish the upload while tearing the object down.
+    /// </summary>
+    private async ValueTask FinalizeAsync(CancellationToken cancellationToken)
+    {
+        // Stage any remaining buffered data
+        bool staged = false;
+        if (_bufferPosition > 0)
+        {
+            await StageCurrentBlockAsync(cancellationToken).ConfigureAwait(false);
+            staged = true;
+        }
+
+        // Commit the block list. `staged` is what makes a SECOND finalize correct: nothing stops a
+        // caller writing more after a FlushAsync — WriteAsync guards on _disposed, not on _committed —
+        // and committing only when !_committed staged that block and then never referenced it, so the
+        // write vanished with no error. Re-committing is cheap and idempotent: CommitBlockList replaces
+        // the blob's block list, and _committedBlockIds is the full list, not a delta.
+        if (!_committed || staged)
         {
             _committed = true;
             await _blobClient.CommitBlockListAsync(
@@ -119,18 +137,45 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         _bufferPosition = 0;
     }
 
+    /// <summary>
+    /// Commits the upload, then marks the object disposed — in that order, and via the unguarded
+    /// <see cref="FinalizeAsync"/>.
+    ///
+    /// <para>This used to set <c>_disposed = true</c> first and then call the guarded
+    /// <see cref="FlushAsync"/>, whose first statement throws on exactly that flag. So
+    /// <c>await using</c> — the documented way to use this type, and the only way a caller who never
+    /// calls <c>FlushAsync</c> by hand commits anything — threw <see cref="ObjectDisposedException"/>
+    /// AND left the block list uncommitted, losing the write. It went unnoticed because CI has never
+    /// executed this class (issue #79); <c>S3SequentialFile</c> and <c>GcsSequentialFile</c> already
+    /// had this shape.</para>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-        _disposed = true;
-
-        // Ensure remaining data is flushed and committed
-        if (!_committed)
-            await FlushAsync().ConfigureAwait(false);
+        try
+        {
+            await FinalizeAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _disposed = true;
+        }
     }
 
+    /// <inheritdoc/>
     public void Dispose()
     {
-        _disposed = true;
+        if (_disposed) return;
+        // Finalize off the current synchronization context to avoid sync-over-async deadlocks;
+        // DisposeAsync is the preferred path. Matches S3SequentialFile/GcsSequentialFile — this used
+        // to only set the flag, which discarded every buffered block without so much as an error.
+        try
+        {
+            Task.Run(() => FinalizeAsync(CancellationToken.None).AsTask()).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            _disposed = true;
+        }
     }
 }

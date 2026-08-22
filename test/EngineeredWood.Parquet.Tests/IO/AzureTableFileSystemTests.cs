@@ -20,6 +20,7 @@ public class AzureTableFileSystemTests : IAsyncLifetime
 
     private BlobContainerClient? _container;
     private bool _azuriteAvailable;
+    private string? _unavailableReason;
 
     private AzureTableFileSystem NewFs(string? root = "table-root") =>
         new(_container!, root);
@@ -30,7 +31,14 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         {
             // Fail fast when Azurite is absent so the skip path doesn't spend minutes
             // in the SDK's default connection retry/backoff.
-            var options = new BlobClientOptions();
+            //
+            // The service version is PINNED, and that is load-bearing rather than tidy: a default
+            // BlobClientOptions negotiates the SDK's newest REST version, which Azurite answers with
+            // 400 "The API version is not supported by Azurite". The probe below caught that, set
+            // available=false, and every test returned early reporting PASSED — so these tests could
+            // not have run honestly even on a machine with Azurite up. Measured 2026-08-07; it is the
+            // second cause behind issue #79, independent of CI starting no emulator at all.
+            var options = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2024_11_04);
             options.Retry.MaxRetries = 0;
             options.Retry.NetworkTimeout = TimeSpan.FromSeconds(2);
 
@@ -39,9 +47,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
             await _container.CreateIfNotExistsAsync();
             _azuriteAvailable = true;
         }
-        catch
+        catch (Exception ex)
         {
             _azuriteAvailable = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -53,10 +62,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
 
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAllBytes_ThenReadAllBytes_Roundtrips()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000000.json", Bytes("hello world"));
@@ -65,10 +74,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         Assert.Equal("hello world", Encoding.UTF8.GetString(read));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task TryWriteAllBytes_CreatesOnce_AndPreservesExistingContent()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.True(await fs.TryWriteAllBytesAsync("commit.json", Bytes("winner")));
@@ -79,10 +88,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
             Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("commit.json")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Exists_ReflectsPresence()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.False(await fs.ExistsAsync("missing.json"));
@@ -91,10 +100,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         Assert.True(await fs.ExistsAsync("present.json"));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Delete_RemovesFile_AndMissingIsNoOp()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("doomed.json", Bytes("x"));
@@ -108,10 +117,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         await fs.DeleteAsync("never-existed.json");
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task List_ReturnsRelativePaths_InLexicographicOrder()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000002.json", Bytes("2"));
@@ -130,10 +139,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         Assert.Equal(1, logFiles[0].Size);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Create_NoOverwrite_ThrowsWhenExists_OverwriteSucceeds()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("file.bin", Bytes("original"));
@@ -151,10 +160,10 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         Assert.Equal("replaced", Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("file.bin")));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task OpenRead_ReadsBackWrittenContent()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
         var fs = NewFs();
 
         var payload = new byte[1000];
