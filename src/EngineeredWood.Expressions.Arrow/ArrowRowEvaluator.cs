@@ -709,38 +709,56 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
+    /// <summary>The widest precision and scale <see cref="decimal"/> represents without loss.</summary>
+    /// <remarks>
+    /// Its mantissa is 96 bits, so it tops out near 7.9228e28 — 29 digits, but not all 29-digit
+    /// values — and its scale runs 0 to 28. A column declared no wider than this in BOTH holds no
+    /// value it cannot carry exactly; one declared wider holds values it cannot, so the whole
+    /// column takes the exact path.
+    /// </remarks>
+    private const int MaxExactDecimalDigits = 28;
+
     // A decimal column value: the common in-range case as System.Decimal (how a decimal literal and a
-    // stats decoder also represent it); a value that overflows System.Decimal falls back to its exact
-    // unscaled BigInteger plus the column's scale, read straight from the fixed-width little-endian value
-    // buffer — the same raw layout the format writers use.
+    // stats decoder also represent it); a column that can hold values System.Decimal cannot takes its
+    // exact unscaled BigInteger plus the column's scale, read straight from the fixed-width
+    // little-endian value buffer — the same raw layout the format writers use.
+    //
+    // DECIDED FROM THE DECLARED TYPE, NOT FROM AN EXCEPTION. Decimal128Array.GetValue raises
+    // OverflowException only for excess MAGNITUDE; for excess significant DIGITS it silently rounds
+    // to 28 and reports success. Keying the fallback on the exception therefore missed exactly the
+    // values it existed to protect — a decimal(38,38) is under 1, never overflows, and arrived
+    // already rounded — so the cell was wrong before any comparison touched it. See #205, and #175
+    // for the same rounding surfacing in rendering.
+    //
+    // Conservative on purpose: a small value in a wide-declared column takes the exact path it does
+    // not strictly need. That costs a BigInteger and is the side to err on, because the alternative
+    // is a per-cell test that has to be right about every corner of decimal's 96-bit mantissa.
     private static LiteralValue DecimalLiteral(Decimal128Array a, int index)
     {
-        try { return LiteralValue.Of(a.GetValue(index)!.Value); }
-        catch (OverflowException)
-        {
-            int scale = ((Decimal128Type)a.Data.DataType).Scale;
-            // ToBigInteger is a call, and therefore a point at which `a` — whose last use is the span
-            // it is being handed — could otherwise be collected out from under that span.
-            // See doc/arrow-span-lifetime.md.
-            var literal = LiteralValue.HighPrecisionDecimalOf(
-                ToBigInteger(a.ValueBuffer.Span.Slice(index * 16, 16)), scale);
-            GC.KeepAlive(a);
-            return literal;
-        }
+        var type = (Decimal128Type)a.Data.DataType;
+        if (type.Precision <= MaxExactDecimalDigits && type.Scale <= MaxExactDecimalDigits)
+            return LiteralValue.Of(a.GetValue(index)!.Value);
+
+        // ToBigInteger is a call, and therefore a point at which `a` — whose last use is the span
+        // it is being handed — could otherwise be collected out from under that span.
+        // See doc/arrow-span-lifetime.md.
+        var literal = LiteralValue.HighPrecisionDecimalOf(
+            ToBigInteger(a.ValueBuffer.Span.Slice(index * 16, 16)), type.Scale);
+        GC.KeepAlive(a);
+        return literal;
     }
 
     private static LiteralValue DecimalLiteral(Decimal256Array a, int index)
     {
-        try { return LiteralValue.Of(a.GetValue(index)!.Value); }
-        catch (OverflowException)
-        {
-            int scale = ((Decimal256Type)a.Data.DataType).Scale;
-            // See the Decimal128 overload above, and doc/arrow-span-lifetime.md.
-            var literal = LiteralValue.HighPrecisionDecimalOf(
-                ToBigInteger(a.ValueBuffer.Span.Slice(index * 32, 32)), scale);
-            GC.KeepAlive(a);
-            return literal;
-        }
+        var type = (Decimal256Type)a.Data.DataType;
+        if (type.Precision <= MaxExactDecimalDigits && type.Scale <= MaxExactDecimalDigits)
+            return LiteralValue.Of(a.GetValue(index)!.Value);
+
+        // See the Decimal128 overload above, and doc/arrow-span-lifetime.md.
+        var literal = LiteralValue.HighPrecisionDecimalOf(
+            ToBigInteger(a.ValueBuffer.Span.Slice(index * 32, 32)), type.Scale);
+        GC.KeepAlive(a);
+        return literal;
     }
 
     private static BigInteger ToBigInteger(ReadOnlySpan<byte> littleEndianTwosComplement)

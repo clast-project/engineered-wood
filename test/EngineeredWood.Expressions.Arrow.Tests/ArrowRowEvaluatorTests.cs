@@ -386,6 +386,81 @@ public class ArrowRowEvaluatorTests
             batch)));
     }
 
+    // ── Wide-precision decimal cells (#205) ──
+
+    [Fact]
+    public void DecimalColumn_BeyondSystemDecimalDigits_IsReadExactly()
+    {
+        // decimal(38,38) carrying all 38 significant digits. Every such value is under 1, so it
+        // never overflows System.Decimal -- Decimal128Array.GetValue succeeds and silently rounds
+        // to 28 digits. The old fallback keyed on OverflowException and therefore never fired
+        // here, so the cell arrived already rounded and this comparison answered FALSE.
+        var digits = BigInteger.Parse("12345678901234567890123456789012345678");
+        var batch = Decimal128Column("p", 38, 38, digits);
+
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("p"), ComparisonOperator.Equal,
+                new LiteralExpression(LiteralValue.HighPrecisionDecimalOf(digits, 38))),
+            batch)));
+    }
+
+    [Fact]
+    public void DecimalColumn_IsNotEqualToItsOwnRoundedValue()
+    {
+        // The discriminating case. The literal is exactly what GetValue used to hand back for this
+        // cell -- the same digits truncated to 28, measured in #175 -- so the OLD reader compared
+        // the cell against itself and answered TRUE. The cell has ten more non-zero digits, so the
+        // answer is FALSE.
+        var exact = BigInteger.Parse("12345678901234567890123456789012345678");   // scale 38
+        var rounded = BigInteger.Parse("1234567890123456789012345678");           // scale 28
+        var batch = Decimal128Column("p", 38, 38, exact);
+
+        Assert.Equal([false], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("p"), ComparisonOperator.Equal,
+                new LiteralExpression(LiteralValue.HighPrecisionDecimalOf(rounded, 28))),
+            batch)));
+
+        // And it is GREATER than that rounded value, the dropped digits being non-zero.
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("p"), ComparisonOperator.GreaterThan,
+                new LiteralExpression(LiteralValue.HighPrecisionDecimalOf(rounded, 28))),
+            batch)));
+    }
+
+    [Fact]
+    public void DecimalColumn_WideScaleButLargeMagnitude_IsReadExactlyToo()
+    {
+        // The other shape, where the width is in the magnitude rather than the scale:
+        // decimal(38,10) holding 1234567890123456789012345678.9012345678 -- 38 significant digits
+        // at about 1.2e27, INSIDE System.Decimal's ~7.9e28 ceiling, so it never overflowed either.
+        // Compared against its own 28-digit truncation, which the old reader produced.
+        var exact = BigInteger.Parse("12345678901234567890123456789012345678");   // scale 10
+        var rounded = BigInteger.Parse("12345678901234567890123456789");          // scale 1
+        var batch = Decimal128Column("r", 38, 10, exact);
+
+        Assert.Equal([false], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("r"), ComparisonOperator.Equal,
+                new LiteralExpression(LiteralValue.HighPrecisionDecimalOf(rounded, 1))),
+            batch)));
+    }
+
+    [Fact]
+    public void DecimalColumn_NarrowlyDeclared_StillReadsAsSystemDecimal()
+    {
+        // A column no wider than System.Decimal in both precision and scale keeps the cheap path,
+        // which is what the declared-type test buys: no BigInteger per cell for ordinary columns.
+        var batch = Decimal128Column("d", 10, 2, new BigInteger(1234));
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal,
+                new LiteralExpression(LiteralValue.Of(12.34m))),
+            batch)));
+    }
+
     // ── Unknown column ──
 
     [Fact]
