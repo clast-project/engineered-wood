@@ -524,10 +524,50 @@ public static class StatisticsEvaluator
     };
 
     /// <summary>
-    /// Returns the comparison result, or <c>int.MinValue</c> on incompatible
-    /// types — sentinel for "can't compare, treat as Unknown."
+    /// Returns the comparison result, or <c>int.MinValue</c> when the answer may not be trusted
+    /// to skip data — sentinel for "treat as Unknown." For comparing a value against a column's
+    /// STATISTICS; constant folding uses <see cref="ConstantCompare"/> instead, for the reason
+    /// given there.
     /// </summary>
+    /// <remarks>
+    /// Two ways an answer cannot be trusted, and only one of them announces itself. A pair that
+    /// cannot be compared at all throws, which this has always caught. A pair that compares
+    /// LOSSILY does not throw — it returns a confident answer about the rounded values, which can
+    /// be the opposite of the answer about the real ones. Acting on that skips row groups that
+    /// contain matching rows.
+    /// <para>
+    /// Measured: a row group holding exactly 9007199254740993 (2^53+1) against the predicate
+    /// <c>&gt; 9007199254740992.0</c> compared AlwaysFalse, because both sides met in a double
+    /// that cannot hold the odd value. The row group was skipped and the matching row lost. See
+    /// #208.
+    /// </para>
+    /// </remarks>
     private static int SafeCompare(LiteralValue a, LiteralValue b)
+    {
+        try
+        {
+            var result = a.CompareTo(b, out bool exact);
+            return exact ? result : int.MinValue;
+        }
+        catch (InvalidOperationException)
+        {
+            return int.MinValue;
+        }
+    }
+
+    /// <summary>
+    /// Compares two constants, or <c>int.MinValue</c> when they cannot be compared at all.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <see cref="SafeCompare"/>, and the difference is the whole point of the
+    /// split. This folds a constant expression: no row group is being skipped on the strength of a
+    /// value's RANGE, so the answer must be whatever the row-level evaluator will produce for the
+    /// same two constants -- lossy widening included, because that is the dialect's own semantics.
+    /// Refusing a lossy answer here would not be conservative, it would be WRONG in the dangerous
+    /// direction: a constant comparison folds straight to AlwaysTrue or AlwaysFalse, and
+    /// AlwaysFalse skips everything.
+    /// </remarks>
+    private static int ConstantCompare(LiteralValue a, LiteralValue b)
     {
         try
         {
@@ -547,7 +587,7 @@ public static class StatisticsEvaluator
         if (a.IsNull || b.IsNull)
             return false; // SQL: comparison with NULL is NULL, treat as false
 
-        int c = SafeCompare(a, b);
+        int c = ConstantCompare(a, b);
         if (c == int.MinValue) return false;
 
         return op switch
