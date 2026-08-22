@@ -36,7 +36,7 @@ internal static class DeltaRs
 
     public static string? Version => Driver.Version;
 
-    public static bool EnsureAvailable() => Driver.EnsureAvailable();
+    public static void Require() => Driver.Require();
 
     public static JsonElement Invoke(string command, object? args = null) => Driver.Invoke(command, args);
 

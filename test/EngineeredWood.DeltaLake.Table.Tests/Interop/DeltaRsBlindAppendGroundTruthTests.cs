@@ -18,13 +18,23 @@ public sealed class DeltaRsBlindAppendGroundTruthFixture : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"deltars_blindappend_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _measured = new Lazy<JsonElement?>(() =>
-            DeltaRs.EnsureAvailable()
+            DeltaRs.Available
                 ? DeltaRs.Invoke("blind_append_ground_truth", new { path = _tempDir })
                 : null);
     }
 
-    /// <summary>The measurement, or null when the toolchain is absent (the tests then self-skip).</summary>
-    public JsonElement? Result => _measured.Value;
+    /// <summary>The measurement. The tier gate lives HERE rather than in each test: touching this
+    /// either yields a real result or skips the caller — or fails it, under <c>EW_REQUIRE_*</c> —
+    /// before there is anything to dereference. That is why the tests below carry no check of their
+    /// own, and why the backing value may still be null while this property never returns one.</summary>
+    public JsonElement Result
+    {
+        get
+        {
+            DeltaRs.Require();
+            return _measured.Value!.Value;
+        }
+    }
 
     public void Dispose()
     {
@@ -66,10 +76,10 @@ public class DeltaRsBlindAppendGroundTruthTests : IClassFixture<DeltaRsBlindAppe
     /// If delta-rs starts declaring the field, the inference stops being load-bearing for its tables and
     /// this test is how we find out.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeltaRs_DeclaresIsBlindAppend_OnNoCommitAtAll()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         foreach (var scenario in result.GetProperty("scenarios").EnumerateArray())
         {
@@ -87,10 +97,10 @@ public class DeltaRsBlindAppendGroundTruthTests : IClassFixture<DeltaRsBlindAppe
     /// part of the inference sees adds only and calls this blind — skipping a concurrent-append check that
     /// is owed, with nothing declared to overrule it.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void InsertOnlyMerge_EmitsCdcWithNoRemove_WhichIsTheOnlyEvidenceItRead()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var merge = Scenario(result, "merge_insert_only");
         Assert.True(merge.GetProperty("has_cdc").GetBoolean());
@@ -106,10 +116,10 @@ public class DeltaRsBlindAppendGroundTruthTests : IClassFixture<DeltaRsBlindAppe
     /// "CDF is enabled" rather than "this statement changed rows", and every append on such a table would
     /// start conflicting — a far more expensive error than the one being fixed.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void PlainAppend_OnTheSameCdfTable_CarriesNoCdc()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var append = Scenario(result, "append");
         Assert.False(append.GetProperty("has_cdc").GetBoolean());
@@ -121,13 +131,13 @@ public class DeltaRsBlindAppendGroundTruthTests : IClassFixture<DeltaRsBlindAppe
     /// cdc clause changes no verdict here. Worth pinning: it bounds the change to exactly one commit shape,
     /// rather than leaving "adding cdc made things stricter" as an open question across all DML.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("update")]
     [InlineData("delete")]
     [InlineData("merge_matched_update")]
     public void RowChangingDml_AlreadyCarriedRemoves_SoTheVerdictIsUnchanged(string name)
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var scenario = Scenario(result, name);
         Assert.True(scenario.GetProperty("has_cdc").GetBoolean());

@@ -16,6 +16,11 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <!-- Same mechanism the ORC and Avro cross-validation suites already use. xunit 2.x cannot skip
+         from inside a test body — Assert.Skip is a v3 API and v2's Skip= is a compile-time constant —
+         but the interop tiers decide at RUNTIME (is there a JDK? is deltalake installed?). See
+         InteropDriver.Require. -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
   </ItemGroup>
 
   <ItemGroup>

@@ -102,17 +102,26 @@ internal sealed class InteropDriver
     public string? UnavailableReason => _probe.Value.Error;
 
     /// <summary>
-    /// Gate every interop test on this: <c>if (!Driver.EnsureAvailable()) return;</c>. Returns false
-    /// to no-op, or throws when the require-env-var demands the toolchain be present.
+    /// Gate every interop test on this: <c>Driver.Require();</c> as the first statement of a test
+    /// marked <c>[SkippableFact]</c> or <c>[SkippableTheory]</c>. Returns when the toolchain is
+    /// present, SKIPS the test when it is not, and throws when the require-env-var says this job
+    /// depended on it.
     ///
-    /// <para>The silent no-op matches the existing ORC/Lance cross-validation pattern, but it is a
-    /// hazard at scale — a whole tier can go dark in CI and quietly leave the suite back at
-    /// round-trip-only. Set the env var in CI so that failure is loud.</para>
+    /// <para>Skipping rather than returning early is the whole point. The early return reported the
+    /// test as PASSED, so a machine with no JDK ran 54 Spark conformance tests to green in 94 ms — a
+    /// result indistinguishable from having validated all of them. A skip states what happened.</para>
+    ///
+    /// <para>The skip is deliberately NOT the whole mechanism, because an honest green is still a
+    /// green: a job can skip an entire tier and pass. That is what <see cref="RequireEnvVar"/> is
+    /// for. The two answer different questions — the skip answers "what did this run actually do?",
+    /// the env var answers "was this job allowed to tolerate that?" — which is why both exist and
+    /// why the env var is per tier: ci.yml requires delta-rs and DuckDB but not Spark, since
+    /// windows-latest has no JDK, while the nightly requires all three.</para>
     /// </summary>
-    public bool EnsureAvailable()
+    public void Require()
     {
         if (Available)
-            return true;
+            return;
 
         if (System.Environment.GetEnvironmentVariable(RequireEnvVar) == "1")
         {
@@ -121,7 +130,9 @@ internal sealed class InteropDriver
                 + $"{_probe.Value.Error}");
         }
 
-        return false;
+        // Always skips by the time control reaches here — Skip exposes only the two conditional
+        // forms, so the condition is restated rather than an unconditional Skip.Always being called.
+        Skip.IfNot(Available, $"{ScriptName} toolchain unavailable: {_probe.Value.Error}");
     }
 
     /// <summary>Runs one command and returns its parsed JSON result, asserting <c>ok</c>.</summary>

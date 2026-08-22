@@ -110,10 +110,12 @@ jobs:
       - name: Build
         run: dotnet build test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj -f net10.0 --configuration Release
 
-      # EW_REQUIRE_* makes an unreachable toolchain a FAILURE rather than a silent
-      # no-op. Without them an interop test whose tier is missing returns early and
-      # xUnit reports it PASSED, so the nightly would go green having validated
-      # nothing — the exact failure mode this job exists to prevent.
+      # EW_REQUIRE_* makes an unreachable toolchain a FAILURE rather than a skip.
+      # The tests self-report honestly now ([SkippableFact] + X.Require()), but an
+      # honest skip is still a green: without these the nightly could skip every
+      # tier and pass having validated nothing — the exact failure mode this job
+      # exists to prevent. All three are set because this job, unlike ci.yml,
+      # depends on all three tiers.
       - name: Interop tests
         env:
           EW_REQUIRE_SPARK_INTEROP: '1'

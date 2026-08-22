@@ -19,13 +19,23 @@ public sealed class BlindAppendGroundTruthFixture : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"delta_blindappend_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _measured = new Lazy<JsonElement?>(() =>
-            Spark.EnsureAvailable()
+            Spark.Available
                 ? Spark.Invoke("blind_append_ground_truth", new { path = _tempDir })
                 : null);
     }
 
-    /// <summary>The measurement, or null when the toolchain is absent (the tests then self-skip).</summary>
-    public JsonElement? Result => _measured.Value;
+    /// <summary>The measurement. The tier gate lives HERE rather than in each test: touching this
+    /// either yields a real result or skips the caller — or fails it, under <c>EW_REQUIRE_*</c> —
+    /// before there is anything to dereference. That is why the tests below carry no check of their
+    /// own, and why the backing value may still be null while this property never returns one.</summary>
+    public JsonElement Result
+    {
+        get
+        {
+            Spark.Require();
+            return _measured.Value!.Value;
+        }
+    }
 
     public void Dispose()
     {
@@ -66,10 +76,10 @@ public class BlindAppendGroundTruthTests : IClassFixture<BlindAppendGroundTruthF
     /// writing it, EW's read side would silently fall back to inference on every Spark table and this
     /// suite would be the only thing that noticed.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Spark_RecordsIsBlindAppend_OnEveryCommit()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         foreach (var scenario in result.GetProperty("scenarios").EnumerateArray())
         {
@@ -80,10 +90,10 @@ public class BlindAppendGroundTruthTests : IClassFixture<BlindAppendGroundTruthF
     }
 
     /// <summary>A genuine blind append — no read, adds only — is recorded <c>true</c>.</summary>
-    [Fact]
+    [SkippableFact]
     public void PlainAppend_IsRecordedBlind()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var append = Scenario(result, "append");
         Assert.True(append.GetProperty("is_blind_append").GetBoolean());
@@ -95,10 +105,10 @@ public class BlindAppendGroundTruthTests : IClassFixture<BlindAppendGroundTruthF
     /// missing, so Delta records <c>false</c> — while the commit it produces contains nothing but adds,
     /// which is exactly what EW's inference reads as blind.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void InsertOnlyMerge_IsRecordedNotBlind_ThoughItEmitsOnlyAdds()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var merge = Scenario(result, "merge_insert_only");
         Assert.False(
@@ -115,10 +125,10 @@ public class BlindAppendGroundTruthTests : IClassFixture<BlindAppendGroundTruthF
     /// Two independent statement shapes reaching it is what makes this a class of commit rather than a
     /// quirk of MERGE.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void InsertSelectFromSelf_IsRecordedNotBlind_ThoughItEmitsOnlyAdds()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var insert = Scenario(result, "insert_select_self");
         Assert.False(insert.GetProperty("is_blind_append").GetBoolean());
@@ -130,10 +140,10 @@ public class BlindAppendGroundTruthTests : IClassFixture<BlindAppendGroundTruthF
     /// removes. The CONTROL: without it, "Spark records false" could be true of everything, and the
     /// tests above would prove nothing about which commits the inference misjudges.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Delete_IsRecordedNotBlind_AndTheInferenceAgrees()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var delete = Scenario(result, "delete");
         Assert.False(delete.GetProperty("is_blind_append").GetBoolean());

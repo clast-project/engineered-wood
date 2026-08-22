@@ -20,11 +20,21 @@ public sealed class ConflictSemanticsFixture : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"delta_conflict_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _measured = new Lazy<JsonElement?>(() =>
-            Spark.EnsureAvailable() ? Spark.Invoke("conflict_semantics", new { path = _tempDir }) : null);
+            Spark.Available ? Spark.Invoke("conflict_semantics", new { path = _tempDir }) : null);
     }
 
-    /// <summary>The measurement, or null when the toolchain is absent (the tests then self-skip).</summary>
-    public JsonElement? Result => _measured.Value;
+    /// <summary>The measurement. The tier gate lives HERE rather than in each test: touching this
+    /// either yields a real result or skips the caller — or fails it, under <c>EW_REQUIRE_*</c> —
+    /// before there is anything to dereference. That is why the tests below carry no check of their
+    /// own, and why the backing value may still be null while this property never returns one.</summary>
+    public JsonElement Result
+    {
+        get
+        {
+            Spark.Require();
+            return _measured.Value!.Value;
+        }
+    }
 
     public void Dispose()
     {
@@ -73,10 +83,10 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
     /// from, and any claim of the form "Delta does X at WriteSerializable" is a claim about Databricks,
     /// not about the engine this tier runs.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void OssDelta_AcceptsOnlySerializable()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
 
         var levels = result.GetProperty("isolation_levels");
         Assert.Equal("accepted", levels.GetProperty("Serializable").GetString());
@@ -97,12 +107,12 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
     /// verdict by the other branch. The disagreement is in the label, not the outcome — which is exactly
     /// why this is worth having measured rather than reasoned about.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("whole_vs_delete_cow")]
     [InlineData("whole_vs_delete_dv")]
     public void WholeTableReader_AbortsAgainstAConcurrentDelete(string scenario)
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
         Assert.Equal("ConcurrentAppend", VerdictOf(result, scenario));
     }
 
@@ -117,20 +127,20 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
     /// implementation: a host that declared a whole-table read and then had it dropped would lose
     /// coverage the reference implementation also provides.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void WholeTableReader_AbortsAgainstABlindAppend_SoTheDeclarationCoversAddsToo()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
         Assert.Equal("ConcurrentAppend", VerdictOf(result, "whole_vs_blind_append"));
     }
 
     /// <summary>The control, and the reason the three above mean anything: the SAME concurrent delete
     /// against a transaction that declared NOTHING commits cleanly. The aborts are caused by the
     /// declaration, not by something incidental to driving a transaction through py4j.</summary>
-    [Fact]
+    [SkippableFact]
     public void UndeclaredTransaction_CommitsThroughTheSameConcurrentDelete()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
         Assert.Equal("committed", VerdictOf(result, "undeclared_vs_delete"));
     }
 
@@ -140,10 +150,10 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
     /// what "declare something narrower instead" can buy a host, which is exactly what
     /// <see cref="DeltaTransaction.DeclareFilesRead"/> lets one say: narrower helps only when it actually
     /// excludes the racer's files, and here it does not.</summary>
-    [Fact]
+    [SkippableFact]
     public void FileLevelReader_AlsoAbortsAgainstAConcurrentDelete()
     {
-        if (_fixture.Result is not { } result) return;
+        var result = _fixture.Result;
         Assert.Equal("ConcurrentAppend", VerdictOf(result, "filtered_vs_delete_dv"));
     }
 }
