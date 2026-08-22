@@ -23,6 +23,7 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
     private BlobContainerClient? _container;
     private bool _azuriteAvailable;
+    private string? _unavailableReason;
 
     private BlobContainerClient Container => _container ?? throw new InvalidOperationException("Container not initialized");
 
@@ -30,14 +31,21 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
     {
         try
         {
-            var service = new BlobServiceClient(AzuriteConnectionString);
+            // Pin the service version and fail fast — see AzureTableFileSystemTests.InitializeAsync
+            // for why an unpinned BlobClientOptions cannot talk to Azurite at all.
+            var options = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2024_11_04);
+            options.Retry.MaxRetries = 0;
+            options.Retry.NetworkTimeout = TimeSpan.FromSeconds(2);
+
+            var service = new BlobServiceClient(AzuriteConnectionString, options);
             _container = service.GetBlobContainerClient("ew-test-" + Guid.NewGuid().ToString("N")[..8]);
             await _container.CreateIfNotExistsAsync();
             _azuriteAvailable = true;
         }
-        catch
+        catch (Exception ex)
         {
             _azuriteAvailable = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -47,10 +55,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             await _container.DeleteIfExistsAsync();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SimpleParquetFile()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blobName = "test-simple.parquet";
         var blockBlob = _container!.GetBlockBlobClient(blobName);
@@ -84,10 +92,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SmallBlockSize_MultipleBlocks()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-small-blocks.parquet");
 
@@ -120,10 +128,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_WithCompression()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-compressed.parquet");
 
@@ -160,10 +168,10 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
         Assert.Equal("value-99", col.GetString(99));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Position_TracksWrittenBytes()
     {
-        if (!_azuriteAvailable) return;
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
 
         var blockBlob = _container!.GetBlockBlobClient("test-position.parquet");
         await using var file = new AzureBlobSequentialFile(blockBlob);

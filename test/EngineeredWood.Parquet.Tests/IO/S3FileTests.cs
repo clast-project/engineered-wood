@@ -29,6 +29,7 @@ public class S3FileTests : IAsyncLifetime
     private IAmazonS3? _client;
     private string _bucket = "";
     private bool _s3Available;
+    private string? _unavailableReason;
 
     private IAmazonS3 Client => _client ?? throw new InvalidOperationException("Client not initialized");
 
@@ -50,9 +51,10 @@ public class S3FileTests : IAsyncLifetime
             await _client.PutBucketAsync(new PutBucketRequest { BucketName = _bucket });
             _s3Available = true;
         }
-        catch
+        catch (Exception ex)
         {
             _s3Available = false;
+            _unavailableReason = ex.Message;
         }
     }
 
@@ -81,10 +83,10 @@ public class S3FileTests : IAsyncLifetime
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_SimpleParquetFile()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
 
         const string key = "test-simple.parquet";
 
@@ -114,10 +116,10 @@ public class S3FileTests : IAsyncLifetime
             Assert.Equal(values[i], col.GetValue(i));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_WithCompression()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
 
         const string key = "test-compressed.parquet";
 
@@ -149,10 +151,10 @@ public class S3FileTests : IAsyncLifetime
         Assert.Equal("value-99", col.GetString(99));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task WriteAndRead_MultipartUpload_LargePayload()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
 
         const string key = "test-multipart.bin";
 
@@ -186,10 +188,10 @@ public class S3FileTests : IAsyncLifetime
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Position_TracksWrittenBytes()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
 
         await using var file = new S3SequentialFile(Client, _bucket, "test-position.bin");
 
@@ -204,10 +206,10 @@ public class S3FileTests : IAsyncLifetime
         await file.FlushAsync();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task RandomAccess_ReadRanges_ReturnsCorrectBytes()
     {
-        if (!_s3Available) return;
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
 
         const string key = "test-ranges.bin";
 

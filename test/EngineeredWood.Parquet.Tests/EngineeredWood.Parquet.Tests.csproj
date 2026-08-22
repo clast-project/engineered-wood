@@ -28,6 +28,10 @@
     <PackageReference Include="ParquetSharp" Version="23.0.0.2" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <!-- Runtime skips for the cloud-emulator tests (see IO/CloudEmulator.cs). xUnit 2.9.3 cannot skip
+         from inside a test body — Assert.Skip is a v3 API — and whether an emulator is listening is
+         only knowable at runtime. Same package and version the ORC, Avro and Delta suites use. -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
   </ItemGroup>
 
   <ItemGroup>
