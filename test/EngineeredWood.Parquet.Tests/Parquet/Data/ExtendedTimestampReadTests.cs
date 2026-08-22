@@ -77,9 +77,11 @@ public class ExtendedTimestampReadTests
     [Theory]
     [InlineData("timestamp_millis")]
     [InlineData("timestamp_micros")]
-    public async Task ReadsAtTheDeclaredUnit_ByDefault(string column)
+    public async Task ReadsAtTheDeclaredUnit_WhenAsked(string column)
     {
-        var array = await ReadAsync(column);
+        var array = await ReadAsync(
+            column,
+            new ParquetReadOptions { ExtendedTimestampOutput = ExtendedTimestampOutputKind.Timestamp });
         if (array is null) return;
 
         var timestamps = Assert.IsType<TimestampArray>(array);
@@ -99,37 +101,38 @@ public class ExtendedTimestampReadTests
     }
 
     [Fact]
-    public async Task NanosecondsOutOfInt64RangeAreReported_NotWrapped()
+    public async Task KeepingTheDeclaredUnitReportsWhatItCannotHold()
     {
         var path = FixturePath();
         if (path is null) return;
 
         // Two of the six rows are outside timestamp[ns]. Wrapping them would produce a plausible date,
-        // which is the failure mode worth refusing.
+        // which is the failure mode worth refusing -- but only for a caller who explicitly asked to keep
+        // nanosecond precision. It is not what a plain read does.
         await using var file = new LocalRandomAccessFile(path);
-        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        await using var reader = new ParquetFileReader(
+            file,
+            ownsFile: false,
+            new ParquetReadOptions { ExtendedTimestampOutput = ExtendedTimestampOutputKind.Timestamp });
 
         var error = await Assert.ThrowsAsync<ParquetFormatException>(
             async () => await reader.ReadRowGroupAsync(0, ["timestamp_nanos"]));
 
         Assert.Contains("timestamp_nanos", error.Message, StringComparison.Ordinal);
+        // The remedy has to name the way out, not merely complain.
         Assert.Contains("TimestampMicroseconds", error.Message, StringComparison.Ordinal);
+        Assert.Contains("FixedSizeBinary", error.Message, StringComparison.Ordinal);
     }
 
     [Theory]
     [InlineData("timestamp_millis")]
     [InlineData("timestamp_micros")]
     [InlineData("timestamp_nanos")]
-    public async Task MicrosecondsReadEveryRow(string column)
+    public async Task EveryRowReadsByDefault(string column)
     {
-        // Microseconds span roughly ±292,000 years, so this mode never reports a range error — including
-        // for the nanosecond column that the declared-unit default refuses.
-        var array = await ReadAsync(
-            column,
-            new ParquetReadOptions
-            {
-                ExtendedTimestampOutput = ExtendedTimestampOutputKind.TimestampMicroseconds,
-            });
+        // The property that matters for a generic reader: no options, no refusal, every row -- including
+        // the two the nanosecond column cannot express in int64.
+        var array = await ReadAsync(column);
         if (array is null) return;
 
         var timestamps = Assert.IsType<TimestampArray>(array);

@@ -1648,12 +1648,15 @@ internal sealed class ColumnBuildState : IDisposable
         int index, Int128 value, Apache.Arrow.Types.TimeUnit target)
     {
         string where = _columnPath == null ? string.Empty : $" of column '{_columnPath}'";
+        // Microseconds already span +/-292,000 years, so a value that overflows THAT is past anything a
+        // date can mean and only the raw bytes are left to offer.
         string remedy = target == Apache.Arrow.Types.TimeUnit.Microsecond
             ? "Read the file with ParquetReadOptions { ExtendedTimestampOutput = " +
               "ExtendedTimestampOutputKind.FixedSizeBinary } for the raw bytes."
-            : "Read the file with ParquetReadOptions { ExtendedTimestampOutput = " +
-              "ExtendedTimestampOutputKind.TimestampMicroseconds } for a timestamp that spans the whole " +
-              "range, or ExtendedTimestampOutputKind.FixedSizeBinary for the raw bytes.";
+            : "This is the ExtendedTimestampOutputKind.Timestamp mode, which keeps the file's declared " +
+              "unit. Drop back to the default ExtendedTimestampOutputKind.TimestampMicroseconds to read " +
+              "the column at microsecond precision, or ExtendedTimestampOutputKind.FixedSizeBinary for " +
+              "the raw bytes.";
 
         return $"Extended-precision timestamp at index {index}{where} is {value} {target} since the " +
             $"epoch, which is outside the range of a 64-bit Arrow timestamp. {remedy}";

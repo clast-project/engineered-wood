@@ -451,13 +451,13 @@ internal static class ArrowSchemaConverter
         string? zone = timestamp.IsAdjustedToUtc ? "UTC" : null;
 
 #pragma warning disable EWPARQUET0004 // The experimental signal lives on the enum and the option, not internal dispatch.
-        return (options?.ExtendedTimestampOutput ?? ExtendedTimestampOutputKind.Timestamp) switch
+        return (options?.ExtendedTimestampOutput ?? ExtendedTimestampOutputKind.TimestampMicroseconds) switch
         {
             ExtendedTimestampOutputKind.FixedSizeBinary
                 => new FixedSizeBinaryType(ExtendedTimestamp.ByteWidth),
-            ExtendedTimestampOutputKind.TimestampMicroseconds
-                => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, zone),
-            _ => new TimestampType(ToArrowUnit(timestamp.Unit), zone),
+            ExtendedTimestampOutputKind.Timestamp
+                => new TimestampType(ToArrowUnit(timestamp.Unit), zone),
+            _ => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, zone),
         };
 #pragma warning restore EWPARQUET0004
     }

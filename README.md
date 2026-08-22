@@ -141,9 +141,13 @@ Reading is controlled by `ParquetReadOptions.ExtendedTimestampOutput`:
 
 | `ExtendedTimestampOutputKind` | Arrow type | Notes |
 |---|---|---|
-| `Timestamp` (default) | `timestamp[declared unit]` | Reports a range error rather than wrapping a value int64 cannot hold |
-| `TimestampMicroseconds` | `timestamp[us]` | Spans the whole range; a `NANOS` column loses its last three digits |
+| `TimestampMicroseconds` (default) | `timestamp[us]` | Spans ±292,000 years, so a conforming file always reads; a `NANOS` column loses its last three digits |
+| `Timestamp` | `timestamp[declared unit]` | Keeps every digit, and reports a range error rather than wrapping a value int64 cannot hold |
 | `FixedSizeBinary` | `fixed_size_binary[12]` | The raw bytes, uninterpreted |
+
+The default is the mode that always produces an answer, for the same reason `Int96OutputKind`
+defaults to microseconds: reading a valid file should not require knowing in advance that it
+contains one. `Timestamp` is for callers who would rather be told than lose precision silently.
 
 > **The byte order is not settled.** The proposal text, the parquet-java reference implementation
 > and the proposed conformance fixture are all little-endian, but a proposal co-author argued for

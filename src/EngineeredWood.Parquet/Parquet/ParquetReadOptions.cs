@@ -121,29 +121,36 @@ public enum Int96OutputKind
 public enum ExtendedTimestampOutputKind
 {
     /// <summary>
-    /// Default: <c>timestamp</c> at the unit the file declares, UTC when <c>isAdjustedToUTC</c> is
-    /// set and naive otherwise. Every value keeps the unit it was written at.
+    /// Default: <c>timestamp[us]</c>, rescaled from the unit the file declares, UTC when
+    /// <c>isAdjustedToUTC</c> is set and naive otherwise. Microseconds span roughly ±292,000 years,
+    /// so this reads the whole ANSI SQL range and a long way past it.
+    /// </summary>
+    /// <remarks>
+    /// <para>A NANOS column loses its last three digits, and the conversion floors rather than
+    /// truncating toward zero so that a pre-epoch value rounds the same way as a post-epoch one.
+    /// Choose <see cref="Timestamp"/> when those digits matter.</para>
+    ///
+    /// <para>This is the default for the same reason
+    /// <see cref="Int96OutputKind.TimestampMicroseconds"/> is INT96's: it is the mode that produces
+    /// an answer for every value a writer would sensibly emit. It is not unconditional — the carrier
+    /// holds ±2^95 units, so a value outside ±292,000 years still overflows int64 and is reported —
+    /// but nothing representing a date can reach that.</para>
+    /// </remarks>
+    TimestampMicroseconds = 0,
+
+    /// <summary>
+    /// <c>timestamp</c> at the unit the file declares, keeping every digit that was written.
     /// </summary>
     /// <remarks>
     /// Arrow timestamps are int64, so a value the carrier holds but int64 cannot — year 9999 in
-    /// nanoseconds is the ordinary case, not a corrupt file — throws
+    /// nanoseconds is the ordinary case here, not a corrupt file — throws
     /// <see cref="ParquetFormatException"/> naming the row and this option rather than wrapping into
-    /// a plausible-looking date. Read with <see cref="TimestampMicroseconds"/> for a timestamp that
-    /// spans the whole range, or <see cref="FixedSizeBinary"/> for the raw bytes.
+    /// a plausible-looking date. That refusal is the point of the mode: it is for callers who would
+    /// rather be told than lose precision silently. Use the default
+    /// <see cref="TimestampMicroseconds"/> to read such a column anyway, or
+    /// <see cref="FixedSizeBinary"/> for the raw bytes.
     /// </remarks>
-    Timestamp = 0,
-
-    /// <summary>
-    /// <c>timestamp[us]</c>, rescaled from the declared unit. Microseconds span roughly ±292,000
-    /// years, so this reads every timestamp the carrier can express and never reports a range error.
-    /// </summary>
-    /// <remarks>
-    /// A NANOS column loses its last three digits, and the conversion floors rather than truncating
-    /// toward zero so that a pre-epoch value rounds the same way as a post-epoch one. This is the
-    /// same trade <see cref="Int96OutputKind.TimestampMicroseconds"/> makes, and it is why that one
-    /// is INT96's default: it is the choice that always produces an answer.
-    /// </remarks>
-    TimestampMicroseconds,
+    Timestamp,
 
     /// <summary>
     /// The undecoded 12 bytes as <c>FixedSizeBinaryType(12)</c>. Nothing is lost; this only declines
@@ -186,9 +193,9 @@ public sealed record ParquetReadOptions
 
     /// <summary>
     /// Controls the Arrow output type for a TIMESTAMP-annotated <c>FIXED_LEN_BYTE_ARRAY(12)</c>
-    /// column. Defaults to <see cref="ExtendedTimestampOutputKind.Timestamp"/> — the column reads
-    /// back at its declared unit, and a value outside the int64 range is reported rather than
-    /// wrapped.
+    /// column. Defaults to <see cref="ExtendedTimestampOutputKind.TimestampMicroseconds"/> — the
+    /// column reads back as <c>timestamp[us]</c>, which spans every date the carrier exists to hold,
+    /// so a generic read of a conforming file never fails.
     /// </summary>
     /// <remarks>
     /// The carrier is an unratified parquet-format proposal (apache/parquet-format#600) whose byte
@@ -197,7 +204,7 @@ public sealed record ParquetReadOptions
     /// </remarks>
     [Experimental("EWPARQUET0004")]
     public ExtendedTimestampOutputKind ExtendedTimestampOutput { get; init; }
-        = ExtendedTimestampOutputKind.Timestamp;
+        = ExtendedTimestampOutputKind.TimestampMicroseconds;
 
     /// <summary>
     /// Maximum number of rows per <see cref="Apache.Arrow.RecordBatch"/>. When set, row groups

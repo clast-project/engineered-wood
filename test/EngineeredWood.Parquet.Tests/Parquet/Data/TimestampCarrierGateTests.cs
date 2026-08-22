@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+#pragma warning disable EWPARQUET0004 // The FLBA(12) carrier is experimental; the gate around it is what these pin.
+
 using Apache.Arrow.Types;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
@@ -85,7 +87,7 @@ public class TimestampCarrierGateTests
 
     [Theory]
     [MemberData(nameof(TimestampUnits))]
-    public void FixedLenByteArrayAtTwelveBytesIsTheExtendedCarrier(ParquetTimeUnit parquetUnit, TimeUnit arrowUnit)
+    public void FixedLenByteArrayAtTwelveBytesIsTheExtendedCarrier(ParquetTimeUnit parquetUnit, TimeUnit _)
     {
         // The one width the annotation is legal at. Decoding lives in ExtendedTimestampReadTests; what
         // matters here is that the gate lets exactly this shape past and nothing else.
@@ -95,8 +97,26 @@ public class TimestampCarrierGateTests
             typeLength: 12);
 
         var type = Assert.IsType<TimestampType>(ArrowSchemaConverter.ToArrowType(column));
-        Assert.Equal(arrowUnit, type.Unit);
+        // Whatever unit the file declares, the DEFAULT reads it as microseconds -- the mode that can
+        // represent every date the carrier holds. The declared unit is an opt-in, below.
+        Assert.Equal(TimeUnit.Microsecond, type.Unit);
         Assert.Equal("UTC", type.Timezone);
+    }
+
+    [Theory]
+    [MemberData(nameof(TimestampUnits))]
+    public void TheDeclaredUnitIsAnOptIn(ParquetTimeUnit parquetUnit, TimeUnit arrowUnit)
+    {
+        var column = Describe(
+            PhysicalType.FixedLenByteArray,
+            new LogicalType.TimestampType(true, parquetUnit),
+            typeLength: 12);
+
+        var type = Assert.IsType<TimestampType>(ArrowSchemaConverter.ToArrowType(
+            column,
+            new ParquetReadOptions { ExtendedTimestampOutput = ExtendedTimestampOutputKind.Timestamp }));
+
+        Assert.Equal(arrowUnit, type.Unit);
     }
 
     [Theory]
