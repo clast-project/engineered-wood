@@ -55,8 +55,15 @@ in the test output.
 To enable them, install Python 3.8+ and the following packages:
 
 ```
-pip install pyarrow fastavro tzdata
+pip install pyarrow fastavro lz4 tzdata
 ```
+
+`lz4` is needed by `fastavro`, not by us: fastavro ships the LZ4 codec but
+not the library it calls, so `AvroPhase6Tests.WriteThenReadWithFastavro_Lz4`
+fails with `ValueError: lz4 codec is supported but you need to install one
+of the following libraries: ('lz4',)` if you install `fastavro` alone. That
+is a hard failure, not a skip — the skip logic only checks that `fastavro`
+itself imports.
 
 The `tzdata` package is required on Windows — PyArrow's Arrow C++ ORC
 reader needs IANA timezone data that isn't available natively on Windows.
@@ -159,12 +166,21 @@ bundles its JARs, so two versions cannot share one environment) and point the
 tier at it:
 
 ```
-python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.3 delta-spark==4.1.0
+python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
 
+**Pin `pyspark` to 4.1.1 exactly.** Both neighbours are broken against
+`delta-spark` 4.1.0. 4.1.0 cannot be imported on Windows at all
+(`socketserver.UnixStreamServer` is Unix-only). 4.1.2 changed the
+`ParquetToSparkSchemaConverter` constructor, so `delta-spark` 4.1.0 throws
+`java.lang.NoSuchMethodError` from `CheckpointProvider.getParquetSchema` on
+any checkpointed table. Measured on both 4.1.2 and 4.1.3. This file
+previously recommended 4.1.3, which fails this way on every checkpointed
+table the tier touches.
+
 The GA annotated path and the nested-variant cases have been validated against
-`pyspark` 4.1.3 / `delta-spark` 4.1.0; the unannotated path against 4.0.1 /
+`pyspark` 4.1.1 / `delta-spark` 4.1.0; the unannotated path against 4.0.1 /
 4.0.0. delta-rs (tier 1) reads both layouts regardless, so the compat-mode
 writer is covered in every run even without a second Spark.
 
