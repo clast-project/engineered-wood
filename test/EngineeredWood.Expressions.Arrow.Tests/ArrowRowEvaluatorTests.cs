@@ -389,7 +389,7 @@ public class ArrowRowEvaluatorTests
     // ── Wide-precision decimal cells (#205) ──
 
     [Fact]
-    public void DecimalColumn_BeyondSystemDecimalsDigits_IsReadExactly()
+    public void DecimalColumn_BeyondSystemDecimalDigits_IsReadExactly()
     {
         // decimal(38,38) carrying all 38 significant digits. Every such value is under 1, so it
         // never overflows System.Decimal -- Decimal128Array.GetValue succeeds and silently rounds
