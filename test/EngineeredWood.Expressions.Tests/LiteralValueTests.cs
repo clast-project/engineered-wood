@@ -398,4 +398,77 @@ public class LiteralValueTests
         // than quietly ordering itself at the top.
         Assert.NotEqual(0, d.CompareTo(LiteralValue.Of(double.NaN)));
     }
+
+    // ── NaN sits at the top of the order (#204) ──
+
+    [Theory]
+    // Measured against Spark 4.0: -Infinity < finite < +Infinity < NaN, confirmed by sort_array
+    // returning [-inf, 1.0, inf, nan]. .NET puts NaN at the bottom, so all of these were inverted.
+    [InlineData(double.NegativeInfinity, double.NaN, -1)]
+    [InlineData(double.PositiveInfinity, double.NaN, -1)]
+    [InlineData(1.0, double.NaN, -1)]
+    [InlineData(double.NaN, 1.0, 1)]
+    [InlineData(double.NaN, double.NegativeInfinity, 1)]
+    // NaN equals itself, which .NET already agreed with and Spark confirms (`NaN = NaN` is true).
+    [InlineData(double.NaN, double.NaN, 0)]
+    // The rest of the order is untouched.
+    [InlineData(double.NegativeInfinity, 1.0, -1)]
+    [InlineData(double.PositiveInfinity, 1.0, 1)]
+    // -0.0 equals 0.0 in Spark, and double.CompareTo already compares by value rather than by
+    // total order, so this holds before and after. Pinned because the two conventions differ here.
+    [InlineData(-0.0, 0.0, 0)]
+    [InlineData(0.0, -0.0, 0)]
+    public void Double_OrdersNaNAboveEveryValue(double a, double b, int expected)
+    {
+        Assert.Equal(expected, Math.Sign(LiteralValue.Of(a).CompareTo(LiteralValue.Of(b))));
+    }
+
+    [Theory]
+    // The SAME-KIND float arm, which the cross-width test below does not reach: both operands are
+    // Kind.Float, so this is the only thing that exercises it. Review feedback on #213 -- the
+    // earlier version asserted only nanF vs nanF, which was already zero before the change.
+    [InlineData(1.0f, float.NaN, -1)]
+    [InlineData(float.NaN, 1.0f, 1)]
+    [InlineData(float.PositiveInfinity, float.NaN, -1)]
+    [InlineData(float.NegativeInfinity, float.NaN, -1)]
+    [InlineData(float.NaN, float.NaN, 0)]
+    [InlineData(1.0f, 2.0f, -1)]
+    public void Float_OrdersNaNAboveEveryValue(float a, float b, int expected)
+    {
+        Assert.Equal(expected, Math.Sign(LiteralValue.Of(a).CompareTo(LiteralValue.Of(b))));
+    }
+
+#if NET6_0_OR_GREATER
+    [Theory]
+    // The Half arm, which nothing exercised at all.
+    [InlineData(1.0, double.NaN, -1)]
+    [InlineData(double.NaN, 1.0, 1)]
+    [InlineData(double.NaN, double.NaN, 0)]
+    [InlineData(1.0, 2.0, -1)]
+    public void Half_OrdersNaNAboveEveryValue(double a, double b, int expected)
+    {
+        // Built from double because [InlineData] cannot carry a Half.
+        var ha = LiteralValue.Of(double.IsNaN(a) ? Half.NaN : (Half)a);
+        var hb = LiteralValue.Of(double.IsNaN(b) ? Half.NaN : (Half)b);
+
+        Assert.Equal(expected, Math.Sign(ha.CompareTo(hb)));
+    }
+#endif
+
+    [Fact]
+    public void Float_AndCrossWidth_OrderNaNTheSameWay()
+    {
+        // The same rule has to reach the float arm and the cross-type arm, or a float NaN and a
+        // double NaN would disagree with each other. Measured: Spark's `CAST('NaN' AS FLOAT) =
+        // CAST('NaN' AS DOUBLE)` is TRUE and `CAST('NaN' AS FLOAT) < CAST('Infinity' AS DOUBLE)`
+        // is FALSE.
+        var nanF = LiteralValue.Of(float.NaN);
+        var nanD = LiteralValue.Of(double.NaN);
+        var infD = LiteralValue.Of(double.PositiveInfinity);
+
+        Assert.Equal(0, nanF.CompareTo(nanF));
+        Assert.Equal(0, nanF.CompareTo(nanD));          // cross-width, through the double branch
+        Assert.True(nanF.CompareTo(infD) > 0);
+        Assert.True(LiteralValue.Of(1.0f).CompareTo(nanD) < 0);
+    }
 }
