@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Numerics;
 using System.Runtime.InteropServices;
 
@@ -353,16 +354,26 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         if (TryAsInt64(a, out long ai) && TryAsInt64(b, out long bi))
             return ai.CompareTo(bi);
 
-        // Float widening (any numeric → double)
-        if (TryAsDouble(a, out double ad) && TryAsDouble(b, out double bd))
-            return ad.CompareTo(bd);
-
         // Exact decimal comparison across Decimal / HighPrecisionDecimal (and integers), so a plain
         // decimal literal compares against a high-precision decimal column value, and vice versa, without
         // going through lossy double. Two same-kind values never reach here (handled above); this path is
         // for the mixed pairs. Float/double are deliberately excluded — that would be a lossy compare.
+        //
+        // ORDERED BEFORE the double widening below, and the order is load-bearing. Both branches
+        // can accept a decimal-against-integer pair, and only this one is exact; measured, Spark
+        // agrees -- `d1 = 0.1` over decimal(10,2) 0.10 is TRUE, which a double compare also gives,
+        // but decimal-against-integer stays exact where a double could not.
         if (TryAsScaledInteger(a, out var au, out int asc) && TryAsScaledInteger(b, out var bu, out int bsc))
             return CompareScaledIntegers(au, asc, bu, bsc);
+
+        // Float widening (any numeric → double), which a decimal reaches only when the other side
+        // is floating point and nothing exact is possible.
+        //
+        // LOSSY ON PURPOSE, because Spark is. Measured: a decimal(20,0) holding 9007199254740993
+        // compares EQUAL to the double 9007199254740992, because the decimal goes to double and
+        // 2^53+1 is not representable there. Comparing exactly would answer false and disagree.
+        if (TryAsDouble(a, out double ad) && TryAsDouble(b, out double bd))
+            return ad.CompareTo(bd);
 
 #if NET6_0_OR_GREATER
         // A calendar date (DateOnly) compares against an instant (DateTimeOffset) as UTC midnight —
@@ -455,6 +466,19 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         return false;
     }
 
+    /// <summary>An unscaled integer and a scale as the nearest <see cref="double"/>.</summary>
+    /// <remarks>
+    /// Deliberately NOT <c>(double)unscaled / Math.Pow(10, scale)</c>. BigInteger's conversion to
+    /// double TRUNCATES rather than rounding to nearest — measured, <c>(double)10^30</c> is
+    /// 9.999999999999999e29, one ulp below the 1e30 that Spark produces — and dividing afterwards
+    /// rounds a second time. Formatting the value and parsing it once rounds correctly, and once.
+    /// </remarks>
+    private static double ScaledToDouble(BigInteger unscaled, int scale) =>
+        double.Parse(
+            unscaled.ToString(CultureInfo.InvariantCulture) + "E-" + scale.ToString(CultureInfo.InvariantCulture),
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture);
+
     private static bool TryAsDouble(LiteralValue v, out double result)
     {
         switch (v._kind)
@@ -468,6 +492,16 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 #if NET6_0_OR_GREATER
             case Kind.Half: result = (double)v._inline.Half; return true;
 #endif
+
+            // Decimals convert too, so a decimal compares against a float or a double instead of
+            // being declared incomparable. Reachable only after the exact branch above has
+            // declined, so this never costs precision that was available.
+            case Kind.Decimal: result = (double)(decimal)v._ref!; return true;
+            case Kind.HighPrecisionDecimal:
+                // Not through System.Decimal, which the value may exceed: precision 38 runs to
+                // about 1e38 against decimal's ~7.9e28 ceiling.
+                result = ScaledToDouble((BigInteger)v._ref!, v._inline.Int32);
+                return true;
         }
         result = 0;
         return false;

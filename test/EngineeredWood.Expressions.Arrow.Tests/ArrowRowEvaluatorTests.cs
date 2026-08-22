@@ -302,6 +302,90 @@ public class ArrowRowEvaluatorTests
         Assert.Equal([false, true, true], ToList(r));
     }
 
+    // ── Decimal against floating point (#171) ──
+    //
+    // Every expectation below was measured from Spark 4.0 through the expr_oracle driver on
+    // 2026-08-22, not reasoned about. Before the fix all of them evaluated to NULL:
+    // CompareCrossType had no branch that accepted a decimal beside a double, threw, and
+    // EvalComparison turned that into null under a clause meant for genuinely incomparable types.
+
+    [Fact]
+    public void Compare_DecimalColumnVsDoubleLiteral_GoesThroughDouble()
+    {
+        // decimal(10,2) 0.10 against the double 0.1. They are not the same number -- 0.1 has no
+        // exact binary form -- and Spark still answers TRUE, because the decimal is cast to
+        // double, where both land on the same value.
+        var batch = Decimal128Column("d", 10, 2, new BigInteger(10));
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal, new LiteralExpression(0.1d)),
+            batch)));
+    }
+
+    [Fact]
+    public void Compare_DecimalColumnVsDoubleLiteral_IsLossyExactlyWhereSparkIs()
+    {
+        // The decisive case. decimal(20,0) holding 9007199254740993 is 2^53+1, which a double
+        // cannot represent -- it becomes 2^53. Spark answers TRUE against the double
+        // 9007199254740992, so the comparison must be lossy in the same place. An exact
+        // comparison would answer false here and disagree with Spark.
+        var batch = Decimal128Column("d", 20, 0, BigInteger.Parse("9007199254740993"));
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal,
+                new LiteralExpression(9007199254740992d)),
+            batch)));
+    }
+
+    [Fact]
+    public void Compare_DecimalColumnVsFloatLiteral_WidensTheFloatFirst()
+    {
+        // decimal(10,2) 0.10 against the FLOAT 0.1f is FALSE where the double 0.1 was true,
+        // because 0.1f widened to double is 0.100000001490116..., a different number. Measured;
+        // it is the case that proves both sides go to double rather than the decimal being
+        // compared against a rounded float.
+        var batch = Decimal128Column("d", 10, 2, new BigInteger(10));
+        Assert.Equal([false], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal, new LiteralExpression(0.1f)),
+            batch)));
+    }
+
+    [Fact]
+    public void Compare_DecimalColumnVsExactLiteral_StaysExact()
+    {
+        // The other half, and why the double branch must be ordered AFTER the exact one: a
+        // decimal beside a decimal or an integer is compared exactly, never through double.
+        // decimal(20,0) 9007199254740993 against the integer 9007199254740992 is FALSE -- the
+        // pair that the double route calls equal.
+        var batch = Decimal128Column("d", 20, 0, BigInteger.Parse("9007199254740993"));
+
+        Assert.Equal([false], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal,
+                new LiteralExpression(9007199254740992L)),
+            batch)));
+
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal,
+                new LiteralExpression(9007199254740993L)),
+            batch)));
+    }
+
+    [Fact]
+    public void Compare_WideDecimalColumnVsDoubleLiteral_ConvertsFromTheUnscaledInteger()
+    {
+        // Past System.Decimal's ~7.9e28 ceiling the conversion cannot go through decimal at all.
+        // Measured: decimal(38,0) holding 1e30+1 equals the double 1e30, both landing on the same
+        // double.
+        var batch = Decimal128Column("d", 38, 0, BigInteger.Pow(10, 30) + 1);
+        Assert.Equal([true], ToList(Eval.EvaluatePredicate(
+            new ComparisonPredicate(
+                new UnboundReference("d"), ComparisonOperator.Equal, new LiteralExpression(1e30d)),
+            batch)));
+    }
+
     // ── Unknown column ──
 
     [Fact]
