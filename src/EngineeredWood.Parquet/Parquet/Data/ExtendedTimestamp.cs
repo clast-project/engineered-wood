@@ -2,6 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
+using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -159,6 +162,39 @@ internal static class ExtendedTimestamp
         return toScale > fromScale
             ? value * (Int128)(toScale / fromScale)
             : DivideFloor(value, fromScale / toScale);
+    }
+
+
+    /// <summary>
+    /// Rewrites an Arrow timestamp column as this carrier: twelve little-endian two's-complement bytes
+    /// per value, in the unit the column already carries. Nulls and row positions are preserved.
+    /// </summary>
+    /// <remarks>
+    /// <para>No range check is needed in this direction. An Arrow timestamp is int64 and the carrier
+    /// holds +/-2^95, so every value that exists in Arrow fits with room to spare -- which is also why
+    /// the promotion can never be automatic: nothing Arrow can hold NEEDS it.</para>
+    ///
+    /// <para>Shared by both writers on purpose. The buffered writer is an independent implementation and
+    /// has historically drifted from the streaming one; a carrier encoded two ways would drift silently,
+    /// because both files would be well-formed.</para>
+    /// </remarks>
+    public static IArrowArray EncodeColumn(IArrowArray array)
+    {
+        var data = array.Data;
+        var source = MemoryMarshal.Cast<byte, long>(
+            data.Buffers[1].Span.Slice(data.Offset * sizeof(long), array.Length * sizeof(long)));
+
+        var encoded = new byte[array.Length * ByteWidth];
+        for (int i = 0; i < array.Length; i++)
+        {
+            Write((Int128)source[i], encoded.AsSpan(i * ByteWidth, ByteWidth));
+        }
+
+        // Offset 0: the slice above has already applied it, and carrying it forward would double-count.
+        var newData = new ArrayData(
+            new FixedSizeBinaryType(ByteWidth), array.Length, data.NullCount, offset: 0,
+            [data.Buffers[0], new ArrowBuffer(encoded)]);
+        return ArrowArrayFactory.BuildArray(newData);
     }
 
     /// <summary>Largest value the 96-bit carrier can hold (2^95 - 1).</summary>

@@ -155,6 +155,17 @@ contains one. `Timestamp` is for callers who would rather be told than lose prec
 > the wire distinguishes the two, so if it flips, files already written become silently
 > wrong-valued rather than unreadable. That risk is what the experimental gate carries.
 >
+Writing is opt-in per column, via `ParquetWriteOptions.ExtendedTimestampColumns` (dotted paths, top-level
+columns only). The promotion is never automatic and never can be: an Arrow timestamp is `int64`, so any
+value Arrow can hold already fits `INT64`. The option exists to produce files in that shape — interop
+fixtures, and readers being tested against the proposal — not to rescue values that would otherwise
+overflow. For the same reason this library cannot write the far-past and far-future *nanosecond* values
+that motivate the carrier: they cannot be expressed in Arrow to begin with.
+
+`converted_type` is deliberately omitted for this carrier. `TIMESTAMP_MILLIS` and `TIMESTAMP_MICROS` are
+defined for `INT64` only, so a reader that understands converted types but not the new logical-type
+carrier would decode twelve bytes as eight.
+
 > Arrow has no type for this and no plan for one — `timestamp128`
 > ([apache/arrow#47848](https://github.com/apache/arrow/issues/47848)) is dormant and there is no
 > canonical extension type — so the mapping above is this library's own choice, not a standard.

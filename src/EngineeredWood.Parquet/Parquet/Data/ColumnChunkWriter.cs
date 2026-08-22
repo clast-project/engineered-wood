@@ -177,6 +177,21 @@ internal static class ColumnChunkWriter
             array = MapValues(array, a => ArrowCompute.Widen(a, Int32Type.Default));
         }
 
+        // An Arrow timestamp promoted to the extended-precision carrier becomes twelve little-endian bytes
+        // here, for the same reason the decimal reversal below happens here: everything downstream --
+        // dictionary, page encoders, statistics, bloom filter -- must see the bytes that reach the file.
+        bool extendedTimestamp = physicalType == PhysicalType.FixedLenByteArray
+            && options.IsExtendedTimestampColumn(pathInSchema);
+
+        // Only when the values are still timestamps. The buffered writer encodes at accumulation time --
+        // its encoders dispatch on the Arrow type, so they have to see the carrier -- and then reaches
+        // this method through its dictionary-fallback path with an array that is already twelve-byte.
+        // Encoding it twice reads those bytes back as int64 and produces a well-formed, wrong file.
+        if (extendedTimestamp && ValueType(array) is TimestampType)
+        {
+            array = MapValues(array, ExtendedTimestamp.EncodeColumn);
+        }
+
         // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
         // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
         if (physicalType == PhysicalType.FixedLenByteArray &&
@@ -226,9 +241,6 @@ internal static class ColumnChunkWriter
             bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
             bool floatingPointTotalOrder =
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
-            // An Arrow TimestampType on FIXED_LEN_BYTE_ARRAY can only be the extended-precision carrier,
-            // whose bytes are little-endian signed rather than lexicographically ordered.
-            bool extendedTimestamp = IsExtendedTimestamp(ValueType(array), physicalType);
             var stats = dictResult != null && !isFloatingPoint
                 ? StatisticsCollector.ComputeFromDictEntries(
                     dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
@@ -504,7 +516,8 @@ internal static class ColumnChunkWriter
             : StatisticsCollector.ComputeFromDictEntries(
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
                 physicalType, typeLength, rowCount - nonNullCount,
-                IsExtendedTimestamp(arrowType, physicalType));
+                physicalType == PhysicalType.FixedLenByteArray
+                    && options.IsExtendedTimestampColumn(pathInSchema));
 
         result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;
@@ -1696,13 +1709,6 @@ internal static class ColumnChunkWriter
     // every FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY column goes through SequenceCompareTo, i.e. unsigned
     // lexicographic. So the physical type has to be part of the answer wherever an Arrow type can arrive on
     // more than one physical width.
-    // True for the extended-precision timestamp carrier (apache/parquet-format#600). An Arrow
-    // TimestampType reaches FIXED_LEN_BYTE_ARRAY by no other route, so the pair identifies it without
-    // needing the parquet logical type here.
-    private static bool IsExtendedTimestamp(
-        Apache.Arrow.Types.IArrowType? arrowType, PhysicalType physicalType)
-        => physicalType == PhysicalType.FixedLenByteArray && arrowType is TimestampType;
-
     // Internal rather than private so the gate can be pinned directly. The FIXED_LEN_BYTE_ARRAY answer is
     // latent until an Arrow TimestampType can map to that physical type, so there is no end-to-end write
     // that reaches it yet — a unit test is the only thing that keeps the fix from silently regressing.

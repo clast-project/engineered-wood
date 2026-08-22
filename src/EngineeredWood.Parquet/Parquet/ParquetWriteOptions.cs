@@ -217,6 +217,28 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, ByteArrayEncoding>? ColumnEncodings { get; init; }
 
     /// <summary>
+    /// Dotted paths of timestamp columns to write as the extended-precision carrier —
+    /// <c>FIXED_LEN_BYTE_ARRAY(12)</c> annotated TIMESTAMP, holding a signed 96-bit little-endian count
+    /// of the column's unit since the epoch (apache/parquet-format#600). Columns not listed write as
+    /// INT64, which is what every ratified reader expects.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is a deliberate schema choice, never an automatic one, and it cannot be needed for
+    /// correctness: an Arrow timestamp is int64, so a column that fits in Arrow at all fits in INT64.
+    /// What it is for is producing files in that shape — interop fixtures, and readers being tested
+    /// against the proposal.</para>
+    ///
+    /// <para>Only top-level columns. A path inside a struct, list or map is rejected rather than
+    /// ignored, because the schema and the data are decided in different places and a promotion that
+    /// reached one but not the other would write a file whose footer disagrees with its pages.</para>
+    ///
+    /// <para>The proposal is unratified and its byte order was still under discussion when this
+    /// shipped; see <see cref="ExtendedTimestampOutputKind"/>.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0004")]
+    public IReadOnlyCollection<string>? ExtendedTimestampColumns { get; init; }
+
+    /// <summary>
     /// Per-column dictionary-encoding overrides, keyed by dotted column path. Columns not listed use
     /// <see cref="DictionaryEnabled"/>.
     ///
@@ -456,6 +478,33 @@ public sealed record ParquetWriteOptions
         ColumnEncodings != null && ColumnEncodings.TryGetValue(string.Join(".", pathInSchema), out var enc)
             ? enc
             : ByteArrayEncoding;
+
+    /// <summary>
+    /// True when this column was asked for as the extended-precision timestamp carrier.
+    /// </summary>
+    /// <remarks>
+    /// A linear scan rather than a set lookup: the collection holds the handful of columns a caller
+    /// deliberately named, and this runs once per column per row group.
+    /// </remarks>
+    internal bool IsExtendedTimestampColumn(IReadOnlyList<string> pathInSchema)
+        => IsExtendedTimestampColumn(string.Join(".", pathInSchema));
+
+    internal bool IsExtendedTimestampColumn(string dottedPath)
+    {
+#pragma warning disable EWPARQUET0004 // The experimental signal lives on the option, not internal dispatch.
+        var columns = ExtendedTimestampColumns;
+#pragma warning restore EWPARQUET0004
+        if (columns is null)
+            return false;
+
+        foreach (var column in columns)
+        {
+            if (string.Equals(column, dottedPath, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Resolves whether a column is dictionary-analyzed at all, checking per-column overrides first.
