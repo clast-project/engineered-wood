@@ -505,11 +505,22 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         // OverflowException and TryParse returns false -- and a comparison is not a place that may
         // throw, because callers turn only InvalidOperationException into a SQL null.
         //
-        // Saturating by hand puts every target back on the newer behaviour. The multiply is only
-        // reached for a value already outside double's range, where it can only produce +/-Infinity
-        // or zero, so the truncating BigInteger conversion this deliberately avoids above cannot
-        // cost anything here.
-        return (double)unscaled * Math.Pow(10, -(double)scale);
+        // Saturating by hand puts every target back on the newer behaviour. Done by DECIDING the
+        // direction rather than by arithmetic: (double)unscaled * Math.Pow(10, -scale) reads
+        // naturally and is wrong, because a BigInteger past 1.8e308 converts to Infinity while a
+        // large positive scale underflows the power to zero, and Infinity * 0 is NaN. NaN now
+        // sorts ABOVE every value, so that would make a garbage input compare greater than
+        // everything rather than merely being out of range.
+        if (unscaled.IsZero)
+            return 0d;
+
+        // log10 of the value is log10 of the mantissa less the scale. Past double's exponent
+        // ceiling it saturates to infinity with the mantissa's sign; below its floor, to zero.
+        var log10 = BigInteger.Log10(BigInteger.Abs(unscaled)) - scale;
+        if (log10 > 308d)
+            return unscaled.Sign < 0 ? double.NegativeInfinity : double.PositiveInfinity;
+
+        return 0d;
     }
 
     private static bool TryAsDouble(LiteralValue v, out double result)
