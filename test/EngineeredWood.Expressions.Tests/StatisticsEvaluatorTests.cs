@@ -613,4 +613,28 @@ public class StatisticsEvaluatorTests
                 new LiteralExpression(big), ComparisonOperator.GreaterThan, new LiteralExpression(dbl)),
             new TestStats()));
     }
+
+    [Fact]
+    public void NaNInTheMaximum_DoesNotSkipARowGroupThatMayMatch()
+    {
+        // Why the ordering matters beyond a scalar answer. A column whose maximum is NaN sits at
+        // the TOP of Spark's order, so `col > 5.0` may well match. Ordering NaN at the bottom made
+        // the maximum look smaller than the predicate and folded to AlwaysFalse -- the row group
+        // skipped, and any NaN row lost.
+        var stats = new TestStats().With(
+            "g", min: LiteralValue.Of(1.0d), max: LiteralValue.Of(double.NaN), nullCount: 0);
+
+        Assert.NotEqual(FilterResult.AlwaysFalse,
+            Eval(new ComparisonPredicate(
+                new UnboundReference("g"), ComparisonOperator.GreaterThan,
+                new LiteralExpression(LiteralValue.Of(5.0d))), stats));
+
+        // And a finite maximum still prunes, so the rule has not been blunted.
+        var finite = new TestStats().With(
+            "h", min: LiteralValue.Of(1.0d), max: LiteralValue.Of(4.0d), nullCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(new ComparisonPredicate(
+                new UnboundReference("h"), ComparisonOperator.GreaterThan,
+                new LiteralExpression(LiteralValue.Of(5.0d))), finite));
+    }
 }

@@ -344,8 +344,8 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
                 Kind.Int64 => _inline.Int64.CompareTo(other._inline.Int64),
                 Kind.UInt32 => _inline.UInt32.CompareTo(other._inline.UInt32),
                 Kind.UInt64 => _inline.UInt64.CompareTo(other._inline.UInt64),
-                Kind.Float => _inline.Float.CompareTo(other._inline.Float),
-                Kind.Double => _inline.Double.CompareTo(other._inline.Double),
+                Kind.Float => CompareFloating(_inline.Float, other._inline.Float),
+                Kind.Double => CompareFloating(_inline.Double, other._inline.Double),
                 Kind.Decimal => ((decimal)_ref!).CompareTo((decimal)other._ref!),
                 // Code point (== UTF-8 byte) order, NOT UTF-16 code-unit order — every format's
                 // string stats are ordered over UTF-8 bytes. See StringOrdering.
@@ -354,7 +354,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
                 Kind.Guid => ((Guid)_ref!).CompareTo((Guid)other._ref!),
                 Kind.DateTimeOffset => AsDateTimeOffset.CompareTo(other.AsDateTimeOffset),
 #if NET6_0_OR_GREATER
-                Kind.Half => _inline.Half.CompareTo(other._inline.Half),
+                Kind.Half => CompareFloating((double)_inline.Half, (double)other._inline.Half),
                 Kind.DateOnly => _inline.DateOnly.CompareTo(other._inline.DateOnly),
                 Kind.TimeOnly => _inline.TimeOnly.CompareTo(other._inline.TimeOnly),
 #endif
@@ -403,7 +403,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         {
             // The one branch that can lose information, so the one that reports it.
             exact = ExactAsDouble(a) && ExactAsDouble(b);
-            return ad.CompareTo(bd);
+            return CompareFloating(ad, bd);
         }
 
 #if NET6_0_OR_GREATER
@@ -495,6 +495,30 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         }
         result = 0;
         return false;
+    }
+
+    /// <summary>Orders two floating values the way SQL does, which is not the way .NET does.</summary>
+    /// <remarks>
+    /// NaN sits at the TOP of the order: measured against Spark 4.0,
+    /// <c>-Infinity &lt; finite &lt; +Infinity &lt; NaN</c>, confirmed by <c>sort_array</c>
+    /// returning <c>[-inf, 1.0, inf, nan]</c>. .NET's <see cref="double.CompareTo(double)"/> puts
+    /// NaN at the BOTTOM instead, so every relational operator involving one came out inverted —
+    /// <c>1.0 &gt; NaN</c> answered true where Spark answers false.
+    /// <para>
+    /// Two things .NET already agrees on, and this does not disturb either. NaN equals itself:
+    /// both return 0 for that pair, and Spark's <c>NaN = NaN</c> is true. And -0.0 equals 0.0,
+    /// because <see cref="double.CompareTo(double)"/> compares by value rather than by total
+    /// order — verified rather than assumed, since the two differ on exactly this point.
+    /// </para>
+    /// </remarks>
+    private static int CompareFloating(double a, double b)
+    {
+        bool aNaN = double.IsNaN(a);
+        bool bNaN = double.IsNaN(b);
+        if (aNaN || bNaN)
+            return aNaN && bNaN ? 0 : aNaN ? 1 : -1;
+
+        return a.CompareTo(b);
     }
 
     /// <summary>Whether this value survives the trip to <see cref="double"/> unchanged.</summary>
