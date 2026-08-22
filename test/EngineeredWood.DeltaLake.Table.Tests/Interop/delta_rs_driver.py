@@ -490,4 +490,20 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # Hard-exit rather than returning through interpreter finalization.
+    #
+    # delta-rs runs a tokio runtime (plus jemalloc's background threads) inside
+    # `_internal.abi3.so`, and those threads are still live when CPython begins to finalize.
+    # A thread that reaches for the GIL after that point used to be terminated, which
+    # unwound through Rust frames and aborted the process -- measured here at 22 of 25 runs
+    # on 3.11 and 19 of 25 on 3.12, every one of them AFTER the result file was already
+    # durable, which is why it never showed up as a failure. Python 3.13 changed that thread
+    # to hang forever instead (gh-87135), so the process simply never exits: 20 hangs in 25
+    # runs, each one wedging the caller for as long as it is willing to wait.
+    #
+    # By here the result is written and renamed into place, so finalization has nothing left
+    # to do that anyone depends on. Skipping it measures 25 of 25 clean on both 3.11 and 3.13.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

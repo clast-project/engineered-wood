@@ -27,8 +27,10 @@ internal static class Spark
 {
     /// <summary>Versions these assertions were established against — see <see cref="DeltaRs.ValidatedAgainstVersion"/>
     /// for why this is recorded rather than enforced. delta-spark's major version must match
-    /// pyspark's: 4.x pairs with Spark 4.0, 3.x with Spark 3.5.</summary>
-    public const string ValidatedAgainstVersion = "pyspark 4.0.1 / delta-spark 4.0.0";
+    /// pyspark's: 4.x pairs with Spark 4.0, 3.x with Spark 3.5.
+    /// <para>pyspark 4.0.3 is the floor on Windows regardless of what this records: earlier 4.0.x
+    /// crash the Python worker under Python 3.12+ (SPARK-53759, fixed in 4.0.3 / 4.1.2 / 3.5.9).</para></summary>
+    public const string ValidatedAgainstVersion = "pyspark 4.0.4 / delta-spark 4.0.0";
 
     private static readonly InteropDriver Driver = new(
         scriptName: "spark_driver.py",

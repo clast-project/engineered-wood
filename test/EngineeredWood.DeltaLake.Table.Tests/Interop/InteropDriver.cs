@@ -170,18 +170,36 @@ internal sealed class InteropDriver
                 psi.EnvironmentVariables[kvp.Key] = kvp.Value;
 
             using var proc = Process.Start(psi)!;
-            // Read stdout on this thread and stderr on another: Spark fills the stderr pipe buffer
-            // well past its capacity, and reading them in sequence would deadlock.
-            var stderrTask = Task.Run(() => proc.StandardError.ReadToEnd());
-            string stdout = proc.StandardOutput.ReadToEnd();
+
+            // Drain both pipes on dedicated threads, then bound the whole wait by TimeoutMs.
+            //
+            // Draining separately is required because Spark fills the stderr pipe well past its
+            // capacity, and reading the two in sequence would deadlock. But reading stdout to EOF on
+            // THIS thread is just as dangerous: EOF arrives only when the child exits, so a driver
+            // that writes its result and then wedges on the way out blocks here forever and the
+            // WaitForExit timeout below is never reached. Measured: that is exactly how the delta-rs
+            // driver behaved under Python 3.13 before it learned to os._exit, and it turned a
+            // 3-minute nightly into a 60-minute job that printed nothing at all.
+            //
+            // LongRunning rather than the pool for the same reason InvokeOnServer uses it: xUnit runs
+            // test classes in parallel, so several of these can be outstanding at once.
+            var stdoutTask = Task.Factory.StartNew(
+                () => proc.StandardOutput.ReadToEnd(),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            var stderrTask = Task.Factory.StartNew(
+                () => proc.StandardError.ReadToEnd(),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
             if (!proc.WaitForExit(TimeoutMs))
             {
                 try { proc.Kill(); } catch { }
                 throw new TimeoutException(
-                    $"{ScriptName} '{command}' timed out after {TimeoutMs / 1000}s.");
+                    $"{ScriptName} '{command}' timed out after {TimeoutMs / 1000}s. "
+                    + $"stderr tail: {Tail(Drain(stderrTask), 2000)}");
             }
 
-            string stderr = stderrTask.GetAwaiter().GetResult();
+            string stdout = Drain(stdoutTask);
+            string stderr = Drain(stderrTask);
             if (!File.Exists(resultFile))
             {
                 throw new InvalidOperationException(
@@ -349,6 +367,11 @@ internal sealed class InteropDriver
     {
         get { lock (_stderr) { return _stderr.ToString(); } }
     }
+
+    /// <summary>Collects a pipe-reader's text, giving up rather than blocking if the child was killed
+    /// while something else still holds the write end.</summary>
+    private static string Drain(Task<string> reader) =>
+        reader.Wait(10_000) ? reader.GetAwaiter().GetResult() : "(pipe reader did not finish)";
 
     private static string Tail(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(s.Length - max);

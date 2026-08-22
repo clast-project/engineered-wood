@@ -52,7 +52,9 @@ libraries as subprocesses. These tests are **skipped** automatically if the
 required Python packages are not installed — they will appear as "Skipped"
 in the test output.
 
-To enable them, install Python 3.8+ and the following packages:
+To enable them, install Python 3.8+ (CI uses **3.13**; see the Spark tier
+below for the one version constraint that is not negotiable on Windows) and
+the following packages:
 
 ```
 pip install pyarrow fastavro lz4 tzdata
@@ -147,10 +149,22 @@ $env:EW_REQUIRE_DUCKDB_INTEROP = "1"
 
 **Version pairing matters.** `delta-spark`'s major version must match
 `pyspark`'s — 4.x with Spark 4.0, 3.x with Spark 3.5. The assertions were
-established against `deltalake` 1.6.2 and `pyspark` 4.0.1 /
+established against `deltalake` 1.6.2 and `pyspark` 4.0.4 /
 `delta-spark` 4.0.0; those are recorded in `DeltaRs.ValidatedAgainstVersion`
 and `Spark.ValidatedAgainstVersion`. If these tests fail after an upgrade,
 check the tool version before assuming an EngineeredWood regression.
+
+**On Windows, `pyspark` 4.0.3 is a hard floor under Python 3.12+.** Earlier
+4.0.x hit [SPARK-53759](https://issues.apache.org/jira/browse/SPARK-53759) — a
+missing flush in the simple-worker path — and the Python worker dies partway
+through the JVM handshake. It surfaces as `TASK_WRITE_FAILED` or
+`SparkException: Python worker exited unexpectedly`, with the real cause
+visible only after setting `spark.python.worker.faulthandler.enabled=true`
+(and on 3.12, not even then). Measured: with `pyspark` 4.0.1, Python 3.12 and
+3.13 both fail 18 of the 109 interop tests — every Spark-backed one — while
+3.11 passes all 109. Fixed in 4.0.3 / 4.1.2 / 3.5.9. Linux is unaffected: it
+forks workers via `pyspark.daemon` instead of spawn-and-connect-back, which is
+why `interop-nightly.yml` never saw this.
 
 **Two Spark versions for the VARIANT tests.** Variant is GA in Spark 4.1 and
 experimental in 4.0.x, and they disagree on the parquet layout: 4.1 writes and
