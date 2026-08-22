@@ -186,7 +186,7 @@ The pairing depends on your Python, and neither one is the "obvious" latest:
 py -3.13 -m venv spark41 && spark41\Scripts\pip install --no-deps pyspark==4.1.2 delta-spark==4.3.1
 
 # Python 3.11
-python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
+py -3.11 -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
 
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
@@ -459,9 +459,12 @@ in the nightly `Interop` workflow. So a tier going dark locally no longer
 means it is dark everywhere — but it does mean *your* run proved less than
 it looked like it did.
 
-(Reporting these as genuine skips would be better. It needs xunit.v3 or
-`SkippableFact` — xUnit 2.9.3 has no `Assert.Skip` — so it has not been
-done.)
+Note that the per-commit `build` job on windows-latest has **no JDK** and
+deliberately leaves `EW_REQUIRE_SPARK_INTEROP` unset, so its healthy result
+for this suite is `849 passed, 73 skipped` of 922. Those 73 are the
+Spark-dependent cases; before they reported real skips they were counted as
+passes on every commit. A non-zero skip count there is correct, not a
+regression.
 
 ### Expected test counts
 
@@ -471,7 +474,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 |---|---|
 | **Parquet** | 807 |
 | **Core** | 452 |
-| **DeltaLake.Table** | 842 (98 of them interop) |
+| **DeltaLake.Table** | 922 (109 of them interop) — re-measured 2026-08-22 |
 | **DeltaLake** | 484 |
 | **Vortex** | 322 |
 | **Avro** | 301 |
@@ -484,15 +487,25 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 
 Counts move with every feature, so treat these as an order-of-magnitude
 check rather than a target — the useful signal is `Failed: 0` and, for the
-suites above that have optional tiers, `Skipped: 0`. The one exception is
-`DeltaLake.Table`, where 5 skips are expected on the pinned oracles because
-the features they cover postdate those versions; see [Skipped
-tests](#skipped-tests).
+suites above that have optional tiers, `Skipped: 0`.
 
-Of `DeltaLake.Table`'s 98 interop tests, **68 need PySpark** and **2 need
-DuckDB**; the remaining 28 need delta-rs. Measured by making each tier
-unreachable with its `EW_REQUIRE_*` set and counting the failures, which is
-also a quick way to re-derive these after adding tests.
+`DeltaLake.Table` is the exception, and its skip count is **not** expected to
+be 0 — it depends on what the machine can reach:
+
+| environment | expected |
+|---|---|
+| every toolchain present, 4.0 oracles | 917 passed / 5 skipped |
+| the same, Spark pointed at a 4.1 venv | 922 passed / 0 skipped |
+| no JDK (the per-commit `build` job) | 849 passed / 73 skipped |
+
+See [Skipped tests](#skipped-tests) for what each of those means.
+
+Of its **109 interop cases** (94 test methods; theories expand the rest),
+**73 need PySpark** and **2 need DuckDB**; the remaining **34** need
+delta-rs. Re-measured 2026-08-22 by making each tier unreachable and counting
+the skips — which is also the quick way to re-derive these after adding
+tests. Note these are *cases*, matching what `dotnet test` prints; an earlier
+version of this section counted methods and gave 98/68/2/28.
 
 To regenerate the whole table:
 

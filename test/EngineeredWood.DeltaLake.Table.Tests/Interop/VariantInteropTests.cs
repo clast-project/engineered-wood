@@ -17,10 +17,14 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// emits by default (the reason for <see cref="DeltaTableOptions.EmitVariantLogicalType"/>).
 ///
 /// <para>Validated against BOTH Spark lines: the unannotated path on pyspark 4.0.1 / delta-spark 4.0.0
-/// (the pinned tier-3 base) and the GA annotated path — plus the nested-variant cases below — on
-/// pyspark 4.1.3 / delta-spark 4.1.0 (an isolated venv pointed at via <c>EW_SPARK_PYTHON</c>). The GA
-/// and nested cases self-skip on 4.0.x via <see cref="SparkHasGaVariant"/>, so the suite stays green on
-/// whichever Spark is on hand.</para>
+/// (the pinned tier-3 base) and the GA annotated path — plus the nested-variant cases below — on an
+/// isolated 4.1 venv pointed at via <c>EW_SPARK_PYTHON</c>. That venv is <b>pyspark 4.1.2 /
+/// delta-spark 4.3.1</b> on Python 3.13 and <b>pyspark 4.1.1 / delta-spark 4.1.0</b> on 3.11; the
+/// pairing is not free to choose, and this comment previously named 4.1.3 / 4.1.0, which fails 10 of
+/// the 109 cases with <c>NoSuchMethodError</c> on every checkpointed table. See
+/// <c>doc/running-tests.md</c> for why each line needs the version it does. The GA and nested cases
+/// SKIP on 4.0.x via <see cref="SparkHasGaVariant"/>, so the suite stays green on whichever Spark is
+/// on hand — and a <c>Skipped: 0</c> is what proves they actually ran.</para>
 /// </summary>
 [Collection("Interop")]
 public class VariantInteropTests : IDisposable
@@ -201,7 +205,8 @@ public class VariantInteropTests : IDisposable
     // reference reader/writer can prove is that the NESTED physical group — annotation + child order —
     // matches the spec. Both directions require GA variant (Spark >= 4.1): EW always annotates the
     // nested group (StripAnnotation is top-level only) and Spark 4.0.x's reader NPEs on the annotation.
-    // On a 4.0.x Spark these silently no-op — a version gate, not a missing toolchain.
+    // On a 4.0.x Spark these report as SKIPPED — a version gate, not a missing toolchain, and not the
+    // silent pass this used to be.
 
     [SkippableFact]
     public async Task EwWrittenNestedVariant_SparkReadsVariant()
