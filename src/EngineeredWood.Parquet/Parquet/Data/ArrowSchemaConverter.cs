@@ -303,7 +303,13 @@ internal static class ArrowSchemaConverter
                 { BitWidth: 64, IsSigned: false } => UInt64Type.Default,
                 _ => null,
             },
-            LogicalType.TimestampType ts => new TimestampType(
+            // The guard is load-bearing, not defensive. This arm hands back an Arrow TimestampType, and
+            // the read path then reinterprets the column's value buffer as int64 (ArrowArrayBuilder maps
+            // `Int64Type or TimestampType or Time64Type` to a long buffer). A TIMESTAMP annotation on any
+            // other physical width therefore decoded silent garbage instead of failing. Falling through
+            // to the physical type is lossless. MakeDecimalType has always switched on the physical type
+            // for the same reason; this arm had not.
+            LogicalType.TimestampType ts when column.PhysicalType == PhysicalType.Int64 => new TimestampType(
                 ts.Unit switch
                 {
                     Metadata.TimeUnit.Millis => Apache.Arrow.Types.TimeUnit.Millisecond,
@@ -344,8 +350,14 @@ internal static class ArrowSchemaConverter
             // TimeZoneInfo overload renders the "+00:00" offset. A file old enough to carry only a
             // converted type is exactly the kind this matters for, since it was written by a tool
             // whose output is still being read by everything else.
-            ConvertedType.TimestampMillis => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, "UTC"),
-            ConvertedType.TimestampMicros => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"),
+            // Guarded on INT64 for the same reason as the logical-type arm: these hand back an Arrow
+            // TimestampType, whose buffer is read as int64. TIMESTAMP_MILLIS / TIMESTAMP_MICROS are
+            // INT64-only converted types, so a file carrying one on another width is malformed — and
+            // reading it as raw bytes beats decoding a plausible-looking wrong date.
+            ConvertedType.TimestampMillis when column.PhysicalType == PhysicalType.Int64
+                => new TimestampType(Apache.Arrow.Types.TimeUnit.Millisecond, "UTC"),
+            ConvertedType.TimestampMicros when column.PhysicalType == PhysicalType.Int64
+                => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"),
             ConvertedType.TimeMillis => new Time32Type(Apache.Arrow.Types.TimeUnit.Millisecond),
             ConvertedType.TimeMicros => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
             ConvertedType.Int8 => Int8Type.Default,

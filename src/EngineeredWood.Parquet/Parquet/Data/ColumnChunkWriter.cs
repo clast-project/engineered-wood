@@ -233,7 +233,7 @@ internal static class ColumnChunkWriter
                 : StatisticsCollector.Compute(
                     array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
                     floatingPointTotalOrder);
-            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array));
+            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
         // Build Bloom filter if enabled for this column.
@@ -502,7 +502,7 @@ internal static class ColumnChunkWriter
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
                 physicalType, typeLength, rowCount - nonNullCount);
 
-        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType);
+        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;
     }
 
@@ -1667,9 +1667,9 @@ internal static class ColumnChunkWriter
     /// signed ints incl. date/time/timestamp, floats); drop them elsewhere.
     /// </remarks>
     private static Statistics DropDeprecatedMinMaxIfMisordered(
-        Statistics stats, Apache.Arrow.Types.IArrowType type)
+        Statistics stats, Apache.Arrow.Types.IArrowType type, PhysicalType physicalType)
     {
-        if (SignedOrderMatchesLogical(type))
+        if (SignedOrderMatchesLogical(type, physicalType))
             return stats;
 
         return new Statistics
@@ -1686,12 +1686,31 @@ internal static class ColumnChunkWriter
 
     // True when the type's SIGNED byte ordering equals its logical ordering — the precondition for emitting
     // the deprecated Statistics.min/max fields (see DropDeprecatedMinMaxIfMisordered).
-    private static bool SignedOrderMatchesLogical(Apache.Arrow.Types.IArrowType type) => type switch
+    //
+    // The real precondition is narrower than "this Arrow type is signed": it is that StatisticsCollector
+    // compared these values with a TYPED comparator. It does that only for BOOLEAN/INT32/INT64/FLOAT/DOUBLE;
+    // every FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY column goes through SequenceCompareTo, i.e. unsigned
+    // lexicographic. So the physical type has to be part of the answer wherever an Arrow type can arrive on
+    // more than one physical width.
+    // Internal rather than private so the gate can be pinned directly. The FIXED_LEN_BYTE_ARRAY answer is
+    // latent until an Arrow TimestampType can map to that physical type, so there is no end-to-end write
+    // that reaches it yet — a unit test is the only thing that keeps the fix from silently regressing.
+    internal static bool SignedOrderMatchesLogical(
+        Apache.Arrow.Types.IArrowType type, PhysicalType physicalType) => type switch
     {
         BooleanType => true,
         Int8Type or Int16Type or Int32Type or Int64Type => true,
-        FloatType or DoubleType or HalfFloatType => true,
-        Date32Type or Date64Type or Time32Type or Time64Type or TimestampType or DurationType => true,
+        FloatType or DoubleType => true,
+        // FLOAT16 is FLBA(2), so this claim is already wrong for it — its bounds come from a lexicographic
+        // byte comparison over IEEE-754 halves. That is a separately tracked gap (doc/known-issues.md), and
+        // is left exactly as it was rather than quietly changed under cover of this fix.
+        HalfFloatType => true,
+        // Date/Time/Duration only ever arrive on INT32/INT64, so the collector used a typed comparator.
+        Date32Type or Date64Type or Time32Type or Time64Type or DurationType => true,
+        // TIMESTAMP is the one that can also arrive on FIXED_LEN_BYTE_ARRAY. There the collector compares
+        // bytes unsigned-lexicographically, which is not the signed order these deprecated fields promise —
+        // and a wrong bound in the footer is a wrong prune, not a cosmetic defect.
+        TimestampType => physicalType == PhysicalType.Int64,
         Decimal32Type or Decimal64Type => true, // INT32/INT64 physical — signed numeric ordering
         _ => false, // UTF-8 strings/binary (unsigned lexical), unsigned ints, decimal FLBA, nested, ...
     };

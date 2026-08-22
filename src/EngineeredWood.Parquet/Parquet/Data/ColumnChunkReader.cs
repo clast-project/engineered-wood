@@ -1183,7 +1183,7 @@ internal static class ColumnChunkReader
             throw new NotSupportedException(
                 $"Physical type '{column.PhysicalType}' is not supported for DELTA_BYTE_ARRAY decoding.");
 
-        DeltaByteArrayDecoder.Decode(data, count, state);
+        DeltaByteArrayDecoder.Decode(data, count, state, column.TypeLength ?? 0);
     }
 
     private static void DecodeByteStreamSplitValues(
