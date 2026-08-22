@@ -138,11 +138,26 @@ jobs:
       # affect anything here (only UTC is looked up, and UTC does not move). A rule with
       # one unexplained exception stops being a rule; if a future release ever needs to
       # float, that should be a stated decision rather than the absence of a version.
-      - name: Install interop oracles (delta-rs, DuckDB)
+      #
+      # fastavro is the Avro counterpart of the pyarrow story above, and was missed when
+      # pyarrow was added for ORC. Without it the seven "EW writes -> fastavro reads"
+      # tests report Skipped — honestly, via SkippableFact, unlike the Delta interop
+      # tiers — but nobody reads the Skipped column. Measured: 301 passed / 0 skipped
+      # with fastavro, 294 / 7 without. That is the entire Avro WRITE direction going
+      # unvalidated by an external implementation; direction 1 stays covered either way,
+      # because its .avro fixtures are committed.
+      #
+      # lz4 must come WITH fastavro, never after it. fastavro's LZ4 codec is a separate
+      # package, so installing fastavro alone turns
+      # AvroPhase6Tests.WriteThenReadWithFastavro_Lz4 from a clean skip into a hard
+      # failure: "ValueError: lz4 codec is supported but you need to install one of the
+      # following libraries: ('lz4',)".
+      - name: Install interop oracles (delta-rs, DuckDB, fastavro)
         if: steps.changes.outputs.code == 'true'
         run: >
           python -m pip install --disable-pip-version-check
           deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata==2026.3
+          fastavro==1.12.2 lz4==4.4.5
 
       - name: Restore
         if: steps.changes.outputs.code == 'true'
@@ -157,14 +172,20 @@ jobs:
         # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a
         # silent no-op, which is the whole point of setting them here.
         #
-        # An interop test that cannot reach its toolchain does not report Skipped —
+        # A DELTA interop test that cannot reach its toolchain does not report Skipped —
         # `if (!X.EnsureAvailable()) return;` returns normally, so xUnit counts it
         # PASSED. Measured: with no JDK present the 54 Spark interop tests report
         # "Passed: 54, Skipped: 0" in 94ms. Nothing in a CI summary distinguishes
         # that from real coverage, so a tier can go dark and take its conformance
-        # guarantees with it while the build stays green. (Reporting them as skips
-        # instead would need xunit.v3 or SkippableFact — xUnit 2.9.3 has no
-        # Assert.Skip — which is a bigger change than making CI demand the tiers.)
+        # guarantees with it while the build stays green.
+        #
+        # This is specific to EngineeredWood.DeltaLake.Table.Tests. The Avro and ORC
+        # cross-validation tests already report real skips: both projects reference
+        # Xunit.SkippableFact and gate on `Skip.If(!IsFastavroAvailable(), ...)` /
+        # `Skip.If(!IsPyArrowAvailable(), ...)`. So the pattern is established in this
+        # repo — what makes it a poor fit HERE is the ~100 Delta interop tests that
+        # would need converting, not the dependency. (xUnit 2.9.3 itself has no
+        # Assert.Skip, which is why SkippableFact is the mechanism in the first place.)
         #
         # The Spark tier stays unset here and is exercised by interop-nightly.yml.
         env:
