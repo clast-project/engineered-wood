@@ -5,6 +5,7 @@ using System.Numerics;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.BloomFilter;
+using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -198,7 +199,7 @@ internal static class BloomFilterPredicateEvaluator
     {
         try
         {
-            object? boxed = ToObjectForPhysicalType(value, descriptor.PhysicalType);
+            object? boxed = ToObjectForColumn(value, descriptor);
             if (boxed is null) { bytes = []; return false; }
             bytes = BloomFilterValueEncoder.Encode(boxed, descriptor.PhysicalType);
             return true;
@@ -207,6 +208,116 @@ internal static class BloomFilterPredicateEvaluator
         {
             bytes = [];
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Converts a <see cref="LiteralValue"/> to the boxed .NET value the column's bytes would hold.
+    /// </summary>
+    /// <remarks>
+    /// Temporal literals are decided by the LOGICAL type, not the physical one, so they are handled
+    /// before the physical dispatch below. Until this existed, a predicate on a DATE, TIME or TIMESTAMP
+    /// column could never probe a bloom filter at all: the statistics layer hands those over as
+    /// DateOnly / TimeOnly / DateTimeOffset, and every one of them fell through to null.
+    /// </remarks>
+    private static object? ToObjectForColumn(LiteralValue v, ColumnDescriptor desc)
+        => v.Type is LiteralValue.Kind.DateTimeOffset or LiteralValue.Kind.DateOnly
+            or LiteralValue.Kind.TimeOnly
+            ? TemporalToObject(v, desc)
+            : ToObjectForPhysicalType(v, desc.PhysicalType);
+
+    /// <summary>Ticks (100 ns) from .NET's epoch (0001-01-01) to the Unix epoch.</summary>
+    private const long UnixEpochTicks = 621_355_968_000_000_000L;
+
+    /// <summary>
+    /// Converts a temporal literal to the exact value stored in the column, or null when no stored
+    /// value could equal it.
+    /// </summary>
+    /// <remarks>
+    /// <para>EXACTNESS IS THE WHOLE RULE. A bloom filter answers "these bytes, or definitely nothing",
+    /// so a literal is only worth probing with if it converts to the column's unit without a remainder.
+    /// A DateTimeOffset of 1.5 ms against a MILLIS column does not, and rounding it would probe for a
+    /// value the caller never asked about. Declining costs a pruning opportunity and nothing else.</para>
+    ///
+    /// <para>Returning null is always safe here: it means the filter is not consulted, so the row group
+    /// is read. The unsafe direction would be probing with the wrong bytes and being told "absent".</para>
+    /// </remarks>
+    private static object? TemporalToObject(LiteralValue v, ColumnDescriptor desc)
+    {
+        var logical = desc.SchemaElement.LogicalType;
+
+        switch (v.Type)
+        {
+            case LiteralValue.Kind.DateTimeOffset when logical is LogicalType.TimestampType ts:
+            {
+                // Normalising by the offset is right for an isAdjustedToUTC column, and a no-op for a
+                // naive one -- this reader only ever produces those with a zero offset.
+                long ticks = v.AsDateTimeOffset.ToUniversalTime().Ticks - UnixEpochTicks;
+                if (!TryTicksToUnit(ticks, ts.Unit, out long count))
+                    return null;
+
+                if (desc.PhysicalType == PhysicalType.Int64)
+                    return count;
+
+                if (desc.PhysicalType == PhysicalType.FixedLenByteArray
+                    && desc.TypeLength == ExtendedTimestamp.ByteWidth)
+                {
+                    // The filter holds the hash of the bytes as they sit in the file, so the literal has
+                    // to become those same twelve little-endian bytes.
+                    var carrier = new byte[ExtendedTimestamp.ByteWidth];
+                    ExtendedTimestamp.Write((Int128)count, carrier);
+                    return carrier;
+                }
+
+                return null;
+            }
+
+#if NET6_0_OR_GREATER
+            case LiteralValue.Kind.DateOnly
+                when logical is LogicalType.DateType && desc.PhysicalType == PhysicalType.Int32:
+                return v.AsDateOnly.DayNumber - EpochDays;
+
+            case LiteralValue.Kind.TimeOnly when logical is LogicalType.TimeType time:
+            {
+                long ticks = v.AsTimeOnly.Ticks;
+                return time.Unit switch
+                {
+                    Metadata.TimeUnit.Millis when desc.PhysicalType == PhysicalType.Int32
+                        => ticks % 10_000 == 0 ? (object)(int)(ticks / 10_000) : null,
+                    Metadata.TimeUnit.Micros when desc.PhysicalType == PhysicalType.Int64
+                        => ticks % 10 == 0 ? (object)(ticks / 10) : null,
+                    Metadata.TimeUnit.Nanos when desc.PhysicalType == PhysicalType.Int64
+                        => ticks * 100,
+                    _ => null,
+                };
+            }
+#endif
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>Days from .NET's epoch (0001-01-01) to the Unix epoch (1970-01-01).</summary>
+    private const int EpochDays = 719_162;
+
+    /// <summary>
+    /// Converts ticks since the Unix epoch to a count of <paramref name="unit"/>, refusing any value
+    /// that does not land exactly on one.
+    /// </summary>
+    private static bool TryTicksToUnit(long ticks, Metadata.TimeUnit unit, out long count)
+    {
+        switch (unit)
+        {
+            case Metadata.TimeUnit.Millis:
+                count = ticks / 10_000;
+                return ticks % 10_000 == 0;
+            case Metadata.TimeUnit.Micros:
+                count = ticks / 10;
+                return ticks % 10 == 0;
+            default:
+                // A tick is 100 ns, so every DateTimeOffset lands exactly on a nanosecond count.
+                count = ticks * 100;
+                return true;
         }
     }
 
