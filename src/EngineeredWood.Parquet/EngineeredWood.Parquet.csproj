@@ -18,6 +18,17 @@
     <PackageReference Include="Clast.Alp" Version="0.2.0" />
     <PackageReference Include="Clast.BloomFilter" Version="0.2.0" />
     <PackageReference Include="Clast.Fsst" Version="0.3.1" />
+    <!--
+      Referenced for System.Int128, NOT for Decimal128. The TIMESTAMP annotation on
+      FIXED_LEN_BYTE_ARRAY(12) (apache/parquet-format#601) carries a signed 96-bit little-endian
+      integer, and netstandard2.0 has no 128-bit integer of its own; this package ships a public
+      polyfill, so one reference covers every TFM here. The polyfill is PARTIAL (arithmetic,
+      shifts, conversions, CompareTo and ToString, but no Parse/TryFormat and no generic-math
+      interfaces), which is enough for the decode, the int64 range check and the unit rescale.
+      EngineeredWood.Expressions.Arrow already pairs this package with PolySharp and the net10.0
+      AOT/trim gate, so that combination is known-good.
+    -->
+    <PackageReference Include="Clast.DatabaseDecimal" Version="0.3.0" />
     <PackageReference Include="System.IO.Hashing" Version="9.*" />
     <!--
       Shredded VARIANT reassembly. Apache.Arrow's VariantArray is storage-level: on a shredded
