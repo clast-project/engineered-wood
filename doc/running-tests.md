@@ -179,24 +179,51 @@ install the rest of tier 3 is pinned to, put 4.1 in its own venv (`pyspark`
 bundles its JARs, so two versions cannot share one environment) and point the
 tier at it:
 
+The pairing depends on your Python, and neither one is the "obvious" latest:
+
 ```
+# Python 3.13 (what CI uses). --no-deps is REQUIRED; see below.
+py -3.13 -m venv spark41 && spark41\Scripts\pip install --no-deps pyspark==4.1.2 delta-spark==4.3.1
+
+# Python 3.11
 python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
+
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
 
-**Pin `pyspark` to 4.1.1 exactly.** Both neighbours are broken against
-`delta-spark` 4.1.0. 4.1.0 cannot be imported on Windows at all
-(`socketserver.UnixStreamServer` is Unix-only). 4.1.2 changed the
-`ParquetToSparkSchemaConverter` constructor, so `delta-spark` 4.1.0 throws
+Both are measured at **109 passed / 0 skipped**. The `Skipped: 0` is the
+point: it is what proves the GA-variant and `stats_parsed` cases actually
+ran, which the default 4.0.x lane reports as 5 skips.
+
+**Why the versions differ by interpreter.** On Python 3.13, `pyspark` must be
+≥ 4.1.2 for SPARK-53759 (the Windows worker crash above), but `delta-spark`
+4.1.0's jars do not match Spark 4.1.2 — 4.1.2 changed the
+`ParquetToSparkSchemaConverter` constructor, so it throws
 `java.lang.NoSuchMethodError` from `CheckpointProvider.getParquetSchema` on
-any checkpointed table. Measured on both 4.1.2 and 4.1.3. This file
-previously recommended 4.1.3, which fails this way on every checkpointed
-table the tier touches.
+any checkpointed table (10 of 109 fail; measured on 4.1.2 and 4.1.3).
+`delta-spark` 4.3.1 is the first that matches. On Python 3.11 SPARK-53759 does
+not apply, so the older, self-consistent 4.1.1 / 4.1.0 pairing is fine — and
+`pyspark` 4.1.0 is not, since it cannot be imported on Windows at all
+(`socketserver.UnixStreamServer` is Unix-only).
+
+**Why `--no-deps`.** Every `delta-spark` through 4.3.1 declares
+`Requires-Dist: pyspark<=4.1.1,>=4.0.1` — it caps *below* the 4.1.2 that
+carries the Windows fix, so pip refuses the combination with
+`ResolutionImpossible`. The pairing works anyway; treat it as
+unsupported-but-measured and re-verify on any bump.
+
+**Do not "fix" that by moving to `delta-spark` 4.4.0.** It is the first to
+widen the cap (`pyspark<=4.2.0`) so `pyspark 4.2.0 + delta-spark 4.4.0`
+resolves with no `--no-deps` and clears the `NoSuchMethodError` — but it
+fails 4 of 109: every `ConflictSemanticsInteropTests` case, expecting
+`ConcurrentAppend` and getting `unrecognised`, because Delta 4.4 raises a
+conflict exception class `spark_driver.py` does not classify. That is the
+oracle moving, and the driver has to learn it before the bump can land.
 
 The GA annotated path and the nested-variant cases have been validated against
-`pyspark` 4.1.1 / `delta-spark` 4.1.0; the unannotated path against 4.0.1 /
-4.0.0. delta-rs (tier 1) reads both layouts regardless, so the compat-mode
-writer is covered in every run even without a second Spark.
+both pairings above; the unannotated path against 4.0.1 / 4.0.0. delta-rs
+(tier 1) reads both layouts regardless, so the compat-mode writer is covered
+in every run even without a second Spark.
 
 **Tier 3 on Windows** additionally needs Hadoop's `winutils.exe` +
 `hadoop.dll` (Apache does not publish them; community builds exist for each
