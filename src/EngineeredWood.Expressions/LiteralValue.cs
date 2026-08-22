@@ -535,16 +535,42 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// 9.999999999999999e29, one ulp below the 1e30 that Spark produces — and dividing afterwards
     /// rounds a second time. Formatting the value and parsing it once rounds correctly, and once.
     /// </remarks>
-    private static double ScaledToDouble(BigInteger unscaled, int scale) =>
+    private static double ScaledToDouble(BigInteger unscaled, int scale)
+    {
         // The exponent is -scale and carries its own sign, so it is negated rather than prefixed:
         // "E-" + scale would render a negative scale as the unparseable "123E--2". Scale is
         // normally >= 0 -- DecimalText clamps it and SparkArrays validates it -- but
         // HighPrecisionDecimalOf is public and the format accessors pass whatever the file's
         // metadata claims. Widened to long so int.MinValue has a negation.
-        double.Parse(
-            unscaled.ToString(CultureInfo.InvariantCulture) + "E" + (-(long)scale).ToString(CultureInfo.InvariantCulture),
-            NumberStyles.Float,
-            CultureInfo.InvariantCulture);
+        var text = unscaled.ToString(CultureInfo.InvariantCulture)
+            + "E" + (-(long)scale).ToString(CultureInfo.InvariantCulture);
+
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            return value;
+
+        // TryParse rather than Parse because the two targets disagree about what an out-of-range
+        // value is. Since .NET Core 3.0, parsing saturates: "123E30000" returns Infinity and
+        // "123E-30000" returns zero. On .NET Framework the same input is an error -- Parse raises
+        // OverflowException and TryParse returns false -- and a comparison is not a place that may
+        // throw, because callers turn only InvalidOperationException into a SQL null.
+        //
+        // Saturating by hand puts every target back on the newer behaviour. Done by DECIDING the
+        // direction rather than by arithmetic: (double)unscaled * Math.Pow(10, -scale) reads
+        // naturally and is wrong, because a BigInteger past 1.8e308 converts to Infinity while a
+        // large positive scale underflows the power to zero, and Infinity * 0 is NaN. NaN now
+        // sorts ABOVE every value, so that would make a garbage input compare greater than
+        // everything rather than merely being out of range.
+        if (unscaled.IsZero)
+            return 0d;
+
+        // log10 of the value is log10 of the mantissa less the scale. Past double's exponent
+        // ceiling it saturates to infinity with the mantissa's sign; below its floor, to zero.
+        var log10 = BigInteger.Log10(BigInteger.Abs(unscaled)) - scale;
+        if (log10 > 308d)
+            return unscaled.Sign < 0 ? double.NegativeInfinity : double.PositiveInfinity;
+
+        return 0d;
+    }
 
     private static bool TryAsDouble(LiteralValue v, out double result)
     {

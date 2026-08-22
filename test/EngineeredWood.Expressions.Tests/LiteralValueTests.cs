@@ -355,4 +355,47 @@ public class LiteralValueTests
         Assert.Equal(0, d.CompareTo(LiteralValue.Of(12300d)));
         Assert.True(d.CompareTo(LiteralValue.Of(12299d)) > 0);
     }
+
+    [Theory]
+    // A scale extreme enough to push the value outside double's range. Since .NET Core 3.0
+    // parsing saturates; on .NET Framework the same input is an error, and a comparison may not
+    // throw -- callers turn only InvalidOperationException into a SQL null. Both targets saturate
+    // now, so these answers are the same everywhere.
+    [InlineData(1, -30000, double.PositiveInfinity)]
+    [InlineData(-1, -30000, double.NegativeInfinity)]
+    [InlineData(1, 30000, 0d)]
+    [InlineData(-1, 30000, 0d)]
+    [InlineData(0, -30000, 0d)]
+    public void HighPrecisionDecimal_WithAnOutOfRangeScale_SaturatesRatherThanThrowing(
+        int unscaled, int scale, double expected)
+    {
+        var d = LiteralValue.HighPrecisionDecimalOf(new BigInteger(unscaled), scale);
+
+        // Comparing against the saturated value is how the conversion is observable from outside.
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(expected)));
+    }
+
+    [Theory]
+    // A mantissa large enough to convert to Infinity on its own, paired with a scale large enough
+    // to underflow a power of ten to zero. Computing the saturation as
+    // (double)unscaled * Math.Pow(10, -scale) yields Infinity * 0, which is NaN -- and since #204
+    // NaN sorts ABOVE every value, so the answer would not merely be wrong, it would compare
+    // greater than everything. 10^1000 at scale 400 is 10^600, genuinely past double's ceiling.
+    [InlineData(1000, 400, false)]
+    [InlineData(1000, 400, true)]
+    public void HighPrecisionDecimal_WithAHugeMantissaAndScale_SaturatesToInfinityNotNaN(
+        int mantissaDigits, int scale, bool negative)
+    {
+        var unscaled = BigInteger.Pow(10, mantissaDigits);
+        if (negative) unscaled = -unscaled;
+
+        var d = LiteralValue.HighPrecisionDecimalOf(unscaled, scale);
+        var expected = negative ? double.NegativeInfinity : double.PositiveInfinity;
+
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(expected)));
+
+        // Stated separately because NaN would satisfy neither, and would fail loudly here rather
+        // than quietly ordering itself at the top.
+        Assert.NotEqual(0, d.CompareTo(LiteralValue.Of(double.NaN)));
+    }
 }
