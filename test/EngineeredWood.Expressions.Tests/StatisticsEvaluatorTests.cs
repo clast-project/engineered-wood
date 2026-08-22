@@ -520,4 +520,68 @@ public class StatisticsEvaluatorTests
             new LiteralExpression(2024));
         Assert.Equal(FilterResult.Unknown, Eval(p, stats));
     }
+
+    // ── Lossy comparisons must not skip data (#208) ──
+
+    private static Predicate Compare(string column, ComparisonOperator op, LiteralValue value) =>
+        new ComparisonPredicate(new UnboundReference(column), op, new LiteralExpression(value));
+
+    [Fact]
+    public void BigintAgainstDouble_PastTwoToTheFiftyThree_IsUnknownRatherThanSkipping()
+    {
+        // The row group holds exactly 9007199254740993, which is 2^53+1 and has no double form.
+        // Widening both sides to compare makes the column value look like 9007199254740992, and
+        // the answer to `> 9007199254740992.0` flips from true to false. Acting on that skips the
+        // row group and loses a row that matches.
+        var v = LiteralValue.Of(9007199254740993L);
+        var stats = new TestStats().With("b", min: v, max: v);
+        var literal = LiteralValue.Of(9007199254740992d);
+
+        Assert.Equal(FilterResult.Unknown, Eval(Compare("b", ComparisonOperator.GreaterThan, literal), stats));
+
+        // And the other direction: the rounded values look equal, so equality claimed certainty
+        // about a row that does not match.
+        Assert.Equal(FilterResult.Unknown, Eval(Compare("b", ComparisonOperator.Equal, literal), stats));
+    }
+
+    [Fact]
+    public void DecimalAgainstDouble_IsUnknownRatherThanSkipping()
+    {
+        // Same shape carried by a wide decimal, which is how #171 introduced it here: that
+        // comparison used to throw, and throwing was safe because it produced Unknown.
+        var v = LiteralValue.HighPrecisionDecimalOf(
+            System.Numerics.BigInteger.Parse("9007199254740993"), 0);
+        var stats = new TestStats().With("d", min: v, max: v);
+        var literal = LiteralValue.Of(9007199254740992d);
+
+        Assert.Equal(FilterResult.Unknown, Eval(Compare("d", ComparisonOperator.GreaterThan, literal), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Compare("d", ComparisonOperator.Equal, literal), stats));
+    }
+
+    [Fact]
+    public void OrdinaryIntegerAgainstDouble_StillPrunes()
+    {
+        // The cost of the rule has to stay proportional. Values inside 2^53 convert exactly, so
+        // the ordinary predicate keeps its pruning -- only the values that genuinely cannot
+        // round-trip give it up.
+        var stats = new TestStats().With(
+            "x", min: LiteralValue.Of(10L), max: LiteralValue.Of(20L), nullCount: 0);
+
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(Compare("x", ComparisonOperator.GreaterThan, LiteralValue.Of(25.5d)), stats));
+        Assert.Equal(FilterResult.AlwaysTrue,
+            Eval(Compare("x", ComparisonOperator.LessThan, LiteralValue.Of(25.5d)), stats));
+        Assert.Equal(FilterResult.Unknown,
+            Eval(Compare("x", ComparisonOperator.GreaterThan, LiteralValue.Of(15.5d)), stats));
+    }
+
+    [Fact]
+    public void FloatAgainstDouble_StillPrunes()
+    {
+        // A float widens to double exactly, so nothing is given up here either.
+        var stats = new TestStats().With("f", min: LiteralValue.Of(1.5f), max: LiteralValue.Of(2.5f));
+
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(Compare("f", ComparisonOperator.GreaterThan, LiteralValue.Of(10d)), stats));
+    }
 }

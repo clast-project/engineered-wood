@@ -310,8 +310,26 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// value. Throws <see cref="InvalidOperationException"/> if the kinds
     /// cannot be meaningfully compared.
     /// </summary>
-    public int CompareTo(LiteralValue other)
+    public int CompareTo(LiteralValue other) => CompareTo(other, out _);
+
+    /// <summary>
+    /// Compares, reporting whether the answer required a lossy widening.
+    /// </summary>
+    /// <param name="exact">
+    /// False when the two values had to meet in a type that cannot hold one of them exactly, so
+    /// the ordering is the ordering of the ROUNDED values and may not be the ordering of the real
+    /// ones. True otherwise, including for every same-type comparison.
+    /// </param>
+    /// <remarks>
+    /// The distinction exists because two different questions share this comparison. Evaluating a
+    /// row under a SQL dialect wants the lossy answer — it is what the dialect specifies. Deciding
+    /// whether a row group can be SKIPPED may only act on an exact one: a lossy comparison is not
+    /// an error, it is a confident wrong answer, and acting on it drops rows that match. See
+    /// StatisticsEvaluator, whose contract is that callers must not skip data on Unknown.
+    /// </remarks>
+    public int CompareTo(LiteralValue other, out bool exact)
     {
+        exact = true;
         if (_kind == Kind.Null)
             return other._kind == Kind.Null ? 0 : -1;
         if (other._kind == Kind.Null)
@@ -345,11 +363,15 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
             };
         }
 
-        return CompareCrossType(this, other);
+        return CompareCrossType(this, other, out exact);
     }
 
-    private static int CompareCrossType(LiteralValue a, LiteralValue b)
+    private static int CompareCrossType(LiteralValue a, LiteralValue b) =>
+        CompareCrossType(a, b, out _);
+
+    private static int CompareCrossType(LiteralValue a, LiteralValue b, out bool exact)
     {
+        exact = true;
         // Integer ↔ integer widening
         if (TryAsInt64(a, out long ai) && TryAsInt64(b, out long bi))
             return ai.CompareTo(bi);
@@ -378,7 +400,11 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         // compares EQUAL to the double 9007199254740992, because the decimal goes to double and
         // 2^53+1 is not representable there. Comparing exactly would answer false and disagree.
         if (TryAsDouble(a, out double ad) && TryAsDouble(b, out double bd))
+        {
+            // The one branch that can lose information, so the one that reports it.
+            exact = ExactAsDouble(a) && ExactAsDouble(b);
             return ad.CompareTo(bd);
+        }
 
 #if NET6_0_OR_GREATER
         // A calendar date (DateOnly) compares against an instant (DateTimeOffset) as UTC midnight —
@@ -470,6 +496,29 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         result = 0;
         return false;
     }
+
+    /// <summary>Whether this value survives the trip to <see cref="double"/> unchanged.</summary>
+    /// <remarks>
+    /// Per value, not per type, so ordinary integer pruning keeps working: an <c>int</c> always
+    /// fits, and a <c>long</c> fits up to 2^53, which covers almost every real predicate. Only the
+    /// values that genuinely cannot round-trip give up their pruning.
+    /// <para>
+    /// Decimals are reported inexact without inspection. Deciding precisely means asking whether a
+    /// value with up to 38 digits lands on a binary fraction, which costs more than the pruning it
+    /// would buy — and Unknown here is exactly what this comparison did before #171, when the pair
+    /// threw instead, so nothing regresses by saying so.
+    /// </para>
+    /// </remarks>
+    private static bool ExactAsDouble(LiteralValue v) => v._kind switch
+    {
+        // 2^53 is where consecutive integers stop being representable.
+        Kind.Int64 => v._inline.Int64 is >= -9007199254740992L and <= 9007199254740992L,
+        Kind.UInt64 => v._inline.UInt64 <= 9007199254740992UL,
+        Kind.Decimal or Kind.HighPrecisionDecimal => false,
+
+        // Int32, UInt32, Float, Double and Half all convert without loss.
+        _ => true,
+    };
 
     /// <summary>Whether a kind is floating point, and so has no exact form to compare through.</summary>
     private static bool IsFloating(Kind kind) =>

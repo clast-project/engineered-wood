@@ -524,14 +524,28 @@ public static class StatisticsEvaluator
     };
 
     /// <summary>
-    /// Returns the comparison result, or <c>int.MinValue</c> on incompatible
-    /// types — sentinel for "can't compare, treat as Unknown."
+    /// Returns the comparison result, or <c>int.MinValue</c> when the answer may not be trusted
+    /// to skip data — sentinel for "treat as Unknown."
     /// </summary>
+    /// <remarks>
+    /// Two ways an answer cannot be trusted, and only one of them announces itself. A pair that
+    /// cannot be compared at all throws, which this has always caught. A pair that compares
+    /// LOSSILY does not throw — it returns a confident answer about the rounded values, which can
+    /// be the opposite of the answer about the real ones. Acting on that skips row groups that
+    /// contain matching rows.
+    /// <para>
+    /// Measured: a row group holding exactly 9007199254740993 (2^53+1) against the predicate
+    /// <c>&gt; 9007199254740992.0</c> compared AlwaysFalse, because both sides met in a double
+    /// that cannot hold the odd value. The row group was skipped and the matching row lost. See
+    /// #208.
+    /// </para>
+    /// </remarks>
     private static int SafeCompare(LiteralValue a, LiteralValue b)
     {
         try
         {
-            return a.CompareTo(b);
+            var result = a.CompareTo(b, out bool exact);
+            return exact ? result : int.MinValue;
         }
         catch (InvalidOperationException)
         {
