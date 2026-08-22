@@ -355,4 +355,23 @@ public class LiteralValueTests
         Assert.Equal(0, d.CompareTo(LiteralValue.Of(12300d)));
         Assert.True(d.CompareTo(LiteralValue.Of(12299d)) > 0);
     }
+
+    [Theory]
+    // A scale extreme enough to push the value outside double's range. Since .NET Core 3.0
+    // parsing saturates; on .NET Framework the same input is an error, and a comparison may not
+    // throw -- callers turn only InvalidOperationException into a SQL null. Both targets saturate
+    // now, so these answers are the same everywhere.
+    [InlineData(1, -30000, double.PositiveInfinity)]
+    [InlineData(-1, -30000, double.NegativeInfinity)]
+    [InlineData(1, 30000, 0d)]
+    [InlineData(-1, 30000, 0d)]
+    [InlineData(0, -30000, 0d)]
+    public void HighPrecisionDecimal_WithAnOutOfRangeScale_SaturatesRatherThanThrowing(
+        int unscaled, int scale, double expected)
+    {
+        var d = LiteralValue.HighPrecisionDecimalOf(new BigInteger(unscaled), scale);
+
+        // Comparing against the saturated value is how the conversion is observable from outside.
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(expected)));
+    }
 }

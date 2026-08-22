@@ -486,16 +486,31 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// 9.999999999999999e29, one ulp below the 1e30 that Spark produces — and dividing afterwards
     /// rounds a second time. Formatting the value and parsing it once rounds correctly, and once.
     /// </remarks>
-    private static double ScaledToDouble(BigInteger unscaled, int scale) =>
+    private static double ScaledToDouble(BigInteger unscaled, int scale)
+    {
         // The exponent is -scale and carries its own sign, so it is negated rather than prefixed:
         // "E-" + scale would render a negative scale as the unparseable "123E--2". Scale is
         // normally >= 0 -- DecimalText clamps it and SparkArrays validates it -- but
         // HighPrecisionDecimalOf is public and the format accessors pass whatever the file's
         // metadata claims. Widened to long so int.MinValue has a negation.
-        double.Parse(
-            unscaled.ToString(CultureInfo.InvariantCulture) + "E" + (-(long)scale).ToString(CultureInfo.InvariantCulture),
-            NumberStyles.Float,
-            CultureInfo.InvariantCulture);
+        var text = unscaled.ToString(CultureInfo.InvariantCulture)
+            + "E" + (-(long)scale).ToString(CultureInfo.InvariantCulture);
+
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            return value;
+
+        // TryParse rather than Parse because the two targets disagree about what an out-of-range
+        // value is. Since .NET Core 3.0, parsing saturates: "123E30000" returns Infinity and
+        // "123E-30000" returns zero. On .NET Framework the same input is an error -- Parse raises
+        // OverflowException and TryParse returns false -- and a comparison is not a place that may
+        // throw, because callers turn only InvalidOperationException into a SQL null.
+        //
+        // Saturating by hand puts every target back on the newer behaviour. The multiply is only
+        // reached for a value already outside double's range, where it can only produce +/-Infinity
+        // or zero, so the truncating BigInteger conversion this deliberately avoids above cannot
+        // cost anything here.
+        return (double)unscaled * Math.Pow(10, -(double)scale);
+    }
 
     private static bool TryAsDouble(LiteralValue v, out double result)
     {
