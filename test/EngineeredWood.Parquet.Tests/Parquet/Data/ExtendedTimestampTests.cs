@@ -2,7 +2,12 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Globalization;
+using Apache.Arrow;
+using Apache.Arrow.Arrays;
+using Apache.Arrow.Types;
 using EngineeredWood.Parquet.Data;
+using ParquetTimeUnit = EngineeredWood.Parquet.Metadata.TimeUnit;
+using TimeUnit = Apache.Arrow.Types.TimeUnit;
 
 namespace EngineeredWood.Tests.Parquet.Data;
 
@@ -250,5 +255,82 @@ public class ExtendedTimestampTests
         Assert.True(ExtendedTimestamp.IsRepresentable(ParseInt128("253402300799000000000")));
         Assert.False(ExtendedTimestamp.TryToInt64(ParseInt128("-62135596800000000000"), out _));
         Assert.True(ExtendedTimestamp.IsRepresentable(ParseInt128("-62135596800000000000")));
+    }
+
+    [Fact]
+    public void NanosecondConversionDoesNotWrapAtTheEndOfTheSqlRange()
+    {
+        // Year 9999 is 2.53e20 nanoseconds and a long holds 9.22e18. Computing this in 64 bits wrapped
+        // it to -4852116231933722724 -- and as a bloom-filter probe, a wrapped value means asking
+        // whether some other timestamp entirely is present, which can prune a row group that matches.
+        long ticks = 2_534_023_007_999_999_999L; // 9999-12-31T23:59:59.9999999Z, in ticks since epoch
+
+        Assert.True(ExtendedTimestamp.TryTicksToUnit(ticks, ParquetTimeUnit.Nanos, out Int128 nanos));
+        Assert.Equal("253402300799999999900", nanos.ToString());
+        Assert.False(ExtendedTimestamp.TryToInt64(nanos, out _));
+        Assert.True(ExtendedTimestamp.IsRepresentable(nanos));
+    }
+
+    [Fact]
+    public void CoarserUnitsConvertOnlyWhenExact()
+    {
+        // 1.5 ms is not a MILLIS value, so there is no count to convert it to.
+        Assert.False(ExtendedTimestamp.TryTicksToUnit(15_000, ParquetTimeUnit.Millis, out _));
+        Assert.True(ExtendedTimestamp.TryTicksToUnit(20_000, ParquetTimeUnit.Millis, out Int128 millis));
+        Assert.Equal("2", millis.ToString());
+
+        Assert.False(ExtendedTimestamp.TryTicksToUnit(5, ParquetTimeUnit.Micros, out _));
+        Assert.True(ExtendedTimestamp.TryTicksToUnit(20, ParquetTimeUnit.Micros, out Int128 micros));
+        Assert.Equal("2", micros.ToString());
+    }
+
+    [Fact]
+    public void EncodingASlicedColumnKeepsItsValuesAndItsNulls()
+    {
+        // The buffered writer hands sliced arrays straight through -- it tracks Data.Offset rather than
+        // compacting -- so the encoder has to honour the offset on BOTH buffers. Reusing the caller's
+        // validity bitmap alongside offset 0 silently moved every null.
+        var type = new TimestampType(TimeUnit.Microsecond, "UTC");
+        var values = new ArrowBuffer.Builder<long>();
+        foreach (long v in new[] { 10L, 20L, 30L, 40L, 50L })
+        {
+            values.Append(v);
+        }
+
+        // Valid at absolute rows 1, 2, 4; null at 0 and 3. The slice starts at row 2, so within it the
+        // pattern is present, null, present.
+        var validity = new ArrowBuffer(new byte[] { 0b00010110 });
+        var sliced = new TimestampArray(new ArrayData(
+            type, length: 3, nullCount: 1, offset: 2, [validity, values.Build()]));
+
+        var encoded = ExtendedTimestamp.EncodeColumn(sliced);
+
+        Assert.Equal(3, encoded.Length);
+        Assert.False(encoded.IsNull(0));
+        Assert.True(encoded.IsNull(1));
+        Assert.False(encoded.IsNull(2));
+
+        var bytes = Assert.IsType<FixedSizeBinaryArray>(encoded);
+        Assert.Equal("30", ExtendedTimestamp.Read(bytes.GetBytes(0)).ToString());
+        Assert.Equal("50", ExtendedTimestamp.Read(bytes.GetBytes(2)).ToString());
+    }
+
+    [Fact]
+    public void EncodingAnUnslicedColumnIsUnchanged()
+    {
+        var type = new TimestampType(TimeUnit.Microsecond, "UTC");
+        var values = new ArrowBuffer.Builder<long>();
+        values.Append(7L);
+        values.Append(9L);
+        var array = new TimestampArray(new ArrayData(
+            type, length: 2, nullCount: 0, offset: 0,
+            [new ArrowBuffer(new byte[] { 0b11 }), values.Build()]));
+
+        var bytes = Assert.IsType<FixedSizeBinaryArray>(ExtendedTimestamp.EncodeColumn(array));
+
+        Assert.Equal("7", ExtendedTimestamp.Read(bytes.GetBytes(0)).ToString());
+        Assert.Equal("9", ExtendedTimestamp.Read(bytes.GetBytes(1)).ToString());
+        Assert.False(bytes.IsNull(0));
+        Assert.False(bytes.IsNull(1));
     }
 }

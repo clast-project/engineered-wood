@@ -191,10 +191,65 @@ internal static class ExtendedTimestamp
         }
 
         // Offset 0: the slice above has already applied it, and carrying it forward would double-count.
+        // The validity bitmap has to be shifted to match -- handing back the caller's bitmap alongside
+        // offset 0 moves every null, because bit i would be read where bit (offset + i) was meant.
         var newData = new ArrayData(
             new FixedSizeBinaryType(ByteWidth), array.Length, data.NullCount, offset: 0,
-            [data.Buffers[0], new ArrowBuffer(encoded)]);
+            [ShiftValidity(data, array.Length), new ArrowBuffer(encoded)]);
         return ArrowArrayFactory.BuildArray(newData);
+    }
+
+    /// <summary>
+    /// Rebuilds a validity bitmap so bit <c>i</c> means row <c>i</c> of a slice that started at
+    /// <c>data.Offset</c>. Returns the original buffer untouched when there is nothing to shift.
+    /// </summary>
+    /// <remarks>
+    /// Not skipped when the null count is zero: a bitmap can be present and fully set across the slice
+    /// while holding zeros outside it, and reading that at offset 0 would invent nulls.
+    /// </remarks>
+    private static ArrowBuffer ShiftValidity(ArrayData data, int length)
+    {
+        var source = data.Buffers[0];
+        if (data.Offset == 0 || source.Length == 0)
+            return source;
+
+        var shifted = new byte[BitUtility.ByteCount(length)];
+        var bits = source.Span;
+        for (int i = 0; i < length; i++)
+        {
+            if (BitUtility.GetBit(bits, data.Offset + i))
+                BitUtility.SetBit(shifted, i);
+        }
+
+        return new ArrowBuffer(shifted);
+    }
+
+
+    /// <summary>
+    /// Converts a count of 100 ns ticks since the Unix epoch into a count of <paramref name="unit"/>,
+    /// refusing any value that does not land exactly on one.
+    /// </summary>
+    /// <remarks>
+    /// The result is <see cref="Int128"/> because NANOS does not fit: year 9999 is 2.5e20 nanoseconds
+    /// and a <see cref="long"/> holds 9.2e18. Multiplying in 64 bits wrapped it to a negative number,
+    /// which as a bloom-filter probe means asking whether some other timestamp entirely is present.
+    /// Callers targeting an INT64 column must still range-check the result.
+    /// </remarks>
+    public static bool TryTicksToUnit(long ticks, Metadata.TimeUnit unit, out Int128 count)
+    {
+        switch (unit)
+        {
+            case Metadata.TimeUnit.Millis:
+                count = (Int128)(ticks / 10_000);
+                return ticks % 10_000 == 0;
+            case Metadata.TimeUnit.Micros:
+                count = (Int128)(ticks / 10);
+                return ticks % 10 == 0;
+            default:
+                // A tick is 100 ns, so every tick count lands exactly on a nanosecond count.
+                count = (Int128)ticks * (Int128)100;
+                return true;
+        }
     }
 
     /// <summary>Largest value the 96-bit carrier can hold (2^95 - 1).</summary>

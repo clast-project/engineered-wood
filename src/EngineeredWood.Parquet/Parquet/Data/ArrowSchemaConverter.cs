@@ -440,9 +440,14 @@ internal static class ArrowSchemaConverter
 
     /// <summary>
     /// Maps a TIMESTAMP-annotated FIXED_LEN_BYTE_ARRAY(12) column per
-    /// <see cref="ParquetReadOptions.ExtendedTimestampOutput"/>. Unlike INT96, this carrier declares its
-    /// own unit, so the default keeps it and only the option to rescale or decline is a choice.
+    /// <see cref="ParquetReadOptions.ExtendedTimestampOutput"/>.
     /// </summary>
+    /// <remarks>
+    /// The DEFAULT rescales to microseconds rather than keeping the declared unit, because microseconds
+    /// span every date the carrier can hold and the declared unit may not -- year 9999 in nanoseconds
+    /// does not fit an Arrow int64 timestamp. Keeping the declared unit is
+    /// <see cref="ExtendedTimestampOutputKind.Timestamp"/>, and it can refuse a value.
+    /// </remarks>
     private static IArrowType MakeExtendedTimestampArrowType(
         LogicalType.TimestampType timestamp, ParquetReadOptions? options)
     {

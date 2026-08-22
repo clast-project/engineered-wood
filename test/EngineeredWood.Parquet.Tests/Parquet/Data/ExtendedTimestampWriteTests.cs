@@ -301,4 +301,41 @@ public sealed class ExtendedTimestampWriteTests : IDisposable
 
         Assert.Contains("not a timestamp", error.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task ASlicedBatchKeepsItsValuesAndItsNullsThroughTheBufferedWriter()
+    {
+        // The buffered writer takes sliced arrays as they come -- it tracks Data.Offset rather than
+        // compacting, unlike ParquetFileWriter, which calls CompactSlicedColumns first. So the carrier
+        // encoding has to honour the offset on BOTH buffers, and getting it wrong here moved the values
+        // AND the nulls while leaving a perfectly well-formed file behind.
+        var type = new TimestampType(TimeUnit.Microsecond, "UTC");
+        var values = new ArrowBuffer.Builder<long>();
+        foreach (long v in new[] { 10L, 20L, 30L, 40L, 50L })
+        {
+            values.Append(v);
+        }
+
+        // Valid at absolute rows 1, 2 and 4. The slice starts at row 2, so it reads: 30, null, 50.
+        var sliced = new TimestampArray(new ArrayData(
+            type, length: 3, nullCount: 1, offset: 2,
+            [new ArrowBuffer(new byte[] { 0b00010110 }), values.Build()]));
+
+        var schema = new Apache.Arrow.Schema([new Field("t", type, nullable: true)], null);
+        var path = await WriteAsync(new RecordBatch(schema, [sliced], 3), Promote("t"), buffered: true);
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(
+            file,
+            ownsFile: false,
+            new ParquetReadOptions { ExtendedTimestampOutput = ExtendedTimestampOutputKind.Timestamp });
+        var array = Assert.IsType<TimestampArray>((await reader.ReadRowGroupAsync(0, ["t"])).Column(0));
+
+        Assert.Equal(3, array.Length);
+        Assert.False(array.IsNull(0));
+        Assert.Equal(30L, array.Values[0]);
+        Assert.True(array.IsNull(1));
+        Assert.False(array.IsNull(2));
+        Assert.Equal(50L, array.Values[2]);
+    }
 }

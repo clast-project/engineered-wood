@@ -253,19 +253,26 @@ internal static class BloomFilterPredicateEvaluator
                 // Normalising by the offset is right for an isAdjustedToUTC column, and a no-op for a
                 // naive one -- this reader only ever produces those with a zero offset.
                 long ticks = v.AsDateTimeOffset.ToUniversalTime().Ticks - UnixEpochTicks;
-                if (!TryTicksToUnit(ticks, ts.Unit, out long count))
+                if (!ExtendedTimestamp.TryTicksToUnit(ticks, ts.Unit, out Int128 count))
                     return null;
 
+                // Computed in 128 bits because NANOS does not fit 64: year 9999 is 2.5e20 nanoseconds.
+                // An INT64 column cannot hold such a value at all, so a literal that big matches nothing
+                // there and there is no probe to make.
                 if (desc.PhysicalType == PhysicalType.Int64)
-                    return count;
+                    return ExtendedTimestamp.TryToInt64(count, out long narrowed) ? narrowed : (object?)null;
 
                 if (desc.PhysicalType == PhysicalType.FixedLenByteArray
                     && desc.TypeLength == ExtendedTimestamp.ByteWidth)
                 {
                     // The filter holds the hash of the bytes as they sit in the file, so the literal has
-                    // to become those same twelve little-endian bytes.
+                    // to become those same twelve little-endian bytes. The carrier holds +/-2^95, so a
+                    // value it cannot represent is likewise not in the column.
+                    if (!ExtendedTimestamp.IsRepresentable(count))
+                        return null;
+
                     var carrier = new byte[ExtendedTimestamp.ByteWidth];
-                    ExtendedTimestamp.Write((Int128)count, carrier);
+                    ExtendedTimestamp.Write(count, carrier);
                     return carrier;
                 }
 
@@ -286,6 +293,8 @@ internal static class BloomFilterPredicateEvaluator
                         => ticks % 10_000 == 0 ? (object)(int)(ticks / 10_000) : null,
                     Metadata.TimeUnit.Micros when desc.PhysicalType == PhysicalType.Int64
                         => ticks % 10 == 0 ? (object)(ticks / 10) : null,
+                    // Safe in 64 bits, unlike the TIMESTAMP case: a time of day is at most 8.64e13
+                    // nanoseconds, nowhere near where a long runs out.
                     Metadata.TimeUnit.Nanos when desc.PhysicalType == PhysicalType.Int64
                         => ticks * 100,
                     _ => null,
@@ -299,27 +308,6 @@ internal static class BloomFilterPredicateEvaluator
 
     /// <summary>Days from .NET's epoch (0001-01-01) to the Unix epoch (1970-01-01).</summary>
     private const int EpochDays = 719_162;
-
-    /// <summary>
-    /// Converts ticks since the Unix epoch to a count of <paramref name="unit"/>, refusing any value
-    /// that does not land exactly on one.
-    /// </summary>
-    private static bool TryTicksToUnit(long ticks, Metadata.TimeUnit unit, out long count)
-    {
-        switch (unit)
-        {
-            case Metadata.TimeUnit.Millis:
-                count = ticks / 10_000;
-                return ticks % 10_000 == 0;
-            case Metadata.TimeUnit.Micros:
-                count = ticks / 10;
-                return ticks % 10 == 0;
-            default:
-                // A tick is 100 ns, so every DateTimeOffset lands exactly on a nanosecond count.
-                count = ticks * 100;
-                return true;
-        }
-    }
 
     /// <summary>
     /// Converts a <see cref="LiteralValue"/> to the boxed .NET type that
