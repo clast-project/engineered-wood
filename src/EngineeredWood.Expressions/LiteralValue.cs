@@ -363,7 +363,12 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         // can accept a decimal-against-integer pair, and only this one is exact; measured, Spark
         // agrees -- `d1 = 0.1` over decimal(10,2) 0.10 is TRUE, which a double compare also gives,
         // but decimal-against-integer stays exact where a double could not.
-        if (TryAsScaledInteger(a, out var au, out int asc) && TryAsScaledInteger(b, out var bu, out int bsc))
+        // The floating check comes first so a decimal-against-double row does not pay for
+        // TryAsScaledInteger before it declines: that call reaches DecimalToUnscaled, which runs
+        // decimal.GetBits and allocates a BigInteger, on the evaluator's per-row path.
+        if (!IsFloating(a._kind) && !IsFloating(b._kind)
+            && TryAsScaledInteger(a, out var au, out int asc)
+            && TryAsScaledInteger(b, out var bu, out int bsc))
             return CompareScaledIntegers(au, asc, bu, bsc);
 
         // Float widening (any numeric → double), which a decimal reaches only when the other side
@@ -466,6 +471,14 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         return false;
     }
 
+    /// <summary>Whether a kind is floating point, and so has no exact form to compare through.</summary>
+    private static bool IsFloating(Kind kind) =>
+#if NET6_0_OR_GREATER
+        kind is Kind.Float or Kind.Double or Kind.Half;
+#else
+        kind is Kind.Float or Kind.Double;
+#endif
+
     /// <summary>An unscaled integer and a scale as the nearest <see cref="double"/>.</summary>
     /// <remarks>
     /// Deliberately NOT <c>(double)unscaled / Math.Pow(10, scale)</c>. BigInteger's conversion to
@@ -474,8 +487,13 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// rounds a second time. Formatting the value and parsing it once rounds correctly, and once.
     /// </remarks>
     private static double ScaledToDouble(BigInteger unscaled, int scale) =>
+        // The exponent is -scale and carries its own sign, so it is negated rather than prefixed:
+        // "E-" + scale would render a negative scale as the unparseable "123E--2". Scale is
+        // normally >= 0 -- DecimalText clamps it and SparkArrays validates it -- but
+        // HighPrecisionDecimalOf is public and the format accessors pass whatever the file's
+        // metadata claims. Widened to long so int.MinValue has a negation.
         double.Parse(
-            unscaled.ToString(CultureInfo.InvariantCulture) + "E-" + scale.ToString(CultureInfo.InvariantCulture),
+            unscaled.ToString(CultureInfo.InvariantCulture) + "E" + (-(long)scale).ToString(CultureInfo.InvariantCulture),
             NumberStyles.Float,
             CultureInfo.InvariantCulture);
 

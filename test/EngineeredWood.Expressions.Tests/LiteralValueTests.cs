@@ -320,4 +320,39 @@ public class LiteralValueTests
         Assert.Equal((object)"x", ((LiteralValue)"x").ToObject());
         Assert.Null(LiteralValue.Null.ToObject());
     }
+
+    // ── Decimal against floating point (#171) ──
+
+    [Fact]
+    public void HighPrecisionDecimal_ComparesAgainstDouble_ThroughDouble()
+    {
+        // 2^53+1, which no double holds. Spark compares the pair through double and calls them
+        // equal; measured, and pinned end-to-end in ArrowRowEvaluatorTests.
+        var d = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse("9007199254740993"), 0);
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(9007199254740992d)));
+
+        // The same pair against an INTEGER stays exact, so it is NOT equal.
+        Assert.NotEqual(0, d.CompareTo(LiteralValue.Of(9007199254740992L)));
+    }
+
+    [Fact]
+    public void HighPrecisionDecimal_ToDouble_RoundsRatherThanTruncating()
+    {
+        // (double)BigInteger truncates: 10^30 becomes 9.999999999999999e29, one ulp below the
+        // 1e30 Spark produces. The conversion formats and parses once instead.
+        var d = LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 30), 0);
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(1e30d)));
+    }
+
+    [Fact]
+    public void HighPrecisionDecimal_WithNegativeScale_ComparesRatherThanThrowing()
+    {
+        // A negative scale means the value is unscaled * 10^|scale|. The exponent carries its own
+        // sign, so building it as "E-" + scale would render "123E--2" and throw. Scale is normally
+        // >= 0, but HighPrecisionDecimalOf is public and the format accessors pass through
+        // whatever a file's metadata claims.
+        var d = LiteralValue.HighPrecisionDecimalOf(new BigInteger(123), -2);   // 12300
+        Assert.Equal(0, d.CompareTo(LiteralValue.Of(12300d)));
+        Assert.True(d.CompareTo(LiteralValue.Of(12299d)) > 0);
+    }
 }
