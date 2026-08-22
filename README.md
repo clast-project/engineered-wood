@@ -105,12 +105,25 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | ALP (experimental) | yes | opt-in |
 | FSST (experimental) | yes | opt-in |
 
-The last two are **unratified parquet-format proposals**, gated behind
-`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0003` for FSST) and
-off by default. A third unratified proposal, extended-precision timestamps, is gated
-behind `EWPARQUET0004` and described below. Opt in per column or per file with
-`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
+The last two are **unratified parquet-format proposals**, off by default. Opt in per column
+or per file with `ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
 `ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
+
+### Experimental diagnostics
+
+Features whose wire format could still change are marked `[Experimental]`, so using one is a
+compile error until the diagnostic is suppressed at the use site. That is deliberate: each of
+these can produce a file that some other implementation reads differently, or not at all.
+
+| ID | Feature | Why it is gated |
+|---|---|---|
+| `EWPARQUET0001` | ALP floating-point encoding | Unratified proposal; the wire format may change |
+| `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **Produces files no other implementation can read.** pyarrow, ParquetSharp and delta-kernel-rs report the file as corrupt rather than as using an unsupported feature. Our own reader tolerates it, so a round trip through this library will not detect the problem |
+| `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 11 where the proposal says 10** (see above) |
+| `EWPARQUET0004` | Extended-precision timestamps | Unratified, **and the byte order is still undecided upstream** (see below) |
+
+Suppress with a narrow `#pragma warning disable` at the use site rather than a project-wide
+`NoWarn`, so the choice stays visible where it is made.
 
 FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
 codes drawn from a symbol table trained per column chunk and stored in its own
@@ -169,6 +182,10 @@ carrier would decode twelve bytes as eight.
 > Arrow has no type for this and no plan for one — `timestamp128`
 > ([apache/arrow#47848](https://github.com/apache/arrow/issues/47848)) is dormant and there is no
 > canonical extension type — so the mapping above is this library's own choice, not a standard.
+
+See [doc/parquet-extended-precision-timestamps.md](doc/parquet-extended-precision-timestamps.md),
+which records what is ours rather than the spec's, what changes if the byte order flips, and the
+limits of the validation available for it.
 
 ## Features — ORC
 
