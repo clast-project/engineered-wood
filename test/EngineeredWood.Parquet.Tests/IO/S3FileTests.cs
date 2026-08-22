@@ -79,8 +79,11 @@ public class S3FileTests : IAsyncLifetime
             {
                 // Best-effort cleanup.
             }
-            _client.Dispose();
         }
+
+        // Dispose on EVERY path, not just the reachable one: the probe constructs the client before
+        // the call that fails, so an absent emulator used to leak it for the whole run.
+        _client?.Dispose();
     }
 
     [SkippableFact]

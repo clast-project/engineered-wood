@@ -64,6 +64,10 @@ public class GcsTableFileSystemTests : IAsyncLifetime
                 // Best-effort cleanup.
             }
         }
+
+        // The GCS suites never disposed their StorageClient at all — not even on the reachable path,
+        // where S3 at least did. Dispose on every path.
+        _client?.Dispose();
     }
 
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);

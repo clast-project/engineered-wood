@@ -186,4 +186,32 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
         await file.FlushAsync();
     }
+
+    /// <summary>
+    /// Writing again after an explicit <c>FlushAsync</c> must not lose the second write.
+    ///
+    /// <para>Nothing forbids it — <c>WriteAsync</c> guards on disposed, not on committed — but the
+    /// commit used to be conditional on <c>!_committed</c>, so the trailing block was staged and then
+    /// never referenced by any block list. The blob read back as just the first write, with no error
+    /// anywhere. Both halves matter: the length proves the second write landed, and reading it proves
+    /// the re-commit kept the first block rather than replacing the list with only the new one.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task WriteAfterFlush_IsStillCommitted()
+    {
+        CloudEmulator.Require("Azurite on 127.0.0.1:10000", _azuriteAvailable, _unavailableReason);
+
+        const string blobName = "test-write-after-flush.bin";
+        var blockBlob = _container!.GetBlockBlobClient(blobName);
+
+        await using (var file = new AzureBlobSequentialFile(blockBlob))
+        {
+            await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("first"));
+            await file.FlushAsync();
+            await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("second"));
+        }
+
+        var downloaded = await Container.GetBlobClient(blobName).DownloadContentAsync();
+        Assert.Equal("firstsecond", downloaded.Value.Content.ToString());
+    }
 }

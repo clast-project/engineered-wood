@@ -100,11 +100,19 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
     private async ValueTask FinalizeAsync(CancellationToken cancellationToken)
     {
         // Stage any remaining buffered data
+        bool staged = false;
         if (_bufferPosition > 0)
+        {
             await StageCurrentBlockAsync(cancellationToken).ConfigureAwait(false);
+            staged = true;
+        }
 
-        // Commit the block list
-        if (!_committed)
+        // Commit the block list. `staged` is what makes a SECOND finalize correct: nothing stops a
+        // caller writing more after a FlushAsync — WriteAsync guards on _disposed, not on _committed —
+        // and committing only when !_committed staged that block and then never referenced it, so the
+        // write vanished with no error. Re-committing is cheap and idempotent: CommitBlockList replaces
+        // the blob's block list, and _committedBlockIds is the full list, not a delta.
+        if (!_committed || staged)
         {
             _committed = true;
             await _blobClient.CommitBlockListAsync(
