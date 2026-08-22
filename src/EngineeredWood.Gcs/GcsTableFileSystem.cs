@@ -90,10 +90,33 @@ public sealed class GcsTableFileSystem : ITableFileSystem
                 continue;
 
             long size = obj.Size is { } s ? checked((long)s) : 0L;
-            DateTimeOffset lastModified =
-                obj.UpdatedDateTimeOffset ?? obj.TimeCreatedDateTimeOffset ?? default;
 
-            yield return new TableFileInfo(ToRelative(obj.Name), size, lastModified);
+            yield return new TableFileInfo(ToRelative(obj.Name), size, LastModifiedOf(obj));
+        }
+    }
+
+    /// <summary>
+    /// <para>The object's last-modified time, or <see langword="default"/> when the server sent one this
+    /// SDK cannot parse.</para>
+    ///
+    /// <para><c>UpdatedDateTimeOffset</c> and <c>TimeCreatedDateTimeOffset</c> are not fields — they PARSE
+    /// the raw JSON string on every access and throw <see cref="FormatException"/> when it is not in the
+    /// shape the generated client expects. Unguarded, one object with an odd timestamp aborts the whole
+    /// enumeration mid-stream, and the caller loses the listing rather than one field of one entry. That is
+    /// the wrong trade for this interface: a table format lists to find out what files exist and how big
+    /// they are, and <see cref="TableFileInfo.LastModified"/> is metadata alongside that, not the reason
+    /// for the call. MEASURED against fake-gcs-server, which reports a local UTC offset
+    /// (<c>...855788-07:00</c>) where the real service always reports <c>Z</c>.</para>
+    /// </summary>
+    private static DateTimeOffset LastModifiedOf(Object obj)
+    {
+        try
+        {
+            return obj.UpdatedDateTimeOffset ?? obj.TimeCreatedDateTimeOffset ?? default;
+        }
+        catch (FormatException)
+        {
+            return default;
         }
     }
 
