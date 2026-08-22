@@ -473,7 +473,7 @@ public class ReadRowGroupTests
             try
             {
                 await using var file = new LocalRandomAccessFile(filePath);
-                using var reader = new ParquetFileReader(file, ownsFile: false);
+                using var reader = new ParquetFileReader(file, ownsFile: false, CorpusReadOptions);
                 var metadata = await reader.ReadMetadataAsync();
 
                 if (metadata.RowGroups.Count == 0)
@@ -563,6 +563,25 @@ public class ReadRowGroupTests
         Assert.True(failures.Count == 0,
             $"Failed on {failures.Count} files:\n" + string.Join("\n", failures));
     }
+
+    /// <summary>
+    /// Options for corpus-wide sweeps, whose question is "can every file be read at all".
+    /// </summary>
+    /// <remarks>
+    /// The one departure from defaults is the extended-precision timestamp carrier. Its default,
+    /// <c>ExtendedTimestampOutputKind.Timestamp</c>, reads at the unit the file declares and REFUSES a
+    /// value int64 cannot hold -- and flba12_timestamp.parquet exists precisely to carry two such values,
+    /// so the default cannot read it. That refusal is deliberate and covered by
+    /// <c>ExtendedTimestampReadTests</c>; repeating it here would only stop the sweep from reaching the
+    /// rest of the file. <c>TimestampMicroseconds</c> spans the whole range and always produces an answer,
+    /// which is the question a sweep is asking.
+    /// </remarks>
+#pragma warning disable EWPARQUET0004 // The carrier is experimental; reading a corpus that contains it is not.
+    private static readonly ParquetReadOptions CorpusReadOptions = new()
+    {
+        ExtendedTimestampOutput = ExtendedTimestampOutputKind.TimestampMicroseconds,
+    };
+#pragma warning restore EWPARQUET0004
 
     /// <summary>
     /// Reads the whole corpus twice — once with the default output kind, once with

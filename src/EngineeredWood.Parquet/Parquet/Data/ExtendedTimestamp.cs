@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using EngineeredWood.Parquet.Metadata;
+using EngineeredWood.Parquet.Schema;
 
 namespace EngineeredWood.Parquet.Data;
 
@@ -111,6 +113,52 @@ internal static class ExtendedTimestamp
         if (value % (Int128)divisor != Int128.Zero && (value < Int128.Zero) != (divisor < 0))
             quotient--;
         return quotient;
+    }
+
+
+    /// <summary>
+    /// The <c>TimeUnit</c> this column declares if it is an extended-precision timestamp carrier, or
+    /// <see langword="null"/> if it is anything else. TIMESTAMP is only a carrier at exactly
+    /// <see cref="ByteWidth"/> bytes; the annotation on any other width is malformed and falls through
+    /// to the physical type rather than being decoded.
+    /// </summary>
+    public static Metadata.TimeUnit? DeclaredUnit(ColumnDescriptor column) =>
+        column.PhysicalType == PhysicalType.FixedLenByteArray
+            && column.TypeLength == ByteWidth
+            && column.SchemaElement.LogicalType is LogicalType.TimestampType timestamp
+            ? timestamp.Unit
+            : null;
+
+    /// <summary>Units per second for a Parquet <c>TimeUnit</c>.</summary>
+    public static long ScaleOf(Metadata.TimeUnit unit) => unit switch
+    {
+        Metadata.TimeUnit.Millis => 1_000L,
+        Metadata.TimeUnit.Micros => 1_000_000L,
+        _ => 1_000_000_000L,
+    };
+
+    /// <summary>Units per second for an Arrow <c>TimeUnit</c>.</summary>
+    public static long ScaleOf(Apache.Arrow.Types.TimeUnit unit) => unit switch
+    {
+        Apache.Arrow.Types.TimeUnit.Second => 1L,
+        Apache.Arrow.Types.TimeUnit.Millisecond => 1_000L,
+        Apache.Arrow.Types.TimeUnit.Microsecond => 1_000_000L,
+        _ => 1_000_000_000L,
+    };
+
+    /// <summary>
+    /// Converts a count in <paramref name="fromScale"/> units per second into one in
+    /// <paramref name="toScale"/>. Widening multiplies exactly; narrowing floors, for the reason
+    /// <see cref="DivideFloor"/> describes.
+    /// </summary>
+    public static Int128 Rescale(Int128 value, long fromScale, long toScale)
+    {
+        if (fromScale == toScale)
+            return value;
+
+        return toScale > fromScale
+            ? value * (Int128)(toScale / fromScale)
+            : DivideFloor(value, fromScale / toScale);
     }
 
     /// <summary>Largest value the 96-bit carrier can hold (2^95 - 1).</summary>

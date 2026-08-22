@@ -107,7 +107,8 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 
 The last two are **unratified parquet-format proposals**, gated behind
 `[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0003` for FSST) and
-off by default. Opt in per column or per file with
+off by default. A third unratified proposal, extended-precision timestamps, is gated
+behind `EWPARQUET0004` and described below. Opt in per column or per file with
 `ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
 `ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
 
@@ -127,6 +128,32 @@ actually shrink, so enabling it cannot make a file bigger.
 > (the spec's `FSST` symbol table type) is implemented; `FSST_16` is recognized and rejected with a
 > clear error rather than misread. See [doc/parquet-fsst.md](doc/parquet-fsst.md), which
 > also records how the arrow-rs and arrow-cpp proofs-of-concept differ from the spec.
+
+### Extended-precision timestamps (experimental)
+
+`TIMESTAMP` annotating `FIXED_LEN_BYTE_ARRAY(12)` — a signed 96-bit little-endian count of the
+column's declared unit since the epoch, covering the whole ANSI SQL `TIMESTAMP(9)` range
+(years 0001–9999) where `INT64` nanoseconds stops at 1677-09-21 and 2262-04-11. Proposed in
+[apache/parquet-format#600](https://github.com/apache/parquet-format/issues/600) and gated behind
+`EWPARQUET0004`.
+
+Reading is controlled by `ParquetReadOptions.ExtendedTimestampOutput`:
+
+| `ExtendedTimestampOutputKind` | Arrow type | Notes |
+|---|---|---|
+| `Timestamp` (default) | `timestamp[declared unit]` | Reports a range error rather than wrapping a value int64 cannot hold |
+| `TimestampMicroseconds` | `timestamp[us]` | Spans the whole range; a `NANOS` column loses its last three digits |
+| `FixedSizeBinary` | `fixed_size_binary[12]` | The raw bytes, uninterpreted |
+
+> **The byte order is not settled.** The proposal text, the parquet-java reference implementation
+> and the proposed conformance fixture are all little-endian, but a proposal co-author argued for
+> big-endian on the spec PR and the approving reviewer left the choice explicitly open. Nothing on
+> the wire distinguishes the two, so if it flips, files already written become silently
+> wrong-valued rather than unreadable. That risk is what the experimental gate carries.
+>
+> Arrow has no type for this and no plan for one — `timestamp128`
+> ([apache/arrow#47848](https://github.com/apache/arrow/issues/47848)) is dormant and there is no
+> canonical extension type — so the mapping above is this library's own choice, not a standard.
 
 ## Features — ORC
 

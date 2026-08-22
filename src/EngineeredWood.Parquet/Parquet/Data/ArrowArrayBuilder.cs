@@ -326,17 +326,23 @@ internal static class ArrowArrayBuilder
     }
 
     /// <summary>
-    /// Narrows accumulated INT96 values to 64-bit timestamps when the column's Arrow type asks for
-    /// one. A no-op for every other physical type, and for an INT96 column left as raw bytes.
+    /// Narrows an accumulated 12-byte timestamp carrier to 64-bit values when the column's Arrow type
+    /// asks for one. A no-op for every other physical type, and for either carrier left as raw bytes.
     /// </summary>
     /// <remarks>
-    /// The decoders write INT96 into the value buffer as 12 opaque bytes, so the conversion happens
-    /// once here rather than in each of the plain/dictionary/page paths that fill it.
+    /// Both carriers are written into the value buffer as 12 opaque bytes by the decoders, so the
+    /// conversion happens once here rather than in each of the plain/dictionary/page paths that fill it.
+    /// A column is INT96 or an extended-precision FIXED_LEN_BYTE_ARRAY(12), never both.
     /// </remarks>
     private static void MaybeConvertInt96(ColumnBuildState state, IArrowType arrowType)
     {
-        if (state.PhysicalType == PhysicalType.Int96 && arrowType is TimestampType ts)
+        if (arrowType is not TimestampType ts)
+            return;
+
+        if (state.PhysicalType == PhysicalType.Int96)
             state.ConvertInt96ToTimestamp(ts.Unit);
+        else if (state.ExtendedTimestampUnit is { } declared)
+            state.ConvertExtendedTimestamp(declared, ts.Unit);
     }
 
     private static IArrowArray BuildNullArray(int length)
@@ -1066,8 +1072,14 @@ internal sealed class ColumnBuildState : IDisposable
     private NativeBuffer<byte>? _viewsBuffer;   // 16 bytes per non-null value (dense)
     private int _viewsCount;
 
-    // Set once ConvertInt96ToTimestamp has narrowed the buffer, so a second Build cannot redo it.
+    // Set once a 12-byte carrier has been narrowed to 8, so a second Build cannot redo it. Shared by the
+    // INT96 and extended-precision-timestamp paths -- a column is only ever one of the two.
     private bool _int96Converted;
+
+    // The TimeUnit a TIMESTAMP-annotated FIXED_LEN_BYTE_ARRAY(12) column declares, or null for anything
+    // else. Carried on the state because narrowing happens at Build time, where the column descriptor is
+    // long out of scope, and the target Arrow unit alone does not say what to rescale FROM.
+    private readonly Metadata.TimeUnit? _extendedTimestampUnit;
 
     private readonly int _capacity;
     private int _elementSize; // bytes per element for fixed-width types (12 → 8 once INT96 is narrowed)
@@ -1081,6 +1093,12 @@ internal sealed class ColumnBuildState : IDisposable
 
     /// <summary>The Parquet physical type for this column.</summary>
     public PhysicalType PhysicalType => _physicalType;
+
+    /// <summary>
+    /// The declared <c>TimeUnit</c> when this column is an extended-precision timestamp carrier,
+    /// otherwise <see langword="null"/>.
+    /// </summary>
+    public Metadata.TimeUnit? ExtendedTimestampUnit => _extendedTimestampUnit;
 
     /// <summary>Whether this column is nullable (has def levels).</summary>
     public bool IsNullable => MaxDefLevel > 0;
@@ -1100,9 +1118,11 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
-        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null)
+        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null,
+        Metadata.TimeUnit? extendedTimestampUnit = null)
     {
         _physicalType = physicalType;
+        _extendedTimestampUnit = extendedTimestampUnit;
         MaxDefLevel = maxDefLevel;
         MaxRepLevel = maxRepLevel;
         _capacity = capacity;
@@ -1584,6 +1604,59 @@ internal sealed class ColumnBuildState : IDisposable
 
         _elementSize = sizeof(long);
         _valueByteOffset = _valueCount * sizeof(long);
+    }
+
+    /// <summary>
+    /// Narrows an extended-precision timestamp column's 12-byte little-endian values to 64-bit counts in
+    /// <paramref name="target"/>, rescaling from the unit the file declared.
+    /// </summary>
+    /// <remarks>
+    /// <para>The narrowing is in place: eight bytes is less than twelve, so the values move down over
+    /// themselves and no second buffer is needed. Idempotent, because Build and BuildDense both call the
+    /// hook and a repeated pass would re-read already-narrowed values.</para>
+    ///
+    /// <para>Out of range is the ORDINARY case here, not evidence of a corrupt file -- year 9999 in
+    /// nanoseconds is exactly what the wider carrier exists to hold, and Arrow timestamps are int64. So it
+    /// is reported, with a remedy named, rather than wrapped into a plausible-looking date.</para>
+    /// </remarks>
+    public void ConvertExtendedTimestamp(Metadata.TimeUnit declared, Apache.Arrow.Types.TimeUnit target)
+    {
+        if (_int96Converted || _valueBuffer == null)
+            return;
+        _int96Converted = true;
+
+        long fromScale = ExtendedTimestamp.ScaleOf(declared);
+        long toScale = ExtendedTimestamp.ScaleOf(target);
+
+        var bytes = _valueBuffer.ByteSpan;
+        for (int i = 0; i < _valueCount; i++)
+        {
+            var source = bytes.Slice(i * ExtendedTimestamp.ByteWidth, ExtendedTimestamp.ByteWidth);
+            var rescaled = ExtendedTimestamp.Rescale(ExtendedTimestamp.Read(source), fromScale, toScale);
+
+            if (!ExtendedTimestamp.TryToInt64(rescaled, out long value))
+                throw new ParquetFormatException(ExtendedTimestampRangeMessage(i, rescaled, target));
+
+            BinaryPrimitives.WriteInt64LittleEndian(bytes.Slice(i * sizeof(long), sizeof(long)), value);
+        }
+
+        _elementSize = sizeof(long);
+        _valueByteOffset = _valueCount * sizeof(long);
+    }
+
+    private string ExtendedTimestampRangeMessage(
+        int index, Int128 value, Apache.Arrow.Types.TimeUnit target)
+    {
+        string where = _columnPath == null ? string.Empty : $" of column '{_columnPath}'";
+        string remedy = target == Apache.Arrow.Types.TimeUnit.Microsecond
+            ? "Read the file with ParquetReadOptions { ExtendedTimestampOutput = " +
+              "ExtendedTimestampOutputKind.FixedSizeBinary } for the raw bytes."
+            : "Read the file with ParquetReadOptions { ExtendedTimestampOutput = " +
+              "ExtendedTimestampOutputKind.TimestampMicroseconds } for a timestamp that spans the whole " +
+              "range, or ExtendedTimestampOutputKind.FixedSizeBinary for the raw bytes.";
+
+        return $"Extended-precision timestamp at index {index}{where} is {value} {target} since the " +
+            $"epoch, which is outside the range of a 64-bit Arrow timestamp. {remedy}";
     }
 
     private string Int96NanosecondRangeMessage(int index, long julianDay, long nanosOfDay)
