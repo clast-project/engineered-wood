@@ -226,13 +226,16 @@ internal static class ColumnChunkWriter
             bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
             bool floatingPointTotalOrder =
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+            // An Arrow TimestampType on FIXED_LEN_BYTE_ARRAY can only be the extended-precision carrier,
+            // whose bytes are little-endian signed rather than lexicographically ordered.
+            bool extendedTimestamp = IsExtendedTimestamp(ValueType(array), physicalType);
             var stats = dictResult != null && !isFloatingPoint
                 ? StatisticsCollector.ComputeFromDictEntries(
                     dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                    physicalType, typeLength, rowCount - nonNullCount)
+                    physicalType, typeLength, rowCount - nonNullCount, extendedTimestamp)
                 : StatisticsCollector.Compute(
                     array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                    floatingPointTotalOrder);
+                    floatingPointTotalOrder, extendedTimestamp);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
@@ -500,7 +503,8 @@ internal static class ColumnChunkWriter
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
             : StatisticsCollector.ComputeFromDictEntries(
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount);
+                physicalType, typeLength, rowCount - nonNullCount,
+                IsExtendedTimestamp(arrowType, physicalType));
 
         result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;
@@ -1692,6 +1696,13 @@ internal static class ColumnChunkWriter
     // every FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY column goes through SequenceCompareTo, i.e. unsigned
     // lexicographic. So the physical type has to be part of the answer wherever an Arrow type can arrive on
     // more than one physical width.
+    // True for the extended-precision timestamp carrier (apache/parquet-format#600). An Arrow
+    // TimestampType reaches FIXED_LEN_BYTE_ARRAY by no other route, so the pair identifies it without
+    // needing the parquet logical type here.
+    private static bool IsExtendedTimestamp(
+        Apache.Arrow.Types.IArrowType? arrowType, PhysicalType physicalType)
+        => physicalType == PhysicalType.FixedLenByteArray && arrowType is TimestampType;
+
     // Internal rather than private so the gate can be pinned directly. The FIXED_LEN_BYTE_ARRAY answer is
     // latent until an Arrow TimestampType can map to that physical type, so there is no end-to-end write
     // that reaches it yet — a unit test is the only thing that keeps the fix from silently regressing.
