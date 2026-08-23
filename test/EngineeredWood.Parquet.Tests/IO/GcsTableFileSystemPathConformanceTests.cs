@@ -34,22 +34,23 @@ public sealed class GcsTableFileSystemPathConformanceTests : TableFileSystemPath
     private string? _unavailableReason;
 
     /// <summary>
-    /// <para>fake-gcs-server is the least faithful of the three emulators, and both gaps are measured at
-    /// the wire level rather than inferred from a red test:</para>
-    /// <list type="bullet">
-    /// <item><description>a <c>Range</c> request comes back <c>206 Partial Content</c> carrying
-    /// <c>X-Goog-Hash: crc32c=</c> over the WHOLE object, which the Google client then checks against the
-    /// 50 bytes it asked for.</description></item>
-    /// <item><description><c>ifGenerationMatch=0</c> is ignored: two raw create-if-absent uploads both
-    /// return 200 and the second overwrites.</description></item>
-    /// </list>
-    /// <para>The second is the more serious of the two for step 2. It means fake-gcs-server cannot be the
-    /// oracle for <see cref="ITableFileSystem.TryWriteAllBytesAsync"/> on GCS -- the commit primitive
-    /// itself -- and so a CI job standing this emulator up gets either a false green or a permanent false
-    /// red on exactly the property Delta and Iceberg commits are built on. That is an argument for a
-    /// stricter GCS fake, not for a weaker assertion.</para>
+    /// <para>fake-gcs-server <b>ignores <c>ifGenerationMatch=0</c></b> — measured at the wire level, two
+    /// raw create-if-absent uploads both return 200 and the second overwrites. That makes it unable to
+    /// answer for <see cref="ITableFileSystem.TryWriteAllBytesAsync"/>, the commit primitive Delta and
+    /// Iceberg commits are built on, so a CI job standing this emulator up would get either a false green
+    /// or a permanent false red on exactly that property. An argument for a stricter GCS fake, not for a
+    /// weaker assertion — <c>googleapis/storage-testbench</c> returns <c>412</c> here and preserves the
+    /// winner's bytes.</para>
+    ///
+    /// <para><b>A <c>RangedRead</c> gap used to be declared here and should never have
+    /// been.</b> The hash mismatch on a ranged read was not this emulator being unfaithful; it was
+    /// <c>GcsRandomAccessFile</c> leaving <c>DownloadValidationMode</c> unset. storage-testbench — which
+    /// Google builds to validate its own client libraries — sends the same whole-object hash on a
+    /// <c>206</c>, so the behaviour being blamed on the fake is how the service behaves. Worth recording
+    /// as a caution: a gap declared against someone else's component is a claim that needs the same
+    /// evidence as any other, and this one was wrong for a fortnight.</para>
     /// </summary>
-    protected override EmulatorGap Gaps => EmulatorGap.RangedRead | EmulatorGap.CreateIfAbsent;
+    protected override EmulatorGap Gaps => EmulatorGap.CreateIfAbsent;
 
     /// <inheritdoc/>
     protected override string Emulator => "fake-gcs-server on 127.0.0.1:4443";

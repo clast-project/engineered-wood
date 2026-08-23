@@ -125,6 +125,23 @@ public sealed class GcsRandomAccessFile : IRandomAccessFile
             var options = new DownloadObjectOptions
             {
                 Range = new RangeHeaderValue(range.Offset, range.Offset + range.Length - 1),
+
+                // Leaving this unset is NOT a neutral default: unset means Always, and the hash the
+                // service sends alongside a Range response is computed over the WHOLE object. The client
+                // then checks that against the handful of bytes it asked for and throws
+                // `IOException: Incorrect hash`. A whole-object checksum cannot validate a fragment, so
+                // there is no reading of Always under which this check does useful work here — and every
+                // read through this class is ranged (a Parquet footer, a column chunk), so the reader
+                // could not return a single byte.
+                //
+                // Not Automatic: that mode only detects server-side gzip decompression
+                // (x-goog-stored-content-encoding vs Content-Encoding) and has no notion of partial
+                // content, so it still validates a 206. The library's own guidance for range downloads is
+                // to disable validation.
+                //
+                // Integrity for partial reads therefore comes from the transport (HTTPS) plus the
+                // short-read check below, which is what the other backends rely on too.
+                DownloadValidationMode = DownloadValidationMode.Never,
             };
 
             await _client.DownloadObjectAsync(
