@@ -504,10 +504,11 @@ public class VersionChecksumValidationTests : IDisposable
 
         var name = Field(validation, "metadata.name");
         Assert.Equal("\"two\\nlines and a \\\" quote\"", name.Recorded);
-        Assert.DoesNotContain('\n', name.Recorded!);
+        Assert.DoesNotContain("\n", name.Recorded!, StringComparison.Ordinal);
 
         // One header line and one field line, still.
-        Assert.Equal(2, validation.Describe().Split(Environment.NewLine).Length);
+        Assert.Equal(
+            2, validation.Describe().Split([Environment.NewLine], StringSplitOptions.None).Length);
     }
 
     // ── no checksum, and a checksum that is not one ────────────────────────────────────────────────────
