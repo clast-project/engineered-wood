@@ -105,9 +105,24 @@ public sealed record ReadSet
     /// never declared, and the symptom — spurious <c>concurrentDeleteRead</c> conflicts, process-wide and
     /// nowhere near the code that caused them — is about as hard to trace back as this library gets.</para>
     ///
-    /// <para>The allocation is a few bytes on a path that runs once per commit request, which is not a
-    /// price worth reasoning about. Nothing compares <c>ReadSet</c>s, and record value-equality over an
-    /// <see cref="ISet{T}"/> was reference-based anyway, so no caller can tell the difference.</para>
+    /// <para><b>⚠ This changes identity, and callers must not depend on it.</b> An earlier version of
+    /// this comment claimed no caller could tell the difference; that was wrong, and specifically wrong
+    /// about equality. Measured:</para>
+    /// <code>
+    /// ReferenceEquals(ReadSet.Blind, ReadSet.Blind)   // was true, now FALSE
+    /// ReadSet.Blind == ReadSet.Blind                  // was true, now FALSE
+    /// </code>
+    /// <para>The equality one is the surprise, because <see cref="ReadSet"/> is a record and record
+    /// equality reads as value equality. It is not, here: <see cref="Files"/> is an <see cref="ISet{T}"/>
+    /// whose runtime type does not override <c>Equals</c>, so the synthesized comparison falls through to
+    /// reference equality on two distinct sets. <b>Treat a <see cref="ReadSet"/> as something to READ, never
+    /// to compare</b> — its equality was never meaningful (two independently-built identical read sets
+    /// have never compared equal), and it is now not even reflexive through this property.</para>
+    ///
+    /// <para>The cost is 104 measured bytes per access, and it is not paid speculatively:
+    /// <see cref="Log.LogCommitRequest.Reads"/> defers this default rather than assigning it in a property
+    /// initializer, so a caller that supplies its own read set constructs no blind one at all, and a
+    /// caller that does not pays only if the commit actually collides and the checker asks.</para>
     /// </summary>
     public static ReadSet Blind => new();
 }

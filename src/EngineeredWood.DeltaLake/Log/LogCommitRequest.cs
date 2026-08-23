@@ -47,8 +47,24 @@ public sealed record LogCommitRequest
     /// <summary>
     /// What the transaction read. Defaults to <see cref="ReadSet.Blind"/> — reads nothing, so only a
     /// concurrent metadata change, protocol change, or delete/delete can conflict with it.
+    ///
+    /// <para><b>The default is deferred, not assigned.</b> A property initializer
+    /// (<c>= ReadSet.Blind</c>) runs in the constructor, BEFORE an object initializer can supply a real
+    /// read set — so every request built with an explicit <c>Reads</c> would construct a blind one, and
+    /// immediately throw it away. That was free when <see cref="ReadSet.Blind"/> was a cached singleton
+    /// and stopped being free when it became a fresh instance per access (104 measured bytes, half of what
+    /// this whole record allocates). Resolving it in the getter instead costs nothing to read and nothing
+    /// to ignore: a caller supplying its own set never builds a blind one, and a caller that does not
+    /// builds one only if something asks — which only <see cref="LogCommitter"/>'s conflict check does,
+    /// and only when a commit actually collides.</para>
     /// </summary>
-    public ReadSet Reads { get; init; } = ReadSet.Blind;
+    public ReadSet Reads
+    {
+        get => _reads ?? ReadSet.Blind;
+        init => _reads = value;
+    }
+
+    private readonly ReadSet? _reads;
 
     // The delete/delete check reads the removed paths off Actions. It used to take a PlannedRemovePaths
     // set here, which restated them — and which had to be a DIFFERENT object from Reads.Files even when

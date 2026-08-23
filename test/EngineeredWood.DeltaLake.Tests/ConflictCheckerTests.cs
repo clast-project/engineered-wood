@@ -676,6 +676,32 @@ public class ConflictCheckerTests
     }
 
     /// <summary>
+    /// <see cref="Log.LogCommitRequest.Reads"/> resolves its blind default in the GETTER, so a caller that
+    /// supplies a read set never builds a blind one — the property-initializer form would construct and
+    /// discard one on every request, because initializers run before the object initializer assigns.
+    ///
+    /// <para>Both halves matter: the supplied set must come back untouched, and the defaulted one must
+    /// still be blind rather than null.</para>
+    /// </summary>
+    [Fact]
+    public void LogCommitRequestReads_DefersItsBlindDefault_AndRoundTripsAnExplicitOne()
+    {
+        var mine = new ReadSet { WholeTable = true };
+        var supplied = new Log.LogCommitRequest
+        {
+            BaseSnapshot = null!,
+            Actions = [],
+            Reads = mine,
+        };
+        Assert.Same(mine, supplied.Reads);
+
+        var defaulted = new Log.LogCommitRequest { BaseSnapshot = null!, Actions = [] };
+        Assert.False(defaulted.Reads.WholeTable);
+        Assert.Empty(defaulted.Reads.Files);
+        Assert.Empty(defaulted.Reads.Predicates);
+    }
+
+    /// <summary>
     /// The exemption is for that ONE domain, not for "a commit that also advances the mark": a user domain
     /// contested alongside it still conflicts.
     /// </summary>
