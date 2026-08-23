@@ -315,10 +315,16 @@ public static class ConflictChecker
     /// <para><b>Derived, not declared</b> — the same call as <see cref="ChangesMetadata"/> and
     /// <see cref="RemovedPaths"/>: what a commit writes is fully visible in the actions about to be
     /// written, so there is nothing only the writer could know.</para>
-    /// <para>Delta additionally gates the whole check on the protocol supporting the
-    /// <c>domainMetadata</c> feature. Not reproduced here, because this is a pure function with no
-    /// protocol in hand and the gate cannot change a verdict: a table without the feature has no
-    /// <c>domainMetadata</c> action on either side for the sets to intersect on.</para>
+    /// <para><b>Delta additionally gates the whole check</b> on the protocol supporting the
+    /// <c>domainMetadata</c> feature — <c>checkIfDomainMetadataConflict</c> returns immediately when it is
+    /// absent. Not reproduced here, for the plain reason that this is a pure function with no protocol in
+    /// hand, and erring STRICT is the safe direction for a concurrency check.</para>
+    /// <para>It is not purely theoretical, though, and worth naming rather than glossing: through Delta the
+    /// case cannot arise (it refuses to write <c>domainMetadata</c> to a table lacking the feature at all),
+    /// but <c>DeltaTable.SetDomainMetadataAsync</c> does not declare the feature before writing one, so a
+    /// table this library wrote can reach here with domain actions and no feature. That is a gap in that
+    /// method rather than in this rule, and this rule's answer for it — conflict — is the conservative
+    /// one.</para>
     /// </remarks>
     private static ISet<string> WrittenDomains(IReadOnlyList<DeltaAction> actions)
     {
