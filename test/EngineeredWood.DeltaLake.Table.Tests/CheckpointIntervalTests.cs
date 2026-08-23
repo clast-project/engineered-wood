@@ -140,7 +140,7 @@ public class CheckpointIntervalTests : IDisposable
     /// <summary>
     /// ⚠ The property must be honoured on EVERY commit path, not only the ones that go through the commit
     /// loop. Since #108 there are two triggers reading the interval — the committer's
-    /// <c>LogCommitOptions</c> and <c>CheckpointIfDueAsync</c>, which OPTIMIZE and every metadata change
+    /// <c>LogCommitOptions</c> and <c>AfterCommitAsync</c>, which OPTIMIZE and every metadata change
     /// call — so a resolved value wired into one and not the other honours the table on some writes and
     /// ignores it on others. That is the failure mode this change's own design note calls harder to
     /// notice than ignoring the property everywhere, so it is asserted rather than trusted.
@@ -161,7 +161,7 @@ public class CheckpointIntervalTests : IDisposable
             fs, new DeltaTableOptions { CheckpointInterval = 10 });
         await table.WriteAsync([Row(schema, 1)]);                                  // v1
 
-        // v2 — a metadata-only commit, which reaches the log through CheckpointIfDueAsync and not the
+        // v2 — a metadata-only commit, which reaches the log through AfterCommitAsync and not the
         // committer. At the caller's interval of 10 this version would not checkpoint at all.
         long version = await table.SetDomainMetadataAsync("test.domain", "{\"k\":1}");
 

@@ -450,7 +450,27 @@ it overrides an explicit `delta.checkpointPolicy=classic`.
 over a canonicalized form of the file. Readers "are encouraged to
 validate the checksum, if present", and a wrong one is worse than an
 absent one — a reader that validates would reject a good hint — so it is
-omitted rather than approximated. delta-spark writes it.
+omitted rather than approximated. delta-spark writes it. (Unrelated to
+the `<version>.crc` version-checksum file, which EW now writes beside
+every commit — see below.)
+
+**Version-checksum optional fields.** EW writes
+`_delta_log/<version>.crc` after every commit
+(`DeltaTableOptions.WriteVersionChecksums`, default true) carrying the
+spec's required fields plus `inCommitTimestampOpt`, `setTransactions` and
+`domainMetadata`. Five optional fields are omitted, and delta-kernel-rs
+omits the same five: `txnId` (EW attaches no transaction identifier to a
+commit), `allFiles` (the whole live file set inline — that is a
+checkpoint, and one per commit would be the wrong shape),
+`numDeletedRecordsOpt` / `numDeletionVectorsOpt`, and
+`deletedRecordCountsHistogramOpt`. `fileSizeHistogram` is omitted too and
+is the one with a live consumer: kernel surfaces it through
+`Snapshot::get_file_stats_if_present`, but the two ecosystem writers
+disagree about its NAME — delta-spark emits `histogramOpt`, which is not
+what the spec calls it, and kernel accepts either but rejects a file
+carrying both — so adding EW's is a compatibility question rather than a
+fill-in-a-field one. Nothing in EW READS a checksum to shortcut work; a
+snapshot is still built by replaying the log.
 
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,

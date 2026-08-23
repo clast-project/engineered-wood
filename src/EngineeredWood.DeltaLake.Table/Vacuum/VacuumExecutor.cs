@@ -25,6 +25,11 @@ internal static class VacuumExecutor
     /// history (auditability — and other engines can see WHY older versions stopped being physically
     /// readable). A dry run writes nothing.</para>
     /// </summary>
+    /// <param name="afterCommit">Invoked with the version of each commit this writes, as soon as that
+    /// commit is durable. BOTH bookends get one, which is the point: they are two versions, and a table's
+    /// post-commit work — its version checksum, its interval checkpoint — is owed per version, not per
+    /// operation. Reporting only the last would leave <c>VACUUM START</c> as the one commit in the library
+    /// with no checksum beside it.</param>
     public static async ValueTask<VacuumResult> ExecuteAsync(
         ITableFileSystem fs,
         TransactionLog log,
@@ -32,7 +37,8 @@ internal static class VacuumExecutor
         TimeSpan retentionPeriod,
         bool dryRun,
         bool hideIcebergMetadataDir,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<long, CancellationToken, ValueTask>? afterCommit = null)
     {
         // ── Mark: the keep-set is the CURRENT version's files, plus their deletion vectors. ──
         //
@@ -91,6 +97,7 @@ internal static class VacuumExecutor
         }
 
         int deleted = 0;
+        long? endVersion = null;
         if (!dryRun)
         {
             long startVersion = await WriteCommitInfoAsync(
@@ -105,13 +112,19 @@ internal static class VacuumExecutor
                 firstCandidateVersion: snapshot.Version + 1,
                 cancellationToken).ConfigureAwait(false);
 
+            // Before the deletions, not after them. The commit is durable here, and the work the hook
+            // does — summarising a version, possibly checkpointing it — belongs beside the commit rather
+            // than behind however long the physical deletes take.
+            if (afterCommit is not null)
+                await afterCommit(startVersion, cancellationToken).ConfigureAwait(false);
+
             foreach (string path in filesToDelete)
             {
                 await fs.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
                 deleted++;
             }
 
-            await WriteCommitInfoAsync(
+            endVersion = await WriteCommitInfoAsync(
                 log, snapshot, "VACUUM END",
                 new Dictionary<string, JsonElement>
                 {
@@ -121,12 +134,16 @@ internal static class VacuumExecutor
                 },
                 firstCandidateVersion: startVersion + 1,
                 cancellationToken).ConfigureAwait(false);
+
+            if (afterCommit is not null)
+                await afterCommit(endVersion.Value, cancellationToken).ConfigureAwait(false);
         }
 
         return new VacuumResult
         {
             FilesToDelete = filesToDelete,
             FilesDeleted = deleted,
+            LastCommittedVersion = endVersion,
         };
     }
 
