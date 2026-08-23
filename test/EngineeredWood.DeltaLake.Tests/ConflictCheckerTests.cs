@@ -644,6 +644,63 @@ public class ConflictCheckerTests
         Assert.False(result.HasConflict);
     }
 
+    // ── ReadSet.Blind is not shared state ──
+
+    /// <summary>
+    /// <see cref="ReadSet.Blind"/> hands back a FRESH instance, so deriving from it cannot corrupt the
+    /// default every other blind commit uses.
+    ///
+    /// <para>It used to be a cached singleton whose <see cref="ReadSet.Files"/> is a mutable
+    /// <see cref="ISet{T}"/>. The accident this guards is not someone writing
+    /// <c>ReadSet.Blind.Files.Add(…)</c> on purpose — it is the idiomatic derivation below: a record
+    /// <c>with</c> copies SHALLOWLY, so the copy shared the original's set, and adding one path to the
+    /// copy gave every later blind commit in the process a read dependency it never declared.</para>
+    ///
+    /// <para>The second half is the part that matters. A leaked path would make a concurrent remove of it
+    /// report <c>concurrentDeleteRead</c> against a transaction that read nothing — a spurious conflict,
+    /// process-wide, arising nowhere near the code that caused it.</para>
+    /// </summary>
+    [Fact]
+    public void ReadSetBlind_IsFreshPerAccess_SoADerivedCopyCannotPoisonIt()
+    {
+        var derived = ReadSet.Blind with { WholeTable = true };
+        derived.Files.Add("part-leaked.parquet");
+
+        Assert.Empty(ReadSet.Blind.Files);
+
+        var result = CheckCommitting(
+            [Add("part-mine.parquet", 1, 10)], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Remove("part-leaked.parquet")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// <see cref="Log.LogCommitRequest.Reads"/> resolves its blind default in the GETTER, so a caller that
+    /// supplies a read set never builds a blind one — the property-initializer form would construct and
+    /// discard one on every request, because initializers run before the object initializer assigns.
+    ///
+    /// <para>Both halves matter: the supplied set must come back untouched, and the defaulted one must
+    /// still be blind rather than null.</para>
+    /// </summary>
+    [Fact]
+    public void LogCommitRequestReads_DefersItsBlindDefault_AndRoundTripsAnExplicitOne()
+    {
+        var mine = new ReadSet { WholeTable = true };
+        var supplied = new Log.LogCommitRequest
+        {
+            BaseSnapshot = null!,
+            Actions = [],
+            Reads = mine,
+        };
+        Assert.Same(mine, supplied.Reads);
+
+        var defaulted = new Log.LogCommitRequest { BaseSnapshot = null!, Actions = [] };
+        Assert.False(defaulted.Reads.WholeTable);
+        Assert.Empty(defaulted.Reads.Files);
+        Assert.Empty(defaulted.Reads.Predicates);
+    }
+
     /// <summary>
     /// The exemption is for that ONE domain, not for "a commit that also advances the mark": a user domain
     /// contested alongside it still conflicts.

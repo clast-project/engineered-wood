@@ -93,8 +93,38 @@ public sealed record ReadSet
     /// <summary>The transaction read the entire table — every concurrent add and remove is relevant.</summary>
     public bool WholeTable { get; init; }
 
-    /// <summary>A transaction with no read dependency (an INSERT with no predicate).</summary>
-    public static ReadSet Blind { get; } = new();
+    /// <summary>
+    /// A transaction with no read dependency (an INSERT with no predicate).
+    ///
+    /// <para><b>A fresh instance per access, deliberately, and NOT a cached singleton.</b>
+    /// <see cref="Files"/> is an <see cref="ISet{T}"/> — mutable — so one shared instance would hand every
+    /// blind commit in the process the same set to mutate. The realistic accident is not
+    /// <c>ReadSet.Blind.Files.Add(…)</c> but the idiomatic way to derive one: this is a record, so
+    /// <c>ReadSet.Blind with { WholeTable = true }</c> copies SHALLOWLY and the copy shares the original's
+    /// set. Adding a path to that copy would silently give every later blind commit a read dependency it
+    /// never declared, and the symptom — spurious <c>concurrentDeleteRead</c> conflicts, process-wide and
+    /// nowhere near the code that caused them — is about as hard to trace back as this library gets.</para>
+    ///
+    /// <para><b>⚠ This changes identity, and callers must not depend on it.</b> An earlier version of
+    /// this comment claimed no caller could tell the difference; that was wrong, and specifically wrong
+    /// about equality. Measured:</para>
+    /// <code>
+    /// ReferenceEquals(ReadSet.Blind, ReadSet.Blind)   // was true, now FALSE
+    /// ReadSet.Blind == ReadSet.Blind                  // was true, now FALSE
+    /// </code>
+    /// <para>The equality one is the surprise, because <see cref="ReadSet"/> is a record and record
+    /// equality reads as value equality. It is not, here: <see cref="Files"/> is an <see cref="ISet{T}"/>
+    /// whose runtime type does not override <c>Equals</c>, so the synthesized comparison falls through to
+    /// reference equality on two distinct sets. <b>Treat a <see cref="ReadSet"/> as something to READ, never
+    /// to compare</b> — its equality was never meaningful (two independently-built identical read sets
+    /// have never compared equal), and it is now not even reflexive through this property.</para>
+    ///
+    /// <para>The cost is 104 measured bytes per access, and it is not paid speculatively:
+    /// <see cref="Log.LogCommitRequest.Reads"/> defers this default rather than assigning it in a property
+    /// initializer, so a caller that supplies its own read set constructs no blind one at all, and a
+    /// caller that does not pays only if the commit actually collides and the checker asks.</para>
+    /// </summary>
+    public static ReadSet Blind => new();
 }
 
 /// <summary>
@@ -174,7 +204,7 @@ public static class ConflictChecker
                     return new ConflictResult(ConflictType.ProtocolChanged, version,
                         $"Concurrent commit {version} changed the protocol.");
                 if (action is DomainMetadata concurrentDomain
-                    && writtenDomains.Contains(concurrentDomain.Domain))
+                    && writtenDomains?.Contains(concurrentDomain.Domain) == true)
                 {
                     return new ConflictResult(ConflictType.DomainMetadataChanged, version,
                         $"Concurrent commit {version} wrote the metadata domain "
@@ -196,7 +226,7 @@ public static class ConflictChecker
                             break;
 
                         // 3 — delete/delete. A removed file is removed whatever its dataChange flag.
-                        if (plannedRemovePaths.Contains(remove.Path))
+                        if (plannedRemovePaths?.Contains(remove.Path) == true)
                             return new ConflictResult(ConflictType.ConcurrentDeleteDelete, version,
                                 $"Concurrent commit {version} already removed '{remove.Path}', "
                                 + "which this transaction also removes.");
@@ -281,7 +311,11 @@ public static class ConflictChecker
     /// declaration for what they do not. Reads are the second kind, which is why <see cref="ReadSet"/> is
     /// still passed in.</para>
     /// </remarks>
-    private static ISet<string> RemovedPaths(IReadOnlyList<DeltaAction> actions)
+    /// <remarks>
+    /// Null — rather than a shared empty set — for the common commit that removes nothing. See
+    /// <see cref="WrittenDomains"/> for why the shared empty went away.
+    /// </remarks>
+    private static HashSet<string>? RemovedPaths(IReadOnlyList<DeltaAction> actions)
     {
         HashSet<string>? paths = null;
         foreach (var action in actions)
@@ -290,11 +324,8 @@ public static class ConflictChecker
                 (paths ??= new HashSet<string>(StringComparer.Ordinal)).Add(remove.Path);
         }
 
-        return paths ?? NoRemovedPaths;
+        return paths;
     }
-
-    /// <summary>Shared empty set for the common commit that removes nothing.</summary>
-    private static readonly ISet<string> NoRemovedPaths = new HashSet<string>(StringComparer.Ordinal);
 
     /// <summary>
     /// The metadata domains a set of actions writes, for the domainMetadata check — MINUS the row-tracking
@@ -325,8 +356,14 @@ public static class ConflictChecker
     /// table this library wrote can reach here with domain actions and no feature. That is a gap in that
     /// method rather than in this rule, and this rule's answer for it — conflict — is the conservative
     /// one.</para>
+    /// <para><b>Returns null rather than a shared empty set</b>, as does <see cref="RemovedPaths"/>.
+    /// Both used to hand back a <c>static readonly ISet&lt;string&gt;</c> empty — one process-wide instance,
+    /// behind a MUTABLE interface, returned to a caller. Nothing mutates it today, and the allocation it
+    /// saved was on a path that only runs when a commit collides, so it was buying very little and
+    /// risking a shared-state corruption that would surface as spurious conflicts far from its cause.
+    /// Null costs nothing and cannot be mutated.</para>
     /// </remarks>
-    private static ISet<string> WrittenDomains(IReadOnlyList<DeltaAction> actions)
+    private static HashSet<string>? WrittenDomains(IReadOnlyList<DeltaAction> actions)
     {
         HashSet<string>? domains = null;
         foreach (var action in actions)
@@ -339,11 +376,8 @@ public static class ConflictChecker
             }
         }
 
-        return domains ?? NoWrittenDomains;
+        return domains;
     }
-
-    /// <summary>Shared empty set for the common commit that writes no domain metadata.</summary>
-    private static readonly ISet<string> NoWrittenDomains = new HashSet<string>(StringComparer.Ordinal);
 
     /// <summary>
     /// Whether a set of actions changes the table metadata — Delta's <c>currentTransactionInfo</c>
