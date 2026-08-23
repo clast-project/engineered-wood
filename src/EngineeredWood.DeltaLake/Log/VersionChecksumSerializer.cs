@@ -130,17 +130,14 @@ internal static class VersionChecksumSerializer
             }
         }
 
-        // The spec says MUST be 1 for both. Rejected at the parse boundary — as delta-kernel-rs does —
-        // so nothing downstream has to wonder whether the value it read means anything.
-        foreach (var (name, value) in new[] { ("numMetadata", numMetadata), ("numProtocol", numProtocol) })
-        {
-            if (value is not null && value != 1)
-            {
-                throw new DeltaFormatException(
-                    DeltaErrorCodes.InvalidLogJson,
-                    $"Version checksum for version {version} has {name} {value}; the spec requires 1.");
-            }
-        }
+        // REQUIRED, and required to be 1. Both halves are rejected at the parse boundary — as
+        // delta-kernel-rs does, where `CrcRaw.num_metadata` / `num_protocol` are plain `i64` with no
+        // serde default, so an absent one fails the whole deserialization — because a caller reading a
+        // checksum in order to VALIDATE against it must not be handed a file the spec calls malformed.
+        // Absent is not a milder problem than wrong here: it means the writer was not describing the
+        // shape this file is defined to have, and nothing else it says is more trustworthy for it.
+        RequireOne(numMetadata, "numMetadata", version);
+        RequireOne(numProtocol, "numProtocol", version);
 
         return new VersionChecksum
         {
@@ -185,6 +182,22 @@ internal static class VersionChecksumSerializer
         }
 
         return items;
+    }
+
+    /// <summary>
+    /// Enforces one of the two count fields the spec pins at 1: present, and equal to 1.
+    /// </summary>
+    private static void RequireOne(long? value, string field, long version)
+    {
+        if (value is null)
+            throw MissingField(version, field);
+
+        if (value != 1)
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidLogJson,
+                $"Version checksum for version {version} has {field} {value}; the spec requires 1.");
+        }
     }
 
     private static DeltaFormatException MissingField(long version, string field) =>

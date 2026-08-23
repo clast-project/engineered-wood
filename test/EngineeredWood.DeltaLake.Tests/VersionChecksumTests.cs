@@ -295,24 +295,41 @@ public class VersionChecksumTests : IDisposable
             VersionChecksumSerializer.Serialize(read));
     }
 
-    [Fact]
-    public async Task Read_RejectsAChecksumWhoseNumMetadataIsNotOne()
+    /// <summary>
+    /// <c>numMetadata</c> / <c>numProtocol</c> are REQUIRED and required to be 1, and a file breaking
+    /// either half is refused.
+    /// </summary>
+    /// <remarks>
+    /// Absent is not the milder problem it looks like. The reason to read a checksum at all is to check
+    /// something against it, and a writer that omitted a field the file is DEFINED to carry was not
+    /// describing this shape — which makes nothing else it says more trustworthy. delta-kernel-rs draws
+    /// the line in the same place: its <c>CrcRaw.num_metadata</c> / <c>num_protocol</c> are plain
+    /// <c>i64</c> with no serde default, so an absent one fails the whole deserialization.
+    /// </remarks>
+    [Theory]
+    // Present but wrong.
+    [InlineData("""{"tableSizeBytes":0,"numFiles":0,"numMetadata":2,"numProtocol":1,""", "numMetadata")]
+    [InlineData("""{"tableSizeBytes":0,"numFiles":0,"numMetadata":1,"numProtocol":0,""", "numProtocol")]
+    // Absent entirely.
+    [InlineData("""{"tableSizeBytes":0,"numFiles":0,"numProtocol":1,""", "numMetadata")]
+    [InlineData("""{"tableSizeBytes":0,"numFiles":0,"numMetadata":1,""", "numProtocol")]
+    public async Task Read_RejectsAChecksumWithoutBothCountsSetToOne(string head, string expectedField)
     {
         Directory.CreateDirectory(Path.Combine(_tempDir, "_delta_log"));
         File.WriteAllText(ChecksumFile(0),
-            """
-            {"tableSizeBytes":0,"numFiles":0,"numMetadata":2,"numProtocol":1,
-             "metadata":{"id":"x","format":{"provider":"parquet","options":{}},
-             "schemaString":"{}","partitionColumns":[],"configuration":{}},
-             "protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-            """);
+            head
+            + """
+              "metadata":{"id":"x","format":{"provider":"parquet","options":{}},
+              "schemaString":"{}","partitionColumns":[],"configuration":{}},
+              "protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+              """);
 
-        // Malformed is treated as absent by the reader — every version without a checksum already works —
-        // but the parse itself must refuse, so nothing downstream trusts a count the spec forbids.
+        // Malformed reads as absent through the writer's tolerant path — every version without a
+        // checksum already works — but the parse itself must refuse, so nothing downstream trusts it.
         Assert.Null(await new VersionChecksumWriter(_fs).TryReadAsync(0));
         var thrown = Assert.Throws<DeltaFormatException>(
             () => VersionChecksumSerializer.Deserialize(File.ReadAllBytes(ChecksumFile(0)), 0));
-        Assert.Contains("numMetadata", thrown.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedField, thrown.Message, StringComparison.Ordinal);
     }
 
     // ── never overwrite ────────────────────────────────────────────────────────────────────────────────

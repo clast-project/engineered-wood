@@ -34,7 +34,7 @@ namespace EngineeredWood.DeltaLake.Log;
 /// omitted too; see <see cref="VersionChecksumWriter"/> for that one, which is the only omission with a
 /// live consumer.</para>
 /// <para><c>numMetadata</c> and <c>numProtocol</c> are not modelled: the spec fixes both at 1, so they
-/// are written as constants and rejected on read when they are anything else.</para>
+/// are written as constants, and on read a file is rejected unless it carries both AND both are 1.</para>
 /// </remarks>
 public sealed record VersionChecksum
 {
