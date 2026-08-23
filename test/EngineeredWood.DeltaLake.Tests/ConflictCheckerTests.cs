@@ -644,6 +644,37 @@ public class ConflictCheckerTests
         Assert.False(result.HasConflict);
     }
 
+    // ── ReadSet.Blind is not shared state ──
+
+    /// <summary>
+    /// <see cref="ReadSet.Blind"/> hands back a FRESH instance, so deriving from it cannot corrupt the
+    /// default every other blind commit uses.
+    ///
+    /// <para>It used to be a cached singleton whose <see cref="ReadSet.Files"/> is a mutable
+    /// <see cref="ISet{T}"/>. The accident this guards is not someone writing
+    /// <c>ReadSet.Blind.Files.Add(…)</c> on purpose — it is the idiomatic derivation below: a record
+    /// <c>with</c> copies SHALLOWLY, so the copy shared the original's set, and adding one path to the
+    /// copy gave every later blind commit in the process a read dependency it never declared.</para>
+    ///
+    /// <para>The second half is the part that matters. A leaked path would make a concurrent remove of it
+    /// report <c>concurrentDeleteRead</c> against a transaction that read nothing — a spurious conflict,
+    /// process-wide, arising nowhere near the code that caused it.</para>
+    /// </summary>
+    [Fact]
+    public void ReadSetBlind_IsFreshPerAccess_SoADerivedCopyCannotPoisonIt()
+    {
+        var derived = ReadSet.Blind with { WholeTable = true };
+        derived.Files.Add("part-leaked.parquet");
+
+        Assert.Empty(ReadSet.Blind.Files);
+
+        var result = CheckCommitting(
+            [Add("part-mine.parquet", 1, 10)], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Remove("part-leaked.parquet")));
+
+        Assert.False(result.HasConflict);
+    }
+
     /// <summary>
     /// The exemption is for that ONE domain, not for "a commit that also advances the mark": a user domain
     /// contested alongside it still conflicts.
