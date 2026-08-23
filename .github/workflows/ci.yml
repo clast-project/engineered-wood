@@ -220,3 +220,130 @@ jobs:
           path: |
             artifacts/*.nupkg
             artifacts/*.snupkg
+
+  # The cloud-backend tests, against real emulators. This is step 2 of issue #79.
+  #
+  # WHY A SECOND JOB, ON LINUX. The `build` job above must be windows-latest because several
+  # test projects target net472. None of the three emulators here is usable as an oracle on
+  # Windows: MinIO stores each object as a file and so rejects `region=a?d` with NTFS's rules
+  # rather than S3's, which fails two of the path-conformance cases for a reason that has
+  # nothing to do with the code under test. Linux is where these backends can be measured
+  # honestly, and nothing in EngineeredWood.{Azure,Gcs,Aws} is platform-specific.
+  #
+  # WHY PROCESSES AND NOT `services:`. The issue proposed service containers. Two of the three
+  # emulators do not fit that shape: storage-testbench is a pip package with no published
+  # image, and MinIO's image needs a `server /data` command, which `services:` cannot supply.
+  # Starting all three as background processes is uniform, needs no image, and keeps the health
+  # checks explicit rather than hidden behind `--health-cmd`.
+  #
+  # THIS JOB IS NOT A REQUIRED CHECK. Making it one is a deliberate follow-up: it should earn
+  # that by being green and non-flaky across a few runs first. Until then a failure here is
+  # visible on the PR but does not block merging.
+  cloud-io:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # All three are PINNED, for the same reason the interop oracles above are: these decide
+      # whether the backends conform, so a behaviour change must arrive as a deliberate bump in
+      # this file rather than as a build that started failing overnight.
+      #
+      # storage-testbench is pinned by TAG, not version: the package reports 0.45.0 at tag
+      # v0.63.0 because its setup.py lags its tags, so the version string is not a usable pin.
+      #
+      # storage-testbench rather than fake-gcs-server, and the choice is the point of this job.
+      # fake-gcs-server ignores `ifGenerationMatch=0` — measured at the wire level, two
+      # create-if-absent uploads both return 200 and the second overwrites — so it cannot answer
+      # for ITableFileSystem.TryWriteAllBytesAsync, the primitive Delta and Iceberg commits are
+      # built on. It would give a false green or a permanent false red on exactly that.
+      # storage-testbench returns 412 and preserves the winner. Google maintains it to validate
+      # its own client libraries, which is what makes it credible: it is the fake the vendor's
+      # own conformance tests run against.
+      - name: Install storage-testbench (GCS emulator)
+        run: >
+          python -m pip install --disable-pip-version-check
+          "git+https://github.com/googleapis/storage-testbench.git@v0.63.0"
+
+      - name: Install Azurite (Azure Blob emulator)
+        run: npm install -g azurite@3.36.0
+
+      # MinIO rather than gofakes3, which was used while this ran only on a dev box: gofakes3
+      # stores AWSSDK v4's `aws-chunked` request framing AS the object body, so a multipart
+      # upload reads back longer than it went in. Working around that meant disabling checksum
+      # calculation and validation on the client, which switched off the very thing being
+      # tested. MinIO handles the framing, so the tests now exercise checksums for real.
+      - name: Install MinIO (S3 emulator)
+        run: |
+          curl -fsSL -o /usr/local/bin/minio \
+            https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          chmod +x /usr/local/bin/minio
+
+      - name: Start emulators
+        run: |
+          mkdir -p /tmp/azurite /tmp/minio-data
+          azurite --silent --location /tmp/azurite \
+            --blobPort 10000 --queuePort 10001 --tablePort 10002 &
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            minio server /tmp/minio-data --address :9000 --console-address :9001 &
+          storage-testbench --port 4443 &
+
+      # Explicitly, and with a bounded wait: a test suite that starts before its emulator is
+      # listening does not fail loudly, it SKIPS — the probe in CloudEmulator catches the
+      # connection error and the run goes green having tested nothing. That is the exact failure
+      # #79 exists to remove, so the readiness check is a gate and not a convenience.
+      - name: Wait for emulators
+        run: |
+          for hostport in 127.0.0.1:10000 127.0.0.1:9000 127.0.0.1:4443; do
+            host="${hostport%:*}"; port="${hostport#*:}"
+            for _ in $(seq 1 60); do
+              if timeout 1 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+                echo "$hostport is listening"
+                break 1
+              fi
+              sleep 1
+            done
+            if ! timeout 1 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+              echo "::error::$hostport never came up; the suite would have skipped silently."
+              exit 1
+            fi
+          done
+
+      - name: Restore
+        run: dotnet restore test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+
+      - name: Build
+        run: >
+          dotnet build test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+          --no-restore --configuration Release --framework net10.0
+
+      # EW_REQUIRE_CLOUD_EMULATORS=1 is what makes this job mean anything. Without it every one
+      # of these tests skips when an emulator is missing and the job still reports success —
+      # indistinguishable from having tested the backends. With it, an unreachable emulator is a
+      # failure naming the emulator and the diagnosis its probe produced.
+      - name: Test cloud backends
+        env:
+          EW_REQUIRE_CLOUD_EMULATORS: '1'
+        run: >
+          dotnet test test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+          --no-build --configuration Release --framework net10.0
+          --filter "FullyQualifiedName~EngineeredWood.Tests.IO"
+          --logger "trx;LogFileName=cloud-io-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-io-test-results
+          path: '**/cloud-io-results.trx'

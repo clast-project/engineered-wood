@@ -11,14 +11,26 @@ namespace EngineeredWood.Tests.IO;
 
 /// <summary>
 /// <see cref="TableFileSystemPathConformanceTests"/> against <see cref="S3TableFileSystem"/>, which needs
-/// an S3-compatible endpoint on 127.0.0.1:9000 (gofakes3, MinIO or LocalStack).
+/// MinIO on 127.0.0.1:9000 with the default <c>minioadmin</c> credentials.
 /// </summary>
 /// <remarks>
-/// S3 is the backend where a name can fail in the quietest way. SigV4 signs a canonical URI built by
+/// <para><b>Run MinIO on Linux, not Windows.</b> MinIO stores each object as a file, so the host
+/// volume's naming rules leak out as the store's: on Windows it rejects <c>region=a?d</c> outright with
+/// "Object name contains unsupported characters", which is NTFS's rule and not S3's. Real S3 accepts
+/// <c>?</c>, which is why <see cref="S3TableFileSystem"/> correctly declares
+/// <see cref="PathNameConstraints.None"/> — a backend reports what the STORAGE cannot hold, not what the
+/// machine in front of it cannot. MEASURED: on Windows this costs two cases here; CI runs Linux and is
+/// the oracle for them. The same caveat rules out any filesystem-backed fake for a naming test.</para>
+/// <para>MinIO rather than gofakes3, which was used before: gofakes3 stores AWSSDK v4's
+/// <c>aws-chunked</c> request framing AS the object body, so a multipart upload reads back longer than it
+/// went in, and working around that meant disabling checksum calculation and validation on the client.
+/// MinIO handles the framing correctly, so those settings are gone and the checksums are now actually
+/// exercised.</para>
+/// <para>S3 is the backend where a name can fail in the quietest way. SigV4 signs a canonical URI built by
 /// encoding the key, and the request sends its own encoding of the same key; when the two disagree the
 /// result is <c>SignatureDoesNotMatch</c> or a 404 -- but when the ENCODING is consistent and merely wrong
 /// (a <c>%</c> passed through unescaped, say), the request succeeds against a different object and no layer
-/// reports anything.
+/// reports anything.</para>
 /// </remarks>
 public sealed class S3TableFileSystemPathConformanceTests : TableFileSystemPathConformanceTests
 {
@@ -68,8 +80,6 @@ public sealed class S3TableFileSystemPathConformanceTests : TableFileSystemPathC
                 // 600-byte payload reads back longer than it went in and every byte assertion in this
                 // suite would fail for a reason that has nothing to do with the object's NAME. Turning the
                 // framing off keeps the emulator an oracle for what is actually under test here.
-                RequestChecksumCalculation = RequestChecksumCalculation.WHEN_REQUIRED,
-                ResponseChecksumValidation = ResponseChecksumValidation.WHEN_REQUIRED,
             };
 
             _client = new AmazonS3Client(new BasicAWSCredentials("minioadmin", "minioadmin"), config);
