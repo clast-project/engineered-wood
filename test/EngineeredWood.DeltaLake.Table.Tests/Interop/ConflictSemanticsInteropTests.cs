@@ -156,4 +156,69 @@ public class ConflictSemanticsInteropTests : IClassFixture<ConflictSemanticsFixt
         var result = _fixture.Result;
         Assert.Equal("ConcurrentAppend", VerdictOf(result, "filtered_vs_delete_dv"));
     }
+
+    // ── domainMetadata (#109) ──
+    //
+    // EW's DELTA_DOMAIN_METADATA_CONFLICT rule was written from Delta's `checkIfDomainMetadataConflict`
+    // bytecode, because no source checkout exists on the build machines. These three turn that reading
+    // into a measurement — the same reason the four above exist.
+    //
+    // The scenario tables declare `delta.feature.domainMetadata`, and that is load-bearing rather than
+    // tidy: Delta's check returns immediately when the protocol lacks the feature, so without it all
+    // three would report "committed" and the measurement would mean nothing.
+
+    private static string DomainVerdictOf(JsonElement result, string scenario) =>
+        result.GetProperty("domain_scenarios").EnumerateArray()
+            .Single(s => s.GetProperty("name").GetString() == scenario)
+            .GetProperty("verdict").GetString()!;
+
+    /// <summary>
+    /// Two transactions writing the SAME domain: Delta refuses the second. Measured verdict is
+    /// <c>ConcurrentTransactionException</c> — "A conflicting metadata domain acme.retention is added."
+    ///
+    /// <para>This is the rule EW mirrors as <see cref="DeltaErrorCodes.DomainMetadataConflict"/>. EW
+    /// gives it a name of its own rather than Delta's <c>DELTA_CONCURRENT_TRANSACTION</c>, whose
+    /// catalogued message is entirely about two streaming queries sharing a checkpoint — but the VERDICT
+    /// is the one pinned here, and it is the verdict that has to match.</para>
+    ///
+    /// <para>It is also the rule that made #109 safe rather than merely possible: those five paths used
+    /// to be protected by the version collision itself, and giving them a retry without this would have
+    /// let the loser silently overwrite an edit its author never saw.</para>
+    /// </summary>
+    [SkippableFact]
+    public void ConcurrentWriteOfTheSameDomain_IsRefusedByDelta()
+    {
+        var result = _fixture.Result;
+        Assert.Equal("ConcurrentTransaction", DomainVerdictOf(result, "domain_same"));
+    }
+
+    /// <summary>
+    /// The control: two transactions writing DIFFERENT domains both commit. Without this, the case above
+    /// would be consistent with "Delta refuses any concurrent domainMetadata", which is a materially
+    /// stricter rule than the one EW implemented.
+    /// </summary>
+    [SkippableFact]
+    public void ConcurrentWriteOfADifferentDomain_CommitsCleanly()
+    {
+        var result = _fixture.Result;
+        Assert.Equal("committed", DomainVerdictOf(result, "domain_different"));
+    }
+
+    /// <summary>
+    /// <b>The row-tracking high-water mark is exempt — measured, not inferred.</b> Two transactions both
+    /// writing <c>delta.rowTracking</c> commit, where two writing a user domain do not.
+    ///
+    /// <para>This is the one with real downside if EW had it backwards. Every commit that adds files to
+    /// a row-tracking table advances this domain, so a rule without the exemption would make two ordinary
+    /// concurrent appends conflict on a domain neither writer ever named — turning row tracking on would
+    /// cost a table its concurrency. EW's <c>ConflictChecker.WrittenDomains</c> excludes it for exactly
+    /// the reason Delta's <c>resolveConflict</c> does: the mark is reconciled by a rebase (re-derived
+    /// from the version that landed), not contested.</para>
+    /// </summary>
+    [SkippableFact]
+    public void ConcurrentAdvanceOfTheRowTrackingDomain_IsExemptAndCommits()
+    {
+        var result = _fixture.Result;
+        Assert.Equal("committed", DomainVerdictOf(result, "domain_row_tracking"));
+    }
 }

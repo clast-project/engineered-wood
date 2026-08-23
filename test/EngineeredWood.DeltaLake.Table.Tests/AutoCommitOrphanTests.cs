@@ -312,11 +312,17 @@ public class AutoCommitOrphanTests : IDisposable
     // ── Compaction: the one with the most to lose ──
 
     /// <summary>
-    /// OPTIMIZE rewrites its whole candidate set and then makes ONE commit attempt, so a single concurrent
-    /// commit used to orphan every compacted file — potentially the whole table's worth of bytes.
+    /// OPTIMIZE rewrites its whole candidate set before it commits, so an aborted commit orphans every
+    /// compacted file — potentially the whole table's worth of bytes.
+    ///
+    /// <para>The conflict has to be a REAL one now (#109): a concurrent commit that merely took the
+    /// version no longer defeats OPTIMIZE, it rebases past it. So the racing handle deletes one of the six
+    /// candidates, which is the case that genuinely invalidates the rewrite — the compacted file was built
+    /// from rows that are no longer in the table — and reaches this commit as delete/delete on a path it
+    /// also removes.</para>
     /// </summary>
     [Fact]
-    public async Task Compact_ThatCollides_TakesBackEveryCompactedFile()
+    public async Task Compact_ThatConflicts_TakesBackEveryCompactedFile()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await using var stale = await DeltaTable.CreateAsync(fs, IdSchema);
@@ -325,18 +331,21 @@ public class AutoCommitOrphanTests : IDisposable
         string[] before = DataFiles();
         Assert.Equal(6, before.Length);
 
+        // Copy-on-write, so the file holding id 1 — one of the six — is REMOVED at a version the stale
+        // handle has not seen.
         await using (var other = OpenSecondHandle())
-            await other.WriteAsync([Batch(99)]); // takes the version OPTIMIZE is aiming at
+            await other.DeleteAsync(IdEquals(1));
 
-        await Assert.ThrowsAsync<DeltaConflictException>(async () => await stale.CompactAsync(
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () => await stale.CompactAsync(
             new CompactionOptions { TargetFileSize = 1 << 20, MinFileSize = 1 << 20 }));
+        Assert.Equal(DeltaErrorCodes.ConcurrentDeleteDelete, ex.ErrorCode);
 
-        // The compacted output is gone, and every source file it was going to replace is still there.
-        Assert.Equal(before, DataFiles().Where(before.Contains).ToArray());
-        Assert.Equal(before.Length + 1, DataFiles().Length); // only the concurrent append's file is new
+        // The compacted output is gone, and every source file it was going to replace is still on disk —
+        // including the one the concurrent delete de-referenced, which is VACUUM's to collect, not ours.
+        Assert.Equal(before, DataFiles());
 
         await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
-        Assert.Equal([1L, 2L, 3L, 4L, 5L, 6L, 99L], await ReadIds(reopened));
+        Assert.Equal([2L, 3L, 4L, 5L, 6L], await ReadIds(reopened));
     }
 
     /// <summary>
