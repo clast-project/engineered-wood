@@ -208,9 +208,21 @@ internal static class AlpDecoder
 
         var packed = vector.Slice(headerSize, packedSize);
 
+        // Decoding formula: value = (double)(encoded * 10^factor) * 10^(-exponent), scaling as an
+        // int64 first. Written out here rather than called per value through Clast.Alp, which is
+        // what the FLOAT path above already does: MEASURED, the call does not inline, and writing
+        // it out took decode from 5.6 to 7.4 GB/s over the CWI ALP corpus.
+        //
+        // The int64 scale is not incidental. It is what makes this bit-identical to
+        // Clast.Alp.AlpDecoder.DecodeValue on every input — including the overflow a corrupt page
+        // can reach but legitimately encoded data cannot, where the same expression in double
+        // arithmetic diverges. AlpDecoderTests pins that across all 190 (exponent, factor) pairs.
+        long factMul = DoubleIntPow10[factor];
+        double fracE = DoubleNegPow10[exponent];
+
         if (bitWidth == 0)
         {
-            double value = Clast.Alp.AlpDecoder.DecodeValue(frameOfReference, exponent, factor);
+            double value = (double)unchecked(frameOfReference * factMul) * fracE;
             destination.Slice(0, n).Fill(value);
         }
         else
@@ -219,7 +231,7 @@ internal static class AlpDecoder
             {
                 ulong delta = ExtractBitsUInt64(packed, i, bitWidth);
                 long encoded = unchecked((long)delta + frameOfReference);
-                destination[i] = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor);
+                destination[i] = (double)unchecked(encoded * factMul) * fracE;
             }
         }
 
@@ -319,6 +331,30 @@ internal static class AlpDecoder
             result |= (ulong)packed[byteIndex + k] << (k * 8);
         return result;
     }
+
+    /// <summary>
+    /// Powers of 10 as int64: index f holds <c>10^f</c>. Indices 0..18 cover the DOUBLE factor
+    /// range allowed by the spec, and 10^18 is the largest power of ten an int64 holds.
+    /// </summary>
+    private static readonly long[] DoubleIntPow10 =
+    [
+        1L, 10L, 100L, 1_000L, 10_000L, 100_000L,
+        1_000_000L, 10_000_000L, 100_000_000L, 1_000_000_000L,
+        10_000_000_000L, 100_000_000_000L, 1_000_000_000_000L, 10_000_000_000_000L,
+        100_000_000_000_000L, 1_000_000_000_000_000L, 10_000_000_000_000_000L,
+        100_000_000_000_000_000L, 1_000_000_000_000_000_000L,
+    ];
+
+    /// <summary>
+    /// Negative powers of 10 in double precision: index e holds <c>10^(-e)</c>.
+    /// Indices 0..18 cover the DOUBLE exponent range allowed by the spec.
+    /// </summary>
+    private static readonly double[] DoubleNegPow10 =
+    [
+        1e0,   1e-1,  1e-2,  1e-3,  1e-4,  1e-5,  1e-6,
+        1e-7,  1e-8,  1e-9,  1e-10, 1e-11, 1e-12,
+        1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18,
+    ];
 
     /// <summary>
     /// Powers of 10 in single precision: index e holds <c>(float)10^e</c>.

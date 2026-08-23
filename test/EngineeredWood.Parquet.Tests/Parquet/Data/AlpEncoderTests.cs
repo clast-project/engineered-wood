@@ -96,6 +96,51 @@ public class AlpEncoderTests : IDisposable
     }
 
     [Fact]
+    public void EncodeDoubles_OneAwkwardValue_StillPacksTheRestNarrow()
+    {
+        // One value with twelve decimal places forces the exponent up to 12 for the whole vector.
+        // A search that stops at the first combination costing no exceptions takes (e=12, f=0),
+        // which multiplies every tenth up to 1e11 and pays ~48 bits a value; scoring by size
+        // instead takes (e=12, f=11), divides that scale back out, and pays ~11.
+        var values = new double[1024];
+        var rng = new Random(4242);
+        for (int i = 0; i < values.Length; i++)
+            values[i] = rng.Next(-1000, 1000) / 10.0;
+        values[500] = 0.123456789012;
+
+        var page = AlpEncoder.EncodeDoubles(values);
+
+        var output = new double[values.Length];
+        AlpDecoder.DecodeDoubles(page, output, values.Length);
+        for (int i = 0; i < values.Length; i++)
+            AssertBitEqual(values[i], output[i]);
+
+        double bitsPerValue = page.Length * 8.0 / values.Length;
+        Assert.True(bitsPerValue < 20, $"ALP cost {bitsPerValue:F2} bits/value where PLAIN costs 64");
+    }
+
+    [Fact]
+    public void EncodeFloats_OneAwkwardValue_StillPacksTheRestNarrow()
+    {
+        // FLOAT counterpart of EncodeDoubles_OneAwkwardValue_StillPacksTheRestNarrow.
+        var values = new float[1024];
+        var rng = new Random(4242);
+        for (int i = 0; i < values.Length; i++)
+            values[i] = rng.Next(-1000, 1000) / 10.0f;
+        values[500] = 0.12345678f;
+
+        var page = AlpEncoder.EncodeFloats(values);
+
+        var output = new float[values.Length];
+        AlpDecoder.DecodeFloats(page, output, values.Length);
+        for (int i = 0; i < values.Length; i++)
+            AssertBitEqual(values[i], output[i]);
+
+        double bitsPerValue = page.Length * 8.0 / values.Length;
+        Assert.True(bitsPerValue < 20, $"ALP cost {bitsPerValue:F2} bits/value where PLAIN costs 32");
+    }
+
+    [Fact]
     public void EncodeFloats_DecimalLike_RoundTripsBitExact()
     {
         var values = new float[1024];

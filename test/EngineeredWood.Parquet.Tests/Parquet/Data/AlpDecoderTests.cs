@@ -101,6 +101,58 @@ public class AlpDecoderTests
     }
 
     [Fact]
+    public void DecodeDoubles_InverseTransform_MatchesClastAlpOnEveryCombination()
+    {
+        // The DOUBLE path writes the inverse transform out by hand instead of calling
+        // Clast.Alp.AlpDecoder.DecodeValue per value, because the call does not inline. That is
+        // only safe while the two agree bit for bit, so pin it: every (exponent, factor) the spec
+        // allows, against encoded values spanning the int64 range including the magnitudes where
+        // scaling overflows — which a legitimate page cannot reach but a corrupt one can.
+        // SplitMix64 rather than Random: the same values are then checked on every target
+        // framework, and Random.NextInt64 does not exist on net472 at all.
+        ulong state = 20260823;
+
+        for (int exponent = 0; exponent <= 18; exponent++)
+        {
+            for (int factor = 0; factor <= exponent; factor++)
+            {
+                for (int i = 0; i < 200; i++)
+                {
+                    long encoded = i switch
+                    {
+                        0 => 0L,
+                        1 => 1L,
+                        2 => -1L,
+                        3 => long.MaxValue,
+                        4 => long.MinValue,
+                        5 => 1L << 53,
+                        6 => -(1L << 53),
+                        // Spread across magnitudes so small values, values around 2^53, and the
+                        // overflow range are all covered.
+                        _ => NextEncoded(ref state),
+                    };
+
+                    var page = BuildSingleDoubleVectorPage(
+                        exponent: exponent, factor: factor,
+                        frameOfReference: encoded,
+                        bitWidth: 0,
+                        deltas: [0],
+                        exceptionPositions: [],
+                        exceptionValues: []);
+
+                    var output = new double[1];
+                    AlpDecoder.DecodeDoubles(page, output, 1);
+
+                    double expected = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor);
+                    Assert.Equal(
+                        BitConverter.DoubleToInt64Bits(expected),
+                        BitConverter.DoubleToInt64Bits(output[0]));
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void DecodeFloats_SingleVector_DecimalTenths()
     {
         // Same shape as the double test: (e=1, f=0) with halves and integers, which
@@ -273,6 +325,25 @@ public class AlpDecoderTests
     }
 
     // ─── Page builders ───────────────────────────────────────────────────────
+
+    /// <summary>A deterministic encoded value, spread across the whole int64 magnitude range.</summary>
+    private static long NextEncoded(ref ulong state)
+    {
+        ulong bits = NextRandomBits(ref state);
+        int shift = (int)(NextRandomBits(ref state) % 64);
+        long value = unchecked((long)(bits >> shift));
+        return (bits & 1) == 0 ? value : -value;
+    }
+
+    /// <summary>SplitMix64: a bit source that behaves identically on every target framework.</summary>
+    private static ulong NextRandomBits(ref ulong state)
+    {
+        state = unchecked(state + 0x9E3779B97F4A7C15UL);
+        ulong z = state;
+        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
+        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
+        return z ^ (z >> 31);
+    }
 
     private static byte[] BuildSingleDoubleVectorPage(
         int exponent, int factor,
