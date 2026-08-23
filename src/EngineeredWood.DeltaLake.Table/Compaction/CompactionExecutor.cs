@@ -3,7 +3,6 @@
 
 using Apache.Arrow;
 using EngineeredWood.DeltaLake.Actions;
-using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using DeltaSnapshot = EngineeredWood.DeltaLake.Snapshot.Snapshot;
 using EngineeredWood.IO;
@@ -12,8 +11,22 @@ using EngineeredWood.Parquet;
 namespace EngineeredWood.DeltaLake.Table.Compaction;
 
 /// <summary>
-/// Executes file compaction: reads small files, rewrites them as larger files,
-/// and commits the add/remove actions.
+/// The output of a compaction: the files are already written, and these are the actions that would
+/// publish them. Nothing here is committed — see <see cref="CompactionExecutor.ExecuteAsync"/> for why
+/// the commit is the caller's.
+/// </summary>
+/// <param name="Actions">The removes of every rewritten file and the adds of what replaced them, with
+/// the row-tracking high-water-mark advance when the table tracks rows. No <c>commitInfo</c> — the
+/// committer writes that.</param>
+/// <param name="RowTrackingEnabled">Whether the adds carry a <c>baseRowId</c> that a rebase has to
+/// re-derive against the version it lands on.</param>
+internal readonly record struct CompactionPlan(
+    IReadOnlyList<DeltaAction> Actions,
+    bool RowTrackingEnabled);
+
+/// <summary>
+/// Executes file compaction: reads small files and rewrites them as larger files, returning the
+/// add/remove actions that publish the result.
 /// </summary>
 internal static class CompactionExecutor
 {
@@ -39,12 +52,17 @@ internal static class CompactionExecutor
     }
 
     /// <summary>
-    /// Selects files eligible for compaction and rewrites them.
-    /// Returns the new version number, or null if no files were compacted.
+    /// Selects files eligible for compaction and rewrites them. Returns the actions that publish the
+    /// rewrite, or null if no files were compacted.
+    ///
+    /// <para><b>It does not commit, deliberately.</b> OPTIMIZE used to make one attempt at
+    /// <c>snapshot.Version + 1</c> from here, so any concurrent commit threw away a rewrite of the whole
+    /// candidate set (#109). Committing is now the caller's, through the optimistic-concurrency loop that
+    /// every other write path uses — see <see cref="DeltaTable.CompactAsync"/>, which also explains why a
+    /// rewrite is safe to rebase and what refuses to.</para>
     /// </summary>
-    public static async ValueTask<long?> ExecuteAsync(
+    public static async ValueTask<CompactionPlan?> ExecuteAsync(
         ITableFileSystem fs,
-        TransactionLog log,
         DeltaSnapshot snapshot,
         CompactionOptions options,
         ParquetWriteOptions parquetOptions,
@@ -141,18 +159,7 @@ internal static class CompactionExecutor
                 .BuildHighWaterMarkAction(nextRowId));
         }
 
-        // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes.
-        long newVersion = snapshot.Version + 1;
-        // Not blind: OPTIMIZE reads the files it rewrites and removes every one of them.
-        var commitActions = InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "OPTIMIZE", isBlindAppend: false);
-        await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
-            .ConfigureAwait(false);
-        // Durable: the compacted files are the table's data now, so nothing may collect them. Cleared here
-        // rather than at the caller for the same reason the OCC loop does it — see DeltaTable.CommitOccAsync.
-        written?.Clear();
-
-        return newVersion;
+        return new CompactionPlan(actions, rowTrackingEnabled);
     }
 
     /// <summary>
@@ -381,8 +388,8 @@ internal static class CompactionExecutor
             {
                 string baseName = $"{Guid.NewGuid():N}.parquet";
                 string fileName = physicalDir + baseName;
-                // Recorded before the write: a compaction that fails — including on its single commit
-                // attempt, which ANY concurrent commit defeats — takes its whole rewritten output back.
+                // Recorded before the write: a compaction that fails — including on a commit that a real
+                // conflict aborts — takes its whole rewritten output back.
                 written?.Record(fileName);
                 long fileSize;
                 long fileBaseRowId = nextRowId;

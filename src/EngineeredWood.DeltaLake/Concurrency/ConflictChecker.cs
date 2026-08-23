@@ -28,6 +28,11 @@ public enum ConflictType
 
     /// <summary>A concurrent commit added a file matching this transaction's read predicates (concurrentAppend).</summary>
     ConcurrentAppend,
+
+    /// <summary>
+    /// A concurrent commit wrote a <c>domainMetadata</c> action for a domain this transaction also writes.
+    /// </summary>
+    DomainMetadataChanged,
 }
 
 /// <summary>Result of a conflict check: the type, the version that caused it, and a human-readable reason.</summary>
@@ -56,6 +61,7 @@ public sealed record ConflictResult(ConflictType Type, long ConflictingVersion, 
         ConflictType.ConcurrentDeleteRead => DeltaErrorCodes.ConcurrentDeleteRead,
         ConflictType.ConcurrentDeleteDelete => DeltaErrorCodes.ConcurrentDeleteDelete,
         ConflictType.ConcurrentAppend => DeltaErrorCodes.ConcurrentAppend,
+        ConflictType.DomainMetadataChanged => DeltaErrorCodes.DomainMetadataConflict,
         _ => throw new InvalidOperationException(
             $"{nameof(ConflictType)}.{Type} is not a conflict and has no error code; "
             + $"check {nameof(HasConflict)} first."),
@@ -116,6 +122,8 @@ public sealed record ReadSet
 /// transaction runs at <see cref="IsolationLevel.WriteSerializable"/>, AND this transaction does not
 /// itself change the metadata — see <see cref="ExamineConcurrentAdds"/> for the third term, which is the
 /// one that judges us rather than the winning commit.</item>
+/// <item>domainMetadata — the concurrent commit wrote a <c>domainMetadata</c> action for a domain this
+/// transaction also writes. See <see cref="WrittenDomains"/> for the row-tracking exemption.</item>
 /// </list>
 /// </summary>
 public static class ConflictChecker
@@ -148,13 +156,15 @@ public static class ConflictChecker
         IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent,
         ISet<string>? rowLevelResolvedPaths = null)
     {
-        // Both hoisted: properties of THIS transaction, identical for every concurrent commit examined.
+        // All hoisted: properties of THIS transaction, identical for every concurrent commit examined.
         bool currentChangesMetadata = ChangesMetadata(currentActions);
         var plannedRemovePaths = RemovedPaths(currentActions);
+        var writtenDomains = WrittenDomains(currentActions);
 
         foreach (var (version, actions) in concurrent)
         {
-            // 1 & 2 — a concurrent metadata or protocol change conflicts unconditionally.
+            // 1, 2 & 6 — a concurrent metadata or protocol change conflicts unconditionally; a concurrent
+            // domainMetadata conflicts when it names a domain this transaction also writes.
             foreach (var action in actions)
             {
                 if (action is MetadataAction)
@@ -163,6 +173,13 @@ public static class ConflictChecker
                 if (action is ProtocolAction)
                     return new ConflictResult(ConflictType.ProtocolChanged, version,
                         $"Concurrent commit {version} changed the protocol.");
+                if (action is DomainMetadata concurrentDomain
+                    && writtenDomains.Contains(concurrentDomain.Domain))
+                {
+                    return new ConflictResult(ConflictType.DomainMetadataChanged, version,
+                        $"Concurrent commit {version} wrote the metadata domain "
+                        + $"'{concurrentDomain.Domain}', which this transaction also writes.");
+                }
             }
 
             bool examineAdds = ExamineConcurrentAdds(
@@ -278,6 +295,49 @@ public static class ConflictChecker
 
     /// <summary>Shared empty set for the common commit that removes nothing.</summary>
     private static readonly ISet<string> NoRemovedPaths = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The metadata domains a set of actions writes, for the domainMetadata check — MINUS the row-tracking
+    /// high-water mark, which is reconciled rather than contested.
+    /// </summary>
+    /// <remarks>
+    /// <para>Delta's rule, from <c>ConflictChecker.checkIfDomainMetadataConflict</c> (source-verified
+    /// against the <c>delta-spark_4.2_2.13-4.4.0</c> bytecode): for each <c>DomainMetadata</c> the current
+    /// transaction writes, look the domain up in the winning commit's domain map — absent, keep it; the
+    /// row-tracking domain, keep it; otherwise throw <c>ConcurrentTransactionException("A conflicting
+    /// metadata domain &lt;domain&gt; is added.")</c>.</para>
+    /// <para><b>Why the row-tracking exemption is load-bearing rather than a nicety.</b> Every commit that
+    /// adds files to a row-tracking table advances the <c>delta.rowTracking</c> high-water mark, so without
+    /// it two ordinary concurrent appends would conflict on a domain neither writer ever named — turning
+    /// row tracking on would cost a table its concurrency. The mark is not contested state: a rebase
+    /// re-derives it from the version that landed (see the table layer's rebase handlers), which is
+    /// precisely why it can be reconciled where a user domain cannot.</para>
+    /// <para><b>Derived, not declared</b> — the same call as <see cref="ChangesMetadata"/> and
+    /// <see cref="RemovedPaths"/>: what a commit writes is fully visible in the actions about to be
+    /// written, so there is nothing only the writer could know.</para>
+    /// <para>Delta additionally gates the whole check on the protocol supporting the
+    /// <c>domainMetadata</c> feature. Not reproduced here, because this is a pure function with no
+    /// protocol in hand and the gate cannot change a verdict: a table without the feature has no
+    /// <c>domainMetadata</c> action on either side for the sets to intersect on.</para>
+    /// </remarks>
+    private static ISet<string> WrittenDomains(IReadOnlyList<DeltaAction> actions)
+    {
+        HashSet<string>? domains = null;
+        foreach (var action in actions)
+        {
+            if (action is DomainMetadata domain
+                && !string.Equals(
+                    domain.Domain, RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal))
+            {
+                (domains ??= new HashSet<string>(StringComparer.Ordinal)).Add(domain.Domain);
+            }
+        }
+
+        return domains ?? NoWrittenDomains;
+    }
+
+    /// <summary>Shared empty set for the common commit that writes no domain metadata.</summary>
+    private static readonly ISet<string> NoWrittenDomains = new HashSet<string>(StringComparer.Ordinal);
 
     /// <summary>
     /// Whether a set of actions changes the table metadata — Delta's <c>currentTransactionInfo</c>

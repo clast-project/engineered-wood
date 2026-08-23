@@ -41,7 +41,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The interval THIS table checkpoints at — its own <c>delta.checkpointInterval</c> where it declares
     /// one, else the caller's option. Resolved once and held, because there are TWO independent checkpoint
     /// triggers — the commit loop's <see cref="LogCommitOptions"/> and
-    /// <see cref="CheckpointIfDueAsync"/>, which every path that commits outside the committer calls — and
+    /// <see cref="CheckpointIfDueAsync"/>, which the overwrite family — the one path left that commits
+    /// outside the committer — calls, and
     /// a value read separately in each is a value that can drift: fixing only one leaves the property
     /// honoured on some write paths and ignored on others, which is harder to notice than ignoring it
     /// everywhere.
@@ -1814,9 +1815,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
-    // Commits a metaData action (the shape every metadata-only schema change takes), optionally preceded by a
-    // protocol upgrade in the SAME commit, and refreshes.
-    private async ValueTask<long> CommitMetadataOnlyAsync(
+    /// <summary>
+    /// Commits a metaData action (the shape every metadata-only schema change takes), optionally preceded
+    /// by a protocol upgrade in the SAME commit, through the optimistic-concurrency loop.
+    ///
+    /// <para><b>Rebase-safe, and the metadata rule is what makes it so.</b> The new metadata is derived
+    /// from the BASE snapshot's — <c>snapshot.Metadata with { SchemaString = … }</c>, seven callers over —
+    /// so re-committing it at a later version is only sound while the metadata it was derived from is
+    /// still the table's. That is exactly the condition <see cref="ConflictChecker"/>'s first rule
+    /// enforces: a concurrent <c>metaData</c> (or <c>protocol</c>) aborts unconditionally, whatever the
+    /// read set. So a rebase happens only past commits that left the metadata alone, and past those the
+    /// derived metadata is unchanged by construction.</para>
+    ///
+    /// <para><b>Why <see cref="ReadSet.Blind"/> is the right read set and not a shrug.</b> A schema change
+    /// reads the SCHEMA, which is not a thing <see cref="ReadSet"/> can name — its two facets are files
+    /// and predicates — and the rule that protects that read needs no declaration to fire. Naming files or
+    /// claiming <see cref="ReadSet.WholeTable"/> would not add protection; it would invent a dependency on
+    /// DATA that an ALTER TABLE does not have, and make it conflict with every concurrent append and
+    /// delete. Delta's own ALTER TABLE registers no read files and no read predicates either.
+    /// <see cref="LogCommitRequest.IsBlindAppend"/> is nonetheless declared <c>false</c>: this transaction
+    /// did read, and the two are separate claims (see that property's own remarks).</para>
+    /// </summary>
+    private ValueTask<long> CommitMetadataOnlyAsync(
         Snapshot.Snapshot snapshot,
         MetadataAction newMetadata,
         string operation,
@@ -1828,18 +1848,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actionList.Add(protocolUpgrade);
         actionList.Add(newMetadata);
 
-        var actions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actionList, snapshot.Metadata.Configuration, operation);
-
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
-
-        return newVersion;
+        return CommitOccAsync(
+            snapshot, actionList, ReadSet.Blind, IsolationLevel.WriteSerializable, operation,
+            rebaseSafe: true, cancellationToken, isBlindAppend: false);
     }
 
     /// <summary>
@@ -1851,6 +1862,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// since neither is a reader feature. <paramref name="extraActions"/> (e.g. a caller's table-property
     /// update) join the same commit. Returns the committed version, or the current one when there was
     /// nothing to change and no extra actions.
+    ///
+    /// <para><b>Concurrency.</b> Committed through the optimistic-concurrency loop, so a concurrent commit
+    /// that contests nothing is rebased past rather than thrown at the caller, and one that re-keys this
+    /// table's clustering aborts with <see cref="DeltaErrorCodes.DomainMetadataConflict"/>. That makes
+    /// <paramref name="extraActions"/> a rebase-safety contract as well as a payload: they must mean the
+    /// same thing at whatever version the commit lands on. A metadata or protocol action does (a
+    /// concurrent change to either aborts unconditionally); an <c>add</c> or <c>remove</c> coupled to an
+    /// exact version does not, and does not belong in this call.</para>
     /// </summary>
     public async ValueTask<long> SetClusteringColumnsAsync(
         IReadOnlyList<string>? logicalColumns,
@@ -1896,17 +1915,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (actions.Count == 0)
             return snapshot.Version; // nothing to change
 
-        long newVersion = snapshot.Version + 1;
-        var final = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration,
-            logicalColumns is { Count: > 0 } ? "SET SORTED BY" : "RESET SORTED BY");
-        await _log.WriteCommitAsync(newVersion, final, cancellationToken).ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
-            .ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
-        return newVersion;
+        // Through the OCC loop, and the domainMetadata rule is what makes the rebase sound: the decision
+        // this reads — whether `delta.clustering` is currently declared, which chooses between writing the
+        // spec and writing a tombstone — is invalidated by exactly one kind of concurrent commit, and that
+        // is the kind the rule refuses to rebase past. Past any other, the decision still holds.
+        return await CommitOccAsync(
+            snapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
+            logicalColumns is { Count: > 0 } ? "SET SORTED BY" : "RESET SORTED BY",
+            rebaseSafe: true, cancellationToken, isBlindAppend: false).ConfigureAwait(false);
     }
 
     /// <summary>The Delta system domain carrying a table's liquid-clustering column spec.</summary>
@@ -2167,19 +2183,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             },
         };
 
-        actions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, CurrentSnapshot.Metadata.Configuration, "SET DOMAIN METADATA");
-
-        long newVersion = CurrentSnapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, actions, cancellationToken)
+        // Rebase-safe past anything that did not touch THIS domain — and a commit that did is refused by
+        // the checker's domainMetadata rule, so the two writers do not silently overwrite one another.
+        return await CommitOccAsync(
+            CurrentSnapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
+            "SET DOMAIN METADATA", rebaseSafe: true, cancellationToken, isBlindAppend: false)
             .ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
-
-        return newVersion;
     }
 
     /// <summary>
@@ -2208,19 +2217,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             },
         };
 
-        actions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, CurrentSnapshot.Metadata.Configuration, "REMOVE DOMAIN METADATA");
-
-        long newVersion = CurrentSnapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, actions, cancellationToken)
+        // The existence check above is a READ, and the only commit that can invalidate it is one that
+        // writes this same domain — which the checker's domainMetadata rule refuses to rebase past. So the
+        // read is protected by the rule rather than by a precondition of its own: a concurrent removal
+        // surfaces as DELTA_DOMAIN_METADATA_CONFLICT rather than as a tombstone quietly stacked on a
+        // tombstone. (Delta reports the same case the same way, as a conflict rather than as "no such
+        // domain" — the caller's information is stale either way, and only a re-read can settle it.)
+        return await CommitOccAsync(
+            CurrentSnapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
+            "REMOVE DOMAIN METADATA", rebaseSafe: true, cancellationToken, isBlindAppend: false)
             .ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
-
-        return newVersion;
     }
 
     #endregion
@@ -2688,7 +2694,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
         WrittenFileLedger? written = null,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        ICommitRebaseHandler? rebase = null)
     {
         ThrowIfDisposed();
 
@@ -2707,9 +2714,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 RebaseSafe = rebaseSafe,
                 // Only the version-coupled commits need one. A plain append or a metadata change means the
                 // same thing at whatever version it lands on, so it is re-committed verbatim.
-                Rebase = rowLevel || rowTrackingEnabled
+                //
+                // A caller may supply its own instead: OPTIMIZE's adds are version-coupled in a DIFFERENT
+                // way from a write's (they carry dataChange=false and a defaultRowCommitVersion inherited
+                // from their sources, neither of which OccRebaseHandler's rule fits), so it brings a
+                // handler of its own rather than bend this one to two shapes.
+                Rebase = rebase ?? (rowLevel || rowTrackingEnabled
                     ? new OccRebaseHandler(this, rowLevelDeletes, rowTrackingEnabled, written)
-                    : null,
+                    : null),
                 Precondition = appTransactions is { Count: > 0 }
                     ? (snapshot, concurrent) =>
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
@@ -2727,8 +2739,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // without bound, because log cleanup is defined in terms of what a checkpoint subsumes, so
                 // with no checkpoint nothing can ever be reclaimed.
                 //
-                // OPTIMIZE and the metadata-only changes do NOT come through here — they commit through
-                // TransactionLog directly and get the same interval check from CheckpointIfDueAsync.
+                // OPTIMIZE and the metadata-only changes come through here TOO now (#109), so they get
+                // this check rather than the standalone one they used to call. The overwrite family is the
+                // last path that still commits outside the committer and checkpoints for itself.
                 //
                 // No new mechanism — the condition (interval reached, writer present) and the ordering
                 // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
@@ -5350,9 +5363,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Writes the interval checkpoint for a version that has just committed, if that version is one the
-    /// interval falls on. The commit paths that do NOT go through <see cref="LogCommitter"/> — the
-    /// overwrite family, OPTIMIZE, and the metadata-only changes — each call this; the ones that do get
-    /// the same check from the committer instead, and must not call it as well.
+    /// interval falls on. The overwrite family — the last commit path that does not go through
+    /// <see cref="LogCommitter"/> — calls this; every path that does go through the committer gets the
+    /// same check from it instead, and must NOT call this as well. Doing both writes the interval's
+    /// checkpoint twice, which under the UUID-named V2 format leaves the first behind as a file nothing
+    /// references and nothing collects.
     /// </summary>
     /// <remarks>
     /// <para>Call only AFTER the post-commit snapshot refresh: the checkpoint is written from
@@ -7987,6 +8002,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Compacts small files into larger ones.
     /// Returns the committed version number, or null if no compaction was needed.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Concurrency (#109).</b> OPTIMIZE rewrites its whole candidate set before it commits, so
+    /// losing the version race is the most expensive way to fail in this library — and it used to lose it
+    /// to ANY concurrent commit, because it made one attempt at the read version + 1 and propagated the
+    /// collision. It now commits through the same optimistic-concurrency loop as every other write.</para>
+    ///
+    /// <para><b>Why a rewrite is safe to rebase, which is not obvious.</b> A compacted file is built from
+    /// the LIVE rows of an exact set of source files at an exact version, so re-committing it somewhere
+    /// else is sound only if none of those files moved. That is precisely what the delete/delete rule
+    /// tests, and it tests it for free: OPTIMIZE removes every file it read, so the checker's
+    /// derived-from-actions remove set IS the candidate set. Any concurrent commit that rewrote, deleted,
+    /// or attached a deletion vector to one of them appears as a remove of a path this commit also
+    /// removes, and aborts it with <c>DELTA_CONCURRENT_DELETE_DELETE</c> naming the file. Past a commit
+    /// that touched none of them, the compacted bytes are still exactly the live rows of the files being
+    /// removed, and the rewrite means the same thing at the later version.</para>
+    ///
+    /// <para>A concurrent APPEND is deliberately not a conflict: this operation's decision is "these
+    /// particular files are small", and a file that did not exist when it was made cannot invalidate it.
+    /// The new file simply is not compacted, which the next OPTIMIZE will fix. Delta's OPTIMIZE reaches
+    /// the same place by a different route — it registers no read predicate either (verified against the
+    /// <c>delta-spark_4.2_2.13-4.4.0</c> <c>OptimizeExecutor</c>) and commits through its own retrying
+    /// transaction.</para>
+    ///
+    /// <para>Row tracking is the one part that does not survive a rebase untouched: the compacted adds
+    /// carry a <c>baseRowId</c> reserved out of the base snapshot's high-water mark, which a concurrent
+    /// commit may have consumed. <see cref="CompactionRebaseHandler"/> re-derives those, and no data is
+    /// rewritten to do it — see there for why.</para>
+    /// </remarks>
     public async ValueTask<long?> CompactAsync(
         CompactionOptions? options = null,
         CancellationToken cancellationToken = default)
@@ -7997,27 +8040,99 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         options ??= CompactionOptions.Default;
 
-        // The path with the most to lose: OPTIMIZE rewrites its whole candidate set and then makes ONE commit
-        // attempt at the read version + 1, so a single concurrent commit used to orphan every file it wrote.
-        var result = await CollectOnFailureAsync(
-            written => Compaction.CompactionExecutor.ExecuteAsync(
-                _fs, _log, CurrentSnapshot, options,
-                _options.ParquetWriteOptions, _dataFileReadOptions,
-                cancellationToken, _options.DataFileWriter, _options.DataFileReader, written),
+        var snapshot = CurrentSnapshot;
+        return await CollectOnFailureAsync<long?>(
+            async written =>
+            {
+                var plan = await Compaction.CompactionExecutor.ExecuteAsync(
+                    _fs, snapshot, options,
+                    _options.ParquetWriteOptions, _dataFileReadOptions,
+                    cancellationToken, _options.DataFileWriter, _options.DataFileReader, written)
+                    .ConfigureAwait(false);
+                if (plan is not { } compaction)
+                    return null;
+
+                // Declared rather than left to the delete/delete rule alone. The two sets are the same
+                // here — OPTIMIZE removes every file it read — so this changes no verdict today; it is the
+                // honest answer to "what did this transaction read", which is the one thing the checker
+                // cannot derive from the actions.
+                var read = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var action in compaction.Actions)
+                {
+                    if (action is RemoveFile remove)
+                        read.Add(remove.Path);
+                }
+
+                return await CommitOccAsync(
+                    snapshot, compaction.Actions, new ReadSet { Files = read },
+                    IsolationLevel.WriteSerializable, "OPTIMIZE", rebaseSafe: true, cancellationToken,
+                    written: written, isBlindAppend: false,
+                    rebase: compaction.RowTrackingEnabled ? new CompactionRebaseHandler() : null)
+                    .ConfigureAwait(false);
+            },
             cancellationToken).ConfigureAwait(false);
+    }
 
-        if (result.HasValue)
+    /// <summary>
+    /// OPTIMIZE's half of the commit loop: re-reserves the compacted files' row-id range against the
+    /// version the commit is now landing on, and re-emits the high-water mark to match.
+    ///
+    /// <para>Needed because a compacted add's <c>baseRowId</c> is a RESERVATION out of the base snapshot's
+    /// <c>delta.rowTracking</c> mark, and a concurrent commit that added files has already spent part of
+    /// that range. Re-committing verbatim would hand two files the same ids.</para>
+    ///
+    /// <para><b>Why no data is rewritten to do it, unlike a write's row ids.</b> A row-tracking table can
+    /// only be compacted when it declares materialized row-id columns (<see cref="RejectRowTrackingWrite"/>
+    /// enforces this), and compaction writes each surviving row's ORIGINAL id into them. So the ids the
+    /// rows actually carry live in the file's own columns and do not depend on the add's
+    /// <c>baseRowId</c> at all — the reservation exists to keep ranges from overlapping, and moving it is
+    /// a metadata re-stamp.</para>
+    ///
+    /// <para><b>What it must NOT touch, and where this differs from
+    /// <see cref="OccRebaseHandler"/>.</b> <c>defaultRowCommitVersion</c> stays as staged: compaction
+    /// inherits it from the EARLIEST source file, deliberately, so that rearranging bytes does not make
+    /// rows look newly written. The write path's rebase sets it to the attempt version, which is right
+    /// there and wrong here. The removes' own row-tracking fields are the removed adds' and are likewise
+    /// left alone.</para>
+    /// </summary>
+    private sealed class CompactionRebaseHandler : ICommitRebaseHandler
+    {
+        /// <summary>The advanced high-water mark is table STATE, not a version — it needs the snapshot.</summary>
+        public bool NeedsLatestSnapshot => true;
+
+        public ValueTask<CommitRebase> RebaseAsync(
+            CommitRebaseContext context, CancellationToken cancellationToken)
         {
-            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-                CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+            // Always from the ORIGINAL staged actions, so each retry re-reserves from the newest mark
+            // rather than compounding a previous attempt's.
+            long mark = context.LatestSnapshot!.RowIdHighWaterMark;
+            long nextRowId = mark;
+            var result = new List<DeltaAction>(context.StagedActions.Count);
+            foreach (var action in context.StagedActions)
+            {
+                switch (action)
+                {
+                    case AddFile add when add.BaseRowId is not null:
+                        result.Add(add with { BaseRowId = nextRowId });
+                        nextRowId += add.GetNumRecords() ?? 0;
+                        break;
 
-            // OPTIMIZE is the operation with the most reason to checkpoint: it removes every file it
-            // rewrote, so the commit it writes is the largest the table produces, and a log replay that
-            // cannot start from a checkpoint reads all of it.
-            await CheckpointIfDueAsync(result.Value, cancellationToken).ConfigureAwait(false);
+                    case DomainMetadata dm when string.Equals(
+                        dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName,
+                        StringComparison.Ordinal):
+                        break; // dropped; re-emitted below at the re-derived mark
+
+                    default:
+                        result.Add(action);
+                        break;
+                }
+            }
+
+            if (nextRowId > mark)
+                result.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+
+            return new ValueTask<CommitRebase>(new CommitRebase(result, null));
         }
-
-        return result;
     }
 
     /// <summary>
