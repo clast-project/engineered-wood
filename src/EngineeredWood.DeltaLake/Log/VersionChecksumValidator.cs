@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Globalization;
+using System.Text;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
@@ -39,7 +40,13 @@ namespace EngineeredWood.DeltaLake.Log;
 /// </remarks>
 public sealed class VersionChecksumValidator
 {
-    /// <summary>Rendered values longer than this are elided; schema strings are unbounded.</summary>
+    /// <summary>
+    /// How much of a value the report shows. Elision is a DISPLAY bound and never a comparison one: the
+    /// comparison always runs on the whole value, and where two long values differ past this length the
+    /// window moves to the difference rather than cutting it away — see <see cref="Compared"/>. Without
+    /// that, two schemas differing in their last field would be reported as disagreeing and then shown as
+    /// two identical prefixes, which reads as a bug in the validator.
+    /// </summary>
     private const int MaxRenderedLength = 400;
 
     private readonly ITableFileSystem _fs;
@@ -183,24 +190,21 @@ public sealed class VersionChecksumValidator
             // Enabled, and the writer left out a field the spec makes mandatory when it is on. That is a
             // statement about the checksum rather than about the table, and it is worth reporting as a
             // difference: something wrote this file believing the feature was off.
-            fields.Add(new VersionChecksumFieldComparison
-            {
-                Field = "inCommitTimestampOpt",
-                Outcome = VersionChecksumFieldOutcome.Disagrees,
-                Recorded = null,
-                Reconstructed = reconstructed.InCommitTimestamp is { } value ? Number(value) : null,
-            });
+            fields.Add(Compared(
+                "inCommitTimestampOpt",
+                VersionChecksumFieldOutcome.Disagrees,
+                recorded: null,
+                actual: reconstructed.InCommitTimestamp is { } value ? Number(value) : null));
             return;
         }
 
         if (reconstructed.InCommitTimestamp is null)
         {
-            fields.Add(new VersionChecksumFieldComparison
-            {
-                Field = "inCommitTimestampOpt",
-                Outcome = VersionChecksumFieldOutcome.NotReconstructed,
-                Recorded = Number(recorded.InCommitTimestamp.Value),
-            });
+            fields.Add(Compared(
+                "inCommitTimestampOpt",
+                VersionChecksumFieldOutcome.NotReconstructed,
+                recorded: Number(recorded.InCommitTimestamp.Value),
+                actual: null));
             return;
         }
 
@@ -245,13 +249,8 @@ public sealed class VersionChecksumValidator
     {
         if (string.Equals(recorded, actual, StringComparison.Ordinal))
         {
-            fields.Add(new VersionChecksumFieldComparison
-            {
-                Field = "metadata.schemaString",
-                Outcome = VersionChecksumFieldOutcome.Agrees,
-                Recorded = Elide(recorded),
-                Reconstructed = Elide(actual),
-            });
+            fields.Add(Compared(
+                "metadata.schemaString", VersionChecksumFieldOutcome.Agrees, recorded, actual));
             return;
         }
 
@@ -268,15 +267,11 @@ public sealed class VersionChecksumValidator
             // Leave it as a difference; see the remarks.
         }
 
-        fields.Add(new VersionChecksumFieldComparison
-        {
-            Field = "metadata.schemaString",
-            Outcome = equivalent
-                ? VersionChecksumFieldOutcome.Agrees
-                : VersionChecksumFieldOutcome.Disagrees,
-            Recorded = Elide(recorded),
-            Reconstructed = Elide(actual),
-        });
+        fields.Add(Compared(
+            "metadata.schemaString",
+            equivalent ? VersionChecksumFieldOutcome.Agrees : VersionChecksumFieldOutcome.Disagrees,
+            recorded,
+            actual));
     }
 
     private static void CompareProtocol(
@@ -299,12 +294,11 @@ public sealed class VersionChecksumValidator
     {
         if (recorded is null)
         {
-            fields.Add(new VersionChecksumFieldComparison
-            {
-                Field = "setTransactions",
-                Outcome = VersionChecksumFieldOutcome.NotRecorded,
-                Reconstructed = $"{actual.Count} live transaction(s)",
-            });
+            fields.Add(Compared(
+                "setTransactions",
+                VersionChecksumFieldOutcome.NotRecorded,
+                recorded: null,
+                actual: $"{actual.Count} live transaction(s)"));
             return;
         }
 
@@ -336,12 +330,11 @@ public sealed class VersionChecksumValidator
     {
         if (recorded is null)
         {
-            fields.Add(new VersionChecksumFieldComparison
-            {
-                Field = "domainMetadata",
-                Outcome = VersionChecksumFieldOutcome.NotRecorded,
-                Reconstructed = $"{actual.Count} live domain(s)",
-            });
+            fields.Add(Compared(
+                "domainMetadata",
+                VersionChecksumFieldOutcome.NotRecorded,
+                recorded: null,
+                actual: $"{actual.Count} live domain(s)"));
             return;
         }
 
@@ -355,8 +348,8 @@ public sealed class VersionChecksumValidator
         foreach (string domain in Union(byDomain.Keys, actual.Keys))
         {
             Compare(fields, $"domainMetadata[{domain}]",
-                byDomain.TryGetValue(domain, out var left) ? left.Configuration : null,
-                actual.TryGetValue(domain, out var right) ? right.Configuration : null);
+                byDomain.TryGetValue(domain, out var left) ? Text(left.Configuration) : null,
+                actual.TryGetValue(domain, out var right) ? Text(right.Configuration) : null);
         }
     }
 
@@ -365,22 +358,69 @@ public sealed class VersionChecksumValidator
     /// two nulls agree — an absent value is a value, and both sides saying "absent" is the two of them
     /// saying the same thing.
     /// </summary>
-    /// <remarks>
-    /// The comparison runs on the FULL rendered values and only what is stored for display is elided, so
-    /// a long value that differs past the cut is still reported as differing.
-    /// </remarks>
     private static void Compare(
         List<VersionChecksumFieldComparison> fields, string name, string? recorded, string? actual)
     {
-        fields.Add(new VersionChecksumFieldComparison
-        {
-            Field = name,
-            Outcome = string.Equals(recorded, actual, StringComparison.Ordinal)
+        fields.Add(Compared(
+            name,
+            string.Equals(recorded, actual, StringComparison.Ordinal)
                 ? VersionChecksumFieldOutcome.Agrees
                 : VersionChecksumFieldOutcome.Disagrees,
-            Recorded = recorded is null ? null : Elide(recorded),
-            Reconstructed = actual is null ? null : Elide(actual),
-        });
+            recorded,
+            actual));
+    }
+
+    /// <summary>
+    /// Builds one comparison from an already-decided outcome, eliding the two values for display.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every comparison this type produces goes through here, which is what keeps the eliding rule
+    /// in one place. The decision itself is always made on the WHOLE value — by
+    /// <see cref="Compare(List{VersionChecksumFieldComparison}, string, string, string)"/> before it calls this, or by <see cref="CompareSchema"/>, which decides equivalence by parsing both
+    /// sides — so no amount of eliding can turn a difference into agreement.</para>
+    ///
+    /// <para>Two DIFFERING values are elided around their first difference rather than from the start.
+    /// Cutting from the start is right when a value is merely long, and wrong the moment two long values
+    /// share a prefix: a <c>schemaString</c> pair differing in their last field would be reported as
+    /// disagreeing and then shown as two identical 400-character prefixes, which reads as the validator
+    /// having lost its mind. That is the case that actually arises, because a schema string is the one
+    /// field here routinely longer than the window.</para>
+    /// </remarks>
+    private static VersionChecksumFieldComparison Compared(
+        string field, VersionChecksumFieldOutcome outcome, string? recorded, string? actual)
+    {
+        int from = outcome == VersionChecksumFieldOutcome.Disagrees
+            && recorded is not null && actual is not null
+            ? WindowStart(recorded, actual)
+            : 0;
+
+        return new VersionChecksumFieldComparison
+        {
+            Field = field,
+            Outcome = outcome,
+            Recorded = recorded is null ? null : Elide(recorded, from),
+            Reconstructed = actual is null ? null : Elide(actual, from),
+        };
+    }
+
+    /// <summary>
+    /// Where to start showing two differing values so that what differs is on screen: far enough back
+    /// from the first differing character to carry some context, and 0 whenever both values fit anyway.
+    /// </summary>
+    private static int WindowStart(string recorded, string actual)
+    {
+        if (recorded.Length <= MaxRenderedLength && actual.Length <= MaxRenderedLength)
+            return 0;
+
+        int shared = 0;
+        int common = Math.Min(recorded.Length, actual.Length);
+        while (shared < common && recorded[shared] == actual[shared])
+            shared++;
+
+        // Both values are windowed from the SAME offset. Windows taken from different offsets would line
+        // up on screen while describing different parts of the value, which is a worse way to be wrong
+        // than truncation is.
+        return Math.Max(0, shared - (MaxRenderedLength / 4));
     }
 
     private static IEnumerable<string> Union(
@@ -389,11 +429,22 @@ public sealed class VersionChecksumValidator
 
     private static string Number(long value) => value.ToString(CultureInfo.InvariantCulture);
 
-    private static string? Text(string? value) => value is null ? null : $"\"{value}\"";
+    /// <summary>
+    /// A string value, quoted and escaped so that what it CONTAINS cannot be read as the report's own
+    /// punctuation.
+    /// </summary>
+    /// <remarks>
+    /// A table name holding a newline would otherwise split one field across two lines of
+    /// <see cref="VersionChecksumValidation.Describe"/>, whose whole shape is one line per field, and one
+    /// holding a quote would leave a reader unable to see where the value ended. Both are exactly the
+    /// sort of value that turns up in a disagreement, since the fields most likely to differ are the
+    /// free-text ones.
+    /// </remarks>
+    private static string? Text(string? value) => value is null ? null : $"\"{Escape(value)}\"";
 
     /// <summary>An ordered list, rendered in order — <c>partitionColumns</c> is ordered state.</summary>
     private static string Sequence(IReadOnlyList<string> values) =>
-        $"[{string.Join(", ", values)}]";
+        $"[{string.Join(", ", values.Select(Escape))}]";
 
     /// <summary>
     /// A feature list, rendered as a SET: order is not part of what a protocol says, and null and empty
@@ -402,7 +453,7 @@ public sealed class VersionChecksumValidator
     private static string FeatureSet(IReadOnlyList<string>? values) =>
         values is null or []
             ? "[]"
-            : $"[{string.Join(", ", values.OrderBy(static v => v, StringComparer.Ordinal))}]";
+            : $"[{string.Join(", ", values.OrderBy(static v => v, StringComparer.Ordinal).Select(Escape))}]";
 
     /// <summary>
     /// A configuration map, rendered key-sorted. Null and empty render alike for the same reason as
@@ -417,16 +468,91 @@ public sealed class VersionChecksumValidator
 
         var pairs = values
             .OrderBy(static kvp => kvp.Key, StringComparer.Ordinal)
-            .Select(static kvp => $"{kvp.Key}={kvp.Value}");
+            .Select(static kvp => $"{Escape(kvp.Key)}={Text(kvp.Value)}");
         return $"{{{string.Join(", ", pairs)}}}";
     }
 
     /// <summary>
-    /// Shortens a long value for display. Applied to the RENDERED form only — the comparison always sees
-    /// the whole value, so eliding can hide what differs but can never decide that nothing does.
+    /// Shortens a value for display: at most <see cref="MaxRenderedLength"/> characters starting at
+    /// <paramref name="from"/>, saying so whenever anything was left out.
     /// </summary>
-    private static string Elide(string value) =>
-        value.Length <= MaxRenderedLength
-            ? value
-            : $"{value[..MaxRenderedLength]}… ({value.Length} chars)";
+    /// <remarks>
+    /// The window backs off a surrogate pair at either end. Splitting one leaves a lone surrogate that
+    /// renders as a replacement character in the middle of a value a reader is being asked to compare by
+    /// eye — which looks like the difference being reported.
+    /// </remarks>
+    private static string Elide(string value, int from)
+    {
+        int start = Math.Min(from, value.Length);
+        if (start > 0 && start < value.Length && char.IsLowSurrogate(value[start]))
+            start--;
+
+        int length = Math.Min(MaxRenderedLength, value.Length - start);
+        if (length > 0 && char.IsHighSurrogate(value[start + length - 1]))
+            length--;
+
+        if (start == 0 && length == value.Length)
+            return value;
+
+        string head = start > 0
+            ? $"…(from char {start.ToString(CultureInfo.InvariantCulture)}) "
+            : "";
+        string tail = start + length < value.Length
+            ? $"… ({value.Length.ToString(CultureInfo.InvariantCulture)} chars)"
+            : "";
+
+        return $"{head}{value.Substring(start, length)}{tail}";
+    }
+
+    /// <summary>
+    /// Escapes what would otherwise be read as the report's own punctuation: backslashes, quotes, and the
+    /// control characters — a newline above all, which would break the one-line-per-field shape
+    /// <see cref="VersionChecksumValidation.Describe"/> is read through.
+    /// </summary>
+    private static string Escape(string value)
+    {
+        int first = -1;
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] is '\\' or '"' || char.IsControl(value[i]))
+            {
+                first = i;
+                break;
+            }
+        }
+
+        // Nothing to escape is the overwhelmingly common case, and it keeps its own string.
+        if (first < 0)
+            return value;
+
+        var escaped = new StringBuilder(value.Length + 8);
+        escaped.Append(value, 0, first);
+
+        for (int i = first; i < value.Length; i++)
+        {
+            char c = value[i];
+            switch (c)
+            {
+                case '\\': escaped.Append(@"\\"); break;
+                case '"': escaped.Append("\\\""); break;
+                case '\n': escaped.Append(@"\n"); break;
+                case '\r': escaped.Append(@"\r"); break;
+                case '\t': escaped.Append(@"\t"); break;
+                default:
+                    if (char.IsControl(c))
+                    {
+                        escaped.Append(@"\u")
+                            .Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        escaped.Append(c);
+                    }
+
+                    break;
+            }
+        }
+
+        return escaped.ToString();
+    }
 }

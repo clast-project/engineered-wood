@@ -441,6 +441,75 @@ public class VersionChecksumValidationTests : IDisposable
         Assert.DoesNotContain(validation.Fields, f => f.Field == "inCommitTimestampOpt");
     }
 
+    // ── the report has to be legible, or the values in it are not evidence ─────────────────────────────
+
+    /// <summary>
+    /// A schema string is the one field here routinely longer than the display window, and two schemas
+    /// that differ almost always agree for most of their length. Showing the first N characters of each
+    /// would print two IDENTICAL values under the word "disagrees" — a report that looks like a bug in
+    /// the validator and tells the reader nothing. The window follows the difference.
+    /// </summary>
+    [Fact]
+    public async Task Validate_ShowsWhereTwoLongValuesDiffer_NotTheirCommonPrefix()
+    {
+        // ~40 identical fields, then one that differs — the difference is thousands of characters in.
+        static string WideSchema(string lastField)
+        {
+            var fields = Enumerable.Range(0, 40)
+                .Select(i => $$$"""{"name":"column_number_{{{i}}}","type":"long","nullable":true,"metadata":{}}""")
+                .Append($$$"""{"name":"{{{lastField}}}","type":"string","nullable":true,"metadata":{}}""");
+            return $$"""{"type":"struct","fields":[{{string.Join(",", fields)}}]}""";
+        }
+
+        await _log.WriteCommitAsync(0,
+        [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            Metadata() with { SchemaString = WideSchema("reconstructed_tail") },
+        ]);
+        var snapshot = await SnapshotAsync();
+
+        var different = Recorded(snapshot) with
+        {
+            Metadata = snapshot.Metadata with { SchemaString = WideSchema("recorded_tail") },
+        };
+        var validation = VersionChecksumValidator.Compare(different, snapshot);
+
+        var schema = Field(validation, "metadata.schemaString");
+        Assert.Equal(VersionChecksumFieldOutcome.Disagrees, schema.Outcome);
+
+        // The point: two rendered values that a reader can tell apart, each showing its own side of the
+        // difference, and each saying where in the value it starts.
+        Assert.NotEqual(schema.Recorded, schema.Reconstructed);
+        Assert.Contains("recorded_tail", schema.Recorded!, StringComparison.Ordinal);
+        Assert.Contains("reconstructed_tail", schema.Reconstructed!, StringComparison.Ordinal);
+        Assert.Contains("(from char ", schema.Recorded!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <see cref="VersionChecksumValidation.Describe"/> is one line per field, so a value carrying a
+    /// newline would break the report into pieces that no longer say which field they belong to — and a
+    /// value carrying a quote would leave a reader unable to see where it ended. Free text is exactly
+    /// what <c>name</c> and <c>description</c> hold.
+    /// </summary>
+    [Fact]
+    public async Task Validate_EscapesWhatWouldBeReadAsTheReportsOwnPunctuation()
+    {
+        var snapshot = await CreateTableAsync();
+
+        var awkward = Recorded(snapshot) with
+        {
+            Metadata = snapshot.Metadata with { Name = "two\nlines and a \" quote" },
+        };
+        var validation = VersionChecksumValidator.Compare(awkward, snapshot);
+
+        var name = Field(validation, "metadata.name");
+        Assert.Equal("\"two\\nlines and a \\\" quote\"", name.Recorded);
+        Assert.DoesNotContain('\n', name.Recorded!);
+
+        // One header line and one field line, still.
+        Assert.Equal(2, validation.Describe().Split(Environment.NewLine).Length);
+    }
+
     // ── no checksum, and a checksum that is not one ────────────────────────────────────────────────────
 
     /// <summary>
