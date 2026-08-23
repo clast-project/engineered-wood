@@ -45,11 +45,13 @@ public class S3FileTests : IAsyncLifetime
                 Timeout = TimeSpan.FromSeconds(2),
                 MaxErrorRetry = 0,
 
-                // AWSSDK v4 wraps request bodies in `aws-chunked` framing with a trailing checksum by
-                // default. Real S3 strips it; gofakes3 stores the framing AS the object body, so a payload
-                // reads back longer than it went in and Parquet reads die on "missing trailing PAR1
-                // magic". Turning it off keeps the emulator an oracle for what these tests are actually
-                // about. See step 2 of issue #79.
+                // No checksum overrides here, and their ABSENCE is deliberate: AWSSDK v4 wraps request
+                // bodies in `aws-chunked` framing with a trailing checksum by default, and MinIO handles
+                // that the way real S3 does. gofakes3, the emulator used here previously, stored the
+                // framing AS the object body -- a payload read back longer than it went in and Parquet
+                // reads died on "missing trailing PAR1 magic" -- which forced RequestChecksumCalculation
+                // and ResponseChecksumValidation to WHEN_REQUIRED and so switched off the integrity
+                // checking these tests exist to exercise. See step 2 of issue #79.
             };
             _client = new AmazonS3Client(new BasicAWSCredentials("minioadmin", "minioadmin"), config);
 

@@ -276,6 +276,12 @@ jobs:
           python -m pip install --disable-pip-version-check
           "git+https://github.com/googleapis/storage-testbench.git@v0.63.0"
 
+      # Installed globally with no sudo and no npm prefix juggling, which reads like it should fail
+      # and does not: MEASURED on this runner image, `npm install -g` writes 306 packages without a
+      # permission error, and the curl below writes /usr/local/bin directly. Both are recorded here
+      # because both look wrong to a reviewer. If a future image changes either, the failure is LOUD
+      # and immediate -- the install step exits non-zero under `bash -e` and the job goes red -- so
+      # defending against it in advance would only add noise to a step that cannot fail quietly.
       - name: Install Azurite (Azure Blob emulator)
         run: npm install -g azurite@3.36.0
 

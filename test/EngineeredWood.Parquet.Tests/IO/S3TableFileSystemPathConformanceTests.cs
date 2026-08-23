@@ -75,11 +75,9 @@ public sealed class S3TableFileSystemPathConformanceTests : TableFileSystemPathC
                 Timeout = TimeSpan.FromSeconds(2),
                 MaxErrorRetry = 0,
 
-                // AWSSDK v4 defaults to wrapping request bodies in `aws-chunked` framing with a trailing
-                // checksum. Real S3 strips it; gofakes3 stores the framing AS the object body, so a
-                // 600-byte payload reads back longer than it went in and every byte assertion in this
-                // suite would fail for a reason that has nothing to do with the object's NAME. Turning the
-                // framing off keeps the emulator an oracle for what is actually under test here.
+                // No checksum overrides; see the remarks above. MinIO handles AWSSDK v4's `aws-chunked`
+                // framing correctly, so every byte assertion in this suite fails only for reasons that
+                // really are about the object's NAME.
             };
 
             _client = new AmazonS3Client(new BasicAWSCredentials("minioadmin", "minioadmin"), config);
