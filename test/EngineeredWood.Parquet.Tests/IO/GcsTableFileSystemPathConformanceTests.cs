@@ -9,15 +9,26 @@ namespace EngineeredWood.Tests.IO;
 
 /// <summary>
 /// <see cref="TableFileSystemPathConformanceTests"/> against <see cref="GcsTableFileSystem"/>, which needs
-/// a GCS emulator (fake-gcs-server) on 127.0.0.1:4443.
+/// <c>googleapis/storage-testbench</c> on 127.0.0.1:4443.
 /// </summary>
 /// <remarks>
 /// <para>GCS puts the object name in the PATH for a download and in a QUERY PARAMETER for an upload, so a
 /// single name has to survive two different encodings that are easy to get independently wrong -- and a
 /// disagreement between them writes to one object and reads from another.</para>
-/// <para>Run the emulator with <c>-backend memory</c>, never <c>-backend filesystem</c>: a
-/// filesystem-backed fake stores object names as on-disk paths and so reports the HOST volume's naming
-/// rules as the store's, which makes it an invalid oracle for exactly the question this suite asks.</para>
+/// <para><b>The emulator is <c>googleapis/storage-testbench</c>, not fake-gcs-server, and the choice is
+/// load-bearing.</b> fake-gcs-server ignores <c>ifGenerationMatch=0</c> — measured at the wire level, two
+/// create-if-absent uploads both return 200 and the second overwrites — so it cannot answer for
+/// <see cref="ITableFileSystem.TryWriteAllBytesAsync"/>, the primitive Delta and Iceberg commits are built
+/// on. storage-testbench returns <c>412</c> and preserves the winner's bytes. Google maintains it to
+/// validate its own client libraries, which is the property that makes it a credible oracle: it is the
+/// fake the vendor's own conformance tests run against.</para>
+/// <para>Install and run it with
+/// <c>pip install git+https://github.com/googleapis/storage-testbench.git</c> then
+/// <c>storage-testbench --port 4443</c>. It takes <c>--port</c>; a bare <c>PORT</c> environment variable
+/// is ignored and it binds a random port instead.</para>
+/// <para>Whatever fake is used, it must not store object names as paths on the host filesystem — such a
+/// fake reports the HOST volume's naming rules as the store's, which makes it an invalid oracle for
+/// exactly the question this suite asks. storage-testbench keeps objects in memory.</para>
 /// </remarks>
 public sealed class GcsTableFileSystemPathConformanceTests : TableFileSystemPathConformanceTests
 {
@@ -33,27 +44,9 @@ public sealed class GcsTableFileSystemPathConformanceTests : TableFileSystemPath
     private GcsTableFileSystem? _fileSystem;
     private string? _unavailableReason;
 
-    /// <summary>
-    /// <para>fake-gcs-server <b>ignores <c>ifGenerationMatch=0</c></b> — measured at the wire level, two
-    /// raw create-if-absent uploads both return 200 and the second overwrites. That makes it unable to
-    /// answer for <see cref="ITableFileSystem.TryWriteAllBytesAsync"/>, the commit primitive Delta and
-    /// Iceberg commits are built on, so a CI job standing this emulator up would get either a false green
-    /// or a permanent false red on exactly that property. An argument for a stricter GCS fake, not for a
-    /// weaker assertion — <c>googleapis/storage-testbench</c> returns <c>412</c> here and preserves the
-    /// winner's bytes.</para>
-    ///
-    /// <para><b>A <c>RangedRead</c> gap used to be declared here and should never have
-    /// been.</b> The hash mismatch on a ranged read was not this emulator being unfaithful; it was
-    /// <c>GcsRandomAccessFile</c> leaving <c>DownloadValidationMode</c> unset. storage-testbench — which
-    /// Google builds to validate its own client libraries — sends the same whole-object hash on a
-    /// <c>206</c>, so the behaviour being blamed on the fake is how the service behaves. Worth recording
-    /// as a caution: a gap declared against someone else's component is a claim that needs the same
-    /// evidence as any other, and this one was wrong for a fortnight.</para>
-    /// </summary>
-    protected override EmulatorGap Gaps => EmulatorGap.CreateIfAbsent;
 
     /// <inheritdoc/>
-    protected override string Emulator => "fake-gcs-server on 127.0.0.1:4443";
+    protected override string Emulator => "storage-testbench on 127.0.0.1:4443";
 
     /// <inheritdoc/>
     protected override bool Available => _fileSystem is not null;

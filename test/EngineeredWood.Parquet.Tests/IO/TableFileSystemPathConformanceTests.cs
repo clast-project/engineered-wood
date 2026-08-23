@@ -91,42 +91,6 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
         "region=a%23c",     // literal percent-two-three
     ];
 
-    /// <summary>
-    /// <para>Properties this backend's EMULATOR cannot answer, so that an assertion the real service would
-    /// satisfy is reported as not-made rather than as a failure of the code under test — and rather than
-    /// being quietly dropped, which is the false green step 1 of #79 existed to remove.</para>
-    ///
-    /// <para>Every entry here is a claim about a fake, not about EW, and each is measured at the wire
-    /// level rather than inferred from a red test. A gap declared here is an argument for a better
-    /// emulator in step 2, and the flag should be deleted the day one arrives.</para>
-    ///
-    /// <para><b>Wire-level evidence is necessary and not sufficient.</b> This enum shipped with a
-    /// <c>RangedRead</c> entry blaming fake-gcs-server for sending a whole-object hash on a <c>206</c>.
-    /// That observation was accurate and the conclusion was wrong: <c>googleapis/storage-testbench</c>
-    /// sends the same header, because that is what the SERVICE does — the defect was on our side, in a
-    /// download option left unset. Before adding a flag here, check that a FAITHFUL server would actually
-    /// behave differently; "the emulator does X and our code fails" does not establish that X is the
-    /// emulator's fault. A wrong flag here is worse than no flag, because it turns a real bug into a
-    /// documented, permanently skipped non-problem.</para>
-    /// </summary>
-    [Flags]
-    protected enum EmulatorGap
-    {
-        /// <summary>The emulator is faithful for everything this suite asserts.</summary>
-        None = 0,
-
-        /// <summary>
-        /// The emulator ignores the create-if-absent precondition. MEASURED on fake-gcs-server: two raw
-        /// uploads with <c>ifGenerationMatch=0</c> both return 200 and the second overwrites. EW sends
-        /// the precondition correctly; the fake does not enforce it, so it cannot answer the one
-        /// property <see cref="ITableFileSystem.TryWriteAllBytesAsync"/> documents as load-bearing.
-        /// </summary>
-        CreateIfAbsent = 1 << 0,
-    }
-
-    /// <summary>What this backend's emulator cannot answer. See <see cref="EmulatorGap"/>.</summary>
-    protected virtual EmulatorGap Gaps => EmulatorGap.None;
-
     /// <summary>The emulator this backend needs, phrased so the skip message is actionable on its own.</summary>
     protected abstract string Emulator { get; }
 
@@ -294,7 +258,6 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
     {
         Require();
         var fs = FileSystem;
-        SkipForGap(EmulatorGap.CreateIfAbsent, "the create-if-absent precondition");
 
         // The composite from the issue: literal space, literal '%23', literal '%3F' -- exactly what
         // DeltaPath.Decode hands a backend for a Spark-written partition.
@@ -311,17 +274,6 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
 
         Assert.Equal("winner", Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(path)));
     }
-
-    /// <summary>
-    /// Skips when this backend's emulator cannot answer the property under test. Deliberately a SKIP and
-    /// not an <c>if</c>: the run has to say which assertions it did not make, or the suite reproduces the
-    /// exact reporting failure #79 is about, one layer down.
-    /// </summary>
-    private void SkipForGap(EmulatorGap gap, string what) =>
-        Skip.If(
-            (Gaps & gap) != 0,
-            $"{Emulator} does not implement {what} faithfully ({gap}), so it cannot answer this. " +
-            "The real service can; see EmulatorGap and step 2 of issue #79.");
 
     private static void SkipIfInexpressible(ITableFileSystem fs, string segment) =>
         Skip.IfNot(

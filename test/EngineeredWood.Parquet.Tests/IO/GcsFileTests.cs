@@ -12,12 +12,16 @@ namespace EngineeredWood.Tests.IO;
 
 /// <summary>
 /// Integration tests for <see cref="GcsSequentialFile"/> and <see cref="GcsRandomAccessFile"/>.
-/// Requires a GCS emulator (e.g. fake-gcs-server) reachable at the URL below.
+/// Requires a GCS emulator reachable at the URL below.
 /// Tests are skipped automatically when no emulator is available.
 /// </summary>
 /// <remarks>
 /// To run locally:
-/// <c>docker run -p 4443:4443 fsouza/fake-gcs-server -scheme http -public-host localhost:4443</c>
+/// <c>pip install git+https://github.com/googleapis/storage-testbench.git</c>, then
+/// <c>storage-testbench --port 4443</c>.
+/// <para>storage-testbench rather than fake-gcs-server: the latter ignores <c>ifGenerationMatch=0</c>,
+/// so it cannot answer for the create-if-absent commit primitive. See
+/// <see cref="GcsTableFileSystemPathConformanceTests"/>.</para>
 /// </remarks>
 public class GcsFileTests : IAsyncLifetime
 {
@@ -74,7 +78,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task WriteAndRead_SimpleParquetFile()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-simple.parquet";
 
@@ -107,7 +111,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task WriteAndRead_LargerFile_MultipleRowGroups()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-large.parquet";
 
@@ -140,7 +144,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task WriteAndRead_WithCompression()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-compressed.parquet";
 
@@ -178,7 +182,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task Position_TracksWrittenBytes()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         await using var file = new GcsSequentialFile(Client, _bucket, "test-position.bin");
 
@@ -196,7 +200,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task RandomAccess_ReadRanges_ReturnsCorrectBytes()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-ranges.bin";
 
@@ -235,7 +239,7 @@ public class GcsFileTests : IAsyncLifetime
     [SkippableFact]
     public async Task RandomAccess_KnownLength_SkipsMetadataFetch()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
 
         const string objectName = "test-known-length.bin";
 
