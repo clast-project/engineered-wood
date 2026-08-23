@@ -447,4 +447,64 @@ public class CheckpointRoundTripTests : IDisposable
         Assert.Single(restored.Metadata.PartitionColumns);
         Assert.Equal("date", restored.Metadata.PartitionColumns[0]);
     }
+
+    /// <summary>
+    /// An OPTIONAL field the commits omit must come back OMITTED from the checkpoint, not as an empty
+    /// string or a zero.
+    /// </summary>
+    /// <remarks>
+    /// <para>This looks cosmetic and is not. A checkpoint summarises the commits, so a checkpoint that
+    /// substitutes <c>""</c> for an absent <c>metaData.name</c> makes the same table read back differently
+    /// depending on WHICH of the two a reader used — and until something compared them, nothing could
+    /// see it.</para>
+    ///
+    /// <para>A version checksum is exactly that comparison. delta-spark reconstructs the metadata from the
+    /// checkpoint, reads the metadata out of the <c>.crc</c>, and fails the whole read when they differ —
+    /// with DELTA_STATE_RECOVER_ERROR, "Did you manually delete files in the _delta_log directory?",
+    /// which names nothing that is actually wrong. MEASURED against delta-spark 4.0.0: every EW table with
+    /// both a checkpoint and a checksum was unreadable until the coercions went.</para>
+    /// </remarks>
+    [Fact]
+    public async Task Checkpoint_KeepsOptionalMetadataFieldsAbsent_RatherThanEmpty()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0,
+        [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = "absent-fields",
+                // Name, Description and CreatedTime all left unset — the shape of a table created by a
+                // writer that names none of them.
+                Format = Format.Parquet,
+                SchemaString =
+                    """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+            },
+            // Likewise txn.lastUpdated, which is optional and was being written as 0.
+            new TransactionId { AppId = "app", Version = 7 },
+        ]);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        await new CheckpointWriter(fs).WriteCheckpointAsync(snapshot);
+
+        var reader = new CheckpointReader(fs);
+        var restored = new SnapshotBuilder();
+        restored.ApplyCommit(0, await reader.ReadCheckpointAsync((await reader.ReadLastCheckpointAsync())!));
+        var fromCheckpoint = restored.Build();
+
+        Assert.Null(fromCheckpoint.Metadata.Name);
+        Assert.Null(fromCheckpoint.Metadata.Description);
+        Assert.Null(fromCheckpoint.Metadata.CreatedTime);
+        Assert.Null(fromCheckpoint.AppTransactions["app"].LastUpdated);
+
+        // Stated as the invariant rather than field by field: the metaData read back from the checkpoint
+        // serialises to the same bytes as the one in the log, whatever fields get added later. Compared as
+        // bytes because MetadataAction is a record whose collection properties compare by reference.
+        Assert.Equal(
+            ActionSerializer.Serialize([snapshot.Metadata]),
+            ActionSerializer.Serialize([fromCheckpoint.Metadata]));
+    }
 }

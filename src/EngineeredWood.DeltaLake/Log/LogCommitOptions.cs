@@ -12,8 +12,29 @@ namespace EngineeredWood.DeltaLake.Log;
 /// </summary>
 public sealed record LogCommitOptions
 {
-    /// <summary>The defaults: checkpoint every 10 versions, validate the writer protocol, prefer typed stats.</summary>
+    /// <summary>The defaults: checkpoint every 10 versions, write a version checksum beside every commit,
+    /// validate the writer protocol, prefer typed stats.</summary>
     public static LogCommitOptions Default { get; } = new();
+
+    /// <summary>
+    /// Write a <c>_delta_log/&lt;version&gt;.crc</c> version checksum after each commit, summarising the
+    /// table state at the version it lands on. Default: true.
+    ///
+    /// <para><b>Why on.</b> PROTOCOL.md says writers SHOULD produce one for each commit; delta-spark
+    /// writes one by default; delta-kernel-rs documents calling <c>write_checksum()</c> on the
+    /// post-commit snapshot after every successful commit. A table maintained by this library and another
+    /// engine in turn otherwise carries checksums only for the other engine's versions, which is the
+    /// state that makes divergence introduced across ours invisible.</para>
+    ///
+    /// <para><b>What it costs.</b> One extra create-if-absent request per commit, and one small JSON
+    /// object per version in the log directory — collected by <see cref="LogCleanup"/> along with the
+    /// commits it describes. Turn it off for a writer where that request is the thing being optimised,
+    /// or where something else is producing checksums for this table.</para>
+    ///
+    /// <para>The file is advisory, so a failure to write one never fails the commit — see
+    /// <see cref="VersionChecksumWriter"/>.</para>
+    /// </summary>
+    public bool WriteVersionChecksums { get; init; } = true;
 
     /// <summary>
     /// Write a checkpoint after every Nth version, or 0 to never checkpoint. A commit checkpoints when the

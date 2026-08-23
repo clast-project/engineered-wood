@@ -21,10 +21,10 @@ namespace EngineeredWood.DeltaLake.Log;
 /// found nothing it depended on had moved.</para>
 ///
 /// <para><b>What it owns.</b> Protocol gating before the first write, the retry loop, the conflict verdict,
-/// the post-commit snapshot refresh, and checkpoint-on-interval. What it deliberately does NOT own is the
-/// meaning of the actions: it never inspects them beyond handing them to the log, so a caller with a data
-/// plane of its own — its own parquet, its own statistics, its own deletion vectors — can use this without
-/// bringing one along.</para>
+/// the post-commit snapshot refresh, the version checksum, and checkpoint-on-interval. What it deliberately
+/// does NOT own is the meaning of the actions: it never inspects them beyond handing them to the log, so a
+/// caller with a data plane of its own — its own parquet, its own statistics, its own deletion vectors —
+/// can use this without bringing one along.</para>
 ///
 /// <para><b>What a caller must still do.</b> Actions whose CONTENT depends on the version they land at
 /// cannot simply be re-committed. Either mark the request <see cref="LogCommitRequest.RebaseSafe"/> false,
@@ -40,16 +40,19 @@ public sealed class LogCommitter
     private readonly TransactionLog _log;
     private readonly LogCommitOptions _options;
     private readonly CheckpointWriter? _checkpointWriter;
+    private readonly VersionChecksumWriter? _checksumWriter;
 
     /// <param name="log">The log to commit to.</param>
-    /// <param name="options">Checkpoint interval, protocol gating, statistics preference. Null takes
-    /// <see cref="LogCommitOptions.Default"/>.</param>
+    /// <param name="options">Checkpoint interval, checksum production, protocol gating, statistics
+    /// preference. Null takes <see cref="LogCommitOptions.Default"/>.</param>
     public LogCommitter(TransactionLog log, LogCommitOptions? options = null)
     {
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _options = options ?? LogCommitOptions.Default;
         if (_options.CheckpointInterval > 0)
             _checkpointWriter = _options.CheckpointWriter ?? new CheckpointWriter(log.FileSystem);
+        if (_options.WriteVersionChecksums)
+            _checksumWriter = new VersionChecksumWriter(log.FileSystem);
     }
 
     /// <summary>
@@ -116,6 +119,24 @@ public sealed class LogCommitter
 
                 var snapshot = await SnapshotBuilder.UpdateAsync(
                     request.RefreshFrom ?? baseSnapshot, _log, cancellationToken).ConfigureAwait(false);
+
+                // Before the checkpoint, which is what delta-kernel-rs's post-commit pattern recommends and
+                // is the order that matters if only one of the two gets to happen: the checksum is a small
+                // create-if-absent write describing a version that already exists, while the checkpoint
+                // rewrites the whole state and can take a while on a large table.
+                //
+                // Named for the SNAPSHOT's version, not `attemptVersion`. A concurrent writer can land
+                // between the commit above and this refresh, in which case the snapshot is at a later
+                // version — and a checksum must describe the version it is named for. Writing
+                // `attemptVersion.crc` from a snapshot that has moved past it is precisely the wrong
+                // checksum this feature must never produce; writing the later version's is correct, since
+                // the snapshot is a genuine reconciliation at that version. The next commit's checksum
+                // covers `attemptVersion` no better and no worse than an absent one already does.
+                if (_checksumWriter is not null)
+                {
+                    await _checksumWriter.TryWriteAsync(snapshot, cancellationToken)
+                        .ConfigureAwait(false);
+                }
 
                 if (request.WriteCheckpointOnInterval
                     && _checkpointWriter is not null

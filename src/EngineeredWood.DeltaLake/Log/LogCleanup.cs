@@ -36,9 +36,9 @@ namespace EngineeredWood.DeltaLake.Log;
 /// <see cref="SweepUnreferencedSidecarsAsync"/> for the rule and for why its age condition is
 /// load-bearing rather than tidy.</para>
 ///
-/// <para><b>Version-checksum files go too, though nothing here writes one.</b> delta-spark writes a
-/// <c>&lt;version&gt;.crc</c> beside every commit by default, so a table shared with it accumulates one
-/// per commit — and unrecognised they were the one class of file left growing without bound. See
+/// <para><b>Version-checksum files go too.</b> Both this library and delta-spark write a
+/// <c>&lt;version&gt;.crc</c> beside every commit by default, so a table accumulates one per commit from
+/// either writer — and unrecognised they were the one class of file left growing without bound. See
 /// <see cref="SweepExpiredChecksumsAsync"/>, including why they are swept separately rather than walked
 /// with the commits.</para>
 /// </summary>
@@ -216,10 +216,11 @@ internal static class LogCleanup
     /// removed. Returns how many were deleted.
     /// </summary>
     /// <remarks>
-    /// <para>This library writes none, but delta-spark writes one beside every commit by default, so any
-    /// table shared with it accumulates one per commit. Unrecognised, they were the one file class cleanup
-    /// left growing without bound — the exact condition it exists to end, surviving in a name it did not
-    /// parse. delta-spark deletes them alongside commits and checkpoints, filtering its own listing on
+    /// <para>Both this library (<see cref="VersionChecksumWriter"/>) and delta-spark write one beside every
+    /// commit by default, so a table accumulates one per commit whoever maintains it. Unrecognised, they
+    /// were the one file class cleanup left growing without bound — the exact condition it exists to end,
+    /// surviving in a name it did not parse. delta-spark deletes them alongside commits and checkpoints,
+    /// filtering its own listing on
     /// <c>isCheckpointFile(f) || isDeltaFile(f) || isChecksumFile(f)</c>.</para>
     ///
     /// <para><b>⚠ Swept separately rather than folded into the prefix walk, so that a file outside the

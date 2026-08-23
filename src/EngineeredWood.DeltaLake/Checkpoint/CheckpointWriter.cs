@@ -517,10 +517,23 @@ public sealed class CheckpointWriter
             if (actions[i] is MetadataAction m)
             {
                 idBuilder.Append(m.Id);
-                nameBuilder.Append(m.Name ?? "");
-                descBuilder.Append(m.Description ?? "");
+                // ABSENT, not empty/zero. All three fields are optional in the commit JSON, and coercing
+                // them here made a checkpoint DISAGREE with the commits it summarises: a table read from
+                // the log had `name: null`, the same table read from this checkpoint had `name: ""`, and
+                // no reader could see both to notice.
+                //
+                // A reader that DOES see both is exactly what a version checksum creates. delta-spark
+                // compares the metadata it reconstructs from the checkpoint against the metadata in the
+                // `.crc` and, when they differ, fails the whole read with DELTA_STATE_RECOVER_ERROR —
+                // "Did you manually delete files in the _delta_log directory?", which names nothing that
+                // is actually wrong. MEASURED against delta-spark 4.0.0, and it is why this was found.
+                nameBuilder.AppendOrNull(m.Name);
+                descBuilder.AppendOrNull(m.Description);
                 schemaStringBuilder.Append(m.SchemaString);
-                createdTimeBuilder.Append(m.CreatedTime ?? 0);
+                if (m.CreatedTime is { } createdTime)
+                    createdTimeBuilder.Append(createdTime);
+                else
+                    createdTimeBuilder.AppendNull();
                 formatProviderBuilder.Append(m.Format.Provider);
 
                 int partColCount = 0;
@@ -935,7 +948,13 @@ public sealed class CheckpointWriter
             {
                 appIdBuilder.Append(t.AppId);
                 versionBuilder.Append(t.Version);
-                lastUpdatedBuilder.Append(t.LastUpdated ?? 0);
+                // Absent, not zero — same reasoning as metaData's optional fields above, and the same
+                // consequence: delta-spark compares a checksum's setTransactions against the ones it
+                // reconstructs, and `lastUpdated: 0` against absent is a mismatch.
+                if (t.LastUpdated is { } lastUpdated)
+                    lastUpdatedBuilder.Append(lastUpdated);
+                else
+                    lastUpdatedBuilder.AppendNull();
             }
             else
             {

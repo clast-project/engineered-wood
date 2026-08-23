@@ -84,6 +84,27 @@ internal static class ActionSerializer
         return ms.ToArray();
     }
 
+    /// <summary>
+    /// Writes one action's BODY — what sits inside <c>{"metaData": ... }</c> — with no wrapper object.
+    /// </summary>
+    /// <remarks>
+    /// For the version-checksum file, whose <c>metadata</c> / <c>protocol</c> fields and
+    /// <c>setTransactions</c> / <c>domainMetadata</c> array entries are action bodies carried directly
+    /// rather than wrapped. Routed through the log's own serializer so the two can never disagree about a
+    /// field's name, its presence rule, or its shape — <c>metaData.format.options</c> is emitted even when
+    /// empty because delta-kernel-rs fails the whole read without it, and a checksum carrying its own copy
+    /// of that reasoning would be one edit away from re-breaking it.
+    /// </remarks>
+    internal static void WriteActionBody(Utf8JsonWriter writer, DeltaAction action) =>
+        DeltaActionConverter.WriteBody(writer, action, s_options);
+
+    /// <summary>
+    /// Reads one action's BODY of the given log type, leaving the reader on its final token. The
+    /// counterpart of <see cref="WriteActionBody"/>.
+    /// </summary>
+    internal static DeltaAction? ReadActionBody(ref Utf8JsonReader reader, string actionType) =>
+        DeltaActionConverter.ReadBody(ref reader, actionType, s_options);
+
     private static bool HasNonWhitespace(ReadOnlySpan<byte> data)
     {
         for (int i = 0; i < data.Length; i++)
@@ -113,7 +134,25 @@ internal static class ActionSerializer
             string actionType = reader.GetString()!;
             reader.Read(); // Move to the action value
 
-            DeltaAction? action = actionType switch
+            DeltaAction? action = ReadBody(ref reader, actionType, options);
+
+            reader.Read(); // End object
+            return action;
+        }
+
+        /// <summary>
+        /// Reads ONE action's body — the object INSIDE the <c>{"metaData": ...}</c> wrapper — leaving the
+        /// reader on its final token.
+        /// </summary>
+        /// <remarks>
+        /// Split out of <see cref="Read"/> so a caller holding a bare action body can decode it with the
+        /// same code the log does. The version-checksum file is that caller: its <c>metadata</c> and
+        /// <c>protocol</c> fields, and the entries of its <c>setTransactions</c> / <c>domainMetadata</c>
+        /// arrays, are action bodies with no wrapper — the same shapes, one nesting level up.
+        /// </remarks>
+        public static DeltaAction? ReadBody(
+            ref Utf8JsonReader reader, string actionType, JsonSerializerOptions options) =>
+            actionType switch
             {
                 "add" => DeserializeAdd(ref reader, options),
                 "remove" => DeserializeRemove(ref reader, options),
@@ -128,64 +167,57 @@ internal static class ActionSerializer
                 _ => SkipUnknownAction(ref reader),
             };
 
-            reader.Read(); // End object
-            return action;
-        }
-
         public override void Write(
             Utf8JsonWriter writer, DeltaAction value, JsonSerializerOptions options)
         {
             writer.WriteStartObject();
+            writer.WritePropertyName(ActionTypeName(value));
+            WriteBody(writer, value, options);
+            writer.WriteEndObject();
+        }
 
+        /// <summary>The log's name for this action — the single property of its wrapper object.</summary>
+        public static string ActionTypeName(DeltaAction value) => value switch
+        {
+            AddFile => "add",
+            RemoveFile => "remove",
+            MetadataAction => "metaData",
+            ProtocolAction => "protocol",
+            CommitInfo => "commitInfo",
+            TransactionId => "txn",
+            CdcFile => "cdc",
+            DomainMetadata => "domainMetadata",
+            CheckpointMetadata => "checkpointMetadata",
+            SidecarFile => "sidecar",
+            _ => throw new DeltaFormatException(
+                DeltaErrorCodes.UnsupportedActionType,
+                $"Unknown action type: {value.GetType().Name}"),
+        };
+
+        /// <summary>
+        /// Writes ONE action's body — the object that goes INSIDE the wrapper — and nothing else. The
+        /// write-side counterpart of <see cref="ReadBody"/>; see there for who needs a bare body.
+        /// </summary>
+        public static void WriteBody(
+            Utf8JsonWriter writer, DeltaAction value, JsonSerializerOptions options)
+        {
             switch (value)
             {
-                case AddFile add:
-                    writer.WritePropertyName("add");
-                    SerializeAdd(writer, add, options);
-                    break;
-                case RemoveFile remove:
-                    writer.WritePropertyName("remove");
-                    SerializeRemove(writer, remove, options);
-                    break;
-                case MetadataAction metadata:
-                    writer.WritePropertyName("metaData");
-                    SerializeMetadata(writer, metadata, options);
-                    break;
-                case ProtocolAction protocol:
-                    writer.WritePropertyName("protocol");
-                    SerializeProtocol(writer, protocol, options);
-                    break;
-                case CommitInfo commitInfo:
-                    writer.WritePropertyName("commitInfo");
-                    SerializeCommitInfo(writer, commitInfo);
-                    break;
-                case TransactionId txn:
-                    writer.WritePropertyName("txn");
-                    SerializeTxn(writer, txn, options);
-                    break;
-                case CdcFile cdc:
-                    writer.WritePropertyName("cdc");
-                    SerializeCdc(writer, cdc, options);
-                    break;
-                case DomainMetadata dm:
-                    writer.WritePropertyName("domainMetadata");
-                    SerializeDomainMetadata(writer, dm, options);
-                    break;
-                case CheckpointMetadata cm:
-                    writer.WritePropertyName("checkpointMetadata");
-                    SerializeCheckpointMetadata(writer, cm);
-                    break;
-                case SidecarFile sc:
-                    writer.WritePropertyName("sidecar");
-                    SerializeSidecar(writer, sc);
-                    break;
+                case AddFile add: SerializeAdd(writer, add, options); break;
+                case RemoveFile remove: SerializeRemove(writer, remove, options); break;
+                case MetadataAction metadata: SerializeMetadata(writer, metadata, options); break;
+                case ProtocolAction protocol: SerializeProtocol(writer, protocol, options); break;
+                case CommitInfo commitInfo: SerializeCommitInfo(writer, commitInfo); break;
+                case TransactionId txn: SerializeTxn(writer, txn, options); break;
+                case CdcFile cdc: SerializeCdc(writer, cdc, options); break;
+                case DomainMetadata dm: SerializeDomainMetadata(writer, dm, options); break;
+                case CheckpointMetadata cm: SerializeCheckpointMetadata(writer, cm); break;
+                case SidecarFile sc: SerializeSidecar(writer, sc); break;
                 default:
                     throw new DeltaFormatException(
                         DeltaErrorCodes.UnsupportedActionType,
                         $"Unknown action type: {value.GetType().Name}");
             }
-
-            writer.WriteEndObject();
         }
 
         #region Deserialization

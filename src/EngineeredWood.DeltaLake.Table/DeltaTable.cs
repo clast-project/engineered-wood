@@ -41,12 +41,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The interval THIS table checkpoints at — its own <c>delta.checkpointInterval</c> where it declares
     /// one, else the caller's option. Resolved once and held, because there are TWO independent checkpoint
     /// triggers — the commit loop's <see cref="LogCommitOptions"/> and
-    /// <see cref="CheckpointIfDueAsync"/>, which every path that commits outside the committer calls — and
+    /// <see cref="AfterCommitAsync"/>, which every path that commits outside the committer calls — and
     /// a value read separately in each is a value that can drift: fixing only one leaves the property
     /// honoured on some write paths and ignored on others, which is harder to notice than ignoring it
     /// everywhere.
     /// </summary>
     private readonly int _checkpointInterval;
+
+    /// <summary>
+    /// Writes the post-commit version checksum, or null when
+    /// <see cref="DeltaTableOptions.WriteVersionChecksums"/> is off. Used by
+    /// <see cref="AfterCommitAsync"/> only — the commits that go through <see cref="LogCommitter"/> get
+    /// their checksum from the committer's own writer instead, and must not be written twice.
+    /// </summary>
+    private readonly VersionChecksumWriter? _checksumWriter;
 
     private Snapshot.Snapshot? _currentSnapshot;
     private bool _disposed;
@@ -67,10 +75,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Format = options.CheckpointFormat,
         };
         _checkpointInterval = ResolveCheckpointInterval(options, snapshot);
+        if (options.WriteVersionChecksums)
+            _checksumWriter = new VersionChecksumWriter(fileSystem);
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
             CheckpointInterval = _checkpointInterval,
-            // Shared with CheckpointAsync and with CheckpointIfDueAsync, so every checkpoint this table
+            // Same switch on both commit routes. The committer builds its own writer over the same
+            // filesystem; what must agree is the DECISION, and that is this option.
+            WriteVersionChecksums = options.WriteVersionChecksums,
+            // Shared with CheckpointAsync and with AfterCommitAsync, so every checkpoint this table
             // writes — on the interval, from either commit trigger, or because a caller asked — uses the
             // caller's parquet options and checkpoint format rather than the committer's defaults.
             CheckpointWriter = _checkpointWriter,
@@ -692,7 +705,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             var builder = new SnapshotBuilder();
             builder.ApplyCommit(0, createActions);
-            return new DeltaTable(fileSystem, options, builder.Build());
+            var created = new DeltaTable(fileSystem, options, builder.Build());
+            // The creation commit is a commit, so it gets the same post-commit treatment as any other —
+            // which for version 0 means a checksum and (by delta-spark's own rule) no checkpoint. The
+            // snapshot built above is already at version 0, so the seam's refresh is a no-op.
+            await created.AfterCommitAsync(0, cancellationToken).ConfigureAwait(false);
+            return created;
         }
 
         var provisionalBuilder = previousSnapshot is null
@@ -749,7 +767,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? new SnapshotBuilder()
                 : SnapshotBuilder.FromSnapshot(previousSnapshot);
             committedBuilder.ApplyCommit(version, commitActions);
-            return new DeltaTable(fileSystem, options, committedBuilder.Build());
+            var created = new DeltaTable(fileSystem, options, committedBuilder.Build());
+            await created.AfterCommitAsync(version, cancellationToken).ConfigureAwait(false);
+            return created;
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1834,10 +1854,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long newVersion = snapshot.Version + 1;
         await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
 
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+        // Refresh, checksum and checkpoint-on-interval all live in the seam — see AfterCommitAsync.
+        await AfterCommitAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -1902,10 +1920,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             logicalColumns is { Count: > 0 } ? "SET SORTED BY" : "RESET SORTED BY");
         await _log.WriteCommitAsync(newVersion, final, cancellationToken).ConfigureAwait(false);
 
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken)
-            .ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+        await AfterCommitAsync(newVersion, cancellationToken).ConfigureAwait(false);
         return newVersion;
     }
 
@@ -2174,10 +2189,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await _log.WriteCommitAsync(newVersion, actions, cancellationToken)
             .ConfigureAwait(false);
 
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+        await AfterCommitAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -2215,10 +2227,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await _log.WriteCommitAsync(newVersion, actions, cancellationToken)
             .ConfigureAwait(false);
 
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        await CheckpointIfDueAsync(newVersion, cancellationToken).ConfigureAwait(false);
+        await AfterCommitAsync(newVersion, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
     }
@@ -2728,7 +2737,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // with no checkpoint nothing can ever be reclaimed.
                 //
                 // OPTIMIZE and the metadata-only changes do NOT come through here — they commit through
-                // TransactionLog directly and get the same interval check from CheckpointIfDueAsync.
+                // TransactionLog directly and get the same interval check from AfterCommitAsync.
                 //
                 // No new mechanism — the condition (interval reached, writer present) and the ordering
                 // (after the post-commit snapshot refresh, from the refreshed snapshot) are LogCommitter's
@@ -5328,51 +5337,89 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
             // the OCC loop's own clear — see CommitOccAsync.
             written?.Clear();
-            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-                snapshot, _log, cancellationToken).ConfigureAwait(false);
             committedVersion = newVersion;
         }
 
-        // Auto-checkpoint on the version that actually committed (a rebased append may differ from the
-        // read version + 1). Skipped when nothing was staged (an all-empty append returns the read
-        // version without committing).
+        // Refresh, checksum and auto-checkpoint on the version that actually committed (a rebased append
+        // may differ from the read version + 1). Skipped when nothing was staged (an all-empty append
+        // returns the read version without committing).
         //
-        // The OVERWRITE family only: a blind append goes through the OCC loop above, which checkpoints on
-        // the interval itself. Running both would write the interval's checkpoint TWICE — harmless
-        // duplicated work under the classic form, which overwrites one fixed path, but a V2 checkpoint is
-        // UUID-named, so the second write leaves the first behind as a file nothing references and nothing
-        // collects (VacuumExecutor excludes _delta_log).
+        // The OVERWRITE family only: a blind append goes through the OCC loop above, which does all three
+        // itself. Running both would write the interval's checkpoint TWICE — harmless duplicated work
+        // under the classic form, which overwrites one fixed path, but a V2 checkpoint is UUID-named, so
+        // the second write leaves the first behind as a file nothing references and nothing collects
+        // (VacuumExecutor excludes _delta_log).
         if (!blindAppend && committedVersion > snapshot.Version)
-            await CheckpointIfDueAsync(committedVersion, cancellationToken).ConfigureAwait(false);
+            await AfterCommitAsync(committedVersion, cancellationToken).ConfigureAwait(false);
 
         return committedVersion;
     }
 
     /// <summary>
-    /// Writes the interval checkpoint for a version that has just committed, if that version is one the
-    /// interval falls on. The commit paths that do NOT go through <see cref="LogCommitter"/> — the
-    /// overwrite family, OPTIMIZE, and the metadata-only changes — each call this; the ones that do get
-    /// the same check from the committer instead, and must not call it as well.
+    /// Everything this layer owes a commit once it is durable: bring <see cref="CurrentSnapshot"/> up to
+    /// the committed version, write that version's checksum, and write the interval checkpoint when the
+    /// interval falls on it.
     /// </summary>
     /// <remarks>
-    /// <para>Call only AFTER the post-commit snapshot refresh: the checkpoint is written from
-    /// <see cref="CurrentSnapshot"/>, and is named for the version that snapshot is at. Under a concurrent
-    /// writer that can be a LATER version than <paramref name="committedVersion"/> — which is fine, since
-    /// what gets written is a real checkpoint of a real version either way, and it is the behaviour the
+    /// <para><b>THE post-commit seam for this class.</b> The commit paths that do NOT go through
+    /// <see cref="LogCommitter"/> — table creation, the overwrite family, OPTIMIZE, VACUUM's bookend
+    /// commits, and the metadata-only changes — each call this and only this; the ones that DO go through
+    /// the committer get the identical work from the committer's own post-commit block and must not call
+    /// it as well.</para>
+    ///
+    /// <para><b>Why one method rather than a call per concern.</b> This started as a checkpoint-only hook
+    /// that each path invoked after refreshing its own snapshot, and the interval and the log cleanup had
+    /// both already drifted out of one path or another — a checkpoint written where cleanup was forgotten,
+    /// a path that checkpointed and one beside it that did not. A checksum is worse to get partially
+    /// right than either: written on some commit paths and not others, the checksums of a table stop
+    /// being usable as a set for the divergence detection they exist for. So the refresh moved IN here.
+    /// A path that already refreshed pays nothing (the guard sees the snapshot is current); a path that
+    /// did not gets the snapshot this needs; and adding post-commit work later means editing one method
+    /// rather than auditing six call sites.</para>
+    ///
+    /// <para>Both files are named for the version <see cref="CurrentSnapshot"/> is at, which under a
+    /// concurrent writer can be LATER than <paramref name="committedVersion"/>. That is correct rather
+    /// than merely tolerable: the snapshot is a real reconciliation at its own version, so a checkpoint or
+    /// a checksum written from it describes the version it is named for. It is also the behaviour the
     /// batch write path has always had.</para>
+    ///
+    /// <para><b>Version 0 is never checkpointed</b>, matching delta-spark's own condition
+    /// (<c>committedVersion != 0 &amp;&amp; committedVersion % interval == 0</c>): every interval divides
+    /// zero, so without the exclusion creating a table would checkpoint a log holding one commit. It still
+    /// gets a checksum — that one is per-version and costs a single small write.</para>
     ///
     /// <para><c>CheckpointInterval = 0</c> is "never checkpoint", an absolute caller override — a host may
     /// be driving checkpoints on a cadence of its own and must not have one appear underneath it.</para>
     /// </remarks>
-    private ValueTask CheckpointIfDueAsync(long committedVersion, CancellationToken cancellationToken)
+    private async ValueTask AfterCommitAsync(long committedVersion, CancellationToken cancellationToken)
     {
-        if (_checkpointInterval <= 0
-            || committedVersion % _checkpointInterval != 0)
+        // Refreshed only when BEHIND, so the paths that already built their post-commit snapshot — the
+        // creation commit builds one from actions in memory rather than reading back what it just wrote —
+        // do not pay for a second replay, and never walk backwards.
+        if (_currentSnapshot is null)
         {
-            return default;
+            _currentSnapshot = await SnapshotBuilder.BuildAsync(
+                _log, _checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+        }
+        else if (_currentSnapshot.Version < committedVersion)
+        {
+            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+                _currentSnapshot, _log, cancellationToken).ConfigureAwait(false);
         }
 
-        return WriteCheckpointAndCleanUpLogAsync(CurrentSnapshot, cancellationToken);
+        if (_checksumWriter is not null)
+        {
+            await _checksumWriter.TryWriteAsync(CurrentSnapshot, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (_checkpointInterval > 0
+            && committedVersion != 0
+            && committedVersion % _checkpointInterval == 0)
+        {
+            await WriteCheckpointAndCleanUpLogAsync(CurrentSnapshot, cancellationToken)
+                .ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -5384,7 +5431,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// becoming durable is the one moment the work is both legitimate and worth doing — which means every
     /// checkpoint trigger owes a cleanup, and a trigger that writes one without the other quietly stops
     /// reclaiming on whichever commit paths reach it. There are two triggers left in this class
-    /// (<see cref="CheckpointIfDueAsync"/> and <see cref="CheckpointAsync"/>) and one in
+    /// (<see cref="AfterCommitAsync"/> and <see cref="CheckpointAsync"/>) and one in
     /// <see cref="LogCommitter"/>; that is three chances to wire a checkpoint and forget the cleanup, and
     /// it has already happened once — the interval itself drifted the same way twice, which is why the
     /// tests assert cleanup per trigger rather than once.</para>
@@ -8008,13 +8055,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         if (result.HasValue)
         {
-            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-                CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
-
             // OPTIMIZE is the operation with the most reason to checkpoint: it removes every file it
             // rewrote, so the commit it writes is the largest the table produces, and a log replay that
-            // cannot start from a checkpoint reads all of it.
-            await CheckpointIfDueAsync(result.Value, cancellationToken).ConfigureAwait(false);
+            // cannot start from a checkpoint reads all of it. The snapshot refresh it needs first comes
+            // from the seam.
+            await AfterCommitAsync(result.Value, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
@@ -8044,9 +8089,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             ?? DeletedFileRetention(CurrentSnapshot.Metadata.Configuration)
             ?? _options.VacuumRetention;
 
+        // VACUUM's two commitInfo-only commits are commits, and each goes through the same seam as every
+        // other — hence a per-commit callback rather than one call after the fact. Two consequences worth
+        // naming: this handle's snapshot moves to the VACUUM END version rather than staying two behind,
+        // and a table maintained only by vacuuming can now reach the checkpoint interval. Neither used to
+        // happen, and both are what every other commit path already does.
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun,
-            _options.HideIcebergMetadataDirectory, cancellationToken)
+            _options.HideIcebergMetadataDirectory, cancellationToken,
+            afterCommit: AfterCommitAsync)
             .ConfigureAwait(false);
     }
 
