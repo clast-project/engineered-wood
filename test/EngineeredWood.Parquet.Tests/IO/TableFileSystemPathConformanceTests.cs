@@ -99,6 +99,15 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
     /// <para>Every entry here is a claim about a fake, not about EW, and each is measured at the wire
     /// level rather than inferred from a red test. A gap declared here is an argument for a better
     /// emulator in step 2, and the flag should be deleted the day one arrives.</para>
+    ///
+    /// <para><b>Wire-level evidence is necessary and not sufficient.</b> This enum shipped with a
+    /// <c>RangedRead</c> entry blaming fake-gcs-server for sending a whole-object hash on a <c>206</c>.
+    /// That observation was accurate and the conclusion was wrong: <c>googleapis/storage-testbench</c>
+    /// sends the same header, because that is what the SERVICE does — the defect was on our side, in a
+    /// download option left unset. Before adding a flag here, check that a FAITHFUL server would actually
+    /// behave differently; "the emulator does X and our code fails" does not establish that X is the
+    /// emulator's fault. A wrong flag here is worse than no flag, because it turns a real bug into a
+    /// documented, permanently skipped non-problem.</para>
     /// </summary>
     [Flags]
     protected enum EmulatorGap
@@ -107,20 +116,12 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
         None = 0,
 
         /// <summary>
-        /// The emulator answers a Range request with the WHOLE object's checksum, so the SDK's own
-        /// hash validation rejects the partial content it just asked for. MEASURED on fake-gcs-server:
-        /// a <c>206 Partial Content</c> carrying <c>X-Goog-Hash: crc32c=...</c> computed over all the
-        /// bytes, not the returned ones.
-        /// </summary>
-        RangedRead = 1 << 0,
-
-        /// <summary>
         /// The emulator ignores the create-if-absent precondition. MEASURED on fake-gcs-server: two raw
         /// uploads with <c>ifGenerationMatch=0</c> both return 200 and the second overwrites. EW sends
         /// the precondition correctly; the fake does not enforce it, so it cannot answer the one
         /// property <see cref="ITableFileSystem.TryWriteAllBytesAsync"/> documents as load-bearing.
         /// </summary>
-        CreateIfAbsent = 1 << 1,
+        CreateIfAbsent = 1 << 0,
     }
 
     /// <summary>What this backend's emulator cannot answer. See <see cref="EmulatorGap"/>.</summary>
@@ -194,7 +195,6 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
     {
         Require();
         var fs = FileSystem;
-        SkipForGap(EmulatorGap.RangedRead, "a Range request");
 
         // One representative name is enough here: a ranged read differs from a whole-object read only in
         // the range header, and the key is spelled by the same code either way. What this covers that
