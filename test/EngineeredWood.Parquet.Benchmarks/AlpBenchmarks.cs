@@ -46,13 +46,11 @@ public class AlpBenchmarks
         _decoded = new double[ValueCount];
 
         // A benchmark labelled with a width it did not actually produce is worse than no benchmark,
-        // so check what the encoder chose rather than trusting the generator.
-        int actual = FirstVectorBitWidth(_page);
-        if (actual != BitWidth)
-        {
-            throw new InvalidOperationException(
-                $"generator aimed for bit width {BitWidth} but the encoder produced {actual}");
-        }
+        // so check what the encoder chose rather than trusting the generator. Every vector, not just
+        // the first: a page holds 128 of them and each picks its own (exponent, factor) and its own
+        // width from its own range, so checking one and assuming the rest would be checking the only
+        // vector the generator pins the extremes into.
+        ValidateEveryVectorBitWidth(_page, BitWidth);
 
         AlpDecoder.DecodeDoubles(_page, _decoded, ValueCount);
         for (int i = 0; i < ValueCount; i++)
@@ -105,7 +103,7 @@ public class AlpBenchmarks
 
         for (int i = 0; i < count; i++)
         {
-            long k = NextBelowPowerOfTwo(random, bitWidth) / unit * unit;
+            long k = NextValueOfWidth(random, bitWidth) / unit * unit;
             values[i] = decimalLike ? k / 100.0 : k;
         }
 
@@ -116,7 +114,8 @@ public class AlpBenchmarks
         return values;
     }
 
-    private static long NextBelowPowerOfTwo(Random random, int bits)
+    /// <summary>A random value in the low <paramref name="bits"/> bits, built 30 at a time.</summary>
+    private static long NextValueOfWidth(Random random, int bits)
     {
         long value = 0;
         for (int taken = 0; taken < bits; taken += 30)
@@ -124,14 +123,27 @@ public class AlpBenchmarks
         return value & ((1L << bits) - 1);
     }
 
-    private static int FirstVectorBitWidth(byte[] page)
+    private static void ValidateEveryVectorBitWidth(byte[] page, int expected)
     {
         const int PageHeaderSize = 7;
         const int AlpInfoSize = 4;
         const int DoubleForInfoSize = 9;
 
-        int firstVector = PageHeaderSize +
-            (int)BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(PageHeaderSize, 4));
-        return page[firstVector + AlpInfoSize + DoubleForInfoSize - 1];
+        int vectorSize = 1 << page[2];
+        int numElements = BinaryPrimitives.ReadInt32LittleEndian(page.AsSpan(3, 4));
+        int numVectors = (numElements + vectorSize - 1) / vectorSize;
+
+        for (int v = 0; v < numVectors; v++)
+        {
+            int vector = PageHeaderSize +
+                (int)BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(PageHeaderSize + v * 4, 4));
+            int width = page[vector + AlpInfoSize + DoubleForInfoSize - 1];
+
+            if (width != expected)
+            {
+                throw new InvalidOperationException(
+                    $"aimed for bit width {expected} but vector {v} of {numVectors} came out at {width}");
+            }
+        }
     }
 }
