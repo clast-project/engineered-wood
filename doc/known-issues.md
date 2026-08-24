@@ -469,8 +469,21 @@ is the one with a live consumer: kernel surfaces it through
 disagree about its NAME — delta-spark emits `histogramOpt`, which is not
 what the spec calls it, and kernel accepts either but rejects a file
 carrying both — so adding EW's is a compatibility question rather than a
-fill-in-a-field one. Nothing in EW READS a checksum to shortcut work; a
-snapshot is still built by replaying the log.
+fill-in-a-field one.
+
+**Version checksums are validated against, never served from.**
+`VersionChecksumValidator` compares a reconstructed snapshot against the
+`.crc` beside its version and reports the fields that disagree, naming
+both values and which side each came from. Nothing READS a checksum to
+shortcut work: a snapshot is still built by replaying the log, and the
+counts, the metadata / protocol and the live `txn` / `domainMetadata` sets
+are recomputed rather than taken from the file. That asymmetry is
+deliberate — nothing signs a checksum and nothing cross-checks it, so
+using one as a second opinion costs a report when it is wrong, while
+using one as an answer costs a wrong answer. Validation is opt-in and off
+by default; a disagreement is returned, not thrown, because throwing,
+falling back to the log and reporting-without-failing all suit different
+callers.
 
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
