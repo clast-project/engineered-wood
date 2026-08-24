@@ -335,6 +335,97 @@ public class AlpDecoderTests
         return (bits & 1) == 0 ? value : -value;
     }
 
+    [Fact]
+    public void DecodeDoubles_VectorizedTransform_MatchesClastAlpInAndOutOfRange()
+    {
+        // The transform vectorizes only while two separate things hold: the ENCODED values fit the
+        // range where converting to double is exact, and scaling them by 10^factor does not
+        // overflow int64. The exactness bound is on the encoded value, not the scaled one — putting
+        // it on the scaled one is also correct but disables the fast path on essentially all real
+        // data. Both halves need covering, so sweep every (exponent, factor) the spec allows against
+        // frames of reference that put the vector well inside the range, on its edge, and far
+        // outside it — the last case overflowing int64, where the scalar path and Clast.Alp agree
+        // on the wrapped result.
+        //
+        // 300 values per case is deliberate: more than a whole tile's worth of vector iterations,
+        // and not a multiple of eight, so the bulk unpack, its scalar tail and the vector transform
+        // with a scalar remainder all run in the same decode.
+        ulong state = 555;
+        const int Count = 300;
+        const int BitWidth = 11;
+
+        foreach (long frame in new[] { 0L, -1_000L, 1L << 40, long.MinValue / 4 })
+        {
+            for (int exponent = 0; exponent <= 18; exponent++)
+            {
+                for (int factor = 0; factor <= exponent; factor++)
+                {
+                    var deltas = new long[Count];
+                    for (int i = 0; i < Count; i++)
+                        deltas[i] = (long)(NextRandomBits(ref state) & ((1UL << BitWidth) - 1UL));
+
+                    var page = BuildWideDoubleVectorPage(
+                        Count, exponent, factor, frame, BitWidth, deltas);
+
+                    var output = new double[Count];
+                    AlpDecoder.DecodeDoubles(page, output, Count);
+
+                    for (int i = 0; i < Count; i++)
+                    {
+                        double expected = Clast.Alp.AlpDecoder.DecodeValue(
+                            unchecked(deltas[i] + frame), exponent, factor);
+                        Assert.True(
+                            BitConverter.DoubleToInt64Bits(expected) ==
+                            BitConverter.DoubleToInt64Bits(output[i]),
+                            $"frame={frame} e={exponent} f={factor} i={i}: " +
+                            $"expected {expected:R} got {output[i]:R}");
+                    }
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void DecodeDoubles_VectorizedTransform_IsExactOnTheRangeBoundary()
+    {
+        // Right at the edge of what the conversion can represent: with factor 0 the widest encoded
+        // value the guard admits is 2^51 - 1, which biases to exactly 2^52 - 1 — the last integer a
+        // double holds without rounding. One past it the guard has to decline, and an off-by-one
+        // either way would silently corrupt values rather than fail loudly.
+        const int BitWidth = 51;
+        long span = (1L << BitWidth) - 1;
+
+        // 64 values, not the handful the boundary itself needs: at this width a shorter buffer is
+        // too small for the bulk unpacker's trailing read, so it declines and the whole vector goes
+        // down the per-value path — which would leave this test passing without ever running the
+        // code it is named for. At 64 the bulk path takes 56 of them.
+        const int Count = 64;
+
+        foreach (long frame in new[] { 0L, 1L, -1L, -span })
+        {
+            long[] interesting = [0, 1, span / 2, span - 1, span, 7];
+            var deltas = new long[Count];
+            for (int i = 0; i < Count; i++)
+                deltas[i] = interesting[i % interesting.Length];
+
+            var page = BuildWideDoubleVectorPage(
+                deltas.Length, exponent: 0, factor: 0, frame, BitWidth, deltas);
+
+            var output = new double[deltas.Length];
+            AlpDecoder.DecodeDoubles(page, output, deltas.Length);
+
+            for (int i = 0; i < deltas.Length; i++)
+            {
+                double expected = Clast.Alp.AlpDecoder.DecodeValue(
+                    unchecked(deltas[i] + frame), 0, 0);
+                Assert.True(
+                    BitConverter.DoubleToInt64Bits(expected) ==
+                    BitConverter.DoubleToInt64Bits(output[i]),
+                    $"frame={frame} i={i}: expected {expected:R} got {output[i]:R}");
+            }
+        }
+    }
+
     /// <summary>SplitMix64: a bit source that behaves identically on every target framework.</summary>
     private static ulong NextRandomBits(ref ulong state)
     {
