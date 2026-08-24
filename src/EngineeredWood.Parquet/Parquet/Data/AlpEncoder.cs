@@ -217,9 +217,13 @@ internal static class AlpEncoder
         totals.Clear();
         Span<double> sample = stackalloc double[SamplesPerVector];
 
-        int stride = Math.Max(1, numVectors / SampledVectorsPerPage);
-        for (int v = 0; v < numVectors; v += stride)
+        // Spread the budget over the page rather than striding by a floor-divided step, which
+        // overshoots whenever the vector count is not a multiple of it — a 15-vector page sampled
+        // all 15, and this pass is the most expensive thing the encoder does on a short page.
+        int sampled = Math.Min(SampledVectorsPerPage, numVectors);
+        for (int s = 0; s < sampled; s++)
         {
+            int v = (int)((long)s * numVectors / sampled);
             int start = v * vectorSize;
             int n = Math.Min(vectorSize, values.Length - start);
             int taken = Sample(values.Slice(start, n), sample);
@@ -444,9 +448,11 @@ internal static class AlpEncoder
         totals.Clear();
         Span<float> sample = stackalloc float[SamplesPerVector];
 
-        int stride = Math.Max(1, numVectors / SampledVectorsPerPage);
-        for (int v = 0; v < numVectors; v += stride)
+        // See BuildDoubleShortlist for why this spreads a fixed budget rather than striding.
+        int sampled = Math.Min(SampledVectorsPerPage, numVectors);
+        for (int s = 0; s < sampled; s++)
         {
+            int v = (int)((long)s * numVectors / sampled);
             int start = v * vectorSize;
             int n = Math.Min(vectorSize, values.Length - start);
             int taken = Sample(values.Slice(start, n), sample);
