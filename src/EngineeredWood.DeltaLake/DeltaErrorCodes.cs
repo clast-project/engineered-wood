@@ -229,6 +229,23 @@ public static class DeltaErrorCodes
     public const string DomainMetadataConflict = "DELTA_DOMAIN_METADATA_CONFLICT";
 
     /// <summary>
+    /// A commit carries a <c>domainMetadata</c> action while the protocol it is committing does not
+    /// declare the <c>domainMetadata</c> writer feature. The table that commit would produce is malformed.
+    /// </summary>
+    /// <remarks>
+    /// <para>The code is delta-spark's own, reused deliberately and unusually: unlike
+    /// <see cref="DomainMetadataConflict"/> — where Delta's verdict was right but its catalogued message
+    /// described an unrelated condition — this is the SAME condition delta-spark raises it for, from
+    /// <c>DomainMetadataUtilsBase.validateDomainMetadataSupportedAndNoDuplicate</c>, with the same
+    /// catalogued message ("Detected DomainMetadata action(s) for domains &lt;domainNames&gt;, but
+    /// DomainMetadataTableFeature is not enabled."). A caller who looks the code up finds the right
+    /// diagnosis.</para>
+    /// <para>Reachable only through the host's staged-action escape hatch. Every path this library owns
+    /// declares the feature in the commit that needs it, so it cannot reach this from the inside.</para>
+    /// </remarks>
+    public const string DomainMetadataNotSupported = "DELTA_DOMAIN_METADATA_NOT_SUPPORTED";
+
+    /// <summary>
     /// Nothing this commit read or removed was invalidated, but its actions cannot move to another
     /// version: their CONTENT encodes the version they were planned for — row tracking's
     /// <c>baseRowId</c> / <c>defaultRowCommitVersion</c>, or a deletion vector computed against a

@@ -2041,6 +2041,37 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Refuses a commit whose own protocol action does not permit the <c>domainMetadata</c> actions it
+    /// carries — the one shape <see cref="AddDomainMetadataDeclaration"/> deliberately will not fix,
+    /// because the protocol is the host's own statement and rewriting it would be worse than refusing.
+    /// </summary>
+    /// <exception cref="DeltaFormatException">The staged protocol does not declare the feature.</exception>
+    private static void RequireDomainMetadataDeclared(
+        ProtocolAction staged, IReadOnlyList<DeltaAction> actions)
+    {
+        if (staged.MinWriterVersion >= 7
+            && staged.WriterFeatures?.Contains(DomainMetadataFeature) == true)
+        {
+            return;
+        }
+
+        // Named exactly as delta-spark names them, so the two implementations report one condition one
+        // way — see DeltaErrorCodes.DomainMetadataNotSupported.
+        string domains = string.Join(", ", actions
+            .OfType<DomainMetadata>()
+            .Select(static action => action.Domain)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(static domain => domain, StringComparer.Ordinal));
+
+        throw new DeltaFormatException(
+            DeltaErrorCodes.DomainMetadataNotSupported,
+            $"Detected DomainMetadata action(s) for domains [{domains}], but the protocol action staged "
+            + "in the same transaction does not declare the 'domainMetadata' writer feature. Add it to "
+            + "that protocol's writerFeatures (which requires minWriterVersion 7), or stage no protocol "
+            + "action and the transaction will declare it.");
+    }
+
+    /// <summary>
     /// Protocol upgrade for WRITER-ONLY features (clustering / domainMetadata): bumps minWriterVersion to 7
     /// with the legacy writer features enumerated, and appends the missing ones. The READER side is left
     /// exactly as it was — adding a writer-only feature to readerFeatures would wrongly lock readers out
@@ -2246,11 +2277,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        // Read ONCE, as the other committers in this type do. The protocol the declaration is derived
+        // from and the snapshot the commit is based on must be the same one, or the upgrade could be
+        // computed against a protocol the commit is not actually starting from.
+        var snapshot = CurrentSnapshot;
+        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
         DomainMetadataValidation.ValidateUserModification(domain);
 
         var actions = new List<DeltaAction>();
-        AddDomainMetadataDeclaration(actions, CurrentSnapshot.Protocol);
+        AddDomainMetadataDeclaration(actions, snapshot.Protocol);
         actions.Add(new DomainMetadata
         {
             Domain = domain,
@@ -2261,7 +2297,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Rebase-safe past anything that did not touch THIS domain — and a commit that did is refused by
         // the checker's domainMetadata rule, so the two writers do not silently overwrite one another.
         return await CommitOccAsync(
-            CurrentSnapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
+            snapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
             "SET DOMAIN METADATA", rebaseSafe: true, cancellationToken, isBlindAppend: false)
             .ConfigureAwait(false);
     }
@@ -2275,15 +2311,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        // One read, for the same reason as SetDomainMetadataAsync: the existence check, the protocol the
+        // declaration is derived from, and the commit's base must all be the same snapshot.
+        var snapshot = CurrentSnapshot;
+        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
         DomainMetadataValidation.ValidateUserModification(domain);
 
-        if (!CurrentSnapshot.DomainMetadata.ContainsKey(domain))
+        if (!snapshot.DomainMetadata.ContainsKey(domain))
             throw new InvalidOperationException(
                 $"Domain '{domain}' does not exist in the table metadata.");
 
         var actions = new List<DeltaAction>();
-        AddDomainMetadataDeclaration(actions, CurrentSnapshot.Protocol);
+        AddDomainMetadataDeclaration(actions, snapshot.Protocol);
         actions.Add(new DomainMetadata
         {
             Domain = domain,
@@ -2298,7 +2337,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // tombstone. (Delta reports the same case the same way, as a conflict rather than as "no such
         // domain" — the caller's information is stale either way, and only a re-read can settle it.)
         return await CommitOccAsync(
-            CurrentSnapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
+            snapshot, actions, ReadSet.Blind, IsolationLevel.WriteSerializable,
             "REMOVE DOMAIN METADATA", rebaseSafe: true, cancellationToken, isBlindAppend: false)
             .ConfigureAwait(false);
     }
@@ -2577,15 +2616,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // already supplies the row-tracking high-water mark and the txn actions above — a transaction's
         // staged actions have never been committed strictly verbatim.
         //
-        // Skipped when the commit already carries a protocol action: a commit holds at most one, and a host
-        // that staged its own is making a deliberate statement about the protocol that this must not
-        // silently rewrite.
-        if (actions.Any(static a => a is DomainMetadata) && !actions.Any(static a => a is ProtocolAction))
+        // A host that staged its OWN protocol action is making a deliberate statement this must not
+        // silently rewrite — but not rewriting it is a different thing from not checking it. If that
+        // protocol does not declare the feature, the commit would produce exactly the malformed table
+        // this declaration exists to prevent, so it is refused rather than written: the reference
+        // implementation refuses the same commit for the same reason, and a host cannot fix what it is
+        // never told about.
+        if (actions.Any(static a => a is DomainMetadata))
         {
-            var declared = new List<DeltaAction>(actions.Count + 1);
-            AddDomainMetadataDeclaration(declared, baseSnapshot.Protocol);
-            declared.AddRange(actions);
-            actions = declared;
+            if (actions.FirstOrDefault(static a => a is ProtocolAction) is ProtocolAction staged)
+            {
+                RequireDomainMetadataDeclared(staged, actions);
+            }
+            else
+            {
+                var declared = new List<DeltaAction>(actions.Count + 1);
+                AddDomainMetadataDeclaration(declared, baseSnapshot.Protocol);
+                declared.AddRange(actions);
+                actions = declared;
+            }
         }
 
         return CommitOccAsync(

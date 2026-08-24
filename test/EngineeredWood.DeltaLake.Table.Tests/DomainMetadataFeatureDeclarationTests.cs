@@ -145,6 +145,91 @@ public class DomainMetadataFeatureDeclarationTests : IDisposable
     }
 
     /// <summary>
+    /// A host staging a <c>domainMetadata</c> of its own through the escape hatch gets the declaration
+    /// too. It could not reasonably supply one itself — it would have to stage a protocol action as well
+    /// and get the legacy-feature enumeration right — and the transaction already augments staged actions
+    /// with the row-tracking high-water mark and the <c>txn</c> actions, so this is where it belongs.
+    /// </summary>
+    [Fact]
+    public async Task AHostStagedDomain_GetsTheDeclarationToo()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            new DomainMetadata
+            {
+                Domain = "host.own", Configuration = """{"v":1}""", Removed = false,
+            },
+        ]);
+        long version = await txn.CommitAsync();
+
+        await AssertDeclaredWithTheDomainAsync(version);
+        Assert.Equal("""{"v":1}""", table.GetDomainMetadata("host.own"));
+    }
+
+    /// <summary>
+    /// ...but a host that staged its OWN protocol action is refused rather than rewritten. Not rewriting
+    /// a host's deliberate statement about the protocol is one thing; letting it through unchecked would
+    /// leave the escape hatch able to produce the exact malformed commit this fix exists to stop.
+    /// </summary>
+    /// <remarks>
+    /// The error carries delta-spark's own code and message shape for this condition, since it IS the
+    /// condition delta-spark raises it for — see <see cref="DeltaErrorCodes.DomainMetadataNotSupported"/>.
+    /// </remarks>
+    [Fact]
+    public async Task AHostStagedProtocolThatDoesNotDeclareIt_IsRefusedRatherThanRewritten()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new DomainMetadata
+            {
+                Domain = "host.own", Configuration = """{"v":1}""", Removed = false,
+            },
+        ]);
+
+        var refused = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await txn.CommitAsync());
+
+        Assert.Equal(DeltaErrorCodes.DomainMetadataNotSupported, refused.ErrorCode);
+        Assert.Contains("[host.own]", refused.Message, StringComparison.Ordinal);
+        Assert.Contains("domainMetadata", refused.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>And a host that declared it properly is left entirely alone.</summary>
+    [Fact]
+    public async Task AHostStagedProtocolThatDoesDeclareIt_CommitsUntouched()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            new ProtocolAction
+            {
+                MinReaderVersion = 1,
+                MinWriterVersion = 7,
+                WriterFeatures = ["appendOnly", "invariants", "domainMetadata"],
+            },
+            new DomainMetadata
+            {
+                Domain = "host.own", Configuration = """{"v":1}""", Removed = false,
+            },
+        ]);
+        long version = await txn.CommitAsync();
+
+        // Exactly the protocol the host staged — one protocol action, and its own.
+        var protocol = Assert.Single((await CommitAsync(version)).OfType<ProtocolAction>());
+        Assert.Equal(1, protocol.MinReaderVersion);
+        Assert.Equal(["appendOnly", "invariants", "domainMetadata"], protocol.WriterFeatures);
+    }
+
+    /// <summary>
     /// The cost of the declaration, stated rather than discovered: the FIRST domain written to a table is a
     /// protocol change as well as a domain write, so two writers racing to it no longer both land — the
     /// loser aborts with <see cref="DeltaErrorCodes.ProtocolChanged"/> even though their domains contest
