@@ -194,6 +194,11 @@ internal static class AlpDecoder
             int produced = 0;
             while (produced < n)
             {
+                // It is the tile's START that has to be byte-aligned, not its length: `produced`
+                // only ever advances by whole tiles and UnpackTile is a multiple of eight, so the
+                // offset below is always an exact number of bytes. The last tile can be any size,
+                // and UnpackDeltas leaves whatever does not fill a group of eight to the loop after
+                // it.
                 int tile = Math.Min(UnpackTile, n - produced);
                 int unpacked = UnpackDeltas(
                     packed.Slice((produced * bitWidth) >> 3), bitWidth, tile, scratch);
@@ -283,8 +288,11 @@ internal static class AlpDecoder
             int produced = 0;
             while (produced < n)
             {
-                // Tiles are a multiple of eight values, so each one starts on a byte boundary and
-                // can be addressed by slicing rather than by carrying a bit offset.
+                // It is the tile's START that has to be byte-aligned, not its length: `produced`
+                // only ever advances by whole tiles and UnpackTile is a multiple of eight, so the
+                // offset below is always an exact number of bytes. The last tile can be any size,
+                // and UnpackDeltas leaves whatever does not fill a group of eight to the loop after
+                // it.
                 int tile = Math.Min(UnpackTile, n - produced);
                 int unpacked = UnpackDeltas(
                     packed.Slice((produced * bitWidth) >> 3), bitWidth, tile, scratch);
