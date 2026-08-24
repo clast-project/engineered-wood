@@ -512,8 +512,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             minWriterVersion = 7;
             writerFeatures.Add("rowTracking");
-            if (!writerFeatures.Contains("domainMetadata"))
-                writerFeatures.Add("domainMetadata");
+            if (!writerFeatures.Contains(DomainMetadataFeature))
+                writerFeatures.Add(DomainMetadataFeature);
         }
 
         // In-commit timestamps — a WRITER-only feature ('inCommitTimestamp'); readers read the table
@@ -586,8 +586,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             minWriterVersion = 7;
             writerFeatures.Add("clustering");
-            if (!writerFeatures.Contains("domainMetadata"))
-                writerFeatures.Add("domainMetadata");
+            if (!writerFeatures.Contains(DomainMetadataFeature))
+                writerFeatures.Add(DomainMetadataFeature);
         }
 
         // Column mapping is BOTH a reader and writer feature. Once any other feature has forced
@@ -692,6 +692,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         Removed = true,
                     });
                 }
+            }
+
+            // A tombstone is a `domainMetadata` action like any other, and the replacement protocol was
+            // built from the NEW table's options, which know nothing about the domains being retired. So a
+            // REPLACE that retires a domain has to declare the feature even though the finished table
+            // carries no live domain at all.
+            //
+            // The protocol action is REPLACED rather than a second one appended: one commit carries at most
+            // one. Doing it after IcebergCompat.Validate is sound because that reads the protocol for
+            // exactly one thing — whether V1 sees deletion vectors — and this adds a writer feature without
+            // removing anything, so it can neither introduce that violation nor hide one.
+            if (actions.OfType<DomainMetadata>().Any()
+                && UpgradeProtocolForWriterFeatures(protocolAction, [DomainMetadataFeature]) is { } upgrade)
+            {
+                actions[actions.IndexOf(protocolAction)] = upgrade;
             }
         }
 
@@ -1913,7 +1928,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             var upgrade = UpgradeProtocolForWriterFeatures(
-                snapshot.Protocol, ["clustering", "domainMetadata"]);
+                snapshot.Protocol, ["clustering", DomainMetadataFeature]);
             if (upgrade is not null)
                 actions.Add(upgrade);
 
@@ -1982,6 +1997,47 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Configuration = sb.ToString(),
             Removed = false,
         };
+    }
+
+    /// <summary>
+    /// The writer feature a <c>domainMetadata</c> action requires. Writing one without it produces a table
+    /// the spec calls malformed, and the reference implementation agrees:
+    /// <c>DomainMetadataUtilsBase.validateDomainMetadataSupportedAndNoDuplicate</c> refuses any commit
+    /// whose actions carry a domain the protocol being committed does not support — which is precisely the
+    /// commit this library used to make.
+    ///
+    /// <para><b>No engine can currently be made to reject the RESULT, though</b> — measured, because #224
+    /// claimed otherwise. Nine delta-spark 4.0.0 operations were run against a table carrying an
+    /// undeclared domain (CLUSTER BY, enabling row tracking, enabling deletion vectors, INSERT, RESTORE,
+    /// three REPLACE spellings, SHALLOW CLONE) and every one succeeded, most by upgrading the protocol
+    /// themselves; delta-rs 1.6.2 reads and appends to one too. The validation above does not fire on any
+    /// of them because they all write a protocol of their own in the same commit, and Spark exposes no API
+    /// for an arbitrary user domain — so the commit it would reject is one only a lax writer makes.
+    /// Declaring the feature is therefore spec compliance and consistency with the three sibling paths
+    /// that already declare it, not a fix for a reproducible engine failure.</para>
+    /// </summary>
+    private const string DomainMetadataFeature = "domainMetadata";
+
+    /// <summary>
+    /// Prepends the protocol upgrade that lets <paramref name="actions"/> carry a <c>domainMetadata</c>
+    /// action, when <paramref name="current"/> does not already allow it. A no-op on a table that declares
+    /// the feature, which is every table this library writes a domain to after the first time.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The declaration rides the same commit as the action it authorises.</b> Upgrading in a
+    /// separate commit would leave a window in which the log holds an undeclared domain — the malformed
+    /// state this exists to prevent, briefly rather than permanently, and a concurrent reader cannot tell
+    /// those apart.</para>
+    /// <para><b>It forces <c>minWriterVersion</c> to 7</b>, which on a legacy <c>(1, 2)</c> table is a
+    /// real, one-way protocol upgrade that narrows which engines may write it. There is no alternative:
+    /// table features require writer 7, so a legacy table CANNOT declare this and carry a domain both. The
+    /// clustering path has always made the same upgrade for the same reason.</para>
+    /// </remarks>
+    private static void AddDomainMetadataDeclaration(
+        List<DeltaAction> actions, ProtocolAction current)
+    {
+        if (UpgradeProtocolForWriterFeatures(current, [DomainMetadataFeature]) is { } upgrade)
+            actions.Add(upgrade);
     }
 
     /// <summary>
@@ -2193,15 +2249,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         DomainMetadataValidation.ValidateUserModification(domain);
 
-        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
+        var actions = new List<DeltaAction>();
+        AddDomainMetadataDeclaration(actions, CurrentSnapshot.Protocol);
+        actions.Add(new DomainMetadata
         {
-            new DomainMetadata
-            {
-                Domain = domain,
-                Configuration = configuration,
-                Removed = false,
-            },
-        };
+            Domain = domain,
+            Configuration = configuration,
+            Removed = false,
+        });
 
         // Rebase-safe past anything that did not touch THIS domain — and a commit that did is refused by
         // the checker's domainMetadata rule, so the two writers do not silently overwrite one another.
@@ -2227,15 +2282,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             throw new InvalidOperationException(
                 $"Domain '{domain}' does not exist in the table metadata.");
 
-        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
+        var actions = new List<DeltaAction>();
+        AddDomainMetadataDeclaration(actions, CurrentSnapshot.Protocol);
+        actions.Add(new DomainMetadata
         {
-            new DomainMetadata
-            {
-                Domain = domain,
-                Configuration = "",
-                Removed = true,
-            },
-        };
+            Domain = domain,
+            Configuration = "",
+            Removed = true,
+        });
 
         // The existence check above is a READ, and the only commit that can invalidate it is one that
         // writes this same domain — which the checker's domainMetadata rule refuses to rebase past. So the
@@ -2515,6 +2569,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (var r in required)
                 extended.Add(new TransactionId { AppId = r.AppId, Version = r.Version, LastUpdated = now });
             actions = extended;
+        }
+
+        // A host may stage a `domainMetadata` of its own through StageActions, and declaring the feature is
+        // not something it can reasonably do from out there: it would have to stage a protocol action too
+        // and get the legacy-feature enumeration right. So the transaction declares it, exactly as it
+        // already supplies the row-tracking high-water mark and the txn actions above — a transaction's
+        // staged actions have never been committed strictly verbatim.
+        //
+        // Skipped when the commit already carries a protocol action: a commit holds at most one, and a host
+        // that staged its own is making a deliberate statement about the protocol that this must not
+        // silently rewrite.
+        if (actions.Any(static a => a is DomainMetadata) && !actions.Any(static a => a is ProtocolAction))
+        {
+            var declared = new List<DeltaAction>(actions.Count + 1);
+            AddDomainMetadataDeclaration(declared, baseSnapshot.Protocol);
+            declared.AddRange(actions);
+            actions = declared;
         }
 
         return CommitOccAsync(

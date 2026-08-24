@@ -351,11 +351,11 @@ public static class ConflictChecker
     /// absent. Not reproduced here, for the plain reason that this is a pure function with no protocol in
     /// hand, and erring STRICT is the safe direction for a concurrency check.</para>
     /// <para>It is not purely theoretical, though, and worth naming rather than glossing: through Delta the
-    /// case cannot arise (it refuses to write <c>domainMetadata</c> to a table lacking the feature at all),
-    /// but <c>DeltaTable.SetDomainMetadataAsync</c> does not declare the feature before writing one, so a
-    /// table this library wrote can reach here with domain actions and no feature. That is a gap in that
-    /// method rather than in this rule, and this rule's answer for it — conflict — is the conservative
-    /// one.</para>
+    /// case cannot arise, since it refuses to COMMIT <c>domainMetadata</c> unless the protocol it is
+    /// writing supports the feature. This library used to reach here with domain actions and no feature,
+    /// because <c>SetDomainMetadataAsync</c> wrote one without declaring it (#224, now fixed) — but a table
+    /// some other lax writer left in that state still can, so the case stays live and this rule's answer
+    /// for it — conflict — remains the conservative one.</para>
     /// <para><b>Returns null rather than a shared empty set</b>, as does <see cref="RemovedPaths"/>.
     /// Both used to hand back a <c>static readonly ISet&lt;string&gt;</c> empty — one process-wide instance,
     /// behind a MUTABLE interface, returned to a caller. Nothing mutates it today, and the allocation it
