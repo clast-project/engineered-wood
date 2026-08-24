@@ -302,8 +302,9 @@ internal static class AlpDecoder
         else
         {
             // Decided once for the vector: every delta in it shares one frame of reference and one
-            // bit width, so whether the scaled integers stay inside the conversion's range is a
-            // property of the vector header, not of any individual value.
+            // bit width, so both halves of the guard — the encoded values fitting the range where
+            // converting to double is exact, and scaling them not overflowing int64 — are
+            // properties of the vector header rather than of any individual value.
             bool convertible = EncodedValuesFitConversion(frameOfReference, bitWidth, factMul);
 
             int produced = 0;

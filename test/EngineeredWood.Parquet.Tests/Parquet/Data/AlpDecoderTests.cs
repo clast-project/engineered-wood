@@ -338,11 +338,14 @@ public class AlpDecoderTests
     [Fact]
     public void DecodeDoubles_VectorizedTransform_MatchesClastAlpInAndOutOfRange()
     {
-        // The transform vectorizes only while the scaled integers fit a double's mantissa, and it
-        // reorders the scale past the conversion to get there. Both halves of that guard need
-        // covering, so sweep every (exponent, factor) the spec allows against frames of reference
-        // that put the vector well inside the range, on its edge, and far outside it — the last
-        // case overflowing int64, where the scalar path and Clast.Alp agree on the wrapped result.
+        // The transform vectorizes only while two separate things hold: the ENCODED values fit the
+        // range where converting to double is exact, and scaling them by 10^factor does not
+        // overflow int64. The exactness bound is on the encoded value, not the scaled one — putting
+        // it on the scaled one is also correct but disables the fast path on essentially all real
+        // data. Both halves need covering, so sweep every (exponent, factor) the spec allows against
+        // frames of reference that put the vector well inside the range, on its edge, and far
+        // outside it — the last case overflowing int64, where the scalar path and Clast.Alp agree
+        // on the wrapped result.
         //
         // 300 values per case is deliberate: more than a whole tile's worth of vector iterations,
         // and not a multiple of eight, so the bulk unpack, its scalar tail and the vector transform
