@@ -154,7 +154,14 @@ public class MetadataCommitConcurrencyTests : IDisposable
     public async Task SetDomainMetadata_AgainstTheSameDomain_Conflicts()
     {
         await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        {
             await setup.WriteAsync([Batch(1)]);
+            // Declares the domainMetadata writer feature, so the racing commits below carry no protocol
+            // action of their own and the rule under test is the only one in play. The first domain write
+            // to a table is a protocol upgrade as well as a domain write, and that race is its own case —
+            // see DomainMetadataFeatureDeclarationTests.
+            await setup.SetDomainMetadataAsync("acme.seed", "{}");
+        }
 
         await using var stale = await OpenAsync();
         long baseVersion = stale.CurrentSnapshot.Version;
@@ -183,7 +190,14 @@ public class MetadataCommitConcurrencyTests : IDisposable
     public async Task SetDomainMetadata_AgainstADifferentDomain_BothLand()
     {
         await using (var setup = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
+        {
             await setup.WriteAsync([Batch(1)]);
+            // Declares the domainMetadata writer feature, so the racing commits below carry no protocol
+            // action of their own and the rule under test is the only one in play. The first domain write
+            // to a table is a protocol upgrade as well as a domain write, and that race is its own case —
+            // see DomainMetadataFeatureDeclarationTests.
+            await setup.SetDomainMetadataAsync("acme.seed", "{}");
+        }
 
         await using var stale = await OpenAsync();
 
