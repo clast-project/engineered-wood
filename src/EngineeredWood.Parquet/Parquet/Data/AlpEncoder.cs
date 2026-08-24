@@ -18,6 +18,21 @@ internal static class AlpEncoder
     private const int MaxFloatExponent = 10;
     private const int MaxDoubleExponent = 18;
 
+    /// <summary>Values sampled out of each vector when scoring candidate (exponent, factor) pairs.</summary>
+    private const int SamplesPerVector = 32;
+
+    /// <summary>How many of a page's vectors are sampled to build the page-level shortlist.</summary>
+    private const int SampledVectorsPerPage = 8;
+
+    /// <summary>How many candidate combinations survive the page-level pass into the per-vector one.</summary>
+    private const int ShortlistSize = 5;
+
+    /// <summary>What one exception costs on the wire: the raw value plus its uint16 position.</summary>
+    private const int DoubleExceptionBits = 64 + 16;
+
+    /// <summary>What one exception costs on the wire: the raw value plus its uint16 position.</summary>
+    private const int FloatExceptionBits = 32 + 16;
+
     private const float FloatMagic = (1u << 22) + (1u << 23);
     private const double DoubleMagic = (1L << 51) + (1L << 52);
 
@@ -41,13 +56,15 @@ internal static class AlpEncoder
         int vectorSize = 1 << logVectorSize;
         int numVectors = (values.Length + vectorSize - 1) / vectorSize;
 
+        var shortlist = BuildDoubleShortlist(values, vectorSize, numVectors);
+
         var vectorBytes = new byte[numVectors][];
         int totalVectorSize = 0;
         for (int v = 0; v < numVectors; v++)
         {
             int start = v * vectorSize;
             int n = Math.Min(vectorSize, values.Length - start);
-            vectorBytes[v] = EncodeDoubleVector(values.Slice(start, n));
+            vectorBytes[v] = EncodeDoubleVector(values.Slice(start, n), shortlist);
             totalVectorSize += vectorBytes[v].Length;
         }
 
@@ -64,13 +81,15 @@ internal static class AlpEncoder
         int vectorSize = 1 << logVectorSize;
         int numVectors = (values.Length + vectorSize - 1) / vectorSize;
 
+        var shortlist = BuildFloatShortlist(values, vectorSize, numVectors);
+
         var vectorBytes = new byte[numVectors][];
         int totalVectorSize = 0;
         for (int v = 0; v < numVectors; v++)
         {
             int start = v * vectorSize;
             int n = Math.Min(vectorSize, values.Length - start);
-            vectorBytes[v] = EncodeFloatVector(values.Slice(start, n));
+            vectorBytes[v] = EncodeFloatVector(values.Slice(start, n), shortlist);
             totalVectorSize += vectorBytes[v].Length;
         }
 
@@ -107,14 +126,31 @@ internal static class AlpEncoder
 
     // ───── DOUBLE vector encoding ─────
 
-    private static byte[] EncodeDoubleVector(ReadOnlySpan<double> values)
+    private static byte[] EncodeDoubleVector(
+        ReadOnlySpan<double> values, (byte Exponent, byte Factor)[] shortlist)
+    {
+        var (exponent, factor) = ChooseDoubleCombination(values, shortlist, exact: false);
+        var vector = EncodeDoubleVectorWith(values, exponent, factor);
+
+        // A 32-value sample can badly misjudge a vector where nearly everything ends up an
+        // exception — raw radian coordinates are the canonical case — and land on a combination
+        // that costs more than storing the doubles outright. That is rare enough to detect after
+        // the fact: when it happens, re-score the shortlist against every value and keep whichever
+        // of the two is smaller. Data that ALP suits never takes this path.
+        if (values.Length == 0 || (long)vector.Length * 8 <= (long)values.Length * 64)
+            return vector;
+
+        var (exactExponent, exactFactor) = ChooseDoubleCombination(values, shortlist, exact: true);
+        if (exactExponent == exponent && exactFactor == factor)
+            return vector;
+
+        var retry = EncodeDoubleVectorWith(values, exactExponent, exactFactor);
+        return retry.Length < vector.Length ? retry : vector;
+    }
+
+    private static byte[] EncodeDoubleVectorWith(ReadOnlySpan<double> values, int exponent, int factor)
     {
         int n = values.Length;
-
-        // The Parquet spec restricts DOUBLE to exponent ∈ [0, 18]. Clast.Alp's
-        // FindBestFactorExponent searches up to e=23, so we use our own
-        // constrained version that calls into the same shared primitives.
-        var (exponent, factor) = FindBestDoubleFactorExponent(values);
 
         // Encode each value, recording exceptions and substituting placeholders so the
         // FOR range stays tight.
@@ -165,48 +201,118 @@ internal static class AlpEncoder
         return buf;
     }
 
-    private static (int Exponent, int Factor) FindBestDoubleFactorExponent(ReadOnlySpan<double> samples)
+    /// <summary>
+    /// Builds the page-level shortlist of candidate (exponent, factor) pairs, ALP's "first level"
+    /// sampling: a handful of the page's vectors are sampled, every combination the Parquet spec
+    /// allows is scored on those samples by the size it would produce, and the cheapest few go
+    /// forward. Only those survivors are re-scored per vector, which is what keeps the search off
+    /// the critical path.
+    /// </summary>
+    private static (byte Exponent, byte Factor)[] BuildDoubleShortlist(
+        ReadOnlySpan<double> values, int vectorSize, int numVectors)
     {
-        int bestExponent = 0;
-        int bestFactor = 0;
-        int bestExceptions = samples.Length + 1;
+        const int Combinations = (MaxDoubleExponent + 1) * (MaxDoubleExponent + 2) / 2;
 
-        for (int e = 0; e <= MaxDoubleExponent; e++)
+        Span<long> totals = stackalloc long[Combinations];
+        totals.Clear();
+        Span<double> sample = stackalloc double[SamplesPerVector];
+
+        // Spread the budget over the page rather than striding by a floor-divided step, which
+        // overshoots whenever the vector count is not a multiple of it — a 15-vector page sampled
+        // all 15, and this pass is the most expensive thing the encoder does on a short page.
+        int sampled = Math.Min(SampledVectorsPerPage, numVectors);
+        for (int s = 0; s < sampled; s++)
         {
-            for (int f = 0; f <= e; f++)
+            int v = (int)((long)s * numVectors / sampled);
+            int start = v * vectorSize;
+            int n = Math.Min(vectorSize, values.Length - start);
+            int taken = Sample(values.Slice(start, n), sample);
+
+            int c = 0;
+            for (int e = 0; e <= MaxDoubleExponent; e++)
+                for (int f = 0; f <= e; f++, c++)
+                    totals[c] += EstimateDoubleBits(sample.Slice(0, taken), e, f);
+        }
+
+        return TakeCheapest(totals, MaxDoubleExponent);
+    }
+
+    /// <summary>
+    /// ALP's "second level" pass: scores only the shortlisted combinations against this vector —
+    /// against a sample of it normally, against every value when <paramref name="exact"/> — and
+    /// keeps the cheapest. The choice is an optimization, never a correctness requirement:
+    /// whatever it picks, values that do not round-trip are stored as exceptions.
+    /// </summary>
+    private static (int Exponent, int Factor) ChooseDoubleCombination(
+        ReadOnlySpan<double> values, (byte Exponent, byte Factor)[] shortlist, bool exact)
+    {
+        Span<double> sample = stackalloc double[SamplesPerVector];
+        ReadOnlySpan<double> scored = exact
+            ? values
+            : sample.Slice(0, Sample(values, sample));
+
+        long bestBits = long.MaxValue;
+        (int Exponent, int Factor) best = (shortlist[0].Exponent, shortlist[0].Factor);
+
+        foreach (var candidate in shortlist)
+        {
+            long bits = EstimateDoubleBits(scored, candidate.Exponent, candidate.Factor);
+            if (bits < bestBits)
             {
-                int exceptions = 0;
-                for (int i = 0; i < samples.Length; i++)
-                {
-                    double v = samples[i];
-
-                    if (!IsFiniteDouble(v) || IsNegativeZero(v))
-                    {
-                        if (++exceptions >= bestExceptions) break;
-                        continue;
-                    }
-
-                    long encoded = Clast.Alp.AlpEncoder.EncodeValue(v, e, f);
-                    double decoded = Clast.Alp.AlpDecoder.DecodeValue(encoded, e, f);
-                    if (decoded != v)
-                    {
-                        if (++exceptions >= bestExceptions) break;
-                    }
-                }
-
-                if (exceptions < bestExceptions)
-                {
-                    bestExceptions = exceptions;
-                    bestExponent = e;
-                    bestFactor = f;
-                    if (bestExceptions == 0) return (bestExponent, bestFactor);
-                }
+                bestBits = bits;
+                best = (candidate.Exponent, candidate.Factor);
             }
         }
 
-        return (bestExponent, bestFactor);
+        return best;
     }
 
+    /// <summary>
+    /// The bits one vector of <paramref name="sample"/> would occupy under this combination: every
+    /// value bit-packed at the frame-of-reference width, plus the full width of each exception.
+    /// Scoring by size rather than by exception count alone is the whole point — a combination that
+    /// round-trips everything but needs 55-bit integers loses to one that takes a few exceptions
+    /// and needs 11.
+    /// </summary>
+    private static long EstimateDoubleBits(ReadOnlySpan<double> sample, int exponent, int factor)
+    {
+        long min = long.MaxValue;
+        long max = long.MinValue;
+        int exceptions = 0;
+
+        for (int i = 0; i < sample.Length; i++)
+        {
+            double v = sample[i];
+
+            if (!IsFiniteDouble(v) || IsNegativeZero(v))
+            {
+                exceptions++;
+                continue;
+            }
+
+            long encoded = Clast.Alp.AlpEncoder.EncodeValue(v, exponent, factor);
+            if (Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor) != v)
+            {
+                exceptions++;
+                continue;
+            }
+
+            if (encoded < min) min = encoded;
+            if (encoded > max) max = encoded;
+        }
+
+        int bitWidth = exceptions == sample.Length
+            ? 0
+            : BitsRequired64(unchecked((ulong)(max - min)));
+
+        return ((long)sample.Length * bitWidth) + ((long)exceptions * DoubleExceptionBits);
+    }
+
+    /// <summary>
+    /// Encodes a vector under the chosen combination, substituting the first value that did encode
+    /// for every one that did not so the frame-of-reference range stays tight, and handing back the
+    /// exceptions to be stored verbatim.
+    /// </summary>
     private static void EncodeDoubleVectorWithParams(
         ReadOnlySpan<double> values, int exponent, int factor,
         Span<long> destination,
@@ -214,66 +320,48 @@ internal static class AlpEncoder
     {
         long fillValue = 0;
         bool hasFill = false;
-        int exceptionCount = 0;
+        List<int>? exceptions = null;
 
-        // First pass: encode round-tripping values, count exceptions.
         for (int i = 0; i < values.Length; i++)
         {
             double v = values[i];
+            bool special = !IsFiniteDouble(v) || IsNegativeZero(v);
+            long encoded = 0;
 
-            if (!IsFiniteDouble(v) || IsNegativeZero(v))
+            if (!special)
             {
-                exceptionCount++;
+                encoded = Clast.Alp.AlpEncoder.EncodeValue(v, exponent, factor);
+                special = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor) != v;
+            }
+
+            if (special)
+            {
+                (exceptions ??= new List<int>()).Add(i);
                 continue;
             }
 
-            long encoded = Clast.Alp.AlpEncoder.EncodeValue(v, exponent, factor);
-            double decoded = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor);
-            if (decoded != v)
+            destination[i] = encoded;
+            if (!hasFill)
             {
-                exceptionCount++;
-            }
-            else
-            {
-                destination[i] = encoded;
-                if (!hasFill)
-                {
-                    fillValue = encoded;
-                    hasFill = true;
-                }
+                fillValue = encoded;
+                hasFill = true;
             }
         }
 
-        if (exceptionCount == 0)
+        if (exceptions is null)
         {
             exceptionPositions = [];
             exceptionValues = [];
             return;
         }
 
-        exceptionPositions = new int[exceptionCount];
-        exceptionValues = new double[exceptionCount];
-        int ei = 0;
-
-        // Second pass: substitute placeholders for exception slots and record their values.
-        for (int i = 0; i < values.Length; i++)
+        exceptionPositions = exceptions.ToArray();
+        exceptionValues = new double[exceptions.Count];
+        for (int j = 0; j < exceptions.Count; j++)
         {
-            double v = values[i];
-            bool special = !IsFiniteDouble(v) || IsNegativeZero(v);
-            if (!special)
-            {
-                long encoded = Clast.Alp.AlpEncoder.EncodeValue(v, exponent, factor);
-                double decoded = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor);
-                if (decoded != v) special = true;
-            }
-
-            if (special)
-            {
-                exceptionPositions[ei] = i;
-                exceptionValues[ei] = v;
-                destination[i] = fillValue;
-                ei++;
-            }
+            int i = exceptions[j];
+            exceptionValues[j] = values[i];
+            destination[i] = fillValue;
         }
     }
 
@@ -281,11 +369,27 @@ internal static class AlpEncoder
 
     // ───── FLOAT vector encoding ─────
 
-    private static byte[] EncodeFloatVector(ReadOnlySpan<float> values)
+    private static byte[] EncodeFloatVector(
+        ReadOnlySpan<float> values, (byte Exponent, byte Factor)[] shortlist)
+    {
+        var (exponent, factor) = ChooseFloatCombination(values, shortlist, exact: false);
+        var vector = EncodeFloatVectorWith(values, exponent, factor);
+
+        // See EncodeDoubleVector for why the sampled choice is double-checked here.
+        if (values.Length == 0 || (long)vector.Length * 8 <= (long)values.Length * 32)
+            return vector;
+
+        var (exactExponent, exactFactor) = ChooseFloatCombination(values, shortlist, exact: true);
+        if (exactExponent == exponent && exactFactor == factor)
+            return vector;
+
+        var retry = EncodeFloatVectorWith(values, exactExponent, exactFactor);
+        return retry.Length < vector.Length ? retry : vector;
+    }
+
+    private static byte[] EncodeFloatVectorWith(ReadOnlySpan<float> values, int exponent, int factor)
     {
         int n = values.Length;
-
-        var (exponent, factor) = FindBestFloatFactorExponent(values);
 
         int[] encoded = new int[n];
         EncodeFloatVectorWithParams(values, exponent, factor, encoded,
@@ -334,160 +438,197 @@ internal static class AlpEncoder
         return buf;
     }
 
-    private static (int Exponent, int Factor) FindBestFloatFactorExponent(ReadOnlySpan<float> samples)
+    /// <summary>Page-level shortlist for FLOAT columns. See <see cref="BuildDoubleShortlist"/>.</summary>
+    private static (byte Exponent, byte Factor)[] BuildFloatShortlist(
+        ReadOnlySpan<float> values, int vectorSize, int numVectors)
     {
-        int bestExponent = 0;
-        int bestFactor = 0;
-        int bestExceptions = samples.Length + 1;
+        const int Combinations = (MaxFloatExponent + 1) * (MaxFloatExponent + 2) / 2;
 
-        for (int e = 0; e <= MaxFloatExponent; e++)
+        Span<long> totals = stackalloc long[Combinations];
+        totals.Clear();
+        Span<float> sample = stackalloc float[SamplesPerVector];
+
+        // See BuildDoubleShortlist for why this spreads a fixed budget rather than striding.
+        int sampled = Math.Min(SampledVectorsPerPage, numVectors);
+        for (int s = 0; s < sampled; s++)
         {
-            float expMul = FloatPow10[e];
-            float fracE = FloatNegPow10[e];
+            int v = (int)((long)s * numVectors / sampled);
+            int start = v * vectorSize;
+            int n = Math.Min(vectorSize, values.Length - start);
+            int taken = Sample(values.Slice(start, n), sample);
 
-            for (int f = 0; f <= e; f++)
+            int c = 0;
+            for (int e = 0; e <= MaxFloatExponent; e++)
+                for (int f = 0; f <= e; f++, c++)
+                    totals[c] += EstimateFloatBits(sample.Slice(0, taken), e, f);
+        }
+
+        return TakeCheapest(totals, MaxFloatExponent);
+    }
+
+    /// <summary>Per-vector choice for FLOAT columns. See <see cref="ChooseDoubleCombination"/>.</summary>
+    private static (int Exponent, int Factor) ChooseFloatCombination(
+        ReadOnlySpan<float> values, (byte Exponent, byte Factor)[] shortlist, bool exact)
+    {
+        Span<float> sample = stackalloc float[SamplesPerVector];
+        ReadOnlySpan<float> scored = exact
+            ? values
+            : sample.Slice(0, Sample(values, sample));
+
+        long bestBits = long.MaxValue;
+        (int Exponent, int Factor) best = (shortlist[0].Exponent, shortlist[0].Factor);
+
+        foreach (var candidate in shortlist)
+        {
+            long bits = EstimateFloatBits(scored, candidate.Exponent, candidate.Factor);
+            if (bits < bestBits)
             {
-                float fracMul = FloatNegPow10[f];
-                float factMulF = FloatPow10[f];
-
-                int exceptions = 0;
-                for (int i = 0; i < samples.Length; i++)
-                {
-                    float v = samples[i];
-
-                    if (!IsFiniteFloat(v) || IsNegativeZero(v))
-                    {
-                        if (++exceptions >= bestExceptions) break;
-                        continue;
-                    }
-
-                    float scaled = v * expMul * fracMul;
-                    if (scaled <= int.MinValue + 512 || scaled >= int.MaxValue - 512)
-                    {
-                        if (++exceptions >= bestExceptions) break;
-                        continue;
-                    }
-
-                    float rounded = scaled + FloatMagic - FloatMagic;
-                    int enc = (int)rounded;
-                    float decoded = enc * factMulF * fracE;
-                    if (decoded != v)
-                    {
-                        if (++exceptions >= bestExceptions) break;
-                    }
-                }
-
-                if (exceptions < bestExceptions)
-                {
-                    bestExceptions = exceptions;
-                    bestExponent = e;
-                    bestFactor = f;
-                    if (bestExceptions == 0) return (bestExponent, bestFactor);
-                }
+                bestBits = bits;
+                best = (candidate.Exponent, candidate.Factor);
             }
         }
 
-        return (bestExponent, bestFactor);
+        return best;
     }
 
+    /// <summary>The bits one vector of FLOAT samples would occupy. See <see cref="EstimateDoubleBits"/>.</summary>
+    private static long EstimateFloatBits(ReadOnlySpan<float> sample, int exponent, int factor)
+    {
+        long min = long.MaxValue;
+        long max = long.MinValue;
+        int exceptions = 0;
+
+        for (int i = 0; i < sample.Length; i++)
+        {
+            if (!TryEncodeFloat(sample[i], exponent, factor, out int encoded))
+            {
+                exceptions++;
+                continue;
+            }
+
+            if (encoded < min) min = encoded;
+            if (encoded > max) max = encoded;
+        }
+
+        int bitWidth = exceptions == sample.Length
+            ? 0
+            : BitsRequired32(unchecked((ulong)(max - min)));
+
+        return ((long)sample.Length * bitWidth) + ((long)exceptions * FloatExceptionBits);
+    }
+
+    /// <summary>
+    /// Encodes one FLOAT under a candidate combination, reporting <see langword="false"/> when the
+    /// value has to be stored as an exception instead: non-finite, negative zero, out of int32
+    /// range, or simply not recoverable by the inverse transform.
+    /// </summary>
+    private static bool TryEncodeFloat(float value, int exponent, int factor, out int encoded)
+    {
+        encoded = 0;
+
+        if (!IsFiniteFloat(value) || IsNegativeZero(value))
+            return false;
+
+        float scaled = value * FloatPow10[exponent] * FloatNegPow10[factor];
+        if (scaled <= int.MinValue + 512 || scaled >= int.MaxValue - 512)
+            return false;
+
+        int candidate = (int)(scaled + FloatMagic - FloatMagic);
+        if (candidate * FloatPow10[factor] * FloatNegPow10[exponent] != value)
+            return false;
+
+        encoded = candidate;
+        return true;
+    }
+
+    /// <summary>Takes up to <see cref="SamplesPerVector"/> evenly spaced values out of a vector.</summary>
+    private static int Sample<T>(ReadOnlySpan<T> values, Span<T> destination)
+    {
+        if (values.Length <= destination.Length)
+        {
+            values.CopyTo(destination);
+            return values.Length;
+        }
+
+        int stride = values.Length / destination.Length;
+        for (int i = 0; i < destination.Length; i++)
+            destination[i] = values[i * stride];
+
+        return destination.Length;
+    }
+
+    /// <summary>
+    /// Returns the <see cref="ShortlistSize"/> cheapest combinations, mapping each scoreboard slot
+    /// back to the (exponent, factor) pair that filled it — the pairs are enumerated with f less
+    /// than or equal to e, so slot c belongs to the exponent whose triangular number it falls under.
+    /// </summary>
+    private static (byte Exponent, byte Factor)[] TakeCheapest(Span<long> totals, int maxExponent)
+    {
+        var result = new (byte Exponent, byte Factor)[Math.Min(ShortlistSize, totals.Length)];
+
+        for (int slot = 0; slot < result.Length; slot++)
+        {
+            int cheapest = 0;
+            for (int c = 1; c < totals.Length; c++)
+            {
+                if (totals[c] < totals[cheapest])
+                    cheapest = c;
+            }
+
+            int exponent = 0;
+            while (exponent < maxExponent && (exponent + 1) * (exponent + 2) / 2 <= cheapest)
+                exponent++;
+
+            result[slot] = ((byte)exponent, (byte)(cheapest - (exponent * (exponent + 1) / 2)));
+            totals[cheapest] = long.MaxValue;
+        }
+
+        return result;
+    }
+
+    /// <summary>FLOAT counterpart of <see cref="EncodeDoubleVectorWithParams"/>.</summary>
     private static void EncodeFloatVectorWithParams(
         ReadOnlySpan<float> values, int exponent, int factor,
         Span<int> destination,
         out int[] exceptionPositions, out float[] exceptionValues)
     {
-        float expMul = FloatPow10[exponent];
-        float fracMul = FloatNegPow10[factor];
-        float factMulF = FloatPow10[factor];
-        float fracE = FloatNegPow10[exponent];
-
         int fillValue = 0;
         bool hasFill = false;
-        int exceptionCount = 0;
+        List<int>? exceptions = null;
 
         for (int i = 0; i < values.Length; i++)
         {
-            float v = values[i];
-
-            if (!IsFiniteFloat(v) || IsNegativeZero(v))
+            if (!TryEncodeFloat(values[i], exponent, factor, out int encoded))
             {
-                exceptionCount++;
+                (exceptions ??= new List<int>()).Add(i);
                 continue;
             }
 
-            float scaled = v * expMul * fracMul;
-            if (scaled <= int.MinValue + 512 || scaled >= int.MaxValue - 512)
+            destination[i] = encoded;
+            if (!hasFill)
             {
-                exceptionCount++;
-                continue;
-            }
-
-            float rounded = scaled + FloatMagic - FloatMagic;
-            int enc = (int)rounded;
-            float decoded = enc * factMulF * fracE;
-            if (decoded != v)
-            {
-                exceptionCount++;
-            }
-            else
-            {
-                destination[i] = enc;
-                if (!hasFill)
-                {
-                    fillValue = enc;
-                    hasFill = true;
-                }
+                fillValue = encoded;
+                hasFill = true;
             }
         }
 
-        if (exceptionCount == 0)
+        if (exceptions is null)
         {
             exceptionPositions = [];
             exceptionValues = [];
             return;
         }
 
-        exceptionPositions = new int[exceptionCount];
-        exceptionValues = new float[exceptionCount];
-        int ei = 0;
-
-        for (int i = 0; i < values.Length; i++)
+        exceptionPositions = exceptions.ToArray();
+        exceptionValues = new float[exceptions.Count];
+        for (int j = 0; j < exceptions.Count; j++)
         {
-            float v = values[i];
-
-            bool special = !IsFiniteFloat(v) || IsNegativeZero(v);
-            if (!special)
-            {
-                float scaled = v * expMul * fracMul;
-                if (scaled <= int.MinValue + 512 || scaled >= int.MaxValue - 512)
-                {
-                    special = true;
-                }
-                else
-                {
-                    float rounded = scaled + FloatMagic - FloatMagic;
-                    int enc = (int)rounded;
-                    float decoded = enc * factMulF * fracE;
-                    if (decoded != v)
-                        special = true;
-                }
-            }
-
-            if (special)
-            {
-                exceptionPositions[ei] = i;
-                exceptionValues[ei] = v;
-                destination[i] = fillValue;
-                ei++;
-            }
+            int i = exceptions[j];
+            exceptionValues[j] = values[i];
+            destination[i] = fillValue;
         }
     }
 
-    // ───── Bit packing ─────
-
-    /// <summary>
-    /// Writes <paramref name="value"/> at value index <paramref name="i"/> in an LSB-first
-    /// bit-packed stream of <paramref name="bitWidth"/>-bit values.
-    /// </summary>
     private static void PackBits64(Span<byte> dest, int i, int bitWidth, ulong value)
     {
         long bitOffset = (long)i * bitWidth;
