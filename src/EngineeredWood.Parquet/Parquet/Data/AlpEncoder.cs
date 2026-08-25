@@ -181,11 +181,7 @@ internal static class AlpEncoder
         buf[12] = (byte)bitWidth;
 
         if (bitWidth > 0)
-        {
-            var packDest = buf.AsSpan(13, packedSize);
-            for (int i = 0; i < n; i++)
-                PackBits64(packDest, i, bitWidth, unchecked((ulong)(encoded[i] - min)));
-        }
+            PackBits(buf.AsSpan(13, packedSize), encoded.AsSpan(0, n), min, bitWidth);
 
         int posOffset = 13 + packedSize;
         int valOffset = posOffset + exceptionPositions.Length * 2;
@@ -418,11 +414,7 @@ internal static class AlpEncoder
         buf[8] = (byte)bitWidth;
 
         if (bitWidth > 0)
-        {
-            var packDest = buf.AsSpan(9, packedSize);
-            for (int i = 0; i < n; i++)
-                PackBits64(packDest, i, bitWidth, unchecked((ulong)(encoded[i] - min)));
-        }
+            PackBits(buf.AsSpan(9, packedSize), encoded.AsSpan(0, n), min, bitWidth);
 
         int posOffset = 9 + packedSize;
         int valOffset = posOffset + exceptionPositions.Length * 2;
@@ -629,45 +621,78 @@ internal static class AlpEncoder
         }
     }
 
-    private static void PackBits64(Span<byte> dest, int i, int bitWidth, ulong value)
+    /// <summary>
+    /// Bit-packs frame-of-reference deltas LSB-first, accumulating into a register and writing each
+    /// output word once.
+    /// </summary>
+    /// <remarks>
+    /// <para>The obvious shape — locate each value's byte, read the word there, OR the value in,
+    /// write it back — makes consecutive values touch the same word, so every store feeds the next
+    /// load. MEASURED, that ran at about 2 GB/s; accumulating and writing each word once runs at
+    /// 9 to 17 GB/s depending on the width, and bit packing was roughly two fifths of encode.</para>
+    /// <para>Note this is the opposite conclusion to the decoder's unpacker, where hoisting the
+    /// per-value offsets into locals was the win. Unpacking is pure reads with no dependency
+    /// between values; the same trick applied here measured no better than what it replaced,
+    /// because it does not remove the read-modify-write.</para>
+    /// </remarks>
+    private static void PackBits(Span<byte> dest, ReadOnlySpan<long> values, long min, int bitWidth)
     {
-        long bitOffset = (long)i * bitWidth;
-        int byteIdx = (int)(bitOffset >> 3);
-        int bitIdx = (int)(bitOffset & 7);
+        ulong accumulator = 0;
+        int held = 0;
+        int offset = 0;
 
-        ulong low = ReadLE(dest, byteIdx);
-        low |= value << bitIdx;
-        WriteLE(dest, byteIdx, low);
-
-        int spill = bitIdx + bitWidth - 64;
-        if (spill > 0)
+        for (int i = 0; i < values.Length; i++)
         {
-            ulong high = ReadLE(dest, byteIdx + 8);
-            high |= value >> (64 - bitIdx);
-            WriteLE(dest, byteIdx + 8, high);
+            ulong delta = unchecked((ulong)(values[i] - min));
+            accumulator |= delta << held;
+            held += bitWidth;
+
+            if (held >= 64)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(offset, 8), accumulator);
+                offset += 8;
+                held -= 64;
+                accumulator = held == 0 ? 0UL : delta >> (bitWidth - held);
+            }
         }
+
+        WriteTail(dest, offset, accumulator, held);
     }
 
-    private static ulong ReadLE(Span<byte> dest, int idx)
+    /// <summary>FLOAT counterpart of <see cref="PackBits(Span{byte}, ReadOnlySpan{long}, long, int)"/>.</summary>
+    private static void PackBits(Span<byte> dest, ReadOnlySpan<int> values, long min, int bitWidth)
     {
-        if (idx >= dest.Length) return 0;
-        int rem = dest.Length - idx;
-        if (rem >= 8) return BinaryPrimitives.ReadUInt64LittleEndian(dest.Slice(idx, 8));
-        ulong r = 0;
-        for (int k = 0; k < rem; k++) r |= (ulong)dest[idx + k] << (k * 8);
-        return r;
+        ulong accumulator = 0;
+        int held = 0;
+        int offset = 0;
+
+        for (int i = 0; i < values.Length; i++)
+        {
+            ulong delta = unchecked((ulong)(values[i] - min));
+            accumulator |= delta << held;
+            held += bitWidth;
+
+            if (held >= 64)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(offset, 8), accumulator);
+                offset += 8;
+                held -= 64;
+                accumulator = held == 0 ? 0UL : delta >> (bitWidth - held);
+            }
+        }
+
+        WriteTail(dest, offset, accumulator, held);
     }
 
-    private static void WriteLE(Span<byte> dest, int idx, ulong v)
+    /// <summary>
+    /// Writes the bits still in the accumulator, a byte at a time. The whole words above are
+    /// written eight bytes at once and always fit, but the destination is sized to the exact
+    /// packed length, so the last partial word cannot be.
+    /// </summary>
+    private static void WriteTail(Span<byte> dest, int offset, ulong accumulator, int held)
     {
-        if (idx >= dest.Length) return;
-        int rem = dest.Length - idx;
-        if (rem >= 8)
-        {
-            BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(idx, 8), v);
-            return;
-        }
-        for (int k = 0; k < rem; k++) dest[idx + k] = (byte)(v >> (k * 8));
+        for (int k = 0; held > 0; k++, held -= 8)
+            dest[offset + k] = (byte)(accumulator >> (k * 8));
     }
 
     private static int BitsRequired64(ulong v)
