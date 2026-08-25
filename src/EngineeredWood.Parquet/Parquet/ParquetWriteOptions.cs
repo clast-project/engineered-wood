@@ -34,9 +34,17 @@ public enum FloatingPointEncoding
     /// <summary>
     /// ADAPTIVE_LOSSLESS_FLOATING_POINT (ALP, encoding 10): decimal-aware integer encoding plus
     /// frame-of-reference and bit-packing. Strong for monetary, sensor, and scientific data with
-    /// limited decimal precision; comparable to plain values for high-precision irrational data.
+    /// limited decimal precision.
     /// New in parquet-format; older readers will not be able to decode it.
     /// </summary>
+    /// <remarks>
+    /// Data with no decimal structure — raw coordinates, high-precision irrational values — cannot
+    /// be encoded this way at all, and is stored value by value alongside a position, which costs
+    /// more than writing it plainly. The writer falls back to PLAIN per page when that happens, so
+    /// as with <see cref="ByteArrayEncoding.Fsst"/>, choosing this setting cannot make a file
+    /// bigger than leaving it alone. Pages within one column chunk may therefore differ in
+    /// encoding, which is what the format allows for.
+    /// </remarks>
     [Experimental("EWPARQUET0001")]
     Alp,
 

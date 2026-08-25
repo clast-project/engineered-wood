@@ -224,6 +224,162 @@ public class AlpEncoderTests : IDisposable
     }
 
     [Fact]
+    public async Task ParquetWriter_DoubleAlpWorseThanPlain_FallsBackPerPage()
+    {
+        // Coordinates in radians: no decimal structure at all, so almost every value fails to
+        // round-trip through ALP's scaling and is stored whole beside a position — costing more
+        // than writing the doubles out. Choosing ALP must not make the file bigger.
+        var path = TempPath("ew-alp-fallback-double.parquet");
+        var values = new double[5000];
+        var rng = new Random(4242);
+        for (int i = 0; i < values.Length; i++)
+            values[i] = rng.NextDouble() * 2.0 - 1.0;
+
+        await WriteDoubleColumn(path, values, FloatingPointEncoding.Alp);
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+        var column = meta.RowGroups[0].Columns[0].MetaData!;
+
+        Assert.DoesNotContain(Encoding.Alp, column.Encodings);
+        Assert.Contains(Encoding.Plain, column.Encodings);
+
+        double bitsPerValue = column.TotalCompressedSize * 8.0 / values.Length;
+        Assert.True(bitsPerValue < 65, $"fell back but still cost {bitsPerValue:F2} bits/value");
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        var arr = (DoubleArray)batch.Column(0);
+        for (int i = 0; i < values.Length; i++)
+            AssertBitEqual(values[i], arr.GetValue(i)!.Value);
+    }
+
+    [Fact]
+    public async Task ParquetWriter_FloatAlpWorseThanPlain_FallsBackPerPage()
+    {
+        // FLOAT counterpart. Two-decimal values above about 2^16 are the shape that does it: the
+        // format's 24-bit mantissa cannot reproduce them through the decode formula whatever the
+        // encoder picks, so they all become exceptions.
+        var path = TempPath("ew-alp-fallback-float.parquet");
+        var values = new float[5000];
+        var rng = new Random(99);
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (float)(rng.Next(1 << 20, 1 << 24) / 100.0);
+
+        await WriteFloatColumn(path, values, FloatingPointEncoding.Alp);
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+        var column = meta.RowGroups[0].Columns[0].MetaData!;
+
+        Assert.DoesNotContain(Encoding.Alp, column.Encodings);
+        Assert.Contains(Encoding.Plain, column.Encodings);
+
+        double bitsPerValue = column.TotalCompressedSize * 8.0 / values.Length;
+        Assert.True(bitsPerValue < 33, $"fell back but still cost {bitsPerValue:F2} bits/value");
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        var arr = (FloatArray)batch.Column(0);
+        for (int i = 0; i < values.Length; i++)
+            AssertBitEqual(values[i], arr.GetValue(i)!.Value);
+    }
+
+    [Fact]
+    public async Task ParquetWriter_AlpFallbackWithNulls_RoundTripsAndStaysPlain()
+    {
+        // The fallback writes the dense values ALP already compacted rather than compacting the
+        // column a second time, so a nullable column is the case where it could diverge — PLAIN
+        // stores only the defined values, and getting the compaction wrong would shift every value
+        // after the first null. Both other fallback tests use non-nullable columns.
+        var path = TempPath("ew-alp-fallback-nulls.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", DoubleType.Default, nullable: true))
+            .Build();
+
+        var rng = new Random(31337);
+        var builder = new DoubleArray.Builder();
+        var expected = new double?[4000];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (i % 7 == 0)
+            {
+                builder.AppendNull();
+                expected[i] = null;
+            }
+            else
+            {
+                // Radians again: nothing ALP can encode, so every page falls back.
+                double value = rng.NextDouble() * 2.0 - 1.0;
+                builder.Append(value);
+                expected[i] = value;
+            }
+        }
+
+        var batch = new RecordBatch(schema, [builder.Build()], expected.Length);
+        var options = ParquetWriteOptions.Default with
+        {
+            FloatingPointEncoding = FloatingPointEncoding.Alp,
+            DataPageVersion = DataPageVersion.V2,
+            DictionaryEnabled = false,
+            Compression = EngineeredWood.Compression.CompressionCodec.Uncompressed,
+        };
+
+        await using (var sink = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(sink, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+        var column = meta.RowGroups[0].Columns[0].MetaData!;
+
+        Assert.DoesNotContain(Encoding.Alp, column.Encodings);
+        Assert.Contains(Encoding.Plain, column.Encodings);
+
+        var read = await reader.ReadRowGroupAsync(0);
+        var arr = (DoubleArray)read.Column(0);
+        Assert.Equal(expected.Length, arr.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (expected[i] is null)
+            {
+                Assert.True(arr.IsNull(i), $"row {i} should be null");
+                continue;
+            }
+
+            Assert.False(arr.IsNull(i), $"row {i} should not be null");
+            AssertBitEqual(expected[i]!.Value, arr.GetValue(i)!.Value);
+        }
+    }
+
+    [Fact]
+    public void EncodeFloats_IntegralValuesPastTheOldRoundingLimit_StayExceptionFree()
+    {
+        // The encoder rounded by biasing into a float's mantissa, which only works below 2^22.
+        // Everything above it lost its round trip and became an exception at 48 bits, so integers
+        // that ALP should store in 24 cost more than PLAIN's 32. Rounding in double fixes it.
+        var values = new float[4096];
+        var rng = new Random(2024);
+        for (int i = 0; i < values.Length; i++)
+            values[i] = rng.Next(0, 1 << 24);
+
+        var page = AlpEncoder.EncodeFloats(values);
+
+        var output = new float[values.Length];
+        AlpDecoder.DecodeFloats(page, output, values.Length);
+        for (int i = 0; i < values.Length; i++)
+            AssertBitEqual(values[i], output[i]);
+
+        double bitsPerValue = page.Length * 8.0 / values.Length;
+        Assert.True(bitsPerValue < 26, $"cost {bitsPerValue:F2} bits/value; PLAIN would cost 32");
+    }
+
+    [Fact]
     public async Task ParquetWriter_DoubleAlp_ReadableByParquetSharp()
     {
         var path = TempPath("ew-alp-ps.parquet");
