@@ -430,6 +430,109 @@ public class AlpEncoderTests : IDisposable
             $"expected {expected:R} got {actual:R}");
     }
 
+    [Fact]
+    public void PackBits_EveryWidthAndLength_MatchesABitByBitReference()
+    {
+        // The packer accumulates into a register and flushes whole words, so its invariants are the
+        // word rollover and the final partial word — neither of which an end-to-end encode reaches
+        // except at whatever widths the data happens to produce. Sweep every width against lengths
+        // sitting either side of the 64-bit word boundary, and compare against a reference that
+        // simply sets one bit at a time.
+        ulong state = 9001;
+
+        foreach (int count in new[] { 1, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 1000, 1024 })
+        {
+            for (int bitWidth = 1; bitWidth <= 64; bitWidth++)
+            {
+                ulong mask = bitWidth == 64 ? ulong.MaxValue : (1UL << bitWidth) - 1UL;
+                var values = new long[count];
+                for (int i = 0; i < count; i++)
+                    values[i] = unchecked((long)(NextRandomBits(ref state) & mask));
+
+                int packedSize = (int)(((long)count * bitWidth + 7) / 8);
+
+                // Four bytes of slack past the end, expected to stay zero: the packer must fill the
+                // packed length exactly and no further.
+                var actual = new byte[packedSize + 4];
+                var expected = new byte[packedSize + 4];
+                AlpEncoder.PackBits(actual.AsSpan(0, packedSize), values, min: 0, bitWidth);
+                PackOneBitAtATime(expected.AsSpan(0, packedSize), values, bitWidth);
+
+                Assert.True(
+                    actual.AsSpan().SequenceEqual(expected),
+                    $"count={count} bitWidth={bitWidth}: packed bytes differ");
+            }
+        }
+    }
+
+    [Fact]
+    public void PackBits_FloatOverload_MatchesABitByBitReference()
+    {
+        // Same sweep for the int32 overload the FLOAT encoder uses; widths stop at 32 there.
+        ulong state = 4242;
+
+        foreach (int count in new[] { 1, 7, 8, 9, 63, 64, 65, 1000 })
+        {
+            for (int bitWidth = 1; bitWidth <= 32; bitWidth++)
+            {
+                // The frame of reference is the minimum of the encoded values, so a delta is never
+                // negative — and it must not be, since (values[i] - min) widens to long and a
+                // negative would sign-extend into the neighbouring field. Anchoring min at
+                // int.MinValue lets a delta span the full 32 bits while every value stays an int.
+                const int Min = int.MinValue;
+                uint mask = bitWidth == 32 ? uint.MaxValue : (1u << bitWidth) - 1u;
+                var values = new int[count];
+                var deltas = new long[count];
+                for (int i = 0; i < count; i++)
+                {
+                    long delta = (uint)NextRandomBits(ref state) & mask;
+                    values[i] = (int)(Min + delta);
+                    deltas[i] = delta;
+                }
+
+                int packedSize = (int)(((long)count * bitWidth + 7) / 8);
+                var actual = new byte[packedSize + 4];
+                var expected = new byte[packedSize + 4];
+                AlpEncoder.PackBits(actual.AsSpan(0, packedSize), values, Min, bitWidth);
+                PackOneBitAtATime(expected.AsSpan(0, packedSize), deltas, bitWidth);
+
+                Assert.True(
+                    actual.AsSpan().SequenceEqual(expected),
+                    $"count={count} bitWidth={bitWidth}: packed bytes differ");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The reference: LSB-first, one bit at a time. Obviously correct and obviously slow, which is
+    /// what makes it worth comparing against.
+    /// </summary>
+    private static void PackOneBitAtATime(Span<byte> dest, ReadOnlySpan<long> values, int bitWidth)
+    {
+        for (int i = 0; i < values.Length; i++)
+        {
+            ulong value = unchecked((ulong)values[i]);
+            for (int b = 0; b < bitWidth; b++)
+            {
+                if ((value & (1UL << b)) == 0)
+                    continue;
+
+                long bit = ((long)i * bitWidth) + b;
+                dest[(int)(bit >> 3)] |= (byte)(1 << (int)(bit & 7));
+            }
+        }
+    }
+
+    /// <summary>SplitMix64: a bit source that behaves identically on every target framework.</summary>
+    private static ulong NextRandomBits(ref ulong state)
+    {
+        state = unchecked(state + 0x9E3779B97F4A7C15UL);
+        ulong z = state;
+        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
+        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
+        return z ^ (z >> 31);
+    }
+
     private static async Task WriteDoubleColumn(string path, double[] values, FloatingPointEncoding fpe)
     {
         var schema = new Apache.Arrow.Schema.Builder()
