@@ -207,6 +207,13 @@ internal static class AlpDecoder
         }
         else
         {
+            // Decided once for the vector, as on the DOUBLE path. What FLOAT needs is narrower:
+            // AVX2 converts int32 to float natively, so there is no mantissa trick and no reordered
+            // multiply to justify — the only question is whether every encoded value this vector can
+            // produce still fits int32, which it does for anything the encoder wrote and need not
+            // for a corrupt page.
+            bool convertible = EncodedValuesFitInt32(frameOfReference, bitWidth);
+
             int produced = 0;
             while (produced < n)
             {
@@ -219,11 +226,9 @@ internal static class AlpDecoder
                 int unpacked = UnpackDeltas(
                     packed.Slice((produced * bitWidth) >> 3), bitWidth, tile, scratch);
 
-                for (int i = 0; i < unpacked; i++)
-                {
-                    long encoded = unchecked((long)(uint)scratch[i] + frameOfReference);
-                    destination[produced + i] = (float)encoded * factMulF * fracEF;
-                }
+                Transform(
+                    scratch.Slice(0, unpacked), destination.Slice(produced, unpacked),
+                    frameOfReference, factMulF, fracEF, convertible);
 
                 for (int i = unpacked; i < tile; i++)
                 {
@@ -417,6 +422,67 @@ internal static class AlpDecoder
             long encoded = unchecked((long)deltas[i] + frameOfReference);
             destination[i] = (double)unchecked(encoded * factMul) * fracE;
         }
+    }
+
+    /// <summary>
+    /// FLOAT counterpart of the DOUBLE <see cref="Transform(ReadOnlySpan{ulong}, Span{double}, long, long, double, bool)"/>.
+    /// </summary>
+    /// <remarks>
+    /// Simpler than the DOUBLE path in every way that matters: AVX2 has a native int32-to-float
+    /// conversion, so there is no mantissa trick, nothing is reordered, and eight values fit a
+    /// register instead of four. The deltas arrive in the shared 64-bit scratch and are narrowed
+    /// two vectors at a time to feed it.
+    /// </remarks>
+#if NET8_0_OR_GREATER
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
+    private static void Transform(
+        ReadOnlySpan<ulong> deltas, Span<float> destination,
+        int frameOfReference, float factMulF, float fracEF, bool convertible)
+    {
+        int i = 0;
+
+#if NET8_0_OR_GREATER
+        if (convertible && Vector256.IsHardwareAccelerated && deltas.Length >= Vector256<float>.Count)
+        {
+            var frame = Vector256.Create(frameOfReference);
+            var factor = Vector256.Create(factMulF);
+            var scale = Vector256.Create(fracEF);
+
+            ref ulong source = ref MemoryMarshal.GetReference(deltas);
+            ref float target = ref MemoryMarshal.GetReference(destination);
+
+            for (; i <= deltas.Length - Vector256<float>.Count; i += Vector256<float>.Count)
+            {
+                var low = Vector256.LoadUnsafe(ref source, (nuint)i);
+                var high = Vector256.LoadUnsafe(ref source, (nuint)(i + Vector256<ulong>.Count));
+                var encoded = Vector256.Narrow(low, high).AsInt32() + frame;
+
+                ((Vector256.ConvertToSingle(encoded) * factor) * scale)
+                    .StoreUnsafe(ref target, (nuint)i);
+            }
+        }
+#endif
+
+        for (; i < deltas.Length; i++)
+        {
+            long encoded = unchecked((long)(uint)deltas[i] + frameOfReference);
+            destination[i] = (float)encoded * factMulF * fracEF;
+        }
+    }
+
+    /// <summary>
+    /// Whether every encoded value this FLOAT vector can produce still fits int32, which is what
+    /// lets the conversion happen in 32-bit lanes. True of anything the encoder wrote — it derives
+    /// the frame of reference from int32 values — and not guaranteed of a corrupt page.
+    /// </summary>
+    private static bool EncodedValuesFitInt32(int frameOfReference, int bitWidth)
+    {
+        if (bitWidth > MaxSingleReadBitWidth)
+            return false;
+
+        long span = (1L << bitWidth) - 1;
+        return (long)frameOfReference + span <= int.MaxValue;
     }
 
     /// <summary>
