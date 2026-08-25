@@ -630,12 +630,16 @@ internal static class AlpEncoder
     /// write it back — makes consecutive values touch the same word, so every store feeds the next
     /// load. MEASURED, that ran at about 2 GB/s; accumulating and writing each word once runs at
     /// 9 to 17 GB/s depending on the width, and bit packing was roughly two fifths of encode.</para>
+    /// <para><paramref name="min"/> is the vector's frame of reference, so every delta is
+    /// non-negative and narrower than <paramref name="bitWidth"/>. Both matter: the subtraction
+    /// widens to long, so a negative would sign-extend and shift into the neighbouring value's
+    /// field, and a delta wider than the bit width would overlap the next one.</para>
     /// <para>Note this is the opposite conclusion to the decoder's unpacker, where hoisting the
     /// per-value offsets into locals was the win. Unpacking is pure reads with no dependency
     /// between values; the same trick applied here measured no better than what it replaced,
     /// because it does not remove the read-modify-write.</para>
     /// </remarks>
-    private static void PackBits(Span<byte> dest, ReadOnlySpan<long> values, long min, int bitWidth)
+    internal static void PackBits(Span<byte> dest, ReadOnlySpan<long> values, long min, int bitWidth)
     {
         ulong accumulator = 0;
         int held = 0;
@@ -660,7 +664,10 @@ internal static class AlpEncoder
     }
 
     /// <summary>FLOAT counterpart of <see cref="PackBits(Span{byte}, ReadOnlySpan{long}, long, int)"/>.</summary>
-    private static void PackBits(Span<byte> dest, ReadOnlySpan<int> values, long min, int bitWidth)
+    /// <remarks>Internal rather than private so the packing tests can reach it directly: driving it
+    /// through a whole encode only exercises whatever widths the chosen (exponent, factor) happens to
+    /// produce, which on the corpus is four of the sixty-four.</remarks>
+    internal static void PackBits(Span<byte> dest, ReadOnlySpan<int> values, long min, int bitWidth)
     {
         ulong accumulator = 0;
         int held = 0;
