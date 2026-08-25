@@ -1174,11 +1174,11 @@ internal static class ColumnChunkWriter
             PhysicalType.Int32 => EncodeDeltaInt32ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Int64 => EncodeDeltaInt64ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Float when useAlp => EncodeAlpSingleToBuffer(
-                array, offset, numValues, nonNullCount, defLevels, physicalType, typeLength, ref encoding),
+                array, offset, numValues, nonNullCount, defLevels, ref encoding),
             PhysicalType.Float when usePlainFp => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Float => EncodeBssSingleToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Double when useAlp => EncodeAlpDoubleToBuffer(
-                array, offset, numValues, nonNullCount, defLevels, physicalType, typeLength, ref encoding),
+                array, offset, numValues, nonNullCount, defLevels, ref encoding),
             PhysicalType.Double when usePlainFp => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Double => EncodeBssDoubleToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.ByteArray when useDba => EncodeDbaByteArrayToBuffer(array, offset, numValues, nonNullCount, defLevels),
@@ -1211,7 +1211,7 @@ internal static class ColumnChunkWriter
     /// </remarks>
     private static int EncodeAlpSingleToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
-        PhysicalType physicalType, int typeLength, ref Encoding encoding)
+        ref Encoding encoding)
     {
         ReadOnlySpan<float> source = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
         float[] dense;
@@ -1230,9 +1230,13 @@ internal static class ColumnChunkWriter
         byte[] page = AlpEncoder.EncodeFloats(values);
         if (page.Length >= nonNullCount * sizeof(float))
         {
+            // Written from the dense values already in hand. Going back through
+            // EncodePlainToBuffer would walk the definition levels to compact them a second time
+            // and allocate a buffer to do it, on a path that runs for every page of any column ALP
+            // does not suit.
             encoding = Encoding.Plain;
-            return EncodePlainToBuffer(
-                array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels);
+            EnsureValuesBuffer(nonNullCount * sizeof(float));
+            return PlainEncoder.EncodeFloats(values, t_valuesBuffer!);
         }
 
         EnsureValuesBuffer(page.Length);
@@ -1245,7 +1249,7 @@ internal static class ColumnChunkWriter
     /// </summary>
     private static int EncodeAlpDoubleToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
-        PhysicalType physicalType, int typeLength, ref Encoding encoding)
+        ref Encoding encoding)
     {
         ReadOnlySpan<double> source = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
         double[] dense;
@@ -1264,9 +1268,11 @@ internal static class ColumnChunkWriter
         byte[] page = AlpEncoder.EncodeDoubles(values);
         if (page.Length >= nonNullCount * sizeof(double))
         {
+            // See EncodeAlpSingleToBuffer: written from the dense values rather than compacting a
+            // second time.
             encoding = Encoding.Plain;
-            return EncodePlainToBuffer(
-                array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels);
+            EnsureValuesBuffer(nonNullCount * sizeof(double));
+            return PlainEncoder.EncodeDoubles(values, t_valuesBuffer!);
         }
 
         EnsureValuesBuffer(page.Length);

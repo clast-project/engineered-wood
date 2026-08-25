@@ -274,6 +274,7 @@ public class AlpEncoderTests : IDisposable
         var column = meta.RowGroups[0].Columns[0].MetaData!;
 
         Assert.DoesNotContain(Encoding.Alp, column.Encodings);
+        Assert.Contains(Encoding.Plain, column.Encodings);
 
         double bitsPerValue = column.TotalCompressedSize * 8.0 / values.Length;
         Assert.True(bitsPerValue < 33, $"fell back but still cost {bitsPerValue:F2} bits/value");
@@ -282,6 +283,78 @@ public class AlpEncoderTests : IDisposable
         var arr = (FloatArray)batch.Column(0);
         for (int i = 0; i < values.Length; i++)
             AssertBitEqual(values[i], arr.GetValue(i)!.Value);
+    }
+
+    [Fact]
+    public async Task ParquetWriter_AlpFallbackWithNulls_RoundTripsAndStaysPlain()
+    {
+        // The fallback writes the dense values ALP already compacted rather than compacting the
+        // column a second time, so a nullable column is the case where it could diverge — PLAIN
+        // stores only the defined values, and getting the compaction wrong would shift every value
+        // after the first null. Both other fallback tests use non-nullable columns.
+        var path = TempPath("ew-alp-fallback-nulls.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", DoubleType.Default, nullable: true))
+            .Build();
+
+        var rng = new Random(31337);
+        var builder = new DoubleArray.Builder();
+        var expected = new double?[4000];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (i % 7 == 0)
+            {
+                builder.AppendNull();
+                expected[i] = null;
+            }
+            else
+            {
+                // Radians again: nothing ALP can encode, so every page falls back.
+                double value = rng.NextDouble() * 2.0 - 1.0;
+                builder.Append(value);
+                expected[i] = value;
+            }
+        }
+
+        var batch = new RecordBatch(schema, [builder.Build()], expected.Length);
+        var options = ParquetWriteOptions.Default with
+        {
+            FloatingPointEncoding = FloatingPointEncoding.Alp,
+            DataPageVersion = DataPageVersion.V2,
+            DictionaryEnabled = false,
+            Compression = EngineeredWood.Compression.CompressionCodec.Uncompressed,
+        };
+
+        await using (var sink = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(sink, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+        var column = meta.RowGroups[0].Columns[0].MetaData!;
+
+        Assert.DoesNotContain(Encoding.Alp, column.Encodings);
+        Assert.Contains(Encoding.Plain, column.Encodings);
+
+        var read = await reader.ReadRowGroupAsync(0);
+        var arr = (DoubleArray)read.Column(0);
+        Assert.Equal(expected.Length, arr.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (expected[i] is null)
+            {
+                Assert.True(arr.IsNull(i), $"row {i} should be null");
+                continue;
+            }
+
+            Assert.False(arr.IsNull(i), $"row {i} should not be null");
+            AssertBitEqual(expected[i]!.Value, arr.GetValue(i)!.Value);
+        }
     }
 
     [Fact]
