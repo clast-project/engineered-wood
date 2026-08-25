@@ -1173,10 +1173,12 @@ internal static class ColumnChunkWriter
             PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels, options.MaxLiteralGroups),
             PhysicalType.Int32 => EncodeDeltaInt32ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Int64 => EncodeDeltaInt64ToBuffer(array, offset, numValues, nonNullCount, defLevels),
-            PhysicalType.Float when useAlp => EncodeAlpSingleToBuffer(array, offset, numValues, nonNullCount, defLevels),
+            PhysicalType.Float when useAlp => EncodeAlpSingleToBuffer(
+                array, offset, numValues, nonNullCount, defLevels, physicalType, typeLength, ref encoding),
             PhysicalType.Float when usePlainFp => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Float => EncodeBssSingleToBuffer(array, offset, numValues, nonNullCount, defLevels),
-            PhysicalType.Double when useAlp => EncodeAlpDoubleToBuffer(array, offset, numValues, nonNullCount, defLevels),
+            PhysicalType.Double when useAlp => EncodeAlpDoubleToBuffer(
+                array, offset, numValues, nonNullCount, defLevels, physicalType, typeLength, ref encoding),
             PhysicalType.Double when usePlainFp => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Double => EncodeBssDoubleToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.ByteArray when useDba => EncodeDbaByteArrayToBuffer(array, offset, numValues, nonNullCount, defLevels),
@@ -1195,8 +1197,21 @@ internal static class ColumnChunkWriter
         return page.Length;
     }
 
+    /// <summary>
+    /// ALP for a FLOAT page, falling back to PLAIN when ALP would not shrink it.
+    /// </summary>
+    /// <remarks>
+    /// ALP cannot fit every column, and when it does not fit it is not merely unhelpful but
+    /// actively worse: values that do not survive the spec's decode formula are stored whole
+    /// alongside a position, costing half again what writing them plainly would. MEASURED, that is
+    /// two-decimal FLOAT values past about 2^16, where the format's 24-bit mantissa cannot reproduce
+    /// them at all, and DOUBLE coordinate columns with no decimal structure. Declining per page
+    /// keeps the guarantee the FSST writer already makes: choosing this encoding cannot make a file
+    /// bigger than not choosing it.
+    /// </remarks>
     private static int EncodeAlpSingleToBuffer(
-        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
+        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
+        PhysicalType physicalType, int typeLength, ref Encoding encoding)
     {
         ReadOnlySpan<float> source = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
         float[] dense;
@@ -1213,13 +1228,24 @@ internal static class ColumnChunkWriter
         }
 
         byte[] page = AlpEncoder.EncodeFloats(values);
+        if (page.Length >= nonNullCount * sizeof(float))
+        {
+            encoding = Encoding.Plain;
+            return EncodePlainToBuffer(
+                array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels);
+        }
+
         EnsureValuesBuffer(page.Length);
         page.CopyTo(t_valuesBuffer!, 0);
         return page.Length;
     }
 
+    /// <summary>
+    /// ALP for a DOUBLE page. See <see cref="EncodeAlpSingleToBuffer"/> for why it may decline.
+    /// </summary>
     private static int EncodeAlpDoubleToBuffer(
-        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
+        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
+        PhysicalType physicalType, int typeLength, ref Encoding encoding)
     {
         ReadOnlySpan<double> source = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
         double[] dense;
@@ -1236,6 +1262,13 @@ internal static class ColumnChunkWriter
         }
 
         byte[] page = AlpEncoder.EncodeDoubles(values);
+        if (page.Length >= nonNullCount * sizeof(double))
+        {
+            encoding = Encoding.Plain;
+            return EncodePlainToBuffer(
+                array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels);
+        }
+
         EnsureValuesBuffer(page.Length);
         page.CopyTo(t_valuesBuffer!, 0);
         return page.Length;

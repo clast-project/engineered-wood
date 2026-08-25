@@ -533,7 +533,14 @@ internal static class AlpEncoder
         if (scaled <= int.MinValue + 512 || scaled >= int.MaxValue - 512)
             return false;
 
-        int candidate = (int)(scaled + FloatMagic - FloatMagic);
+        // Round to nearest, ties to even, by biasing into the mantissa — but in DOUBLE, not float.
+        // The float constant only rounds correctly below 2^22, because past that the biased value
+        // leaves the range where floats are spaced one apart. Everything above lost its round trip
+        // and became an exception at 48 bits: MEASURED, random integers under 2^24 cost 40.80
+        // bits/value against PLAIN's 32, and two-decimal values fell off from 2^16 because scaling
+        // by a hundred crosses the same threshold. Biasing in double covers the whole int32 range
+        // the check above admits, and rounds identically everywhere the float form already worked.
+        int candidate = (int)((double)scaled + DoubleMagic - DoubleMagic);
         if (candidate * FloatPow10[factor] * FloatNegPow10[exponent] != value)
             return false;
 
