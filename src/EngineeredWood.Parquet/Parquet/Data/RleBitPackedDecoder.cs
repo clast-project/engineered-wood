@@ -3,6 +3,8 @@
 
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Data;
@@ -104,20 +106,28 @@ internal ref struct RleBitPackedDecoder
                         toCopy -= 8;
                     }
                 }
+                // Guarded here rather than inside the kernel. AggressiveOptimization implies no
+                // inlining, so an unguarded call costs a real call on every run that cannot use it —
+                // MEASURED at 0.51 -> 0.85 ms per million level values, which is the whole of what
+                // the bulk path wins elsewhere. Thirty-two is where the kernel's setup starts paying
+                // for itself: EW writes a run header every eight values by default, and at one group
+                // per run the kernel MEASURED slower than the loop below.
+                if (toCopy >= MinBulkValues && _bitWidth > 1)
+                {
+                    int bulk = UnpackGroups(destination, offset, toCopy);
+                    offset += bulk;
+                    toCopy -= bulk;
+                }
 
                 // General path for remaining values or other bit widths
-                int mask = (1 << _bitWidth) - 1;
+                ulong mask = (1UL << _bitWidth) - 1UL;
                 for (int i = 0; i < toCopy; i++)
                 {
                     int byteIdx = _bitPackedPos + (_bitOffset >> 3);
                     int bitIdx = _bitOffset & 7;
                     _bitOffset += _bitWidth;
 
-                    int rem = _data.Length - byteIdx;
-                    uint raw = rem >= 4
-                        ? BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(byteIdx))
-                        : AssemblePartial(byteIdx, rem);
-                    destination[offset++] = (int)((raw >> bitIdx) & (uint)mask);
+                    destination[offset++] = (int)((ReadPackedWord(byteIdx) >> bitIdx) & mask);
                     _remaining--;
                 }
             }
@@ -165,19 +175,27 @@ internal ref struct RleBitPackedDecoder
                         toCopy -= 8;
                     }
                 }
+                // Guarded here rather than inside the kernel. AggressiveOptimization implies no
+                // inlining, so an unguarded call costs a real call on every run that cannot use it —
+                // MEASURED at 0.51 -> 0.85 ms per million level values, which is the whole of what
+                // the bulk path wins elsewhere. Thirty-two is where the kernel's setup starts paying
+                // for itself: EW writes a run header every eight values by default, and at one group
+                // per run the kernel MEASURED slower than the loop below.
+                if (toCopy >= MinBulkValues && _bitWidth > 1)
+                {
+                    int bulk = UnpackGroups(destination, offset, toCopy);
+                    offset += bulk;
+                    toCopy -= bulk;
+                }
 
-                int mask = (1 << _bitWidth) - 1;
+                ulong mask = (1UL << _bitWidth) - 1UL;
                 for (int i = 0; i < toCopy; i++)
                 {
                     int byteIdx = _bitPackedPos + (_bitOffset >> 3);
                     int bitIdx = _bitOffset & 7;
                     _bitOffset += _bitWidth;
 
-                    int rem = _data.Length - byteIdx;
-                    uint raw = rem >= 4
-                        ? BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(byteIdx))
-                        : AssemblePartial(byteIdx, rem);
-                    destination[offset++] = (byte)((raw >> bitIdx) & (uint)mask);
+                    destination[offset++] = (byte)((ReadPackedWord(byteIdx) >> bitIdx) & mask);
                     _remaining--;
                 }
             }
@@ -235,19 +253,35 @@ internal ref struct RleBitPackedDecoder
                         toCopy -= 8;
                     }
                 }
+                // Unpacked in bulk, then counted over what was produced: keeping the comparison
+                // out of the kernel is what lets it stay a straight line.
+                // Guarded here rather than inside the kernel. AggressiveOptimization implies no
+                // inlining, so an unguarded call costs a real call on every run that cannot use it —
+                // MEASURED at 0.51 -> 0.85 ms per million level values, which is the whole of what
+                // the bulk path wins elsewhere. Thirty-two is where the kernel's setup starts paying
+                // for itself: EW writes a run header every eight values by default, and at one group
+                // per run the kernel MEASURED slower than the loop below.
+                if (toCopy >= MinBulkValues && _bitWidth > 1)
+                {
+                    int bulk = UnpackGroups(destination, offset, toCopy);
+                    for (int i = 0; i < bulk; i++)
+                    {
+                        if (destination[offset + i] == matchValue)
+                            matchCount++;
+                    }
 
-                int mask = (1 << _bitWidth) - 1;
+                    offset += bulk;
+                    toCopy -= bulk;
+                }
+
+                ulong mask = (1UL << _bitWidth) - 1UL;
                 for (int i = 0; i < toCopy; i++)
                 {
                     int byteIdx = _bitPackedPos + (_bitOffset >> 3);
                     int bitIdx = _bitOffset & 7;
                     _bitOffset += _bitWidth;
 
-                    int rem = _data.Length - byteIdx;
-                    uint raw = rem >= 4
-                        ? BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(byteIdx))
-                        : AssemblePartial(byteIdx, rem);
-                    byte val = (byte)((raw >> bitIdx) & (uint)mask);
+                    byte val = (byte)((ReadPackedWord(byteIdx) >> bitIdx) & mask);
                     destination[offset++] = val;
                     if (val == matchValue) matchCount++;
                     _remaining--;
@@ -310,19 +344,34 @@ internal ref struct RleBitPackedDecoder
                         toCopy -= 8;
                     }
                 }
+                // See the byte overload: unpacked in bulk, counted afterwards.
+                // Guarded here rather than inside the kernel. AggressiveOptimization implies no
+                // inlining, so an unguarded call costs a real call on every run that cannot use it —
+                // MEASURED at 0.51 -> 0.85 ms per million level values, which is the whole of what
+                // the bulk path wins elsewhere. Thirty-two is where the kernel's setup starts paying
+                // for itself: EW writes a run header every eight values by default, and at one group
+                // per run the kernel MEASURED slower than the loop below.
+                if (toCopy >= MinBulkValues && _bitWidth > 1)
+                {
+                    int bulk = UnpackGroups(destination, offset, toCopy);
+                    for (int i = 0; i < bulk; i++)
+                    {
+                        if (destination[offset + i] == matchValue)
+                            matchCount++;
+                    }
 
-                int mask = (1 << _bitWidth) - 1;
+                    offset += bulk;
+                    toCopy -= bulk;
+                }
+
+                ulong mask = (1UL << _bitWidth) - 1UL;
                 for (int i = 0; i < toCopy; i++)
                 {
                     int byteIdx = _bitPackedPos + (_bitOffset >> 3);
                     int bitIdx = _bitOffset & 7;
                     _bitOffset += _bitWidth;
 
-                    int rem = _data.Length - byteIdx;
-                    uint raw = rem >= 4
-                        ? BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(byteIdx))
-                        : AssemblePartial(byteIdx, rem);
-                    int val = (int)((raw >> bitIdx) & (uint)mask);
+                    int val = (int)((ReadPackedWord(byteIdx) >> bitIdx) & mask);
                     destination[offset++] = val;
                     if (val == matchValue) matchCount++;
                     _remaining--;
@@ -384,31 +433,178 @@ internal ref struct RleBitPackedDecoder
         int bitIndex = _bitOffset & 7;
         _bitOffset += _bitWidth;
 
-        // Fast path: read up to 4 bytes and extract value with shift+mask
-        // Safe when bitWidth <= 24 (value spans at most 4 bytes)
-        int remaining = _data.Length - byteIndex;
-        uint raw;
-        if (remaining >= 4)
-        {
-            raw = BinaryPrimitives.ReadUInt32LittleEndian(_data.Slice(byteIndex));
-        }
-        else
-        {
-            // Near end of buffer — assemble from available bytes
-            raw = 0;
-            for (int i = 0; i < remaining; i++)
-                raw |= (uint)_data[byteIndex + i] << (i * 8);
-        }
-
-        int mask = (1 << _bitWidth) - 1;
-        return (int)((raw >> bitIndex) & (uint)mask);
+        // A 64-bit read, and a 64-bit mask. The comment that used to sit here said the 32-bit
+        // version was "safe when bitWidth <= 24" and then used it at every width: at 27, 29, 30 and
+        // 31 some values need more than 32 bits from their starting byte and were truncated, and at
+        // 32 the mask itself was wrong, because shifting an int by 32 wraps to a shift by zero.
+        ulong mask = (1UL << _bitWidth) - 1UL;
+        return (int)((ReadPackedWord(byteIndex) >> bitIndex) & mask);
     }
 
-    private uint AssemblePartial(int byteIndex, int remaining)
+    /// <summary>
+    /// Values a bit-packed run must have left before the bulk path is worth entering. See the call
+    /// sites: below this the kernel's setup costs more than it saves.
+    /// </summary>
+    private const int MinBulkValues = 32;
+
+    /// <summary>
+    /// Unpacks whole groups of eight values from the current bit-packed run, returning how many it
+    /// produced. The caller finishes the remainder one value at a time.
+    /// </summary>
+    /// <remarks>
+    /// <para>A bit-packed run is always a whole number of groups of eight, and eight values at
+    /// <c>bitWidth</c> bits occupy exactly <c>bitWidth</c> bytes — so every group realigns to a byte
+    /// boundary and the eight byte offsets and shifts within one depend only on the width. Hoisting
+    /// them out of the loop turns a value into one unaligned read, one shift and one mask, where the
+    /// loop below recomputes the address and re-checks the buffer for each.</para>
+    /// <para>MEASURED at 1.78x the per-value loop on a real dictionary column read — but only where
+    /// the literal runs are long. A bit-packed run holds as few as eight values, and how many it
+    /// holds is the writer's choice: parquet-mr and arrow-rs batch up to 63 groups into one run,
+    /// while EW itself emits a run header every eight values unless
+    /// <c>ParquetWriteOptions.BatchBitPackedRuns</c> is set. At eight values a run there is exactly
+    /// one group to unpack and the setup below does not pay for itself, which is what
+    /// <see cref="MinBulkValues"/> keeps it out of.</para>
+    /// <para>Deliberately NOT <c>AggressiveOptimization</c>, unlike the ALP unpacker this is modelled
+    /// on. That attribute implies no inlining, and MEASURED, the resulting call in the middle of
+    /// ReadBatch costs more on the runs that decline it than the kernel wins on the runs that use it
+    /// — level decoding at width 1, which never enters here at all, slowed by 25%. Without it the
+    /// win is identical (0.55 vs 0.56 ms per million values) and that cost is gone. An isolated
+    /// harness said the opposite, measuring the same body at 13.6 GB/s with the attribute against
+    /// 9.0 without; it had no surrounding method for the call to disturb.</para>
+    /// </remarks>
+    private int UnpackGroups(Span<int> destination, int offset, int count)
     {
-        uint raw = 0;
+        int groups = PlanGroups(count, out int baseByte);
+        if (groups == 0)
+            return 0;
+
+        int width = _bitWidth;
+        ulong mask = (1UL << width) - 1UL;
+        int o1 = width >> 3, o2 = (2 * width) >> 3, o3 = (3 * width) >> 3;
+        int o4 = (4 * width) >> 3, o5 = (5 * width) >> 3;
+        int o6 = (6 * width) >> 3, o7 = (7 * width) >> 3;
+        int s1 = width & 7, s2 = (2 * width) & 7, s3 = (3 * width) & 7;
+        int s4 = (4 * width) & 7, s5 = (5 * width) & 7;
+        int s6 = (6 * width) & 7, s7 = (7 * width) & 7;
+
+        ref byte source = ref Unsafe.Add(ref MemoryMarshal.GetReference(_data), baseByte);
+
+        for (int g = 0; g < groups; g++)
+        {
+            int b = g * width;
+            int o = offset + (g * 8);
+            destination[o] = (int)(Word(ref source, b) & mask);
+            destination[o + 1] = (int)((Word(ref source, b + o1) >> s1) & mask);
+            destination[o + 2] = (int)((Word(ref source, b + o2) >> s2) & mask);
+            destination[o + 3] = (int)((Word(ref source, b + o3) >> s3) & mask);
+            destination[o + 4] = (int)((Word(ref source, b + o4) >> s4) & mask);
+            destination[o + 5] = (int)((Word(ref source, b + o5) >> s5) & mask);
+            destination[o + 6] = (int)((Word(ref source, b + o6) >> s6) & mask);
+            destination[o + 7] = (int)((Word(ref source, b + o7) >> s7) & mask);
+        }
+
+        int produced = groups * 8;
+        _bitOffset += produced * width;
+        _remaining -= produced;
+        return produced;
+    }
+
+    /// <summary>Byte-destination counterpart of <see cref="UnpackGroups(Span{int}, int, int)"/>.</summary>
+    private int UnpackGroups(Span<byte> destination, int offset, int count)
+    {
+        int groups = PlanGroups(count, out int baseByte);
+        if (groups == 0)
+            return 0;
+
+        int width = _bitWidth;
+        ulong mask = (1UL << width) - 1UL;
+        int o1 = width >> 3, o2 = (2 * width) >> 3, o3 = (3 * width) >> 3;
+        int o4 = (4 * width) >> 3, o5 = (5 * width) >> 3;
+        int o6 = (6 * width) >> 3, o7 = (7 * width) >> 3;
+        int s1 = width & 7, s2 = (2 * width) & 7, s3 = (3 * width) & 7;
+        int s4 = (4 * width) & 7, s5 = (5 * width) & 7;
+        int s6 = (6 * width) & 7, s7 = (7 * width) & 7;
+
+        ref byte source = ref Unsafe.Add(ref MemoryMarshal.GetReference(_data), baseByte);
+
+        for (int g = 0; g < groups; g++)
+        {
+            int b = g * width;
+            int o = offset + (g * 8);
+            destination[o] = (byte)(Word(ref source, b) & mask);
+            destination[o + 1] = (byte)((Word(ref source, b + o1) >> s1) & mask);
+            destination[o + 2] = (byte)((Word(ref source, b + o2) >> s2) & mask);
+            destination[o + 3] = (byte)((Word(ref source, b + o3) >> s3) & mask);
+            destination[o + 4] = (byte)((Word(ref source, b + o4) >> s4) & mask);
+            destination[o + 5] = (byte)((Word(ref source, b + o5) >> s5) & mask);
+            destination[o + 6] = (byte)((Word(ref source, b + o6) >> s6) & mask);
+            destination[o + 7] = (byte)((Word(ref source, b + o7) >> s7) & mask);
+        }
+
+        int produced = groups * 8;
+        _bitOffset += produced * width;
+        _remaining -= produced;
+        return produced;
+    }
+
+    /// <summary>
+    /// How many whole groups the bulk path may take, and the byte it starts at. Zero when the run
+    /// is not currently sitting on a group boundary, when the width is outside what one 64-bit read
+    /// covers, or when the reads would run past the buffer — each of which the per-value loop
+    /// handles safely.
+    /// </summary>
+    private readonly int PlanGroups(int count, out int baseByte)
+    {
+        baseByte = 0;
+
+        int width = _bitWidth;
+        if (width is < 2 or > 32 || count < 8)
+            return 0;
+
+        // Every group of eight consumes exactly `width` bytes, so a group boundary is also a byte
+        // boundary. Anywhere else the shifts below would not be the ones computed here.
+        if (_bitOffset % (width * 8) != 0)
+            return 0;
+
+        baseByte = _bitPackedPos + (_bitOffset >> 3);
+
+        // The last value of a group is read as a whole word, which for narrow widths reaches past
+        // the group's own bytes.
+        int reach = ((7 * width) >> 3) + 8;
+        if (_data.Length < baseByte + reach)
+            return 0;
+
+        return Math.Min(count / 8, ((_data.Length - baseByte - reach) / width) + 1);
+    }
+
+    /// <summary>Reads a little-endian 64-bit word at a byte offset, aligned or not.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Word(ref byte source, int byteOffset)
+    {
+        ulong value = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref source, byteOffset));
+        return BitConverter.IsLittleEndian ? value : BinaryPrimitives.ReverseEndianness(value);
+    }
+
+    /// <summary>
+    /// Reads the 64-bit word holding a value, padding with zeroes past the end of the buffer.
+    /// </summary>
+    /// <remarks>
+    /// Sixty-four bits, not thirty-two. A value starts up to seven bits into its first byte, so a
+    /// 32-bit read only covers it while <c>bitIdx + bitWidth &lt;= 32</c> — at widths 27, 29, 30 and
+    /// 31 some values in every group need more than that and were silently truncated. Unreachable
+    /// through this writer, which abandons dictionary encoding long before an index needs 27 bits,
+    /// but reachable by reading a file another implementation wrote.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private readonly ulong ReadPackedWord(int byteIndex)
+    {
+        int remaining = _data.Length - byteIndex;
+        if (remaining >= 8)
+            return BinaryPrimitives.ReadUInt64LittleEndian(_data.Slice(byteIndex));
+
+        ulong raw = 0;
         for (int i = 0; i < remaining; i++)
-            raw |= (uint)_data[byteIndex + i] << (i * 8);
+            raw |= (ulong)_data[byteIndex + i] << (i * 8);
         return raw;
     }
 }
