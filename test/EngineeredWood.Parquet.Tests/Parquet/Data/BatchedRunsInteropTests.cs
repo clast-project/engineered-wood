@@ -7,6 +7,7 @@ using Apache.Arrow.Types;
 using EngineeredWood.Compression;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Tests.Parquet.Interop;
 using Xunit.Abstractions;
 
 namespace EngineeredWood.Tests.Parquet.Data;
@@ -284,5 +285,110 @@ public class BatchedRunsInteropTests : IDisposable
             Assert.Equal(3, vec.Length);
             Assert.Equal(i * 3 + 0.25f, vec.GetValue(0));
         }
+    }
+
+    /// <summary>
+    /// Every reader crossed with every page-version and codec combination. The reader is part of the
+    /// case rather than looped over inside one, so an absent DuckDB shows up as four skipped cases
+    /// naming DuckDB instead of silently shrinking what a green run proves.
+    /// </summary>
+    public static TheoryData<string, string, DataPageVersion, CompressionCodec> ExternalReaders()
+    {
+        var data = new TheoryData<string, string, DataPageVersion, CompressionCodec>();
+        foreach (string reader in new[] { ExternalParquetReaders.DuckDb, ExternalParquetReaders.DataFusion })
+        {
+            data.Add(reader, "v2-uncompressed", DataPageVersion.V2, CompressionCodec.Uncompressed);
+            data.Add(reader, "v2-snappy", DataPageVersion.V2, CompressionCodec.Snappy);
+            data.Add(reader, "v1-uncompressed", DataPageVersion.V1, CompressionCodec.Uncompressed);
+            data.Add(reader, "v1-snappy", DataPageVersion.V1, CompressionCodec.Snappy);
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// Dictionary indices, definition levels and RLE booleans, read back by DuckDB and by arrow-rs
+    /// (through DataFusion) — the two decoders nothing else in this repository exercises.
+    /// </summary>
+    /// <remarks>
+    /// The assertion is deliberately framing-only: the batched file must decode to what the
+    /// unbatched file decoded to, in the same reader. Comparing against values asserted here instead
+    /// would fail for reasons that have nothing to do with batching — a reader's own type mapping,
+    /// its null handling, its idea of what a boolean column is. Batching changes only how runs are
+    /// framed, so the twin file is the right control, and a reader that cannot read the unbatched
+    /// file has told us nothing about batching and skips.
+    /// </remarks>
+    [SkippableTheory]
+    [MemberData(nameof(ExternalReaders))]
+    public async Task BatchedRuns_DecodeIdenticallyForAnExternalReader(
+        string reader, string label, DataPageVersion pageVersion, CompressionCodec codec)
+    {
+        ExternalParquetReaders.Require();
+
+        var batch = BuildDictBatch(rows: 20_000, cardinality: 1000);
+        var baseOptions = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = pageVersion,
+            Compression = codec,
+        };
+
+        string plain = await WriteAsync($"ext-{reader}-plain-{label}.parquet", batch, baseOptions);
+        string batched = await WriteAsync($"ext-{reader}-batched-{label}.parquet", batch,
+            baseOptions with { BatchBitPackedRuns = true });
+
+        var fromPlain = ExternalParquetReaders.Read(reader, plain);
+        Skip.IfNot(fromPlain.Installed, $"{reader} is not installed: {fromPlain.Error}");
+        Skip.If(fromPlain.Result is null,
+            $"{reader} cannot read the unbatched file either, so it says nothing about batching: "
+            + fromPlain.Error);
+
+        var fromBatched = ExternalParquetReaders.Read(reader, batched);
+        Assert.True(fromBatched.Result is not null,
+            $"{reader} read the unbatched file but failed on its batched twin: {fromBatched.Error}");
+
+        Assert.Equal(fromPlain.Result!.Rows, fromBatched.Result!.Rows);
+        Assert.Equal(fromPlain.Result.Columns, fromBatched.Result.Columns);
+
+        _output.WriteLine(
+            $"{reader,-11} {label,-16} v{fromPlain.Result.Version,-9} rows={fromPlain.Result.Rows} " +
+            $"cols={fromPlain.Result.Columns.Count}  plain={new FileInfo(plain).Length,8}  " +
+            $"batched={new FileInfo(batched).Length,8}");
+    }
+
+    /// <summary>
+    /// The same check over fixed-length lists, where batching changes the framing of a REPETITION
+    /// level stream rather than a dictionary index stream. Worth its own case: repetition levels are
+    /// the one stream V2 stores uncompressed, so this is where a framing bug would be least likely
+    /// to be papered over by a codec.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(ExternalReaders))]
+    public async Task BatchedRuns_DecodeIdenticallyForAnExternalReader_NestedLists(
+        string reader, string label, DataPageVersion pageVersion, CompressionCodec codec)
+    {
+        ExternalParquetReaders.Require();
+
+        var batch = BuildListBatch(rows: 5000, length: 3);
+        var baseOptions = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = pageVersion,
+            Compression = codec,
+        };
+
+        string plain = await WriteAsync($"extlist-{reader}-plain-{label}.parquet", batch, baseOptions);
+        string batched = await WriteAsync($"extlist-{reader}-batched-{label}.parquet", batch,
+            baseOptions with { BatchBitPackedRuns = true });
+
+        var fromPlain = ExternalParquetReaders.Read(reader, plain);
+        Skip.IfNot(fromPlain.Installed, $"{reader} is not installed: {fromPlain.Error}");
+        Skip.If(fromPlain.Result is null,
+            $"{reader} cannot read the unbatched file either: {fromPlain.Error}");
+
+        var fromBatched = ExternalParquetReaders.Read(reader, batched);
+        Assert.True(fromBatched.Result is not null,
+            $"{reader} read the unbatched file but failed on its batched twin: {fromBatched.Error}");
+
+        Assert.Equal(fromPlain.Result!.Rows, fromBatched.Result!.Rows);
+        Assert.Equal(fromPlain.Result.Columns, fromBatched.Result.Columns);
     }
 }

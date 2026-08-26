@@ -4,6 +4,8 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
+using EngineeredWood.Tests.Interop;
+
 namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 
 /// <summary>
