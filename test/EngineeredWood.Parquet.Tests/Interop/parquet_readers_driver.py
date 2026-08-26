@@ -21,11 +21,20 @@ an EngineeredWood file in anger:
 
 Both readers are asked only to decode a file and hand back what they saw. All judgement lives in the
 C# assertions.
+
+pyarrow is a REQUIRED dependency of this driver, not an optional one: it is the transport both
+readers hand their decoded values back through. It does no parquet decoding here and so cannot mask
+a framing bug, but its absence would make the tier fail for a reason that has nothing to do with
+parquet — which is why the availability probe checks for it too rather than discovering it here.
 """
 import hashlib
 import json
 import sys
 import traceback
+
+
+# Values per hashed window. Ours, not the reader's — see cmd_read_digest.
+_DIGEST_STRIDE = 8192
 
 
 def _import(reader):
@@ -91,10 +100,15 @@ def cmd_read_digest(args):
     table = _to_arrow(reader, args["path"])
     columns = []
     for name, column in zip(table.column_names, table.columns):
+        # to_pylist() on the CHUNKED array, then windows of our own STRIDE: the digest must depend
+        # on the values alone, never on how the reader chose to chunk them. Hashing chunk by chunk
+        # would fold the reader's batch boundaries into the hash, and those can legitimately follow
+        # page boundaries — which is the one thing batching changes. That would turn this oracle
+        # into a false alarm on exactly the files it exists to clear.
+        values = column.to_pylist()
         digest = hashlib.sha256()
-        # Chunk by chunk so a large column never materialises as one Python list.
-        for chunk in column.chunks:
-            digest.update(repr(chunk.to_pylist()).encode("utf-8"))
+        for start in range(0, len(values), _DIGEST_STRIDE):
+            digest.update(repr(values[start:start + _DIGEST_STRIDE]).encode("utf-8"))
         columns.append({"name": name, "digest": digest.hexdigest()})
 
     return {

@@ -19,9 +19,9 @@ namespace EngineeredWood.Tests.Parquet.Interop;
 /// A writer-side framing change is exactly the kind of thing a genuinely independent decoder is
 /// placed differently to catch, so these two are worth their own tier.</para>
 ///
-/// <para><b>Setup.</b> <c>pip install duckdb datafusion</c> into any interpreter and point
-/// <c>EW_PARQUET_READERS_PYTHON</c> at it — on this project's dev boxes an isolated venv, since the
-/// base interpreter carries a DuckDB pinned older for the Delta suite's reasons.
+/// <para><b>Setup.</b> <c>pip install duckdb datafusion pyarrow</c> into any interpreter and
+/// point <c>EW_PARQUET_READERS_PYTHON</c> at it — on this project's dev boxes an isolated venv,
+/// since the base interpreter carries a DuckDB pinned older for the Delta suite's reasons.
 /// <c>EW_REQUIRE_PARQUET_READERS_INTEROP=1</c> turns unavailability into a hard failure, so a green
 /// CI run proves the tier actually ran rather than skipped.</para>
 ///
@@ -41,12 +41,20 @@ internal static class ExternalParquetReaders
     private static readonly InteropDriver Driver = new(
         scriptName: "parquet_readers_driver.py",
         // find_spec rather than import: it answers the availability question without paying to
-        // load either library, and the assert is what makes "neither reader installed" an
-        // unavailable tier rather than an available one whose every test skips itself.
+        // load either library, and the asserts are what make a missing prerequisite an unavailable
+        // tier rather than an available one that fails later for an unrelated reason.
+        //
+        // pyarrow is checked despite not being a parquet reader here, because it is the transport
+        // both readers hand decoded values back through. Without this the tier would report itself
+        // available, satisfy EW_REQUIRE_PARQUET_READERS_INTEROP=1, and then fail with an ImportError
+        // indistinguishable from a decode failure — the same undeclared-dependency trap ci.yml
+        // already records for deltalake and pyarrow.
         probeExpression:
             "import json, importlib.util as u; "
             + "ms=[m for m in ('duckdb','datafusion') if u.find_spec(m)]; "
             + "assert ms, 'neither duckdb nor datafusion is installed'; "
+            + "assert u.find_spec('pyarrow'), "
+            + "'pyarrow is missing; it is how both readers return decoded values'; "
             + "print(json.dumps({'v': ', '.join(ms)}))",
         requireEnvVar: "EW_REQUIRE_PARQUET_READERS_INTEROP",
         timeoutMs: 180_000,
