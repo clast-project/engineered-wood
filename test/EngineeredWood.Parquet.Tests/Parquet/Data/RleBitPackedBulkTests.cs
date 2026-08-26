@@ -39,9 +39,10 @@ public class RleBitPackedBulkTests
     [Fact]
     public void ReadBatch_InChunksThatStraddleGroups_RoundTrips()
     {
-        // Reading in pieces leaves the run part-way through a group of eight between calls, which is
-        // exactly where the bulk path must decline and hand back to the per-value loop. Chunk sizes
-        // are deliberately coprime with eight.
+        // Two cases, and the chunk sizes name which is which. The odd ones are coprime with eight,
+        // so a call ends part-way through a group and the next one has to decline the bulk path and
+        // hand back to the per-value loop; eight and sixteen land on a group boundary, where it has
+        // to stay engaged across the call instead. Getting either wrong corrupts silently.
         ulong state = 777;
 
         foreach (int chunk in new[] { 1, 3, 5, 7, 11, 13, 8, 16 })
