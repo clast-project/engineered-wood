@@ -39,6 +39,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The DuckDB / DataFusion reader tier. InteropDriver is shared with the Delta suite's tiers
+         rather than copied; see test/Shared/InteropDriver.cs. -->
+    <Compile Include="..\Shared\InteropDriver.cs" Link="Interop\InteropDriver.cs" />
+    <None Update="Interop\**\*.py" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Gcs\EngineeredWood.Gcs.csproj" />

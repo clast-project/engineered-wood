@@ -160,11 +160,20 @@ jobs:
       # AvroPhase6Tests.WriteThenReadWithFastavro_Lz4 from a clean skip into a hard
       # failure: "ValueError: lz4 codec is supported but you need to install one of the
       # following libraries: ('lz4',)".
-      - name: Install interop oracles (delta-rs, DuckDB, fastavro)
+      # datafusion is here for its parquet reader, not for SQL: it reads through the
+      # arrow-rs `parquet` crate, which is the decoder behind polars, delta-rs and every
+      # Rust consumer, and which nothing else in this repository exercises. ParquetSharp
+      # covers parquet-cpp and pyarrow descends from it, so without datafusion the whole
+      # test suite validates against a single lineage of reference implementation.
+      #
+      # It shares the DuckDB pin's reasoning: an upgrade that changes what these readers
+      # accept must arrive as a deliberate bump here.
+      - name: Install interop oracles (delta-rs, DuckDB, DataFusion, fastavro)
         if: steps.changes.outputs.code == 'true'
         run: >
           python -m pip install --disable-pip-version-check
           deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata==2026.3
+          datafusion==54.0.0
           fastavro==1.12.2 lz4==4.4.5
 
       - name: Restore
@@ -197,6 +206,7 @@ jobs:
         env:
           EW_REQUIRE_DELTA_INTEROP: '1'
           EW_REQUIRE_DUCKDB_INTEROP: '1'
+          EW_REQUIRE_PARQUET_READERS_INTEROP: '1'
         run: dotnet test engineered-wood.slnx --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
 
       - name: Pack
