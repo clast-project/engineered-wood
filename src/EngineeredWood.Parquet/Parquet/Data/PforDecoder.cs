@@ -140,20 +140,40 @@ internal static class PforDecoder
     /// Slices vector <paramref name="index"/> out of the page. Offsets are measured from the
     /// start of the offset array, not from the start of the page.
     /// </summary>
+    /// <remarks>
+    /// The slice ends at the next vector's offset, not at the end of the page. Each offset is the
+    /// previous one plus the previous vector's stored size, so the next offset is where this
+    /// vector ends — and bounding the slice there is what gives the per-vector truncation checks
+    /// anything to catch. Run to the end of the page instead and a vector shorter than its own
+    /// header claims reads on into the next vector's bytes, passes every length check, and
+    /// decodes whatever it found without complaint.
+    /// </remarks>
     private static ReadOnlySpan<byte> SliceVector(ReadOnlySpan<byte> data, int numVectors, int index)
     {
         var body = data.Slice(PageHeaderSize);
-        uint offset = BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(index * 4, 4));
+        uint offsetArrayBytes = (uint)numVectors * 4;
+
+        uint start = BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(index * 4, 4));
 
         // The first vector begins just past the offset array, and every vector holds at least a
         // header, so an offset inside the array or at the very end of the page is malformed.
-        uint offsetArrayBytes = (uint)numVectors * 4;
-        if (offset < offsetArrayBytes || offset >= (uint)body.Length)
+        if (start < offsetArrayBytes || start >= (uint)body.Length)
             throw new ParquetFormatException(
-                $"PFOR vector {index} has offset {offset}, which is outside the page body " +
+                $"PFOR vector {index} has offset {start}, which is outside the page body " +
                 $"({offsetArrayBytes}..{body.Length}).");
 
-        return body.Slice((int)offset);
+        uint end = index + 1 < numVectors
+            ? BinaryPrimitives.ReadUInt32LittleEndian(body.Slice((index + 1) * 4, 4))
+            : (uint)body.Length;
+
+        // Offsets strictly increase, so anything else is a malformed page: equal offsets give a
+        // zero-length vector, and a decreasing one overlaps the vector before it.
+        if (end <= start || end > (uint)body.Length)
+            throw new ParquetFormatException(
+                $"PFOR vector {index} spans {start}..{end}, which is not a forward range inside " +
+                $"the page body ({offsetArrayBytes}..{body.Length}).");
+
+        return body.Slice((int)start, (int)(end - start));
     }
 
     // ───── Vector decoding ─────

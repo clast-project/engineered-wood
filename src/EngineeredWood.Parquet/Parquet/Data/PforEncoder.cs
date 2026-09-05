@@ -47,17 +47,53 @@ internal static class PforEncoder
     /// <inheritdoc cref="FrameSearchBits"/>
     private const int FrameSearchBuckets = 1 << FrameSearchBits;
 
+    // Scratch, reused across pages. Encoding a page needs several arrays sized to the vector
+    // (differences, residuals, exception positions) plus two small fixed ones, and allocating
+    // them per page put about eleven kilobytes of garbage on the write path for every page of
+    // every integer column. Thread-static rather than pooled because column chunks are encoded in
+    // parallel and each thread encodes one page at a time — the same reason
+    // ColumnChunkWriter.t_valuesBuffer is thread-static.
+
+    [ThreadStatic]
+    private static int[]? t_int32Differences;
+
+    [ThreadStatic]
+    private static uint[]? t_int32Residuals;
+
+    [ThreadStatic]
+    private static long[]? t_int64Differences;
+
+    [ThreadStatic]
+    private static ulong[]? t_int64Residuals;
+
+    [ThreadStatic]
+    private static ushort[]? t_positions;
+
+    /// <summary>Sized for INT64; the INT32 paths clear and read only the low 33 entries.</summary>
+    [ThreadStatic]
+    private static int[]? t_histogram;
+
+    [ThreadStatic]
+    private static int[]? t_buckets;
+
+    private static T[] Ensure<T>(ref T[]? cache, int length)
+    {
+        if (cache == null || cache.Length < length)
+            cache = new T[length];
+        return cache;
+    }
+
     /// <summary>Encodes a span of INT32 values into a single PFOR page.</summary>
     public static byte[] EncodeInt32s(ReadOnlySpan<int> values, int logVectorSize = DefaultLogVectorSize)
     {
         int vectorSize = ValidateLogVectorSize(logVectorSize);
         int numVectors = (values.Length + vectorSize - 1) / vectorSize;
 
-        var differences = new int[vectorSize];
-        var residuals = new uint[vectorSize];
-        var positions = new ushort[vectorSize];
-        var histogram = new int[33];
-        var buckets = new int[FrameSearchBuckets + 1];
+        var differences = Ensure(ref t_int32Differences, vectorSize);
+        var residuals = Ensure(ref t_int32Residuals, vectorSize);
+        var positions = Ensure(ref t_positions, vectorSize);
+        var histogram = Ensure(ref t_histogram, 65);
+        var buckets = Ensure(ref t_buckets, FrameSearchBuckets + 1);
 
         var vectorBytes = new byte[numVectors][];
         int totalVectorSize = 0;
@@ -79,11 +115,11 @@ internal static class PforEncoder
         int vectorSize = ValidateLogVectorSize(logVectorSize);
         int numVectors = (values.Length + vectorSize - 1) / vectorSize;
 
-        var differences = new long[vectorSize];
-        var residuals = new ulong[vectorSize];
-        var positions = new ushort[vectorSize];
-        var histogram = new int[65];
-        var buckets = new int[FrameSearchBuckets + 1];
+        var differences = Ensure(ref t_int64Differences, vectorSize);
+        var residuals = Ensure(ref t_int64Residuals, vectorSize);
+        var positions = Ensure(ref t_positions, vectorSize);
+        var histogram = Ensure(ref t_histogram, 65);
+        var buckets = Ensure(ref t_buckets, FrameSearchBuckets + 1);
 
         var vectorBytes = new byte[numVectors][];
         int totalVectorSize = 0;

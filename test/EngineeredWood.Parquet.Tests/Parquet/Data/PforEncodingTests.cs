@@ -590,6 +590,65 @@ public class PforEncodingTests : IDisposable
         Assert.Contains("outside the page body", ex.Message);
     }
 
+    /// <summary>
+    /// A vector shorter than its own header claims, where the shortfall is only visible from the
+    /// next vector's offset.
+    /// </summary>
+    /// <remarks>
+    /// A vector sliced to the end of the page rather than to the next offset reads on into the
+    /// next vector's bytes, satisfies every length check, and decodes whatever it finds. Nothing
+    /// downstream notices: the value count comes from the page header, so the output is the right
+    /// shape and the wrong data.
+    /// </remarks>
+    [Fact]
+    public void Rejects_VectorTruncatedByTheFollowingOffset()
+    {
+        var values = Enumerable.Range(0, 32).Select(i => 1000 + (i * 37) % 4096).ToArray();
+        byte[] page = PforEncoder.EncodeInt32s(values, logVectorSize: 3);
+
+        const int OffsetArrayAt = 7;
+        const int NumVectors = 4;
+        uint first = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(OffsetArrayAt, 4));
+        uint second = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(OffsetArrayAt + 4, 4));
+
+        // Widen the first vector's declared width to 32 bits, so its header claims 7 + 8*4 = 39
+        // bytes where the next offset leaves it far fewer. Nothing else in the page moves.
+        page[OffsetArrayAt + NumVectors * 4 + (int)(first - NumVectors * 4) + 4] = 32;
+
+        const int Declared = 7 + 8 * 4;
+        int extentFromNextOffset = (int)(second - first);
+        int extentToEndOfPage = page.Length - OffsetArrayAt - (int)first;
+
+        // The precondition that makes this a regression test rather than a tautology: the vector
+        // is short of what it declares only when measured against the next offset. Sliced to the
+        // end of the page instead, there is room to spare and the truncation check never fires —
+        // the decoder reads on into the following vectors and returns their bytes as data.
+        Assert.True(extentFromNextOffset < Declared,
+            $"vector 0 spans {extentFromNextOffset} bytes but declares {Declared}");
+        Assert.True(extentToEndOfPage >= Declared,
+            $"the rest of the page is {extentToEndOfPage} bytes, which would satisfy {Declared}");
+
+        var ex = Assert.Throws<ParquetFormatException>(() => Decode32(page, values.Length));
+        Assert.Contains("truncated", ex.Message);
+    }
+
+    /// <summary>
+    /// Offsets strictly increase — each is the previous one plus the previous vector's stored
+    /// size — so a decreasing one overlaps the vector before it.
+    /// </summary>
+    [Fact]
+    public void Rejects_NonMonotonicVectorOffsets()
+    {
+        var values = Enumerable.Range(0, 16).Select(i => 1000 + (i * 37) % 4096).ToArray();
+        byte[] page = PforEncoder.EncodeInt32s(values, logVectorSize: 3);
+
+        uint first = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(7, 4));
+        BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(7 + 4, 4), first);
+
+        var ex = Assert.Throws<ParquetFormatException>(() => Decode32(page, values.Length));
+        Assert.Contains("not a forward range", ex.Message);
+    }
+
     [Fact]
     public void Rejects_PageTooSmallForAHeader()
     {
