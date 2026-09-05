@@ -177,14 +177,98 @@ public sealed class SparkSqlParserTests
         Assert.Equal(expected, Assert.IsType<LiteralExpression>(Parse(sql)).Value.Type);
     }
 
+    /// <summary>
+    /// Spark's escape table, every row of it measured — #179.
+    /// </summary>
+    /// <remarks>
+    /// The corpus asserts these too, through <c>SparkEvaluationCorpusTests</c>. They are repeated
+    /// here because this is where a reader looks for the table, and because a theory row names
+    /// the rule where a corpus entry only records an answer. Three rows contradict the obvious
+    /// reading and are called out where they appear.
+    /// </remarks>
     [Theory]
-    [InlineData("'it''s'", "it's")]
-    [InlineData(@"'a\'b'", "a'b")]
-    [InlineData(@"'100\%'", @"100\%")]   // an unrecognised escape keeps its backslash
+    // The rule this replaces: a doubled quote is TWO literals, joined into one string.
+    [InlineData("'it''s'", "its")]
     [InlineData("''", "")]
+    [InlineData("''''", "")]
+    [InlineData("'a'''", "a")]
+
+    // Adjacent literals concatenate over TOKENS, so whitespace, comments and the quote style
+    // between the pieces make no difference.
+    [InlineData("'a' 'b'", "ab")]
+    [InlineData("'a'  'b'", "ab")]
+    [InlineData("'a' 'b' 'c'", "abc")]
+    [InlineData("'a' /* c */ 'b'", "ab")]
+    [InlineData("'a' \"b\"", "ab")]
+    [InlineData("\"a\"\"b\"", "ab")]
+
+    // Each piece is unescaped BEFORE the join, so an escape cannot span two literals. Joining
+    // first would answer "A" and "101" here.
+    [InlineData(@"'\u00' '41'", "u0041")]
+    [InlineData(@"'\1' '01'", "101")]
+
+    // The escapes that are in the table.
+    [InlineData(@"'a\'b'", "a'b")]
+    [InlineData(@"'a\""b'", "a\"b")]
+    [InlineData(@"'a\\b'", @"a\b")]
+    [InlineData(@"'a\nb'", "a\nb")]
+    [InlineData(@"'a\tb'", "a\tb")]
+    [InlineData(@"'a\rb'", "a\rb")]
+    [InlineData(@"'a\bb'", "a\bb")]
+    [InlineData(@"'\0'", "\0")]
+    [InlineData(@"'a\Zb'", "a\u001Ab")]   // \Z is in the table though C has no such escape
+
+    // ...and the ones that are not. An unrecognised escape DROPS its backslash, except for the
+    // two LIKE wildcards, which keep it.
+    [InlineData(@"'a\fb'", "afb")]        // \f is NOT a form feed: it is not in the table at all
+    [InlineData(@"'a\qb'", "aqb")]
+    [InlineData(@"'a\vb'", "avb")]
+    [InlineData(@"'a\ b'", "a b")]
+    [InlineData(@"'a\`b'", "a`b")]
+    [InlineData(@"'100\%'", @"100\%")]
+    [InlineData(@"'a\_b'", @"a\_b")]
+
+    // Width decides the numeric escapes, and the octal one stops at \177 rather than \377.
+    [InlineData(@"'\101'", "A")]
+    [InlineData(@"'\177'", "\u007F")]
+    [InlineData(@"'\200'", "200")]        // first digit above 1: not an octal escape at all
+    [InlineData(@"'\377'", "377")]
+    [InlineData(@"'\7'", "7")]            // one digit is not an octal escape
+    [InlineData(@"'\1011'", "A1")]
+    [InlineData(@"'\u0041'", "A")]
+    [InlineData(@"'\u004a'", "J")]        // hex digits are either case
+    [InlineData(@"'\u00411'", "A1")]
+    [InlineData(@"'\u12'", "u12")]        // too few digits: not an escape
+
+    // The same shortfall, but landing at the END of the literal rather than mid-string — the
+    // boundary Unquote's explicit bound exists for, now that it scans the original quoted text
+    // instead of an unquoted copy. Coverage of that edge rather than a new measurement: the rule
+    // is the one the two rows above measured.
+    [InlineData(@"'\u004'", "u004")]
+    [InlineData(@"'\10'", "10")]
+    [InlineData(@"'\U0000004'", "U0000004")]
+    [InlineData(@"'\x41'", "x41")]        // C's hex escape is not Spark's
+    [InlineData(@"'\U00000041'", "A")]
+    [InlineData(@"'\U0001F600'", "\U0001F600")]
     public void StringsAreUnescapedTheWaySparkUnescapesThem(string sql, string expected)
     {
         Assert.Equal(expected, Assert.IsType<LiteralExpression>(Parse(sql)).Value.AsString);
+    }
+
+    [Fact]
+    public void AnOutOfRangeCodePointDecomposesRatherThanBeingRefused()
+    {
+        // char.ConvertFromUtf32 would throw for both of these. Spark applies Java's surrogate
+        // arithmetic with no range check and answers, so this does too — measured, and the
+        // corpus cannot assert it because the value reaches the fixture as '?' once the unpaired
+        // surrogates are encoded.
+        Assert.Equal(
+            new[] { '\uDC00', '\uDC00' },
+            Assert.IsType<LiteralExpression>(Parse(@"'\U00110000'")).Value.AsString.ToCharArray());
+
+        Assert.Equal(
+            new[] { '\uD7BF', '\uDFFF' },
+            Assert.IsType<LiteralExpression>(Parse(@"'\UFFFFFFFF'")).Value.AsString.ToCharArray());
     }
 
     [Fact]
@@ -287,11 +371,9 @@ public sealed class SparkSqlParserTests
     /// Pins exactly which corpus expressions this parser refuses, and why.
     /// </summary>
     /// <remarks>
-    /// 190 of the 197 expressions Spark accepts also parse here. The seven that do not are
-    /// listed rather than counted, so the set is a decision on the record instead of a number
-    /// nobody can check: adding a construct should shorten this list deliberately, and losing
-    /// one should fail loudly. Four are constructs this tree has no shape for, and three are
-    /// exactly what Delta itself rejects with DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT.
+    /// The expressions Spark accepts and this parser does not are listed rather than counted, so
+    /// the set is a decision on the record instead of a number nobody can check: adding a
+    /// construct should shorten this list deliberately, and losing one should fail loudly.
     /// </remarks>
     [Fact]
     public void TheCorpusExpressionsWeRefuseAreExactlyThese()
@@ -313,6 +395,20 @@ public sealed class SparkSqlParserTests
             "*",                        // not an expression
             "a IN (SELECT 1)",          // subquery
             "rank() OVER (ORDER BY a)", // window function — Delta refuses these too
+
+            // An ALIAS. Spark's expression parser reads `'a' x` as `'a' AS x`, which is a
+            // select-list shape with no meaning in a CHECK constraint — and Spark itself refuses
+            // it the moment the expression is evaluated. Arrived with #179's string-literals
+            // group, where it was asked in order to find where `stringLit+` stops.
+            "'a' x",
+
+            // Raw string literals, where no escape applies at all: R'a\n' is a backslash and an
+            // n. Spark reads them, and they even take part in the adjacent-literal concatenation
+            // (R'it' 's' is "its"), but the tokenizer has no notion of a prefixed literal — `R`
+            // scans as an identifier. Its own change, and not part of #179.
+            @"R'a\nb'",
+            @"r'a\nb'",
+            "R'it''s'",
         };
 
         var refused = new List<string>();

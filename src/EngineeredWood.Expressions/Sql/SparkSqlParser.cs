@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text;
+
 namespace EngineeredWood.Expressions.Sql;
 
 /// <summary>
@@ -400,8 +402,7 @@ public static class SparkSqlParser
                     return new LiteralExpression(SparkLiteral.Number(TextOf(token), _sql, token.Start));
 
                 case TokenKind.String:
-                    Advance();
-                    return new LiteralExpression(SparkLiteral.String(TextOf(token)));
+                    return new LiteralExpression(LiteralValue.Of(ConcatenatedString()));
 
                 case TokenKind.QuotedIdentifier:
                     Advance();
@@ -422,6 +423,52 @@ public static class SparkSqlParser
                 default:
                     throw Fail($"'{TextOf(token)}' cannot start an expression");
             }
+        }
+
+        /// <summary>
+        /// Reads a run of adjacent string literals as the one string Spark makes of them.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Spark's grammar for a string constant is <c>stringLit+</c> and its AST builder joins
+        /// the pieces, so <c>'a' 'b'</c> is <c>ab</c>. That rule is also the answer to <c>'it''s'</c>:
+        /// a doubled quote closes one literal and opens the next, so the expression is
+        /// <c>'it'</c> followed by <c>'s'</c> and Spark evaluates it to <c>its</c>. #179.
+        /// </para>
+        /// <para>
+        /// <b>The run is over TOKENS, not over adjacency.</b> Measured — whitespace, a newline, a
+        /// block comment and a line comment between the pieces all join, and so do two different
+        /// quote styles: <c>'a' /* c */ "b"</c> is <c>ab</c>. There is nothing to check for here
+        /// beyond the next token's kind, and checking positions instead would be wrong.
+        /// </para>
+        /// <para>
+        /// <b>Each piece is unescaped before joining</b>, which is Spark's order and is not the
+        /// same function as joining first. Measured: <c>'\u00' '41'</c> is <c>u0041</c>, not
+        /// <c>A</c>, and <c>'\1' '01'</c> is <c>101</c>. An escape cannot span two literals.
+        /// </para>
+        /// <para>
+        /// Only a bare string primary concatenates. A typed literal takes exactly one piece —
+        /// Spark's rule there is <c>identifier stringLit</c>, singular — so
+        /// <c>DATE'2026-08-11' '2026-08-12'</c> is a syntax error in Spark and stays one here.
+        /// </para>
+        /// </remarks>
+        private string ConcatenatedString()
+        {
+            var first = SparkLiteral.Unquote(TextOf(Current));
+            Advance();
+
+            if (Current.Kind != TokenKind.String)
+                return first;
+
+            var builder = new StringBuilder(first);
+            do
+            {
+                builder.Append(SparkLiteral.Unquote(TextOf(Current)));
+                Advance();
+            }
+            while (Current.Kind == TokenKind.String);
+
+            return builder.ToString();
         }
 
         private Expression ParseIdentifierPrimary()
