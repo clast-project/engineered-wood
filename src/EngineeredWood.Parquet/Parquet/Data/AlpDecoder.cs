@@ -76,16 +76,7 @@ internal static class AlpDecoder
     /// <summary>Decodes an ALP-encoded page of FLOAT values.</summary>
     public static void DecodeFloats(ReadOnlySpan<byte> data, Span<float> destination, int count)
     {
-        var (logVectorSize, numElements) = ReadPageHeader(data);
-        if (numElements != count)
-            throw new ParquetFormatException(
-                $"ALP page header num_elements ({numElements}) does not match expected count ({count}).");
-
-        int vectorSize = 1 << logVectorSize;
-        int numVectors = (numElements + vectorSize - 1) / vectorSize;
-
-        var offsetArray = data.Slice(PageHeaderSize, numVectors * 4);
-        var vectorsBase = data.Slice(PageHeaderSize);
+        var (vectorSize, numVectors) = ReadPageHeader(data, count);
 
         // One scratch buffer for the whole page: the deltas are unpacked into it in bulk and then
         // transformed, rather than each value being extracted and transformed on its own.
@@ -94,12 +85,8 @@ internal static class AlpDecoder
         int produced = 0;
         for (int v = 0; v < numVectors; v++)
         {
-            int vectorOffset = (int)BinaryPrimitives.ReadUInt32LittleEndian(offsetArray.Slice(v * 4, 4));
-            int valuesInVector = (v == numVectors - 1)
-                ? numElements - produced
-                : vectorSize;
-
-            DecodeFloatVector(vectorsBase.Slice(vectorOffset), valuesInVector,
+            int valuesInVector = Math.Min(vectorSize, count - produced);
+            DecodeFloatVector(SliceVector(data, numVectors, v), valuesInVector,
                 destination.Slice(produced, valuesInVector), scratch);
             produced += valuesInVector;
         }
@@ -108,16 +95,7 @@ internal static class AlpDecoder
     /// <summary>Decodes an ALP-encoded page of DOUBLE values.</summary>
     public static void DecodeDoubles(ReadOnlySpan<byte> data, Span<double> destination, int count)
     {
-        var (logVectorSize, numElements) = ReadPageHeader(data);
-        if (numElements != count)
-            throw new ParquetFormatException(
-                $"ALP page header num_elements ({numElements}) does not match expected count ({count}).");
-
-        int vectorSize = 1 << logVectorSize;
-        int numVectors = (numElements + vectorSize - 1) / vectorSize;
-
-        var offsetArray = data.Slice(PageHeaderSize, numVectors * 4);
-        var vectorsBase = data.Slice(PageHeaderSize);
+        var (vectorSize, numVectors) = ReadPageHeader(data, count);
 
         // One scratch buffer for the whole page: the deltas are unpacked into it in bulk and then
         // transformed, rather than each value being extracted and transformed on its own.
@@ -126,18 +104,18 @@ internal static class AlpDecoder
         int produced = 0;
         for (int v = 0; v < numVectors; v++)
         {
-            int vectorOffset = (int)BinaryPrimitives.ReadUInt32LittleEndian(offsetArray.Slice(v * 4, 4));
-            int valuesInVector = (v == numVectors - 1)
-                ? numElements - produced
-                : vectorSize;
-
-            DecodeDoubleVector(vectorsBase.Slice(vectorOffset), valuesInVector,
+            int valuesInVector = Math.Min(vectorSize, count - produced);
+            DecodeDoubleVector(SliceVector(data, numVectors, v), valuesInVector,
                 destination.Slice(produced, valuesInVector), scratch);
             produced += valuesInVector;
         }
     }
 
-    private static (int LogVectorSize, int NumElements) ReadPageHeader(ReadOnlySpan<byte> data)
+    /// <summary>
+    /// Validates the page header and returns the framing it implies. The offset array is bounds
+    /// checked here, once, so that <see cref="SliceVector"/> can read any of its entries.
+    /// </summary>
+    private static (int VectorSize, int NumVectors) ReadPageHeader(ReadOnlySpan<byte> data, int count)
     {
         if (data.Length < PageHeaderSize)
             throw new ParquetFormatException(
@@ -162,8 +140,62 @@ internal static class AlpDecoder
         if (numElements < 0)
             throw new ParquetFormatException(
                 $"ALP num_elements {numElements} is negative.");
+        if (numElements != count)
+            throw new ParquetFormatException(
+                $"ALP page header num_elements ({numElements}) does not match expected count ({count}).");
 
-        return (logVectorSize, numElements);
+        int vectorSize = 1 << logVectorSize;
+        int numVectors = (numElements + vectorSize - 1) / vectorSize;
+
+        if (data.Length < PageHeaderSize + (long)numVectors * 4)
+            throw new ParquetFormatException(
+                "ALP page is truncated before the end of its offset array.");
+
+        return (vectorSize, numVectors);
+    }
+
+    /// <summary>
+    /// Slices vector <paramref name="index"/> out of the page. Offsets are measured from the
+    /// start of the offset array, not from the start of the page.
+    /// </summary>
+    /// <remarks>
+    /// The slice ends at the next vector's offset, not at the end of the page. Each offset is the
+    /// previous one plus the previous vector's stored size, so the next offset is where this
+    /// vector ends — and bounding the slice there is what gives the per-vector truncation checks
+    /// anything to catch. Run to the end of the page instead and a vector shorter than its own
+    /// header claims reads on into the next vector's bytes, passes every length check, and
+    /// decodes whatever it found without complaint. The same reasoning, and the same code, as
+    /// <c>PforDecoder.SliceVector</c>, whose page layout is modelled on this one.
+    /// </remarks>
+    private static ReadOnlySpan<byte> SliceVector(ReadOnlySpan<byte> data, int numVectors, int index)
+    {
+        var body = data.Slice(PageHeaderSize);
+        uint offsetArrayBytes = (uint)numVectors * 4;
+
+        uint start = BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(index * 4, 4));
+
+        // The first vector begins just past the offset array, and every vector holds at least a
+        // header, so an offset inside the array or at the very end of the page is malformed.
+        // Reading the offset unsigned also keeps a value at or past 2^31 from casting to a
+        // negative int, which would leave Slice as an ArgumentOutOfRangeException rather than as
+        // the format error it is.
+        if (start < offsetArrayBytes || start >= (uint)body.Length)
+            throw new ParquetFormatException(
+                $"ALP vector {index} has offset {start}, which is outside the page body " +
+                $"({offsetArrayBytes}..{body.Length}).");
+
+        uint end = index + 1 < numVectors
+            ? BinaryPrimitives.ReadUInt32LittleEndian(body.Slice((index + 1) * 4, 4))
+            : (uint)body.Length;
+
+        // Offsets strictly increase, so anything else is a malformed page: equal offsets give a
+        // zero-length vector, and a decreasing one overlaps the vector before it.
+        if (end <= start || end > (uint)body.Length)
+            throw new ParquetFormatException(
+                $"ALP vector {index} spans {start}..{end}, which is not a forward range inside " +
+                $"the page body ({offsetArrayBytes}..{body.Length}).");
+
+        return body.Slice((int)start, (int)(end - start));
     }
 
 #if NET8_0_OR_GREATER
