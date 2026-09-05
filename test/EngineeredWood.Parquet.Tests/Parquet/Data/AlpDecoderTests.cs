@@ -541,6 +541,103 @@ public class AlpDecoderTests
         }
     }
 
+    // ─── Page framing ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A vector shorter than its own header claims has to be rejected. The per-vector truncation
+    /// check only has something to measure against while the slice ends at the next vector's
+    /// offset: run it to the end of the page instead and the vector reads on into its successors'
+    /// bytes, passes every length check, and returns them as data.
+    /// </summary>
+    [Fact]
+    public void Rejects_VectorTruncatedByTheFollowingOffset()
+    {
+        var values = Enumerable.Range(0, 64).Select(i => (i * 37 % 4096) / 100.0).ToArray();
+        byte[] page = AlpEncoder.EncodeDoubles(values, logVectorSize: 3);
+
+        const int OffsetArrayAt = 7;
+        const int BitWidthInVector = 12; // exponent(1) factor(1) num_exceptions(2) frame(8)
+        uint first = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(OffsetArrayAt, 4));
+        uint second = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(OffsetArrayAt + 4, 4));
+
+        // Widen the first vector's declared bit width to 64, so its header claims 13 + 8*8 = 77
+        // bytes where the next offset leaves it far fewer. Nothing else in the page moves.
+        // Pulling the next offset backwards instead would also truncate the *second* vector,
+        // which then throws for an unrelated reason and lets the test pass against the bug.
+        page[OffsetArrayAt + (int)first + BitWidthInVector] = 64;
+
+        const int Declared = 13 + (8 * 64 / 8);
+        int extentFromNextOffset = (int)(second - first);
+        int extentToEndOfPage = page.Length - OffsetArrayAt - (int)first;
+
+        // The precondition that makes this a regression test rather than a tautology: the vector
+        // is short of what it declares only when measured against the next offset.
+        Assert.True(extentFromNextOffset < Declared,
+            $"vector 0 spans {extentFromNextOffset} bytes but declares {Declared}");
+        Assert.True(extentToEndOfPage >= Declared,
+            $"the rest of the page is {extentToEndOfPage} bytes, which would satisfy {Declared}");
+
+        var output = new double[values.Length];
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => AlpDecoder.DecodeDoubles(page, output, values.Length));
+        Assert.Contains("truncated", ex.Message);
+    }
+
+    /// <summary>
+    /// Offsets strictly increase — each is the previous one plus the previous vector's stored
+    /// size — so a decreasing one overlaps the vector before it.
+    /// </summary>
+    [Fact]
+    public void Rejects_NonMonotonicVectorOffsets()
+    {
+        var values = Enumerable.Range(0, 16).Select(i => (i * 37 % 4096) / 100.0).ToArray();
+        byte[] page = AlpEncoder.EncodeDoubles(values, logVectorSize: 3);
+
+        uint first = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(7, 4));
+        BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(7 + 4, 4), first);
+
+        var output = new double[values.Length];
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => AlpDecoder.DecodeDoubles(page, output, values.Length));
+        Assert.Contains("not a forward range", ex.Message);
+    }
+
+    /// <summary>
+    /// An offset past the end of the page is a malformed file, not an internal error: unchecked
+    /// it leaves <c>Slice</c> as an <see cref="ArgumentOutOfRangeException"/>, and a value at or
+    /// past 2^31 casts to a negative int and does the same.
+    /// </summary>
+    [Theory]
+    [InlineData(0u)]                 // inside the offset array
+    [InlineData(uint.MaxValue)]      // past the page, and negative once cast to int
+    public void Rejects_VectorOffsetOutsideThePage(uint offset)
+    {
+        var values = Enumerable.Range(0, 16).Select(i => (i * 37 % 4096) / 100.0).ToArray();
+        byte[] page = AlpEncoder.EncodeDoubles(values, logVectorSize: 3);
+
+        BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(7, 4), offset);
+
+        var output = new double[values.Length];
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => AlpDecoder.DecodeDoubles(page, output, values.Length));
+        Assert.Contains("outside the page body", ex.Message);
+    }
+
+    /// <summary>A page cut off inside its own offset array is a format error too.</summary>
+    [Fact]
+    public void Rejects_PageTruncatedInsideItsOffsetArray()
+    {
+        var values = Enumerable.Range(0, 16).Select(i => (i * 37 % 4096) / 100.0).ToArray();
+        byte[] page = AlpEncoder.EncodeDoubles(values, logVectorSize: 3);
+
+        var truncated = page.AsSpan(0, 7 + 5).ToArray();
+
+        var output = new double[values.Length];
+        var ex = Assert.Throws<ParquetFormatException>(
+            () => AlpDecoder.DecodeDoubles(truncated, output, values.Length));
+        Assert.Contains("offset array", ex.Message);
+    }
+
     /// <summary>
     /// A one-vector page whose vector size is large enough to hold <paramref name="n"/> values, so
     /// lengths past the canonical 1024 exercise the decoder's tiling.
