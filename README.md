@@ -103,13 +103,33 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | RLE (levels) | yes | yes |
 | BIT_PACKED (deprecated, levels) | yes | — |
 | ALP (experimental) | yes | opt-in |
+| PFOR (experimental) | yes | opt-in |
 | FSST (experimental) | yes | opt-in |
 
-The last two are **unratified parquet-format proposals**, gated behind
-`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0003` for FSST) and
-off by default. Opt in per column or per file with
-`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
+The last three are **unratified parquet-format proposals**, gated behind
+`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0005` for PFOR,
+`EWPARQUET0003` for FSST) and off by default. Opt in per column or per file with
+`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp`,
+`ParquetWriteOptions.IntegerEncoding = IntegerEncoding.Pfor`, and
 `ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
+
+PFOR (Patched Frame of Reference) subtracts a frame of reference from an integer column and
+bit-packs what is left, storing the values that do not fit the chosen width separately as
+exceptions. That is what lets one outlier stop widening the packing for everyone: a foreign key
+column with a null sentinel, a sequence with gaps, a measure with a few extremes. Each 1024-value
+vector independently chooses whether to pack values or the differences between successive values,
+so a column that is sorted only in stretches gets the delta treatment on those stretches — the
+difference from `DELTA_BINARY_PACKED`, which always differences. The writer measures the result
+and falls back to `PLAIN` for any page PFOR did not shrink, so enabling it cannot make a file
+bigger.
+
+> **A note on the frame.** The proposal says the frame of reference is the column's minimum. That
+> is the wrong answer on exactly the shape PFOR exists for — a low sentinel becomes the frame and
+> the width is set by the gap, not the cluster — and the proposal's own worked example quotes a
+> width only a frame *above* the minimum can produce. This library searches for the frame, which
+> is worth **5.31x against `DELTA_BINARY_PACKED`** on that shape where taking the minimum gives
+> 0.65x. See [doc/parquet-pfor.md](doc/parquet-pfor.md) for the measurements, and for a second
+> place the proposal contradicts itself.
 
 FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
 codes drawn from a symbol table trained per column chunk and stored in its own

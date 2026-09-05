@@ -42,10 +42,19 @@ public enum Encoding
     [Experimental("EWPARQUET0001")]
     Alp = 10,
 
-    // 11 is PFOR (Patched Frame of Reference), proposed in apache/parquet-format#617 and
-    // implemented by apache/parquet-java#3775 and apache/arrow-rs#10977. Reserved rather than
-    // reused: a file written with 11 meaning FSST is unreadable by anyone implementing PFOR,
-    // and silently so, since both decoders will accept the byte and misread the page.
+    /// <summary>
+    /// Patched Frame of Reference (PFOR) for INT32 and INT64 columns: frame of reference plus
+    /// bit-packing, with the values that do not fit the chosen width stored as exceptions, and
+    /// an optional per-vector delta mode. The Parquet spec proposal is not yet finalized; the
+    /// wire format may change before the spec is ratified.
+    /// </summary>
+    /// <remarks>
+    /// Proposed in apache/parquet-format#617, and implemented by apache/parquet-java#3775 and
+    /// apache/arrow-rs#10977, both of which write 11. Unlike the FSST proposal below it, PFOR's
+    /// number is not in dispute.
+    /// </remarks>
+    [Experimental("EWPARQUET0005")]
+    Pfor = 11,
 
     /// <summary>
     /// Fast Static Symbol Table (FSST) substring compression for BYTE_ARRAY columns.

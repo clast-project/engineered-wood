@@ -22,11 +22,19 @@ internal static class EncodingStrategyResolver
     public static Encoding GetV2Encoding(
         PhysicalType physicalType,
         ByteArrayEncoding byteArrayEncoding,
-        FloatingPointEncoding floatingPointEncoding) =>
+        FloatingPointEncoding floatingPointEncoding,
+        IntegerEncoding integerEncoding) =>
         physicalType switch
         {
             PhysicalType.Boolean => Encoding.Rle,
-            PhysicalType.Int32 or PhysicalType.Int64 => Encoding.DeltaBinaryPacked,
+            PhysicalType.Int32 or PhysicalType.Int64 => integerEncoding switch
+            {
+#pragma warning disable EWPARQUET0005 // PFOR is intentionally selectable; the experimental signal lives on the enum value, not internal dispatch.
+                IntegerEncoding.Pfor => Encoding.Pfor,
+#pragma warning restore EWPARQUET0005
+                IntegerEncoding.Plain => Encoding.Plain,
+                _ => Encoding.DeltaBinaryPacked,
+            },
             PhysicalType.Float or PhysicalType.Double => floatingPointEncoding switch
             {
 #pragma warning disable EWPARQUET0001 // ALP is intentionally selectable; the experimental signal lives on the enum value, not internal dispatch.
@@ -59,6 +67,7 @@ internal static class EncodingStrategyResolver
     /// </summary>
     public static Encoding GetFallbackEncoding(PhysicalType physicalType, ParquetWriteOptions options) =>
         options.DataPageVersion == DataPageVersion.V2
-            ? GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding)
+            ? GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding,
+                options.IntegerEncoding)
             : GetV1Encoding();
 }

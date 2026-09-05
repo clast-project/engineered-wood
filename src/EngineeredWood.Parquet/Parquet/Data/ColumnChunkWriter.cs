@@ -1144,6 +1144,10 @@ internal static class ColumnChunkWriter
         bool useAlp = options.FloatingPointEncoding == FloatingPointEncoding.Alp;
 #pragma warning restore EWPARQUET0001
         bool usePlainFp = options.FloatingPointEncoding == FloatingPointEncoding.Plain;
+#pragma warning disable EWPARQUET0005 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
+        bool usePfor = options.IntegerEncoding == IntegerEncoding.Pfor;
+#pragma warning restore EWPARQUET0005
+        bool usePlainInt = options.IntegerEncoding == IntegerEncoding.Plain;
 
         if (nonNullCount == 0)
         {
@@ -1156,7 +1160,8 @@ internal static class ColumnChunkWriter
             return 0;
         }
 
-        encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding);
+        encoding = EncodingStrategyResolver.GetV2Encoding(
+            physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding, options.IntegerEncoding);
 
         // FSST is decided per column chunk, not per page: when the chunk declined it (nothing
         // trainable, or no size win) the resolver's answer is stale and the page falls back.
@@ -1171,7 +1176,13 @@ internal static class ColumnChunkWriter
             PhysicalType.ByteArray when useFsst =>
                 EncodeFsstToBuffer(fsstColumn!, valueIndex, nonNullCount),
             PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels, options.MaxLiteralGroups),
+            PhysicalType.Int32 when usePfor => EncodePforInt32ToBuffer(
+                array, offset, numValues, nonNullCount, defLevels, ref encoding),
+            PhysicalType.Int32 when usePlainInt => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Int32 => EncodeDeltaInt32ToBuffer(array, offset, numValues, nonNullCount, defLevels),
+            PhysicalType.Int64 when usePfor => EncodePforInt64ToBuffer(
+                array, offset, numValues, nonNullCount, defLevels, ref encoding),
+            PhysicalType.Int64 when usePlainInt => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Int64 => EncodeDeltaInt64ToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.Float when useAlp => EncodeAlpSingleToBuffer(
                 array, offset, numValues, nonNullCount, defLevels, ref encoding),
@@ -1343,6 +1354,80 @@ internal static class ColumnChunkWriter
         EnsureValuesBuffer(encoder.Length);
         encoder.WrittenSpan.CopyTo(t_valuesBuffer);
         return encoder.Length;
+    }
+
+    /// <summary>
+    /// Encodes an INT32 page as PFOR, falling back to PLAIN when PFOR did not shrink it.
+    /// </summary>
+    /// <remarks>
+    /// The fallback is what makes <see cref="IntegerEncoding.Pfor"/> safe to turn on: uniformly
+    /// random integers have no outliers to exploit and no frame worth subtracting, so the cost
+    /// model lands on the full width and the page comes out larger than PLAIN by the size of its
+    /// headers. Pages within one column chunk may therefore differ in encoding, which is what
+    /// the format allows for.
+    /// </remarks>
+    private static int EncodePforInt32ToBuffer(
+        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
+        ref Encoding encoding)
+    {
+        ReadOnlySpan<int> source = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span);
+        int[] dense;
+        ReadOnlySpan<int> values;
+        if (defLevels == null)
+        {
+            values = source.Slice(offset, numValues);
+            dense = [];
+        }
+        else
+        {
+            dense = ExtractNonNullValues<int>(array, offset, numValues, nonNullCount, defLevels);
+            values = dense;
+        }
+
+        byte[] page = PforEncoder.EncodeInt32s(values);
+        if (page.Length >= nonNullCount * sizeof(int))
+        {
+            // Written from the dense values rather than compacting a second time.
+            encoding = Encoding.Plain;
+            EnsureValuesBuffer(nonNullCount * sizeof(int));
+            return PlainEncoder.EncodeInt32s(values, t_valuesBuffer!);
+        }
+
+        EnsureValuesBuffer(page.Length);
+        page.CopyTo(t_valuesBuffer!, 0);
+        return page.Length;
+    }
+
+    /// <inheritdoc cref="EncodePforInt32ToBuffer"/>
+    private static int EncodePforInt64ToBuffer(
+        IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels,
+        ref Encoding encoding)
+    {
+        ReadOnlySpan<long> source = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span);
+        long[] dense;
+        ReadOnlySpan<long> values;
+        if (defLevels == null)
+        {
+            values = source.Slice(offset, numValues);
+            dense = [];
+        }
+        else
+        {
+            dense = ExtractNonNullValues<long>(array, offset, numValues, nonNullCount, defLevels);
+            values = dense;
+        }
+
+        byte[] page = PforEncoder.EncodeInt64s(values);
+        if (page.Length >= nonNullCount * sizeof(long))
+        {
+            encoding = Encoding.Plain;
+            EnsureValuesBuffer(nonNullCount * sizeof(long));
+            return PlainEncoder.EncodeInt64s(values, t_valuesBuffer!);
+        }
+
+        EnsureValuesBuffer(page.Length);
+        page.CopyTo(t_valuesBuffer!, 0);
+        return page.Length;
     }
 
     private static int EncodeBssSingleToBuffer(

@@ -290,6 +290,7 @@ ParquetFileReader.ReadRowGroupAsync()
 | DELTA_BYTE_ARRAY | `DeltaByteArrayDecoder` | Delta-encoded prefix lengths + suffix lengths + suffix data |
 | BYTE_STREAM_SPLIT | `ByteStreamSplitDecoder` | AVX2 SIMD with scalar fallback; interleaved byte streams for float/double |
 | ALP (experimental, 10) | `AlpDecoder` | Unratified proposal; decimal-aware integer encoding + FOR + bit-packing, per 1024-value vector |
+| PFOR (experimental, 11) | `PforDecoder` | Unratified proposal; frame of reference + bit-packing with patched outliers, per 1024-value vector; per-vector delta mode in bit 7 of the width byte |
 | FSST (experimental, 12) | `FsstPageDecoder` + `FsstSymbolTable` | Unratified proposal; symbol table lives in a chunk-level `SYMBOL_TABLE_PAGE`, data pages carry a 9-byte header + end-offset array + code stream |
 
 **Arrow array construction** — `ArrowArrayBuilder` dispatches by Arrow type. For nullable flat columns, it scatters non-null values right-to-left in-place to open gaps for nulls, avoiding a temporary buffer. Validity bitmaps are built from definition levels with SIMD (`Vector256`/`Vector128`) when available.
