@@ -46,7 +46,7 @@ Phase 1 only (§1.4): one symbol table per column chunk, in its own page.
   `PageHeader` field 9 (the spec does not assign a field id; 9 is the next free one).
 - `ColumnMetaData.symbol_table_page_offset` (18) and `symbol_table_page_length` (19).
 - Both symbol table types: `FSST` (8-bit codes) and `FSST_16` (16-bit), selected by
-  `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`. Both are written as encoding 11 —
+  `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`. Both are written as encoding 12 —
   the symbol table page's type field is what tells them apart (§2.3), so the data pages are
   byte-identical in structure either way.
 - BYTE_ARRAY only (§1.3), V2 data pages only.

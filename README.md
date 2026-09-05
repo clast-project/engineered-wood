@@ -119,14 +119,19 @@ dictionary cannot help but the values still share substrings. The writer measure
 result and falls back to `DELTA_LENGTH_BYTE_ARRAY` for any column chunk FSST did not
 actually shrink, so enabling it cannot make a file bigger.
 
-> **Encoding numbers.** ALP and FSST are both unratified proposals that claim encoding
-> 10. ALP shipped here first and keeps it, so **this library writes FSST as 11** — which
-> is also what the arrow-rs proof-of-concept expects to happen once ALP lands. Files
-> written here are self-consistent, but will not interoperate with an implementation that
-> settles on 10 for FSST until the spec picks a winner. Only the 8-bit code variant
-> (the spec's `FSST` symbol table type) is implemented; `FSST_16` is recognized and rejected with a
-> clear error rather than misread. See [doc/parquet-fsst.md](doc/parquet-fsst.md), which
-> also records how the arrow-rs and arrow-cpp proofs-of-concept differ from the spec.
+> **Encoding numbers.** FSST's proposal claims encoding 10, and it does not get it. ALP
+> claimed 10 too, shipped here first, and has since been merged into `parquet.thrift` on
+> parquet-format `main`, so 10 is settled. FSST then held 11 here — what the arrow-rs
+> proof-of-concept predicted — until PFOR claimed 11 in a spec PR backed by both a
+> parquet-java and an arrow-rs implementation. So **this library writes FSST as 12**.
+> Files written here are self-consistent, but will not interoperate with an implementation
+> that has settled on a different number until the spec picks one; the number is cheap to
+> move precisely because the encoding is experimental. Both symbol table widths are
+> implemented — `FSST` (8-bit codes) and `FSST_16` (16-bit) — selected by
+> `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`, and told apart on the wire by
+> the symbol table page's type field rather than by the encoding number. See
+> [doc/parquet-fsst.md](doc/parquet-fsst.md), which also records how the arrow-rs and
+> arrow-cpp proofs-of-concept differ from the spec.
 
 ## Features — ORC
 
