@@ -84,7 +84,7 @@ internal static class ExternalParquetReaders
             return new ReaderOutcome(Installed: true, Error: error, Result: null);
         }
 
-        if (!result.GetProperty("available").GetBoolean())
+        if (!result.TryGetProperty("available", out var available) || !available.GetBoolean())
         {
             return new ReaderOutcome(
                 Installed: false,
