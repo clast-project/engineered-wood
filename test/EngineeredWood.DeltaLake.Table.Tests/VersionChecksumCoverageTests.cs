@@ -72,12 +72,13 @@ public class VersionChecksumCoverageTests : IDisposable
     private IEnumerable<long> CommittedVersions() =>
         Directory.GetFiles(LogDir, "*.json")
             .Select(Path.GetFileName)
-            .Where(name => DeltaVersion.TryParseCommitVersion(name!, out _))
             .Select(name =>
             {
-                DeltaVersion.TryParseCommitVersion(name!, out long version);
-                return version;
+                bool parsed = DeltaVersion.TryParseCommitVersion(name!, out long version);
+                return (parsed, version);
             })
+            .Where(result => result.parsed)
+            .Select(result => result.version)
             .OrderBy(v => v);
 
     private void AssertEveryCommittedVersionHasAChecksum()
