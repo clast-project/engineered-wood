@@ -191,6 +191,111 @@ GROUPS = {
         "DATE'2026-08-11'", "TIMESTAMP'2026-08-11 12:30:00'",
         "INTERVAL 1 DAY", "1Y", "1S", "1L", "1BD", "1D", "1F",
     ],
+    "string-literals": [
+        # Issue #179. Spark's lexer does NOT read '' as an escaped quote: STRING_LITERAL ends at
+        # the first unescaped quote, so 'it''s' is TWO literals, and the grammar's `stringLit+`
+        # concatenates them into `its`. That rule is surprising enough that #179 asks for its
+        # corners to be measured rather than reasoned about, and this group is that measurement.
+
+        # The rule itself, and how far it reaches.
+        "'it''s'",
+        "'a' 'b'",
+        "'a'  'b'",
+        "'a''b''c'",
+        "'a' 'b' 'c'",
+        "''''",
+        "''''''",
+        "'a'''",
+        # Whitespace and comments are lexer-skipped. If concatenation is over TOKENS these join
+        # too; if it is over literal adjacency, they do not.
+        "'a'\n'b'",
+        "'a' /* c */ 'b'",
+        "'a' -- c\n'b'",
+        # In an argument and in a comparison, so the rule is not an artefact of a bare literal.
+        "concat('a' 'b', 'c')",
+        "s = 'a' 'b'",
+        "length('a' 'b')",
+        # Across quote STYLES, which is a different token type reaching the same rule.
+        '"a" "b"',
+        "'a' \"b\"",
+        '"a""b"',
+        # A literal followed by something that is not one. `identifier stringLit` is its own
+        # grammar rule -- DATE '...', X'...' -- so this asks where that rule stops.
+        "'a' x",
+        "DATE'2026-08-11' '2026-08-12'",
+
+        # The escape rule the fix has to KEEP, since a backslash is what replaces the doubled
+        # quote. Getting the concatenation right while dropping these would trade one defect for
+        # a worse one.
+        "'it\\'s'",
+        "'a\\\\b'",
+        "'a\\nb'",
+        "'a\\tb'",
+        "'a\\rb'",
+        "'a\\bb'",
+        "'a\\fb'",
+        "'a\\\"b'",
+        # An unrecognised escape. EngineeredWood keeps the backslash, which is what makes one
+        # usable in a LIKE pattern -- asked rather than assumed, because Spark 4 added error
+        # classes for invalid escapes.
+        "'100\\%'",
+        "'a\\qb'",
+        "'a\\'",
+        # Numeric and unicode escapes, which EngineeredWood does not implement at all.
+        "'\\101'",
+        "'\\0'",
+        "'\\u0041'",
+        "'\\U00000041'",
+        # `\%` keeps its backslash while `\q` and `\f` lose theirs, so "unrecognised" is not one
+        # rule but two. These separate them: the other LIKE wildcard, the fourth quote character,
+        # the octal edges, an incomplete unicode escape, and a handful of escapes C recognises
+        # that Spark may not.
+        "'a\\_b'",
+        "'a\\`b'",
+        "'a\\Zb'",
+        "'a\\8b'",
+        "'\\7'",
+        "'\\400'",
+        "'\\777'",
+        "'\\u12'",
+        "'\\x41'",
+        "'a\\vb'",
+        "'a\\ b'",
+        # `\101` is 'A' but `\377` is the text "377", so the octal escape does not take every
+        # 3-digit value. These bracket where it stops, and the lowercase forms check that the hex
+        # escapes are not case-sensitive.
+        "'\\177'",
+        "'\\200'",
+        "'\\201'",
+        "'\\277'",
+        "'\\u004a'",
+        "'\\U0000004a'",
+        # The width rules, which decide how many characters each escape consumes. Every line here
+        # is a branch of the unescaping that measuring `\7` and `\400` proved is not guessable:
+        # a single octal digit is NOT an octal escape, and three digits only count when the value
+        # fits a byte.
+        "'\\377'",
+        "'\\1011'",
+        "'\\u00411'",
+        "'\\uZZZZ'",
+        "'\\U0001F600'",
+        "'\\uD83D\\uDE00'",
+        "'\\U00110000'",
+        # The same escaping through the other quote style, which is a different lexer rule.
+        '"a\\nb"',
+        '"a\\%b"',
+        # WHICH COMES FIRST, unescaping or joining. Spark maps createString over the pieces and
+        # then joins, so an escape cannot span two literals: unescape-then-join answers "u0041"
+        # and "101", where join-then-unescape would answer "A" for both.
+        "'\\u00' '41'",
+        "'\\1' '01'",
+        # Eight hex digits that overflow a signed int, which is where Java's own parse gives up.
+        "'\\UFFFFFFFF'",
+        # Raw string literals, where no escape applies and the doubled quote may not either.
+        "R'a\\nb'",
+        "r'a\\nb'",
+        "R'it''s'",
+    ],
     "identifiers": [
         "`a`", "`a` > 0", "`weird name`", "nested.`name`",
         "a", "A", "nested.arr", "nested.m",

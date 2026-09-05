@@ -65,7 +65,19 @@ public sealed class SparkEvaluationCorpusTests
         // Frozen at harvest time; re-harvesting moves them and they are not a function of input.
         ["current_date()"] = "value is the harvest date",
         ["current_timestamp()"] = "value is the harvest instant",
+
+        // Spark applies Java's surrogate arithmetic to a \U escape with no range check, so both
+        // of these answer with UNPAIRED surrogates -- and an unpaired surrogate does not survive
+        // the JVM's UTF-8 encoding on the way to the fixture, which records '?' for each one.
+        // The recorded text is a property of the transport, and the part that did survive agrees:
+        // '\UFFFFFFFF' is recorded as U+D7BF followed by '?', and U+D7BF is exactly what
+        // SparkLiteral produces. Asserted directly instead, in SparkSqlParserTests.
+        ["'" + Backslash + "U00110000'"] = "unpaired surrogates reach the fixture as '?'",
+        ["'" + Backslash + "UFFFFFFFF'"] = "unpaired surrogates reach the fixture as '?'",
     };
+
+    /// <summary>One backslash, kept out of the keys above so they stay legible.</summary>
+    private const string Backslash = "\\";
 
 
     /// <summary>
@@ -86,7 +98,6 @@ public sealed class SparkEvaluationCorpusTests
     private static readonly Dictionary<string, string> KnownDifferences = new(StringComparer.Ordinal)
     {
         // ── DIVERGENT: we and Spark both answer, and disagree. Each has an issue. ──────────────
-        ["'it''s'"] = "#179: Spark concatenates adjacent string literals ('it' + 's' = its); we read '' as an escaped quote",
         ["s = a"] = "#180: Spark refuses string/number comparison under ANSI; we return a value",
         ["s < a"] = "#180: Spark refuses string/number comparison under ANSI; we return a value",
         ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
@@ -115,6 +126,14 @@ public sealed class SparkEvaluationCorpusTests
         ["size(nested.arr)"] = "struct columns are not modelled",
         ["element_at(nested.m, 'k')"] = "struct columns are not modelled",
         ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
+
+        // ── NOT IMPLEMENTED: raw string literals, where no escape applies. ───────────────────
+        // Spark reads R'...' and r'...' and even lets them join the adjacent-literal run, so
+        // R'it''s' is "its". The tokenizer has no notion of a prefixed literal -- `R` scans as an
+        // identifier -- and adding one is its own change rather than part of #179.
+        ["R'a" + Backslash + "nb'"] = "raw string literals are not implemented",
+        ["r'a" + Backslash + "nb'"] = "raw string literals are not implemented",
+        ["R'it''s'"] = "raw string literals are not implemented",
 
         // ── OUT OF SCOPE: a CHECK constraint evaluates one row at a time. ─────────────────────
         ["count(a)"] = "aggregate: out of scope for a per-row constraint",

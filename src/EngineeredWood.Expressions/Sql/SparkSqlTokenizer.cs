@@ -271,14 +271,28 @@ internal static class SparkSqlTokenizer
     }
 
     /// <summary>
-    /// Scans text delimited by <paramref name="quote"/>, where the delimiter is escaped by
-    /// doubling it and a backslash escapes whatever follows.
+    /// Scans text delimited by <paramref name="quote"/>, ending at the first delimiter that is
+    /// not escaped.
     /// </summary>
     /// <remarks>
-    /// Both escapes matter to where the token ends, which is why they are handled here rather
-    /// than left to lowering: <c>'it''s'</c> is one token, not two, and <c>'a\'b'</c> does not
-    /// end at its middle quote. Unescaping is still lowering's job — this keeps the text as
-    /// written.
+    /// <b>The two kinds escape their delimiter differently, and conflating them was #179.</b>
+    /// A string escapes with a BACKSLASH and a quoted identifier escapes by DOUBLING, and neither
+    /// accepts the other's spelling:
+    /// <list type="bullet">
+    /// <item><description>
+    ///   <c>'it''s'</c> is TWO string tokens, not one. Spark's <c>STRING_LITERAL</c> ends at the
+    ///   first unescaped quote and the grammar's <c>stringLit+</c> then concatenates the pieces,
+    ///   which is why Spark evaluates it to <c>its</c> rather than to <c>it's</c>. Reading
+    ///   <c>''</c> as an escape here is what produced the wrong answer.
+    /// </description></item>
+    /// <item><description>
+    ///   <c>`a``b`</c> is ONE identifier token, because doubling is the only escape a quoted
+    ///   identifier has — it takes no backslash escape at all.
+    /// </description></item>
+    /// </list>
+    /// Escaping is handled here rather than left to lowering because it decides where the token
+    /// ENDS: <c>'a\'b'</c> is one string and not two. Unescaping is still lowering's job — this
+    /// keeps the text as written.
     /// </remarks>
     private static Token ScanQuoted(string source, ref int position, char quote, TokenKind kind, string what)
     {
@@ -292,6 +306,7 @@ internal static class SparkSqlTokenizer
 
             var c = source[position];
 
+            // A backslash escapes whatever follows -- in a string only.
             if (c == '\\' && kind == TokenKind.String && position + 1 < source.Length)
             {
                 position += 2;
@@ -300,7 +315,8 @@ internal static class SparkSqlTokenizer
 
             if (c == quote)
             {
-                if (Peek(source, position + 1) == quote)
+                // ...and a doubled delimiter escapes itself -- in a quoted identifier only.
+                if (kind == TokenKind.QuotedIdentifier && Peek(source, position + 1) == quote)
                 {
                     position += 2;
                     continue;

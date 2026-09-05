@@ -2261,9 +2261,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-05 07:32:19.641420",
-      "2026-09-05 07:32:19.641420",
-      "2026-09-05 07:32:19.641420"
+      "2026-09-05 08:21:58.532097",
+      "2026-09-05 08:21:58.532097",
+      "2026-09-05 08:21:58.532097"
      ]
     }
    },
@@ -2946,6 +2946,1314 @@
     }
    }
   ],
+  "string-literals": [
+   {
+    "expression": "'it''s'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'its'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "its",
+      "its",
+      "its"
+     ]
+    }
+   },
+   {
+    "expression": "'a' 'b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a'  'b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a''b''c'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'abc'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      "abc",
+      "abc"
+     ]
+    }
+   },
+   {
+    "expression": "'a' 'b' 'c'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'abc'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      "abc",
+      "abc"
+     ]
+    }
+   },
+   {
+    "expression": "''''",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "''"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "''''''",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "''"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "'a'''",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a",
+      "a",
+      "a"
+     ]
+    }
+   },
+   {
+    "expression": "'a'\n'b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a' /* c */ 'b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a' -- c\n'b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "concat('a' 'b', 'c')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('ab', 'c')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      "abc",
+      "abc"
+     ]
+    }
+   },
+   {
+    "expression": "s = 'a' 'b'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = 'ab')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "length('a' 'b')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "length('ab')"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "\"a\" \"b\"",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a' \"b\"",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "\"a\"\"b\"",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a' x",
+    "parse": {
+     "ok": true,
+     "node": "Alias",
+     "sql": "'a' AS x"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near ')'. SQLSTATE: 42601 (line 1, pos 6)\n\n== SQL ==\n('a' x) AS r\n------^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near ')'. SQLSTATE: 42601 (line 1, pos 6)\n\n== SQL ==\n('a' x) AS r\n------^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11' '2026-08-12'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near ''2026-08-12'': extra input ''2026-08-12''. SQLSTATE: 42601 (line 1, pos 17)\n\n== SQL ==\nDATE'2026-08-11' '2026-08-12'\n-----------------^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near ''2026-08-12''. SQLSTATE: 42601 (line 1, pos 18)\n\n== SQL ==\n(DATE'2026-08-11' '2026-08-12') AS r\n------------------^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near ''2026-08-12''. SQLSTATE: 42601 (line 1, pos 18)\n\n== SQL ==\n(DATE'2026-08-11' '2026-08-12') AS r\n------------------^^^\n"
+    }
+   },
+   {
+    "expression": "'it\\'s'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'it\\'s'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "it's",
+      "it's",
+      "it's"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\\\b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\\\\b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\\b",
+      "a\\b",
+      "a\\b"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\nb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\nb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\nb",
+      "a\nb",
+      "a\nb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\tb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\tb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\tb",
+      "a\tb",
+      "a\tb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\rb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\rb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\rb",
+      "a\rb",
+      "a\rb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\bb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\bb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\bb",
+      "a\bb",
+      "a\bb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\fb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'afb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "afb",
+      "afb",
+      "afb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\\"b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\"b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\"b",
+      "a\"b",
+      "a\"b"
+     ]
+    }
+   },
+   {
+    "expression": "'100\\%'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'100\\\\%'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "100\\%",
+      "100\\%",
+      "100\\%"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\qb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'aqb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "aqb",
+      "aqb",
+      "aqb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near '''. SQLSTATE: 42601 (line 1, pos 0)\n\n== SQL ==\n'a\\'\n^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near '''. SQLSTATE: 42601 (line 1, pos 1)\n\n== SQL ==\n('a\\') AS r\n-^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near '''. SQLSTATE: 42601 (line 1, pos 1)\n\n== SQL ==\n('a\\') AS r\n-^^^\n"
+    }
+   },
+   {
+    "expression": "'\\101'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'A'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "A",
+      "A",
+      "A"
+     ]
+    }
+   },
+   {
+    "expression": "'\\0'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'\u0000'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "\u0000",
+      "\u0000",
+      "\u0000"
+     ]
+    }
+   },
+   {
+    "expression": "'\\u0041'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'A'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "A",
+      "A",
+      "A"
+     ]
+    }
+   },
+   {
+    "expression": "'\\U00000041'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'A'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "A",
+      "A",
+      "A"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\_b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\\\\_b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\\_b",
+      "a\\_b",
+      "a\\_b"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\`b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a`b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a`b",
+      "a`b",
+      "a`b"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\Zb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\u001ab'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\u001ab",
+      "a\u001ab",
+      "a\u001ab"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\8b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a8b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a8b",
+      "a8b",
+      "a8b"
+     ]
+    }
+   },
+   {
+    "expression": "'\\7'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'7'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "7",
+      "7",
+      "7"
+     ]
+    }
+   },
+   {
+    "expression": "'\\400'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'400'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "400",
+      "400",
+      "400"
+     ]
+    }
+   },
+   {
+    "expression": "'\\777'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'777'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "777",
+      "777",
+      "777"
+     ]
+    }
+   },
+   {
+    "expression": "'\\u12'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'u12'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "u12",
+      "u12",
+      "u12"
+     ]
+    }
+   },
+   {
+    "expression": "'\\x41'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'x41'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "x41",
+      "x41",
+      "x41"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\vb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'avb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "avb",
+      "avb",
+      "avb"
+     ]
+    }
+   },
+   {
+    "expression": "'a\\ b'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a b",
+      "a b",
+      "a b"
+     ]
+    }
+   },
+   {
+    "expression": "'\\177'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "''"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "'\\200'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'200'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "200",
+      "200",
+      "200"
+     ]
+    }
+   },
+   {
+    "expression": "'\\201'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'201'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "201",
+      "201",
+      "201"
+     ]
+    }
+   },
+   {
+    "expression": "'\\277'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'277'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "277",
+      "277",
+      "277"
+     ]
+    }
+   },
+   {
+    "expression": "'\\u004a'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'J'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "J",
+      "J",
+      "J"
+     ]
+    }
+   },
+   {
+    "expression": "'\\U0000004a'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'J'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "J",
+      "J",
+      "J"
+     ]
+    }
+   },
+   {
+    "expression": "'\\377'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'377'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "377",
+      "377",
+      "377"
+     ]
+    }
+   },
+   {
+    "expression": "'\\1011'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'A1'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "A1",
+      "A1",
+      "A1"
+     ]
+    }
+   },
+   {
+    "expression": "'\\u00411'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'A1'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "A1",
+      "A1",
+      "A1"
+     ]
+    }
+   },
+   {
+    "expression": "'\\uZZZZ'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'uZZZZ'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "uZZZZ",
+      "uZZZZ",
+      "uZZZZ"
+     ]
+    }
+   },
+   {
+    "expression": "'\\U0001F600'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'😀'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "😀",
+      "😀",
+      "😀"
+     ]
+    }
+   },
+   {
+    "expression": "'\\uD83D\\uDE00'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'😀'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "😀",
+      "😀",
+      "😀"
+     ]
+    }
+   },
+   {
+    "expression": "'\\U00110000'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'??'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "??",
+      "??",
+      "??"
+     ]
+    }
+   },
+   {
+    "expression": "\"a\\nb\"",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\nb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\nb",
+      "a\nb",
+      "a\nb"
+     ]
+    }
+   },
+   {
+    "expression": "\"a\\%b\"",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\\\\%b'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\\%b",
+      "a\\%b",
+      "a\\%b"
+     ]
+    }
+   },
+   {
+    "expression": "'\\u00' '41'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'u0041'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "u0041",
+      "u0041",
+      "u0041"
+     ]
+    }
+   },
+   {
+    "expression": "'\\1' '01'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'101'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "101",
+      "101",
+      "101"
+     ]
+    }
+   },
+   {
+    "expression": "'\\UFFFFFFFF'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'ힿ?'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ힿ?",
+      "ힿ?",
+      "ힿ?"
+     ]
+    }
+   },
+   {
+    "expression": "R'a\\nb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\\\\nb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\\nb",
+      "a\\nb",
+      "a\\nb"
+     ]
+    }
+   },
+   {
+    "expression": "r'a\\nb'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'a\\\\nb'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a\\nb",
+      "a\\nb",
+      "a\\nb"
+     ]
+    }
+   },
+   {
+    "expression": "R'it''s'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "'its'"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "its",
+      "its",
+      "its"
+     ]
+    }
+   }
+  ],
   "identifiers": [
    {
     "expression": "`a`",
@@ -2996,11 +4304,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#654]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#903]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#655]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as sm"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#904]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as sm"
     }
    },
    {

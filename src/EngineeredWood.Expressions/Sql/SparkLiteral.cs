@@ -76,55 +76,183 @@ internal static class SparkLiteral
     }
 
     /// <summary>
-    /// Unquotes a string literal, resolving the doubled delimiter and backslash escapes.
+    /// Unquotes one string literal, resolving Spark's backslash escapes.
     /// </summary>
     /// <remarks>
-    /// An unrecognised escape keeps its backslash — <c>'100\%'</c> stays <c>100\%</c> — matching
-    /// Spark, where that behaviour is what makes backslashes usable in LIKE patterns.
+    /// ONE literal, not a run of them. A doubled quote never appears inside a string token at
+    /// all — it closes one literal and opens the next — so joining the run belongs to
+    /// <see cref="SparkSqlParser"/>, which joins these results rather than the raw text. See
+    /// #179 and the <c>string-literals</c> group of the corpus.
     /// </remarks>
-    public static LiteralValue String(string text)
+    public static LiteralValue String(string text) => LiteralValue.Of(Unquote(text));
+
+    /// <summary>
+    /// The text of one string literal token, without its quotes and with its escapes resolved.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's table, and almost none of it was guessable. Every rule below is an answer in the
+    /// <c>string-literals</c> group of <c>Fixtures/spark-expression-corpus.json</c>, and three
+    /// of them contradict the obvious reading:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    ///   <b><c>\f</c> is not a form feed.</b> It is not in the table at all, so it is the letter
+    ///   <c>f</c> and <c>'a\fb'</c> is <c>afb</c>. Meanwhile <c>\Z</c>, which C does not have,
+    ///   IS in the table and is U+001A.
+    /// </description></item>
+    /// <item><description>
+    ///   <b>An unrecognised escape DROPS its backslash</b> — <c>'a\qb'</c> is <c>aqb</c> —
+    ///   except for <c>\%</c> and <c>\_</c>, which keep it so a backslash stays usable in a LIKE
+    ///   pattern. The rule this replaces kept the backslash for every unrecognised escape: right
+    ///   for the one case it had been checked against, wrong for the rest.
+    /// </description></item>
+    /// <item><description>
+    ///   <b>The octal escape stops at <c>\177</c>, not <c>\377</c>.</b> <c>'\101'</c> is
+    ///   <c>A</c> while <c>'\200'</c> is the text <c>200</c>, so the first digit must be 0 or 1
+    ///   and only ASCII is reachable. One octal digit is not an escape either: <c>'\7'</c> is
+    ///   <c>7</c>, and <c>'\0'</c> is U+0000 only because the table has a <c>0</c> row.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// Width decides the rest. <c>\u</c> takes exactly four hex digits and <c>\U</c> exactly
+    /// eight, in either case; short of that they are not escapes at all, so <c>'\u12'</c> is
+    /// <c>u12</c> and <c>'\u00411'</c> is <c>A1</c>.
+    /// </para>
+    /// </remarks>
+    public static string Unquote(string text)
     {
-        var quote = text[0];
         var inner = text.Substring(1, text.Length - 2);
+
+        // Nothing to resolve is the common case — it is every literal in a generated constraint —
+        // and scanning for it first keeps that case allocation-free.
+        if (inner.IndexOf('\\') < 0)
+            return inner;
+
         var builder = new StringBuilder(inner.Length);
 
         for (var i = 0; i < inner.Length; i++)
         {
             var c = inner[i];
 
-            if (c == quote && i + 1 < inner.Length && inner[i + 1] == quote)
+            // A trailing backslash cannot reach here from the tokenizer — it would have escaped
+            // the closing quote and the scan would have run on to an unterminated literal — but
+            // this method is reachable from outside it, so it must not read past the end.
+            if (c != '\\' || i + 1 >= inner.Length)
             {
-                builder.Append(quote);
-                i++;
+                builder.Append(c);
                 continue;
             }
 
-            if (c == '\\' && i + 1 < inner.Length)
-            {
-                var escaped = inner[++i];
-                switch (escaped)
-                {
-                    case 'n': builder.Append('\n'); break;
-                    case 't': builder.Append('\t'); break;
-                    case 'r': builder.Append('\r'); break;
-                    case 'b': builder.Append('\b'); break;
-                    case '0': builder.Append('\0'); break;
-                    case '\\': builder.Append('\\'); break;
-                    case '\'': builder.Append('\''); break;
-                    case '"': builder.Append('"'); break;
-                    default:
-                        builder.Append('\\').Append(escaped);
-                        break;
-                }
+            var next = inner[i + 1];
 
+            if (next == 'u' && TryHex(inner, i + 2, 4, out var unit))
+            {
+                builder.Append((char)unit);
+                i += 5;
                 continue;
             }
 
-            builder.Append(c);
+            if (next == 'U' && TryHex(inner, i + 2, 8, out var point))
+            {
+                AppendCodePoint(builder, point);
+                i += 9;
+                continue;
+            }
+
+            if ((next == '0' || next == '1') && IsOctal(inner, i + 2) && IsOctal(inner, i + 3))
+            {
+                builder.Append((char)(
+                    ((next - '0') << 6) | ((inner[i + 2] - '0') << 3) | (inner[i + 3] - '0')));
+                i += 3;
+                continue;
+            }
+
+            switch (next)
+            {
+                case '0': builder.Append('\0'); break;
+                case 'b': builder.Append('\b'); break;
+                case 'n': builder.Append('\n'); break;
+                case 'r': builder.Append('\r'); break;
+                case 't': builder.Append('\t'); break;
+                case 'Z': builder.Append('\u001A'); break;
+                case '\'': builder.Append('\''); break;
+                case '"': builder.Append('"'); break;
+                case '\\': builder.Append('\\'); break;
+
+                // The two LIKE wildcards keep their backslash, and they are the only characters
+                // that do — it is what lets '100\%' survive as a pattern.
+                case '%': builder.Append("\\%"); break;
+                case '_': builder.Append("\\_"); break;
+
+                default: builder.Append(next); break;
+            }
+
+            i++;
         }
 
-        return LiteralValue.Of(builder.ToString());
+        return builder.ToString();
     }
+
+    /// <summary>
+    /// Appends a <c>\U</c> code point the way Spark's own arithmetic does.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <c>char.ConvertFromUtf32</c>, which refuses anything above U+10FFFF or
+    /// inside the surrogate range. Spark applies Java's surrogate formulas with no range check at
+    /// all, and the two measurements that pin it are the ones a range check would have refused:
+    /// <c>'\U00110000'</c> and <c>'\UFFFFFFFF'</c> are both ANSWERS, the second of them
+    /// U+D7BF followed by an unpaired low surrogate.
+    /// <para>
+    /// The BMP test is an UNSIGNED shift, which is what keeps those two apart from
+    /// <c>'\U00000041'</c>: eight hex digits overflow a signed 32-bit accumulator, so
+    /// <c>\UFFFFFFFF</c> arrives here as -1, and a signed <c>&lt; 0x10000</c> test would take the
+    /// BMP branch for it and answer one character where Spark answers two.
+    /// </para>
+    /// </remarks>
+    private static void AppendCodePoint(StringBuilder builder, int point)
+    {
+        if ((uint)point >> 16 == 0)
+        {
+            builder.Append((char)point);
+            return;
+        }
+
+        // Java's Character.highSurrogate/lowSurrogate, including their arithmetic shift: -1 >> 10
+        // is -1, which is what puts 0xD7BF at the front of the \UFFFFFFFF answer.
+        builder.Append((char)((point >> 10) + 0xD7C0));
+        builder.Append((char)((point & 0x3FF) + 0xDC00));
+    }
+
+    /// <summary>
+    /// Reads exactly <paramref name="count"/> hex digits, or reports that they are not there.
+    /// </summary>
+    /// <remarks>
+    /// Overflow is deliberate rather than guarded: eight digits do not fit a signed int, and the
+    /// wrapped value is exactly what <see cref="AppendCodePoint"/> needs. Digits are either case,
+    /// measured — <c>'\u004a'</c> is <c>J</c>.
+    /// </remarks>
+    private static bool TryHex(string text, int start, int count, out int value)
+    {
+        value = 0;
+
+        if (start + count > text.Length)
+            return false;
+
+        for (var i = start; i < start + count; i++)
+        {
+            var digit = HexDigit(text[i]);
+            if (digit < 0)
+                return false;
+
+            value = unchecked((value << 4) | digit);
+        }
+
+        return true;
+    }
+
+    private static bool IsOctal(string text, int index) =>
+        index < text.Length && text[index] >= '0' && text[index] <= '7';
 
     /// <summary>
     /// Builds a typed literal — <c>DATE '…'</c>, <c>TIMESTAMP '…'</c>, or <c>X'…'</c>.

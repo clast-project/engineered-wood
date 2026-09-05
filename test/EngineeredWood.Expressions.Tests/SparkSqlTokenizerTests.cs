@@ -114,7 +114,6 @@ public sealed class SparkSqlTokenizerTests
     [InlineData("'abc'")]
     [InlineData("''")]
     [InlineData("\"abc\"")]
-    [InlineData("'it''s'")]
     [InlineData(@"'a\'b'")]
     [InlineData(@"'100\%'")]
     [InlineData("'a, b (c)'")]
@@ -125,6 +124,31 @@ public sealed class SparkSqlTokenizerTests
         Assert.Equal(sql, token.Text(sql).ToString());
     }
 
+    /// <summary>
+    /// A doubled quote ends one string literal and starts another — #179.
+    /// </summary>
+    /// <remarks>
+    /// This is the tokenizer half of the fix, and the reason it belongs here rather than in the
+    /// parser: Spark's <c>STRING_LITERAL</c> stops at the first unescaped quote, so <c>'it''s'</c>
+    /// is two tokens and the parser's job is to join them into <c>its</c>. Reading <c>''</c> as
+    /// an escaped quote made it one token holding <c>it's</c>, which no amount of later work
+    /// could correct.
+    /// </remarks>
+    [Theory]
+    [InlineData("'it''s'", "'it'", "'s'")]
+    [InlineData("''''", "''", "''")]
+    [InlineData("'a'''", "'a'", "''")]
+    [InlineData("\"a\"\"b\"", "\"a\"", "\"b\"")]
+    public void ADoubledQuoteSplitsAStringIntoTwoTokens(string sql, string first, string second)
+    {
+        var tokens = Significant(sql);
+
+        Assert.Equal(2, tokens.Count);
+        Assert.All(tokens, t => Assert.Equal(TokenKind.String, t.Kind));
+        Assert.Equal(first, tokens[0].Text(sql).ToString());
+        Assert.Equal(second, tokens[1].Text(sql).ToString());
+    }
+
     [Fact]
     public void QuotedIdentifiersKeepTheirSpellingAndNeverBecomeKeywords()
     {
@@ -132,8 +156,25 @@ public sealed class SparkSqlTokenizerTests
         Assert.Equal(TokenKind.QuotedIdentifier, tokens[0].Kind);
         Assert.Equal("weird name", tokens[0].IdentifierName("`weird name`"));
 
+        // A quoted identifier keeps the doubling rule that a string literal loses: it is the only
+        // escape a backquoted identifier has, and Spark gives it no backslash escape at all. The
+        // two kinds moved apart in #179 and this is the side that did not move.
         const string doubled = "`a``b`";
-        Assert.Equal("a`b", Scan(doubled)[0].IdentifierName(doubled));
+        Assert.Equal("a`b", Only(doubled).IdentifierName(doubled));
+    }
+
+    [Fact]
+    public void ABackslashDoesNotEscapeInsideAQuotedIdentifier()
+    {
+        // `a\`b` ends at its middle backquote, leaving `b` as trailing text — where the same
+        // spelling inside a string literal would be one token. Scanning the remainder would fail
+        // on the unterminated identifier, so only the first token is asked for.
+        const string sql = @"`a\`";
+        var token = Only(sql);
+
+        Assert.Equal(TokenKind.QuotedIdentifier, token.Kind);
+        Assert.Equal(@"`a\`", token.Text(sql).ToString());
+        Assert.Equal(@"a\", token.IdentifierName(sql));
     }
 
     [Fact]
