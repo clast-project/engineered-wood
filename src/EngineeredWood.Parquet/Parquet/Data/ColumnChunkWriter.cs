@@ -177,6 +177,21 @@ internal static class ColumnChunkWriter
             array = MapValues(array, a => ArrowCompute.Widen(a, Int32Type.Default));
         }
 
+        // An Arrow timestamp promoted to the extended-precision carrier becomes twelve little-endian bytes
+        // here, for the same reason the decimal reversal below happens here: everything downstream --
+        // dictionary, page encoders, statistics, bloom filter -- must see the bytes that reach the file.
+        bool extendedTimestamp = physicalType == PhysicalType.FixedLenByteArray
+            && options.IsExtendedTimestampColumn(pathInSchema);
+
+        // Only when the values are still timestamps. The buffered writer encodes at accumulation time --
+        // its encoders dispatch on the Arrow type, so they have to see the carrier -- and then reaches
+        // this method through its dictionary-fallback path with an array that is already twelve-byte.
+        // Encoding it twice reads those bytes back as int64 and produces a well-formed, wrong file.
+        if (extendedTimestamp && ValueType(array) is TimestampType)
+        {
+            array = MapValues(array, ExtendedTimestamp.EncodeColumn);
+        }
+
         // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
         // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
         if (physicalType == PhysicalType.FixedLenByteArray &&
@@ -229,10 +244,10 @@ internal static class ColumnChunkWriter
             var stats = dictResult != null && !isFloatingPoint
                 ? StatisticsCollector.ComputeFromDictEntries(
                     dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                    physicalType, typeLength, rowCount - nonNullCount)
+                    physicalType, typeLength, rowCount - nonNullCount, extendedTimestamp)
                 : StatisticsCollector.Compute(
                     array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                    floatingPointTotalOrder);
+                    floatingPointTotalOrder, extendedTimestamp);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
@@ -500,7 +515,9 @@ internal static class ColumnChunkWriter
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
             : StatisticsCollector.ComputeFromDictEntries(
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount);
+                physicalType, typeLength, rowCount - nonNullCount,
+                physicalType == PhysicalType.FixedLenByteArray
+                    && options.IsExtendedTimestampColumn(pathInSchema));
 
         result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;

@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using EngineeredWood.Expressions;
+using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -262,6 +263,15 @@ public sealed class ParquetStatisticsAccessor
 
             case LogicalType.DecimalType d:
                 return LiteralValue.HighPrecisionDecimalOf(BigEndianToBigInteger(bytes), d.Scale);
+
+            // The extended-precision carrier (apache/parquet-format#600). BigInteger's byte[] constructor
+            // reads little-endian two's complement and takes the sign from the top bit of the last byte,
+            // which is exactly this layout -- unlike DECIMAL above, which is big-endian and needs
+            // reversing first.
+            case LogicalType.TimestampType ts
+                when desc.TypeLength == ExtendedTimestamp.ByteWidth
+                    && bytes.Length == ExtendedTimestamp.ByteWidth:
+                return TimestampLiteral(new BigInteger(bytes), ts, isMax);
 
 #if NET6_0_OR_GREATER
             case LogicalType.Float16Type when bytes.Length == 2:

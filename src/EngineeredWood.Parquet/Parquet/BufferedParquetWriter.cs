@@ -79,7 +79,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         if (!_headerWritten)
         {
             _arrowSchema = batch.Schema;
-            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema);
+            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
             await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
             _headerWritten = true;
         }
@@ -351,6 +351,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 ? ext.StorageType
                 : field.DataType;
 
+            // A promoted timestamp reaches the encoders as the twelve-byte carrier, not as int64. The
+            // schema element already says FIXED_LEN_BYTE_ARRAY(12); if the encoder still dispatched on
+            // TimestampType it would write eight-byte values under a twelve-byte declaration, and the
+            // file would be well-formed and wrong.
+            bool extendedTimestamp = _options.IsExtendedTimestampColumn([field.Name])
+                && encodingType is Apache.Arrow.Types.TimestampType;
+            if (extendedTimestamp)
+                encodingType = new Apache.Arrow.Types.FixedSizeBinaryType(ExtendedTimestamp.ByteWidth);
+
             leafColumns.Add(new BufferedColumnState
             {
                 PathInSchema = [field.Name],
@@ -360,6 +369,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 MaxRepLevel = 0,
                 ArrowType = encodingType,
                 IsNullable = field.IsNullable,
+                ExtendedTimestamp = extendedTimestamp,
             });
         }
 
@@ -380,6 +390,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             // array so it dispatches on the Arrow storage type.
             if (array is ExtensionArray ea)
                 array = ea.Storage;
+            if (state.ExtendedTimestamp)
+                array = ExtendedTimestamp.EncodeColumn(array);
             state.AppendArray(array, rowCount);
         });
 
@@ -682,6 +694,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public required int MaxRepLevel { get; init; }
         public required Apache.Arrow.Types.IArrowType ArrowType { get; init; }
         public required bool IsNullable { get; init; }
+
+        /// <summary>
+        /// True when this column's Arrow timestamps are encoded to the twelve-byte carrier on the way in.
+        /// <see cref="ArrowType"/> is then the storage type the encoders see, not the caller's type.
+        /// </summary>
+        public bool ExtendedTimestamp { get; init; }
 
         // Running dictionary: maps a value's BIT PATTERN → index. The float and double dictionaries are
         // keyed on uint/ulong rather than on the value because a dictionary entry is a set of BYTES, and

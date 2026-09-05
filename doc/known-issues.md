@@ -38,6 +38,26 @@ write. Pushdown granularity is the row group; files we write do not carry
 page indexes. Tracked as phases 11–13 in
 [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
 
+*If page indexes are ever added:* bounds for the extended-precision
+timestamp carrier must never be truncated. Truncation assumes
+lexicographic byte order, and that carrier is little-endian signed.
+parquet-java had to special-case `BinaryTruncator` for exactly this.
+
+**Extended-precision timestamps — three limits.** The
+`FIXED_LEN_BYTE_ARRAY(12)` `TIMESTAMP` carrier
+([parquet-format#600](https://github.com/apache/parquet-format/issues/600),
+gated behind `EWPARQUET0004`) is implemented for top-level columns only;
+a nested path is refused rather than half-applied, because the schema and
+the physical type of the data are decided in different places. There is
+also no Arrow extension type for it, so a `FixedSizeBinary` read does not
+round-trip back to the carrier without naming the column again on write.
+
+Most importantly, **this library cannot write the values that motivate
+the type.** An Arrow timestamp is `int64`, so anything Arrow can hold
+already fits `INT64`; the far-past and far-future nanosecond values the
+carrier exists for cannot be expressed in Arrow at all. See
+[`parquet-extended-precision-timestamps.md`](parquet-extended-precision-timestamps.md).
+
 **LZO compression.** `CompressionCodec.Lzo` is defined and decoded from
 Thrift, but `Decompressor.Decompress` in
 `src/EngineeredWood.Core/Compression/Decompressor.cs` has no case for it

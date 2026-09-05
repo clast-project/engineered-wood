@@ -145,7 +145,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         if (_arrowSchema is null)
         {
             _arrowSchema = batch.Schema;
-            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema);
+            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
         }
 
         // Decompose all Arrow columns into leaf columns (flat columns produce 1 leaf each,
@@ -603,7 +603,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         if (_parquetSchema is null && _declaredSchema is not null)
         {
             _parquetSchema = ArrowToSchemaConverter.Convert(
-                Data.TimeUnitRescaler.ToParquetUnits(_declaredSchema));
+                Data.TimeUnitRescaler.ToParquetUnits(_declaredSchema), _options);
         }
 
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];

@@ -72,7 +72,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath);
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -247,7 +247,7 @@ internal static class ColumnChunkReader
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
         using var state = new ColumnBuildState(
             column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
-            column.DottedPath);
+            column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
@@ -500,7 +500,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath);
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
 
         for (int p = startPage; p <= endPage; p++)
         {
@@ -583,7 +583,7 @@ internal static class ColumnChunkReader
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath);
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
 
         for (int p = startPage; p <= endPage; p++)
         {

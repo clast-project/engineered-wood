@@ -303,6 +303,13 @@ internal static class ArrowSchemaConverter
                 { BitWidth: 64, IsSigned: false } => UInt64Type.Default,
                 _ => null,
             },
+            // The extended-precision carrier proposed in apache/parquet-format#600: TIMESTAMP on
+            // FIXED_LEN_BYTE_ARRAY(12), holding a signed 96-bit little-endian count of the declared unit.
+            // Matched before the INT64 arm below so the guard there stays a plain physical-type check.
+            LogicalType.TimestampType extended
+                when column.PhysicalType == PhysicalType.FixedLenByteArray
+                    && column.TypeLength == ExtendedTimestamp.ByteWidth
+                => MakeExtendedTimestampArrowType(extended, options),
             // The guard is load-bearing, not defensive. This arm hands back an Arrow TimestampType, and
             // the read path then reinterprets the column's value buffer as int64 (ArrowArrayBuilder maps
             // `Int64Type or TimestampType or Time64Type` to a long buffer). A TIMESTAMP annotation on any
@@ -310,13 +317,7 @@ internal static class ArrowSchemaConverter
             // to the physical type is lossless. MakeDecimalType has always switched on the physical type
             // for the same reason; this arm had not.
             LogicalType.TimestampType ts when column.PhysicalType == PhysicalType.Int64 => new TimestampType(
-                ts.Unit switch
-                {
-                    Metadata.TimeUnit.Millis => Apache.Arrow.Types.TimeUnit.Millisecond,
-                    Metadata.TimeUnit.Micros => Apache.Arrow.Types.TimeUnit.Microsecond,
-                    Metadata.TimeUnit.Nanos => Apache.Arrow.Types.TimeUnit.Nanosecond,
-                    _ => Apache.Arrow.Types.TimeUnit.Microsecond,
-                },
+                ToArrowUnit(ts.Unit),
                 // Parquet records only isAdjustedToUTC, never a zone name, so an adjusted column
                 // can only come back as UTC. Arrow spells that "UTC"; the TimeZoneInfo overload
                 // renders it as the "+00:00" offset instead, which is a legal but unconventional
@@ -427,6 +428,43 @@ internal static class ArrowSchemaConverter
             return extType;
         }
         return storage;
+    }
+
+    private static Apache.Arrow.Types.TimeUnit ToArrowUnit(Metadata.TimeUnit unit) => unit switch
+    {
+        Metadata.TimeUnit.Millis => Apache.Arrow.Types.TimeUnit.Millisecond,
+        Metadata.TimeUnit.Micros => Apache.Arrow.Types.TimeUnit.Microsecond,
+        Metadata.TimeUnit.Nanos => Apache.Arrow.Types.TimeUnit.Nanosecond,
+        _ => Apache.Arrow.Types.TimeUnit.Microsecond,
+    };
+
+    /// <summary>
+    /// Maps a TIMESTAMP-annotated FIXED_LEN_BYTE_ARRAY(12) column per
+    /// <see cref="ParquetReadOptions.ExtendedTimestampOutput"/>.
+    /// </summary>
+    /// <remarks>
+    /// The DEFAULT rescales to microseconds rather than keeping the declared unit, because microseconds
+    /// span every date the carrier can hold and the declared unit may not -- year 9999 in nanoseconds
+    /// does not fit an Arrow int64 timestamp. Keeping the declared unit is
+    /// <see cref="ExtendedTimestampOutputKind.Timestamp"/>, and it can refuse a value.
+    /// </remarks>
+    private static IArrowType MakeExtendedTimestampArrowType(
+        LogicalType.TimestampType timestamp, ParquetReadOptions? options)
+    {
+        // Parquet records only isAdjustedToUTC, never a zone name, so an adjusted column comes back as
+        // "UTC" for the same reason the INT64 arm above spells it that way.
+        string? zone = timestamp.IsAdjustedToUtc ? "UTC" : null;
+
+#pragma warning disable EWPARQUET0004 // The experimental signal lives on the enum and the option, not internal dispatch.
+        return (options?.ExtendedTimestampOutput ?? ExtendedTimestampOutputKind.TimestampMicroseconds) switch
+        {
+            ExtendedTimestampOutputKind.FixedSizeBinary
+                => new FixedSizeBinaryType(ExtendedTimestamp.ByteWidth),
+            ExtendedTimestampOutputKind.Timestamp
+                => new TimestampType(ToArrowUnit(timestamp.Unit), zone),
+            _ => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, zone),
+        };
+#pragma warning restore EWPARQUET0004
     }
 
     /// <summary>

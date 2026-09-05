@@ -36,7 +36,8 @@ internal static class StatisticsCollector
         int[]? defLevels,
         int nonNullCount,
         int rowCount,
-        bool floatingPointTotalOrder = false)
+        bool floatingPointTotalOrder = false,
+        bool extendedTimestamp = false)
     {
         long nullCount = rowCount - nonNullCount;
         bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
@@ -77,7 +78,8 @@ internal static class StatisticsCollector
             PhysicalType.Int32 => WithExact(ComputeMinMax<int>(array, defLevels, CompareInt32)),
             PhysicalType.Int64 => WithExact(ComputeMinMax<long>(array, defLevels, CompareInt64)),
             PhysicalType.ByteArray => ComputeByteArrayMinMaxTruncated(array, defLevels),
-            PhysicalType.FixedLenByteArray => ComputeFlbaMinMaxTruncated(array, defLevels, typeLength),
+            PhysicalType.FixedLenByteArray
+                => ComputeFlbaMinMaxTruncated(array, defLevels, typeLength, extendedTimestamp),
             _ => (null, null, true, true),
         };
 
@@ -107,7 +109,8 @@ internal static class StatisticsCollector
         int dictCount,
         PhysicalType physicalType,
         int typeLength,
-        long nullCount)
+        long nullCount,
+        bool extendedTimestamp = false)
     {
         if (dictCount == 0)
             return new Statistics { NullCount = nullCount };
@@ -115,7 +118,8 @@ internal static class StatisticsCollector
         var (minBytes, maxBytes, minExact, maxExact) = physicalType switch
         {
             PhysicalType.ByteArray => ComputeByteArrayMinMaxFromDict(dictPageData, dictCount),
-            PhysicalType.FixedLenByteArray => ComputeFlbaMinMaxFromDict(dictPageData, dictCount, typeLength),
+            PhysicalType.FixedLenByteArray
+                => ComputeFlbaMinMaxFromDict(dictPageData, dictCount, typeLength, extendedTimestamp),
             _ => ComputeFixedMinMaxFromDict(dictPageData, dictCount, physicalType, typeLength),
         };
 
@@ -305,7 +309,7 @@ internal static class StatisticsCollector
     }
 
     private static (byte[]?, byte[]?, bool, bool) ComputeFlbaMinMaxFromDict(
-        byte[] dictPage, int dictCount, int typeLength)
+        byte[] dictPage, int dictCount, int typeLength, bool extendedTimestamp)
     {
         var span = dictPage.AsSpan();
         int minIdx = 0, maxIdx = 0;
@@ -313,9 +317,9 @@ internal static class StatisticsCollector
         for (int i = 1; i < dictCount; i++)
         {
             var val = span.Slice(i * typeLength, typeLength);
-            if (val.SequenceCompareTo(span.Slice(minIdx * typeLength, typeLength)) < 0)
+            if (CompareFlba(val, span.Slice(minIdx * typeLength, typeLength), extendedTimestamp) < 0)
                 minIdx = i;
-            if (val.SequenceCompareTo(span.Slice(maxIdx * typeLength, typeLength)) > 0)
+            if (CompareFlba(val, span.Slice(maxIdx * typeLength, typeLength), extendedTimestamp) > 0)
                 maxIdx = i;
         }
 
@@ -657,7 +661,7 @@ internal static class StatisticsCollector
     }
 
     private static (byte[]?, byte[]?, bool, bool) ComputeFlbaMinMaxTruncated(
-        IArrowArray array, int[]? defLevels, int typeLength)
+        IArrowArray array, int[]? defLevels, int typeLength, bool extendedTimestamp)
     {
         var valueBuffer = array.Data.Buffers[1].Span;
         int minIdx = -1, maxIdx = -1;
@@ -673,9 +677,9 @@ internal static class StatisticsCollector
             else
             {
                 var val = valueBuffer.Slice(i * typeLength, typeLength);
-                if (val.SequenceCompareTo(valueBuffer.Slice(minIdx * typeLength, typeLength)) < 0)
+                if (CompareFlba(val, valueBuffer.Slice(minIdx * typeLength, typeLength), extendedTimestamp) < 0)
                     minIdx = i;
-                if (val.SequenceCompareTo(valueBuffer.Slice(maxIdx * typeLength, typeLength)) > 0)
+                if (CompareFlba(val, valueBuffer.Slice(maxIdx * typeLength, typeLength), extendedTimestamp) > 0)
                     maxIdx = i;
             }
         }
@@ -688,6 +692,21 @@ internal static class StatisticsCollector
             valueBuffer.Slice(maxIdx * typeLength, typeLength).ToArray(),
             true, true);
     }
+
+    /// <summary>
+    /// Orders two FIXED_LEN_BYTE_ARRAY values for statistics.
+    /// </summary>
+    /// <remarks>
+    /// Unsigned lexicographic is right for every FLBA column but one. DECIMAL gets away with it because
+    /// ColumnChunkWriter has already rewritten the buffer to big-endian two's complement before this runs,
+    /// and the deprecated min/max are then dropped for it. The extended-precision timestamp carrier
+    /// (apache/parquet-format#600) cannot: it is LITTLE-endian, so its most significant byte is last and a
+    /// lexicographic comparison would sort -1 (all 0xFF) above every positive value.
+    /// </remarks>
+    private static int CompareFlba(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right, bool extendedTimestamp)
+        => extendedTimestamp
+            ? ExtendedTimestamp.Compare(left, right)
+            : left.SequenceCompareTo(right);
 
     // ── Truncation helpers ──
 

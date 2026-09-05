@@ -5,6 +5,7 @@ using System.Numerics;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.BloomFilter;
+using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -198,7 +199,7 @@ internal static class BloomFilterPredicateEvaluator
     {
         try
         {
-            object? boxed = ToObjectForPhysicalType(value, descriptor.PhysicalType);
+            object? boxed = ToObjectForColumn(value, descriptor);
             if (boxed is null) { bytes = []; return false; }
             bytes = BloomFilterValueEncoder.Encode(boxed, descriptor.PhysicalType);
             return true;
@@ -209,6 +210,104 @@ internal static class BloomFilterPredicateEvaluator
             return false;
         }
     }
+
+    /// <summary>
+    /// Converts a <see cref="LiteralValue"/> to the boxed .NET value the column's bytes would hold.
+    /// </summary>
+    /// <remarks>
+    /// Temporal literals are decided by the LOGICAL type, not the physical one, so they are handled
+    /// before the physical dispatch below. Until this existed, a predicate on a DATE, TIME or TIMESTAMP
+    /// column could never probe a bloom filter at all: the statistics layer hands those over as
+    /// DateOnly / TimeOnly / DateTimeOffset, and every one of them fell through to null.
+    /// </remarks>
+    private static object? ToObjectForColumn(LiteralValue v, ColumnDescriptor desc)
+        => v.Type is LiteralValue.Kind.DateTimeOffset or LiteralValue.Kind.DateOnly
+            or LiteralValue.Kind.TimeOnly
+            ? TemporalToObject(v, desc)
+            : ToObjectForPhysicalType(v, desc.PhysicalType);
+
+    /// <summary>Ticks (100 ns) from .NET's epoch (0001-01-01) to the Unix epoch.</summary>
+    private const long UnixEpochTicks = 621_355_968_000_000_000L;
+
+    /// <summary>
+    /// Converts a temporal literal to the exact value stored in the column, or null when no stored
+    /// value could equal it.
+    /// </summary>
+    /// <remarks>
+    /// <para>EXACTNESS IS THE WHOLE RULE. A bloom filter answers "these bytes, or definitely nothing",
+    /// so a literal is only worth probing with if it converts to the column's unit without a remainder.
+    /// A DateTimeOffset of 1.5 ms against a MILLIS column does not, and rounding it would probe for a
+    /// value the caller never asked about. Declining costs a pruning opportunity and nothing else.</para>
+    ///
+    /// <para>Returning null is always safe here: it means the filter is not consulted, so the row group
+    /// is read. The unsafe direction would be probing with the wrong bytes and being told "absent".</para>
+    /// </remarks>
+    private static object? TemporalToObject(LiteralValue v, ColumnDescriptor desc)
+    {
+        var logical = desc.SchemaElement.LogicalType;
+
+        switch (v.Type)
+        {
+            case LiteralValue.Kind.DateTimeOffset when logical is LogicalType.TimestampType ts:
+            {
+                // Normalising by the offset is right for an isAdjustedToUTC column, and a no-op for a
+                // naive one -- this reader only ever produces those with a zero offset.
+                long ticks = v.AsDateTimeOffset.ToUniversalTime().Ticks - UnixEpochTicks;
+                if (!ExtendedTimestamp.TryTicksToUnit(ticks, ts.Unit, out Int128 count))
+                    return null;
+
+                // Computed in 128 bits because NANOS does not fit 64: year 9999 is 2.5e20 nanoseconds.
+                // An INT64 column cannot hold such a value at all, so a literal that big matches nothing
+                // there and there is no probe to make.
+                if (desc.PhysicalType == PhysicalType.Int64)
+                    return ExtendedTimestamp.TryToInt64(count, out long narrowed) ? narrowed : (object?)null;
+
+                if (desc.PhysicalType == PhysicalType.FixedLenByteArray
+                    && desc.TypeLength == ExtendedTimestamp.ByteWidth)
+                {
+                    // The filter holds the hash of the bytes as they sit in the file, so the literal has
+                    // to become those same twelve little-endian bytes. The carrier holds +/-2^95, so a
+                    // value it cannot represent is likewise not in the column.
+                    if (!ExtendedTimestamp.IsRepresentable(count))
+                        return null;
+
+                    var carrier = new byte[ExtendedTimestamp.ByteWidth];
+                    ExtendedTimestamp.Write(count, carrier);
+                    return carrier;
+                }
+
+                return null;
+            }
+
+#if NET6_0_OR_GREATER
+            case LiteralValue.Kind.DateOnly
+                when logical is LogicalType.DateType && desc.PhysicalType == PhysicalType.Int32:
+                return v.AsDateOnly.DayNumber - EpochDays;
+
+            case LiteralValue.Kind.TimeOnly when logical is LogicalType.TimeType time:
+            {
+                long ticks = v.AsTimeOnly.Ticks;
+                return time.Unit switch
+                {
+                    Metadata.TimeUnit.Millis when desc.PhysicalType == PhysicalType.Int32
+                        => ticks % 10_000 == 0 ? (object)(int)(ticks / 10_000) : null,
+                    Metadata.TimeUnit.Micros when desc.PhysicalType == PhysicalType.Int64
+                        => ticks % 10 == 0 ? (object)(ticks / 10) : null,
+                    // Safe in 64 bits, unlike the TIMESTAMP case: a time of day is at most 8.64e13
+                    // nanoseconds, nowhere near where a long runs out.
+                    Metadata.TimeUnit.Nanos when desc.PhysicalType == PhysicalType.Int64
+                        => ticks * 100,
+                    _ => null,
+                };
+            }
+#endif
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>Days from .NET's epoch (0001-01-01) to the Unix epoch (1970-01-01).</summary>
+    private const int EpochDays = 719_162;
 
     /// <summary>
     /// Converts a <see cref="LiteralValue"/> to the boxed .NET type that

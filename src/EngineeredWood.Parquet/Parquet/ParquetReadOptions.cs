@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Diagnostics.CodeAnalysis;
 using Apache.Arrow;
 using EngineeredWood.Expressions;
 
@@ -98,6 +99,67 @@ public enum Int96OutputKind
 }
 
 /// <summary>
+/// Controls the Arrow output type for a TIMESTAMP-annotated <c>FIXED_LEN_BYTE_ARRAY(12)</c> column —
+/// the extended-precision carrier proposed in apache/parquet-format#600.
+/// </summary>
+/// <remarks>
+/// <para>The carrier holds a signed 96-bit little-endian count of the column's declared
+/// <c>TimeUnit</c> since the Unix epoch, which spans the whole ANSI SQL TIMESTAMP(9) range.
+/// INT64 nanoseconds does not: it stops at 1677-09-21 and 2262-04-11.</para>
+///
+/// <para>This is deliberately a sibling of <see cref="Int96OutputKind"/> rather than the same enum.
+/// INT96 carries no logical annotation, so its unit is the reader's choice; here the file declares
+/// MILLIS, MICROS or NANOS and reading at any other unit would be a rescale, not an output kind.</para>
+///
+/// <para><b>The byte order is not settled upstream.</b> The proposal, the parquet-java reference
+/// implementation and the proposed conformance fixture are all little-endian, but the choice was
+/// still open on the spec PR when this was written. Nothing on the wire distinguishes the two
+/// orders, so if it flips, files already written become silently wrong-valued rather than
+/// unreadable.</para>
+/// </remarks>
+[Experimental("EWPARQUET0004")]
+public enum ExtendedTimestampOutputKind
+{
+    /// <summary>
+    /// Default: <c>timestamp[us]</c>, rescaled from the unit the file declares, UTC when
+    /// <c>isAdjustedToUTC</c> is set and naive otherwise. Microseconds span roughly ±292,000 years,
+    /// so this reads the whole ANSI SQL range and a long way past it.
+    /// </summary>
+    /// <remarks>
+    /// <para>A NANOS column loses its last three digits, and the conversion floors rather than
+    /// truncating toward zero so that a pre-epoch value rounds the same way as a post-epoch one.
+    /// Choose <see cref="Timestamp"/> when those digits matter.</para>
+    ///
+    /// <para>This is the default for the same reason
+    /// <see cref="Int96OutputKind.TimestampMicroseconds"/> is INT96's: it is the mode that produces
+    /// an answer for every value a writer would sensibly emit. It is not unconditional — the carrier
+    /// holds ±2^95 units, so a value outside ±292,000 years still overflows int64 and is reported —
+    /// but nothing representing a date can reach that.</para>
+    /// </remarks>
+    TimestampMicroseconds = 0,
+
+    /// <summary>
+    /// <c>timestamp</c> at the unit the file declares, keeping every digit that was written.
+    /// </summary>
+    /// <remarks>
+    /// Arrow timestamps are int64, so a value the carrier holds but int64 cannot — year 9999 in
+    /// nanoseconds is the ordinary case here, not a corrupt file — throws
+    /// <see cref="ParquetFormatException"/> naming the row and this option rather than wrapping into
+    /// a plausible-looking date. That refusal is the point of the mode: it is for callers who would
+    /// rather be told than lose precision silently. Use the default
+    /// <see cref="TimestampMicroseconds"/> to read such a column anyway, or
+    /// <see cref="FixedSizeBinary"/> for the raw bytes.
+    /// </remarks>
+    Timestamp,
+
+    /// <summary>
+    /// The undecoded 12 bytes as <c>FixedSizeBinaryType(12)</c>. Nothing is lost; this only declines
+    /// to say what the bytes mean.
+    /// </summary>
+    FixedSizeBinary,
+}
+
+/// <summary>
 /// Options that control how Parquet data is read and mapped to Apache Arrow types.
 /// </summary>
 /// <remarks>
@@ -128,6 +190,21 @@ public sealed record ParquetReadOptions
     /// naive <c>timestamp[us]</c>, not as raw bytes.
     /// </summary>
     public Int96OutputKind Int96Output { get; init; } = Int96OutputKind.TimestampMicroseconds;
+
+    /// <summary>
+    /// Controls the Arrow output type for a TIMESTAMP-annotated <c>FIXED_LEN_BYTE_ARRAY(12)</c>
+    /// column. Defaults to <see cref="ExtendedTimestampOutputKind.TimestampMicroseconds"/> — the
+    /// column reads back as <c>timestamp[us]</c>, which spans every date the carrier exists to hold,
+    /// so a generic read of a conforming file never fails.
+    /// </summary>
+    /// <remarks>
+    /// The carrier is an unratified parquet-format proposal (apache/parquet-format#600) whose byte
+    /// order was still under discussion when this shipped; see
+    /// <see cref="ExtendedTimestampOutputKind"/>.
+    /// </remarks>
+    [Experimental("EWPARQUET0004")]
+    public ExtendedTimestampOutputKind ExtendedTimestampOutput { get; init; }
+        = ExtendedTimestampOutputKind.TimestampMicroseconds;
 
     /// <summary>
     /// Maximum number of rows per <see cref="Apache.Arrow.RecordBatch"/>. When set, row groups

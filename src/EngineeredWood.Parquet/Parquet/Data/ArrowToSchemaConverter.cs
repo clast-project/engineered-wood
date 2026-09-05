@@ -17,7 +17,8 @@ internal static class ArrowToSchemaConverter
     /// Converts an Arrow schema to a flat list of Parquet schema elements
     /// (pre-order traversal with root "schema" element).
     /// </summary>
-    public static IReadOnlyList<SchemaElement> Convert(Apache.Arrow.Schema arrowSchema)
+    public static IReadOnlyList<SchemaElement> Convert(
+        Apache.Arrow.Schema arrowSchema, ParquetWriteOptions? options = null)
     {
         var elements = new List<SchemaElement>();
 
@@ -29,13 +30,15 @@ internal static class ArrowToSchemaConverter
         });
 
         foreach (var field in arrowSchema.FieldsList)
-            AddField(elements, field);
+            AddField(elements, field, parentPath: string.Empty, options);
 
         return elements;
     }
 
-    private static void AddField(List<SchemaElement> elements, Field field)
+    private static void AddField(
+        List<SchemaElement> elements, Field field, string parentPath, ParquetWriteOptions? options)
     {
+        string path = parentPath.Length == 0 ? field.Name : parentPath + "." + field.Name;
         var repetition = field.IsNullable
             ? FieldRepetitionType.Optional
             : FieldRepetitionType.Required;
@@ -45,21 +48,21 @@ internal static class ArrowToSchemaConverter
         switch (field.DataType)
         {
             case StructType structType:
-                AddStructField(elements, field.Name, repetition, structType, fieldId);
+                AddStructField(elements, field.Name, repetition, structType, path, options, fieldId);
                 return;
 
             case ListType listType:
-                AddListField(elements, field.Name, repetition, listType.ValueField, fieldId);
+                AddListField(elements, field.Name, repetition, listType.ValueField, path, options, fieldId);
                 return;
 
             // Parquet has no fixed-size list, so it writes as an ordinary LIST — the same thing
             // PyArrow, Polars, and DuckDB put on disk. The width lives only in Arrow, and is lost.
             case FixedSizeListType fixedListType:
-                AddListField(elements, field.Name, repetition, fixedListType.ValueField, fieldId);
+                AddListField(elements, field.Name, repetition, fixedListType.ValueField, path, options, fieldId);
                 return;
 
             case MapType mapType:
-                AddMapField(elements, field.Name, repetition, mapType, fieldId);
+                AddMapField(elements, field.Name, repetition, mapType, path, options, fieldId);
                 return;
 
             // ExtensionType over a nested storage type: emit the storage as a
@@ -67,13 +70,13 @@ internal static class ArrowToSchemaConverter
             // VARIANT extension takes this path; future extensions over List/
             // Map (none defined yet) would as well.
             case ExtensionType ext when ext.StorageType is StructType extStruct:
-                AddStructField(elements, field.Name, repetition, extStruct, fieldId,
+                AddStructField(elements, field.Name, repetition, extStruct, path, options, fieldId,
                     logicalType: GetExtensionLogicalType(ext));
                 return;
         }
 
         var (physicalType, typeLength, logicalType, convertedType, scale, precision) =
-            MapArrowType(field.DataType);
+            MapArrowType(field.DataType, ExtendedTimestampRequested(field, path, parentPath, options));
 
         elements.Add(new SchemaElement
         {
@@ -109,10 +112,44 @@ internal static class ArrowToSchemaConverter
         return null;
     }
 
+    /// <summary>
+    /// Whether this leaf was named in <see cref="ParquetWriteOptions.ExtendedTimestampColumns"/>.
+    /// </summary>
+    /// <remarks>
+    /// Nested paths are REFUSED rather than ignored. The schema is built here, but the physical type the
+    /// data is actually written with is decided independently by NestedLevelWriter, which does not see
+    /// these options -- so honouring a nested request here would produce a file whose footer says
+    /// FIXED_LEN_BYTE_ARRAY(12) over pages holding INT64. Silently ignoring it would be almost as bad: the
+    /// caller asked for a carrier and would get an ordinary column with no indication.
+    /// </remarks>
+    private static bool ExtendedTimestampRequested(
+        Field field, string path, string parentPath, ParquetWriteOptions? options)
+    {
+        if (options is null || !options.IsExtendedTimestampColumn(path))
+            return false;
+
+        if (field.DataType is not TimestampType)
+        {
+            throw new NotSupportedException(
+                $"Column '{path}' is named in ParquetWriteOptions.ExtendedTimestampColumns but is " +
+                $"'{field.DataType.Name}', not a timestamp. Only a timestamp column has an " +
+                "extended-precision carrier to be written as.");
+        }
+
+        if (parentPath.Length != 0)
+        {
+            throw new NotSupportedException(
+                $"Column '{path}' is named in ParquetWriteOptions.ExtendedTimestampColumns but is nested. " +
+                "The extended-precision timestamp carrier is supported for top-level columns only.");
+        }
+
+        return true;
+    }
+
     private static void AddStructField(
         List<SchemaElement> elements, string name,
-        FieldRepetitionType repetition, StructType structType, int? fieldId = null,
-        LogicalType? logicalType = null)
+        FieldRepetitionType repetition, StructType structType, string path, ParquetWriteOptions? options,
+        int? fieldId = null, LogicalType? logicalType = null)
     {
         elements.Add(new SchemaElement
         {
@@ -124,7 +161,7 @@ internal static class ArrowToSchemaConverter
         });
 
         foreach (var child in structType.Fields)
-            AddField(elements, child);
+            AddField(elements, child, path, options);
     }
 
     /// <summary>
@@ -141,7 +178,8 @@ internal static class ArrowToSchemaConverter
 
     private static void AddListField(
         List<SchemaElement> elements, string name,
-        FieldRepetitionType repetition, Field elementField, int? fieldId = null)
+        FieldRepetitionType repetition, Field elementField, string path, ParquetWriteOptions? options,
+        int? fieldId = null)
     {
         // 3-level encoding: optional/required group (LIST) → repeated group "list" → element
         elements.Add(new SchemaElement
@@ -163,12 +201,13 @@ internal static class ArrowToSchemaConverter
         });
 
         // Element field
-        AddField(elements, elementField);
+        AddField(elements, elementField, path + ".list", options);
     }
 
     private static void AddMapField(
         List<SchemaElement> elements, string name,
-        FieldRepetitionType repetition, MapType mapType, int? fieldId = null)
+        FieldRepetitionType repetition, MapType mapType, string path, ParquetWriteOptions? options,
+        int? fieldId = null)
     {
         // optional/required group (MAP) → repeated group "key_value" → key + value
         elements.Add(new SchemaElement
@@ -191,10 +230,10 @@ internal static class ArrowToSchemaConverter
 
         // Key field (always required)
         var keyField = new Field(mapType.KeyField.Name, mapType.KeyField.DataType, nullable: false);
-        AddField(elements, keyField);
+        AddField(elements, keyField, path + ".key_value", options);
 
         // Value field
-        AddField(elements, mapType.ValueField);
+        AddField(elements, mapType.ValueField, path + ".key_value", options);
     }
 
     /// <summary>
@@ -207,7 +246,7 @@ internal static class ArrowToSchemaConverter
         ConvertedType? ConvertedType,
         int? Scale,
         int? Precision)
-        MapArrowType(IArrowType arrowType)
+        MapArrowType(IArrowType arrowType, bool extendedTimestamp = false)
     {
         return arrowType switch
         {
@@ -244,6 +283,15 @@ internal static class ArrowToSchemaConverter
 
             Date32Type => (PhysicalType.Int32, null,
                 new LogicalType.DateType(), ConvertedType.Date, null, null),
+
+            // The extended-precision carrier (apache/parquet-format#600). converted_type is deliberately
+            // OMITTED: TIMESTAMP_MILLIS and TIMESTAMP_MICROS are defined for INT64 only, so a reader that
+            // understands converted types but not the new logical-type carrier would decode twelve bytes
+            // as eight. parquet-java suppresses it for the same reason.
+            TimestampType extended when extendedTimestamp => (
+                PhysicalType.FixedLenByteArray, ExtendedTimestamp.ByteWidth,
+                new LogicalType.TimestampType(extended.Timezone != null, MapTimeUnit(extended.Unit)),
+                null, null, null),
 
             TimestampType ts => (PhysicalType.Int64, null,
                 new LogicalType.TimestampType(

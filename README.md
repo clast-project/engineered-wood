@@ -131,6 +131,23 @@ bigger.
 > 0.65x. See [doc/parquet-pfor.md](doc/parquet-pfor.md) for the measurements, and for a second
 > place the proposal contradicts itself.
 
+### Experimental diagnostics
+
+Features whose wire format could still change are marked `[Experimental]`, so using one is a
+compile error until the diagnostic is suppressed at the use site. That is deliberate: each of
+these can produce a file that some other implementation reads differently, or not at all.
+
+| ID | Feature | Why it is gated |
+|---|---|---|
+| `EWPARQUET0001` | ALP floating-point encoding | Unratified proposal; the wire format may change |
+| `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **Produces files no other implementation can read.** pyarrow, ParquetSharp and delta-kernel-rs report the file as corrupt rather than as using an unsupported feature. Our own reader tolerates it, so a round trip through this library will not detect the problem |
+| `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 12 where the proposal says 10** (see below) |
+| `EWPARQUET0004` | Extended-precision timestamps | Unratified, **and the byte order is still undecided upstream** (see below) |
+| `EWPARQUET0005` | PFOR integer encoding | Unratified proposal; the wire format may change |
+
+Suppress with a narrow `#pragma warning disable` at the use site rather than a project-wide
+`NoWarn`, so the choice stays visible where it is made.
+
 FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
 codes drawn from a symbol table trained per column chunk and stored in its own
 `SYMBOL_TABLE_PAGE`, which is what keeps per-value random access. It pays off on
@@ -152,6 +169,51 @@ actually shrink, so enabling it cannot make a file bigger.
 > the symbol table page's type field rather than by the encoding number. See
 > [doc/parquet-fsst.md](doc/parquet-fsst.md), which also records how the arrow-rs and
 > arrow-cpp proofs-of-concept differ from the spec.
+
+### Extended-precision timestamps (experimental)
+
+`TIMESTAMP` annotating `FIXED_LEN_BYTE_ARRAY(12)` — a signed 96-bit little-endian count of the
+column's declared unit since the epoch, covering the whole ANSI SQL `TIMESTAMP(9)` range
+(years 0001–9999) where `INT64` nanoseconds stops at 1677-09-21 and 2262-04-11. Proposed in
+[apache/parquet-format#600](https://github.com/apache/parquet-format/issues/600) and gated behind
+`EWPARQUET0004`.
+
+Reading is controlled by `ParquetReadOptions.ExtendedTimestampOutput`:
+
+| `ExtendedTimestampOutputKind` | Arrow type | Notes |
+|---|---|---|
+| `TimestampMicroseconds` (default) | `timestamp[us]` | Spans ±292,000 years, so a conforming file always reads; a `NANOS` column loses its last three digits |
+| `Timestamp` | `timestamp[declared unit]` | Keeps every digit, and reports a range error rather than wrapping a value int64 cannot hold |
+| `FixedSizeBinary` | `fixed_size_binary[12]` | The raw bytes, uninterpreted |
+
+The default is the mode that always produces an answer, for the same reason `Int96OutputKind`
+defaults to microseconds: reading a valid file should not require knowing in advance that it
+contains one. `Timestamp` is for callers who would rather be told than lose precision silently.
+
+> **The byte order is not settled.** The proposal text, the parquet-java reference implementation
+> and the proposed conformance fixture are all little-endian, but a proposal co-author argued for
+> big-endian on the spec PR and the approving reviewer left the choice explicitly open. Nothing on
+> the wire distinguishes the two, so if it flips, files already written become silently
+> wrong-valued rather than unreadable. That risk is what the experimental gate carries.
+>
+Writing is opt-in per column, via `ParquetWriteOptions.ExtendedTimestampColumns` (dotted paths, top-level
+columns only). The promotion is never automatic and never can be: an Arrow timestamp is `int64`, so any
+value Arrow can hold already fits `INT64`. The option exists to produce files in that shape — interop
+fixtures, and readers being tested against the proposal — not to rescue values that would otherwise
+overflow. For the same reason this library cannot write the far-past and far-future *nanosecond* values
+that motivate the carrier: they cannot be expressed in Arrow to begin with.
+
+`converted_type` is deliberately omitted for this carrier. `TIMESTAMP_MILLIS` and `TIMESTAMP_MICROS` are
+defined for `INT64` only, so a reader that understands converted types but not the new logical-type
+carrier would decode twelve bytes as eight.
+
+> Arrow has no type for this and no plan for one — `timestamp128`
+> ([apache/arrow#47848](https://github.com/apache/arrow/issues/47848)) is dormant and there is no
+> canonical extension type — so the mapping above is this library's own choice, not a standard.
+
+See [doc/parquet-extended-precision-timestamps.md](doc/parquet-extended-precision-timestamps.md),
+which records what is ours rather than the spec's, what changes if the byte order flips, and the
+limits of the validation available for it.
 
 ## Features — ORC
 

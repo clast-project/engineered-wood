@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+#pragma warning disable EWPARQUET0004 // The FLBA(12) carrier is experimental; the gate around it is what these pin.
+
 using Apache.Arrow.Types;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
@@ -21,7 +23,8 @@ namespace EngineeredWood.Tests.Parquet.Data;
 /// parquet-format is in the middle of allowing exactly that (apache/parquet-format#601 puts TIMESTAMP on
 /// FIXED_LEN_BYTE_ARRAY(12)), so files in this shape are about to exist. These tests pin the gate: an
 /// unrecognised carrier falls through to the physical type, which is lossless, rather than being decoded
-/// as a timestamp. The FLBA(12) carrier gets a real decode in its own change; this is only the guard.
+/// as a timestamp. FLBA(12) is now a real carrier and decodes (see ExtendedTimestampReadTests); every
+/// other width, and every other physical type, still falls through.
 /// </summary>
 public class TimestampCarrierGateTests
 {
@@ -84,31 +87,55 @@ public class TimestampCarrierGateTests
 
     [Theory]
     [MemberData(nameof(TimestampUnits))]
-    public void FixedLenByteArrayFallsThroughToItsPhysicalType(ParquetTimeUnit parquetUnit, TimeUnit _)
+    public void FixedLenByteArrayAtTwelveBytesIsTheExtendedCarrier(ParquetTimeUnit parquetUnit, TimeUnit _)
     {
-        // The carrier proposed by apache/parquet-format#601. Until it is decoded, twelve honest bytes
-        // beat a wrong date.
+        // The one width the annotation is legal at. Decoding lives in ExtendedTimestampReadTests; what
+        // matters here is that the gate lets exactly this shape past and nothing else.
         var column = Describe(
             PhysicalType.FixedLenByteArray,
             new LogicalType.TimestampType(true, parquetUnit),
             typeLength: 12);
 
-        var type = Assert.IsType<FixedSizeBinaryType>(ArrowSchemaConverter.ToArrowType(column));
-        Assert.Equal(12, type.ByteWidth);
+        var type = Assert.IsType<TimestampType>(ArrowSchemaConverter.ToArrowType(column));
+        // Whatever unit the file declares, the DEFAULT reads it as microseconds -- the mode that can
+        // represent every date the carrier holds. The declared unit is an opt-in, below.
+        Assert.Equal(TimeUnit.Microsecond, type.Unit);
+        Assert.Equal("UTC", type.Timezone);
     }
 
-    [Fact]
-    public void AMalformedTimestampCarrierIsNotDecodedAsATimestampEither()
+    [Theory]
+    [MemberData(nameof(TimestampUnits))]
+    public void TheDeclaredUnitIsAnOptIn(ParquetTimeUnit parquetUnit, TimeUnit arrowUnit)
     {
-        // TIMESTAMP on FLBA(8) is not legal under any proposal. The point is that the width being
-        // coincidentally right for an int64 must not be what saves us.
+        var column = Describe(
+            PhysicalType.FixedLenByteArray,
+            new LogicalType.TimestampType(true, parquetUnit),
+            typeLength: 12);
+
+        var type = Assert.IsType<TimestampType>(ArrowSchemaConverter.ToArrowType(
+            column,
+            new ParquetReadOptions { ExtendedTimestampOutput = ExtendedTimestampOutputKind.Timestamp }));
+
+        Assert.Equal(arrowUnit, type.Unit);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(8)]
+    [InlineData(11)]
+    [InlineData(13)]
+    [InlineData(16)]
+    public void FixedLenByteArrayAtAnyOtherWidthFallsThroughToItsPhysicalType(int typeLength)
+    {
+        // TIMESTAMP is a carrier at twelve bytes and malformed at every other width -- including 8, where
+        // the width is coincidentally right for an int64 and must not be what saves us.
         var column = Describe(
             PhysicalType.FixedLenByteArray,
             new LogicalType.TimestampType(true, ParquetTimeUnit.Micros),
-            typeLength: 8);
+            typeLength: typeLength);
 
         var type = Assert.IsType<FixedSizeBinaryType>(ArrowSchemaConverter.ToArrowType(column));
-        Assert.Equal(8, type.ByteWidth);
+        Assert.Equal(typeLength, type.ByteWidth);
     }
 
     [Fact]
