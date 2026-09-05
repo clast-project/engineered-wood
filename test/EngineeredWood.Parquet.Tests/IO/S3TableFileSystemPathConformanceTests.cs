@@ -101,16 +101,24 @@ public sealed class S3TableFileSystemPathConformanceTests : TableFileSystemPathC
         {
             try
             {
-                var listed = await _client.ListObjectsV2Async(
-                    new ListObjectsV2Request { BucketName = _bucket });
-                if (listed.S3Objects.Count > 0)
+                string? continuationToken = null;
+                do
                 {
-                    await _client.DeleteObjectsAsync(new DeleteObjectsRequest
+                    var listed = await _client.ListObjectsV2Async(new ListObjectsV2Request
                     {
                         BucketName = _bucket,
-                        Objects = listed.S3Objects.Select(o => new KeyVersion { Key = o.Key }).ToList(),
+                        ContinuationToken = continuationToken,
                     });
-                }
+                    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : null;
+                    if (listed.S3Objects.Count > 0)
+                    {
+                        await _client.DeleteObjectsAsync(new DeleteObjectsRequest
+                        {
+                            BucketName = _bucket,
+                            Objects = listed.S3Objects.Select(o => new KeyVersion { Key = o.Key }).ToList(),
+                        });
+                    }
+                } while (continuationToken is not null);
 
                 await _client.DeleteBucketAsync(_bucket);
             }

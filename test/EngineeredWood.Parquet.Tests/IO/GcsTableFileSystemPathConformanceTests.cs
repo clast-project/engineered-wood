@@ -44,7 +44,6 @@ public sealed class GcsTableFileSystemPathConformanceTests : TableFileSystemPath
     private GcsTableFileSystem? _fileSystem;
     private string? _unavailableReason;
 
-
     /// <inheritdoc/>
     protected override string Emulator => "storage-testbench on 127.0.0.1:4443";
 

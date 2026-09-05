@@ -26,7 +26,8 @@ namespace EngineeredWood.Tests.Parquet.Interop;
 /// CI run proves the tier actually ran rather than skipped.</para>
 ///
 /// <para><b>Cost.</b> A process start and a query per call, well under a second — no JVM, no
-/// session. Each reader is probed separately: one being absent skips only its own tests.</para>
+/// session. The tier first probes whether either reader is installed, then each read reports whether
+/// its selected reader is available, so one being absent skips only its own tests.</para>
 /// </remarks>
 internal static class ExternalParquetReaders
 {
