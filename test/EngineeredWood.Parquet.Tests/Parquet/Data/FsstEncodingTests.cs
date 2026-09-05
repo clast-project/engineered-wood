@@ -398,7 +398,7 @@ public class FsstEncodingTests : IDisposable
     public void EncodingStrategyResolver_V2_ByteArray_Fsst()
     {
         var enc = EncodingStrategyResolver.GetV2Encoding(
-            PhysicalType.ByteArray, ByteArrayEncoding.Fsst, FloatingPointEncoding.ByteStreamSplit);
+            PhysicalType.ByteArray, ByteArrayEncoding.Fsst, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.Fsst, enc);
     }
 

@@ -107,8 +107,21 @@ killed the change — so this is tested three ways rather than assumed:
   *plain* file either — nullable `DELTA_BINARY_PACKED` and V2 nested lists, pre-existing fastparquet
   limitations independent of batching. No reader could read a plain file but fail on its batched
   twin, which is the exact failure batching would introduce.
+- **DuckDB and arrow-rs.** `BatchedRuns_DecodeIdenticallyForAnExternalReader` (and its nested-list
+  twin) write each shape both ways across all four page-version × codec combinations and read both
+  with **DuckDB**, whose decoder was written from the spec rather than derived from a reference
+  implementation, and with **DataFusion**, which reads through the **arrow-rs** `parquet` crate — the
+  decoder behind polars, delta-rs and every Rust consumer. Result: **16 pass, 0 fail** against
+  duckdb 1.5.5 and datafusion 54.0.0. This tier exists because ParquetSharp, pyarrow and fastparquet
+  all descend from — or were written against — the same two reference implementations, so before it
+  the entire interop story rested on one lineage.
 - **Read-side regression.** The 92-file compatibility corpus (EW reading foreign files) still passes
   135 / 0 fail after these changes.
+- **The corpus already contains this framing.** Instrumenting the decoder over
+  `parquet-testing/data` shows **32.4% of bit-packed literal runs (2,867 of 8,851) are multi-group**,
+  across 14 of the 68 readable files — Impala's and parquet-mr's own output. Multi-group literal runs
+  are not a framing EngineeredWood would be introducing; they are one every reader has always had to
+  handle. (The largest run in that corpus is 8 groups, not 63, because those files are small.)
 
 ## Assessment
 
@@ -123,8 +136,19 @@ depths, encoder reuse across `Reset()`, third-party interop (ParquetSharp, pyarr
 the 92-file read-side compatibility corpus — but it remains the reason to land this on its own rather
 than bundled with a read-path feature.
 
-Validation against ParquetSharp, pyarrow, fastparquet, and the compatibility corpus is now complete
-(see Interop). Recommend keeping it opt-in for one release cycle, then considering it as the default.
+Validation against ParquetSharp, pyarrow, fastparquet, DuckDB, arrow-rs (via DataFusion) and the
+compatibility corpus is now complete (see Interop). Recommend keeping it opt-in for one release
+cycle, then considering it as the default.
+
+The decode-speed half of the trade-off this flag was parked on has since been measured on the reader
+side as well: with the group-of-eight bulk unpacker (#236), `ReadBatch` on a dictionary-index stream
+runs **2.9× faster** on batched runs than on eight-value ones, and **unchanged** on the eight-value
+framing this writer emits by default. So the bulk unpacker only pays on files somebody else wrote —
+turning this flag on is what would extend it to EngineeredWood's own. A flip was also dry-run against
+the suite: the full Parquet suite passes with `BatchBitPackedRuns` defaulted to `true`, and file size
+falls by a constant ~0.123 bytes per value per RLE stream (12.3% / 6.0% / 1.7% of three
+representative uncompressed V2 files). Size can never grow: the RLE-versus-literal decision in
+`AppendRun` does not consult the batching depth, so batching only ever removes run headers.
 
 ## Not covered by the prototype
 

@@ -103,11 +103,33 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | RLE (levels) | yes | yes |
 | BIT_PACKED (deprecated, levels) | yes | — |
 | ALP (experimental) | yes | opt-in |
+| PFOR (experimental) | yes | opt-in |
 | FSST (experimental) | yes | opt-in |
 
-The last two are **unratified parquet-format proposals**, off by default. Opt in per column
-or per file with `ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` and
+The last three are **unratified parquet-format proposals**, gated behind
+`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0005` for PFOR,
+`EWPARQUET0003` for FSST) and off by default. Opt in per column or per file with
+`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp`,
+`ParquetWriteOptions.IntegerEncoding = IntegerEncoding.Pfor`, and
 `ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
+
+PFOR (Patched Frame of Reference) subtracts a frame of reference from an integer column and
+bit-packs what is left, storing the values that do not fit the chosen width separately as
+exceptions. That is what lets one outlier stop widening the packing for everyone: a foreign key
+column with a null sentinel, a sequence with gaps, a measure with a few extremes. Each 1024-value
+vector independently chooses whether to pack values or the differences between successive values,
+so a column that is sorted only in stretches gets the delta treatment on those stretches — the
+difference from `DELTA_BINARY_PACKED`, which always differences. The writer measures the result
+and falls back to `PLAIN` for any page PFOR did not shrink, so enabling it cannot make a file
+bigger.
+
+> **A note on the frame.** The proposal says the frame of reference is the column's minimum. That
+> is the wrong answer on exactly the shape PFOR exists for — a low sentinel becomes the frame and
+> the width is set by the gap, not the cluster — and the proposal's own worked example quotes a
+> width only a frame *above* the minimum can produce. This library searches for the frame, which
+> is worth **5.31x against `DELTA_BINARY_PACKED`** on that shape where taking the minimum gives
+> 0.65x. See [doc/parquet-pfor.md](doc/parquet-pfor.md) for the measurements, and for a second
+> place the proposal contradicts itself.
 
 ### Experimental diagnostics
 
@@ -119,8 +141,9 @@ these can produce a file that some other implementation reads differently, or no
 |---|---|---|
 | `EWPARQUET0001` | ALP floating-point encoding | Unratified proposal; the wire format may change |
 | `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **Produces files no other implementation can read.** pyarrow, ParquetSharp and delta-kernel-rs report the file as corrupt rather than as using an unsupported feature. Our own reader tolerates it, so a round trip through this library will not detect the problem |
-| `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 11 where the proposal says 10** (see above) |
+| `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 12 where the proposal says 10** (see below) |
 | `EWPARQUET0004` | Extended-precision timestamps | Unratified, **and the byte order is still undecided upstream** (see below) |
+| `EWPARQUET0005` | PFOR integer encoding | Unratified proposal; the wire format may change |
 
 Suppress with a narrow `#pragma warning disable` at the use site rather than a project-wide
 `NoWarn`, so the choice stays visible where it is made.
@@ -133,14 +156,19 @@ dictionary cannot help but the values still share substrings. The writer measure
 result and falls back to `DELTA_LENGTH_BYTE_ARRAY` for any column chunk FSST did not
 actually shrink, so enabling it cannot make a file bigger.
 
-> **Encoding numbers.** ALP and FSST are both unratified proposals that claim encoding
-> 10. ALP shipped here first and keeps it, so **this library writes FSST as 11** — which
-> is also what the arrow-rs proof-of-concept expects to happen once ALP lands. Files
-> written here are self-consistent, but will not interoperate with an implementation that
-> settles on 10 for FSST until the spec picks a winner. Only the 8-bit code variant
-> (the spec's `FSST` symbol table type) is implemented; `FSST_16` is recognized and rejected with a
-> clear error rather than misread. See [doc/parquet-fsst.md](doc/parquet-fsst.md), which
-> also records how the arrow-rs and arrow-cpp proofs-of-concept differ from the spec.
+> **Encoding numbers.** FSST's proposal claims encoding 10, and it does not get it. ALP
+> claimed 10 too, shipped here first, and has since been merged into `parquet.thrift` on
+> parquet-format `main`, so 10 is settled. FSST then held 11 here — what the arrow-rs
+> proof-of-concept predicted — until PFOR claimed 11 in a spec PR backed by both a
+> parquet-java and an arrow-rs implementation. So **this library writes FSST as 12**.
+> Files written here are self-consistent, but will not interoperate with an implementation
+> that has settled on a different number until the spec picks one; the number is cheap to
+> move precisely because the encoding is experimental. Both symbol table widths are
+> implemented — `FSST` (8-bit codes) and `FSST_16` (16-bit) — selected by
+> `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`, and told apart on the wire by
+> the symbol table page's type field rather than by the encoding number. See
+> [doc/parquet-fsst.md](doc/parquet-fsst.md), which also records how the arrow-rs and
+> arrow-cpp proofs-of-concept differ from the spec.
 
 ### Extended-precision timestamps (experimental)
 

@@ -101,6 +101,58 @@ public class AlpDecoderTests
     }
 
     [Fact]
+    public void DecodeDoubles_InverseTransform_MatchesClastAlpOnEveryCombination()
+    {
+        // The DOUBLE path writes the inverse transform out by hand instead of calling
+        // Clast.Alp.AlpDecoder.DecodeValue per value, because the call does not inline. That is
+        // only safe while the two agree bit for bit, so pin it: every (exponent, factor) the spec
+        // allows, against encoded values spanning the int64 range including the magnitudes where
+        // scaling overflows — which a legitimate page cannot reach but a corrupt one can.
+        // SplitMix64 rather than Random: the same values are then checked on every target
+        // framework, and Random.NextInt64 does not exist on net472 at all.
+        ulong state = 20260823;
+
+        for (int exponent = 0; exponent <= 18; exponent++)
+        {
+            for (int factor = 0; factor <= exponent; factor++)
+            {
+                for (int i = 0; i < 200; i++)
+                {
+                    long encoded = i switch
+                    {
+                        0 => 0L,
+                        1 => 1L,
+                        2 => -1L,
+                        3 => long.MaxValue,
+                        4 => long.MinValue,
+                        5 => 1L << 53,
+                        6 => -(1L << 53),
+                        // Spread across magnitudes so small values, values around 2^53, and the
+                        // overflow range are all covered.
+                        _ => NextEncoded(ref state),
+                    };
+
+                    var page = BuildSingleDoubleVectorPage(
+                        exponent: exponent, factor: factor,
+                        frameOfReference: encoded,
+                        bitWidth: 0,
+                        deltas: [0],
+                        exceptionPositions: [],
+                        exceptionValues: []);
+
+                    var output = new double[1];
+                    AlpDecoder.DecodeDoubles(page, output, 1);
+
+                    double expected = Clast.Alp.AlpDecoder.DecodeValue(encoded, exponent, factor);
+                    Assert.Equal(
+                        BitConverter.DoubleToInt64Bits(expected),
+                        BitConverter.DoubleToInt64Bits(output[0]));
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void DecodeFloats_SingleVector_DecimalTenths()
     {
         // Same shape as the double test: (e=1, f=0) with halves and integers, which
@@ -273,6 +325,258 @@ public class AlpDecoderTests
     }
 
     // ─── Page builders ───────────────────────────────────────────────────────
+
+    /// <summary>A deterministic encoded value, spread across the whole int64 magnitude range.</summary>
+    private static long NextEncoded(ref ulong state)
+    {
+        ulong bits = NextRandomBits(ref state);
+        int shift = (int)(NextRandomBits(ref state) % 64);
+        long value = unchecked((long)(bits >> shift));
+        return (bits & 1) == 0 ? value : -value;
+    }
+
+    [Fact]
+    public void DecodeDoubles_VectorizedTransform_MatchesClastAlpInAndOutOfRange()
+    {
+        // The transform vectorizes only while two separate things hold: the ENCODED values fit the
+        // range where converting to double is exact, and scaling them by 10^factor does not
+        // overflow int64. The exactness bound is on the encoded value, not the scaled one — putting
+        // it on the scaled one is also correct but disables the fast path on essentially all real
+        // data. Both halves need covering, so sweep every (exponent, factor) the spec allows against
+        // frames of reference that put the vector well inside the range, on its edge, and far
+        // outside it — the last case overflowing int64, where the scalar path and Clast.Alp agree
+        // on the wrapped result.
+        //
+        // 300 values per case is deliberate: more than a whole tile's worth of vector iterations,
+        // and not a multiple of eight, so the bulk unpack, its scalar tail and the vector transform
+        // with a scalar remainder all run in the same decode.
+        ulong state = 555;
+        const int Count = 300;
+        const int BitWidth = 11;
+
+        foreach (long frame in new[] { 0L, -1_000L, 1L << 40, long.MinValue / 4 })
+        {
+            for (int exponent = 0; exponent <= 18; exponent++)
+            {
+                for (int factor = 0; factor <= exponent; factor++)
+                {
+                    var deltas = new long[Count];
+                    for (int i = 0; i < Count; i++)
+                        deltas[i] = (long)(NextRandomBits(ref state) & ((1UL << BitWidth) - 1UL));
+
+                    var page = BuildWideDoubleVectorPage(
+                        Count, exponent, factor, frame, BitWidth, deltas);
+
+                    var output = new double[Count];
+                    AlpDecoder.DecodeDoubles(page, output, Count);
+
+                    for (int i = 0; i < Count; i++)
+                    {
+                        double expected = Clast.Alp.AlpDecoder.DecodeValue(
+                            unchecked(deltas[i] + frame), exponent, factor);
+                        Assert.True(
+                            BitConverter.DoubleToInt64Bits(expected) ==
+                            BitConverter.DoubleToInt64Bits(output[i]),
+                            $"frame={frame} e={exponent} f={factor} i={i}: " +
+                            $"expected {expected:R} got {output[i]:R}");
+                    }
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void DecodeDoubles_VectorizedTransform_IsExactOnTheRangeBoundary()
+    {
+        // Right at the edge of what the conversion can represent: with factor 0 the widest encoded
+        // value the guard admits is 2^51 - 1, which biases to exactly 2^52 - 1 — the last integer a
+        // double holds without rounding. One past it the guard has to decline, and an off-by-one
+        // either way would silently corrupt values rather than fail loudly.
+        const int BitWidth = 51;
+        long span = (1L << BitWidth) - 1;
+
+        // 64 values, not the handful the boundary itself needs: at this width a shorter buffer is
+        // too small for the bulk unpacker's trailing read, so it declines and the whole vector goes
+        // down the per-value path — which would leave this test passing without ever running the
+        // code it is named for. At 64 the bulk path takes 56 of them.
+        const int Count = 64;
+
+        foreach (long frame in new[] { 0L, 1L, -1L, -span })
+        {
+            long[] interesting = [0, 1, span / 2, span - 1, span, 7];
+            var deltas = new long[Count];
+            for (int i = 0; i < Count; i++)
+                deltas[i] = interesting[i % interesting.Length];
+
+            var page = BuildWideDoubleVectorPage(
+                deltas.Length, exponent: 0, factor: 0, frame, BitWidth, deltas);
+
+            var output = new double[deltas.Length];
+            AlpDecoder.DecodeDoubles(page, output, deltas.Length);
+
+            for (int i = 0; i < deltas.Length; i++)
+            {
+                double expected = Clast.Alp.AlpDecoder.DecodeValue(
+                    unchecked(deltas[i] + frame), 0, 0);
+                Assert.True(
+                    BitConverter.DoubleToInt64Bits(expected) ==
+                    BitConverter.DoubleToInt64Bits(output[i]),
+                    $"frame={frame} i={i}: expected {expected:R} got {output[i]:R}");
+            }
+        }
+    }
+
+    /// <summary>SplitMix64: a bit source that behaves identically on every target framework.</summary>
+    private static ulong NextRandomBits(ref ulong state)
+    {
+        state = unchecked(state + 0x9E3779B97F4A7C15UL);
+        ulong z = state;
+        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
+        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
+        return z ^ (z >> 31);
+    }
+
+    [Fact]
+    public void DecodeDoubles_EveryBitWidthAndLength_RoundTrips()
+    {
+        // The bulk unpacker reads a whole 64-bit word per value, which means its behaviour turns on
+        // the bit width (widths above 57 fall back per value) and on how close a group sits to the
+        // end of the buffer. Sweep both. Exponent and factor are zero so the decoded value is the
+        // encoded integer itself and any failure is the unpacker's, not the transform's.
+        ulong state = 99;
+
+        foreach (int n in new[] { 1, 7, 8, 9, 17, 63, 64, 1000, 1024, 1031, 2048 })
+        {
+            for (int bitWidth = 0; bitWidth <= 64; bitWidth++)
+            {
+                var deltas = new long[n];
+                ulong mask = bitWidth == 64 ? ulong.MaxValue : (1UL << bitWidth) - 1UL;
+                for (int i = 0; i < n; i++)
+                    deltas[i] = unchecked((long)(NextRandomBits(ref state) & mask));
+
+                const long Frame = -1_000_000;
+                var page = BuildWideDoubleVectorPage(n, exponent: 0, factor: 0,
+                    frameOfReference: Frame, bitWidth: bitWidth, deltas: deltas);
+
+                var output = new double[n];
+                AlpDecoder.DecodeDoubles(page, output, n);
+
+                for (int i = 0; i < n; i++)
+                {
+                    double expected = (double)unchecked(deltas[i] + Frame);
+                    Assert.True(
+                        BitConverter.DoubleToInt64Bits(expected) == BitConverter.DoubleToInt64Bits(output[i]),
+                        $"n={n} bitWidth={bitWidth} index={i}: expected {expected:R} got {output[i]:R}");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void DecodeFloats_EveryBitWidthAndLength_RoundTrips()
+    {
+        // FLOAT counterpart. The spec caps FLOAT bit widths at 32, so every width takes the bulk
+        // path and only the end-of-buffer cutoff varies.
+        ulong state = 4242;
+
+        foreach (int n in new[] { 1, 7, 8, 9, 17, 1000, 1024, 1031 })
+        {
+            for (int bitWidth = 0; bitWidth <= 32; bitWidth++)
+            {
+                var deltas = new long[n];
+                ulong mask = bitWidth == 0 ? 0UL : (1UL << bitWidth) - 1UL;
+                for (int i = 0; i < n; i++)
+                    deltas[i] = unchecked((long)(NextRandomBits(ref state) & mask));
+
+                const int Frame = -1000;
+                var page = BuildWideFloatVectorPage(n, exponent: 0, factor: 0,
+                    frameOfReference: Frame, bitWidth: bitWidth, deltas: deltas);
+
+                var output = new float[n];
+                AlpDecoder.DecodeFloats(page, output, n);
+
+                for (int i = 0; i < n; i++)
+                {
+                    float expected = (float)unchecked(deltas[i] + Frame);
+                    Assert.True(
+                        SingleToInt32Bits(expected) == SingleToInt32Bits(output[i]),
+                        $"n={n} bitWidth={bitWidth} index={i}: expected {expected:R} got {output[i]:R}");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void DecodeDoubles_ExceptionsAcrossTileBoundaries_ArePatched()
+    {
+        // Deltas are unpacked a tile at a time while exceptions are patched per vector, so a vector
+        // longer than one tile is where the two can disagree. Put an exception either side of every
+        // boundary, and at both ends.
+        const int N = 3000;
+        const long Frame = 7;
+        const int BitWidth = 13;
+
+        ulong state = 31337;
+        var deltas = new long[N];
+        for (int i = 0; i < N; i++)
+            deltas[i] = unchecked((long)(NextRandomBits(ref state) & ((1UL << BitWidth) - 1UL)));
+
+        var positions = new List<int> { 0, 1023, 1024, 1025, 2047, 2048, 2049, N - 1 };
+        var values = positions.Select(x => x * -0.5).ToArray();
+
+        var page = BuildWideDoubleVectorPage(N, exponent: 0, factor: 0,
+            frameOfReference: Frame, bitWidth: BitWidth, deltas: deltas,
+            exceptionPositions: positions.ToArray(), exceptionValues: values);
+
+        var output = new double[N];
+        AlpDecoder.DecodeDoubles(page, output, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            int slot = positions.IndexOf(i);
+            double expected = slot >= 0 ? values[slot] : (double)unchecked(deltas[i] + Frame);
+            Assert.True(
+                BitConverter.DoubleToInt64Bits(expected) == BitConverter.DoubleToInt64Bits(output[i]),
+                $"index={i}: expected {expected:R} got {output[i]:R}");
+        }
+    }
+
+    /// <summary>
+    /// A one-vector page whose vector size is large enough to hold <paramref name="n"/> values, so
+    /// lengths past the canonical 1024 exercise the decoder's tiling.
+    /// </summary>
+    private static byte[] BuildWideDoubleVectorPage(
+        int n, int exponent, int factor, long frameOfReference, int bitWidth,
+        ReadOnlySpan<long> deltas,
+        int[]? exceptionPositions = null, double[]? exceptionValues = null)
+    {
+        int logVectorSize = 3;
+        while ((1 << logVectorSize) < n)
+            logVectorSize++;
+
+        var vector = SerializeDoubleVector(exponent, factor, frameOfReference, bitWidth, deltas,
+            exceptionPositions ?? [], exceptionValues ?? []);
+
+        var offsetArrayBytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(offsetArrayBytes, 4u);
+        return ConcatPage(logVectorSize, n, offsetArrayBytes, vector);
+    }
+
+    /// <summary>FLOAT counterpart of <see cref="BuildWideDoubleVectorPage"/>.</summary>
+    private static byte[] BuildWideFloatVectorPage(
+        int n, int exponent, int factor, int frameOfReference, int bitWidth,
+        ReadOnlySpan<long> deltas)
+    {
+        int logVectorSize = 3;
+        while ((1 << logVectorSize) < n)
+            logVectorSize++;
+
+        var vector = SerializeFloatVector(exponent, factor, frameOfReference, bitWidth, deltas, [], []);
+
+        var offsetArrayBytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(offsetArrayBytes, 4u);
+        return ConcatPage(logVectorSize, n, offsetArrayBytes, vector);
+    }
 
     private static byte[] BuildSingleDoubleVectorPage(
         int exponent, int factor,

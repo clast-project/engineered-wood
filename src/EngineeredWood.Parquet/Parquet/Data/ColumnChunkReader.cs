@@ -1024,6 +1024,12 @@ internal static class ColumnChunkReader
             DecodeAlpValues(data, column, nonNullCount, state);
         }
 #pragma warning restore EWPARQUET0001
+#pragma warning disable EWPARQUET0005 // The reader must accept PFOR-encoded pages produced by other writers regardless of our experimental marking.
+        else if (encoding == Encoding.Pfor)
+        {
+            DecodePforValues(data, column, nonNullCount, state);
+        }
+#pragma warning restore EWPARQUET0005
 #pragma warning disable EWPARQUET0003 // The reader must accept FSST-encoded pages produced by other writers regardless of our experimental marking.
         else if (encoding == Encoding.Fsst)
         {
@@ -1255,6 +1261,32 @@ internal static class ColumnChunkReader
             default:
                 throw new NotSupportedException(
                     $"Physical type '{column.PhysicalType}' is not supported for ALP decoding.");
+        }
+    }
+
+    private static void DecodePforValues(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int count,
+        ColumnBuildState state)
+    {
+        switch (column.PhysicalType)
+        {
+            case PhysicalType.Int32:
+            {
+                var dest = state.ReserveValues<int>(count);
+                PforDecoder.DecodeInt32s(data, dest, count);
+                break;
+            }
+            case PhysicalType.Int64:
+            {
+                var dest = state.ReserveValues<long>(count);
+                PforDecoder.DecodeInt64s(data, dest, count);
+                break;
+            }
+            default:
+                throw new NotSupportedException(
+                    $"Physical type '{column.PhysicalType}' is not supported for PFOR decoding.");
         }
     }
 

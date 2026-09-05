@@ -34,9 +34,17 @@ public enum FloatingPointEncoding
     /// <summary>
     /// ADAPTIVE_LOSSLESS_FLOATING_POINT (ALP, encoding 10): decimal-aware integer encoding plus
     /// frame-of-reference and bit-packing. Strong for monetary, sensor, and scientific data with
-    /// limited decimal precision; comparable to plain values for high-precision irrational data.
+    /// limited decimal precision.
     /// New in parquet-format; older readers will not be able to decode it.
     /// </summary>
+    /// <remarks>
+    /// Data with no decimal structure — raw coordinates, high-precision irrational values — cannot
+    /// be encoded this way at all, and is stored value by value alongside a position, which costs
+    /// more than writing it plainly. The writer falls back to PLAIN per page when that happens, so
+    /// as with <see cref="ByteArrayEncoding.Fsst"/>, choosing this setting cannot make a file
+    /// bigger than leaving it alone. Pages within one column chunk may therefore differ in
+    /// encoding, which is what the format allows for.
+    /// </remarks>
     [Experimental("EWPARQUET0001")]
     Alp,
 
@@ -44,6 +52,47 @@ public enum FloatingPointEncoding
     /// PLAIN: write IEEE-754 values uncompressed. Universal lowest-common-denominator —
     /// readable by every Parquet implementation. Choose this for maximum reader compatibility
     /// or when an outer codec (e.g. Zstd) already exploits byte-level correlation.
+    /// </summary>
+    Plain,
+}
+
+/// <summary>
+/// Controls the non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data
+/// pages.
+/// </summary>
+public enum IntegerEncoding
+{
+    /// <summary>
+    /// DELTA_BINARY_PACKED: differences between successive values, bit-packed in blocks. Ratified
+    /// and read by every current implementation, and strong on sorted or sequential integers.
+    /// This is the default.
+    /// </summary>
+    DeltaBinaryPacked,
+
+    /// <summary>
+    /// PFOR (encoding 11): frame of reference plus bit-packing, with the values that do not fit
+    /// the chosen width stored separately as exceptions. Strong on columns that cluster tightly
+    /// but carry occasional outliers — foreign keys, sequence IDs with sentinel values, measures
+    /// with a null sentinel — where one outlier would otherwise widen the packing for everyone.
+    /// New in parquet-format and <b>not yet ratified</b>; older readers cannot decode it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Each vector independently chooses whether to pack values or the differences between
+    /// them, so a column that is sorted in stretches gets the delta treatment on those stretches
+    /// and frame-of-reference on the rest. That per-vector choice is what distinguishes it from
+    /// <see cref="DeltaBinaryPacked"/>, which always differences.</para>
+    /// <para>The writer measures the result and falls back to PLAIN for any page PFOR did not
+    /// shrink, so as with <see cref="FloatingPointEncoding.Alp"/> and
+    /// <see cref="ByteArrayEncoding.Fsst"/>, choosing this setting cannot make a file bigger.
+    /// Pages within one column chunk may therefore differ in encoding.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0005")]
+    Pfor,
+
+    /// <summary>
+    /// PLAIN: write the integers uncompressed. Universal lowest-common-denominator — readable by
+    /// every Parquet implementation. Choose this when an outer codec already does the work, or
+    /// for maximum reader compatibility.
     /// </summary>
     Plain,
 }
@@ -67,7 +116,7 @@ public enum ByteArrayEncoding
     DeltaByteArray,
 
     /// <summary>
-    /// FSST (encoding 11): trains a per-column-chunk symbol table that maps frequent 1-8 byte
+    /// FSST (encoding 12): trains a per-column-chunk symbol table that maps frequent 1-8 byte
     /// substrings to single-byte codes, then stores each value as a sequence of codes. Strong
     /// for high-cardinality machine-generated text — URLs, UUIDs, log lines, identifiers —
     /// where a dictionary cannot help but the values still share substrings.
@@ -77,14 +126,14 @@ public enum ByteArrayEncoding
     /// encoding. The writer also falls back per column chunk when FSST does not actually
     /// shrink the data, so this setting cannot make a file bigger.</para>
     /// <para>New in parquet-format and <b>not yet ratified</b>; older readers cannot decode it,
-    /// and this library writes the encoding as 11 rather than the proposal's 10 — see
+    /// and this library writes the encoding as 12 rather than the proposal's 10 — see
     /// <see cref="Encoding.Fsst"/>.</para>
     /// </remarks>
     [Experimental("EWPARQUET0003")]
     Fsst,
 
     /// <summary>
-    /// FSST_16 (encoding 11 with a 16-bit symbol table): as <see cref="Fsst"/>, but codes are
+    /// FSST_16 (encoding 12 with a 16-bit symbol table): as <see cref="Fsst"/>, but codes are
     /// two bytes, so the table can hold up to 65,535 symbols instead of 255.
     /// </summary>
     /// <remarks>
@@ -197,6 +246,13 @@ public sealed record ParquetWriteOptions
     /// <see cref="FloatingPointEncoding.Alp"/> for decimal-like floating-point data.
     /// </summary>
     public FloatingPointEncoding FloatingPointEncoding { get; init; } = FloatingPointEncoding.ByteStreamSplit;
+
+    /// <summary>
+    /// Non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data pages.
+    /// Default is <see cref="IntegerEncoding.DeltaBinaryPacked"/>; set to
+    /// <see cref="IntegerEncoding.Pfor"/> for clustered integers with occasional outliers.
+    /// </summary>
+    public IntegerEncoding IntegerEncoding { get; init; } = IntegerEncoding.DeltaBinaryPacked;
 
     /// <summary>
     /// Per-column compression codec overrides, keyed by dotted column path (e.g. "col1" or "struct1.field1").

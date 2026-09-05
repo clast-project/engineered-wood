@@ -792,6 +792,84 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// The same compaction, but REBASED — the artifact #109 newly makes possible, and the one nothing
+    /// else observes. A stale handle plans an OPTIMIZE, a concurrent append takes the version it was
+    /// aiming at, and the compaction rebases onto it instead of throwing its whole rewrite away. What
+    /// Spark then reads is a compacted file whose <c>baseRowId</c> was re-reserved out of the high-water
+    /// mark that append advanced, rather than assigned when the rewrite was planned.
+    ///
+    /// <para><b>What each half of this test is actually worth — measured, by disabling the rebase and
+    /// re-running.</b> The two assertions do NOT overlap, and the division is the opposite of the
+    /// intuitive one:</para>
+    /// <list type="number">
+    /// <item>The <b>EW-side</b> <c>baseRowId</c> assertion is what catches a broken re-reservation. With
+    /// <c>CompactionRebaseHandler</c> disabled, this test fails there.</item>
+    /// <item>The <b>Spark</b> assertions do not catch it at all: with the same break, and that assertion
+    /// relaxed, Spark still answers 0/1/2/3 and the test PASSES. The compacted file carries a
+    /// materialized id column, so a conformant reader takes the ids from there and never falls back to
+    /// <c>baseRowId + position</c> — which means the overlapping range the break produces is INVISIBLE
+    /// to the reader even though the spec forbids it.</item>
+    /// </list>
+    ///
+    /// <para>That is worth stating plainly rather than leaving implied: <b>the interop tier cannot police
+    /// row-id range overlap.</b> Only EW's own assertions can, here and in
+    /// <c>MetadataCommitConcurrencyTests</c>. What Spark contributes instead is the other half, and it is
+    /// not covered anywhere else: that a REBASED compaction is still read correctly — the materialized
+    /// column keeps winning after the id range moved underneath it, and the concurrently appended row
+    /// keeps the id it committed with. A future change that dropped the materialized columns on the
+    /// rebase path, or disturbed <c>defaultRowCommitVersion</c>, would fail here and nowhere else.</para>
+    ///
+    /// <para>The version assertion is not decoration either. Without it this test degrades silently into
+    /// <see cref="EwCompacted_RowTracking_SparkReadsPreservedIds"/> the moment the race stops happening,
+    /// and would keep passing while measuring nothing.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task EwCompacted_RowTracking_RebasedPastAConcurrentAppend_SparkReadsPreservedIds()
+    {
+        Spark.Require();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var setup = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await setup.WriteAsync([IdRegionBatch([10], ["us"])]);   // id 0
+            await setup.WriteAsync([IdRegionBatch([20], ["eu"])]);   // id 1
+            await setup.WriteAsync([IdRegionBatch([30], ["apac"])]); // id 2
+        }
+
+        // This handle plans its compaction against the three-file version and never sees the append
+        // below, so its candidate set is those three and its commit collides.
+        await using var stale = await DeltaTable.OpenAsync(fs);
+        long baseVersion = stale.CurrentSnapshot.Version;
+
+        await using (var other = await DeltaTable.OpenAsync(fs))
+            await other.WriteAsync([IdRegionBatch([40], ["us"])]); // id 3, and the mark moves to 4
+
+        long? committed = await stale.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        // It rebased rather than aborted, and rather than winning the race outright.
+        Assert.Equal(baseVersion + 2, committed);
+
+        // The re-reservation itself. This assertion, NOT the Spark one below, is what catches a broken
+        // rebase — see the remarks above for the measurement that establishes which is which.
+        await using (var check = await DeltaTable.OpenAsync(fs))
+        {
+            var compacted = check.CurrentSnapshot.ActiveFiles.Values.Single(f => f.BaseRowId >= 4);
+            Assert.Equal(4L, compacted.BaseRowId); // re-reserved ABOVE the append, not overlapping it
+        }
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+        // The three compacted rows keep their ORIGINAL ids — from the materialized column, not from the
+        // re-reserved range — and the concurrently appended row keeps the id it committed with.
+        Assert.Equal(0L, idToRowId[10]);
+        Assert.Equal(1L, idToRowId[20]);
+        Assert.Equal(2L, idToRowId[30]);
+        Assert.Equal(3L, idToRowId[40]);
+    }
+
+    /// <summary>
     /// <para>Layer 3 sub-problem (B), cross-engine: a stale EW DELETE remapped across a concurrent EW
     /// COMPACTION. One handle compacts two files into one (materialized ids preserved); a second, stale handle
     /// then deletes a row whose original file is gone — EW relocates it by STABLE ROW ID and soft-deletes it

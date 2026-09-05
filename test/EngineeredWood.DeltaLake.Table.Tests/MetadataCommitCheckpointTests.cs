@@ -8,12 +8,15 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The commit paths that do NOT go through <c>LogCommitter</c> must honour the checkpoint interval too.
+/// OPTIMIZE and every metadata-only change (schema edits, clustering, domain metadata) must honour the
+/// checkpoint interval.
 ///
-/// <para>OPTIMIZE and every metadata-only change (schema edits, clustering, domain metadata) build their
-/// actions and call <c>TransactionLog.WriteCommitAsync</c> directly, so the committer's interval check
-/// never saw them — they were the half of issue #86 that flipping <c>WriteCheckpointOnInterval</c> could
-/// not reach. A table maintained purely through, say, ALTER TABLE would still never have checkpointed.</para>
+/// <para>They used to build their actions and call <c>TransactionLog.WriteCommitAsync</c> directly, so
+/// the committer's interval check never saw them — they were the half of issue #86 that flipping
+/// <c>WriteCheckpointOnInterval</c> could not reach, and a table maintained purely through, say, ALTER
+/// TABLE would never have checkpointed. #86 gave them a local interval check; #109 then routed them
+/// through <c>LogCommitter</c> outright, so the check they get now is the committer's own. These tests
+/// are written against the BEHAVIOUR rather than the mechanism, and hold across both.</para>
 ///
 /// <para>Each case drives the version onto the interval with the operation under test as the LAST commit,
 /// so the checkpoint asserted is the one that operation was responsible for and not one an earlier

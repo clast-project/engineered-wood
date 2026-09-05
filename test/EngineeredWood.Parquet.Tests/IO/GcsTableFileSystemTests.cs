@@ -10,12 +10,16 @@ namespace EngineeredWood.Tests.IO;
 
 /// <summary>
 /// Integration tests for <see cref="GcsTableFileSystem"/>.
-/// Requires a GCS emulator (e.g. fake-gcs-server) reachable at the URL below.
+/// Requires a GCS emulator reachable at the URL below.
 /// Tests are skipped automatically when no emulator is available.
 /// </summary>
 /// <remarks>
 /// To run locally:
-/// <c>docker run -p 4443:4443 fsouza/fake-gcs-server -scheme http -public-host localhost:4443</c>
+/// <c>pip install git+https://github.com/googleapis/storage-testbench.git</c>, then
+/// <c>storage-testbench --port 4443</c>.
+/// <para>storage-testbench rather than fake-gcs-server: the latter ignores <c>ifGenerationMatch=0</c>,
+/// so it cannot answer for the create-if-absent commit primitive. See
+/// <see cref="GcsTableFileSystemPathConformanceTests"/>.</para>
 /// </remarks>
 public class GcsTableFileSystemTests : IAsyncLifetime
 {
@@ -75,7 +79,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task WriteAllBytes_ThenReadAllBytes_Roundtrips()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000000.json", Bytes("hello world"));
@@ -87,7 +91,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task TryWriteAllBytes_CreatesOnce_AndPreservesExistingContent()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.True(await fs.TryWriteAllBytesAsync("commit.json", Bytes("winner")));
@@ -101,7 +105,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task Exists_ReflectsPresence()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         Assert.False(await fs.ExistsAsync("missing.json"));
@@ -113,7 +117,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task Delete_RemovesFile_AndMissingIsNoOp()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("doomed.json", Bytes("x"));
@@ -130,7 +134,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task List_ReturnsRelativePaths_InLexicographicOrder()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("_delta_log/00000000000000000002.json", Bytes("2"));
@@ -152,7 +156,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task Create_NoOverwrite_ThrowsWhenExists_OverwriteSucceeds()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         await fs.WriteAllBytesAsync("file.bin", Bytes("original"));
@@ -173,7 +177,7 @@ public class GcsTableFileSystemTests : IAsyncLifetime
     [SkippableFact]
     public async Task OpenRead_ReadsBackWrittenContent()
     {
-        CloudEmulator.Require("fake-gcs-server on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
+        CloudEmulator.Require("storage-testbench on 127.0.0.1:4443", _emulatorAvailable, _unavailableReason);
         var fs = NewFs();
 
         var payload = new byte[1000];

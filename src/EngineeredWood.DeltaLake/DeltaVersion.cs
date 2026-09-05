@@ -32,6 +32,13 @@ public static class DeltaVersion
         $"_delta_log/{Format(version)}.checkpoint.parquet";
 
     /// <summary>
+    /// Gets the version-checksum file path for a given version
+    /// (e.g., <c>_delta_log/00000000000000000005.crc</c>).
+    /// </summary>
+    public static string ChecksumPath(long version) =>
+        $"_delta_log/{Format(version)}.crc";
+
+    /// <summary>
     /// Gets the multi-part checkpoint file path.
     /// </summary>
     public static string CheckpointPartPath(long version, int part, int totalParts) =>
@@ -79,9 +86,9 @@ public static class DeltaVersion
     /// (e.g., <c>00000000000000000005.crc</c>).
     /// </summary>
     /// <remarks>
-    /// This library writes no checksum files, but delta-spark writes one beside every commit by default,
-    /// so any table shared with it carries them — which makes them something log cleanup has to recognise
-    /// even though nothing here produces them.
+    /// Both this library (see <see cref="Log.VersionChecksumWriter"/>) and delta-spark write one beside
+    /// every commit by default, so a shared table carries them from either writer — and log cleanup has to
+    /// recognise them whoever produced them.
     /// </remarks>
     public static bool TryParseChecksumVersion(string fileName, out long version)
     {

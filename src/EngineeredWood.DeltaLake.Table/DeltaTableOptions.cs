@@ -61,6 +61,32 @@ public sealed record DeltaTableOptions
     public CheckpointFormat CheckpointFormat { get; init; } = CheckpointFormat.Automatic;
 
     /// <summary>
+    /// Whether every commit is followed by a <c>_delta_log/&lt;version&gt;.crc</c> version checksum
+    /// summarising the table state at the version it landed on. Default: true.
+    /// </summary>
+    /// <remarks>
+    /// <para>True is what every other implementation does — PROTOCOL.md says writers SHOULD produce one
+    /// for each commit, delta-spark writes one by default, and delta-kernel-rs's documented post-commit
+    /// pattern is to call <c>write_checksum()</c> on the post-commit snapshot after every commit. The
+    /// file lets a reader learn a version's file count and byte size without replaying the log, and lets
+    /// an engine maintaining table state incrementally notice its view has drifted from the log's. On a
+    /// table this library and another engine write in turn, checksums for only the other engine's
+    /// versions is what makes a divergence introduced across ours invisible.</para>
+    ///
+    /// <para>The cost is one extra create-if-absent request per commit and one small JSON object per
+    /// version in the log directory, which log cleanup reclaims alongside the commits it describes. Set
+    /// false where that request is what is being optimised, or where something else already produces
+    /// checksums for this table.</para>
+    ///
+    /// <para><b>A missing checksum is always safe; a wrong one is not.</b> Every version this library has
+    /// ever written lacks one, and the spec requires readers to cope with that. So a checksum is written
+    /// only from a snapshot that IS the reconciled state at the version being named, and skipped
+    /// otherwise; a failure to write one never fails the commit it follows. See
+    /// <see cref="Log.VersionChecksumWriter"/>.</para>
+    /// </remarks>
+    public bool WriteVersionChecksums { get; init; } = true;
+
+    /// <summary>
     /// Default retention period for vacuum operations. Default: 7 days.
     /// </summary>
     public TimeSpan VacuumRetention { get; init; } = TimeSpan.FromDays(7);

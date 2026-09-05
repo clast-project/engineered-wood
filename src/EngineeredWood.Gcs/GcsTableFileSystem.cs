@@ -90,10 +90,56 @@ public sealed class GcsTableFileSystem : ITableFileSystem
                 continue;
 
             long size = obj.Size is { } s ? checked((long)s) : 0L;
-            DateTimeOffset lastModified =
-                obj.UpdatedDateTimeOffset ?? obj.TimeCreatedDateTimeOffset ?? default;
 
-            yield return new TableFileInfo(ToRelative(obj.Name), size, lastModified);
+            yield return new TableFileInfo(ToRelative(obj.Name), size, LastModifiedOf(obj));
+        }
+    }
+
+    /// <summary>
+    /// <para>The object's last-modified time, or <see langword="default"/> when the server sent one this
+    /// SDK cannot parse.</para>
+    ///
+    /// <para><c>UpdatedDateTimeOffset</c> and <c>TimeCreatedDateTimeOffset</c> are not fields — they PARSE
+    /// the raw JSON string on every access and throw <see cref="FormatException"/> when it is not in the
+    /// shape the generated client expects. Unguarded, one object with an odd timestamp aborts the whole
+    /// enumeration mid-stream, and the caller loses the listing rather than one field of one entry. That is
+    /// the wrong trade for this interface: a table format lists to find out what files exist and how big
+    /// they are, and <see cref="TableFileInfo.LastModified"/> is metadata alongside that, not the reason
+    /// for the call.</para>
+    ///
+    /// <para>MEASURED: the parser accepts EXACTLY 0, 3, 6 or 9 fractional-second digits and throws on any
+    /// other count — <c>...49.855788-07:00</c> and <c>...49-07:00</c> parse, <c>...49.85578-07:00</c> and
+    /// <c>...49.8-07:00</c> do not. The UTC offset is NOT the problem; a non-<c>Z</c> offset parses fine.
+    /// Go's <c>RFC3339Nano</c> trims trailing zeros from the fraction, so a Go-based emulator emits
+    /// whatever digit count the value happens to have and lands on a rejected one whenever the microseconds
+    /// end in zero. That is why this failure looks intermittent rather than constant, and why it is worth a
+    /// guard rather than a fix in the emulator.</para>
+    ///
+    /// <para>The two are guarded SEPARATELY, which is the whole point of reading them in this order: a
+    /// single <c>try</c> around both would throw away a perfectly good <c>timeCreated</c> the moment
+    /// <c>updated</c> failed to parse, turning the fallback into dead code in exactly the case it exists
+    /// for. Written out rather than routed through a helper taking a delegate, to keep this allocation-free
+    /// — it runs once per object in a listing.</para>
+    /// </summary>
+    private static DateTimeOffset LastModifiedOf(Object obj)
+    {
+        try
+        {
+            if (obj.UpdatedDateTimeOffset is { } updated)
+                return updated;
+        }
+        catch (FormatException)
+        {
+            // Fall through and let timeCreated answer.
+        }
+
+        try
+        {
+            return obj.TimeCreatedDateTimeOffset ?? default;
+        }
+        catch (FormatException)
+        {
+            return default;
         }
     }
 

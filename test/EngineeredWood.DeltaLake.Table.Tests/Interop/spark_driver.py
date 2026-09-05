@@ -790,7 +790,78 @@ def cmd_conflict_semantics(args):
         {"name": "undeclared_vs_delete", "declare": "none", "racer": "delete",
          "deletion_vectors": True},
     ]
-    return {"isolation_levels": levels, "scenarios": [run(sc) for sc in scenarios]}
+
+    # ── domainMetadata: whether two writers of the SAME domain conflict, and the row-tracking
+    # exemption (EW issue #109) ──
+    #
+    # Both transactions have to be JVM transactions: there is no SQL that writes a user domain, so
+    # unlike the scenarios above the racer cannot be a plain statement. Order is what makes it a race
+    # -- `ours` starts (and so reads) at version N, the racer commits N+1, and ours then collides.
+    #
+    # THE TABLE MUST DECLARE `domainMetadata`. Delta's checkIfDomainMetadataConflict returns
+    # immediately when the protocol lacks the feature, so a table without it reports "committed" for
+    # every case here and the measurement silently means nothing.
+    def domain_action(jvm_, domain, configuration):
+        return jvm_.org.apache.spark.sql.delta.actions.DomainMetadata(domain, configuration, False)
+
+    def run_domain(scenario):
+        uri = _uri(os.path.join(base, scenario["name"]))
+        spark.sql(f"CREATE TABLE delta.`{uri}` (id BIGINT) USING DELTA "
+                  f"TBLPROPERTIES ('delta.feature.domainMetadata'='supported')")
+        spark.range(0, 5).selectExpr("id").write.format("delta").mode("append").save(uri)
+
+        delta_log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, uri)
+        ours = delta_log.startTransaction()
+
+        loader = delta_log.getClass().getClassLoader()
+        op = (jvm.java.lang.Class
+              .forName("org.apache.spark.sql.delta.DeltaOperations$ManualUpdate$", True, loader)
+              .getField("MODULE$").get(None))
+
+        def commit(txn, domain, configuration):
+            staged = jvm.java.util.ArrayList()
+            staged.add(domain_action(jvm, domain, configuration))
+            txn.commit(jvm.org.apache.spark.api.python.PythonUtils.toSeq(staged), op)
+
+        # The racer takes the version `ours` was aiming at.
+        commit(delta_log.startTransaction(), scenario["racer_domain"], scenario["racer_config"])
+
+        try:
+            commit(ours, scenario["our_domain"], scenario["our_config"])
+            return dict(scenario, verdict="committed")
+        except Exception as e:
+            text = str(e)
+            java_exc = getattr(e, "java_exception", None)
+            if java_exc is not None:
+                text += " " + java_exc.toString()
+            kind = next((m for m in ("ConcurrentTransaction", "MetadataChanged", "ProtocolChanged",
+                                     "ConcurrentAppend", "ConcurrentDeleteRead",
+                                     "ConcurrentDeleteDelete")
+                         if m in text), "unrecognised")
+            return dict(scenario, verdict=kind, detail=text[:300])
+
+    domain_scenarios = [
+        # Two writers of the same user domain. The verdict EW mirrors as
+        # DELTA_DOMAIN_METADATA_CONFLICT.
+        {"name": "domain_same", "our_domain": "acme.retention", "our_config": '{"days":30}',
+         "racer_domain": "acme.retention", "racer_config": '{"days":7}'},
+        # Different domains contest nothing.
+        {"name": "domain_different", "our_domain": "acme.retention", "our_config": '{"days":30}',
+         "racer_domain": "acme.lineage", "racer_config": '{"v":1}'},
+        # The row-tracking high-water mark, which resolveConflict special-cases. This is the one that
+        # would hurt if EW had it wrong: every commit adding files to a row-tracking table advances
+        # this domain, so a NON-exempt answer here means EW is more permissive than Delta on the most
+        # common commit shape such a table produces.
+        {"name": "domain_row_tracking",
+         "our_domain": "delta.rowTracking", "our_config": '{"rowIdHighWaterMark":20}',
+         "racer_domain": "delta.rowTracking", "racer_config": '{"rowIdHighWaterMark":10}'},
+    ]
+
+    return {
+        "isolation_levels": levels,
+        "scenarios": [run(sc) for sc in scenarios],
+        "domain_scenarios": [run_domain(sc) for sc in domain_scenarios],
+    }
 
 
 def cmd_expr_oracle(args):

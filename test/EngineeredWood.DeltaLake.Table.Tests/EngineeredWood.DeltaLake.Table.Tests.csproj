@@ -37,6 +37,8 @@
   <ItemGroup>
     <None Update="TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
     <None Update="Interop\**\*.py" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Shared with the Parquet suite's reader tiers; see test/Shared/InteropDriver.cs. -->
+    <Compile Include="..\Shared\InteropDriver.cs" Link="Interop\InteropDriver.cs" />
   </ItemGroup>
 
 </Project>

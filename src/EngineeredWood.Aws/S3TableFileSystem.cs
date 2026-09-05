@@ -86,24 +86,42 @@ public sealed class S3TableFileSystem : ITableFileSystem
 
         var request = new ListObjectsV2Request { BucketName = _bucket, Prefix = fullPrefix };
 
-        // S3 returns keys in lexicographic (UTF-8) order; the paginator transparently
-        // follows continuation tokens.
-        await foreach (S3Object obj in _client.Paginators
-            .ListObjectsV2(request).S3Objects
-            .WithCancellation(cancellationToken)
-            .ConfigureAwait(false))
+        // The continuation token is followed by hand rather than through _client.Paginators, which
+        // CANNOT WORK on .NET Framework. AWSSDK.Core's net472 build takes no dependency on
+        // Microsoft.Bcl.AsyncInterfaces, so the IAsyncEnumerable<T> its paginator implements is a
+        // different type from the one this project's `await foreach` binds to; the mismatch compiles
+        // (this assembly is built against netstandard2.1's interface) and then throws
+        // EntryPointNotFoundException at the first MoveNextAsync, so every S3 listing from a .NET
+        // Framework host failed outright. MEASURED against a live endpoint on net472 -- not reachable
+        // before, because no cloud test had ever executed. S3 returns keys in lexicographic UTF-8 order
+        // within a page and pages continue in that order, so the contract still holds.
+        do
         {
-            // Skip "directory" placeholder keys ending in '/'.
-            if (obj.Key.Length == 0 || obj.Key[obj.Key.Length - 1] == '/')
-                continue;
+            ListObjectsV2Response response = await _client
+                .ListObjectsV2Async(request, cancellationToken)
+                .ConfigureAwait(false);
 
-            long size = obj.Size ?? 0L;
-            DateTimeOffset lastModified = obj.LastModified is { } dt
-                ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))
-                : default;
+            foreach (S3Object obj in response.S3Objects ?? [])
+            {
+                // Skip "directory" placeholder keys ending in '/'.
+                if (obj.Key.Length == 0 || obj.Key[obj.Key.Length - 1] == '/')
+                    continue;
 
-            yield return new TableFileInfo(ToRelative(obj.Key), size, lastModified);
+                long size = obj.Size ?? 0L;
+                DateTimeOffset lastModified = obj.LastModified is { } dt
+                    ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))
+                    : default;
+
+                yield return new TableFileInfo(ToRelative(obj.Key), size, lastModified);
+            }
+
+            // Both conditions, not either: a store that reports truncation without handing back a token
+            // would otherwise spin forever re-reading page one.
+            request.ContinuationToken = response.IsTruncated == true
+                ? response.NextContinuationToken
+                : null;
         }
+        while (!string.IsNullOrEmpty(request.ContinuationToken));
     }
 
     /// <inheritdoc/>

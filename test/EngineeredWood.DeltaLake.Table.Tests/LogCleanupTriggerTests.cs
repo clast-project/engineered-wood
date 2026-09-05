@@ -12,7 +12,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 ///
 /// <para>Cleanup deletes what a checkpoint covers, so a checkpoint becoming durable is the moment the work
 /// is legitimate — which makes "wrote a checkpoint" and "reclaimed what it covers" one operation with
-/// three triggers: <c>LogCommitter</c>'s, <c>CheckpointIfDueAsync</c> (the overwrite family, OPTIMIZE and
+/// three triggers: <c>LogCommitter</c>'s, <c>AfterCommitAsync</c> (the overwrite family, OPTIMIZE and
 /// the metadata-only changes) and the explicit <c>CheckpointAsync</c>. Wiring one and not the others
 /// reclaims on some commit paths and silently not on others.</para>
 ///
@@ -82,7 +82,7 @@ public class LogCleanupTriggerTests : IDisposable
     }
 
     /// <summary>
-    /// A metadata-only commit, which reaches the log through <c>CheckpointIfDueAsync</c> rather than the
+    /// A metadata-only commit, which reaches the log through <c>AfterCommitAsync</c> rather than the
     /// committer. This is the case that was silently not reclaiming.
     /// </summary>
     [Fact]
@@ -103,7 +103,7 @@ public class LogCleanupTriggerTests : IDisposable
         Assert.True(CommitExists(2));
     }
 
-    /// <summary>OPTIMIZE, the other <c>CheckpointIfDueAsync</c> caller worth naming on its own.</summary>
+    /// <summary>OPTIMIZE, the other <c>AfterCommitAsync</c> caller worth naming on its own.</summary>
     [Fact]
     public async Task OptimizeCheckpoint_RunsCleanup()
     {

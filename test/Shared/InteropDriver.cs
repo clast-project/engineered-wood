@@ -5,12 +5,14 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 
-namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
+namespace EngineeredWood.Tests.Interop;
 
 /// <summary>
 /// <para>Shared plumbing for the external-validation tiers: locate a Python driver script, run one
-/// command, parse its JSON result. <see cref="DeltaRs"/> (tier 1, delta-rs) and <see cref="Spark"/>
-/// (tier 3, PySpark + delta-spark) are thin configurations over this.</para>
+/// command, parse its JSON result. Every tier is a thin configuration over this — delta-rs, DuckDB
+/// and PySpark under the Delta suite, and the DuckDB/DataFusion readers under the Parquet suite.
+/// It lives under <c>test/Shared</c> and is linked into each test project rather than copied, so a
+/// fix to the process handling below reaches every tier at once.</para>
 ///
 /// <para>Every driver obeys the same contract: <c>python &lt;script&gt; &lt;command&gt;
 /// &lt;args-file&gt; &lt;result-file&gt;</c>, writing exactly one JSON object to the result file, with

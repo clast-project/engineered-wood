@@ -564,4 +564,157 @@ public class ConflictCheckerTests
         Assert.Equal(ConflictType.ConcurrentDeleteDelete, result.Type);
         Assert.Equal(7, result.ConflictingVersion);
     }
+
+    // ── domainMetadata (#109) ──
+
+    private static DomainMetadata Domain(string domain, string configuration = "{}", bool removed = false) =>
+        new() { Domain = domain, Configuration = configuration, Removed = removed };
+
+    /// <summary>
+    /// Two writers editing the SAME domain conflict. Rebasing would not merge them — the later commit's
+    /// configuration simply replaces the earlier one, silently losing an edit its author never saw.
+    /// </summary>
+    [Fact]
+    public void ConcurrentWriteOfTheSameDomain_Conflicts()
+    {
+        var result = CheckCommitting(
+            [Domain("acme.retention", "{\"days\":30}")], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Domain("acme.retention", "{\"days\":7}")));
+
+        Assert.Equal(ConflictType.DomainMetadataChanged, result.Type);
+        Assert.Equal(4, result.ConflictingVersion);
+        Assert.Equal(DeltaErrorCodes.DomainMetadataConflict, result.ErrorCode);
+        Assert.Contains("acme.retention", result.Message);
+    }
+
+    /// <summary>A tombstone is an edit of the domain like any other, on either side of the race.</summary>
+    [Fact]
+    public void ConcurrentRemovalOfTheSameDomain_Conflicts()
+    {
+        var result = CheckCommitting(
+            [Domain("acme.retention", "", removed: true)], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Domain("acme.retention", "", removed: true)));
+
+        Assert.Equal(ConflictType.DomainMetadataChanged, result.Type);
+    }
+
+    /// <summary>
+    /// Different domains do not contest anything, so the two commits linearize in either order.
+    /// </summary>
+    [Fact]
+    public void ConcurrentWriteOfADifferentDomain_DoesNotConflict()
+    {
+        var result = CheckCommitting(
+            [Domain("acme.retention")], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Domain("acme.lineage")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// A transaction that writes NO domain metadata is untouched by one that does — the rule is symmetric
+    /// intersection, not "a concurrent domainMetadata is dangerous".
+    /// </summary>
+    [Fact]
+    public void ConcurrentDomainWrite_AgainstATransactionThatWritesNone_DoesNotConflict()
+    {
+        var result = CheckCommitting(
+            [Add("part-new.parquet", 1, 10)], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Domain("acme.retention")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// The row-tracking high-water mark is EXEMPT, and this is the case that makes the exemption
+    /// load-bearing: every commit that adds files to a row-tracking table advances it, so without the
+    /// exemption two ordinary appends would conflict on a domain neither writer ever named — turning row
+    /// tracking on would cost the table its concurrency. Delta special-cases the same domain in the same
+    /// place.
+    /// </summary>
+    [Fact]
+    public void ConcurrentAdvanceOfTheRowTrackingHighWaterMark_DoesNotConflict()
+    {
+        string rowTracking = RowTracking.RowTrackingConfig.DomainName;
+        var result = CheckCommitting(
+            [Add("part-mine.parquet", 1, 10), Domain(rowTracking, "{\"rowIdHighWaterMark\":200}")],
+            ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Add("part-theirs.parquet", 20, 30), Domain(rowTracking, "{\"rowIdHighWaterMark\":150}")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    // ── ReadSet.Blind is not shared state ──
+
+    /// <summary>
+    /// <see cref="ReadSet.Blind"/> hands back a FRESH instance, so deriving from it cannot corrupt the
+    /// default every other blind commit uses.
+    ///
+    /// <para>It used to be a cached singleton whose <see cref="ReadSet.Files"/> is a mutable
+    /// <see cref="ISet{T}"/>. The accident this guards is not someone writing
+    /// <c>ReadSet.Blind.Files.Add(…)</c> on purpose — it is the idiomatic derivation below: a record
+    /// <c>with</c> copies SHALLOWLY, so the copy shared the original's set, and adding one path to the
+    /// copy gave every later blind commit in the process a read dependency it never declared.</para>
+    ///
+    /// <para>The second half is the part that matters. A leaked path would make a concurrent remove of it
+    /// report <c>concurrentDeleteRead</c> against a transaction that read nothing — a spurious conflict,
+    /// process-wide, arising nowhere near the code that caused it.</para>
+    /// </summary>
+    [Fact]
+    public void ReadSetBlind_IsFreshPerAccess_SoADerivedCopyCannotPoisonIt()
+    {
+        var derived = ReadSet.Blind with { WholeTable = true };
+        derived.Files.Add("part-leaked.parquet");
+
+        Assert.Empty(ReadSet.Blind.Files);
+
+        var result = CheckCommitting(
+            [Add("part-mine.parquet", 1, 10)], ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Remove("part-leaked.parquet")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>
+    /// <see cref="Log.LogCommitRequest.Reads"/> resolves its blind default in the GETTER, so a caller that
+    /// supplies a read set never builds a blind one — the property-initializer form would construct and
+    /// discard one on every request, because initializers run before the object initializer assigns.
+    ///
+    /// <para>Both halves matter: the supplied set must come back untouched, and the defaulted one must
+    /// still be blind rather than null.</para>
+    /// </summary>
+    [Fact]
+    public void LogCommitRequestReads_DefersItsBlindDefault_AndRoundTripsAnExplicitOne()
+    {
+        var mine = new ReadSet { WholeTable = true };
+        var supplied = new Log.LogCommitRequest
+        {
+            BaseSnapshot = null!,
+            Actions = [],
+            Reads = mine,
+        };
+        Assert.Same(mine, supplied.Reads);
+
+        var defaulted = new Log.LogCommitRequest { BaseSnapshot = null!, Actions = [] };
+        Assert.False(defaulted.Reads.WholeTable);
+        Assert.Empty(defaulted.Reads.Files);
+        Assert.Empty(defaulted.Reads.Predicates);
+    }
+
+    /// <summary>
+    /// The exemption is for that ONE domain, not for "a commit that also advances the mark": a user domain
+    /// contested alongside it still conflicts.
+    /// </summary>
+    [Fact]
+    public void RowTrackingExemption_DoesNotCoverAUserDomainInTheSameCommit()
+    {
+        string rowTracking = RowTracking.RowTrackingConfig.DomainName;
+        var result = CheckCommitting(
+            [Domain(rowTracking, "{\"rowIdHighWaterMark\":200}"), Domain("acme.retention")],
+            ReadSet.Blind, IsolationLevel.WriteSerializable,
+            Commit(4, Domain(rowTracking, "{\"rowIdHighWaterMark\":150}"), Domain("acme.retention")));
+
+        Assert.Equal(ConflictType.DomainMetadataChanged, result.Type);
+        Assert.Contains("acme.retention", result.Message);
+    }
 }

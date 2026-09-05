@@ -18,6 +18,7 @@ BenchmarkSwitcher.FromTypes([
     typeof(DeltaBinaryPackedBenchmarks),
     typeof(DeltaByteArrayBenchmarks),
     typeof(ByteStreamSplitBenchmarks),
+    typeof(AlpBenchmarks),
     typeof(EncodingReadBenchmarks),
     typeof(PrimitivesBenchmarks),
     typeof(FixedListReadBenchmarks),

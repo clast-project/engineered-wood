@@ -470,7 +470,40 @@ it overrides an explicit `delta.checkpointPolicy=classic`.
 over a canonicalized form of the file. Readers "are encouraged to
 validate the checksum, if present", and a wrong one is worse than an
 absent one — a reader that validates would reject a good hint — so it is
-omitted rather than approximated. delta-spark writes it.
+omitted rather than approximated. delta-spark writes it. (Unrelated to
+the `<version>.crc` version-checksum file, which EW now writes beside
+every commit — see below.)
+
+**Version-checksum optional fields.** EW writes
+`_delta_log/<version>.crc` after every commit
+(`DeltaTableOptions.WriteVersionChecksums`, default true) carrying the
+spec's required fields plus `inCommitTimestampOpt`, `setTransactions` and
+`domainMetadata`. Five optional fields are omitted, and delta-kernel-rs
+omits the same five: `txnId` (EW attaches no transaction identifier to a
+commit), `allFiles` (the whole live file set inline — that is a
+checkpoint, and one per commit would be the wrong shape),
+`numDeletedRecordsOpt` / `numDeletionVectorsOpt`, and
+`deletedRecordCountsHistogramOpt`. `fileSizeHistogram` is omitted too and
+is the one with a live consumer: kernel surfaces it through
+`Snapshot::get_file_stats_if_present`, but the two ecosystem writers
+disagree about its NAME — delta-spark emits `histogramOpt`, which is not
+what the spec calls it, and kernel accepts either but rejects a file
+carrying both — so adding EW's is a compatibility question rather than a
+fill-in-a-field one.
+
+**Version checksums are validated against, never served from.**
+`VersionChecksumValidator` compares a reconstructed snapshot against the
+`.crc` beside its version and reports the fields that disagree, naming
+both values and which side each came from. Nothing READS a checksum to
+shortcut work: a snapshot is still built by replaying the log, and the
+counts, the metadata / protocol and the live `txn` / `domainMetadata` sets
+are recomputed rather than taken from the file. That asymmetry is
+deliberate — nothing signs a checksum and nothing cross-checks it, so
+using one as a second opinion costs a report when it is wrong, while
+using one as an answer costs a wrong answer. Validation is opt-in and off
+by default; a disagreement is returned, not thrown, because throwing,
+falling back to the log and reporting-without-failing all suit different
+callers.
 
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,
