@@ -65,7 +65,7 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 # Which groups are worth asking twice. Every expression here is one whose answer the ANSI switch
 # can change; the rest of the corpus would return the same answer under both and doubling it would
 # only make the fixture harder to read.
-LEGACY_GROUPS = ("wide-decimal", "ansi-sensitive", "string-to-decimal")
+LEGACY_GROUPS = ("wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -432,6 +432,93 @@ GROUPS = {
         # fold. `s` holds 'abc' / NULL / '', which is a refusal, a null and a refusal.
         "CAST(s AS DECIMAL(38,0))",
         "TRY_CAST(s AS DECIMAL(38,0))",
+    ],
+    "integral-cast-overflow": [
+        # Issue #243. Under ANSI every overflow here raises; the legacy dialect ANSWERS, and #174
+        # measured one of those answers -- CAST(d4 AS INT) is 1073741824, the wrapped low bits --
+        # without asking whether one rule covers the rest. Scala's Double.toInt SATURATES where
+        # BigDecimal.longValue WRAPS, so "the legacy dialect wraps" is a claim about the source
+        # type and not about the cast, and this group is what decides it.
+        #
+        # Harvested under BOTH confs: the ANSI answers pin the error classes, the legacy answers
+        # pin the values.
+
+        # A DECIMAL source at every integral width. d4 holds 10^30 and -10^30.
+        "CAST(d4 AS INT)",
+        "CAST(d4 AS BIGINT)",
+        "CAST(d4 AS SMALLINT)",
+        "CAST(d4 AS TINYINT)",
+        # ...and as literals, so the answer does not depend on which row it came from.
+        "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+        "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)",
+        "CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+        # A fraction, where truncation toward zero happens before any width cut. The third has an
+        # integer part that overflows an int by exactly two.
+        "CAST(CAST(2.9 AS DECIMAL(10,1)) AS INT)",
+        "CAST(CAST(-2.9 AS DECIMAL(10,1)) AS INT)",
+        "CAST(CAST(4294967298.5 AS DECIMAL(20,1)) AS INT)",
+        # Inside System.Decimal's range but outside the target's, which is the branch that already
+        # has a `long` to truncate.
+        "CAST(CAST(300 AS DECIMAL(10,0)) AS TINYINT)",
+        "CAST(CAST(70000 AS DECIMAL(10,0)) AS SMALLINT)",
+
+        # A DOUBLE source. If this saturates, the fix needs two rules rather than one.
+        "CAST(CAST(1e30 AS DOUBLE) AS INT)",
+        "CAST(CAST(-1e30 AS DOUBLE) AS INT)",
+        "CAST(CAST(1e30 AS DOUBLE) AS BIGINT)",
+        "CAST(CAST(4294967298.5 AS DOUBLE) AS INT)",
+        "CAST(CAST(300 AS DOUBLE) AS TINYINT)",
+        "CAST(CAST(1e30 AS FLOAT) AS INT)",
+        "CAST(CAST(2.9 AS DOUBLE) AS INT)",
+        # The two values that have no integer at all.
+        "CAST(CAST('NaN' AS DOUBLE) AS INT)",
+        "CAST(CAST('Infinity' AS DOUBLE) AS INT)",
+        "CAST(CAST('-Infinity' AS DOUBLE) AS BIGINT)",
+
+        # An INTEGRAL source narrowing, which is the case SparkArrays.Truncate already covers on
+        # the arithmetic path.
+        "CAST(4294967298 AS INT)",
+        "CAST(300 AS TINYINT)",
+        "CAST(-300 AS TINYINT)",
+        "CAST(70000 AS SMALLINT)",
+        "CAST(b AS INT)",
+
+        # A STRING source, where being out of range is a different question from being malformed.
+        "CAST('4294967298' AS INT)",
+        "CAST('300' AS TINYINT)",
+        "CAST('12.5' AS INT)",
+        "CAST('1e30' AS INT)",
+        "CAST('abc' AS INT)",
+
+        # The discriminating case for the floating-point rule. If Spark saturated at the TARGET
+        # width this would be 127; if it saturates at INT and then narrows by wrapping, it is -1.
+        # 300.0 -> TINYINT giving 44 already says the narrowing wraps, and this says where the
+        # saturation happens.
+        "CAST(CAST(4294967298.5 AS DOUBLE) AS TINYINT)",
+        "CAST(CAST(1e30 AS DOUBLE) AS TINYINT)",
+        "CAST(CAST(-1e30 AS DOUBLE) AS SMALLINT)",
+
+        # A TEMPORAL source, which becomes epoch seconds and can overflow the narrower widths.
+        # Left unmeasured, its branch would be the one rule in this method nobody had asked about.
+        "CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)",
+        "CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)",
+        "CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)",
+
+        # A STRING carrying a fraction, both signs, and one that is out of range as well as
+        # fractional -- so truncation and range are separated rather than tangled.
+        "CAST('-12.9' AS INT)",
+        "CAST('300.5' AS TINYINT)",
+        # try_cast is NOT the legacy dialect. Both refuse to raise, so one `raising: false` covered
+        # them for as long as every non-raising answer was null -- and it stops covering them the
+        # moment the legacy dialect answers a VALUE. These separate the two under both confs.
+        "TRY_CAST(300 AS TINYINT)",
+        "TRY_CAST(d4 AS INT)",
+        "TRY_CAST(CAST(1e30 AS DOUBLE) AS INT)",
+        "TRY_CAST('12.5' AS INT)",
+        # Controls that must not move whatever the overflow rule turns out to be.
+        "CAST(true AS INT)",
+        "CAST(a AS BIGINT)",
+        "CAST(g AS INT)",
     ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",

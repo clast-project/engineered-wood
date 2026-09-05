@@ -1,0 +1,148 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using System.Numerics;
+using Apache.Arrow;
+using Apache.Arrow.Types;
+
+namespace EngineeredWood.Expressions.Arrow.Spark;
+
+/// <summary>
+/// What the legacy dialect answers when a cast to an integral type overflows.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Under ANSI an overflowing integral cast raises <c>CAST_OVERFLOW</c> and there is nothing to
+/// decide. With <see cref="SparkDialectOptions.Ansi"/> false Spark ANSWERS, and #243 was filed
+/// on the belief that it answers with one rule — the wrap that <see cref="SparkArrays.Truncate"/>
+/// already applies to arithmetic overflow. It does not. Measured into the corpus's
+/// <c>integral-cast-overflow</c> group, harvested under both configurations, there are FOUR
+/// source families and no two of them agree:
+/// </para>
+/// <list type="table">
+/// <item>
+///   <term>decimal or integral</term>
+///   <description>
+///     WRAPS. <c>CAST(<i>10^30 as decimal(38,0)</i> AS INT)</c> is 1073741824, which is
+///     10^30 mod 2^32, and the same value as a BIGINT is 5076944270305263616, which is
+///     10^30 mod 2^64. A fraction truncates toward zero first.
+///   </description>
+/// </item>
+/// <item>
+///   <term>float or double</term>
+///   <description>
+///     SATURATES, because Scala's <c>toInt</c> does. <c>CAST(1e30 AS INT)</c> is
+///     <c>int.MaxValue</c> where the decimal of the same value wraps to 1073741824.
+///   </description>
+/// </item>
+/// <item>
+///   <term>string</term>
+///   <description>
+///     NULLS. <c>CAST('4294967298' AS INT)</c> is null rather than 2 — the parser simply fails,
+///     which is also why every string failure is <c>CAST_INVALID_INPUT</c> under ANSI and never
+///     <c>CAST_OVERFLOW</c>, whether the text was malformed or merely too large.
+///   </description>
+/// </item>
+/// <item>
+///   <term>timestamp</term>
+///   <description>
+///     NULLS, on a round-trip check rather than a range one.
+///     <c>CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)</c> is null while the same value as a
+///     BIGINT is 253402300799. This needs no code here — refusing is what the evaluator already
+///     did — but it is the family that would have been wrong had the wrap been generalised.
+///   </description>
+/// </item>
+/// </list>
+/// </remarks>
+internal static class SparkIntegralCasts
+{
+    private static readonly BigInteger LowWordMask = new(ulong.MaxValue);
+
+    /// <summary>Which of Spark's four overflow rules a source type takes.</summary>
+    internal enum Source
+    {
+        /// <summary>
+        /// Decimal and integral: the value has an exact integer form, and wraps.
+        /// </summary>
+        /// <remarks>
+        /// Boolean lands here too, and never reaches the wrap: 0 and 1 fit every integral type,
+        /// so the overflow branches it would take are unreachable for one.
+        /// </remarks>
+        Exact,
+
+        /// <summary>Float and double, which saturate.</summary>
+        Floating,
+
+        /// <summary>String, where an out-of-range value is a failed parse and yields null.</summary>
+        Text,
+
+        /// <summary>Date and timestamp, which yield null.</summary>
+        Temporal,
+    }
+
+    internal static Source FamilyOf(IArrowType type) => type switch
+    {
+        FloatType or DoubleType => Source.Floating,
+        StringType => Source.Text,
+        Date32Type or Date64Type or TimestampType => Source.Temporal,
+        _ => Source.Exact,
+    };
+
+    /// <summary>
+    /// The low bits of an exact source, which is what Spark's legacy dialect answers for one.
+    /// </summary>
+    /// <remarks>
+    /// Read from the source array rather than from the <see cref="decimal"/> the evaluator
+    /// already holds, because that form covers only part of the range: a decimal past
+    /// <see cref="decimal"/>'s ~7.9e28 has none at all, and one past <c>long</c>'s ~9.2e18 has no
+    /// <c>long</c> to truncate. Both are exactly the values that overflow an integral target, so
+    /// the unscaled integer is the only form that can answer here.
+    /// </remarks>
+    internal static long Wrap(IArrowArray source, int index, IArrowType target) =>
+        SparkArrays.Truncate(
+            source is Decimal128Array decimals
+                ? LowBits(decimals, index)
+                : SparkArrays.ReadInt64(source, index)!.Value,
+            target);
+
+    /// <summary>The low 64 bits of a decimal cell's integer part, truncated toward zero.</summary>
+    private static long LowBits(Decimal128Array array, int index)
+    {
+        var scale = ((Decimal128Type)array.Data.DataType).Scale;
+
+        // BigInteger division truncates toward zero, which is the order Spark uses: the fraction
+        // goes before the width does, so decimal(20,1) holding 4294967298.5 casts to INT as 2.
+        var truncated = SparkArrays.Unscaled(array, index) / BigInteger.Pow(10, scale);
+
+        // Two's complement, which BigInteger's bitwise operators already use: the mask of a
+        // negative value is its low 64 bits as an unsigned number.
+        return unchecked((long)(ulong)(truncated & LowWordMask));
+    }
+
+    /// <summary>
+    /// A floating-point source clamped the way Scala's <c>toInt</c> and <c>toLong</c> clamp it.
+    /// </summary>
+    /// <remarks>
+    /// <b>The saturation happens at INT even for a narrower target, and the narrowing after it
+    /// wraps.</b> Spark casts a double to a byte as <c>numeric.toInt(d).toByte</c>, and the
+    /// corpus separates the two possibilities: <c>CAST(300.0 AS TINYINT)</c> is 44, so the
+    /// narrowing is not a clamp, and <c>CAST(4294967298.5 AS TINYINT)</c> is -1 rather than 127,
+    /// so the clamp before it is at <c>int</c> and not at the target.
+    /// </remarks>
+    internal static long Saturate(double value, IArrowType target) =>
+        target is Int64Type ? ToInt64(value) : SparkArrays.Truncate(ToInt32(value), target);
+
+    /// <summary>Java's <c>(int)</c> conversion: NaN is zero and the ends clamp.</summary>
+    private static long ToInt32(double value) =>
+        double.IsNaN(value) ? 0L
+        : value >= int.MaxValue ? int.MaxValue
+        : value <= int.MinValue ? int.MinValue
+        : (long)value;
+
+    /// <summary>Java's <c>(long)</c> conversion, which C#'s own cast leaves undefined out of range.</summary>
+    private static long ToInt64(double value) =>
+        double.IsNaN(value) ? 0L
+        : value >= long.MaxValue ? long.MaxValue
+        : value <= long.MinValue ? long.MinValue
+        : (long)value;
+}

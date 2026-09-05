@@ -391,6 +391,13 @@ public sealed class SparkSqlParserTests
             // feature, but it is its own change and not part of the arithmetic work in #131.
             "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
             + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
+
+            // The same limit at 31 digits, arriving with #243's integral-cast group. Its column
+            // form -- CAST(d4 AS INT) -- measures the same rule and does parse, so these cost the
+            // corpus nothing while #173 is open.
+            "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+            "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)",
+            "CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
             "a > (SELECT 1)",           // subquery — Delta refuses these too
             "*",                        // not an expression
             "a IN (SELECT 1)",          // subquery
