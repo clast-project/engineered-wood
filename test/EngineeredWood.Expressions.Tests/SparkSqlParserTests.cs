@@ -239,6 +239,14 @@ public sealed class SparkSqlParserTests
     [InlineData(@"'\u004a'", "J")]        // hex digits are either case
     [InlineData(@"'\u00411'", "A1")]
     [InlineData(@"'\u12'", "u12")]        // too few digits: not an escape
+
+    // The same shortfall, but landing at the END of the literal rather than mid-string — the
+    // boundary Unquote's explicit bound exists for, now that it scans the original quoted text
+    // instead of an unquoted copy. Coverage of that edge rather than a new measurement: the rule
+    // is the one the two rows above measured.
+    [InlineData(@"'\u004'", "u004")]
+    [InlineData(@"'\10'", "10")]
+    [InlineData(@"'\U0000004'", "U0000004")]
     [InlineData(@"'\x41'", "x41")]        // C's hex escape is not Spark's
     [InlineData(@"'\U00000041'", "A")]
     [InlineData(@"'\U0001F600'", "\U0001F600")]

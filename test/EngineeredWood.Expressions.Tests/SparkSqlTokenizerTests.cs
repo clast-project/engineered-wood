@@ -166,9 +166,11 @@ public sealed class SparkSqlTokenizerTests
     [Fact]
     public void ABackslashDoesNotEscapeInsideAQuotedIdentifier()
     {
-        // `a\`b` ends at its middle backquote, leaving `b` as trailing text — where the same
-        // spelling inside a string literal would be one token. Scanning the remainder would fail
-        // on the unterminated identifier, so only the first token is asked for.
+        // A backslash is not an escape here, so `a\` is COMPLETE: the final backquote closes the
+        // identifier instead of being escaped by the backslash before it. Inside a STRING literal
+        // the same spelling means the opposite: the backslash escapes the quote, the literal runs
+        // on, and the scan reaches the end unterminated. Sharing one rule between the two kinds
+        // is what #179 undid, and this is the side that had to keep doubling instead.
         const string sql = @"`a\`";
         var token = Only(sql);
 

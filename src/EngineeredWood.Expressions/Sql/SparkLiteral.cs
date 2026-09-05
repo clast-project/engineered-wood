@@ -122,48 +122,52 @@ internal static class SparkLiteral
     /// </remarks>
     public static string Unquote(string text)
     {
-        var inner = text.Substring(1, text.Length - 2);
+        // The index of the closing quote, and the exclusive bound for everything below. Working
+        // against the ORIGINAL text rather than an unquoted copy is what keeps the escape path to
+        // a single allocation — the StringBuilder's result.
+        var end = text.Length - 1;
 
-        // Nothing to resolve is the common case — it is every literal in a generated constraint —
-        // and scanning for it first keeps that case allocation-free.
-        if (inner.IndexOf('\\') < 0)
-            return inner;
+        // Nothing to resolve is the common case: it is every literal in a generated constraint,
+        // and there the substring is the answer rather than a working copy.
+        if (text.IndexOf('\\', 1, end - 1) < 0)
+            return text.Substring(1, end - 1);
 
-        var builder = new StringBuilder(inner.Length);
+        var builder = new StringBuilder(end - 1);
 
-        for (var i = 0; i < inner.Length; i++)
+        for (var i = 1; i < end; i++)
         {
-            var c = inner[i];
+            var c = text[i];
 
             // A trailing backslash cannot reach here from the tokenizer — it would have escaped
             // the closing quote and the scan would have run on to an unterminated literal — but
             // this method is reachable from outside it, so it must not read past the end.
-            if (c != '\\' || i + 1 >= inner.Length)
+            if (c != '\\' || i + 1 >= end)
             {
                 builder.Append(c);
                 continue;
             }
 
-            var next = inner[i + 1];
+            var next = text[i + 1];
 
-            if (next == 'u' && TryHex(inner, i + 2, 4, out var unit))
+            if (next == 'u' && TryHex(text, i + 2, 4, end, out var unit))
             {
                 builder.Append((char)unit);
                 i += 5;
                 continue;
             }
 
-            if (next == 'U' && TryHex(inner, i + 2, 8, out var point))
+            if (next == 'U' && TryHex(text, i + 2, 8, end, out var point))
             {
                 AppendCodePoint(builder, point);
                 i += 9;
                 continue;
             }
 
-            if ((next == '0' || next == '1') && IsOctal(inner, i + 2) && IsOctal(inner, i + 3))
+            if ((next == '0' || next == '1')
+                && IsOctal(text, i + 2, end) && IsOctal(text, i + 3, end))
             {
                 builder.Append((char)(
-                    ((next - '0') << 6) | ((inner[i + 2] - '0') << 3) | (inner[i + 3] - '0')));
+                    ((next - '0') << 6) | ((text[i + 2] - '0') << 3) | (text[i + 3] - '0')));
                 i += 3;
                 continue;
             }
@@ -225,18 +229,24 @@ internal static class SparkLiteral
     }
 
     /// <summary>
-    /// Reads exactly <paramref name="count"/> hex digits, or reports that they are not there.
+    /// Reads exactly <paramref name="count"/> hex digits before <paramref name="end"/>, or
+    /// reports that they are not there.
     /// </summary>
     /// <remarks>
+    /// <paramref name="end"/> is the literal's closing quote rather than the string's length,
+    /// because the caller scans the original quoted text: without it, <c>'\u0041'</c> would be
+    /// free to read its own closing quote as a digit position.
+    /// <para>
     /// Overflow is deliberate rather than guarded: eight digits do not fit a signed int, and the
     /// wrapped value is exactly what <see cref="AppendCodePoint"/> needs. Digits are either case,
     /// measured — <c>'\u004a'</c> is <c>J</c>.
+    /// </para>
     /// </remarks>
-    private static bool TryHex(string text, int start, int count, out int value)
+    private static bool TryHex(string text, int start, int count, int end, out int value)
     {
         value = 0;
 
-        if (start + count > text.Length)
+        if (start + count > end)
             return false;
 
         for (var i = start; i < start + count; i++)
@@ -251,8 +261,8 @@ internal static class SparkLiteral
         return true;
     }
 
-    private static bool IsOctal(string text, int index) =>
-        index < text.Length && text[index] >= '0' && text[index] <= '7';
+    private static bool IsOctal(string text, int index, int end) =>
+        index < end && text[index] >= '0' && text[index] <= '7';
 
     /// <summary>
     /// Builds a typed literal — <c>DATE '…'</c>, <c>TIMESTAMP '…'</c>, or <c>X'…'</c>.
