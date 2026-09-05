@@ -63,6 +63,11 @@ internal sealed class InteropDriver
         Environment = environment;
         Persistent = persistent;
         InterpreterOverrideEnvVar = interpreterOverrideEnvVar;
+        if (persistent)
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => StopServer();
+        }
+
         _probe = new Lazy<(string?, string?, string?)>(() =>
         {
             string? blocked = preflight?.Invoke();
@@ -343,11 +348,18 @@ internal sealed class InteropDriver
         proc.BeginErrorReadLine();
 
         _server = proc;
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => StopServer();
         return proc;
     }
 
     private void StopServer()
+    {
+        lock (_serverLock)
+        {
+            StopServerCore();
+        }
+    }
+
+    private void StopServerCore()
     {
         var proc = _server;
         _server = null;

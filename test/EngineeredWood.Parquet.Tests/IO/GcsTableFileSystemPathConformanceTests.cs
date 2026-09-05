@@ -89,7 +89,7 @@ public sealed class GcsTableFileSystemPathConformanceTests : TableFileSystemPath
     /// <inheritdoc/>
     public override async Task DisposeAsync()
     {
-        if (_client is not null && _fileSystem is not null)
+        if (_client is not null)
         {
             try
             {

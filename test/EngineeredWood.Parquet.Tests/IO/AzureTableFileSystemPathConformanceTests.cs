@@ -79,7 +79,7 @@ public sealed class AzureTableFileSystemPathConformanceTests : TableFileSystemPa
     /// <inheritdoc/>
     public override async Task DisposeAsync()
     {
-        if (_container is not null && _fileSystem is not null)
+        if (_container is not null)
         {
             try
             {

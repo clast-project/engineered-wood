@@ -97,7 +97,11 @@ def cmd_read_digest(args):
     if module is None:
         return {"available": False, "error": error}
 
-    table = _to_arrow(reader, args["path"])
+    try:
+        table = _to_arrow(reader, args["path"])
+    except ImportError as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
     columns = []
     for name, column in zip(table.column_names, table.columns):
         # to_pylist() on the CHUNKED array, then windows of our own STRIDE: the digest must depend
