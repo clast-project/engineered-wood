@@ -58,6 +58,26 @@ internal static class SparkIntegralCasts
 {
     private static readonly BigInteger LowWordMask = new(ulong.MaxValue);
 
+    /// <summary>10^0 through 10^38, so the divisor below is not rebuilt for every row.</summary>
+    /// <remarks>
+    /// Unlike the parse-time work in <see cref="SparkDecimalText"/>, this really is a per-row
+    /// path: a wide decimal column cast to an <c>int</c> overflows on every row it holds. 38 is
+    /// Spark's largest decimal scale, so the fallback past the end of the table is unreachable
+    /// through a Spark type — it is there because the Arrow type is not ours to constrain.
+    /// </remarks>
+    private static readonly BigInteger[] PowersOfTen = BuildPowersOfTen();
+
+    private static BigInteger[] BuildPowersOfTen()
+    {
+        var powers = new BigInteger[SparkNumericTypes.MaxPrecision + 1];
+        powers[0] = BigInteger.One;
+
+        for (var i = 1; i < powers.Length; i++)
+            powers[i] = powers[i - 1] * 10;
+
+        return powers;
+    }
+
     /// <summary>Which of Spark's four overflow rules a source type takes.</summary>
     internal enum Source
     {
@@ -109,10 +129,14 @@ internal static class SparkIntegralCasts
     private static long LowBits(Decimal128Array array, int index)
     {
         var scale = ((Decimal128Type)array.Data.DataType).Scale;
+        var unscaled = SparkArrays.Unscaled(array, index);
 
         // BigInteger division truncates toward zero, which is the order Spark uses: the fraction
         // goes before the width does, so decimal(20,1) holding 4294967298.5 casts to INT as 2.
-        var truncated = SparkArrays.Unscaled(array, index) / BigInteger.Pow(10, scale);
+        // Scale 0 is the common shape of a column cast to an integral type, and skips the divide.
+        var truncated = scale == 0
+            ? unscaled
+            : unscaled / (scale < PowersOfTen.Length ? PowersOfTen[scale] : BigInteger.Pow(10, scale));
 
         // Two's complement, which BigInteger's bitwise operators already use: the mask of a
         // negative value is its low 64 bits as an unsigned number.
