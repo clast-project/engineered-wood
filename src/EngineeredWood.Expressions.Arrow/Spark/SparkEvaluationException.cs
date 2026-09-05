@@ -61,6 +61,23 @@ public sealed class SparkEvaluationException : Exception
             "If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, " +
             "and return NULL instead.");
 
+    /// <summary>
+    /// A string carrying more integral digits than any Spark decimal has.
+    /// </summary>
+    /// <remarks>
+    /// A third class alongside <see cref="NumericValueOutOfRange"/> and
+    /// <see cref="CastOverflow"/>, and the one hand-reasoning would have missed: it names a
+    /// property of the STRING rather than of the target type. Measured for #174 — 39 nines and
+    /// <c>'1e39'</c> report it against <c>DECIMAL(38,0)</c>, while a 30-digit string against the
+    /// much narrower <c>DECIMAL(10,0)</c> reports <c>NUMERIC_VALUE_OUT_OF_RANGE</c> instead.
+    /// Pinned by the <c>string-to-decimal</c> group of
+    /// <c>Fixtures/spark-expression-corpus.json</c>.
+    /// </remarks>
+    internal static SparkEvaluationException NumericOutOfSupportedRange(string value) =>
+        new("NUMERIC_OUT_OF_SUPPORTED_RANGE",
+            $"The value {value} cannot be interpreted as a numeric since it has more than " +
+            $"{SparkNumericTypes.MaxPrecision} digits.");
+
     internal static SparkEvaluationException DivideByZero() =>
         new("DIVIDE_BY_ZERO", "Division by zero. Use `try_divide` to tolerate a zero divisor.");
 

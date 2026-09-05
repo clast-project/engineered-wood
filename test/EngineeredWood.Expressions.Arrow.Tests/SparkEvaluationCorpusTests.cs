@@ -38,6 +38,9 @@ public sealed class SparkEvaluationCorpusTests
     // The corpus pins ansi on, so the ANSI registry is the one its answers describe.
     private static readonly SparkFunctionRegistry Ansi = new();
 
+    // ...and the `legacy` section pins it off, which is the registry THOSE answers describe.
+    private static readonly SparkFunctionRegistry Legacy = new(new SparkDialectOptions { Ansi = false });
+
     /// <summary>
     /// Expressions whose recorded answer cannot be compared, each with the reason.
     /// </summary>
@@ -120,6 +123,50 @@ public sealed class SparkEvaluationCorpusTests
         ["a IN (SELECT 1)"] = "subquery: out of scope for a per-row constraint",
         ["rank() OVER (ORDER BY a)"] = "window function: out of scope for a per-row constraint",
     };
+
+    /// <summary>
+    /// The <see cref="Excluded"/> counterpart for the legacy section.
+    /// </summary>
+    /// <remarks>
+    /// Empty, and separate rather than shared, because the two sections do not cover the same
+    /// expressions: nothing in the legacy section is a timestamp, a binary or a harvest-time
+    /// value, which is what every ANSI exclusion is. Its own list keeps the exact skip count in
+    /// each test meaningful.
+    /// </remarks>
+    private static readonly Dictionary<string, string> LegacyExcluded = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The <see cref="KnownDifferences"/> counterpart for the legacy section, asserted exactly.
+    /// </summary>
+    private static readonly Dictionary<string, string> LegacyKnownDifferences =
+        new(StringComparer.Ordinal)
+        {
+            // The struct column the harness cannot build, exactly as in the ANSI list.
+            ["nested.arr[99]"] = "struct columns are not modelled",
+            ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
+
+            // ── DIVERGENT, and both are visible ONLY here. ────────────────────────────────────
+            // Under ANSI both expressions are recorded as refusals, and a refusal we answer with
+            // a throw counts as agreement whatever the throw was -- so the ANSI section passes on
+            // each of them for the wrong reason. Asking the same expression under a conf where
+            // Spark ANSWERS is what separates "we refuse because Spark does" from "we cannot do
+            // this at all".
+            ["CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
+             + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"] =
+                "#173: the parser cannot read a 38-digit literal, so this never reaches evaluation",
+            ["CAST(d4 AS INT)"] =
+                "#243: legacy WRAPS an integral cast (10^30 -> 1073741824); we return null",
+        };
+
+    private static HashSet<string> ExpressionsIn(JsonElement groups)
+    {
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var group in groups.EnumerateObject())
+            foreach (var entry in group.Value.EnumerateArray())
+                known.Add(entry.GetProperty("expression").GetString()!);
+
+        return known;
+    }
 
     private static RecordBatch BuildBatch()
     {
@@ -361,28 +408,79 @@ public sealed class SparkEvaluationCorpusTests
         // Without this, a typo or a renamed expression turns an exclusion into a no-op and the
         // expression silently stops being compared -- the exact failure mode this whole test
         // exists to end.
-        var known = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var group in Corpus.RootElement.GetProperty("groups").EnumerateObject())
-            foreach (var entry in group.Value.EnumerateArray())
-                known.Add(entry.GetProperty("expression").GetString()!);
+        Assert.Empty(Excluded.Keys.Where(
+            e => !ExpressionsIn(Corpus.RootElement.GetProperty("groups")).Contains(e)));
 
-        Assert.Empty(Excluded.Keys.Where(e => !known.Contains(e)));
+        Assert.Empty(LegacyExcluded.Keys.Where(
+            e => !ExpressionsIn(Corpus.RootElement.GetProperty("legacy").GetProperty("groups"))
+                .Contains(e)));
     }
 
     [Fact]
     public void EveryCorpusExpressionEvaluatesToSparksAnswer()
     {
+        var differing = EvaluateSection(
+            Corpus.RootElement.GetProperty("groups"), Ansi, Excluded, out var compared, out var skipped);
+
+        Assert.True(compared > 150, $"only {compared} expressions were compared");
+        Assert.Equal(Excluded.Count, skipped);
+        AssertOnlyDeclaredDifferences(differing, KnownDifferences);
+    }
+
+    /// <summary>
+    /// The same comparison against the corpus gathered with ANSI off, and the legacy registry.
+    /// </summary>
+    /// <remarks>
+    /// <c>SparkDialectOptions.Ansi = false</c> selects a whole second set of answers, and until
+    /// #174 asked whether a string-to-decimal cast follows the pattern the option describes, none
+    /// of them had been measured — the option's own documentation was the only statement of what
+    /// they were. Harvesting the ANSI-sensitive part of the corpus a second time under a second
+    /// conf turns that into data.
+    /// <para>
+    /// The two answers are NOT the same shape: legacy nulls a decimal overflow but WRAPS an
+    /// integral one, so <c>CAST(d4 AS INT)</c> is 1073741824 rather than null. "Legacy yields
+    /// null" is true of this section's decimal cases and false of its integral ones.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void EveryLegacyCorpusExpressionEvaluatesToSparksAnswer()
+    {
+        var legacy = Corpus.RootElement.GetProperty("legacy");
+
+        // The section is only worth comparing against the legacy registry if it really was
+        // gathered with ANSI off; a mis-harvest would otherwise read as a pile of differences.
+        Assert.Equal(
+            "false", legacy.GetProperty("conf").GetProperty("spark.sql.ansi.enabled").GetString());
+
+        var differing = EvaluateSection(
+            legacy.GetProperty("groups"), Legacy, LegacyExcluded, out var compared, out var skipped);
+
+        Assert.True(compared > 60, $"only {compared} expressions were compared");
+        Assert.Equal(LegacyExcluded.Count, skipped);
+        AssertOnlyDeclaredDifferences(differing, LegacyKnownDifferences);
+    }
+
+    /// <summary>
+    /// Evaluates every expression in one corpus section, returning those whose answer differs.
+    /// </summary>
+    private static Dictionary<string, string> EvaluateSection(
+        JsonElement groups,
+        SparkFunctionRegistry registry,
+        Dictionary<string, string> excluded,
+        out int compared,
+        out int skipped)
+    {
         var batch = BuildBatch();
         var differing = new Dictionary<string, string>(StringComparer.Ordinal);
-        var compared = 0;
-        var skipped = 0;
+        compared = 0;
+        skipped = 0;
 
-        foreach (var group in Corpus.RootElement.GetProperty("groups").EnumerateObject())
+        foreach (var group in groups.EnumerateObject())
         {
             foreach (var entry in group.Value.EnumerateArray())
             {
                 var expression = entry.GetProperty("expression").GetString()!;
-                if (Excluded.ContainsKey(expression))
+                if (excluded.ContainsKey(expression))
                 {
                     skipped++;
                     continue;
@@ -397,7 +495,7 @@ public sealed class SparkEvaluationCorpusTests
                 string? threw = null;
                 try
                 {
-                    actual = new ArrowRowEvaluator(Ansi)
+                    actual = new ArrowRowEvaluator(registry)
                         .EvaluateExpression(SparkSqlParser.ParseExpression(expression), batch);
                 }
                 catch (Exception ex)
@@ -432,23 +530,33 @@ public sealed class SparkEvaluationCorpusTests
             }
         }
 
-        Assert.True(compared > 150, $"only {compared} expressions were compared");
-        Assert.Equal(Excluded.Count, skipped);
+        return differing;
+    }
 
-        // A difference nobody declared is a regression.
+    /// <summary>Asserts that the differences found are exactly the ones declared.</summary>
+    private static void AssertOnlyDeclaredDifferences(
+        Dictionary<string, string> differing, Dictionary<string, string> declared)
+    {
+        // A difference nobody declared is a regression. Reported as a joined message rather than
+        // through Assert.Empty, which elides each entry after about 50 characters -- and the
+        // elided part is the reason, which is the only thing that says what to do next.
         var undeclared = differing
-            .Where(d => !KnownDifferences.ContainsKey(d.Key))
+            .Where(d => !declared.ContainsKey(d.Key))
             .Select(d => $"{d.Key} -- {d.Value}")
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToList();
-        Assert.Empty(undeclared);
+        Assert.True(
+            undeclared.Count == 0,
+            $"{undeclared.Count} undeclared difference(s):\n  " + string.Join("\n  ", undeclared));
 
         // A declared difference that no longer happens is a fix; delete its entry.
-        var stale = KnownDifferences.Keys
+        var stale = declared.Keys
             .Where(e => !differing.ContainsKey(e))
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToList();
-        Assert.Empty(stale);
+        Assert.True(
+            stale.Count == 0,
+            $"{stale.Count} fixed difference(s) still declared:\n  " + string.Join("\n  ", stale));
     }
 
     /// <summary>Compares one cell against Spark's recorded value, or returns why it differs.</summary>

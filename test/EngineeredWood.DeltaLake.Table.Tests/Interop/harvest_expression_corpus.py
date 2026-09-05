@@ -18,7 +18,8 @@ to extend the corpus or to move to a new Spark version.
 CONFIG IS PART OF THE DATA. Delta pins nothing when it evaluates a constraint -- it runs under
 whatever session writes the row -- so an expectation is only meaningful next to the settings it
 was gathered under. They are pinned here and echoed into the fixture. Do not merge corpora
-gathered under different settings.
+gathered under different settings. The `legacy` section is a SECOND corpus, gathered under a
+second conf with ansi off and kept beside the first rather than merged into it.
 
 WHAT THE THREE ANSWERS ARE FOR:
   parse -- `sql` comes back fully parenthesised, which makes it a precedence and associativity
@@ -53,6 +54,18 @@ CONF = {
     "spark.sql.session.timeZone": "UTC",
     "spark.sql.storeAssignmentPolicy": "ANSI",
 }
+
+# The legacy dialect, harvested SEPARATELY and kept separately. `SparkDialectOptions.Ansi = false`
+# selects a whole second set of answers -- an overflow yields null where ANSI raises -- and until
+# #174 asked whether a string-to-decimal cast follows that pattern, none of them had been measured
+# at all. They are not merged into `groups`, because merging corpora gathered under different
+# settings is the one thing the rule at the top of this file forbids.
+LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
+
+# Which groups are worth asking twice. Every expression here is one whose answer the ANSI switch
+# can change; the rest of the corpus would return the same answer under both and doubling it would
+# only make the fixture harder to read.
+LEGACY_GROUPS = ("wide-decimal", "ansi-sensitive", "string-to-decimal")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -242,6 +255,79 @@ GROUPS = {
         "CAST('12345' AS DECIMAL(3,0))",
         "CAST(a AS DECIMAL(2,0))",
     ],
+    "string-to-decimal": [
+        # Issue #174. After #131 every route to a wide decimal reaches Spark's precision 38 --
+        # except a CAST from a STRING, which stayed on System.Decimal and its ~7.9e28 ceiling
+        # because what Spark does with an over-long string was UNMEASURED. This group is that
+        # measurement, and nothing in the cast path was allowed to change before it existed.
+        #
+        # Literals rather than columns, for the same reason as wide-decimal: `eval` is answered per
+        # EXPRESSION, so a literal makes every row give the same answer and the answer is the point.
+
+        # Past System.Decimal's ceiling but inside precision 38 -- the values the gap makes
+        # unreachable. Both signs.
+        "CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+        "CAST('-123456789012345678901234567890' AS DECIMAL(38,0))",
+        # The full width of the type, and one digit more than it holds.
+        "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))",
+        "CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+        # More SIGNIFICANT digits than System.Decimal keeps, at a magnitude it can hold. This is
+        # the trap a range check alone misses: decimal.TryParse ACCEPTS these and silently rounds
+        # to 28-29 digits, reporting success, so the wrong answer arrives as a valid one.
+        "CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))",
+        "CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8))",
+
+        # More FRACTIONAL digits than the target scale: round, truncate, error or null -- and if it
+        # rounds, does it agree with the HALF_UP measured everywhere else on this path? Both signs,
+        # because away-from-zero and toward-negative-infinity differ only on the negative side.
+        "CAST('2.5' AS DECIMAL(38,0))",
+        "CAST('-2.5' AS DECIMAL(38,0))",
+        "CAST('1.45' AS DECIMAL(38,1))",
+        "CAST('-1.45' AS DECIMAL(38,1))",
+        # Control: half-up and half-even agree here, so a disagreement means something else is wrong.
+        "CAST('3.5' AS DECIMAL(38,0))",
+        # An even digit before an exactly-half remainder -- the only case where the two rules
+        # disagree -- at a width no System.Decimal rounding could have reached.
+        "CAST('123456789012345678901234567890.1234565' AS DECIMAL(38,6))",
+
+        # Rounding that CARRIES past the declared precision: the value fits, its rounded form
+        # does not.
+        "CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))",
+        # Rounding away entirely, at the bottom of an all-scale type.
+        "CAST('0.000000000000000000000000000000000000005' AS DECIMAL(38,38))",
+
+        # Exponent notation, which the NumberStyles.Float parse in use today accepts.
+        "CAST('1e30' AS DECIMAL(38,0))",
+        "CAST('1.5e3' AS DECIMAL(38,0))",
+        "CAST('1e39' AS DECIMAL(38,0))",
+
+        # Forms AROUND the number. Surrounding space, an explicit plus, a trailing point and a
+        # leading point are all accepted by decimal.TryParse today; a thousands separator is not a
+        # number to Spark but is one to several parsing modes, so it is asked rather than assumed.
+        "CAST(' 42 ' AS DECIMAL(38,0))",
+        "CAST('+42' AS DECIMAL(38,0))",
+        "CAST('42.' AS DECIMAL(38,0))",
+        "CAST('.5' AS DECIMAL(38,1))",
+        "CAST('abc' AS DECIMAL(38,0))",
+        "CAST('' AS DECIMAL(38,0))",
+        "CAST('1,000' AS DECIMAL(38,0))",
+
+        # A wide string against a NARROW target, where the refusal is about the target rather than
+        # about System.Decimal -- so the two reasons cannot be confused for one another.
+        "CAST('123456789012345678901234567890' AS DECIMAL(10,0))",
+
+        # try_cast is the non-raising path, which is also the shape the legacy dialect takes. One
+        # value that succeeds and three refusals, so both branches are recorded.
+        "TRY_CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+        "TRY_CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+        "TRY_CAST('abc' AS DECIMAL(38,0))",
+        "TRY_CAST('2.5' AS DECIMAL(38,0))",
+
+        # A string COLUMN rather than a literal, so at least one answer here is not a constant
+        # fold. `s` holds 'abc' / NULL / '', which is a refusal, a null and a refusal.
+        "CAST(s AS DECIMAL(38,0))",
+        "TRY_CAST(s AS DECIMAL(38,0))",
+    ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",
@@ -294,6 +380,14 @@ def main():
     groups = {name: [by_expr[e] for e in exprs if e in by_expr]
               for name, exprs in GROUPS.items()}
 
+    legacy_exprs = list(dict.fromkeys(e for name in LEGACY_GROUPS for e in GROUPS[name]))
+    legacy = _run_driver({"expressions": legacy_exprs, "schema": SCHEMA,
+                          "rows": ROWS, "conf": LEGACY_CONF})
+    if not legacy.get("ok"):
+        raise SystemExit("driver error (legacy): " + json.dumps(legacy)[:2000])
+
+    legacy_by_expr = {r["expression"]: r for r in legacy["results"]}
+
     fixture = {
         "_comment": "Generated by harvest_expression_corpus.py. Do not edit by hand. "
                     "Answers come from Spark and are only valid under `conf`.",
@@ -302,6 +396,13 @@ def main():
         "schema": SCHEMA,
         "rows": ROWS,
         "groups": groups,
+        "legacy": {
+            "_comment": "The SAME expressions under ansi off, gathered in a separate session and "
+                        "kept in a separate section. Valid only under the `conf` below.",
+            "conf": legacy["conf"],
+            "groups": {name: [legacy_by_expr[e] for e in GROUPS[name] if e in legacy_by_expr]
+                       for name in LEGACY_GROUPS},
+        },
     }
 
     os.makedirs(os.path.dirname(FIXTURE), exist_ok=True)
@@ -314,6 +415,7 @@ def main():
     typed = sum(1 for r in result["results"] if r.get("type", {}).get("ok"))
     print(f"{total} expressions -> {FIXTURE}")
     print(f"  parse ok: {parsed}/{total}   type ok: {typed}/{total}")
+    print(f"  legacy (ansi off): {len(legacy_exprs)} expressions")
 
 
 if __name__ == "__main__":
