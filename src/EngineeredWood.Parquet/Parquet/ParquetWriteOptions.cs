@@ -57,6 +57,47 @@ public enum FloatingPointEncoding
 }
 
 /// <summary>
+/// Controls the non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data
+/// pages.
+/// </summary>
+public enum IntegerEncoding
+{
+    /// <summary>
+    /// DELTA_BINARY_PACKED: differences between successive values, bit-packed in blocks. Ratified
+    /// and read by every current implementation, and strong on sorted or sequential integers.
+    /// This is the default.
+    /// </summary>
+    DeltaBinaryPacked,
+
+    /// <summary>
+    /// PFOR (encoding 11): frame of reference plus bit-packing, with the values that do not fit
+    /// the chosen width stored separately as exceptions. Strong on columns that cluster tightly
+    /// but carry occasional outliers — foreign keys, sequence IDs with sentinel values, measures
+    /// with a null sentinel — where one outlier would otherwise widen the packing for everyone.
+    /// New in parquet-format and <b>not yet ratified</b>; older readers cannot decode it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Each vector independently chooses whether to pack values or the differences between
+    /// them, so a column that is sorted in stretches gets the delta treatment on those stretches
+    /// and frame-of-reference on the rest. That per-vector choice is what distinguishes it from
+    /// <see cref="DeltaBinaryPacked"/>, which always differences.</para>
+    /// <para>The writer measures the result and falls back to PLAIN for any page PFOR did not
+    /// shrink, so as with <see cref="FloatingPointEncoding.Alp"/> and
+    /// <see cref="ByteArrayEncoding.Fsst"/>, choosing this setting cannot make a file bigger.
+    /// Pages within one column chunk may therefore differ in encoding.</para>
+    /// </remarks>
+    [Experimental("EWPARQUET0005")]
+    Pfor,
+
+    /// <summary>
+    /// PLAIN: write the integers uncompressed. Universal lowest-common-denominator — readable by
+    /// every Parquet implementation. Choose this when an outer codec already does the work, or
+    /// for maximum reader compatibility.
+    /// </summary>
+    Plain,
+}
+
+/// <summary>
 /// Controls the non-dictionary fallback encoding for BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY columns
 /// when using V2 data pages.
 /// </summary>
@@ -205,6 +246,13 @@ public sealed record ParquetWriteOptions
     /// <see cref="FloatingPointEncoding.Alp"/> for decimal-like floating-point data.
     /// </summary>
     public FloatingPointEncoding FloatingPointEncoding { get; init; } = FloatingPointEncoding.ByteStreamSplit;
+
+    /// <summary>
+    /// Non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data pages.
+    /// Default is <see cref="IntegerEncoding.DeltaBinaryPacked"/>; set to
+    /// <see cref="IntegerEncoding.Pfor"/> for clustered integers with occasional outliers.
+    /// </summary>
+    public IntegerEncoding IntegerEncoding { get; init; } = IntegerEncoding.DeltaBinaryPacked;
 
     /// <summary>
     /// Per-column compression codec overrides, keyed by dotted column path (e.g. "col1" or "struct1.field1").

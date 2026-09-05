@@ -525,7 +525,7 @@ public class Fsst16EncodingTests : IDisposable
         // Both widths are written as encoding 12; the symbol table page is what distinguishes
         // them, so the resolver must not invent a second encoding id.
         var enc = EncodingStrategyResolver.GetV2Encoding(
-            PhysicalType.ByteArray, ByteArrayEncoding.Fsst16, FloatingPointEncoding.ByteStreamSplit);
+            PhysicalType.ByteArray, ByteArrayEncoding.Fsst16, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.Fsst, enc);
     }
 

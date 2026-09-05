@@ -3,6 +3,7 @@
 
 #pragma warning disable EWPARQUET0001 // Pinning the experimental enum values is the point of this file.
 #pragma warning disable EWPARQUET0003
+#pragma warning disable EWPARQUET0005
 
 using EngineeredWood.Parquet;
 
@@ -52,16 +53,26 @@ public class EncodingWireNumberTests
     }
 
     /// <summary>
-    /// 11 is reserved for PFOR. Asserting that nothing currently answers to it is what stops a
-    /// later encoding from quietly taking the slot: a file written with 11 meaning something
-    /// else is misread rather than rejected, because a PFOR decoder will accept the byte.
+    /// PFOR is 11 in apache/parquet-format#617, and in both implementations behind it. This is
+    /// the slot FSST used to hold; a file written with 11 meaning FSST is misread rather than
+    /// rejected by a PFOR reader, since nothing in the page body disagrees with the byte.
     /// </summary>
     [Fact]
-    public void ElevenIsNotAssigned()
+    public void PforIsEleven()
+    {
+        Assert.Equal(11, (int)Encoding.Pfor);
+    }
+
+    /// <summary>
+    /// No two encodings share a number. Cheap to assert and the one thing that would make a
+    /// written page unreadable in a way no round-trip test can see.
+    /// </summary>
+    [Fact]
+    public void EveryEncodingNumberIsDistinct()
     {
         // Enum.GetValues(Type) rather than the generic overload: this assembly also targets
         // net472, where Enum.GetValues<T>() does not exist.
-        var assigned = Enum.GetValues(typeof(Encoding)).Cast<Encoding>().Select(e => (int)e);
-        Assert.DoesNotContain(11, assigned);
+        var assigned = Enum.GetValues(typeof(Encoding)).Cast<Encoding>().Select(e => (int)e).ToList();
+        Assert.Equal(assigned.Count, assigned.Distinct().Count());
     }
 }
