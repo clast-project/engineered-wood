@@ -2241,9 +2241,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-08-13",
-      "2026-08-13",
-      "2026-08-13"
+      "2026-09-05",
+      "2026-09-05",
+      "2026-09-05"
      ]
     }
    },
@@ -2261,9 +2261,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-08-13 16:55:39.131489",
-      "2026-08-13 16:55:39.131489",
-      "2026-08-13 16:55:39.131489"
+      "2026-09-05 07:32:19.641420",
+      "2026-09-05 07:32:19.641420",
+      "2026-09-05 07:32:19.641420"
      ]
     }
    },
@@ -4378,6 +4378,596 @@
     }
    }
   ],
+  "string-to-decimal": [
+   {
+    "expression": "CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('123456789012345678901234567890' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "123456789012345678901234567890",
+      "123456789012345678901234567890",
+      "123456789012345678901234567890"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('-123456789012345678901234567890' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-123456789012345678901234567890' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-123456789012345678901234567890",
+      "-123456789012345678901234567890",
+      "-123456789012345678901234567890"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_OUT_OF_SUPPORTED_RANGE] The value 999999999999999999999999999999999999999 cannot be interpreted as a numeric since it has more than 38 digits. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,31)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0000000000000000000000000000001",
+      "1.0000000000000000000000000000001",
+      "1.0000000000000000000000000000001"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,8)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "123456789012345678901234567890.12345678",
+      "123456789012345678901234567890.12345678",
+      "123456789012345678901234567890.12345678"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('2.5' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('2.5' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3",
+      "3",
+      "3"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('-2.5' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-2.5' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-3",
+      "-3",
+      "-3"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1.45' AS DECIMAL(38,1))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.45' AS DECIMAL(38,1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      "1.5",
+      "1.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('-1.45' AS DECIMAL(38,1))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-1.45' AS DECIMAL(38,1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('3.5' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('3.5' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "4",
+      "4",
+      "4"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('123456789012345678901234567890.1234565' AS DECIMAL(38,6))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('123456789012345678901234567890.1234565' AS DECIMAL(38,6))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "123456789012345678901234567890.123457",
+      "123456789012345678901234567890.123457",
+      "123456789012345678901234567890.123457"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  99999999999999999999999999999999999999.5 cannot be represented as Decimal(38, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "CAST('0.000000000000000000000000000000000000005' AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('0.000000000000000000000000000000000000005' AS DECIMAL(38,38))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-38",
+      "1.0E-38",
+      "1.0E-38"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1e30' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e30' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      "1000000000000000000000000000000",
+      "1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1.5e3' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.5e3' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1500",
+      "1500",
+      "1500"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1e39' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e39' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_OUT_OF_SUPPORTED_RANGE] The value 1e39 cannot be interpreted as a numeric since it has more than 38 digits. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(' 42 ' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(' 42 ' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "42",
+      "42",
+      "42"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('+42' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('+42' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "42",
+      "42",
+      "42"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('42.' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('42.' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "42",
+      "42",
+      "42"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('.5' AS DECIMAL(38,1))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('.5' AS DECIMAL(38,1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.5",
+      "0.5",
+      "0.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('abc' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('abc' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DECIMAL(38,0)\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('abc' AS DECIMAL(38,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"DECIMAL(38,0)\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('' AS DECIMAL(38,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1,000' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1,000' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1,000' of the type \"STRING\" cannot be cast to \"DECIMAL(38,0)\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1,000' AS DECIMAL(38,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('123456789012345678901234567890' AS DECIMAL(10,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('123456789012345678901234567890' AS DECIMAL(10,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(10,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  123456789012345678901234567890 cannot be represented as Decimal(10, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST('123456789012345678901234567890' AS DECIMAL(10,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "TRY_CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('123456789012345678901234567890' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "123456789012345678901234567890",
+      "123456789012345678901234567890",
+      "123456789012345678901234567890"
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('abc' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('abc' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('2.5' AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('2.5' AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3",
+      "3",
+      "3"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(s AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(s AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DECIMAL(38,0)\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(s AS DECIMAL(38,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TRY_CAST(s AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(s AS DECIMAL(38,0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -4692,5 +5282,1441 @@
     }
    }
   ]
+ },
+ "legacy": {
+  "_comment": "The SAME expressions under ansi off, gathered in a separate session and kept in a separate section. Valid only under the `conf` below.",
+  "conf": {
+   "spark.sql.ansi.enabled": "false",
+   "spark.sql.session.timeZone": "UTC",
+   "spark.sql.storeAssignmentPolicy": "ANSI"
+  },
+  "groups": {
+   "wide-decimal": [
+    {
+     "expression": "d4 + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d4 + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000001",
+       null,
+       "-999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "d4 - 1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(d4 - 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "999999999999999999999999999999",
+       null,
+       "-1000000000000000000000000000001"
+      ]
+     }
+    },
+    {
+     "expression": "d4 * 2",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d4 * 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2000000000000000000000000000000",
+       null,
+       "-2000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "-d4",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1000000000000000000000000000000",
+       null,
+       "1000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d4 + d1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d4 + d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000012.34",
+       null,
+       "-1000000000000000000000000000000.00"
+      ]
+     }
+    },
+    {
+     "expression": "d4 + d3",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d4 + d3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000009.990000",
+       null,
+       "-1000000000000000000000000000000.000000"
+      ]
+     }
+    },
+    {
+     "expression": "d4 * d1",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d4 * d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12340000000000000000000000000000.00",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "d5 / d5",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(d5 / d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.000000",
+       null,
+       "1.000000"
+      ]
+     }
+    },
+    {
+     "expression": "d5 * d5",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d5 * d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,37)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0100000000000000000000000000000000000",
+       null,
+       "0.2500000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d5 + d5",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d5 + d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,37)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.2000000000000000000000000000000000000",
+       null,
+       "1.0000000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d4 = d4",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d4 = d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "d4 > d1",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(d4 > d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(d4, d1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(d4, d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       null,
+       "-1000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS DECIMAL(38,2))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS DECIMAL(38,2))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000.00",
+       null,
+       "-1000000000000000000000000000000.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+30,
+       null,
+       -1e+30
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       null,
+       "-1000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(CAST(246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.123457",
+       "0.123457",
+       "0.123457"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(CAST(-246913 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.123457",
+       "-0.123457",
+       "-0.123457"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(CAST(-1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.000001",
+       "-0.000001",
+       "-0.000001"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(CAST(1 AS DECIMAL(38,0)) / CAST(2000000 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.000001",
+       "0.000001",
+       "0.000001"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(2.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "3",
+       "3",
+       "3"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-2.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(-2.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-3",
+       "-3",
+       "-3"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1.45 AS DECIMAL(38,2)) AS DECIMAL(38,1))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1.45BD AS DECIMAL(38,2)) AS DECIMAL(38,1))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.5",
+       "1.5",
+       "1.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(3.5 AS DECIMAL(38,1)) AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(3.5BD AS DECIMAL(38,1)) AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "4",
+       "4",
+       "4"
+      ]
+     }
+    },
+    {
+     "expression": "d3 * d3",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d3 * d3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99.800100",
+       null,
+       "0.000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0)) + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(CAST(60000000000000000000000000000000000000BD AS DECIMAL(38,0)) + CAST(60000000000000000000000000000000000000BD AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "d4 * d4",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d4 * d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS DECIMAL(10,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS DECIMAL(10,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(10,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1073741824,
+       null,
+       -1073741824
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(3,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('12345' AS DECIMAL(3,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('12345' AS DECIMAL(3,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(3,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(a AS DECIMAL(2,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(a AS DECIMAL(2,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(2,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       null,
+       null
+      ]
+     }
+    }
+   ],
+   "ansi-sensitive": [
+    {
+     "expression": "a / 0",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(a / 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "a % 0",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(a % 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(s AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(s AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "a + 2147483647",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(a + 2147483647)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       null,
+       -1
+      ]
+     }
+    },
+    {
+     "expression": "CAST(g AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(g AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('abc' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('abc' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nested.arr[99]",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedExtractValue",
+      "sql": "nested.arr[99]"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "element_at(nested.m, 'missing')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "element_at(nested.m, 'missing')"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    }
+   ],
+   "string-to-decimal": [
+    {
+     "expression": "CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('123456789012345678901234567890' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "123456789012345678901234567890",
+       "123456789012345678901234567890",
+       "123456789012345678901234567890"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-123456789012345678901234567890' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-123456789012345678901234567890' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-123456789012345678901234567890",
+       "-123456789012345678901234567890",
+       "-123456789012345678901234567890"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,31)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.0000000000000000000000000000001",
+       "1.0000000000000000000000000000001",
+       "1.0000000000000000000000000000001"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,8)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "123456789012345678901234567890.12345678",
+       "123456789012345678901234567890.12345678",
+       "123456789012345678901234567890.12345678"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('2.5' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('2.5' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "3",
+       "3",
+       "3"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-2.5' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-2.5' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-3",
+       "-3",
+       "-3"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.45' AS DECIMAL(38,1))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.45' AS DECIMAL(38,1))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.5",
+       "1.5",
+       "1.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-1.45' AS DECIMAL(38,1))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-1.45' AS DECIMAL(38,1))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.5",
+       "-1.5",
+       "-1.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('3.5' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('3.5' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "4",
+       "4",
+       "4"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('123456789012345678901234567890.1234565' AS DECIMAL(38,6))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('123456789012345678901234567890.1234565' AS DECIMAL(38,6))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "123456789012345678901234567890.123457",
+       "123456789012345678901234567890.123457",
+       "123456789012345678901234567890.123457"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('0.000000000000000000000000000000000000005' AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('0.000000000000000000000000000000000000005' AS DECIMAL(38,38))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,38)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.0E-38",
+       "1.0E-38",
+       "1.0E-38"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e30' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e30' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       "1000000000000000000000000000000",
+       "1000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.5e3' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.5e3' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1500",
+       "1500",
+       "1500"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e39' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e39' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(' 42 ' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(' 42 ' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "42",
+       "42",
+       "42"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('+42' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('+42' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "42",
+       "42",
+       "42"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('42.' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('42.' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "42",
+       "42",
+       "42"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('.5' AS DECIMAL(38,1))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('.5' AS DECIMAL(38,1))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.5",
+       "0.5",
+       "0.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('abc' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('abc' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1,000' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1,000' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('123456789012345678901234567890' AS DECIMAL(10,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('123456789012345678901234567890' AS DECIMAL(10,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(10,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('123456789012345678901234567890' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('123456789012345678901234567890' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "123456789012345678901234567890",
+       "123456789012345678901234567890",
+       "123456789012345678901234567890"
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('999999999999999999999999999999999999999' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('abc' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('abc' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('2.5' AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('2.5' AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "3",
+       "3",
+       "3"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(s AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(s AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(s AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(s AS DECIMAL(38,0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    }
+   ]
+  }
  }
 }

@@ -669,13 +669,21 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
     private IArrowArray CastToDecimal(IArrowArray source, Decimal128Type target, int rowCount, bool raising)
     {
         // A decimal or integral source has an exact unscaled form, so the cast is a rescale and the
-        // whole precision range is reachable. Everything else — strings, booleans, floating point,
-        // temporals — keeps the System.Decimal path below, which stops near 7.9e28. Only a string
-        // can actually spell a value past that, and what Spark does when one does is unmeasured;
-        // guessing it here would be the one thing this file's rules are not allowed to do.
+        // whole precision range is reachable.
         if (SparkWideDecimals.IsExact(source.Data.DataType))
             return CastExactToDecimal(source, target, rowCount, raising);
 
+        // A string is the only other source that can spell a value past System.Decimal's ~7.9e28,
+        // and #174 measured what Spark does when one does, so it reads exactly too.
+        if (source is StringArray strings)
+            return CastStringToDecimal(strings, target, rowCount, raising);
+
+        // What is left keeps the System.Decimal path below. A boolean is 0 or 1 and a temporal is
+        // epoch seconds, so neither can reach that path's ceiling — but FLOATING POINT can, and
+        // #244 is the gap: measured, CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(38,0)) is 1e30 in Spark
+        // and NUMERIC_VALUE_OUT_OF_RANGE here. It is not the string gap with a different source
+        // type, which is why it is not fixed alongside it: Spark reaches the decimal through
+        // Double.toString, whose answer is a property of the JVM rather than of the value.
         var builder = new Decimal128Array.Builder(target);
 
         for (var i = 0; i < rowCount; i++)
@@ -716,6 +724,47 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         }
 
         return builder.Build();
+    }
+
+    /// <summary>Casts a string column to a decimal type, reading the text exactly.</summary>
+    /// <remarks>
+    /// Three refusals with three different error classes, all measured rather than reasoned —
+    /// see <see cref="SparkDecimalText"/> for what each one is and why the middle one is not the
+    /// one anybody would have guessed.
+    /// </remarks>
+    private IArrowArray CastStringToDecimal(
+        StringArray source, Decimal128Type target, int rowCount, bool raising)
+    {
+        var mantissas = new Int128?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (source.IsNull(i))
+                continue;
+
+            var text = source.GetString(i);
+
+            switch (SparkDecimalText.TryRead(text, target, out var unscaled))
+            {
+                case SparkDecimalText.Result.Ok:
+                    mantissas[i] = unscaled;
+                    break;
+
+                case SparkDecimalText.Result.Malformed:
+                    if (!raising) continue;
+                    throw SparkEvaluationException.InvalidCast(text, SparkArrays.Describe(target));
+
+                case SparkDecimalText.Result.TooManyDigits:
+                    if (!raising) continue;
+                    throw SparkEvaluationException.NumericOutOfSupportedRange(text);
+
+                default:
+                    if (!raising) continue;
+                    throw SparkEvaluationException.NumericValueOutOfRange(text, target);
+            }
+        }
+
+        return SparkWideDecimals.Build(mantissas, target, rowCount);
     }
 
     /// <summary>Casts a decimal or integral column to a decimal type, on the unscaled integers.</summary>
