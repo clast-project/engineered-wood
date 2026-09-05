@@ -142,8 +142,14 @@ public class RleBitPackedBulkTests
             var byteDecoder = new RleBitPackedDecoder(encoded, bitWidth);
             byteDecoder.ReadBatch(asBytes);
 
+            var asIntegers = new int[Count];
+            var integerDecoder = new RleBitPackedDecoder(encoded, bitWidth);
+            integerDecoder.ReadBatch(asIntegers);
+
             for (int i = 0; i < Count; i++)
-                Assert.True(asBytes[i] == values[i], $"bitWidth={bitWidth} index={i}");
+            {
+                Assert.Equal(asIntegers[i], (int)asBytes[i]);
+            }
         }
     }
 
