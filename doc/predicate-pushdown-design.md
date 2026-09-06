@@ -314,6 +314,16 @@ public static class Expressions
 A value type that wraps any comparable scalar without boxing. Supports cross-type
 numeric promotion (int vs long, float vs double) via `IComparable<LiteralValue>`.
 
+**`CompareTo` and `Equals` are two different relations, on purpose.** `CompareTo`
+is SQL's, measured against Spark, and promotes across kinds: `1` compares equal
+to `1.0d`, and a `decimal(20,0)` holding 2^53+1 compares equal to the double
+2^53 because both widen to double. That relation is *pairwise* — which pairs
+match depends on the types involved — so it is neither transitive nor consistent
+with any hash, and cannot also be `Equals`. `Equals`/`GetHashCode` therefore
+compare representation: two kinds are never equal, the hash agrees, and `Equals`
+never throws. Evaluate predicates with `CompareTo(x) == 0`; use `Equals` only for
+keys and for comparing expression trees. See issue #206.
+
 ```csharp
 public readonly struct LiteralValue : IComparable<LiteralValue>, IEquatable<LiteralValue>
 {

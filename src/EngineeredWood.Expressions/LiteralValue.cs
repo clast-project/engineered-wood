@@ -8,14 +8,21 @@ using System.Runtime.InteropServices;
 namespace EngineeredWood.Expressions;
 
 /// <summary>
-/// A typed scalar value used in expressions. Supports cross-type numeric
-/// promotion for comparisons (e.g. <c>int</c> vs <c>long</c>, <c>float</c> vs
-/// <c>double</c>) and equality.
+/// A typed scalar value used in expressions.
 /// </summary>
 /// <remarks>
 /// Implemented as a value type to avoid boxing common scalars. Reference-typed
 /// values (string, byte[], BigInteger) and types larger than 8 bytes are stored
 /// in an object slot; primitive scalars are stored in an inline 16-byte union.
+/// <para>
+/// Carries TWO relations, and they are not the same one.
+/// <see cref="CompareTo(LiteralValue)"/> is SQL's, with cross-type numeric promotion
+/// (<c>int</c> against <c>long</c>, <c>decimal</c> against <c>double</c>) measured against Spark.
+/// <see cref="Equals(LiteralValue)"/> is .NET's, comparing representation, so it is an
+/// equivalence relation with a consistent <see cref="GetHashCode"/>. Ask the first when
+/// evaluating a predicate; ask the second when using a literal as a key or comparing two
+/// expression trees.
+/// </para>
 /// </remarks>
 public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<LiteralValue>
 {
@@ -242,10 +249,33 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 
     // ── Equality ──
 
+    /// <summary>
+    /// Whether two literals hold the same value in the same representation.
+    /// </summary>
+    /// <remarks>
+    /// A .NET equivalence relation, deliberately NOT SQL's <c>=</c>. Two values of different
+    /// <see cref="Kind"/>s are never equal here, so <c>Of(1)</c> does not equal <c>Of(1.0d)</c>
+    /// even though the SQL comparison says they match. For the SQL answer ask
+    /// <see cref="CompareTo(LiteralValue)"/> and test for zero, which is what the evaluators do.
+    /// <para>
+    /// The split exists because the two relations cannot be the same method. SQL's cross-type
+    /// comparison is pairwise: which pairs compare equal depends on the types involved, so the
+    /// relation is neither transitive nor consistent with any hash. Measured, all three of these
+    /// answers match Spark and all three cannot be an <c>Equals</c>: a <c>decimal(20,0)</c>
+    /// holding 9007199254740993 compares equal to the double 9007199254740992 (both widen to
+    /// double, where 2^53+1 does not exist), that double compares equal to the long
+    /// 9007199254740992, and the decimal does not compare equal to that long, because
+    /// decimal-against-integer stays exact. Routing that through <c>Equals</c> also made
+    /// <c>Of(1)</c> and <c>Of(1.0d)</c> equal while hashing differently, so a hash lookup missed
+    /// them, and made <c>Equals</c> THROW for any pair SQL cannot compare at all --
+    /// <c>Of(1).Equals(Of("x"))</c> and <c>Null.Equals(Of(1))</c> both raised
+    /// <see cref="InvalidOperationException"/>. This method never throws.
+    /// </para>
+    /// </remarks>
     public bool Equals(LiteralValue other)
     {
         if (_kind != other._kind)
-            return CompareCrossType(this, other) == 0;
+            return false;
 
         return _kind switch
         {
@@ -278,6 +308,13 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 
     public override bool Equals(object? obj) => obj is LiteralValue other && Equals(other);
 
+    /// <summary>A hash consistent with <see cref="Equals(LiteralValue)"/>.</summary>
+    /// <remarks>
+    /// Representation-based, matching the equality above: no kind is folded into another, because
+    /// values of two kinds are never equal. The kind itself is not mixed in -- two kinds may share
+    /// a hash, which a hash is allowed to do, and every such collision is resolved by
+    /// <see cref="Equals(LiteralValue)"/>.
+    /// </remarks>
     public override int GetHashCode() => _kind switch
     {
         Kind.Null => 0,
@@ -365,9 +402,6 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 
         return CompareCrossType(this, other, out exact);
     }
-
-    private static int CompareCrossType(LiteralValue a, LiteralValue b) =>
-        CompareCrossType(a, b, out _);
 
     private static int CompareCrossType(LiteralValue a, LiteralValue b, out bool exact)
     {

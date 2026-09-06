@@ -270,6 +270,27 @@ public class ArrowRowEvaluatorTests
         Assert.Equal([null], ToList(r));
     }
 
+    /// <summary>
+    /// An IN list still matches across numeric kinds, which is the SQL semantics and NOT what
+    /// <see cref="LiteralValue.Equals(LiteralValue)"/> answers.
+    /// </summary>
+    /// <remarks>
+    /// #206 made equality representation-based, so <c>Of(1) != Of(1.0d)</c> as a .NET value. The
+    /// evaluator is unaffected because it asks <c>CompareTo</c>, and this pins that it stays that
+    /// way: an int column against a list of a double, a long and a decimal matches every one.
+    /// </remarks>
+    [Fact]
+    public void In_MatchesAcrossNumericKinds()
+    {
+        var batch = IntColumn("x", 1, 2, 3, 4);
+        var r = Eval.EvaluatePredicate(
+            new SetPredicate(new UnboundReference("x"),
+                [LiteralValue.Of(1.0d), LiteralValue.Of(2L), LiteralValue.Of(3m)],
+                SetOperator.In),
+            batch);
+        Assert.Equal([true, true, true, false], ToList(r));
+    }
+
     // ── String column ──
 
     [Fact]
