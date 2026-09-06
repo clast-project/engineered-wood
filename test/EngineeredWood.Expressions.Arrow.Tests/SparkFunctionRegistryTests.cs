@@ -1371,12 +1371,30 @@ public sealed class SparkFunctionRegistryTests
     public void AWideDecimalStillParticipatesWhereTheResultIsADouble()
     {
         // Converting to double is lossy either way, so the wide value costs nothing the target
-        // type was going to keep.
+        // type was going to keep. EXACTLY 1e30, though: this assertion used to allow 1e15 of
+        // slack and passed on 9.999999999999999E+29, which is #202.
         var batch = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
 
         var result = Assert.IsType<DoubleArray>(Eval(Ansi, "CAST(big AS DOUBLE)", batch));
 
-        Assert.Equal(1e30, result.GetValue(0)!.Value, 1e15);
+        Assert.Equal(1e30, result.GetValue(0)!.Value);
+    }
+
+    [Fact]
+    public void ADecimalWithinSystemDecimalsReachConvertsExactlyToo()
+    {
+        // The half of #202 the issue scoped OUT. This value fits System.Decimal, so the old code
+        // took (double)GetValue(index) and never reached the wide fallback -- and answered
+        // 5814944.017002577, an ulp above the nearest double. Measured, that cast is wrong on
+        // 17.4% of the decimals it accepts, so the narrow path was not the safe one.
+        var batch = WideDecimalBatch(
+            11, ("d", System.Numerics.BigInteger.Parse("581494401700257601")));
+
+        var result = Assert.IsType<DoubleArray>(Eval(Ansi, "CAST(d AS DOUBLE)", batch));
+
+        // Written as a bit pattern rather than a literal so that reading the expectation does not
+        // depend on the platform's parser, which on net472 is itself an ulp out.
+        Assert.Equal(BitConverter.Int64BitsToDouble(0x41562EA8011691F9L), result.GetValue(0)!.Value);
     }
 
     [Theory]

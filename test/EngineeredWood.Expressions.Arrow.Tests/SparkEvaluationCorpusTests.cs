@@ -692,12 +692,12 @@ public sealed class SparkEvaluationCorpusTests
             }
 
             case DoubleArray a:
-                return NearlyEqual(ExpectedDouble(expected), a.GetValue(row)!.Value)
+                return SameDouble(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
                     : $"expected {expected}, got {a.GetValue(row)}";
 
             case FloatArray a:
-                return NearlyEqual(ExpectedDouble(expected), a.GetValue(row)!.Value)
+                return SameDouble(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
                     : $"expected {expected}, got {a.GetValue(row)}";
 
@@ -749,46 +749,55 @@ public sealed class SparkEvaluationCorpusTests
             }
             : expected.GetDouble();
 
-    private static bool NearlyEqual(double expected, double actual)
+    /// <summary>
+    /// Whether a recorded floating-point answer and ours are the SAME double. No tolerance.
+    /// </summary>
+    /// <remarks>
+    /// This used to allow a relative 1e-12, justified as slack for Spark's answer arriving through
+    /// Python's <c>repr</c> of a float. #202 measured the justification and it does not hold:
+    /// <c>repr</c> is the shortest round-tripping form, so parsing it back returns the identical
+    /// double, and running the whole corpus with the tolerance set to ZERO produced exactly one
+    /// difference on each of net10.0, net8.0 and net472 — the wide-decimal cast #202 is about.
+    /// Every other recorded float agrees bit for bit, on all three targets.
+    /// <para>
+    /// It also has to be zero rather than merely tighter. That one difference is <b>one ulp</b>,
+    /// so a tolerance "sized to a few ulps" would swallow it just as 1e-12 did. There is no band
+    /// between "catches this" and "no tolerance at all".
+    /// </para>
+    /// </remarks>
+    private static bool SameDouble(double expected, double actual)
     {
-        // Exact first. This is also the only route by which two infinities of the same sign
-        // compare equal, and it settles NaN against NaN — double.Equals calls those equal where
-        // == does not, which is the answer a value oracle wants.
-        if (expected.Equals(actual)) return true;
-
-        // Anything non-finite that did not match exactly is a real difference, and must not reach
-        // the tolerance below: with either side infinite, `scale` is infinite, the tolerance is
-        // infinite, and every mismatch would compare equal. That fails in the dangerous
-        // direction, because `actual` is OUR value — an overflow to infinity where Spark answered
-        // a finite number is exactly the defect this harness exists to catch.
-        //
-        // double.IsFinite would say this in one call, and does not exist on net472.
-        if (double.IsNaN(expected) || double.IsNaN(actual)) return false;
-        if (double.IsInfinity(expected) || double.IsInfinity(actual)) return false;
-
-        // Spark's answer arrives through Python's repr of a float, so the last bit can differ.
-        var scale = Math.Max(Math.Abs(expected), Math.Abs(actual));
-        return Math.Abs(expected - actual) <= scale * 1e-12;
+        // double.Equals rather than ==, because it settles NaN against NaN as equal — which is
+        // the answer a value oracle wants — and distinguishes nothing else that matters here.
+        // Everything the old tolerance had to special-case (an infinity making the tolerance
+        // infinite, so that our overflow to infinity compared equal to Spark's finite answer)
+        // stops existing once there is no tolerance to compute.
+        return expected.Equals(actual);
     }
 
     [Theory]
     // The comparison oracle needs its own test: a wrong `true` here is silent, and silence is the
     // failure mode this whole file exists to remove.
     [InlineData(1.0, 1.0, true)]
-    [InlineData(0.1 + 0.2, 0.3, true)]                       // last-bit drift, which is the point
+    // Last-bit drift, which used to be tolerated and is now a difference. 0.1 + 0.2 is one ulp
+    // above 0.3, the same distance as the defect in #202 — tolerating it is what hid that one.
+    [InlineData(0.1 + 0.2, 0.3, false)]
+    // Two spellings of ONE double still agree: the comparison is on the value, not the text.
+    [InlineData(1e30, 1000000000000000000000000000000.0, true)]
     [InlineData(1.0, 1.5, false)]
     [InlineData(0.0, 0.0, true)]
     [InlineData(double.NaN, double.NaN, true)]
     [InlineData(double.NaN, 1.0, false)]
     [InlineData(double.PositiveInfinity, double.PositiveInfinity, true)]
     [InlineData(double.NegativeInfinity, double.NegativeInfinity, true)]
-    // The cases that were wrong: an infinite tolerance swallowed all of them.
+    // Non-finite against finite. These needed their own guard while a tolerance existed —
+    // an infinite `scale` made the tolerance infinite and swallowed all four.
     [InlineData(double.PositiveInfinity, 1.0, false)]
     [InlineData(1.0, double.PositiveInfinity, false)]
     [InlineData(double.PositiveInfinity, double.NegativeInfinity, false)]
     [InlineData(double.NegativeInfinity, 0.0, false)]
-    public void TheFloatComparisonToleratesDriftButNotInfinity(double expected, double actual, bool equal) =>
-        Assert.Equal(equal, NearlyEqual(expected, actual));
+    public void TheFloatComparisonIsExactAndStillSettlesNaN(double expected, double actual, bool equal) =>
+        Assert.Equal(equal, SameDouble(expected, actual));
 
     private static string Show(IArrowArray array, int row) => array switch
     {

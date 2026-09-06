@@ -177,44 +177,43 @@ internal static class SparkArrays
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index),
         FloatArray a => a.IsNull(index) ? null : a.GetValue(index),
         DoubleArray a => a.IsNull(index) ? null : a.GetValue(index),
-        Decimal128Array a => a.IsNull(index) ? null : WideDecimalAsDouble(a, index),
+        Decimal128Array a => a.IsNull(index) ? null : DecimalAsDouble(a, index),
         _ => throw new NotSupportedException(
             $"{array.Data.DataType.Name} is not a numeric array"),
     };
 
-    /// <summary>
-    /// A Decimal128 cell as a double, going through the unscaled integer when the value is too
-    /// wide for <see cref="decimal"/>.
-    /// </summary>
+    /// <summary>A Decimal128 cell as the nearest <see cref="double"/>.</summary>
     /// <remarks>
-    /// Spark decimals reach precision 38 where <see cref="decimal"/> stops near 7.9e28, so
-    /// <c>Decimal128Array.GetValue</c> raises on a legitimate column value. Converting to double
-    /// is lossy either way, so the fallback costs nothing that the target type was going to keep.
+    /// Through the unscaled integer for EVERY width, not just the wide ones. This used to try
+    /// <c>(double)GetValue(index)</c> first and fall back on <see cref="OverflowException"/>,
+    /// which is two rounding rules -- and #202 measured BOTH of them wrong. <c>(double)decimal</c>
+    /// is an ulp off on 17.4% of the values it accepts, so the fallback was not a slower path to
+    /// the same answer; it was the only correct one.
+    /// <see cref="ScaledDecimal.ToDouble(System.Numerics.BigInteger, int)"/> now carries the whole
+    /// range, and its exact fast path covers the widths the old happy path was there to make
+    /// cheap.
     /// </remarks>
-    private static double WideDecimalAsDouble(Decimal128Array array, int index)
-    {
-        try
-        {
-            return (double)array.GetValue(index)!.Value;
-        }
-        catch (OverflowException)
-        {
-            var scale = ((Decimal128Type)array.Data.DataType).Scale;
-            return (double)Unscaled(array, index) / Math.Pow(10, scale);
-        }
-    }
+    private static double DecimalAsDouble(Decimal128Array array, int index) =>
+        ScaledDecimal.ToDouble(Unscaled(array, index), ((Decimal128Type)array.Data.DataType).Scale);
 
     /// <summary>The raw unscaled integer behind a Decimal128 cell.</summary>
     internal static System.Numerics.BigInteger Unscaled(Decimal128Array array, int index)
     {
         // GC.KeepAlive because `array` is otherwise dead once the span is taken, and the span
         // points into its buffer. See doc/arrow-span-lifetime.md.
+#if NETSTANDARD2_0
         var bytes = array.ValueBuffer.Span.Slice(index * 16, 16).ToArray();
         GC.KeepAlive(array);
-#if NETSTANDARD2_0
         return new System.Numerics.BigInteger(bytes);
 #else
-        return new System.Numerics.BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+        // No ToArray: the span overload consumes the bytes inside the call, so the copy bought
+        // nothing that the KeepAlive below does not already buy. That matters now that EVERY
+        // decimal-to-double cast comes through here rather than only the wide ones -- it was an
+        // allocation per row.
+        var value = new System.Numerics.BigInteger(
+            array.ValueBuffer.Span.Slice(index * 16, 16), isUnsigned: false, isBigEndian: false);
+        GC.KeepAlive(array);
+        return value;
 #endif
     }
 
