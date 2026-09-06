@@ -476,6 +476,38 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal("0.3333333", SparkFloatText.ShortestRoundTrip(0.3333333f));
     }
 
+
+    /// <summary>
+    /// A refused row names its own value, which is what deferring the rendering puts at risk.
+    /// </summary>
+    /// <remarks>
+    /// <c>CastInput.Text</c> is rendered on demand for a numeric source (#251), from an array and
+    /// an index carried in the struct rather than from a string built when the row was read. If
+    /// either were wrong the message would name a different row's value — or no row's — and every
+    /// existing test would still pass, because they assert error CLASSES and not messages.
+    /// </remarks>
+    [Fact]
+    public void ADeferredRenderingNamesTheRowThatWasRefused()
+    {
+        // Row 2 is the one that overflows, and it is neither the first nor the last.
+        var batch = Batch(("g", Doubles(1.0, 2.0, 1e30, 4.0)));
+
+        var thrown = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(g AS INT)", batch));
+        Assert.Contains("1.0E30", thrown.Message, StringComparison.Ordinal);
+
+        // ...and in Java's spelling rather than .NET's, so the deferral goes through the same
+        // renderer the eager path used.
+        Assert.DoesNotContain("1E+30", thrown.Message, StringComparison.Ordinal);
+
+        // The same for a decimal source, whose rendering comes from the unscaled buffer.
+        var decimals = Batch(("d", Decimals(10, 2, 1.00m, 12345.67m)));
+        Assert.Contains(
+            "12345.67",
+            Assert.Throws<SparkEvaluationException>(
+                () => Eval(Ansi, "CAST(d AS DECIMAL(4,2))", decimals)).Message,
+            StringComparison.Ordinal);
+    }
+
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
 
     [Fact]
