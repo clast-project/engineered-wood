@@ -32,13 +32,42 @@ public class ScaledDecimalTests
     private static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
 
     /// <summary>Two doubles apart by how many representable steps, for a readable failure.</summary>
+    /// <remarks>
+    /// The gap is measured in <c>ulong</c> and saturated, because the mapped keys span very
+    /// nearly the whole signed range and their difference does not fit one. Measured, the obvious
+    /// <c>Math.Abs(ka - kb)</c> reports 9007199254740992 for +Infinity against -Infinity (a
+    /// wrapped value, not a distance) and THROWS OverflowException on the pair whose difference
+    /// lands exactly on long.MinValue. This runs only while building a failure message, so either
+    /// one replaces a real mismatch with noise or with a second exception.
+    /// </remarks>
     private static long Ulps(double a, double b)
     {
         long ka = BitConverter.DoubleToInt64Bits(a), kb = BitConverter.DoubleToInt64Bits(b);
         if (ka < 0) ka = unchecked(long.MinValue - ka);
         if (kb < 0) kb = unchecked(long.MinValue - kb);
-        return Math.Abs(ka - kb);
+
+        var distance = ka >= kb ? (ulong)ka - (ulong)kb : (ulong)kb - (ulong)ka;
+        return distance > long.MaxValue ? long.MaxValue : (long)distance;
     }
+
+    [Theory]
+    // The failure-message helper needs its own test, for the same reason the corpus's comparison
+    // does: it runs only when something has already gone wrong, so a defect in it destroys the
+    // evidence rather than announcing itself. Given as raw bit patterns because two of these
+    // cases cannot be written as literals.
+    [InlineData(0x3FF0000000000000L, 0x3FF0000000000000L, 0L)]                  // 1.0 vs itself
+    [InlineData(0x46293E5939A08CEAL, 0x46293E5939A08CE9L, 1L)]                  // the #202 pair
+    // Opposite infinities. The keys are nearly the whole signed range apart, so subtracting them
+    // as long WRAPPED and reported 9007199254740992 -- a plausible-looking number, and not a
+    // distance at all.
+    [InlineData(0x7FF0000000000000L, unchecked((long)0xFFF0000000000000), long.MaxValue)]
+    // The pair whose difference lands exactly on long.MinValue, where Math.Abs THREW
+    // OverflowException on top of the assertion failure that called it.
+    [InlineData(0x7FFFFFFFFFFFFFFFL, unchecked((long)0x8000000000000001), long.MaxValue)]
+    public void TheUlpHelperSaturatesRatherThanWrappingOrThrowing(long a, long b, long expected) =>
+        Assert.Equal(
+            expected,
+            Ulps(BitConverter.Int64BitsToDouble(a), BitConverter.Int64BitsToDouble(b)));
 
     [Fact]
     public void TheWideDecimalFromTheIssueRoundsRatherThanTruncating()

@@ -1381,7 +1381,7 @@ public sealed class SparkFunctionRegistryTests
     }
 
     [Fact]
-    public void ADecimalWithinSystemDecimalsReachConvertsExactlyToo()
+    public void ANarrowDecimalConvertsExactlyToo()
     {
         // The half of #202 the issue scoped OUT. This value fits System.Decimal, so the old code
         // took (double)GetValue(index) and never reached the wide fallback -- and answered
