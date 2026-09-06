@@ -211,12 +211,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             return;
 
         bool anyString = IsString(operandType, operand);
-        bool anyOther = !anyString && FirstKind(operand) is not null;
+        bool anyOther = !anyString && (operandType is not null || FirstKind(operand) is not null);
 
         for (var k = 0; k < members.Length; k++)
         {
             if (IsMemberString(members[k], memberTypes[k])) anyString = true;
-            else if (MemberKind(members[k], memberTypes[k]) is not null) anyOther = true;
+            else if (MemberIsTyped(members[k], memberTypes[k])) anyOther = true;
         }
 
         if (!anyString || !anyOther)
@@ -255,13 +255,17 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             ? member.Constant?.Type == LiteralValue.Kind.String
             : IsString(declared, member.PerRow);
 
-    /// <summary>The kind a set member carries, or null when it has no value at all.</summary>
-    private static LiteralValue.Kind? MemberKind(in SetMember member, IArrowType? declared) =>
+    /// <summary>Whether a member brings a type to the resolution at all.</summary>
+    /// <remarks>
+    /// A declared type answers on its own — a column has one whether or not any row is populated
+    /// — so the values are read only for a member that has none, and a typed member is never
+    /// scanned. What is left with nothing either way is a null literal, which says nothing about
+    /// what the set resolves through.
+    /// </remarks>
+    private static bool MemberIsTyped(in SetMember member, IArrowType? declared) =>
         member.IsConstant
-            ? member.Constant?.Type
-            : (declared is not null || FirstKind(member.PerRow) is not null
-                ? FirstKind(member.PerRow) ?? LiteralValue.Kind.String
-                : null);
+            ? member.Constant.HasValue
+            : declared is not null || FirstKind(member.PerRow) is not null;
 
     /// <summary>The Arrow type a set member resolves through.</summary>
     private static IArrowType MemberType(in SetMember member, IArrowType? declared) =>
