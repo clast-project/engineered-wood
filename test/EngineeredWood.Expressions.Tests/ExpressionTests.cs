@@ -36,7 +36,7 @@ public class ExpressionTests
         var p = Expressions.In("status", "active", "pending");
         Assert.Equal(SetOperator.In, p.Op);
         Assert.Equal(2, p.Values.Count);
-        Assert.Equal((LiteralValue)"active", p.Values[0]);
+        Assert.Equal(new LiteralExpression("active"), p.Values[0]);
     }
 
     [Fact]

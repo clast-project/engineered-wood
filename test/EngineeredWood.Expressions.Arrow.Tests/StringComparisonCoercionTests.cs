@@ -298,6 +298,36 @@ public class StringComparisonCoercionTests
     }
 
     [Fact]
+    public void AListHoldingColumnsResolvesOverTheWholeListToo()
+    {
+        // The list used to be expanded into a disjunction of equalities, which resolved each
+        // pair on its own. `'1.5' IN (a, g)` is what that got wrong under ANSI: the list holds an
+        // int and a double, so the whole set resolves through DOUBLE and answers false, where
+        // pairwise the string was cast to bigint against `a` and refused. #261.
+        Assert.False(Evaluate(Ansi, "'1.5' IN (a, g)"));
+        Assert.False(Evaluate(Legacy, "'1.5' IN (a, g)"));
+
+        // ...and the legacy dialect resolves the same list through text, which these separate:
+        // 1.0 is the number a holds and is not the text it renders as.
+        Assert.True(Evaluate(Ansi, "'1.0' IN (a, g)"));
+        Assert.False(Evaluate(Legacy, "'1.0' IN (a, g)"));
+
+        // 0.1 as a float is not 0.1 as a double, and renders as neither's spelling of the other.
+        Assert.False(Evaluate(Ansi, "'0.1' IN (f)"));
+        Assert.True(Evaluate(Legacy, "'0.1' IN (f)"));
+    }
+
+    [Fact]
+    public void AColumnListWithNoStringIsLeftAlone()
+    {
+        // Nothing to promote, so the members compare as they are -- and a column list is
+        // per-row, not a set of constants.
+        Assert.True(Evaluate(Ansi, "a IN (a, sh)"));
+        Assert.False(Evaluate(Ansi, "a IN (sh, g)"));
+        Assert.True(Evaluate(Ansi, "a NOT IN (sh, g)"));
+    }
+
+    [Fact]
     public void ANullInTheListKeepsItsThreeValuedAnswerThroughTheCoercion()
     {
         // No match plus a null in the list is unknown, not false -- and the coercion must not

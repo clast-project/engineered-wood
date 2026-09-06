@@ -198,10 +198,15 @@ internal static class IndexPruner
     {
         if (!TryGetReferenceName(sp.Operand, out string colName)) return null;
         if (!byColumn.TryGetValue(colName, out var info)) return null;
+
+        // An index answers "which fragments hold this VALUE", so a list holding anything else --
+        // `x IN (a, b)` names two other columns -- is one it cannot be asked about.
+        if (!sp.TryGetLiteralValues(out var values)) return null;
+
         bool isBitmap = info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal);
 
         var acc = new HashSet<uint>();
-        foreach (var lit in sp.Values)
+        foreach (var lit in values)
         {
             if (lit.Type != LiteralValue.Kind.Int32) return null;
             int v = lit.AsInt32;

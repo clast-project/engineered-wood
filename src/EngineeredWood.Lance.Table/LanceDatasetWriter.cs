@@ -797,6 +797,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 break;
             case SetPredicate s:
                 CollectColumnReferences(s.Operand, sink);
+                // The list holds expressions, so `x IN (a, b)` names `a` and `b` too.
+                foreach (var value in s.Values) CollectColumnReferences(value, sink);
                 break;
         }
     }

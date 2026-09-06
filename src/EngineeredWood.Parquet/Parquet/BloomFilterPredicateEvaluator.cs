@@ -124,7 +124,12 @@ internal static class BloomFilterPredicateEvaluator
         if (set.Values.Count == 0)
             return FilterResult.AlwaysFalse;
 
-        return await ProbeAsync(column!, set.Values, ctx, ct).ConfigureAwait(false);
+        // A Bloom filter answers "does this VALUE appear", so a list naming other columns --
+        // `x IN (a, b)` -- is not a question it can be asked.
+        if (!set.TryGetLiteralValues(out var values))
+            return FilterResult.Unknown;
+
+        return await ProbeAsync(column!, values, ctx, ct).ConfigureAwait(false);
     }
 
     /// <summary>

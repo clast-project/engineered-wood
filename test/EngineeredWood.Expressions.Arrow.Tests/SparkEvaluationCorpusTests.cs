@@ -104,6 +104,14 @@ public sealed class SparkEvaluationCorpusTests
         // underneath it, which reads an exponent where Spark's integral parse does not.
         ["'1e3' = a"] = "#258: we cast '1e3' to an integral where Spark refuses it",
 
+        // Spark TYPE-CHECKS an IN list and refuses one whose members share no type -- in both
+        // dialects, and with no string involved in `a IN (bl)` at all. That is an analysis-time
+        // check rather than a coercion, and EngineeredWood has no analysis phase: the registry
+        // declines to coerce, the set is compared as it stands, and we answer. Reproducing the
+        // refusal would mean writing a type checker, and is #261's open half.
+        ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
+        ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
+
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -195,19 +203,15 @@ public sealed class SparkEvaluationCorpusTests
             // so the comparison answers false where Spark answers null.
             ["'1e3' = a"] = "#258: we cast '1e3' to an integral where legacy Spark nulls it",
 
-            // IN over a list containing COLUMNS. The parser expands `x IN (expr, …)` into a
-            // disjunction of equalities, which resolves each pair on its own where Spark
-            // resolves one type over the whole list -- right under ANSI, wrong here. A literal
-            // list keeps its shape and is coerced; this one cannot be until the tree does.
-            ["s IN (a, b)"] = "#261: legacy IN over a column list compares as strings",
-            ["fs IN (a, b)"] = "#261: legacy IN over a column list compares as strings",
-
-            // Spark's string promotion excludes boolean and binary, and REFUSES these sets at
-            // analysis rather than answering. We answer, because declining to coerce leaves the
-            // set as it stands -- and reproducing an analysis-time refusal is a different thing
-            // from reproducing a cast.
+            // Spark's string promotion excludes boolean and binary, so it REFUSES these two sets
+            // at analysis rather than answering. See the ANSI list for why refusing is not
+            // reproduced; under ANSI these two resolve and we match.
             ["bl IN ('true')"] = "#261: legacy Spark refuses a boolean/string set; we answer",
             ["bin IN ('A')"] = "#261: legacy Spark refuses a binary/string set; we answer",
+
+            // The same type-check the ANSI list carries, and for the same reason.
+            ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
+            ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce

@@ -980,11 +980,24 @@ moving side. Before it, a mixed set compared through `LiteralValue.CompareTo`,
 which has no cross-kind branch for a string, so `ns IN (1, 2)` over the string
 `'1'` was false where Spark says true in both dialects.
 
-Two cases stay declared (#261): a list containing COLUMNS, which the parser
-still expands into a disjunction because `SetPredicate` holds `LiteralValue`s
-and cannot carry an expression, and the sets Spark refuses in the analyzer —
-its string promotion excludes boolean and binary, so `bl IN ('true')` is an
-analysis error under the legacy dialect and an answer for us.
+`SetPredicate.Values` holds **expressions**, so a list containing columns keeps
+its shape and resolves the same way (#261). It used to expand into a disjunction
+of equalities, on the grounds that SQL defines `IN` that way — true of the
+three-valued logic and false of the types, which is why `fs IN (a, g)` refused
+under ANSI where Spark answers false: an `int` and a `double` resolve through
+`double` for the whole list, while pairwise the string went to `bigint`. The
+consumers that read the list as data rather than evaluating it — statistics
+pruning, Bloom probing, Lance's index pruning — ask `TryGetLiteralValues` and
+fall back to "no information", which is the answer they already gave for a set
+they could not use.
+
+What stays declared is Spark's analysis-time TYPE CHECK, which refuses a list
+whose members share no type: `a IN (bl)` is an error in both dialects, with no
+string in it at all, and `bl IN ('true')` is one under the legacy dialect
+because string promotion excludes boolean and binary. That is a check rather
+than a coercion, and EngineeredWood has no analysis phase to put it in — see
+#261 for why reproducing it at evaluation time is a decision rather than a
+gap.
 
 ### Function set
 

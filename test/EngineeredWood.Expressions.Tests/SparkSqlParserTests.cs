@@ -108,15 +108,29 @@ public sealed class SparkSqlParserTests
     }
 
     [Fact]
-    public void AnInListHoldingExpressionsExpandsToADisjunction()
+    public void AnInListHoldingExpressionsKeepsItsShape()
     {
-        // SetPredicate carries LiteralValues, so `a IN (b, 5)` cannot use it. Expanding to
-        // equality alternatives is SQL's own definition of IN and keeps the null behaviour.
-        var parsed = Assert.IsType<OrPredicate>(Parse("a IN (b, 5)"));
+        // It used to expand to a disjunction of equalities, on the grounds that SQL defines IN
+        // that way. True of the three-valued logic and false of the TYPES: Spark resolves one
+        // type over the operand and the whole list, so `a IN ('01')` is false under the legacy
+        // dialect where `a = '01'` is true, and a disjunction cannot express that. #261.
+        var parsed = Assert.IsType<SetPredicate>(Parse("a IN (b, 5)"));
 
-        Assert.Equal(2, parsed.Children.Count);
-        Assert.All(parsed.Children,
-            child => Assert.Equal(ComparisonOperator.Equal, ((ComparisonPredicate)child).Op));
+        Assert.Equal(SetOperator.In, parsed.Op);
+        Assert.Equal(new Expression[] { new UnboundReference("b"), new LiteralExpression(5) },
+            parsed.Values);
+
+        // ...and a list of expressions is not a list of literals, which is what pruning asks.
+        Assert.False(parsed.TryGetLiteralValues(out _));
+        Assert.True(Assert.IsType<SetPredicate>(Parse("a IN (1, 2)")).TryGetLiteralValues(out _));
+    }
+
+    [Fact]
+    public void ANegatedInListKeepsItsShapeToo()
+    {
+        var parsed = Assert.IsType<SetPredicate>(Parse("a NOT IN (b, 5)"));
+        Assert.Equal(SetOperator.NotIn, parsed.Op);
+        Assert.Equal(2, parsed.Values.Count);
     }
 
     [Fact]

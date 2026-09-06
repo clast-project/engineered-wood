@@ -203,70 +203,53 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// the overwhelmingly common set — a column against literals of its own type — needs none.
     /// </para>
     /// </remarks>
-    private IReadOnlyList<LiteralValue> CoerceSet(
-        IReadOnlyList<LiteralValue> members, ref LiteralValue?[] operand,
-        IArrowType? operandType, int rowCount)
+    private void CoerceSet(
+        ref LiteralValue?[] operand, IArrowType? operandType,
+        LiteralValue?[][] members, IArrowType?[] memberTypes, int rowCount)
     {
         if (_coercion is null)
-            return members;
+            return;
 
-        bool operandIsString = IsString(operandType, operand);
-        bool anyString = operandIsString;
-        bool anyOther = !operandIsString && FirstKind(operand) is not null;
+        bool anyString = IsString(operandType, operand);
+        bool anyOther = !anyString && FirstKind(operand) is not null;
 
-        foreach (var member in members)
+        for (var k = 0; k < members.Length; k++)
         {
-            if (member.IsNull) continue;
-            if (member.Type == LiteralValue.Kind.String) anyString = true;
-            else anyOther = true;
+            if (IsString(memberTypes[k], members[k])) anyString = true;
+            else if (FirstKind(members[k]) is not null) anyOther = true;
         }
 
         if (!anyString || !anyOther)
-            return members;   // one kind throughout: nothing to resolve
+            return;   // one kind throughout: nothing to resolve
 
-        var types = new List<IArrowType>(members.Count + 1)
+        // Resolved once and reused, because the type decides two things: which target the set
+        // takes, and how each member is rebuilt as an Arrow array. Inferring the second from
+        // values instead cannot build a decimal at all and reads a date as an instant.
+        var operandResolved = OperandType(operandType, operand);
+        var resolved = new IArrowType[members.Length];
+        var types = new List<IArrowType>(members.Length + 1) { operandResolved };
+        for (var k = 0; k < members.Length; k++)
         {
-            OperandType(operandType, operand),
-        };
-        foreach (var member in members)
-        {
-            if (!member.IsNull)
-                types.Add(ConstantArray(member, 1).Data.DataType);
+            resolved[k] = OperandType(memberTypes[k], members[k]);
+            types.Add(resolved[k]);
         }
 
         var target = _coercion.SetComparisonTarget(types);
         if (target is null)
-            return members;   // a set the registry has no rule for; compare it as it stands
+            return;   // a set the registry has no rule for; compare it as it stands
 
-        // Rebuilt against the operand's DECLARED type, not one inferred from its values. The
-        // inferring materialiser cannot build a decimal at all, and it reads a date as an
-        // instant -- which under the legacy dialect renders `dt` as "2026-08-11 00:00:00" and
-        // makes `dt IN ('2026-08-11')` false where Spark says true.
-        var operandArray = operandType is null
-            ? MaterializeAsArray(operand, rowCount)
-            : MaterializeAsArray(operand, rowCount, operandType);
-
-        operand = ArrowToLiteralValues(
-            _coercion.CastForComparison(operandArray, target, rowCount), rowCount);
-
-        // Cast per member rather than as one array: a mixed list has no single kind to
-        // materialise from, and this runs once per batch rather than once per row.
-        var coerced = new LiteralValue[members.Count];
-        for (var i = 0; i < members.Count; i++)
-        {
-            if (members[i].IsNull)
-            {
-                coerced[i] = members[i];
-                continue;
-            }
-
-            var one = ArrowToLiteralValues(
-                _coercion.CastForComparison(ConstantArray(members[i], 1), target, 1), 1);
-            coerced[i] = one[0] ?? LiteralValue.Null;
-        }
-
-        return coerced;
+        operand = CastMember(operand, operandResolved, target, rowCount);
+        for (var k = 0; k < members.Length; k++)
+            members[k] = CastMember(members[k], resolved[k], target, rowCount);
     }
+
+    /// <summary>Rebuilds one member of a set as <paramref name="target"/>.</summary>
+    private LiteralValue?[] CastMember(
+        LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
+        ArrowToLiteralValues(
+            _coercion!.CastForComparison(
+                MaterializeAsArray(values, rowCount, type), target, rowCount),
+            rowCount);
 
     /// <summary>
     /// Casts whichever operand has to move before the two can be compared, in place.
@@ -477,7 +460,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)
     {
         var (operand, operandType) = EvalOperand(set.Operand, batch);
-        var values = CoerceSet(set.Values, ref operand, operandType, batch.Length);
+
+        // Every member is an expression, so each is a column of its own: `x IN (a, b)` compares
+        // row i of x against row i of a and of b, not against two constants.
+        var members = new LiteralValue?[set.Values.Count][];
+        var memberTypes = new IArrowType?[set.Values.Count];
+        for (var k = 0; k < set.Values.Count; k++)
+            (members[k], memberTypes[k]) = EvalOperand(set.Values[k], batch);
+
+        CoerceSet(ref operand, operandType, members, memberTypes, batch.Length);
+
         var result = new bool?[batch.Length];
         bool isIn = set.Op == SetOperator.In;
 
@@ -493,12 +485,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
             bool found = false;
             bool sawNullInList = false;
-            foreach (var lit in values)
+            foreach (var member in members)
             {
-                if (lit.IsNull) { sawNullInList = true; continue; }
+                var lit = member[i];
+                if (!lit.HasValue) { sawNullInList = true; continue; }
                 try
                 {
-                    if (v.Value.CompareTo(lit) == 0) { found = true; break; }
+                    if (v.Value.CompareTo(lit.Value) == 0) { found = true; break; }
                 }
                 catch (InvalidOperationException) { /* incompatible types */ }
             }

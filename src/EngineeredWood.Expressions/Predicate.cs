@@ -124,9 +124,68 @@ public sealed record UnaryPredicate(
 /// </summary>
 public sealed record SetPredicate(
     Expression Operand,
-    IReadOnlyList<LiteralValue> Values,
+    IReadOnlyList<Expression> Values,
     SetOperator Op) : Predicate
 {
+    /// <summary>A set over literal values, which is what most <c>IN</c> lists are.</summary>
+    /// <remarks>
+    /// The list holds expressions so that <c>x IN (a, b)</c> can exist at all; this spelling
+    /// exists so that <c>x IN (1, 2)</c> does not have to say so twice.
+    /// </remarks>
+    public SetPredicate(Expression operand, IReadOnlyList<LiteralValue> values, SetOperator op)
+        : this(operand, AsExpressions(values), op)
+    {
+    }
+
+    private static IReadOnlyList<Expression> AsExpressions(IReadOnlyList<LiteralValue> values)
+    {
+        if (values is null)
+            throw new ArgumentNullException(nameof(values));
+
+        var wrapped = new Expression[values.Count];
+        for (var i = 0; i < values.Count; i++)
+            wrapped[i] = new LiteralExpression(values[i]);
+
+        return wrapped;
+    }
+
+    /// <summary>
+    /// The list as literal values, when every member is one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The list holds EXPRESSIONS, because <c>IN</c> takes them: <c>x IN (a, b)</c> is as
+    /// ordinary as <c>x IN (1, 2)</c>, and it cannot be rewritten as a disjunction of equalities
+    /// without changing its meaning. Spark resolves one type over the operand and the whole
+    /// list, where a disjunction resolves each pair on its own — measured, <c>a IN ('01')</c> is
+    /// false under the legacy dialect and <c>a = '01'</c> is true. #261.
+    /// </para>
+    /// <para>
+    /// Everything that reads the list as data rather than evaluating it — statistics pruning,
+    /// Lance's index pruning — needs the literal case and can do nothing with the rest, so this
+    /// is the shape they ask in. A list with an expression in it answers false and they fall
+    /// back to "no information", which is the same answer they already gave for a set they could
+    /// not use.
+    /// </para>
+    /// </remarks>
+    public bool TryGetLiteralValues(out IReadOnlyList<LiteralValue> literals)
+    {
+        var found = new LiteralValue[Values.Count];
+        for (var i = 0; i < Values.Count; i++)
+        {
+            if (Values[i] is not LiteralExpression literal)
+            {
+                literals = Array.Empty<LiteralValue>();
+                return false;
+            }
+
+            found[i] = literal.Value;
+        }
+
+        literals = found;
+        return true;
+    }
+
     /// <remarks>
     /// Hand-written because the generated version compares <see cref="Values"/> by reference —
     /// see <see cref="SequenceEquality"/>.

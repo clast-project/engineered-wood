@@ -1045,13 +1045,11 @@ targets are right, so this is the integral parse specifically
 issue records the opposite-direction case: `CAST('1d' AS DOUBLE)` is 1.0 to
 Spark, since Java accepts a type suffix, and we refuse it.
 
-**`IN` over a list containing columns resolves pairwise.** `SetPredicate` holds
-`LiteralValue`s, so the parser expands `x IN (expr, expr)` into a disjunction of
-equalities, and each pair then resolves its own type where Spark resolves one
-over the whole list. A literal list is coerced correctly; a column list is not,
-so `fs IN (a, b)` over `'1.5'` is false in Spark and true here under the legacy
-dialect — and `fs IN (a, g)` refuses here where Spark answers false, so it is not
-legacy-only. The same issue records the sets Spark refuses in the analyzer and we
-answer: its string promotion excludes boolean and binary, so `bl IN ('true')` is
-an analysis error under the legacy dialect
+**Spark type-checks an `IN` list and refuses one whose members share no type; we
+answer.** `a IN (bl)` is an analysis error in both dialects — with no string in
+it at all — and `bl IN ('true')` is one under the legacy dialect, because Spark's
+string promotion excludes boolean and binary. Both are answers here. This is an
+analysis-time check rather than a coercion, and EngineeredWood has no analysis
+phase, so reproducing it would mean refusing at evaluation time instead: a
+decision rather than a gap, and one worth taking deliberately
 ([#261](https://github.com/clast-project/engineered-wood/issues/261)).

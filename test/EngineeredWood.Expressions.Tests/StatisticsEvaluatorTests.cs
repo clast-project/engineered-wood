@@ -327,6 +327,23 @@ public class StatisticsEvaluatorTests
     }
 
     [Fact]
+    public void In_ListHoldingAnExpression_Unknown()
+    {
+        // `x IN (y, 5)` is partly a claim about ANOTHER column, and statistics do not pair rows
+        // of x with rows of y -- min/max says nothing about whether any single row matches. The
+        // list carries expressions now (#261), so this is the shape pruning has to decline.
+        var stats = new TestStats().With("x", min: 10, max: 20);
+        var p = Expressions.In(
+            Expressions.Ref("x"),
+            new Expression[] { Expressions.Ref("y"), new LiteralExpression(5) });
+
+        Assert.Equal(FilterResult.Unknown, Eval(p, stats));
+
+        // A list of literals still prunes, which is what most of them are.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.In("x", 1, 5), stats));
+    }
+
+    [Fact]
     public void In_EmptyValues_AlwaysFalse()
     {
         var stats = new TestStats().With("x", min: 10, max: 20);
