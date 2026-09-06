@@ -451,4 +451,86 @@ public class StatsCollectorTests
                 Assert.True(Utf8Compare(max, v) >= 0, $"max below {v.Length}-char value");
         }
     }
+
+    // â”€â”€ NaN and the infinities (#214) â”€â”€
+    //
+    // Expectations here are Spark 4.0's own output, read out of the commit JSON of a Delta table
+    // it wrote: a double column holding [3.0, NaN] commits
+    //   {"minValues":{"g":3.0},"maxValues":{"g":"NaN"}}
+    // an all-NaN column commits "NaN" at BOTH ends, and the infinities come back as the quoted
+    // strings "Infinity" / "-Infinity".
+
+    private static JsonElement Bounds(IArrowArray column, string which)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("g", column.Data.DataType, true))
+            .Build();
+        string? stats = StatsCollector.Collect(new RecordBatch(schema, [column], column.Length));
+        Assert.NotNull(stats);
+        return JsonDocument.Parse(stats!).RootElement.GetProperty(which);
+    }
+
+    [Fact]
+    public void Collect_DoubleWithNaN_RecordsItAsTheMaximum()
+    {
+        var values = new DoubleArray.Builder().Append(3.0).Append(double.NaN).Build();
+
+        // .NET's CompareTo puts NaN at the BOTTOM, which made this file's bounds min = NaN,
+        // max = 3.0 -- inverted under the order the reader uses, and min > max is a shape nothing
+        // downstream is prepared for.
+        Assert.Equal(3.0, Bounds(values, "minValues").GetProperty("g").GetDouble(), 5);
+        Assert.Equal("NaN", Bounds(values, "maxValues").GetProperty("g").GetString());
+    }
+
+    [Fact]
+    public void Collect_AllNaN_IsNaNAtBothEnds()
+    {
+        var values = new DoubleArray.Builder().Append(double.NaN).Append(double.NaN).Build();
+
+        Assert.Equal("NaN", Bounds(values, "minValues").GetProperty("g").GetString());
+        Assert.Equal("NaN", Bounds(values, "maxValues").GetProperty("g").GetString());
+    }
+
+    [Fact]
+    public void Collect_Infinities_AreWrittenAsStrings()
+    {
+        // Not merely a wrong bound before this: Utf8JsonWriter THROWS ArgumentException on all
+        // three non-finite doubles, so collecting stats for this column failed outright and took
+        // the whole Delta write down with it.
+        var values = new DoubleArray.Builder()
+            .Append(double.NegativeInfinity).Append(1.0).Append(double.PositiveInfinity).Build();
+
+        Assert.Equal("-Infinity", Bounds(values, "minValues").GetProperty("g").GetString());
+        Assert.Equal("Infinity", Bounds(values, "maxValues").GetProperty("g").GetString());
+    }
+
+    [Fact]
+    public void Collect_FloatColumn_FollowsTheSameOrder()
+    {
+        var values = new FloatArray.Builder().Append(float.NaN).Append(1.5f).Build();
+
+        Assert.Equal(1.5, Bounds(values, "minValues").GetProperty("g").GetDouble(), 5);
+        Assert.Equal("NaN", Bounds(values, "maxValues").GetProperty("g").GetString());
+    }
+
+    [Fact]
+    public void Collect_NaNInOneBatchOfSeveral_StillRisesToTheMaximum()
+    {
+        // The merge across batches compares against the bound already recorded, and that compare
+        // has to obey the same order -- otherwise a NaN found in batch 2 loses to batch 1's finite
+        // maximum and vanishes from the stats.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("g", DoubleType.Default, true))
+            .Build();
+        var first = new RecordBatch(schema,
+            [new DoubleArray.Builder().Append(1.0).Append(9.0).Build()], 2);
+        var second = new RecordBatch(schema,
+            [new DoubleArray.Builder().Append(double.NaN).Build()], 1);
+
+        string? stats = StatsCollector.Collect([first, second]);
+        var root = JsonDocument.Parse(stats!).RootElement;
+
+        Assert.Equal(1.0, root.GetProperty("minValues").GetProperty("g").GetDouble(), 5);
+        Assert.Equal("NaN", root.GetProperty("maxValues").GetProperty("g").GetString());
+    }
 }

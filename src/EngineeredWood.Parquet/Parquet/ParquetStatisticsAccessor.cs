@@ -107,7 +107,18 @@ public sealed class ParquetStatisticsAccessor
     private static LiteralValue? DecodeMin(ColumnDescriptor desc, Statistics stats)
     {
         var bytes = stats.MinValue ?? FallbackBytes(desc, stats.Min);
-        return bytes is null ? null : Decode(desc, bytes, isMax: false);
+        if (bytes is null)
+            return null;
+
+        // A NaN MINIMUM is trustworthy only when the maximum is NaN too. Under SQL's order (#204)
+        // that pair means every value is NaN, and so it does under .NET's opposite order -- the two
+        // agree on exactly this shape. A NaN min beside a FINITE max is the signature of a writer
+        // using .NET's order, where the pair reads min > max; treating it as a real lower bound
+        // would prune `col < 5.0` away from a file whose values genuinely are below 5.0.
+        if (IsNaNBound(desc, bytes) && !IsNaNBound(desc, stats.MaxValue ?? FallbackBytes(desc, stats.Max)))
+            return null;
+
+        return Decode(desc, bytes, isMax: false);
     }
 
     private static LiteralValue? DecodeMax(ColumnDescriptor desc, Statistics stats)
@@ -115,6 +126,15 @@ public sealed class ParquetStatisticsAccessor
         var bytes = stats.MaxValue ?? FallbackBytes(desc, stats.Max);
         return bytes is null ? null : Decode(desc, bytes, isMax: true);
     }
+
+    /// <summary>Whether a raw FLOAT/DOUBLE bound holds a NaN.</summary>
+    private static bool IsNaNBound(ColumnDescriptor desc, byte[]? bytes) =>
+        bytes is not null && desc.PhysicalType switch
+        {
+            PhysicalType.Float => bytes.Length >= 4 && float.IsNaN(MemoryMarshal.Read<float>(bytes)),
+            PhysicalType.Double => bytes.Length >= 8 && double.IsNaN(MemoryMarshal.Read<double>(bytes)),
+            _ => false,
+        };
 
     /// <summary>
     /// The legacy <c>min</c>/<c>max</c> fields used unsigned byte comparison,
@@ -160,28 +180,28 @@ public sealed class ParquetStatisticsAccessor
         };
     }
 
-    /// <summary>
-    /// Decodes a FLOAT bound, returning <see langword="null"/> for a NaN bound.
-    /// A NaN min/max (possible only under IEEE 754 total order, when every value
-    /// is NaN) is not a usable range endpoint, so the evaluator treats it as
-    /// unknown rather than pruning on it.
-    /// </summary>
-    private static LiteralValue? DecodeFloat(byte[] bytes)
-    {
-        if (bytes.Length < 4) return null;
-        float value = MemoryMarshal.Read<float>(bytes);
-        if (float.IsNaN(value)) return null;
-        return LiteralValue.Of(value);
-    }
+    /// <summary>Decodes a FLOAT bound, NaN included.</summary>
+    /// <remarks>
+    /// A NaN bound used to be dropped, on the reading that it "is not a usable range endpoint".
+    /// It is one: NaN sits at the TOP of SQL's order (#204), so a NaN MAXIMUM is simply the weakest
+    /// upper bound there is -- it can never make a predicate prune, only stop it. Dropping it cost
+    /// the OTHER bound too, since the evaluator gives up on a pair with a missing end, so a row
+    /// group with a NaN in it lost all of its pruning including the `&lt;` and `=` cases the finite
+    /// minimum fully supports.
+    /// <para>
+    /// This is not a hypothetical shape. Parquet's spec says NaN must not be written to min/max,
+    /// but parquet-mr 1.15.2 -- Spark's writer -- does it anyway: measured, a DOUBLE column holding
+    /// <c>[3.0, NaN]</c> comes out as <c>min_value = 3.0, max_value = NaN</c>, in Spark's own order,
+    /// and it records no <c>nan_count</c> at all. The min side is guarded separately; see
+    /// <see cref="DecodeMin"/>.
+    /// </para>
+    /// </remarks>
+    private static LiteralValue? DecodeFloat(byte[] bytes) =>
+        bytes.Length < 4 ? null : (LiteralValue?)LiteralValue.Of(MemoryMarshal.Read<float>(bytes));
 
-    /// <summary>Decodes a DOUBLE bound, returning <see langword="null"/> for a NaN bound.</summary>
-    private static LiteralValue? DecodeDouble(byte[] bytes)
-    {
-        if (bytes.Length < 8) return null;
-        double value = MemoryMarshal.Read<double>(bytes);
-        if (double.IsNaN(value)) return null;
-        return LiteralValue.Of(value);
-    }
+    /// <summary>Decodes a DOUBLE bound, NaN included. See <see cref="DecodeFloat"/>.</summary>
+    private static LiteralValue? DecodeDouble(byte[] bytes) =>
+        bytes.Length < 8 ? null : (LiteralValue?)LiteralValue.Of(MemoryMarshal.Read<double>(bytes));
 
     private static LiteralValue? DecodeInt32(byte[] bytes, LogicalType? logical)
     {

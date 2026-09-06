@@ -449,6 +449,41 @@ When statistics are missing or the accessor returns null, the result is
 `Unknown`. When `IsMinExact` or `IsMaxExact` is false (truncated statistics),
 range comparisons at the boundary conservatively return `Unknown`.
 
+### Float bounds and the NaN they may not mention
+
+The table above assumes the bounds describe every value. On a FLOAT or DOUBLE
+column they may not, because producers disagree about what a float bound means:
+
+| producer | a column holding `[3.0, NaN]` | measured |
+|---|---|---|
+| Parquet spec | `min = max = 3.0`, NaN only in `nan_count` | â€” |
+| EngineeredWood (Parquet) | `min = max = 3.0`, `nan_count = 1` | â€” |
+| Vortex | `min = max = 3.0`, `nan_count = 1` | â€” |
+| parquet-mr 1.15.2 | `min = 3.0`, **`max = NaN`**, no `nan_count` | Spark 4.0 |
+| Spark (Delta stats) | `min = 3.0`, `max = "NaN"` | Spark 4.0 |
+| delta-rs 1.6.2 (Delta stats) | `min = max = 3.0`, NaN dropped | delta-rs 1.6.2 |
+
+Nothing in a file says which wrote it, so **a finite maximum does not rule out a
+NaN**. NaN sits at the top of SQL's order (#204), so `col > 5.0` is TRUE of a row
+the bounds place at 3.0 â€” an `AlwaysFalse` drawn from that maximum skips a row
+group holding a match.
+
+The evaluator therefore reconciles every definite answer with the answer the
+predicate gives for a NaN row, unless `INanCountAccessor` reports a count of
+zero. Which conclusions survive is per operator, not all-or-nothing:
+
+| predicate | `AlwaysFalse` | `AlwaysTrue` |
+|---|---|---|
+| `col > v`, `col >= v` | lost (NaN is above every bound) | kept |
+| `col < v`, `col <= v` | kept (NaN is below nothing) | lost |
+| `col = v`, `col IN (â€¦)` | kept (NaN equals only NaN) | lost |
+| `col <> v` | lost | kept |
+
+So equality and `IN` keep pruning float columns unconditionally, and half of the
+ordering comparisons do too. Formats that record a NaN count â€” Parquet and Vortex
+â€” keep all of it; Delta's stats have no such field, and Iceberg's
+`nan_value_counts` is not yet read, so both are conservative on `>` and `>=`.
+
 ## `EngineeredWood.Expressions.Arrow` — Row Evaluator
 
 Walks an `Expression` tree against a `RecordBatch`, producing typed Arrow arrays

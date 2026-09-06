@@ -643,8 +643,11 @@ public class StatisticsEvaluatorTests
     [Fact]
     public void FloatAgainstDouble_StillPrunes()
     {
-        // A float widens to double exactly, so nothing is given up here either.
-        var stats = new TestStats().With("f", min: LiteralValue.Of(1.5f), max: LiteralValue.Of(2.5f));
+        // A float widens to double exactly, so nothing is given up here either. The nan_count says
+        // no NaN hides above the maximum, which is what leaves the widening as the only question
+        // this test is asking (#214).
+        var stats = new TestStats().With(
+            "f", min: LiteralValue.Of(1.5f), max: LiteralValue.Of(2.5f), nanCount: 0);
 
         Assert.Equal(FilterResult.AlwaysFalse,
             Eval(Compare("f", ComparisonOperator.GreaterThan, LiteralValue.Of(10d)), stats));
@@ -694,12 +697,143 @@ public class StatisticsEvaluatorTests
                 new UnboundReference("g"), ComparisonOperator.GreaterThan,
                 new LiteralExpression(LiteralValue.Of(5.0d))), stats));
 
-        // And a finite maximum still prunes, so the rule has not been blunted.
+        // And a finite maximum still prunes, so the rule has not been blunted -- as long as the NaN
+        // count says there is no NaN hiding behind it (#214; the nanCount: 0 is load-bearing).
         var finite = new TestStats().With(
-            "h", min: LiteralValue.Of(1.0d), max: LiteralValue.Of(4.0d), nullCount: 0);
+            "h", min: LiteralValue.Of(1.0d), max: LiteralValue.Of(4.0d), nullCount: 0, nanCount: 0);
         Assert.Equal(FilterResult.AlwaysFalse,
             Eval(new ComparisonPredicate(
                 new UnboundReference("h"), ComparisonOperator.GreaterThan,
                 new LiteralExpression(LiteralValue.Of(5.0d))), finite));
+    }
+
+    // â”€â”€ A NaN the bounds do not mention (#214) â”€â”€
+    //
+    // Formats that follow Parquet's spec never write a NaN to min/max, so a file holding
+    // [1.0, NaN] presents as an ordinary min = max = 1.0. Every conclusion below is checked
+    // against the row those bounds do not describe.
+
+    private static readonly LiteralValue Five = LiteralValue.Of(5.0d);
+    private static readonly LiteralValue NaN = LiteralValue.Of(double.NaN);
+
+    /// <summary>A float column whose bounds are finite and whose NaN count is not recorded.</summary>
+    private static TestStats HiddenNaN(double min = 1.0, double max = 4.0, long? nullCount = 0) =>
+        new TestStats().With("g",
+            min: LiteralValue.Of(min), max: LiteralValue.Of(max), nullCount: nullCount);
+
+    /// <summary>The same bounds, with the count that proves no NaN is there.</summary>
+    private static TestStats NoNaN(double min = 1.0, double max = 4.0, long? nullCount = 0) =>
+        new TestStats().With("g",
+            min: LiteralValue.Of(min), max: LiteralValue.Of(max), nullCount: nullCount, nanCount: 0);
+
+    [Fact]
+    public void GreaterThan_HiddenNaNAboveTheMaximum_CannotPrune()
+    {
+        // The headline case. `NaN > 5.0` is TRUE, so a file whose maximum is 4.0 may still hold a
+        // matching row. Pruning it on the strength of the maximum loses that row silently.
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.GreaterThan("g", Five), HiddenNaN()));
+        Assert.Equal(FilterResult.Unknown,
+            Eval(Expressions.GreaterThanOrEqual("g", Five), HiddenNaN()));
+
+        // A recorded zero is what turns the pruning back on.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.GreaterThan("g", Five), NoNaN()));
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(Expressions.GreaterThanOrEqual("g", Five), NoNaN()));
+    }
+
+    [Fact]
+    public void LessThan_HiddenNaNIsBelowNothing_StillPrunes()
+    {
+        // The other direction survives untouched, which is the point of answering per operator
+        // rather than refusing to prune float columns at all: `NaN < 5.0` is FALSE, so a minimum
+        // above the predicate still proves the file cannot match.
+        var above = HiddenNaN(min: 6.0, max: 8.0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.LessThan("g", Five), above));
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.LessThanOrEqual("g", Five), above));
+
+        // And AlwaysTrue is the half that goes: every value being under 5.0 says nothing about a NaN.
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.LessThan("g", Five), HiddenNaN()));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.LessThan("g", Five), NoNaN()));
+    }
+
+    [Fact]
+    public void GreaterThan_AlwaysTrueSurvivesAHiddenNaN()
+    {
+        // Mirror image: a NaN row satisfies `> 5.0` too, so an AlwaysTrue drawn from a minimum
+        // above the predicate needs no NaN count.
+        Assert.Equal(FilterResult.AlwaysTrue,
+            Eval(Expressions.GreaterThan("g", Five), HiddenNaN(min: 6.0, max: 8.0)));
+    }
+
+    [Fact]
+    public void Equal_HiddenNaNMatchesNothing_StillPrunes()
+    {
+        // Equality keeps its pruning, which matters -- it is the commonest predicate there is.
+        // A NaN equals nothing but another NaN, so a value outside finite bounds is still absent.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("g", Five), HiddenNaN()));
+
+        // `g = NaN` is the mirror: the bounds cannot rule the NaN row in either, so it stays open.
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("g", NaN), HiddenNaN()));
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("g", NaN), NoNaN()));
+
+        // And `g <> NaN` is TRUE of every value the bounds describe and FALSE of the one they do
+        // not, which is exactly when a definite answer has to be given up.
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.NotEqual("g", NaN), HiddenNaN()));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.NotEqual("g", NaN), NoNaN()));
+    }
+
+    [Fact]
+    public void Equal_AlwaysTrueNeedsTheNaNRuledOut()
+    {
+        // The one equality conclusion a hidden NaN breaks: min == max == 5.0 says every value the
+        // bounds cover is 5.0, and a NaN row is not covered.
+        var pinned = new TestStats().With(
+            "g", min: Five, max: Five, nullCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("g", Five), pinned));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.NotEqual("g", Five), pinned));
+
+        var counted = new TestStats().With(
+            "g", min: Five, max: Five, nullCount: 0, nanCount: 0);
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.Equal("g", Five), counted));
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.NotEqual("g", Five), counted));
+    }
+
+    [Fact]
+    public void In_HiddenNaN_PrunesUnlessTheListNamesANaN()
+    {
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(Expressions.In("g", Five, LiteralValue.Of(6.0d)), HiddenNaN()));
+
+        // ...but a NaN in the list is a value the hidden row could match.
+        Assert.Equal(FilterResult.Unknown,
+            Eval(Expressions.In("g", Five, NaN), HiddenNaN()));
+        Assert.Equal(FilterResult.AlwaysFalse,
+            Eval(Expressions.In("g", Five, NaN), NoNaN()));
+    }
+
+    [Fact]
+    public void HiddenNaN_AppliesToEveryFloatWidthAndNoOthers()
+    {
+        // Float32 gets the same treatment as Float64...
+        var f32 = new TestStats().With(
+            "g", min: LiteralValue.Of(1.0f), max: LiteralValue.Of(4.0f), nullCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.GreaterThan("g", Five), f32));
+
+        // ...and an integer column is untouched, because its order has no NaN in it. Without this
+        // the guard would cost every ordinary column its pruning.
+        var ints = new TestStats().With("x", min: 10, max: 20, nullCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.GreaterThan("x", 25), ints));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.GreaterThan("x", 5), ints));
+    }
+
+    [Fact]
+    public void NaNInTheMaximum_NeedsNoNaNCount()
+    {
+        // A format that DOES record the NaN -- Spark's Delta writer puts it in maxValues -- already
+        // says everything the guard would add, so nothing is lost by not knowing a count. An all-NaN
+        // column still proves `g < 5.0` cannot match.
+        var allNaN = new TestStats().With("g", min: NaN, max: NaN, nullCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.LessThan("g", Five), allNaN));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.GreaterThan("g", Five), allNaN));
     }
 }
