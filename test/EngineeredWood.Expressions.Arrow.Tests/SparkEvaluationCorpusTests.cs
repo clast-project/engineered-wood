@@ -102,6 +102,25 @@ public sealed class SparkEvaluationCorpusTests
         ["s < a"] = "#180: Spark refuses string/number comparison under ANSI; we return a value",
         ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
 
+        // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
+        // Spark reaches a decimal from a double through Double.toString, which did not produce
+        // the shortest representation before JDK 19 (JDK-4511638). This corpus was gathered on
+        // the JDK named by `java_version` beside `conf`; .NET renders the shortest form, so these
+        // three land in the band where the two disagree. Each pair round-trips to the SAME
+        // double -- they are two spellings of one value, not two values.
+        //
+        // Measured over ~1e6 doubles: the two renderings differ on 2.4%, all of them needing 17
+        // or 18 digits where the shortest form needs 16 or 17, and on NONE past 7.9e28. #244
+        // deliberately documents this rather than resolving it: matching would mean
+        // reimplementing a JDK algorithm that Java itself has replaced. Re-harvesting on JDK 19
+        // or later should make all three vanish, and the test will then ask for their removal.
+        ["CAST(CAST(1e23 AS DOUBLE) AS DECIMAL(38,0))"] =
+            "#244: JDK 17 renders 9.999999999999999E22 where the shortest form is 1E23",
+        ["CAST(CAST(2.7703798343611187E17 AS DOUBLE) AS DECIMAL(38,0))"] =
+            "#244: JDK 17 renders 18 digits where the shortest form needs 17",
+        ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))"] =
+            "#244: JDK 17 renders 17 digits where the shortest form needs 16",
+
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
         ["round(g, 2)"] = "#182: function not registered",
         ["greatest(a, b)"] = "#182: function not registered",
@@ -175,6 +194,25 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
              + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"] =
                 "#173: the parser cannot read a 38-digit literal, so this never reaches evaluation",
+            // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
+            // Spark reaches a decimal from a double through Double.toString, which did not produce
+            // the shortest representation before JDK 19 (JDK-4511638). This corpus was gathered on
+            // the JDK named by `java_version` beside `conf`; .NET renders the shortest form, so these
+            // three land in the band where the two disagree. Each pair round-trips to the SAME
+            // double -- they are two spellings of one value, not two values.
+            //
+            // Measured over ~1e6 doubles: the two renderings differ on 2.4%, all of them needing 17
+            // or 18 digits where the shortest form needs 16 or 17, and on NONE past 7.9e28. #244
+            // deliberately documents this rather than resolving it: matching would mean
+            // reimplementing a JDK algorithm that Java itself has replaced. Re-harvesting on JDK 19
+            // or later should make all three vanish, and the test will then ask for their removal.
+            ["CAST(CAST(1e23 AS DOUBLE) AS DECIMAL(38,0))"] =
+                "#244: JDK 17 renders 9.999999999999999E22 where the shortest form is 1E23",
+            ["CAST(CAST(2.7703798343611187E17 AS DOUBLE) AS DECIMAL(38,0))"] =
+                "#244: JDK 17 renders 18 digits where the shortest form needs 17",
+            ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))"] =
+                "#244: JDK 17 renders 17 digits where the shortest form needs 16",
+
             // Blocked by #173 rather than by the cast: SparkLiteral.ParseDecimal cannot read a
             // 31-digit literal, so these never reach evaluation. `CAST(d4 AS INT)` measures the
             // same rule through a column and does pass.

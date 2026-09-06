@@ -324,6 +324,42 @@ internal static class SparkArrays
                 $"{array.Data.DataType.Name} reached Render with no exact value"),
     };
 
+    /// <summary>
+    /// The shortest decimal text that round-trips <paramref name="value"/>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Deliberately not <c>ToString("R")</c></b>, which is the shortest form only on .NET Core.
+    /// Measured: on net472 the double 0.3333333333333333 renders as seventeen digits there and as
+    /// sixteen on net10.0, which made <c>CAST(g AS DECIMAL(38,20))</c> answer differently per
+    /// target framework — a cast is not allowed to depend on which build of this library is
+    /// loaded. The G15/G16/G17 ladder is the portable spelling of the same thing, and produces the
+    /// identical value on every target: checked against <c>"R"</c> over ~1e6 doubles on net10.0
+    /// with no disagreement at all.
+    /// <para>
+    /// This is what Spark's <c>BigDecimal.valueOf(d)</c> reads — up to the JVM's own version of
+    /// the question, since <c>Double.toString</c> did not produce the shortest form before JDK 19.
+    /// See <c>SparkFunctionRegistry.CastFloatingToDecimal</c> and #244.
+    /// </para>
+    /// <para>
+    /// <see cref="Render"/> still uses <c>"R"</c> and so still varies by target framework. It is
+    /// not simply this method with a different caller: it renders a float AS a float, where the
+    /// decimal cast renders the widened double, and what Spark answers for
+    /// <c>CAST(&lt;double&gt; AS STRING)</c> has not been measured. #248.
+    /// </para>
+    /// </remarks>
+    public static string ShortestRoundTrip(double value)
+    {
+        for (var digits = 15; digits < 17; digits++)
+        {
+            var text = value.ToString($"G{digits}", Invariant);
+            if (double.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value)
+                return text;
+        }
+
+        // Seventeen significant digits always round-trip a double, so there is nothing to check.
+        return value.ToString("G17", Invariant);
+    }
+
     /// <summary>Whether an integral Arrow type is narrower than <c>int</c>.</summary>
     /// <remarks>Spark reports overflow of those under a different error class.</remarks>
     public static bool NarrowerThanInt(IArrowType type) => type is Int8Type or Int16Type;

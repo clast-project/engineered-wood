@@ -955,7 +955,17 @@ def cmd_expr_oracle(args):
 
         results.append(entry)
 
-    return {"conf": applied, "results": results}
+    # THE JVM IS PART OF THE ANSWER for anything that renders a double. Spark converts a double to
+    # a decimal through BigDecimal.valueOf, which is new BigDecimal(Double.toString(d)) -- and
+    # Double.toString did not produce the shortest repr before JDK 19 (JDK-4511638). Measured
+    # against this JDK: 2.4% of doubles render differently from the shortest form, so a corpus
+    # gathered on 17 and one gathered on 21 are not the same corpus. See #244.
+    return {
+        "conf": applied,
+        "java_version": spark._jvm.System.getProperty("java.version"),
+        "spark_version": spark.version,
+        "results": results,
+    }
 
 
 def cmd_blind_append_ground_truth(args):

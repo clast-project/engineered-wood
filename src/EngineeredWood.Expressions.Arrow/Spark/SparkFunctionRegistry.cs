@@ -719,12 +719,12 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         if (source is StringArray strings)
             return CastStringToDecimal(strings, target, rowCount, raising);
 
-        // What is left keeps the System.Decimal path below. A boolean is 0 or 1 and a temporal is
-        // epoch seconds, so neither can reach that path's ceiling — but FLOATING POINT can, and
-        // #244 is the gap: measured, CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(38,0)) is 1e30 in Spark
-        // and NUMERIC_VALUE_OUT_OF_RANGE here. It is not the string gap with a different source
-        // type, which is why it is not fixed alongside it: Spark reaches the decimal through
-        // Double.toString, whose answer is a property of the JVM rather than of the value.
+        // Floating point goes through its RENDERING, which is what Spark converts. #244.
+        if (source.Data.DataType is FloatType or DoubleType)
+            return CastFloatingToDecimal(source, target, rowCount, raising);
+
+        // What is left keeps the System.Decimal path below, and cannot reach its ~7.9e28 ceiling:
+        // a boolean is 0 or 1 and a temporal is epoch seconds.
         var builder = new Decimal128Array.Builder(target);
 
         for (var i = 0; i < rowCount; i++)
@@ -765,6 +765,74 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         }
 
         return builder.Build();
+    }
+
+    /// <summary>
+    /// Casts a floating-point column to a decimal, through Spark's own rendering of the value.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Spark converts the RENDERING, not the binary expansion.</b> It reaches a decimal through
+    /// <c>BigDecimal.valueOf(d)</c>, which is <c>new BigDecimal(Double.toString(d))</c>, so the
+    /// answer is the shortest decimal that round-trips the double rather than the exact binary
+    /// value. The float row of the corpus is the proof: <c>1e30f</c> widens to the double
+    /// 1.0000000150474662E30 and Spark answers those digits, where the exact value of the float
+    /// and the digits of <c>1e30</c> are both something else.
+    /// </para>
+    /// <para>
+    /// This replaces a <see cref="decimal"/> conversion that was wrong in two directions. Past
+    /// <see cref="decimal"/>'s ~7.9e28 there was no exact form at all and the cast was REFUSED —
+    /// the gap #244 was filed for. Inside it, <c>(decimal)double</c> rounds to 15 significant
+    /// digits where Spark keeps up to 17, so it quietly lost digits: measured over ~1e6 doubles,
+    /// it disagreed with Spark's rendering on 93% of the values a decimal could hold at all.
+    /// </para>
+    /// <para>
+    /// <b>The JVM is part of the answer here, and #244 held the fix back until that was
+    /// measured.</b> <c>Double.toString</c> did not produce the shortest representation before
+    /// JDK 19, so a Spark on 17 and one on 21 do not agree. Measured against this corpus's JDK
+    /// over ~1e6 doubles: they differ on 2.4% of them — needing 17 or 18 digits where the
+    /// shortest form needs 16 or 17 — and on NONE of the 130,152 sampled past 7.9e28, which is
+    /// the whole of the range the refusal covered. So the fix lands where the JVM does not
+    /// matter, and shrinks the disagreement below it from 93% to that 2.4% band.
+    /// <c>java_version</c> now sits beside <c>conf</c> in the fixture, and the three corpus rows
+    /// that land in the band are declared differences rather than a remark.
+    /// </para>
+    /// </remarks>
+    private IArrowArray CastFloatingToDecimal(
+        IArrowArray source, Decimal128Type target, int rowCount, bool raising)
+    {
+        var mantissas = new Int128?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            // Widened for a float source, because that is what Spark renders — the corpus's
+            // 1e30f row answers the double's digits and not the float's.
+            if (SparkArrays.ReadDouble(source, i) is not { } value)
+                continue;
+
+            // NaN and the infinities yield NULL rather than raising, EVEN UNDER ANSI. Measured,
+            // and it is the one refusal on this path that is not an error.
+            if (double.IsNaN(value) || double.IsInfinity(value))
+                continue;
+
+            var text = SparkArrays.ShortestRoundTrip(value);
+
+            if (SparkDecimalText.TryRead(text, target, out var unscaled) == SparkDecimalText.Result.Ok)
+            {
+                mantissas[i] = unscaled;
+                continue;
+            }
+
+            if (!raising) continue;
+
+            // Every failure here is NUMERIC_VALUE_OUT_OF_RANGE, including the one a STRING source
+            // reports as NUMERIC_OUT_OF_SUPPORTED_RANGE: measured, CAST(1e39 AS DOUBLE) to a
+            // DECIMAL(38,0) names the first. The two sources reach the decimal by different
+            // routes and only the string one meets Spark's digit-count fast-fail.
+            throw SparkEvaluationException.NumericValueOutOfRange(text, target);
+        }
+
+        return SparkWideDecimals.Build(mantissas, target, rowCount);
     }
 
     /// <summary>Casts a string column to a decimal type, reading the text exactly.</summary>

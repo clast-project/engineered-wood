@@ -65,7 +65,9 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 # Which groups are worth asking twice. Every expression here is one whose answer the ANSI switch
 # can change; the rest of the corpus would return the same answer under both and doubling it would
 # only make the fixture harder to read.
-LEGACY_GROUPS = ("wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow")
+LEGACY_GROUPS = (
+    "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
+    "double-to-decimal")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -520,6 +522,62 @@ GROUPS = {
         "CAST(a AS BIGINT)",
         "CAST(g AS INT)",
     ],
+    "double-to-decimal": [
+        # Issue #244. A double past System.Decimal's ~7.9e28 was refused where Spark answers, and
+        # the issue held the fix back until the JVM's part in it was settled: Spark converts a
+        # double through BigDecimal.valueOf, which is new BigDecimal(Double.toString(d)), and
+        # Double.toString did not produce the shortest representation before JDK 19.
+        #
+        # MEASURED, comparing this JDK's Double.toString against the shortest form over ~1e6
+        # doubles: they differ on 2.4% -- and on NONE of the 130,152 sampled past 7.9e28. The
+        # JVM matters, and it does not matter anywhere in this issue's range. `java_version` now
+        # sits next to `conf` so the claim stays checkable.
+
+        # The values from the issue. A rendering and not a binary expansion: the FLOAT row is the
+        # proof, since 1e30f widens to 1.0000000150474662E30 and Spark answers those digits.
+        "CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(-1e30 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(38,2))",
+        "CAST(CAST(1e30 AS FLOAT) AS DECIMAL(38,0))",
+        "CAST(CAST(1e39 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(1e37 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(-1e37 AS DOUBLE) AS DECIMAL(38,0))",
+
+        # Below the ceiling, where the value already had an answer -- and where the answer was
+        # wrong in a quieter way. (decimal)double rounds to 15 significant digits while Spark
+        # keeps up to 17, so these are the shape that was silently losing digits.
+        "CAST(CAST(0.1 AS DOUBLE) AS DECIMAL(38,30))",
+        "CAST(CAST(1.0E-3 AS DOUBLE) AS DECIMAL(38,20))",
+        "CAST(CAST(2.7703798343611187E17 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(0.3333333333333333 AS DOUBLE) AS DECIMAL(38,20))",
+
+        # THE JDK BAND. Both of these need 17 digits under this JDK's Double.toString and 16 under
+        # the shortest form, so they are the cases where a Spark on 17 and a Spark on 21 disagree
+        # -- recorded so the divergence is on the record rather than in a comment.
+        "CAST(CAST(1e23 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))",
+
+        # Values with no decimal at all.
+        "CAST(CAST('NaN' AS DOUBLE) AS DECIMAL(10,2))",
+        "CAST(CAST('Infinity' AS DOUBLE) AS DECIMAL(10,2))",
+        "CAST(CAST('-Infinity' AS DOUBLE) AS DECIMAL(38,0))",
+
+        # Rounding, which the rendering hands to the same rescale every other source uses.
+        "CAST(CAST(2.5 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(-2.5 AS DOUBLE) AS DECIMAL(38,0))",
+        "CAST(CAST(1.45 AS DOUBLE) AS DECIMAL(38,1))",
+        # Below the target's last place entirely.
+        "CAST(CAST(1e-30 AS DOUBLE) AS DECIMAL(38,2))",
+
+        # A float source at ordinary magnitudes, where the widening is what decides the digits.
+        "CAST(CAST(0.1 AS FLOAT) AS DECIMAL(38,20))",
+        "CAST(f AS DECIMAL(38,10))",
+        "CAST(g AS DECIMAL(38,10))",
+
+        # Narrow targets, so the refusal is about the target rather than the ceiling.
+        "CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(10,0))",
+        "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))",
+    ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",
@@ -585,6 +643,11 @@ def main():
                     "Answers come from Spark and are only valid under `conf`.",
         "source": "delta-spark interop tier (pyspark 4.0.1)",
         "conf": result["conf"],
+        # The JVM belongs next to the conf, not in the prose. Anything that renders a double goes
+        # through Double.toString, which did not produce the shortest representation before JDK 19
+        # -- so two corpora gathered on different JDKs are two different claims. #244.
+        "java_version": result["java_version"],
+        "spark_version": result["spark_version"],
         "schema": SCHEMA,
         "rows": ROWS,
         "groups": groups,
@@ -592,6 +655,7 @@ def main():
             "_comment": "The SAME expressions under ansi off, gathered in a separate session and "
                         "kept in a separate section. Valid only under the `conf` below.",
             "conf": legacy["conf"],
+            "java_version": legacy["java_version"],
             "groups": {name: [legacy_by_expr[e] for e in GROUPS[name] if e in legacy_by_expr]
                        for name in LEGACY_GROUPS},
         },
@@ -608,6 +672,7 @@ def main():
     print(f"{total} expressions -> {FIXTURE}")
     print(f"  parse ok: {parsed}/{total}   type ok: {typed}/{total}")
     print(f"  legacy (ansi off): {len(legacy_exprs)} expressions")
+    print(f"  spark {result['spark_version']} on java {result['java_version']}")
 
 
 if __name__ == "__main__":
