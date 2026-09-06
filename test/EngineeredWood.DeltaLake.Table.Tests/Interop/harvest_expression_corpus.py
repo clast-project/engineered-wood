@@ -633,6 +633,58 @@ GROUPS = {
         # And through concat, which casts implicitly and is how a constraint usually meets one.
         "concat(s, g)",
     ],
+    "wide-decimal-literals": [
+        # Issue #173. SparkLiteral.ParseDecimal goes through decimal.TryParse, so a literal wider
+        # than System.Decimal fails to parse — while a decimal(38,0) COLUMN evaluates fine across
+        # the whole range. The seam is the parser alone.
+        #
+        # Bare literals, so `type` answers what Spark INFERS for one rather than what an
+        # expression around it resolves to. That inference is the thing the fallback must not
+        # guess: where precision comes from, where scale comes from, and where it stops.
+
+        # 38 digits, which is as wide as a Spark decimal goes.
+        "12345678901234567890123456789012345678",
+        "-12345678901234567890123456789012345678",
+        # 39, which is one past it.
+        "123456789012345678901234567890123456789",
+        "-123456789012345678901234567890123456789",
+
+        # A fraction, so the scale is not zero, at and past the 38-digit total.
+        "1234567890123456789012345678901234.5678",
+        "12345678901234567890123456789012345.6789",
+        "0.12345678901234567890123456789012345678",
+        "0.123456789012345678901234567890123456789",
+
+        # Around System.Decimal's own ceiling, which is where the current parse gives up: its
+        # largest value, the next integer up, and the first width past its 28-29 digits.
+        "79228162514264337593543950335",
+        "79228162514264337593543950336",
+        "12345678901234567890123456789",
+
+        # Shapes that decide precision and scale separately from the value.
+        "1.50",
+        "100",
+        "0.0000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000001",
+
+        # Scale counts toward precision as well as digits: Spark's rule is
+        # max(digits, scale) <= 38, so a value with ONE significant digit can still be too wide if
+        # its scale is. Asked because the first cut of #173 checked only the digit count and let
+        # 1e-45BD through as a scale-45 decimal that no Spark type can hold.
+        "0.00000000000000000000000000000000000001",
+        "0.000000000000000000000000000000000000001",
+        "1e-38BD",
+        "1e-39BD",
+        "1e-45BD",
+        # The BD suffix, which asks for a decimal explicitly.
+        "12345678901234567890123456789012345678BD",
+        "1.5BD",
+
+        # And in the expressions the seam actually shows up in.
+        "d4 + 12345678901234567890123456789012345678",
+        "d4 = 1000000000000000000000000000000",
+        "12345678901234567890123456789012345678 + 1",
+    ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",

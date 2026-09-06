@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Globalization;
+using System.Numerics;
 using System.Text;
 
 namespace EngineeredWood.Expressions.Sql;
@@ -51,7 +52,7 @@ internal static class SparkLiteral
             case "D":
                 return LiteralValue.Of(ParseDouble(digits, sql, position));
             case "BD":
-                return LiteralValue.Of(ParseDecimal(digits, sql, position));
+                return Decimal(digits, sql, position);
 
             // LiteralValue has no 8- or 16-bit integer kind, and silently widening to int would
             // change how the value coerces and overflows. Refusing is the honest answer.
@@ -67,12 +68,17 @@ internal static class SparkLiteral
             return LiteralValue.Of(ParseDouble(digits, sql, position));
 
         if (digits.IndexOf('.') >= 0)
-            return LiteralValue.Of(ParseDecimal(digits, sql, position));
+            return Decimal(digits, sql, position);
 
         if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asInt))
             return LiteralValue.Of(asInt);
 
-        return LiteralValue.Of(ParseLong(digits, sql, position));
+        if (long.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asLong))
+            return LiteralValue.Of(asLong);
+
+        // Spark's ladder does not stop at bigint: an integral literal too wide for one becomes a
+        // DECIMAL, which is why a 38-digit literal is a decimal(38,0) rather than an error. #173.
+        return Decimal(digits, sql, position);
     }
 
     /// <summary>
@@ -339,10 +345,132 @@ internal static class SparkLiteral
             ? value
             : throw Overflow(text, "an integer", sql, position);
 
-    private static decimal ParseDecimal(string text, string sql, int position) =>
-        decimal.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
-            ? value
-            : throw Overflow(text, "a decimal", sql, position);
+    /// <summary>
+    /// Parses a decimal literal exactly, at whatever width Spark allows one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Not <c>decimal.TryParse</c>, and not because it refuses.</b> It refuses a literal too
+    /// LARGE for <see cref="decimal"/> — and it silently ROUNDS one that is merely too precise,
+    /// reporting success. Measured:
+    /// <c>0.12345678901234567890123456789012345678</c> comes back as
+    /// <c>0.1234567890123456789012345679</c> and <c>TryParse</c> returns true, so the literal was
+    /// quietly wrong rather than refused. Keying the fallback off a failed parse would have left
+    /// that half of #173 in place.
+    /// </para>
+    /// <para>
+    /// So the digits decide. The text is split into an unscaled integer and a scale — which is
+    /// what the rest of the pipeline speaks anyway, since #131 put arithmetic, casts, unification
+    /// and equality on exactly that pair — and <see cref="decimal"/> is used only where it is
+    /// EXACT: a scale it can carry, and an unscaled value inside its 96 bits.
+    /// </para>
+    /// </remarks>
+    private static LiteralValue Decimal(string text, string sql, int position)
+    {
+        var (unscaled, scale) = SplitDecimal(text, sql, position);
+
+        // Precision counts the SCALE as well as the digits, because a Spark decimal requires
+        // 0 <= scale <= precision <= 38: a value with a single significant digit is still too wide
+        // if its scale is. Measured — `1e-38BD` is a decimal(38,38) and `1e-39BD` is refused,
+        // by Spark's PARSER rather than at analysis, which is where this refuses too. Checking
+        // only the digit count let `1e-45BD` through as a scale-45 decimal no Spark type holds.
+        var precision = Math.Max(Precision(unscaled), scale);
+
+        if (precision > MaxPrecision)
+            throw new SparkSqlParseException(
+                $"'{text}' needs a precision of {precision}, and no decimal is wider than {MaxPrecision}",
+                sql, position);
+
+        // System.Decimal holds a scale up to 28 and an unscaled value inside 96 bits. Inside that
+        // it is exact and is the kind the rest of the library expects for an ordinary literal;
+        // outside it, the high-precision kind carries the same pair losslessly.
+        return scale <= 28 && BigInteger.Abs(unscaled) <= MaxDecimalUnscaled
+            ? LiteralValue.Of(ToDecimal(unscaled, scale))
+            : LiteralValue.HighPrecisionDecimalOf(unscaled, scale);
+    }
+
+    /// <summary>Spark's widest decimal, and so the widest literal one can be written as.</summary>
+    private const int MaxPrecision = 38;
+
+    /// <summary>2^96 - 1, the largest unscaled value <see cref="decimal"/> carries.</summary>
+    private static readonly BigInteger MaxDecimalUnscaled =
+        BigInteger.Parse("79228162514264337593543950335", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Splits literal text into the unscaled integer and scale that denote it exactly.
+    /// </summary>
+    /// <remarks>
+    /// An exponent is handled because it can reach here: the <c>BD</c> suffix is stripped before
+    /// the exponent check above, so <c>1e3BD</c> arrives as <c>1e3</c> asking to be a decimal.
+    /// A negative resulting scale is folded into the integer rather than kept, because a decimal
+    /// has no negative scale — <c>1e3BD</c> is 1000 at scale 0.
+    /// </remarks>
+    private static (BigInteger Unscaled, int Scale) SplitDecimal(string text, string sql, int position)
+    {
+        var exponent = 0;
+        var e = text.IndexOf('E');
+        if (e < 0) e = text.IndexOf('e');
+
+        if (e >= 0)
+        {
+            if (!int.TryParse(
+                    text.Substring(e + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out exponent))
+            {
+                throw Overflow(text, "a decimal", sql, position);
+            }
+
+            text = text.Substring(0, e);
+        }
+
+        var dot = text.IndexOf('.');
+        if (dot >= 0)
+        {
+            exponent -= text.Length - dot - 1;
+            text = text.Remove(dot, 1);
+        }
+
+        // The tokenizer has already established that what is left is digits, possibly none of
+        // them — `.5` and `1.` are both literals Spark accepts.
+        var unscaled = text.Length == 0
+            ? BigInteger.Zero
+            : BigInteger.Parse(text, NumberStyles.Integer, CultureInfo.InvariantCulture);
+
+        if (exponent >= 0)
+            return (unscaled * BigInteger.Pow(Ten, exponent), 0);
+
+        return (unscaled, -exponent);
+    }
+
+    private static readonly BigInteger Ten = new(10);
+
+    /// <summary>The number of digits in an unscaled value, which is a decimal's precision.</summary>
+    private static int Precision(BigInteger unscaled)
+    {
+        var digits = 0;
+        var magnitude = BigInteger.Abs(unscaled);
+
+        do
+        {
+            digits++;
+            magnitude /= Ten;
+        }
+        while (!magnitude.IsZero);
+
+        return digits;
+    }
+
+    /// <summary>
+    /// Builds a <see cref="decimal"/> from a pair the caller has already checked it can hold.
+    /// </summary>
+    private static decimal ToDecimal(BigInteger unscaled, int scale)
+    {
+        var magnitude = BigInteger.Abs(unscaled);
+        var low = (int)(uint)(magnitude & uint.MaxValue);
+        var mid = (int)(uint)((magnitude >> 32) & uint.MaxValue);
+        var high = (int)(uint)((magnitude >> 64) & uint.MaxValue);
+
+        return new decimal(low, mid, high, unscaled.Sign < 0, (byte)scale);
+    }
 
     private static double ParseDouble(string text, string sql, int position) =>
         double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)

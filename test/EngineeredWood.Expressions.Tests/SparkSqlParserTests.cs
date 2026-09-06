@@ -288,6 +288,116 @@ public sealed class SparkSqlParserTests
         Assert.Throws<SparkSqlParseException>(() => Parse(sql));
     }
 
+    // ── Wide decimal literals (#173) ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A literal wider than <see cref="decimal"/> keeps every digit.
+    /// </summary>
+    /// <remarks>
+    /// #173 was filed as "cannot parse", and that was half of it. `decimal.TryParse` REFUSES a
+    /// literal too large for the type and silently ROUNDS one that is merely too precise, so
+    /// <c>0.12345678901234567890123456789012345678</c> came back as
+    /// <c>0.1234567890123456789012345679</c> with the parse reporting success — a wrong value
+    /// rather than a refusal. That row is the one that matters most here.
+    /// </remarks>
+    [Theory]
+    // No negative row: a leading '-' is a NEGATION node rather than part of the literal, so it
+    // does not reach SparkLiteral at all. Its evaluation is asserted in the Arrow tests.
+    [InlineData("12345678901234567890123456789012345678", "12345678901234567890123456789012345678", 0)]
+    [InlineData("1234567890123456789012345678901234.5678", "12345678901234567890123456789012345678", 4)]
+    [InlineData("0.12345678901234567890123456789012345678", "12345678901234567890123456789012345678", 38)]
+    [InlineData("79228162514264337593543950336", "79228162514264337593543950336", 0)]
+    public void AWideDecimalLiteralKeepsEveryDigit(string sql, string unscaled, int scale)
+    {
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+
+        Assert.Equal(LiteralValue.Kind.HighPrecisionDecimal, value.Type);
+        Assert.Equal(unscaled, value.AsHighPrecisionDecimal.UnscaledValue.ToString());
+        Assert.Equal(scale, value.AsHighPrecisionDecimal.Scale);
+    }
+
+    /// <summary>
+    /// A literal <see cref="decimal"/> can hold EXACTLY stays an ordinary decimal.
+    /// </summary>
+    /// <remarks>
+    /// The boundary is the type's own domain — a scale it can carry and an unscaled value inside
+    /// its 96 bits — and not whether <c>TryParse</c> happens to succeed. 79228162514264337593543950335
+    /// is the largest it holds; one more is the row above.
+    /// </remarks>
+    [Theory]
+    [InlineData("1.5")]
+    [InlineData("1.50")]
+    [InlineData("79228162514264337593543950335")]
+    [InlineData("12345678901234567890123456789")]
+    public void ALiteralDecimalCanHoldExactlyStaysADecimal(string sql) =>
+        Assert.Equal(
+            LiteralValue.Kind.Decimal, Assert.IsType<LiteralExpression>(Parse(sql)).Value.Type);
+
+    [Fact]
+    public void AnIntegralLiteralTooWideForBigintBecomesADecimal()
+    {
+        // Spark's ladder is int, then bigint, then decimal — it does not stop at bigint and
+        // refuse. 20 digits is past long and far inside decimal.
+        Assert.Equal(
+            LiteralValue.Kind.Decimal,
+            Assert.IsType<LiteralExpression>(Parse("12345678901234567890")).Value.Type);
+
+        Assert.Equal(
+            LiteralValue.Kind.Int64,
+            Assert.IsType<LiteralExpression>(Parse("1000000000000")).Value.Type);
+    }
+
+    /// <summary>
+    /// A literal wider than any Spark decimal is refused, and width counts the SCALE.
+    /// </summary>
+    /// <remarks>
+    /// A Spark decimal requires 0 &lt;= scale &lt;= precision &lt;= 38, so the last two rows are
+    /// too wide on their scale alone — one significant digit each. Checking only the digit count
+    /// accepted <c>1e-45BD</c> as a scale-45 decimal that no Spark type can hold. Measured:
+    /// <c>1e-38BD</c> is a <c>decimal(38,38)</c> and <c>1e-39BD</c> is refused by Spark's own
+    /// parser, which is the stage this refuses at.
+    /// </remarks>
+    [Theory]
+    [InlineData("123456789012345678901234567890123456789")]
+    [InlineData("0.123456789012345678901234567890123456789")]
+    [InlineData("12345678901234567890123456789012345.6789")]
+    [InlineData("0.000000000000000000000000000000000000001")]
+    [InlineData("1e-39BD")]
+    [InlineData("1e-45BD")]
+    public void ALiteralWiderThanAnyDecimalIsRefusedWithAQuotableReason(string sql)
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+        Assert.Contains("38", thrown.Reason, StringComparison.Ordinal);
+        Assert.Equal(sql, thrown.Expression);
+    }
+
+    [Theory]
+    [InlineData("0.00000000000000000000000000000000000001", 38)]
+    [InlineData("1e-38BD", 38)]
+    [InlineData("0.0000000000000000000000000000000000001", 37)]
+    public void AScaleOfExactlyThirtyEightIsStillAccepted(string sql, int scale)
+    {
+        // The accepting side of the same boundary, so the check cannot be tightened by accident.
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+
+        Assert.Equal(LiteralValue.Kind.HighPrecisionDecimal, value.Type);
+        Assert.Equal(scale, value.AsHighPrecisionDecimal.Scale);
+        Assert.Equal("1", value.AsHighPrecisionDecimal.UnscaledValue.ToString());
+    }
+
+    [Fact]
+    public void TheBdSuffixTakesTheSameWidthAsAnyOtherDecimalLiteral()
+    {
+        var value = Assert.IsType<LiteralExpression>(
+            Parse("12345678901234567890123456789012345678BD")).Value;
+
+        Assert.Equal(LiteralValue.Kind.HighPrecisionDecimal, value.Type);
+        Assert.Equal(
+            "12345678901234567890123456789012345678",
+            value.AsHighPrecisionDecimal.UnscaledValue.ToString());
+    }
+
+
     // ── Refusals, which must be clean rather than absent ───────────────────────────────────
 
     [Theory]
@@ -384,20 +494,6 @@ public sealed class SparkSqlParserTests
             "1Y",                       // no 8-bit integer kind; widening would change coercion
             "1S",                       // no 16-bit integer kind
 
-            // A 38-digit literal, which Spark reads as decimal(38,0). SparkLiteral.ParseDecimal
-            // goes through decimal.TryParse and throws above ~28 digits. Everything downstream is
-            // already in place — LiteralValue.HighPrecisionDecimal is constructed, compared and
-            // evaluated — so this is a missing fallback in one method rather than a missing
-            // feature, but it is its own change and not part of the arithmetic work in #131.
-            "CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
-            + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))",
-
-            // The same limit at 31 digits, arriving with #243's integral-cast group. Its column
-            // form -- CAST(d4 AS INT) -- measures the same rule and does parse, so these cost the
-            // corpus nothing while #173 is open.
-            "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
-            "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)",
-            "CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
             "a > (SELECT 1)",           // subquery — Delta refuses these too
             "*",                        // not an expression
             "a IN (SELECT 1)",          // subquery

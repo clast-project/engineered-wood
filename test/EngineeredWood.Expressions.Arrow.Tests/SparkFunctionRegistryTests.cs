@@ -512,6 +512,79 @@ public sealed class SparkFunctionRegistryTests
             StringComparison.Ordinal);
     }
 
+
+    // ── Wide decimal literals reach the evaluator (#173) ────────────────────────────────────
+
+    /// <summary>
+    /// A literal too wide for <see cref="decimal"/> materialises and computes, which is the seam
+    /// #173 names: the same value worked as a COLUMN and not as a literal.
+    /// </summary>
+    [Fact]
+    public void AWideLiteralComputesAgainstAWideColumn()
+    {
+        var batch = WideDecimalBatch(("d4", System.Numerics.BigInteger.Pow(10, 30)));
+
+        // The issue's own example.
+        Assert.Equal(
+            "1000000000000000000000000000001",
+            Rendered(Ansi, "d4 + 1", batch, 0));
+
+        Assert.Equal(
+            "2000000000000000000000000000000",
+            Rendered(Ansi, "d4 + 1000000000000000000000000000000", batch, 0));
+
+        Assert.True(Assert.IsType<BooleanArray>(
+            Eval(Ansi, "d4 = 1000000000000000000000000000000", batch)).GetValue(0));
+    }
+
+    /// <summary>
+    /// A wide literal's type comes from its own digits, and the digit count must be exact.
+    /// </summary>
+    /// <remarks>
+    /// Counting with <c>BigInteger.Log10</c> got both boundaries wrong: 10^30 came back as thirty
+    /// digits, because its logarithm is 29.999999999999996 in a double, and 10^38-1 as
+    /// thirty-nine, because that one rounds up. The first is not cosmetic — a value needing
+    /// thirty-one digits was handed a decimal(30,0) to live in, so NEGATING it overflowed and
+    /// produced null. The second built a decimal(39,0), wider than any Spark decimal.
+    /// </remarks>
+    [Fact]
+    public void AWideLiteralsPrecisionIsCountedExactly()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        // 10^30 needs 31 digits. Under the old count this was null.
+        var negated = Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "-1000000000000000000000000000000", batch));
+
+        Assert.Equal(31, ((Decimal128Type)negated.Data.DataType).Precision);
+        Assert.Equal(
+            "-1000000000000000000000000000000",
+            SparkWideDecimals.Render(SparkWideDecimals.Read(negated, 0)!.Value));
+
+        // 38 nines needs 38, not 39 — a decimal(39,0) is wider than Spark has.
+        var nines = Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "99999999999999999999999999999999999999", batch));
+
+        Assert.Equal(38, ((Decimal128Type)nines.Data.DataType).Precision);
+    }
+
+    [Fact]
+    public void AWideLiteralsScaleSurvivesMaterialisation()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        // All scale, which is the shape that has no integral digits to fall back on.
+        var value = Assert.IsType<Decimal128Array>(
+            Eval(Ansi, "0.12345678901234567890123456789012345678", batch));
+
+        var type = (Decimal128Type)value.Data.DataType;
+        Assert.Equal(38, type.Precision);
+        Assert.Equal(38, type.Scale);
+        Assert.Equal(
+            "0.12345678901234567890123456789012345678",
+            SparkWideDecimals.Render(SparkWideDecimals.Read(value, 0)!.Value));
+    }
+
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
 
     [Fact]

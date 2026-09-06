@@ -313,8 +313,61 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 Repeat(value, length), length, new Decimal128Type(precision, scale));
         }
 
+        // ...and the same for one too wide for System.Decimal, which the parser now reads (#173).
+        // Without this the literal parses and then cannot be turned into a column, which is the
+        // same seam one method further along: `d4 + <38 digits>` failed here rather than there.
+        if (!value.IsNull && value.Type == LiteralValue.Kind.HighPrecisionDecimal)
+        {
+            var (unscaled, wideScale) = value.AsHighPrecisionDecimal;
+            return MaterializeAsArray(
+                Repeat(value, length), length,
+                new Decimal128Type(DecimalPrecisionOf(unscaled, wideScale), wideScale));
+        }
+
         return MaterializeAsArray(Repeat(value.IsNull ? null : (LiteralValue?)value, length), length);
     }
+
+    /// <summary>
+    /// The precision Spark gives a decimal literal, from its unscaled value and scale.
+    /// </summary>
+    /// <remarks>
+    /// The scale is a floor, for the reason <see cref="DecimalTypeOf"/> gives: <c>0.05</c> has one
+    /// significant digit and still needs precision 2 to exist at scale 2.
+    /// </remarks>
+    private static int DecimalPrecisionOf(BigInteger unscaled, int scale) =>
+        Math.Max(Math.Max(DigitCount(unscaled), scale), 1);
+
+    /// <summary>
+    /// The number of decimal digits in a value, counted exactly.
+    /// </summary>
+    /// <remarks>
+    /// <b>Not <c>BigInteger.Log10</c>, which is a double and gets the boundaries wrong in both
+    /// directions.</b> Measured: it types 10^30 as thirty digits, because its logarithm comes back
+    /// as 29.999999999999996 rather than 30 — and 10^38-1 as thirty-nine, because that one rounds
+    /// UP to 38.0. The first made <c>-1000000000000000000000000000000</c> evaluate to null, since
+    /// a value needing thirty-one digits was given a decimal(30,0) to live in and overflowed it;
+    /// the second built a decimal(39,0), which is wider than any Spark decimal.
+    /// <para>
+    /// Repeated division is exact and costs nothing that matters: this runs once per literal, not
+    /// once per row.
+    /// </para>
+    /// </remarks>
+    private static int DigitCount(BigInteger value)
+    {
+        var magnitude = BigInteger.Abs(value);
+        var digits = 0;
+
+        do
+        {
+            digits++;
+            magnitude /= Ten;
+        }
+        while (!magnitude.IsZero);
+
+        return digits;
+    }
+
+    private static readonly BigInteger Ten = new(10);
 
     /// <summary>The precision and scale Spark gives a decimal literal.</summary>
     private static (int Precision, int Scale) DecimalTypeOf(decimal value)
@@ -329,8 +382,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             (new BigInteger((uint)bits[1]) << 32) |
             (new BigInteger((uint)bits[2]) << 64));
 
-        int digits = unscaled.IsZero ? 1 : (int)Math.Floor(BigInteger.Log10(unscaled)) + 1;
-        return (Math.Max(Math.Max(digits, scale), 1), scale);
+        return (Math.Max(Math.Max(DigitCount(unscaled), scale), 1), scale);
     }
 
     private static IArrowArray GetColumn(RecordBatch batch, string name)
