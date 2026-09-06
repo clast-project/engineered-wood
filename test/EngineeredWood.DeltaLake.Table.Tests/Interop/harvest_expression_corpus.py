@@ -720,6 +720,11 @@ GROUPS = {
         "round(d1, 5)",
         "round(d1, 2)",
         "round(b, -3)",
+        # Is the scale allowed to VARY BY ROW? Raised in review of #255: RoundScale reads row 0,
+        # which is either correct because Spark requires a constant there, or a silent wrong
+        # answer for every row after the first. Asking rather than arguing.
+        "round(g, a)",
+        "round(g, sh)",
 
         # The values with no rounding to do.
         "round(CAST('NaN' AS DOUBLE), 2)",

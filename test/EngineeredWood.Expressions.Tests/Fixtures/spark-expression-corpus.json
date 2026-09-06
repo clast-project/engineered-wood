@@ -2263,9 +2263,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 05:48:05.642586",
-      "2026-09-06 05:48:05.642586",
-      "2026-09-06 05:48:05.642586"
+      "2026-09-06 06:07:40.011133",
+      "2026-09-06 06:07:40.011133",
+      "2026-09-06 06:07:40.011133"
      ]
     }
    },
@@ -9034,6 +9034,38 @@
       null,
       0
      ]
+    }
+   },
+   {
+    "expression": "round(g, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, a#0) AS r#1851]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#21, a#17) AS r#1852]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as smallint) AS "
+    }
+   },
+   {
+    "expression": "round(g, sh)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, sh)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, cast(sh#2 as int)) AS r#1853]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], fa"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#21, cast(sh#19 as int)) AS r#1854]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 "
     }
    },
    {

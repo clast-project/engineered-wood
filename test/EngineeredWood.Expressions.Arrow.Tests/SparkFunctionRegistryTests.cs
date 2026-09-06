@@ -697,6 +697,21 @@ public sealed class SparkFunctionRegistryTests
     }
 
     [Fact]
+    public void RoundRefusesAScaleThatVariesByRow()
+    {
+        // Spark requires a foldable scale and reports NON_FOLDABLE_INPUT for a column, so a scale
+        // that differs between rows cannot come from an expression it accepted. This registry
+        // sees columns rather than the tree, so it refuses the case it can actually see rather
+        // than silently rounding every row to the first row's scale.
+        var varying = Batch(("g", Doubles(2.5, 2.5)), ("n", Ints(1, 2)));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "round(g, n)", varying));
+
+        // A constant column is what a literal scale materialises as, and it still works.
+        var constant = Batch(("g", Doubles(2.55, 2.55)), ("n", Ints(1, 1)));
+        Assert.Equal(2.6, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, n)", constant)).GetValue(0));
+    }
+
+    [Fact]
     public void GreatestNeedsTwoArguments()
     {
         // Measured: Spark reports WRONG_NUM_ARGS for one argument as well as for none, rather

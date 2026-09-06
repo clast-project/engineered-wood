@@ -1003,7 +1003,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
     private IArrowArray Round(IReadOnlyList<IArrowArray> args, int rowCount)
     {
         var source = args[0];
-        var scale = args.Count > 1 ? RoundScale(args[1]) : 0;
+        var scale = args.Count > 1 ? RoundScale(args[1], rowCount) : 0;
 
         if (source.Data.DataType is Decimal128Type decimals)
             return RoundDecimal(source, decimals, scale, rowCount);
@@ -1040,11 +1040,34 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         return builder.Build();
     }
 
-    /// <summary>The scale argument, which is a constant integer.</summary>
-    private static int RoundScale(IArrowArray argument) =>
-        SparkArrays.ReadInt64(argument, 0) is { } value
-            ? checked((int)value)
-            : throw new ArgumentException("the scale of round must not be null", nameof(argument));
+    /// <summary>
+    /// The scale argument, which Spark requires to be a constant.
+    /// </summary>
+    /// <remarks>
+    /// <b>Measured:</b> <c>round(g, a)</c> is <c>DATATYPE_MISMATCH.NON_FOLDABLE_INPUT</c> — Spark
+    /// refuses a scale that is not foldable, so one that varies by row cannot come from an
+    /// expression it accepted. This registry sees materialised columns rather than the tree, so
+    /// it cannot check foldability; what it can see is a scale that actually differs between
+    /// rows, and refusing that keeps the answer fail-closed instead of silently using the first
+    /// row's scale for all of them. Raised in review of #255.
+    /// </remarks>
+    private static int RoundScale(IArrowArray argument, int rowCount)
+    {
+        if (SparkArrays.ReadInt64(argument, 0) is not { } first)
+            throw new ArgumentException("the scale of round must not be null", nameof(argument));
+
+        for (var i = 1; i < rowCount; i++)
+        {
+            if (SparkArrays.ReadInt64(argument, i) != first)
+            {
+                throw new NotSupportedException(
+                    "the scale of round must be the same for every row; Spark requires a constant "
+                    + "there and refuses a column with NON_FOLDABLE_INPUT");
+            }
+        }
+
+        return checked((int)first);
+    }
 
     private static IArrowArray RoundFloating(IArrowArray source, int scale, int rowCount)
     {

@@ -417,9 +417,9 @@ internal static class SparkFunctions
     /// <remarks>
     /// Same type on both sides by construction — the caller unifies first — so this never has to
     /// promote, and a decimal can be compared on its unscaled integer alone because the scales
-    /// already match. Read as <see cref="System.Numerics.BigInteger"/> rather than
-    /// <see cref="Int128"/> because ordering operators are what the netstandard2.0 polyfill does
-    /// not carry.
+    /// already match. A decimal goes through <see cref="SparkWideDecimals.Compare"/>, which orders
+    /// the unscaled integers by their two halves and allocates nothing — this runs once per
+    /// argument per ROW, where reading a BigInteger copied sixteen bytes and allocated each time.
     /// </remarks>
     public static int CompareAt(IArrowArray left, IArrowArray right, int index) => left switch
     {
@@ -429,8 +429,7 @@ internal static class SparkFunctions
         FloatArray or DoubleArray =>
             SparkArrays.ReadDouble(left, index)!.Value.CompareTo(SparkArrays.ReadDouble(right, index)!.Value),
 
-        Decimal128Array a => SparkArrays.Unscaled(a, index)
-            .CompareTo(SparkArrays.Unscaled((Decimal128Array)right, index)),
+        Decimal128Array a => SparkWideDecimals.Compare(a, (Decimal128Array)right, index),
 
         StringArray a => string.CompareOrdinal(a.GetString(index), ((StringArray)right).GetString(index)),
 

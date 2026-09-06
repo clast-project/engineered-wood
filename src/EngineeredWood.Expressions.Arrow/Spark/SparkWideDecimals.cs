@@ -264,6 +264,43 @@ internal static class SparkWideDecimals
             new[] { validity.Build(), new ArrowBuffer(buffer) }));
     }
 
+    /// <summary>
+    /// Orders two decimal cells that carry the same scale, without allocating.
+    /// </summary>
+    /// <remarks>
+    /// Same scale by construction — the caller unifies first — so the unscaled integers order the
+    /// values directly. Compared as two 64-bit halves rather than through
+    /// <see cref="System.Numerics.BigInteger"/>, which copies sixteen bytes and allocates for
+    /// every comparison: <c>greatest</c> and <c>least</c> call this once per argument per ROW.
+    /// Halves rather than <see cref="Int128"/>'s own operators because the netstandard2.0 build
+    /// takes that type from database-decimal's polyfill, which carries no ordering.
+    /// </remarks>
+    internal static int Compare(Decimal128Array left, Decimal128Array right, int index)
+    {
+        var (leftLow, leftHigh) = Halves(left, index);
+        var (rightLow, rightHigh) = Halves(right, index);
+
+        // The high half carries the sign, so it is compared as signed and the low half as
+        // unsigned — which is the whole of two's complement ordering.
+        return leftHigh != rightHigh
+            ? ((long)leftHigh).CompareTo((long)rightHigh)
+            : leftLow.CompareTo(rightLow);
+    }
+
+    /// <summary>The two 64-bit halves of a Decimal128 cell, little-endian as Arrow stores them.</summary>
+    private static (ulong Low, ulong High) Halves(Decimal128Array array, int index)
+    {
+        RequireLittleEndian();
+
+        // GC.KeepAlive because `array` is otherwise dead once the span is taken, and the span
+        // points into its buffer. See doc/arrow-span-lifetime.md.
+        var words = MemoryMarshal.Cast<byte, ulong>(array.ValueBuffer.Span);
+        var halves = (words[index * 2], words[(index * 2) + 1]);
+        GC.KeepAlive(array);
+
+        return halves;
+    }
+
     /// <summary>How Spark prints a decimal, which a decimal past 7.9e28 could not be asked before.</summary>
     internal static string Render(Operand value) =>
         new Decimal128(value.Unscaled).ToString(value.Type.Scale);
