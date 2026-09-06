@@ -100,10 +100,6 @@ public sealed class SparkEvaluationCorpusTests
         // ── DIVERGENT: we and Spark both answer, and disagree. Each has an issue. ──────────────
         ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
 
-        // The comparison coerces the string correctly now (#180); what is left is the CAST
-        // underneath it, which reads an exponent where Spark's integral parse does not.
-        ["'1e3' = a"] = "#258: we cast '1e3' to an integral where Spark refuses it",
-
         // Spark TYPE-CHECKS an IN list and refuses one whose members share no type -- in both
         // dialects, and with no string involved in `a IN (bl)` at all. That is an analysis-time
         // check rather than a coercion, and EngineeredWood has no analysis phase: the registry
@@ -197,11 +193,6 @@ public sealed class SparkEvaluationCorpusTests
             // The struct column the harness cannot build, exactly as in the ANSI list.
             ["nested.arr[99]"] = "struct columns are not modelled",
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
-
-            // The same cast difference the ANSI list carries. #258 shows up here as a wrong
-            // VALUE rather than a missing refusal: legacy Spark nulls '1e3' and we answer 1000,
-            // so the comparison answers false where Spark answers null.
-            ["'1e3' = a"] = "#258: we cast '1e3' to an integral where legacy Spark nulls it",
 
             // Spark's string promotion excludes boolean and binary, so it REFUSES these two sets
             // at analysis rather than answering. See the ANSI list for why refusing is not

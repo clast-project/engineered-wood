@@ -86,11 +86,15 @@ internal static class SparkArrays
             _array = null;
             _index = 0;
             FromString = true;
+
+            // Trimmed once and shared. Both parses want the same text, and `Trim` allocates
+            // whenever there is anything to trim -- twice per row, for a padded cell.
+            var trimmed = text.Trim();
             IsNumeric = double.TryParse(
-                text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
+                trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
             AsDouble = IsNumeric ? asDouble : 0d;
             Exact = IsNumeric
-                && decimal.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+                && decimal.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
                 ? parsed
                 : null;
         }
@@ -382,6 +386,56 @@ internal static class SparkArrays
         return builder.Build();
     }
 
+    /// <summary>
+    /// Reads a floating literal carrying Java's trailing type suffix, as in <c>1d</c>.
+    /// </summary>
+    /// <remarks>
+    /// The suffix belongs to Java's FloatingPointLiteral grammar, which requires digits, so it
+    /// attaches to a numeric form and not to a named one: <c>'1e3d'</c> is 1000 and
+    /// <c>'NaNd'</c> is refused. Requiring a digit or a point before the suffix is what draws
+    /// that line -- measured, Spark refuses <c>'NaNd'</c>, <c>'Infinityf'</c>, <c>'1l'</c> and
+    /// <c>'1 d'</c> alike.
+    /// </remarks>
+    public static bool TryReadTypeSuffixed(string text, out double value)
+    {
+        value = 0d;
+        var trimmed = text.Trim();
+        if (trimmed.Length < 2)
+            return false;
+
+        var suffix = trimmed[trimmed.Length - 1];
+        if (suffix is not ('d' or 'D' or 'f' or 'F'))
+            return false;
+
+        var previous = trimmed[trimmed.Length - 2];
+        if (!((previous >= '0' && previous <= '9') || previous == '.'))
+            return false;
+
+        // Read without the suffix, and without copying the text to drop it. The span overload
+        // lands on net8.0 and net10.0; netstandard2.0 has only the string one.
+#if NETSTANDARD2_0
+        return double.TryParse(
+            trimmed.Substring(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+#else
+        return double.TryParse(
+            trimmed.AsSpan(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+#endif
+    }
+
+    /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
+    /// <remarks>
+    /// The span overload lands on net8.0 and net10.0; netstandard2.0 has only the array one, so
+    /// that build alone pays for a copy.
+    /// </remarks>
+    private static string DecodeUtf8(ReadOnlySpan<byte> bytes)
+    {
+#if NETSTANDARD2_0
+        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+#else
+        return System.Text.Encoding.UTF8.GetString(bytes);
+#endif
+    }
+
     /// <summary>Renders a numeric cell the way Spark would print it.</summary>
     /// <remarks>
     /// Floating point goes through <see cref="SparkFloatText"/>, which reproduces Java's own
@@ -398,20 +452,6 @@ internal static class SparkArrays
     /// correct — verified over signs, trailing zeros and every scale.
     /// </para>
     /// </remarks>
-    /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
-    /// <remarks>
-    /// The span overload lands on net8.0 and net10.0; netstandard2.0 has only the array one, so
-    /// that build alone pays for a copy.
-    /// </remarks>
-    private static string DecodeUtf8(ReadOnlySpan<byte> bytes)
-    {
-#if NETSTANDARD2_0
-        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
-#else
-        return System.Text.Encoding.UTF8.GetString(bytes);
-#endif
-    }
-
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
     {
         FloatArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
