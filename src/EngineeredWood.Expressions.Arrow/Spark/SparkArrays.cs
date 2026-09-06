@@ -49,24 +49,31 @@ internal static class SparkArrays
             FromString = false;
         }
 
-        /// <summary>A binary value, which renders and takes part in no numeric cast.</summary>
+        /// <summary>A binary cell, decoded only if something asks for its text.</summary>
         /// <remarks>
         /// Spark decodes the bytes as UTF-8 and replaces what is not valid rather than refusing,
         /// so <c>CAST(X'FF' AS STRING)</c> is U+FFFD. <see cref="System.Text.Encoding.UTF8"/>
         /// replaces on the same terms as Java's <c>new String(bytes, UTF_8)</c>.
+        /// <para>
+        /// Deferred for the reason the numeric cell is — see <see cref="Text"/> and #251. The
+        /// cell is read once per row and its text is read only by a cast to string and by an
+        /// error message, so decoding here would allocate a string per row for every cast that
+        /// then refuses it. Holding the array rather than a copy of the bytes also keeps it
+        /// alive for the span <see cref="Render"/> takes.
+        /// </para>
         /// <para>
         /// <see cref="IsNumeric"/> is false, which is what makes every other cast refuse it: a
         /// binary is not a number in Spark either, and reading its rendering as one would accept
         /// <c>CAST(X'3132' AS INT)</c> as 12.
         /// </para>
         /// </remarks>
-        public static CastInput FromBinary(byte[] bytes) => new(bytes);
+        public static CastInput FromBinary(IArrowArray array, int index) => new(array, index);
 
-        private CastInput(byte[] bytes)
+        private CastInput(IArrowArray array, int index)
         {
-            _text = System.Text.Encoding.UTF8.GetString(bytes);
-            _array = null;
-            _index = 0;
+            _text = null;
+            _array = array;
+            _index = index;
             FromString = false;
             IsNumeric = false;
             AsDouble = 0d;
@@ -295,11 +302,7 @@ internal static class SparkArrays
         // BinaryArray, so this pattern matches one too and would take its bytes instead of its
         // text. Every other cast refuses a binary, which is what CastInput.FromBinary encodes.
         if (array is BinaryArray binary)
-        {
-            return binary.IsNull(index)
-                ? null
-                : CastInput.FromBinary(binary.GetBytes(index).ToArray());
-        }
+            return binary.IsNull(index) ? null : CastInput.FromBinary(binary, index);
 
         if (array is BooleanArray booleans)
         {
@@ -395,11 +398,29 @@ internal static class SparkArrays
     /// correct — verified over signs, trailing zeros and every scale.
     /// </para>
     /// </remarks>
+    /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
+    /// <remarks>
+    /// The span overload lands on net8.0 and net10.0; netstandard2.0 has only the array one, so
+    /// that build alone pays for a copy.
+    /// </remarks>
+    private static string DecodeUtf8(ReadOnlySpan<byte> bytes)
+    {
+#if NETSTANDARD2_0
+        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+#else
+        return System.Text.Encoding.UTF8.GetString(bytes);
+#endif
+    }
+
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
     {
         FloatArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
         DoubleArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
         Decimal128Array => SparkWideDecimals.Render(SparkWideDecimals.Read(array, index)!.Value),
+
+        // A StringArray is a BinaryArray too, and never reaches here: its text is known when the
+        // cell is read, so it takes the `_text` path instead of this one.
+        BinaryArray a => DecodeUtf8(a.GetBytes(index)),
 
         // Integral arrays only, and their exact form is never null: the widest is Int64 at about
         // 9.2e18, far inside the bound that decides whether an exact form is taken at all. There

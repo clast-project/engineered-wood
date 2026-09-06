@@ -228,17 +228,23 @@ public class StringComparisonCoercionTests
         Assert.True(Evaluate(Legacy, "CAST(X'FF' AS STRING) = X'FF'"));
 
         // The same rule on values where both directions would agree, so the ordering is covered.
-        Assert.True(Evaluate(Ansi, "'A' = X'41'"));
-        Assert.True(Evaluate(Ansi, "X'41' < 'B'"));
-        Assert.False(Evaluate(Ansi, "s = X'41'"));
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.True(Evaluate(registry, "'A' = X'41'"));
+            Assert.True(Evaluate(registry, "X'41' < 'B'"));
+            Assert.False(Evaluate(registry, "s = X'41'"));
+        }
     }
 
     [Fact]
     public void TwoBinariesAreComparedAsBinaries()
     {
         // No string on either side, so nothing moves and the bytes compare as bytes.
-        Assert.True(Evaluate(Ansi, "X'41' = X'41'"));
-        Assert.False(Evaluate(Ansi, "X'41' = X'42'"));
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.True(Evaluate(registry, "X'41' = X'41'"));
+            Assert.False(Evaluate(registry, "X'41' = X'42'"));
+        }
     }
 
     // ── IN resolves ONE type over the operand and the whole list ──
