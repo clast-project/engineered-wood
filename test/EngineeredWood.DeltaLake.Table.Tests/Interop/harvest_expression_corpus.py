@@ -578,6 +578,61 @@ GROUPS = {
         "CAST(CAST(1e30 AS DOUBLE) AS DECIMAL(10,0))",
         "CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))",
     ],
+    "float-to-string": [
+        # Issue #248. Render formats a float or a double with ToString("R"), which is the shortest
+        # round-trip form only on .NET Core -- so the netstandard2.0 build and the net10.0 build
+        # print the same value differently. #244 measured that and routed the DECIMAL cast around
+        # it; this group asks what the STRING cast should print, which #244 left unmeasured.
+        #
+        # The digits are only half the question. A cast to a string produces TEXT, so Java's
+        # formatting conventions matter as well: where it switches to scientific notation, whether
+        # a whole number keeps a ".0", how the exponent is spelled. None of that is asked by a
+        # cast to a decimal, where only the value survives.
+
+        # Notation. Java switches to scientific outside [1e-3, 1e7); .NET switches elsewhere and
+        # spells the exponent differently, so these are where the two disagree on shape rather
+        # than on digits.
+        "CAST(CAST(1.0 AS DOUBLE) AS STRING)",
+        "CAST(CAST(2.5 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1234567 AS DOUBLE) AS STRING)",
+        "CAST(CAST(12345678 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e7 AS DOUBLE) AS STRING)",
+        "CAST(CAST(9999999 AS DOUBLE) AS STRING)",
+        "CAST(CAST(0.001 AS DOUBLE) AS STRING)",
+        "CAST(CAST(0.0001 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-7 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e30 AS DOUBLE) AS STRING)",
+        "CAST(CAST(-1e30 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-30 AS DOUBLE) AS STRING)",
+
+        # Zero, negative zero and the values that are not numbers.
+        "CAST(CAST(0.0 AS DOUBLE) AS STRING)",
+        "CAST(CAST(-0.0 AS DOUBLE) AS STRING)",
+        "CAST(CAST('NaN' AS DOUBLE) AS STRING)",
+        "CAST(CAST('Infinity' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-Infinity' AS DOUBLE) AS STRING)",
+
+        # The JDK band from #244, asked again on this path: Double.toString is what prints here
+        # too, so the same 2.4% of doubles should print differently on JDK 19+.
+        "CAST(CAST(1e23 AS DOUBLE) AS STRING)",
+        "CAST(CAST(3.333333333333333E17 AS DOUBLE) AS STRING)",
+        "CAST(CAST(0.3333333333333333 AS DOUBLE) AS STRING)",
+
+        # A FLOAT source, and the question that makes it its own ladder: the decimal cast renders
+        # the WIDENED double (measured -- 1e30f answers 1000000015047466200000000000000), so this
+        # asks whether printing does the same or keeps the float's own shorter digits.
+        "CAST(CAST(1e30 AS FLOAT) AS STRING)",
+        "CAST(CAST(0.1 AS FLOAT) AS STRING)",
+        "CAST(CAST(1.5 AS FLOAT) AS STRING)",
+        "CAST(CAST(0.3333333 AS FLOAT) AS STRING)",
+        "CAST(CAST('NaN' AS FLOAT) AS STRING)",
+
+        # Through the columns, so at least one answer is not a constant fold.
+        "CAST(g AS STRING)",
+        "CAST(f AS STRING)",
+        # And through concat, which casts implicitly and is how a constraint usually meets one.
+        "concat(s, g)",
+    ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",

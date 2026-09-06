@@ -303,17 +303,24 @@ internal static class SparkArrays
 
     /// <summary>Renders a numeric cell the way Spark would print it.</summary>
     /// <remarks>
+    /// Floating point goes through <see cref="SparkFloatText"/>, which reproduces Java's own
+    /// spelling — where the exponent starts, the digit that always follows the point, and an
+    /// unsigned exponent. Measured: every row of the corpus's <c>float-to-string</c> group is
+    /// exactly what <c>Double.toString</c> or <c>Float.toString</c> prints, and .NET's <c>"R"</c>
+    /// matched almost none of it. #248.
+    /// <para>
     /// A decimal renders from its unscaled integer and scale rather than from the
     /// <see cref="decimal"/> exact form, because that form covers only part of the range: past
     /// decimal's ceiling it is null, and inside the ceiling it silently rounds a value carrying
     /// more than 28 significant digits. Rendering from the buffer is exact across all of
     /// precision 38, and is byte-identical to the old rendering everywhere the old one was
     /// correct — verified over signs, trailing zeros and every scale.
+    /// </para>
     /// </remarks>
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
     {
-        FloatArray a => a.GetValue(index)!.Value.ToString("R", Invariant),
-        DoubleArray a => a.GetValue(index)!.Value.ToString("R", Invariant),
+        FloatArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
+        DoubleArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
         Decimal128Array => SparkWideDecimals.Render(SparkWideDecimals.Read(array, index)!.Value),
 
         // Integral arrays only, and their exact form is never null: the widest is Int64 at about
@@ -323,49 +330,6 @@ internal static class SparkArrays
             ?? throw new NotSupportedException(
                 $"{array.Data.DataType.Name} reached Render with no exact value"),
     };
-
-    /// <summary>
-    /// The shortest decimal text that round-trips <paramref name="value"/>.
-    /// </summary>
-    /// <remarks>
-    /// <b>Deliberately not <c>ToString("R")</c></b>, which is the shortest form only on .NET Core.
-    /// Measured: on net472 the double 0.3333333333333333 renders as seventeen digits there and as
-    /// sixteen on net10.0, which made <c>CAST(g AS DECIMAL(38,20))</c> answer differently per
-    /// target framework — a cast is not allowed to depend on which build of this library is
-    /// loaded. The G15/G16/G17 ladder is the portable spelling of the same thing, and produces the
-    /// identical value on every target: checked against <c>"R"</c> over ~1e6 doubles on net10.0
-    /// with no disagreement at all.
-    /// <para>
-    /// This is what Spark's <c>BigDecimal.valueOf(d)</c> reads — up to the JVM's own version of
-    /// the question, since <c>Double.toString</c> did not produce the shortest form before JDK 19.
-    /// See <c>SparkFunctionRegistry.CastFloatingToDecimal</c> and #244.
-    /// </para>
-    /// <para>
-    /// <see cref="Render"/> still uses <c>"R"</c> and so still varies by target framework. It is
-    /// not simply this method with a different caller: it renders a float AS a float, where the
-    /// decimal cast renders the widened double, and what Spark answers for
-    /// <c>CAST(&lt;double&gt; AS STRING)</c> has not been measured. #248.
-    /// </para>
-    /// </remarks>
-    public static string ShortestRoundTrip(double value)
-    {
-        // Unrolled onto constant format strings rather than built per iteration: this runs for
-        // every row of every cast, and there are only ever three rungs.
-        if (RoundTrips(value, "G15", out var fifteen))
-            return fifteen;
-
-        if (RoundTrips(value, "G16", out var sixteen))
-            return sixteen;
-
-        // Seventeen significant digits always round-trip a double, so there is nothing to check.
-        return value.ToString("G17", Invariant);
-    }
-
-    private static bool RoundTrips(double value, string format, out string text)
-    {
-        text = value.ToString(format, Invariant);
-        return double.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value;
-    }
 
     /// <summary>Whether an integral Arrow type is narrower than <c>int</c>.</summary>
     /// <remarks>Spark reports overflow of those under a different error class.</remarks>
