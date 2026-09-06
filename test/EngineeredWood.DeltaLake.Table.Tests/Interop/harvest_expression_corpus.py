@@ -67,7 +67,7 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 # only make the fixture harder to read.
 LEGACY_GROUPS = (
     "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
-    "double-to-decimal", "string-coercion")
+    "double-to-decimal", "string-coercion", "numeric-text")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -870,6 +870,34 @@ GROUPS = {
         "CAST(X'FF' AS STRING) = X'FF'", "CAST(bin AS STRING)",
         "'A' = X'41'", "X'41' < 'B'", "s = bin", "'00' = bin",
     ],
+    # What Spark's numeric TEXT parse accepts, per target. The three targets do not agree, and
+    # the integral one is the strict one: it takes a sign, digits and an optional '.', and NO
+    # exponent -- in either dialect. ANSI then refuses the '.' form outright while the legacy
+    # dialect truncates it. The floating targets take Java's trailing type suffix, which .NET's
+    # parse does not, and the decimal target takes an exponent but not a suffix. #258.
+    "numeric-text": [
+        # An exponent: valid for a floating or decimal target, never for an integral one.
+        "CAST('1e3' AS BIGINT)", "CAST('1E3' AS BIGINT)", "CAST('1e+3' AS BIGINT)",
+        "CAST('1e-3' AS BIGINT)", "CAST('1.5e2' AS BIGINT)", "CAST('1e3' AS INT)",
+        "CAST('1e3' AS DOUBLE)", "CAST('1e3' AS DECIMAL(20,4))",
+
+        # A decimal point, whose fraction need not be non-zero to be refused under ANSI.
+        "CAST('1.0' AS BIGINT)", "CAST('1.' AS BIGINT)", "CAST('.0' AS BIGINT)",
+        "CAST('10.' AS BIGINT)", "CAST('1.5' AS BIGINT)", "CAST('-1.' AS BIGINT)",
+        "CAST('1.0' AS TINYINT)", "CAST('1.0' AS DECIMAL(20,4))",
+
+        # Accepted by every target, and the shapes that are refused by all of them.
+        "CAST('+1' AS BIGINT)", "CAST('  1  ' AS BIGINT)",
+        "CAST('1_0' AS BIGINT)", "CAST('' AS BIGINT)", "CAST('12abc' AS BIGINT)",
+        "CAST('9223372036854775808' AS BIGINT)",
+
+        # Java's type suffix, which attaches to a numeric form and not to a named one.
+        "CAST('1d' AS DOUBLE)", "CAST('1D' AS DOUBLE)", "CAST('1.5f' AS DOUBLE)",
+        "CAST('1e3d' AS DOUBLE)", "CAST('1f' AS FLOAT)",
+        "CAST('NaNd' AS DOUBLE)", "CAST('Infinityf' AS DOUBLE)", "CAST('1l' AS DOUBLE)",
+        "CAST('1 d' AS DOUBLE)", "CAST('1d' AS DECIMAL(20,4))",
+    ],
+
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",

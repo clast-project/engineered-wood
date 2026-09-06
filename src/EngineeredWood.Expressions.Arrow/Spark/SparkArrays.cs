@@ -398,6 +398,35 @@ internal static class SparkArrays
     /// correct — verified over signs, trailing zeros and every scale.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// Reads a floating literal carrying Java's trailing type suffix, as in <c>1d</c>.
+    /// </summary>
+    /// <remarks>
+    /// The suffix belongs to Java's FloatingPointLiteral grammar, which requires digits, so it
+    /// attaches to a numeric form and not to a named one: <c>'1e3d'</c> is 1000 and
+    /// <c>'NaNd'</c> is refused. Requiring a digit or a point before the suffix is what draws
+    /// that line -- measured, Spark refuses <c>'NaNd'</c>, <c>'Infinityf'</c>, <c>'1l'</c> and
+    /// <c>'1 d'</c> alike.
+    /// </remarks>
+    public static bool TryReadTypeSuffixed(string text, out double value)
+    {
+        value = 0d;
+        var span = text.Trim();
+        if (span.Length < 2)
+            return false;
+
+        var suffix = span[span.Length - 1];
+        if (suffix is not ('d' or 'D' or 'f' or 'F'))
+            return false;
+
+        var previous = span[span.Length - 2];
+        if (!((previous >= '0' && previous <= '9') || previous == '.'))
+            return false;
+
+        return double.TryParse(
+            span.Substring(0, span.Length - 1), NumberStyles.Float, Invariant, out value);
+    }
+
     /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
     /// <remarks>
     /// The span overload lands on net8.0 and net10.0; netstandard2.0 has only the array one, so

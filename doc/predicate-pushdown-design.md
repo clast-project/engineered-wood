@@ -966,6 +966,25 @@ A binary is the pair where the OTHER operand moves: measured,
 text — cast the other way, U+FFFD's three UTF-8 bytes are not `FF`. Both
 dialects agree. #259.
 
+#### Three targets, three acceptances of the same text
+
+Added 2026-09-06, closing #258. Spark's numeric text parse is not one rule, and
+none of the three is .NET's:
+
+| text | integral | floating | decimal |
+|---|---|---|---|
+| `'1e3'` | refused, in BOTH dialects | 1000.0 | 1000.0000 |
+| `'1.0'` | ANSI refuses, legacy truncates | 1.0 | 1.0000 |
+| `'1d'` | refused | 1.0 | refused |
+
+The integral parse takes a sign, digits and an optional decimal point, and never
+an exponent — so `SparkIntegralCasts.Classify` reads the text rather than the
+value the shared parse produced. The point is syntactic: ANSI refuses `'1.0'`
+and `'10.'` as readily as `'1.5'`, which asking whether the value survives
+truncation did not. The floating targets take Java's trailing type suffix, which
+attaches to a numeric form and not to a named one — `'1e3d'` is 1000 and
+`'NaNd'` is refused.
+
 #### `IN` is not the disjunction of equalities it resembles
 
 Spark resolves **one** type over the operand and the whole list, where a

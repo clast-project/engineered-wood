@@ -851,6 +851,20 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
             }
 
+            // Spark's integral parse is stricter than the one that produced this value: it takes
+            // a sign, digits and an optional point, and NO exponent -- so `CAST('1e3' AS BIGINT)`
+            // fails where `CAST('1e3' AS DOUBLE)` is 1000. Both dialects refuse it; only what
+            // the failure looks like differs. #258.
+            var form = value.Value.FromString
+                ? SparkIntegralCasts.Classify(value.Value.Text)
+                : SparkIntegralCasts.TextForm.Integer;
+
+            if (form == SparkIntegralCasts.TextForm.Invalid)
+            {
+                if (!raising) continue;
+                throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
+            }
+
             // No exact form means the magnitude is past decimal's range, and so past every
             // integral type's range too.
             if (value.Value.Exact is not { } exact)
@@ -861,12 +875,15 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
                 continue;
             }
 
-            // A string carrying a fraction is where the dialects part: ANSI refuses it, and the
-            // legacy dialect TRUNCATES toward zero and carries on to the range check below. Both
-            // measured — CAST('12.5' AS INT) is an error under ANSI and 12 without it, while
-            // CAST('300.5' AS TINYINT) is null because 300 does not fit rather than because of
-            // the fraction. try_cast takes ANSI's reading of the value and nulls it.
-            if (!legacy && value.Value.FromString && exact != decimal.Truncate(exact))
+            // A string carrying a decimal POINT is where the dialects part: ANSI refuses it, and
+            // the legacy dialect TRUNCATES toward zero and carries on to the range check below.
+            // Both measured — CAST('12.5' AS INT) is an error under ANSI and 12 without it,
+            // while CAST('300.5' AS TINYINT) is null because 300 does not fit rather than
+            // because of the fraction. try_cast takes ANSI's reading of the value and nulls it.
+            //
+            // The point, not the fraction: ANSI refuses '1.0', '0.0' and '10.' too, so asking
+            // whether the VALUE survives truncation accepted all three. #258.
+            if (!legacy && form == SparkIntegralCasts.TextForm.Fractional)
             {
                 if (!raising) continue;
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
@@ -906,6 +923,19 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         for (var i = 0; i < rowCount; i++)
         {
             var value = SparkArrays.ReadForCast(source, i);
+
+            // Java's floating-point literal takes a trailing type suffix, and Spark's parse is
+            // Java's: CAST('1d' AS DOUBLE) is 1.0 and CAST('1.5f' AS FLOAT) is 1.5, where .NET
+            // reads neither. It attaches to a NUMERIC form only -- 'NaNd' and 'Infinityf' are
+            // refused -- and only a floating target takes it, CAST('1d' AS DECIMAL(20,4)) being
+            // an error. Measured; #258.
+            if (value is { IsNumeric: false, FromString: true }
+                && SparkArrays.TryReadTypeSuffixed(value.Value.Text, out var suffixed))
+            {
+                doubles?.Append(suffixed);
+                floats?.Append((float)suffixed);
+                continue;
+            }
 
             if (value is null || !value.Value.IsNumeric)
             {

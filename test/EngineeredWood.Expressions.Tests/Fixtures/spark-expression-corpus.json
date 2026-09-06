@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 11:54:18.911001",
-      "2026-09-06 11:54:18.911001",
-      "2026-09-06 11:54:18.911001"
+      "2026-09-06 12:39:09.279860",
+      "2026-09-06 12:39:09.279860",
+      "2026-09-06 12:39:09.279860"
      ]
     }
    },
@@ -11497,6 +11497,560 @@
     }
    }
   ],
+  "numeric-text": [
+   {
+    "expression": "CAST('1e3' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e3' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e3' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1E3' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1E3' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1E3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1E3' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e+3' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e+3' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e+3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e+3' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e-3' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e-3' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e-3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e-3' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.5e2' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.5e2' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5e2' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.5e2' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e3' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e3' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e3' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e3' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e3' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e3' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1000.0,
+      1000.0,
+      1000.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1e3' AS DECIMAL(20,4))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e3' AS DECIMAL(20,4))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(20,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000.0000",
+      "1000.0000",
+      "1000.0000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1.0' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.0' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.0' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.0' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('.0' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('.0' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '.0' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('.0' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('10.' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('10.' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '10.' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('10.' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.5' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.5' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.5' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('-1.' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-1.' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '-1.' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('-1.' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.0' AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.0' AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.0' of the type \"STRING\" cannot be cast to \"TINYINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.0' AS TINYINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.0' AS DECIMAL(20,4))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.0' AS DECIMAL(20,4))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(20,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0000",
+      "1.0000",
+      "1.0000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('+1' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('+1' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "CAST('  1  ' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('  1  ' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1_0' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1_0' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1_0' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1_0' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('12abc' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('12abc' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '12abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('12abc' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('9223372036854775808' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('9223372036854775808' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '9223372036854775808' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('9223372036854775808' AS BIGINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "CAST('1d' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1d' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1D' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1D' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1.5f' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.5f' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      1.5,
+      1.5
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1e3d' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e3d' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1000.0,
+      1000.0,
+      1000.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1f' AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1f' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('NaNd' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('NaNd' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'NaNd' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('NaNd' AS DOUBLE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('Infinityf' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('Infinityf' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'Infinityf' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('Infinityf' AS DOUBLE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1l' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1l' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1l' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1l' AS DOUBLE)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1 d' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1 d' AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1 d' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1 d' AS DOUBLE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1d' AS DECIMAL(20,4))",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1d' AS DECIMAL(20,4))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(20,4)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1d' of the type \"STRING\" cannot be cast to \"DECIMAL(20,4)\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1d' AS DECIMAL(20,4))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -16751,6 +17305,648 @@
       "ok": true,
       "values": [
        false,
+       null,
+       null
+      ]
+     }
+    }
+   ],
+   "numeric-text": [
+    {
+     "expression": "CAST('1e3' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e3' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1E3' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1E3' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e+3' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e+3' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e-3' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e-3' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.5e2' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.5e2' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e3' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e3' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e3' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e3' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1000.0,
+       1000.0,
+       1000.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e3' AS DECIMAL(20,4))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e3' AS DECIMAL(20,4))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(20,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000.0000",
+       "1000.0000",
+       "1000.0000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.0' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.0' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('.0' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('.0' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('10.' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('10.' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       10,
+       10,
+       10
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.5' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.5' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-1.' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-1.' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1,
+       -1,
+       -1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.0' AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.0' AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.0' AS DECIMAL(20,4))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.0' AS DECIMAL(20,4))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(20,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.0000",
+       "1.0000",
+       "1.0000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('+1' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('+1' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('  1  ' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('  1  ' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1_0' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1_0' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('12abc' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('12abc' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('9223372036854775808' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('9223372036854775808' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1d' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1d' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1D' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1D' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.5f' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.5f' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       1.5,
+       1.5
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e3d' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e3d' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1000.0,
+       1000.0,
+       1000.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1f' AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1f' AS FLOAT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('NaNd' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('NaNd' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('Infinityf' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('Infinityf' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1l' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1l' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1 d' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1 d' AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1d' AS DECIMAL(20,4))",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1d' AS DECIMAL(20,4))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(20,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
        null,
        null
       ]

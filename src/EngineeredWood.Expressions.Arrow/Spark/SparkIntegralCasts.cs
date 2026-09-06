@@ -56,6 +56,74 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 internal static class SparkIntegralCasts
 {
+    /// <summary>What Spark's integral parse makes of a piece of text.</summary>
+    internal enum TextForm
+    {
+        /// <summary>Not an integral literal at all, whatever the dialect.</summary>
+        Invalid,
+
+        /// <summary>A sign and digits.</summary>
+        Integer,
+
+        /// <summary>A sign, digits and a decimal point — which the two dialects treat apart.</summary>
+        Fractional,
+    }
+
+    /// <summary>
+    /// Reads <paramref name="text"/> as Spark's integral parse does: a sign, digits, and an
+    /// optional decimal point with digits. NO exponent, in either dialect.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Measured, and not what .NET's parse accepts. <c>CAST('1e3' AS BIGINT)</c> is
+    /// CAST_INVALID_INPUT under ANSI and NULL under the legacy dialect, where
+    /// <c>double.TryParse</c> reads 1000 and we answered it — the fail-open half of #258. The
+    /// floating and decimal targets DO take an exponent, which is why this rule belongs to the
+    /// integral cast rather than to the value that reaches it.
+    /// </para>
+    /// <para>
+    /// The <see cref="TextForm.Fractional"/> case is syntactic, and deliberately: measured,
+    /// ANSI refuses <c>'1.0'</c>, <c>'0.0'</c> and <c>'10.'</c> as readily as <c>'1.5'</c>, so
+    /// the point itself is what it objects to and not a non-zero fraction. Testing the VALUE
+    /// instead — whether it survives truncation — accepted all three. The legacy dialect
+    /// truncates every one of them.
+    /// </para>
+    /// </remarks>
+    public static TextForm Classify(string text)
+    {
+        var span = text.Trim();
+        var index = 0;
+
+        if (index < span.Length && (span[index] == '+' || span[index] == '-'))
+            index++;
+
+        var digits = 0;
+        while (index < span.Length && span[index] >= '0' && span[index] <= '9')
+        {
+            index++;
+            digits++;
+        }
+
+        var fractional = false;
+        if (index < span.Length && span[index] == '.')
+        {
+            fractional = true;
+            index++;
+            while (index < span.Length && span[index] >= '0' && span[index] <= '9')
+            {
+                index++;
+                digits++;
+            }
+        }
+
+        // Anything left over is what rules out an exponent, a separator, a type suffix and a
+        // trailing letter alike -- and a form with no digits at all is not a number.
+        if (index != span.Length || digits == 0)
+            return TextForm.Invalid;
+
+        return fractional ? TextForm.Fractional : TextForm.Integer;
+    }
+
     private static readonly BigInteger LowWordMask = new(ulong.MaxValue);
 
     /// <summary>10^0 through 10^38, so the divisor below is not rebuilt for every row.</summary>

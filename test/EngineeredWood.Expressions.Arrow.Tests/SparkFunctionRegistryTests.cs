@@ -921,6 +921,84 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal("CAST_INVALID_INPUT", ex.ErrorClass);
     }
 
+    [Theory]
+    [InlineData("1e3")]     // an exponent is a floating form, never an integral one
+    [InlineData("1E3")]
+    [InlineData("1e+3")]
+    [InlineData("1.5e2")]
+    [InlineData("1_0")]
+    [InlineData("12abc")]
+    public void AnIntegralCastRefusesTextItsParseDoesNotAccept(string text)
+    {
+        // Spark's integral parse takes a sign, digits and an optional point -- and no exponent,
+        // in EITHER dialect. .NET's reads 1e3 as 1000, which is what we answered. #258.
+        var batch = Batch(("s", Strings(text)));
+
+        var thrown = Assert.Throws<SparkEvaluationException>(
+            () => Eval(Ansi, "CAST(s AS BIGINT)", batch));
+        Assert.Equal("CAST_INVALID_INPUT", thrown.ErrorClass);
+
+        // The legacy dialect does not truncate it either -- the parse is what failed.
+        Assert.True(Assert.IsType<Int64Array>(Eval(Legacy, "CAST(s AS BIGINT)", batch)).IsNull(0));
+    }
+
+    [Theory]
+    [InlineData("1.0", 1L)]     // ANSI objects to the POINT, not to a non-zero fraction
+    [InlineData("0.0", 0L)]
+    [InlineData("10.", 10L)]
+    [InlineData("1.", 1L)]
+    [InlineData("-1.", -1L)]
+    [InlineData(".0", 0L)]
+    [InlineData("1.5", 1L)]
+    public void ADecimalPointIsRefusedUnderAnsiAndTruncatedWithoutIt(string text, long truncated)
+    {
+        // Measured: every one of these is CAST_INVALID_INPUT under ANSI. Asking whether the
+        // VALUE survives truncation accepted the first four, which is what #258 was.
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS BIGINT)", batch));
+        Assert.Equal(
+            truncated, Assert.IsType<Int64Array>(Eval(Legacy, "CAST(s AS BIGINT)", batch)).GetValue(0));
+    }
+
+    [Theory]
+    [InlineData("1d", 1d)]
+    [InlineData("1D", 1d)]
+    [InlineData("1.5f", 1.5d)]
+    [InlineData("1e3d", 1000d)]
+    public void AFloatingCastTakesJavasTypeSuffix(string text, double expected)
+    {
+        // Java's floating literal carries a trailing d/D/f/F and Spark's parse is Java's, so
+        // CAST('1d' AS DOUBLE) is 1.0 where .NET reads nothing. Fail-CLOSED before #258: we
+        // refused a value Spark answers.
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(
+            expected, Assert.IsType<DoubleArray>(Eval(Ansi, "CAST(s AS DOUBLE)", batch)).GetValue(0));
+    }
+
+    [Theory]
+    [InlineData("NaNd")]        // the suffix attaches to a numeric form, not to a named one
+    [InlineData("Infinityf")]
+    [InlineData("1l")]          // and only to d/D/f/F
+    [InlineData("1 d")]
+    public void AFloatingCastTakesNoSuffixOnANamedOrSpacedForm(string text)
+    {
+        var batch = Batch(("s", Strings(text)));
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS DOUBLE)", batch));
+    }
+
+    [Fact]
+    public void OnlyAFloatingTargetTakesTheTypeSuffix()
+    {
+        // Measured: CAST('1d' AS DECIMAL(20,4)) is an error while CAST('1e3' AS DECIMAL(20,4))
+        // is 1000 -- the decimal target takes the exponent the integral one refuses, and not the
+        // suffix the floating one accepts. Three targets, three acceptances.
+        var batch = Batch(("s", Strings("1d")));
+        Assert.Throws<SparkEvaluationException>(
+            () => Eval(Ansi, "CAST(s AS DECIMAL(20,4))", batch));
+    }
+
     [Fact]
     public void CastingAStringToAnIntegerTrimsWhitespace()
     {
