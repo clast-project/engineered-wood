@@ -86,11 +86,15 @@ internal static class SparkArrays
             _array = null;
             _index = 0;
             FromString = true;
+
+            // Trimmed once and shared. Both parses want the same text, and `Trim` allocates
+            // whenever there is anything to trim -- twice per row, for a padded cell.
+            var trimmed = text.Trim();
             IsNumeric = double.TryParse(
-                text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
+                trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
             AsDouble = IsNumeric ? asDouble : 0d;
             Exact = IsNumeric
-                && decimal.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+                && decimal.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
                 ? parsed
                 : null;
         }

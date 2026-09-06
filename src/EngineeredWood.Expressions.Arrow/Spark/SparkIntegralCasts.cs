@@ -91,25 +91,29 @@ internal static class SparkIntegralCasts
     /// </remarks>
     public static TextForm Classify(string text)
     {
-        var span = text.Trim();
+        // Read between indices rather than over a trimmed copy: this runs once per row of a
+        // string-to-integral cast, and `Trim` allocates whenever there is anything to trim.
         var index = 0;
+        var end = text.Length;
+        while (index < end && char.IsWhiteSpace(text[index])) index++;
+        while (end > index && char.IsWhiteSpace(text[end - 1])) end--;
 
-        if (index < span.Length && (span[index] == '+' || span[index] == '-'))
+        if (index < end && (text[index] == '+' || text[index] == '-'))
             index++;
 
         var digits = 0;
-        while (index < span.Length && span[index] >= '0' && span[index] <= '9')
+        while (index < end && text[index] >= '0' && text[index] <= '9')
         {
             index++;
             digits++;
         }
 
         var fractional = false;
-        if (index < span.Length && span[index] == '.')
+        if (index < end && text[index] == '.')
         {
             fractional = true;
             index++;
-            while (index < span.Length && span[index] >= '0' && span[index] <= '9')
+            while (index < end && text[index] >= '0' && text[index] <= '9')
             {
                 index++;
                 digits++;
@@ -118,7 +122,7 @@ internal static class SparkIntegralCasts
 
         // Anything left over is what rules out an exponent, a separator, a type suffix and a
         // trailing letter alike -- and a form with no digits at all is not a number.
-        if (index != span.Length || digits == 0)
+        if (index != end || digits == 0)
             return TextForm.Invalid;
 
         return fractional ? TextForm.Fractional : TextForm.Integer;
