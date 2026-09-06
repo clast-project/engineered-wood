@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions.Arrow.Spark;
@@ -240,6 +241,147 @@ public sealed class SparkFunctionRegistryTests
 
         Assert.True(Assert.IsType<Int32Array>(Eval(Legacy, "CAST(ts AS INT)", batch)).IsNull(0));
         Assert.True(Assert.IsType<Int16Array>(Eval(Legacy, "CAST(ts AS SMALLINT)", batch)).IsNull(0));
+    }
+
+
+    // ── Double to decimal, through Spark's rendering of the value (#244) ────────────────────
+
+    private static IArrowArray Floats(params float[] values)
+    {
+        var b = new FloatArray.Builder();
+        foreach (var v in values) b.Append(v);
+        return b.Build();
+    }
+
+    /// <summary>
+    /// A double past System.Decimal's ceiling reaches a decimal, where it used to be refused.
+    /// </summary>
+    [Fact]
+    public void ADoublePastDecimalsCeilingCastsRatherThanBeingRefused()
+    {
+        var batch = Batch(("g", Doubles(1e30, -1e30, 1e37)));
+
+        Assert.Equal("1000000000000000000000000000000", Rendered(Ansi, "CAST(g AS DECIMAL(38,0))", batch, 0));
+        Assert.Equal("-1000000000000000000000000000000", Rendered(Ansi, "CAST(g AS DECIMAL(38,0))", batch, 1));
+        Assert.Equal("10000000000000000000000000000000000000", Rendered(Ansi, "CAST(g AS DECIMAL(38,0))", batch, 2));
+
+        // The scale is applied to the rendering, not to a truncated form of it. Its own batch,
+        // because a cast runs over the whole column and 1e37 needs 39 digits at scale 2.
+        Assert.Equal("1000000000000000000000000000000.00",
+            Rendered(Ansi, "CAST(g AS DECIMAL(38,2))", Batch(("g", Doubles(1e30))), 0));
+    }
+
+    /// <summary>
+    /// Spark converts the RENDERING of a double, which is what makes a float source surprising.
+    /// </summary>
+    /// <remarks>
+    /// 1e30f widens to the double 1.0000000150474662E30, and Spark's answer is those digits — not
+    /// the digits of 1e30, and not the exact binary value of the float. Reading the float's own
+    /// shortest form instead would answer 1000000000000000000000000000000.
+    /// </remarks>
+    [Fact]
+    public void AFloatSourceRendersTheWidenedDouble()
+    {
+        Assert.Equal("1000000015047466200000000000000",
+            Rendered(Ansi, "CAST(f AS DECIMAL(38,0))", Batch(("f", Floats(1e30f))), 0));
+
+        // A separate batch, because a cast runs over the whole column and 1e30 does not fit a
+        // scale of 20.
+        Assert.Equal("0.10000000149011612000",
+            Rendered(Ansi, "CAST(f AS DECIMAL(38,20))", Batch(("f", Floats(0.1f))), 0));
+    }
+
+    /// <summary>
+    /// The digits that <c>(decimal)double</c> used to round away are kept.
+    /// </summary>
+    /// <remarks>
+    /// That conversion rounds to 15 significant digits where Spark keeps up to 17, so it was
+    /// losing digits on values well inside <see cref="decimal"/>'s range — measured over ~1e6
+    /// doubles, it disagreed with Spark's rendering on 93% of the ones a decimal could hold.
+    /// </remarks>
+    [Fact]
+    public void SeventeenSignificantDigitsSurviveWhereFifteenUsedTo()
+    {
+        var batch = Batch(("g", Doubles(0.1, 0.3333333333333333)));
+
+        Assert.Equal("0.100000000000000000000000000000",
+            Rendered(Ansi, "CAST(g AS DECIMAL(38,30))", batch, 0));
+
+        // Sixteen digits, and the value that made this depend on the target framework: net472's
+        // ToString("R") renders it with seventeen. SparkArrays.ShortestRoundTrip is what keeps
+        // every build answering the same thing.
+        Assert.Equal("0.33333333333333330000",
+            Rendered(Ansi, "CAST(g AS DECIMAL(38,20))", batch, 1));
+    }
+
+    [Fact]
+    public void TheShortestRenderingIsTheSameOnEveryTargetFramework()
+    {
+        // Asserted directly as well as through the cast, because the difference it guards against
+        // shows up on one target framework only and would otherwise be invisible here.
+        Assert.Equal("0.3333333333333333", SparkArrays.ShortestRoundTrip(0.3333333333333333));
+        Assert.Equal("0.1", SparkArrays.ShortestRoundTrip(0.1));
+        Assert.Equal("2.5", SparkArrays.ShortestRoundTrip(2.5));
+
+        // Every rendering must read back as the value it came from, whichever rung produced it.
+        foreach (var value in new[] { 0.1, 2.5, 1e30, -1e30, 1.0000000150474662E30, 5e-324, double.MaxValue })
+        {
+            Assert.Equal(value, double.Parse(
+                SparkArrays.ShortestRoundTrip(value), NumberStyles.Float, CultureInfo.InvariantCulture));
+        }
+    }
+
+    /// <summary>
+    /// NaN and the infinities yield null rather than raising, even under ANSI.
+    /// </summary>
+    /// <remarks>
+    /// The one refusal on this path that is not an error. Measured — every other failure of a
+    /// cast to a decimal raises NUMERIC_VALUE_OUT_OF_RANGE under ANSI.
+    /// </remarks>
+    [Fact]
+    public void NaNAndInfinityBecomeNullRatherThanRaising()
+    {
+        var batch = Batch(("g", Doubles(double.NaN, double.PositiveInfinity, double.NegativeInfinity)));
+
+        var result = Assert.IsType<Decimal128Array>(Eval(Ansi, "CAST(g AS DECIMAL(10,2))", batch));
+
+        Assert.True(result.IsNull(0));
+        Assert.True(result.IsNull(1));
+        Assert.True(result.IsNull(2));
+    }
+
+    /// <summary>A value the target cannot hold is the same refusal every other source gets.</summary>
+    [Fact]
+    public void ADoubleTooWideForItsTargetIsNumericValueOutOfRange()
+    {
+        var batch = Batch(("g", Doubles(1e39)));
+
+        // NUMERIC_VALUE_OUT_OF_RANGE and not NUMERIC_OUT_OF_SUPPORTED_RANGE, which is what a
+        // STRING of the same width reports: only the string route meets Spark's digit-count
+        // fast-fail, and a double reaches the decimal by a different one. Measured.
+        Assert.Equal(
+            "NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION",
+            Assert.Throws<SparkEvaluationException>(
+                () => Eval(Ansi, "CAST(g AS DECIMAL(38,0))", batch)).ErrorClass);
+
+        Assert.True(Assert.IsType<Decimal128Array>(
+            Eval(Legacy, "CAST(g AS DECIMAL(38,0))", batch)).IsNull(0));
+
+        // Narrow enough to overflow without being past the ceiling at all.
+        var small = Batch(("g", Doubles(12345)));
+        Assert.Equal(
+            "NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION",
+            Assert.Throws<SparkEvaluationException>(
+                () => Eval(Ansi, "CAST(g AS DECIMAL(3,0))", small)).ErrorClass);
+    }
+
+    /// <summary>Renders one cell of a decimal result the way Spark prints it.</summary>
+    private static string Rendered(SparkFunctionRegistry registry, string sql, RecordBatch batch, int row)
+    {
+        var result = Assert.IsType<Decimal128Array>(Eval(registry, sql, batch));
+        var type = (Decimal128Type)result.Data.DataType;
+        return SparkWideDecimals.Render(
+            new SparkWideDecimals.Operand(SparkWideDecimals.Read(result, row)!.Value.Unscaled, 38, type.Scale));
     }
 
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
