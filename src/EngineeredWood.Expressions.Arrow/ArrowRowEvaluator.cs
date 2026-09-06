@@ -205,7 +205,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </remarks>
     private void CoerceSet(
         ref LiteralValue?[] operand, IArrowType? operandType,
-        LiteralValue?[][] members, IArrowType?[] memberTypes, int rowCount)
+        SetMember[] members, IArrowType?[] memberTypes, int rowCount)
     {
         if (_coercion is null)
             return;
@@ -215,8 +215,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         for (var k = 0; k < members.Length; k++)
         {
-            if (IsString(memberTypes[k], members[k])) anyString = true;
-            else if (FirstKind(members[k]) is not null) anyOther = true;
+            if (IsMemberString(members[k], memberTypes[k])) anyString = true;
+            else if (MemberKind(members[k], memberTypes[k]) is not null) anyOther = true;
         }
 
         if (!anyString || !anyOther)
@@ -230,7 +230,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         var types = new List<IArrowType>(members.Length + 1) { operandResolved };
         for (var k = 0; k < members.Length; k++)
         {
-            resolved[k] = OperandType(memberTypes[k], members[k]);
+            resolved[k] = MemberType(members[k], memberTypes[k]);
             types.Add(resolved[k]);
         }
 
@@ -240,8 +240,36 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         operand = CastMember(operand, operandResolved, target, rowCount);
         for (var k = 0; k < members.Length; k++)
-            members[k] = CastMember(members[k], resolved[k], target, rowCount);
+        {
+            // A constant is cast as a one-row array, not as one row per row of the batch.
+            members[k] = members[k].IsConstant
+                ? new SetMember(CastMember(
+                    new[] { members[k].Constant }, resolved[k], target, 1)[0])
+                : new SetMember(CastMember(members[k].PerRow, resolved[k], target, rowCount));
+        }
     }
+
+    /// <summary>Whether a set member is a string, from its declared type or its value.</summary>
+    private static bool IsMemberString(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? member.Constant?.Type == LiteralValue.Kind.String
+            : IsString(declared, member.PerRow);
+
+    /// <summary>The kind a set member carries, or null when it has no value at all.</summary>
+    private static LiteralValue.Kind? MemberKind(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? member.Constant?.Type
+            : (declared is not null || FirstKind(member.PerRow) is not null
+                ? FirstKind(member.PerRow) ?? LiteralValue.Kind.String
+                : null);
+
+    /// <summary>The Arrow type a set member resolves through.</summary>
+    private static IArrowType MemberType(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? (member.Constant is { } value
+                ? ConstantArray(value, 1).Data.DataType
+                : StringType.Default)
+            : OperandType(declared, member.PerRow);
 
     /// <summary>Rebuilds one member of a set as <paramref name="target"/>.</summary>
     private LiteralValue?[] CastMember(
@@ -250,6 +278,42 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             _coercion!.CastForComparison(
                 MaterializeAsArray(values, rowCount, type), target, rowCount),
             rowCount);
+
+    /// <summary>
+    /// One member of a set test: a constant, or a value per row.
+    /// </summary>
+    /// <remarks>
+    /// The distinction is worth a type because a literal list is the common one. Evaluating a
+    /// member through the ordinary expression path would repeat every literal across the batch,
+    /// so `x IN (1, 2)` over a hundred thousand rows would allocate two hundred thousand cells
+    /// for two values that never change.
+    /// </remarks>
+    private readonly struct SetMember
+    {
+        private readonly LiteralValue?[]? _perRow;
+
+        public SetMember(LiteralValue? constant)
+        {
+            _perRow = null;
+            Constant = constant;
+        }
+
+        public SetMember(LiteralValue?[] perRow)
+        {
+            _perRow = perRow;
+            Constant = null;
+        }
+
+        public bool IsConstant => _perRow is null;
+
+        /// <summary>The value, when this member is a constant.</summary>
+        public LiteralValue? Constant { get; }
+
+        /// <summary>The values, when this member varies by row.</summary>
+        public LiteralValue?[] PerRow => _perRow!;
+
+        public LiteralValue? At(int row) => _perRow is null ? Constant : _perRow[row];
+    }
 
     /// <summary>
     /// Casts whichever operand has to move before the two can be compared, in place.
@@ -461,12 +525,25 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 
-        // Every member is an expression, so each is a column of its own: `x IN (a, b)` compares
-        // row i of x against row i of a and of b, not against two constants.
-        var members = new LiteralValue?[set.Values.Count][];
+        // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
+        // of b. A LITERAL member stays a single value rather than being repeated per row --
+        // `x IN (1, 2)` is most of them, and repeating each one would cost an array the length
+        // of the batch for a value that does not vary.
+        var members = new SetMember[set.Values.Count];
         var memberTypes = new IArrowType?[set.Values.Count];
         for (var k = 0; k < set.Values.Count; k++)
-            (members[k], memberTypes[k]) = EvalOperand(set.Values[k], batch);
+        {
+            if (set.Values[k] is LiteralExpression literal)
+            {
+                members[k] = new SetMember(
+                    literal.Value.IsNull ? null : (LiteralValue?)literal.Value);
+                continue;
+            }
+
+            var (values, type) = EvalOperand(set.Values[k], batch);
+            members[k] = new SetMember(values);
+            memberTypes[k] = type;
+        }
 
         CoerceSet(ref operand, operandType, members, memberTypes, batch.Length);
 
@@ -487,7 +564,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             bool sawNullInList = false;
             foreach (var member in members)
             {
-                var lit = member[i];
+                var lit = member.At(i);
                 if (!lit.HasValue) { sawNullInList = true; continue; }
                 try
                 {

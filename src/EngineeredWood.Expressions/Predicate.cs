@@ -170,17 +170,21 @@ public sealed record SetPredicate(
     /// </remarks>
     public bool TryGetLiteralValues(out IReadOnlyList<LiteralValue> literals)
     {
-        var found = new LiteralValue[Values.Count];
+        // Asked first, so that a list this cannot answer for costs nothing. Its callers use it
+        // as a capability check -- pruning and Bloom probing ask before doing anything else --
+        // and a list holding a column is exactly the case that would have paid for the array.
         for (var i = 0; i < Values.Count; i++)
         {
-            if (Values[i] is not LiteralExpression literal)
+            if (Values[i] is not LiteralExpression)
             {
                 literals = Array.Empty<LiteralValue>();
                 return false;
             }
-
-            found[i] = literal.Value;
         }
+
+        var found = new LiteralValue[Values.Count];
+        for (var i = 0; i < Values.Count; i++)
+            found[i] = ((LiteralExpression)Values[i]).Value;
 
         literals = found;
         return true;
