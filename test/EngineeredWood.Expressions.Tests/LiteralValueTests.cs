@@ -154,11 +154,25 @@ public class LiteralValueTests
         Assert.NotEqual((LiteralValue)"a", (LiteralValue)"b");
     }
 
+    /// <summary>
+    /// Equality is representation-based, so two kinds are never equal -- while the SQL
+    /// comparison still promotes across them. See <see cref="LiteralValue.Equals(LiteralValue)"/>
+    /// for why the two cannot be one method (#206).
+    /// </summary>
     [Fact]
-    public void Equals_CrossTypeNumeric()
+    public void Equals_CrossTypeNumeric_IsFalse_WhileCompareToStillMatches()
     {
-        // int and long with same value should be equal via numeric promotion
-        Assert.Equal((LiteralValue)42, (LiteralValue)42L);
+        Assert.NotEqual((LiteralValue)42, (LiteralValue)42L);
+        Assert.NotEqual((LiteralValue)1, (LiteralValue)1.0d);
+        Assert.NotEqual((LiteralValue)1.5f, (LiteralValue)1.5d);
+        Assert.NotEqual(LiteralValue.Of(1m), LiteralValue.HighPrecisionDecimalOf(1, 0));
+
+        // The SQL answer is unchanged. It is what the evaluators ask for, through
+        // ArrowRowEvaluator.ValueEqual and StatisticsEvaluator.ConstantCompare.
+        Assert.Equal(0, ((LiteralValue)42).CompareTo((LiteralValue)42L));
+        Assert.Equal(0, ((LiteralValue)1).CompareTo((LiteralValue)1.0d));
+        Assert.Equal(0, ((LiteralValue)1.5f).CompareTo((LiteralValue)1.5d));
+        Assert.Equal(0, LiteralValue.Of(1m).CompareTo(LiteralValue.HighPrecisionDecimalOf(1, 0)));
     }
 
     [Fact]

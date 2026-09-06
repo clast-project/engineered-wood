@@ -581,8 +581,17 @@ public static class StatisticsEvaluator
 
     private static bool CompareLiterals(LiteralValue a, ComparisonOperator op, LiteralValue b)
     {
+        // Spark's <=>, which is SQL equality plus NULL <=> NULL. It asks the COMPARISON, not
+        // Equals: equality is representation-based (#206) and would answer false for 1 <=> 1.0d,
+        // diverging from the row evaluator, which reaches CompareTo through ValueEqual.
+        //
+        // No null branch of its own -- CompareTo already orders null before every value and gives
+        // two nulls 0, so <=>'s whole contract falls out of == 0. Reading a.Equals(b) here also
+        // THREW for a null against a value and for any pair the comparison declines, measured, so
+        // `col <=> NULL` folded over two literals raised out of a pruning entry point rather than
+        // answering; ConstantCompare's int.MinValue turns that pair into false.
         if (op == ComparisonOperator.NullSafeEqual)
-            return a.Equals(b);
+            return ConstantCompare(a, b) == 0;
 
         if (a.IsNull || b.IsNull)
             return false; // SQL: comparison with NULL is NULL, treat as false
