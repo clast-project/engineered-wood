@@ -685,6 +685,75 @@ GROUPS = {
         "d4 = 1000000000000000000000000000000",
         "12345678901234567890123456789012345678 + 1",
     ],
+    "round-greatest-least": [
+        # Issue #182. round, greatest and least have corpus answers and no implementation, and the
+        # four entries recording that are the ones this group is here to retire. Four answers are
+        # not enough to write them from, so the rules they depend on are asked here.
+
+        # ROUNDING MODE. Spark has both: `round` is half-up and `bround` is half-even, and the
+        # only inputs that tell them apart are exact halves with an even digit before them.
+        "round(2.5)",
+        "round(-2.5)",
+        "round(3.5)",
+        "round(1.45, 1)",
+        "round(-1.45, 1)",
+        "round(0.5)",
+        "round(1.5)",
+
+        # ARITY and the scale argument, including a negative one, which rounds to the left of the
+        # point rather than the right.
+        "round(g)",
+        "round(g, 0)",
+        "round(g, 2)",
+        "round(12345, -2)",
+        "round(12345, -5)",
+        "round(a, -1)",
+        "round(d1, 1)",
+        "round(d1, 0)",
+        "round(d3, 2)",
+        "round(d4, 0)",
+        "round(g, 20)",
+        # A negative scale on a DOUBLE, and a scale WIDER than the decimal already has -- the two
+        # shapes the rows above leave open. Without them the implementation would be deriving the
+        # double's negative-scale rule from the integral one and the widening rule from nothing.
+        "round(g, -1)",
+        "round(d1, 5)",
+        "round(d1, 2)",
+        "round(b, -3)",
+
+        # The values with no rounding to do.
+        "round(CAST('NaN' AS DOUBLE), 2)",
+        "round(CAST('Infinity' AS DOUBLE), 2)",
+        "round(NULL, 2)",
+
+        # GREATEST and LEAST: how nulls are treated is the whole question. Spark SKIPS them rather
+        # than propagating, which is the opposite of most functions here.
+        "greatest(a, b)",
+        "greatest(a, g)",
+        "least(a, b)",
+        "least(a, g)",
+        "greatest(a, NULL)",
+        "least(a, NULL)",
+        "greatest(NULL, NULL)",
+        "greatest(a, b, g)",
+        "least(a, b, sh)",
+        "greatest(s, t)",
+        "greatest(d1, a)",
+        "least(d1, d2)",
+        "greatest(dt, dt)",
+        "greatest(bl, bl)",
+        # One argument, and none, so the arity rule is on the record too.
+        "greatest(a)",
+        "greatest()",
+
+        # The DATE and TIMESTAMP literals, which parse and resolve and then cannot be materialised.
+        # Recorded here as VALUES rather than only as types.
+        "DATE'2026-08-11'",
+        "DATE'2026-08-11' = dt",
+        "TIMESTAMP'2026-08-11 12:30:00' = ts",
+        "year(DATE'2026-08-11')",
+        "CAST(DATE'2026-08-11' AS STRING)",
+    ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",
@@ -721,6 +790,29 @@ def _run_driver(args):
             raise SystemExit(f"driver produced no result (exit {proc.returncode})")
         with open(result_path, "r", encoding="utf-8") as fh:
             return json.load(fh)
+
+
+def _json_safe(value):
+    """Replace non-finite floats with their names, so the fixture stays valid JSON.
+
+    Python's json writes NaN and Infinity as bare tokens, which json.load accepts and every
+    stricter reader refuses -- System.Text.Json among them, so the fixture simply failed to load.
+    They are legitimate Spark answers (`round(CAST('NaN' AS DOUBLE), 2)` is NaN), so they are
+    recorded as the strings Java prints for them and the comparison reads them back.
+    """
+    if isinstance(value, float):
+        if value != value:
+            return "NaN"
+        if value == float("inf"):
+            return "Infinity"
+        if value == float("-inf"):
+            return "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def main():
@@ -770,7 +862,8 @@ def main():
 
     os.makedirs(os.path.dirname(FIXTURE), exist_ok=True)
     with open(FIXTURE, "w", encoding="utf-8") as fh:
-        json.dump(fixture, fh, indent=1, ensure_ascii=False, default=str)
+        json.dump(_json_safe(fixture), fh, indent=1, ensure_ascii=False, default=str,
+                  allow_nan=False)
         fh.write("\n")
 
     total = len(ordered_unique)

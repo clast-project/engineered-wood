@@ -2263,9 +2263,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 05:31:32.941669",
-      "2026-09-06 05:31:32.941669",
-      "2026-09-06 05:31:32.941669"
+      "2026-09-06 05:48:05.642586",
+      "2026-09-06 05:48:05.642586",
+      "2026-09-06 05:48:05.642586"
      ]
     }
    },
@@ -8595,6 +8595,916 @@
       "12345678901234567890123456789012345679",
       "12345678901234567890123456789012345679",
       "12345678901234567890123456789012345679"
+     ]
+    }
+   }
+  ],
+  "round-greatest-least": [
+   {
+    "expression": "round(2.5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(2.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3",
+      "3",
+      "3"
+     ]
+    }
+   },
+   {
+    "expression": "round(-2.5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(-2.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-3",
+      "-3",
+      "-3"
+     ]
+    }
+   },
+   {
+    "expression": "round(3.5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(3.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "4",
+      "4",
+      "4"
+     ]
+    }
+   },
+   {
+    "expression": "round(1.45, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(1.45BD, 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      "1.5",
+      "1.5"
+     ]
+    }
+   },
+   {
+    "expression": "round(-1.45, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(-1.45BD, 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "round(0.5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(0.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(1,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "round(1.5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(1.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2",
+      "2",
+      "2"
+     ]
+    }
+   },
+   {
+    "expression": "round(g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.0,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "round(g, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.0,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "round(g, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "round(12345, -2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(12345, -2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      12300,
+      12300,
+      12300
+     ]
+    }
+   },
+   {
+    "expression": "round(12345, -5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(12345, -5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      0,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "round(a, -1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(a, -1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] Overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(round(a, -1)) AS r\n ^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "round(d1, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d1, 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(10,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.3",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "round(d1, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d1, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(9,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "round(d3, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d3, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(31,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9.99",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "round(d4, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d4, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "-1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "round(g, 20)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, 20)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "round(g, -1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(g, -1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "round(d1, 5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d1, 5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "round(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "round(b, -3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(b, -3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "round(CAST('NaN' AS DOUBLE), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(CAST('NaN' AS DOUBLE), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "round(CAST('Infinity' AS DOUBLE), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(CAST('Infinity' AS DOUBLE), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Infinity",
+      "Infinity",
+      "Infinity"
+     ]
+    }
+   },
+   {
+    "expression": "round(NULL, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(NULL, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "greatest(a, b)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      10,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "greatest(a, g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "least(a, b)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(a, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "least(a, g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(a, g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      null,
+      -2147483648.0
+     ]
+    }
+   },
+   {
+    "expression": "greatest(a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "least(a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(a, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "greatest(NULL, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(NULL, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "void"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "greatest(a, b, g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, b, g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      10.0,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "least(a, b, sh)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(a, b, sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "greatest(s, t)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(s, t)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      null,
+      "xyz"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d1, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d1, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "least(d1, d2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(d1, d2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.2345",
+      null,
+      "0.0000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(dt, dt)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(dt, dt)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      null,
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(bl, bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(bl, bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "greatest(a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `greatest` requires > 1 parameters but the actual number is 1. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `greatest` requires > 1 parameters but the actual number is 1. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605"
+    }
+   },
+   {
+    "expression": "greatest()",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest()"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `greatest` requires > 1 parameters but the actual number is 0. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `greatest` requires > 1 parameters but the actual number is 0. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605"
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11' = dt",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(DATE '2026-08-11' = dt)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "TIMESTAMP'2026-08-11 12:30:00' = ts",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(TIMESTAMP '2026-08-11 12:30:00' = ts)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "year(DATE'2026-08-11')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "year(DATE '2026-08-11')"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2026,
+      2026,
+      2026
+     ]
+    }
+   },
+   {
+    "expression": "CAST(DATE'2026-08-11' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(DATE '2026-08-11' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
      ]
     }
    }

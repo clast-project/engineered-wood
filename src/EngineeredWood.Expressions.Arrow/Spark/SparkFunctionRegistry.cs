@@ -66,6 +66,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         "year" or "month" or "day" or "dayofmonth" or "hour" or "minute" or "second" => true,
         "date_format" => true,
         "coalesce" or "nvl" or "ifnull" or "nullif" or "if" or "case" => true,
+        "round" or "greatest" or "least" => true,
         _ => false,
     };
 
@@ -144,6 +145,13 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
 
             case "coalesce" or "nvl" or "ifnull":
                 return Coalesce(args, rowCount);
+
+            case "greatest" or "least":
+                return Extreme(name, args, rowCount);
+
+            case "round":
+                Expect(name, args, args.Count == 1 ? 1 : 2);
+                return Round(args, rowCount);
 
             case "nullif":
                 Expect(name, args, 2);
@@ -965,6 +973,279 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         }
 
         return type ?? StringType.Default;
+    }
+
+    /// <summary>
+    /// <c>round(x)</c> and <c>round(x, s)</c> — half away from zero, at a scale that may be
+    /// negative.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Half away from zero</b>, which is what <c>round</c> is; Spark spells the half-even one
+    /// <c>bround</c> and it is a different function. Measured on the inputs that tell them apart:
+    /// <c>round(2.5)</c> is 3, <c>round(-2.5)</c> is -3 and <c>round(1.45, 1)</c> is 1.5.
+    /// </para>
+    /// <para>
+    /// <b>The result type depends on the source, and only the decimal one moves.</b> A double
+    /// stays a double and an integral type stays itself — <c>round(12345, -2)</c> is an
+    /// <c>int</c> holding 12300. A decimal(p,s) rounded to <c>d</c> becomes
+    /// decimal(p - s + s' + 1, s'), where s' is min(s, d), capped at 38. Measured:
+    /// decimal(10,2) goes to decimal(10,1) at d=1 and decimal(9,0) at d=0 — and, the shape that
+    /// is not obvious, to decimal(11,2) at d=5, because a scale WIDER than the value already has
+    /// leaves the scale alone and still widens the precision by one.
+    /// </para>
+    /// <para>
+    /// A negative scale on a DECIMAL is the one shape here that was not harvested; it takes the
+    /// integral rule of rounding to a multiple of a power of ten. Everything else on this path is
+    /// an answer from the corpus's <c>round-greatest-least</c> group.
+    /// </para>
+    /// </remarks>
+    private IArrowArray Round(IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        var source = args[0];
+        var scale = args.Count > 1 ? RoundScale(args[1]) : 0;
+
+        if (source.Data.DataType is Decimal128Type decimals)
+            return RoundDecimal(source, decimals, scale, rowCount);
+
+        if (source.Data.DataType is FloatType or DoubleType)
+            return RoundFloating(source, scale, rowCount);
+
+        if (SparkNumericTypes.IsIntegral(source.Data.DataType))
+            return RoundIntegral(source, scale, rowCount);
+
+        // `round(NULL, 2)` resolves to a double in Spark, and an all-null literal reaches here as
+        // the placeholder column the evaluator builds when it has no type to infer.
+        if (AllNull(source, rowCount))
+            return NullDoubles(rowCount);
+
+        throw new NotSupportedException($"round over {source.Data.DataType.Name} is not supported");
+    }
+
+    private static bool AllNull(IArrowArray source, int rowCount)
+    {
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (!SparkFunctions.IsNull(source, i))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static IArrowArray NullDoubles(int rowCount)
+    {
+        var builder = new DoubleArray.Builder();
+        for (var i = 0; i < rowCount; i++) builder.AppendNull();
+        return builder.Build();
+    }
+
+    /// <summary>The scale argument, which is a constant integer.</summary>
+    private static int RoundScale(IArrowArray argument) =>
+        SparkArrays.ReadInt64(argument, 0) is { } value
+            ? checked((int)value)
+            : throw new ArgumentException("the scale of round must not be null", nameof(argument));
+
+    private static IArrowArray RoundFloating(IArrowArray source, int scale, int rowCount)
+    {
+        var isFloat = source.Data.DataType is FloatType;
+        var doubles = isFloat ? null : new DoubleArray.Builder();
+        var floats = isFloat ? new FloatArray.Builder() : null;
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkArrays.ReadDouble(source, i) is not { } value)
+            {
+                doubles?.AppendNull();
+                floats?.AppendNull();
+                continue;
+            }
+
+            var rounded = RoundHalfUp(value, scale);
+            doubles?.Append(rounded);
+            floats?.Append((float)rounded);
+        }
+
+        return (IArrowArray?)doubles?.Build() ?? floats!.Build();
+    }
+
+    /// <summary>
+    /// Half away from zero at a decimal scale, leaving alone anything with no fraction to lose.
+    /// </summary>
+    /// <remarks>
+    /// NaN and the infinities pass through — measured, <c>round(NaN, 2)</c> is NaN — and so does
+    /// a value scaled past 2^53, where a double has no fractional part left to round. That is
+    /// what keeps <c>round(g, 20)</c> equal to <c>g</c> rather than turning it into an infinity.
+    /// </remarks>
+    private static double RoundHalfUp(double value, int scale)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+            return value;
+
+        var factor = Math.Pow(10, scale);
+        var scaled = value * factor;
+
+        if (double.IsInfinity(scaled) || Math.Abs(scaled) >= 9007199254740992d)
+            return value;
+
+        return Math.Round(scaled, MidpointRounding.AwayFromZero) / factor;
+    }
+
+    private IArrowArray RoundIntegral(IArrowArray source, int scale, int rowCount)
+    {
+        var type = source.Data.DataType;
+        var values = new long?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkArrays.ReadInt64(source, i) is not { } value)
+                continue;
+
+            // A non-negative scale has nothing to round: the value is already an integer.
+            if (scale >= 0)
+            {
+                values[i] = value;
+                continue;
+            }
+
+            var rounded = RoundToPowerOfTen(value, -scale);
+
+            if (!SparkArrays.FitsIn(rounded, type))
+            {
+                if (!_options.Ansi) continue;
+
+                // Measured: `round(a, -1)` over INT_MIN reports ARITHMETIC_OVERFLOW rather than
+                // CAST_OVERFLOW — rounding is arithmetic here, not a conversion.
+                throw SparkEvaluationException.Overflow(
+                    SparkArrays.NarrowerThanInt(type),
+                    $"rounding {value} to {scale} places overflows {SparkArrays.Describe(type)}");
+            }
+
+            values[i] = rounded;
+        }
+
+        return SparkArrays.BuildIntegral(values, type, rowCount);
+    }
+
+    /// <summary>Rounds to a multiple of 10^places, half away from zero.</summary>
+    private static long RoundToPowerOfTen(long value, int places)
+    {
+        if (places > 18)
+            return 0;
+
+        var step = 1L;
+        for (var i = 0; i < places; i++) step *= 10;
+
+        var remainder = value % step;
+        var truncated = value - remainder;
+
+        if (Math.Abs(remainder) * 2 < step)
+            return truncated;
+
+        return truncated + (value < 0 ? -step : step);
+    }
+
+    private IArrowArray RoundDecimal(IArrowArray source, Decimal128Type type, int scale, int rowCount)
+    {
+        var resultScale = Math.Max(Math.Min(type.Scale, scale), 0);
+        var resultPrecision = Math.Min(
+            SparkNumericTypes.MaxPrecision, type.Precision - type.Scale + resultScale + 1);
+        var target = new Decimal128Type(resultPrecision, resultScale);
+
+        var mantissas = new Int128?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkWideDecimals.Read(source, i) is not { } value)
+                continue;
+
+            // The same rescale every other exact path uses, so the rounding mode is the one
+            // SparkWideDecimals pins rather than a second opinion about it.
+            var rounded = SparkWideDecimals.Cast(value, target);
+
+            if (rounded is null)
+            {
+                if (!_options.Ansi) continue;
+                throw SparkEvaluationException.NumericValueOutOfRange(
+                    SparkWideDecimals.Render(value), target);
+            }
+
+            mantissas[i] = rounded;
+        }
+
+        return SparkWideDecimals.Build(mantissas, target, rowCount);
+    }
+
+    /// <summary>
+    /// <c>greatest</c> and <c>least</c> — the largest or smallest argument, SKIPPING nulls.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Nulls are skipped, not propagated</b>, which is the opposite of almost everything else
+    /// here: measured, <c>greatest(a, NULL)</c> is <c>a</c> and keeps <c>a</c>'s type, and only
+    /// <c>greatest(NULL, NULL)</c> is null. That makes this the same shape as <c>coalesce</c> —
+    /// choose an argument per row, then unify — rather than the same shape as arithmetic.
+    /// </para>
+    /// <para>
+    /// <b>Two arguments at least.</b> <c>greatest(a)</c> is <c>WRONG_NUM_ARGS</c> in Spark, not
+    /// the identity, and so is <c>greatest()</c>. Measured, because accepting one would have been
+    /// the obvious reading.
+    /// </para>
+    /// </remarks>
+    private static IArrowArray Extreme(string name, IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        if (args.Count < 2)
+            throw new ArgumentException($"{name} needs at least two arguments", nameof(args));
+
+        // Converted to the common type FIRST, so the comparison below is between two values of
+        // one type rather than across a promotion. `greatest(d1, a)` is a decimal(12,2) in Spark,
+        // and comparing the decimal against the raw int would be a different question.
+        // A bare NULL is typed `void` in Spark and constrains nothing: measured,
+        // `greatest(a, NULL)` is an INT holding a, not an error about a common type. The
+        // evaluator materialises a null literal as an all-null placeholder column, so that is
+        // how `void` arrives here, and it is left out of the unification rather than unified
+        // with. If every argument is one, there is no type to find and the answer is null —
+        // which is what Spark says for `greatest(NULL, NULL)`.
+        // An argument that is null in every row is DROPPED rather than unified with. A bare NULL
+        // is typed `void` in Spark and constrains nothing — measured, `greatest(a, NULL)` is an
+        // INT holding a, where unifying int with the all-null placeholder column the evaluator
+        // materialises a null literal as would be an error about int and string. Dropping it
+        // changes no answer, because a row that is null can never be the greatest or the least.
+        var typed = args.Where(a => !AllNull(a, rowCount)).ToList();
+
+        // Every argument was one, so there is no type to find and no value to pick. Spark types
+        // `greatest(NULL, NULL)` as void and answers null, which is what the placeholder already
+        // is.
+        if (typed.Count == 0)
+            return args[0];
+
+        var type = UnifiedType(typed);
+        var here = new int[rowCount];
+        var unified = new IArrowArray[typed.Count];
+        for (var i = 0; i < typed.Count; i++)
+            unified[i] = SparkFunctions.Unify(type, new[] { typed[i] }, here, rowCount);
+
+        var wanted = name == "greatest" ? 1 : -1;
+        var choice = new int[rowCount];
+
+        for (var row = 0; row < rowCount; row++)
+        {
+            choice[row] = -1;
+
+            for (var i = 0; i < unified.Length; i++)
+            {
+                if (SparkFunctions.IsNull(unified[i], row))
+                    continue;
+
+                if (choice[row] < 0
+                    || Math.Sign(SparkFunctions.CompareAt(unified[i], unified[choice[row]], row)) == wanted)
+                {
+                    choice[row] = i;
+                }
+            }
+        }
+
+        return SparkFunctions.Unify(type, unified, choice, rowCount);
     }
 
     private static IArrowArray Coalesce(IReadOnlyList<IArrowArray> args, int rowCount)
