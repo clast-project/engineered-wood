@@ -194,15 +194,6 @@ public sealed class SparkEvaluationCorpusTests
             ["nested.arr[99]"] = "struct columns are not modelled",
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
 
-            // ── DIVERGENT, and both are visible ONLY here. ────────────────────────────────────
-            // Under ANSI both expressions are recorded as refusals, and a refusal we answer with
-            // a throw counts as agreement whatever the throw was -- so the ANSI section passes on
-            // each of them for the wrong reason. Asking the same expression under a conf where
-            // Spark ANSWERS is what separates "we refuse because Spark does" from "we cannot do
-            // this at all".
-            ["CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
-             + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"] =
-                "#173: the parser cannot read a 38-digit literal, so this never reaches evaluation",
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce
             // the shortest representation before JDK 19 (JDK-4511638). This corpus was gathered on
@@ -221,16 +212,6 @@ public sealed class SparkEvaluationCorpusTests
                 "#244: JDK 17 renders 18 digits where the shortest form needs 17",
             ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))"] =
                 "#244: JDK 17 renders 17 digits where the shortest form needs 16",
-
-            // Blocked by #173 rather than by the cast: SparkLiteral.ParseDecimal cannot read a
-            // 31-digit literal, so these never reach evaluation. `CAST(d4 AS INT)` measures the
-            // same rule through a column and does pass.
-            ["CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)"] =
-                "#173: the parser cannot read a 31-digit literal",
-            ["CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)"] =
-                "#173: the parser cannot read a 31-digit literal",
-            ["CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)"] =
-                "#173: the parser cannot read a 31-digit literal",
 
             // Same root cause as the ANSI list's DATE literal.
             ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)"] =

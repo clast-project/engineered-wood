@@ -2263,9 +2263,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-05 18:11:01.950073",
-      "2026-09-05 18:11:01.950073",
-      "2026-09-05 18:11:01.950073"
+      "2026-09-06 05:18:41.887226",
+      "2026-09-06 05:18:41.887226",
+      "2026-09-06 05:18:41.887226"
      ]
     }
    },
@@ -8128,6 +8128,388 @@
       "abc2.5",
       null,
       "0.0"
+     ]
+    }
+   }
+  ],
+  "wide-decimal-literals": [
+   {
+    "expression": "12345678901234567890123456789012345678",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "12345678901234567890123456789012345678BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12345678901234567890123456789012345678",
+      "12345678901234567890123456789012345678",
+      "12345678901234567890123456789012345678"
+     ]
+    }
+   },
+   {
+    "expression": "-12345678901234567890123456789012345678",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-12345678901234567890123456789012345678BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-12345678901234567890123456789012345678",
+      "-12345678901234567890123456789012345678",
+      "-12345678901234567890123456789012345678"
+     ]
+    }
+   },
+   {
+    "expression": "123456789012345678901234567890123456789",
+    "parse": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "type": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "-123456789012345678901234567890123456789",
+    "parse": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "type": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "1234567890123456789012345678901234.5678",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1234567890123456789012345678901234.5678BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1234567890123456789012345678901234.5678",
+      "1234567890123456789012345678901234.5678",
+      "1234567890123456789012345678901234.5678"
+     ]
+    }
+   },
+   {
+    "expression": "12345678901234567890123456789012345.6789",
+    "parse": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "type": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "0.12345678901234567890123456789012345678",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.12345678901234567890123456789012345678BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.12345678901234567890123456789012345678",
+      "0.12345678901234567890123456789012345678",
+      "0.12345678901234567890123456789012345678"
+     ]
+    }
+   },
+   {
+    "expression": "0.123456789012345678901234567890123456789",
+    "parse": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "type": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "79228162514264337593543950335",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "79228162514264337593543950335BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(29,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "79228162514264337593543950335",
+      "79228162514264337593543950335",
+      "79228162514264337593543950335"
+     ]
+    }
+   },
+   {
+    "expression": "79228162514264337593543950336",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "79228162514264337593543950336BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(29,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "79228162514264337593543950336",
+      "79228162514264337593543950336",
+      "79228162514264337593543950336"
+     ]
+    }
+   },
+   {
+    "expression": "12345678901234567890123456789",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "12345678901234567890123456789BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(29,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12345678901234567890123456789",
+      "12345678901234567890123456789",
+      "12345678901234567890123456789"
+     ]
+    }
+   },
+   {
+    "expression": "1.50",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.50BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.50",
+      "1.50",
+      "1.50"
+     ]
+    }
+   },
+   {
+    "expression": "100",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "100"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      100,
+      100,
+      100
+     ]
+    }
+   },
+   {
+    "expression": "0.0000000000000000000000000000000000001",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1E-37BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(37,37)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00E-37",
+      "1.00E-37",
+      "1.00E-37"
+     ]
+    }
+   },
+   {
+    "expression": "0000000000000000000000000000000000000001",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "12345678901234567890123456789012345678BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "12345678901234567890123456789012345678BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12345678901234567890123456789012345678",
+      "12345678901234567890123456789012345678",
+      "12345678901234567890123456789012345678"
+     ]
+    }
+   },
+   {
+    "expression": "1.5BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.5BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      "1.5",
+      "1.5"
+     ]
+    }
+   },
+   {
+    "expression": "d4 + 12345678901234567890123456789012345678",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d4 + 12345678901234567890123456789012345678BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12345679901234567890123456789012345678",
+      null,
+      "12345677901234567890123456789012345678"
+     ]
+    }
+   },
+   {
+    "expression": "d4 = 1000000000000000000000000000000",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d4 = 1000000000000000000000000000000BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "12345678901234567890123456789012345678 + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(12345678901234567890123456789012345678BD + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12345678901234567890123456789012345679",
+      "12345678901234567890123456789012345679",
+      "12345678901234567890123456789012345679"
      ]
     }
    }
