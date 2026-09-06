@@ -27,7 +27,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 {
     private readonly IFunctionRegistry? _functions;
 
-    /// <summary>The registry's comparison rules, when it has any. See <see cref="CoerceStrings"/>.</summary>
+    /// <summary>The registry's comparison rules, when it has any. See <see cref="CoerceOperands"/>.</summary>
     private readonly IComparisonCoercion? _coercion;
 
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
@@ -127,7 +127,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         var (left, leftType) = EvalOperand(cmp.Left, batch);
         var (right, rightType) = EvalOperand(cmp.Right, batch);
-        CoerceStrings(cmp, leftType, rightType, ref left, ref right);
+        CoerceOperands(cmp, leftType, rightType, ref left, ref right);
         var result = new bool?[batch.Length];
 
         for (int i = 0; i < batch.Length; i++)
@@ -171,10 +171,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             }
             catch (InvalidOperationException)
             {
-                // A pair with no comparison between them at all -- a string against a binary, or
-                // anything at all when no registry was supplied to coerce with. Not the
-                // string-against-number case any more: that one is cast before the loop, and
-                // under ANSI a malformed value raises out of the cast rather than arriving here.
+                // A pair with no comparison between them at all -- a boolean against a number, or
+                // anything at all when no registry was supplied to coerce with. Not a string
+                // against a number, a boolean, an instant or a binary any more: those are cast
+                // before the loop, and under ANSI a malformed value raises out of the cast
+                // rather than arriving here.
                 result[i] = null;
             }
         }
@@ -182,16 +183,106 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// Casts a string operand to what it must be to compare against the other one, in place.
+    /// Casts the operand and every member of a set test to the one type they compare through.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Spark compares a string against a non-string by CASTING THE STRING — it does not refuse,
-    /// and it does not render the other side as text. Without this the comparison reached
+    /// <c>IN</c> is not the disjunction of equalities it resembles. Spark resolves ONE type over
+    /// the operand and the whole list, so <c>a IN ('01')</c> is FALSE under the legacy dialect —
+    /// the list resolves to text, and <c>'1'</c> is not <c>'01'</c> — while <c>a = '01'</c> is
+    /// true. Which type is the registry's answer; see <see cref="IComparisonCoercion"/>.
+    /// </para>
+    /// <para>
+    /// Without this the set compared through <see cref="LiteralValue.CompareTo(LiteralValue)"/>,
+    /// which has no cross-kind branch for a string, so every mixed set answered false — not only
+    /// where Spark refuses, but <c>ns IN (1, 2)</c> over the string <c>'1'</c>, which Spark
+    /// answers TRUE in both dialects. #259.
+    /// </para>
+    /// <para>
+    /// The kinds are checked before any type is resolved, because resolving one allocates and
+    /// the overwhelmingly common set — a column against literals of its own type — needs none.
+    /// </para>
+    /// </remarks>
+    private IReadOnlyList<LiteralValue> CoerceSet(
+        IReadOnlyList<LiteralValue> members, ref LiteralValue?[] operand,
+        IArrowType? operandType, int rowCount)
+    {
+        if (_coercion is null)
+            return members;
+
+        bool operandIsString = IsString(operandType, operand);
+        bool anyString = operandIsString;
+        bool anyOther = !operandIsString && FirstKind(operand) is not null;
+
+        foreach (var member in members)
+        {
+            if (member.IsNull) continue;
+            if (member.Type == LiteralValue.Kind.String) anyString = true;
+            else anyOther = true;
+        }
+
+        if (!anyString || !anyOther)
+            return members;   // one kind throughout: nothing to resolve
+
+        var types = new List<IArrowType>(members.Count + 1)
+        {
+            OperandType(operandType, operand),
+        };
+        foreach (var member in members)
+        {
+            if (!member.IsNull)
+                types.Add(ConstantArray(member, 1).Data.DataType);
+        }
+
+        var target = _coercion.SetComparisonTarget(types);
+        if (target is null)
+            return members;   // a set the registry has no rule for; compare it as it stands
+
+        // Rebuilt against the operand's DECLARED type, not one inferred from its values. The
+        // inferring materialiser cannot build a decimal at all, and it reads a date as an
+        // instant -- which under the legacy dialect renders `dt` as "2026-08-11 00:00:00" and
+        // makes `dt IN ('2026-08-11')` false where Spark says true.
+        var operandArray = operandType is null
+            ? MaterializeAsArray(operand, rowCount)
+            : MaterializeAsArray(operand, rowCount, operandType);
+
+        operand = ArrowToLiteralValues(
+            _coercion.CastForComparison(operandArray, target, rowCount), rowCount);
+
+        // Cast per member rather than as one array: a mixed list has no single kind to
+        // materialise from, and this runs once per batch rather than once per row.
+        var coerced = new LiteralValue[members.Count];
+        for (var i = 0; i < members.Count; i++)
+        {
+            if (members[i].IsNull)
+            {
+                coerced[i] = members[i];
+                continue;
+            }
+
+            var one = ArrowToLiteralValues(
+                _coercion.CastForComparison(ConstantArray(members[i], 1), target, 1), 1);
+            coerced[i] = one[0] ?? LiteralValue.Null;
+        }
+
+        return coerced;
+    }
+
+    /// <summary>
+    /// Casts whichever operand has to move before the two can be compared, in place.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark resolves a string against a non-string by CASTING — it does not refuse, and it
+    /// does not always cast the string. Without this the comparison reached
     /// <see cref="LiteralValue.CompareTo(LiteralValue)"/>, which has no cross-kind branch for a
     /// string, and every such comparison answered null: not only <c>s = a</c> over a malformed
     /// string, where Spark refuses under ANSI, but <c>'1' = a</c> over a valid one, where Spark
     /// answers true. The wrong answer was the larger half. #180.
+    /// </para>
+    /// <para>
+    /// A string against a BINARY is the pair where the other operand moves: the binary is
+    /// rendered as text and two strings are compared. #259.
     /// </para>
     /// <para>
     /// The target is dialect-dependent, so the registry chooses it — see
@@ -208,33 +299,52 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// would refuse a write Spark accepts.
     /// </para>
     /// </remarks>
-    private void CoerceStrings(
+    private void CoerceOperands(
         ComparisonPredicate cmp, IArrowType? leftType, IArrowType? rightType,
         ref LiteralValue?[] left, ref LiteralValue?[] right)
     {
         if (_coercion is null)
             return;
 
+        // Every measured rule has a string on exactly one side, so this one cheap test decides
+        // whether to resolve types at all -- and typing an operand can allocate.
         bool leftIsString = IsString(leftType, left);
         if (leftIsString == IsString(rightType, right))
             return;   // two strings, or neither: nothing to coerce
 
         var strings = leftIsString ? left : right;
         var other = leftIsString ? right : left;
-        int rowCount = strings.Length;
+        var stringType = OperandType(leftIsString ? leftType : rightType, strings);
+        var otherType = OperandType(leftIsString ? rightType : leftType, other);
 
-        var coerced = _coercion.CoerceStringForComparison(
-            MaterializeAsArray(
-                cmp.Op == ComparisonOperator.NullSafeEqual ? strings : NulledWhere(strings, other),
-                rowCount),
-            OperandType(leftIsString ? rightType : leftType, other),
-            rowCount);
+        // Which operand moves is the registry's answer, not an assumption here: a string against
+        // a number is cast to the number, while a string against a binary stays and the BINARY
+        // is rendered as text. At most one side moves, so the second question is only asked when
+        // the first declines.
+        bool castTheString = true;
+        var target = _coercion.ComparisonTarget(stringType, otherType);
+        if (target is null)
+        {
+            castTheString = false;
+            target = _coercion.ComparisonTarget(otherType, stringType);
+        }
 
-        if (coerced is null)
+        if (target is null)
             return;   // a pair the registry has no rule for; compare it as it stands
 
+        var moving = castTheString ? strings : other;
+        var staying = castTheString ? other : strings;
+        int rowCount = moving.Length;
+
+        var coerced = _coercion.CastForComparison(
+            MaterializeAsArray(
+                cmp.Op == ComparisonOperator.NullSafeEqual ? moving : NulledWhere(moving, staying),
+                rowCount),
+            target,
+            rowCount);
+
         var values = ArrowToLiteralValues(coerced, rowCount);
-        if (leftIsString) left = values;
+        if (leftIsString == castTheString) left = values;
         else right = values;
     }
 
@@ -366,7 +476,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)
     {
-        var operand = EvalExpression(set.Operand, batch);
+        var (operand, operandType) = EvalOperand(set.Operand, batch);
+        var values = CoerceSet(set.Values, ref operand, operandType, batch.Length);
         var result = new bool?[batch.Length];
         bool isIn = set.Op == SetOperator.In;
 
@@ -382,7 +493,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
             bool found = false;
             bool sawNullInList = false;
-            foreach (var lit in set.Values)
+            foreach (var lit in values)
             {
                 if (lit.IsNull) { sawNullInList = true; continue; }
                 try

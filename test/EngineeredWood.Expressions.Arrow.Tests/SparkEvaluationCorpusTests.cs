@@ -104,10 +104,6 @@ public sealed class SparkEvaluationCorpusTests
         // underneath it, which reads an exponent where Spark's integral parse does not.
         ["'1e3' = a"] = "#258: we cast '1e3' to an integral where Spark refuses it",
 
-        // Spark answers false rather than refusing, so a rule exists -- but the recorded answer
-        // does not say which way it resolves, and a guess would be a silent wrong answer.
-        ["s = bin"] = "#259: string against binary takes no coercion here",
-        ["'00' = bin"] = "#259: string against binary takes no coercion here",
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -194,18 +190,24 @@ public sealed class SparkEvaluationCorpusTests
             ["nested.arr[99]"] = "struct columns are not modelled",
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
 
-            // The same cast and binary differences the ANSI list carries. #258 shows up here as
-            // a wrong VALUE rather than a missing refusal: legacy Spark nulls '1e3' and we
-            // answer 1000, so the comparison answers false where Spark answers null.
+            // The same cast difference the ANSI list carries. #258 shows up here as a wrong
+            // VALUE rather than a missing refusal: legacy Spark nulls '1e3' and we answer 1000,
+            // so the comparison answers false where Spark answers null.
             ["'1e3' = a"] = "#258: we cast '1e3' to an integral where legacy Spark nulls it",
-            ["s = bin"] = "#259: string against binary takes no coercion here",
-            ["'00' = bin"] = "#259: string against binary takes no coercion here",
 
-            // IN resolves its common type as STRING under this dialect, where a comparison casts
-            // the string to a number. The parser expands `x IN (expr, …)` into a disjunction of
-            // equalities, so IN inherits the comparison rule -- right under ANSI, wrong here.
-            ["s IN (a, b)"] = "#259: legacy IN compares as strings; we compare as numbers",
-            ["fs IN (a, b)"] = "#259: legacy IN compares as strings; we compare as numbers",
+            // IN over a list containing COLUMNS. The parser expands `x IN (expr, …)` into a
+            // disjunction of equalities, which resolves each pair on its own where Spark
+            // resolves one type over the whole list -- right under ANSI, wrong here. A literal
+            // list keeps its shape and is coerced; this one cannot be until the tree does.
+            ["s IN (a, b)"] = "#261: legacy IN over a column list compares as strings",
+            ["fs IN (a, b)"] = "#261: legacy IN over a column list compares as strings",
+
+            // Spark's string promotion excludes boolean and binary, and REFUSES these sets at
+            // analysis rather than answering. We answer, because declining to coerce leaves the
+            // set as it stands -- and reproducing an analysis-time refusal is a different thing
+            // from reproducing a cast.
+            ["bl IN ('true')"] = "#261: legacy Spark refuses a boolean/string set; we answer",
+            ["bin IN ('A')"] = "#261: legacy Spark refuses a binary/string set; we answer",
 
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce

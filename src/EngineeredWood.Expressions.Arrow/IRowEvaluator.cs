@@ -61,7 +61,7 @@ public interface IFunctionRegistry
 }
 
 /// <summary>
-/// A function registry that also knows how a comparison coerces a string operand.
+/// A function registry that also knows which operand a comparison casts, and to what.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -77,19 +77,53 @@ public interface IFunctionRegistry
 /// two answers, and only the registry knows which. See the <c>string-coercion</c> group of
 /// <c>Fixtures/spark-expression-corpus.json</c>.
 /// </para>
+/// <para>
+/// Asked per OPERAND rather than per pair, because which side moves is part of the answer:
+/// a string against a number is cast to the number, while a string against a binary stays put
+/// and the BINARY is rendered as text. Splitting the target from the cast also keeps the
+/// evaluator lazy — it materialises an operand as an Arrow array only once a target says one
+/// of them moves.
+/// </para>
 /// </remarks>
 public interface IComparisonCoercion
 {
     /// <summary>
-    /// Casts a string operand to the type it must take to be compared against a value of
-    /// <paramref name="otherType"/>, or returns null when this pair takes no coercion and
-    /// should be compared as it stands.
+    /// The type <paramref name="operand"/> must be cast to before it can be compared against a
+    /// value of <paramref name="other"/>, or null when this operand needs no cast.
     /// </summary>
     /// <remarks>
-    /// Returning null is not a failure: a string against a binary is a pair Spark does not
-    /// resolve this way, and a string against a string needs nothing. Under a raising dialect
-    /// this may throw rather than return, because a comparison against a value the cast refuses
-    /// is a refused comparison.
+    /// Null is an answer, not a failure: it is what both operands of an ordinary comparison get,
+    /// and what a pair with no rule at all gets. A caller asks about each operand in turn and
+    /// casts at most the one that comes back with a target.
     /// </remarks>
-    IArrowArray? CoerceStringForComparison(IArrowArray strings, IArrowType otherType, int rowCount);
+    IArrowType? ComparisonTarget(IArrowType operand, IArrowType other);
+
+    /// <summary>
+    /// The one type every member of a set membership test must be cast to, or null when the set
+    /// needs no coercion.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Separate from <see cref="ComparisonTarget"/> because <c>IN</c> is not the disjunction of
+    /// equalities it looks like: Spark resolves ONE type over the operand and the whole list,
+    /// where a comparison resolves each pair on its own. Measured, the two disagree — under the
+    /// legacy dialect <c>a IN ('01')</c> is false, since the list resolves to text and
+    /// <c>'1'</c> is not <c>'01'</c>, while <c>a = '01'</c> is true.
+    /// </para>
+    /// <para>
+    /// One target for everything, rather than a moving side: every member is cast to it,
+    /// including those that already match.
+    /// </para>
+    /// </remarks>
+    IArrowType? SetComparisonTarget(IReadOnlyList<IArrowType> memberTypes);
+
+    /// <summary>
+    /// Casts an operand to a target <see cref="ComparisonTarget"/> or
+    /// <see cref="SetComparisonTarget"/> returned for it.
+    /// </summary>
+    /// <remarks>
+    /// Under a raising dialect this may throw rather than return, because a comparison against a
+    /// value the cast refuses is a refused comparison.
+    /// </remarks>
+    IArrowArray CastForComparison(IArrowArray operand, IArrowType target, int rowCount);
 }

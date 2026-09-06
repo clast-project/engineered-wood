@@ -832,12 +832,31 @@ GROUPS = {
         "s <=> CAST(NULL AS INT)",
         "s = CAST(NULL AS INT)",
 
+        # IN over a LITERAL list, which is the shape a real constraint uses and the one with no
+        # coercion at all today. Spark resolves ONE common type over the operand and the whole
+        # list rather than pairwise: ANSI casts the strings to it, and the legacy dialect
+        # promotes everything to STRING -- which `a IN ('01')` separates, since 1 and 01 are the
+        # same number and different text. Boolean, binary and timestamp are the mixes Spark's
+        # string promotion excludes.
+        "s IN (1, 2)", "ns IN (1, 2)", "fs IN (1, 2)", "ns IN (1.5, 2)",
+        "a IN ('1', '2')", "a IN ('01')", "a IN ('1.5')", "a IN (' 1')",
+        "d1 IN ('12.340')", "g IN ('2.50')",
+        "ns NOT IN (1, 2)", "s NOT IN (1, 2)",
+        "ns IN (1, NULL)", "s IN (1, NULL)",
+        "dt IN ('2026-08-11')", "dt IN ('2026-08-11 12:30:00')",
+        "bl IN ('true')", "ts IN ('2026-08-11 12:30:00')", "bin IN ('A')",
+
         # IN does NOT follow the comparison rule -- under the legacy dialect it compares as
         # STRINGS rather than casting, so `s IN (a, b)` is false where `s = a` is null -- and a
         # binary operand takes no numeric-style coercion at all. Recorded here so the answers
         # exist, and declared as differences rather than implemented.
         "ns IN (a, b)", "s IN (a, b)", "fs IN (a, b)",
-        "s = bin", "'00' = bin",
+
+        # A binary against a string is the pair where the OTHER operand moves: the binary is
+        # rendered as text. The first of these is what says so -- X'FF' is not valid UTF-8, so
+        # the two directions disagree about it, and only "both became text" makes it true.
+        "CAST(X'FF' AS STRING) = X'FF'", "CAST(bin AS STRING)",
+        "'A' = X'41'", "X'41' < 'B'", "s = bin", "'00' = bin",
     ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
