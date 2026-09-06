@@ -199,7 +199,14 @@ internal static class SparkFloatText
     {
         var exponent = 0;
 
-        var e = text.IndexOfAny(new[] { 'e', 'E' });
+        // Two IndexOf calls rather than IndexOfAny(new[] { 'e', 'E' }), which allocates its
+        // needle array on every call — and this runs for every rendered value. Uppercase first
+        // because that is what the G formats above produce; lowercase is accepted so the method
+        // reads any well-formed decimal text.
+        var e = text.IndexOf('E');
+        if (e < 0)
+            e = text.IndexOf('e');
+
         if (e >= 0)
         {
             exponent = int.Parse(text.Substring(e + 1), NumberStyles.Integer, Invariant);
