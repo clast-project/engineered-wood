@@ -1488,6 +1488,17 @@ paren-free scope is unusable here. Note also that other writers (delta-rs,
 EngineeredWood itself) need not follow this convention, so the parser cannot
 rely on the spacing.
 
+A fourth consequence lands on the evaluator rather than the parser. Identifiers
+are preserved as written too, and Spark resolves them case-insensitively —
+`spark.sql.caseSensitive` defaults to false — so a table Spark created can carry
+`CHECK (ID > 0)` against a column named `id`, and matching the name exactly
+refuses every write to that table. Measured against Spark 4.0.1 and recorded in
+the corpus's `identifier_case` section: backticks do not make a reference exact
+(`` `WEIRD NAME` `` resolves to a column named `weird name`), and a schema
+carrying two names that differ only in case makes *every* spelling ambiguous —
+the exactly-spelled one included, so resolving the exact match first is not the
+rule Spark follows. #181.
+
 One surprise worth recording for whoever writes the grammar: in Spark 4.0
 `a between 1 and 10` parses to an `UnresolvedFunction` rendering as
 `between(a, 1, 10)`, not to a desugared pair of comparisons.

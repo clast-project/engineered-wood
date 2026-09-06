@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 12:39:09.279860",
-      "2026-09-06 12:39:09.279860",
-      "2026-09-06 12:39:09.279860"
+      "2026-09-06 13:44:16.846738",
+      "2026-09-06 13:44:16.846738",
+      "2026-09-06 13:44:16.846738"
      ]
     }
    },
@@ -17948,6 +17948,493 @@
       "values": [
        null,
        null,
+       null
+      ]
+     }
+    }
+   ]
+  }
+ },
+ "identifier_case": {
+  "_comment": "A SECOND SCHEMA, under the same conf. Identifier resolution is a property of the schema, and the questions #181 asks -- ambiguity, and whether backticks make a reference exact -- need names that differ only in case. Adding those to the schema above would have made `a` ambiguous for the whole corpus.",
+  "conf": {
+   "spark.sql.ansi.enabled": "true",
+   "spark.sql.session.timeZone": "UTC",
+   "spark.sql.storeAssignmentPolicy": "ANSI"
+  },
+  "schema": [
+   {
+    "name": "a",
+    "type": "int"
+   },
+   {
+    "name": "mixedCase",
+    "type": "int"
+   },
+   {
+    "name": "weird name",
+    "type": "int"
+   },
+   {
+    "name": "dup",
+    "type": "int"
+   },
+   {
+    "name": "DUP",
+    "type": "int"
+   }
+  ],
+  "rows": [
+   [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5"
+   ],
+   [
+    "NULL",
+    "NULL",
+    "NULL",
+    "NULL",
+    "NULL"
+   ]
+  ],
+  "groups": {
+   "resolution": [
+    {
+     "expression": "a",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "a"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "A",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "A"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`a`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "a"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`A`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "A"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "mixedCase",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "mixedCase"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "MIXEDCASE",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "MIXEDCASE"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "mixedcase",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "mixedcase"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "MixedCase",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "MixedCase"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`MIXEDCASE`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "MIXEDCASE"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`weird name`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "`weird name`"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`WEIRD NAME`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "`WEIRD NAME`"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "`Weird Name`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "`Weird Name`"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "A + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(A + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(A AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(A AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "A IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(A IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "UPPER(A)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "UPPER(A)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nothere",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "nothere"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `nothere` cannot be resolved. Did you mean one of the following? [`DUP`, `a`, `dup`, `mixedCase`, `weird name`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['nothere AS r#63]\n+- LogicalRDD [a#0, mixedCase#1, weird name#2, dup#3, DUP#4], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `nothere` cannot be resolved. Did you mean one of the following? [`DUP`, `a`, `dup`, `mixedCase`, `weird name`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['nothere AS r#64]\n+- Union false, false\n   :- Project [cast(1 as int) AS a#5, cast(2 as int) AS mixedCase#6, cast(3 as int) AS weird name#7"
+     }
+    },
+    {
+     "expression": "NOTHERE",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "NOTHERE"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `NOTHERE` cannot be resolved. Did you mean one of the following? [`DUP`, `a`, `dup`, `mixedCase`, `weird name`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['NOTHERE AS r#65]\n+- LogicalRDD [a#0, mixedCase#1, weird name#2, dup#3, DUP#4], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `NOTHERE` cannot be resolved. Did you mean one of the following? [`DUP`, `a`, `dup`, `mixedCase`, `weird name`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['NOTHERE AS r#66]\n+- Union false, false\n   :- Project [cast(1 as int) AS a#5, cast(2 as int) AS mixedCase#6, cast(3 as int) AS weird name#7"
+     }
+    }
+   ],
+   "ambiguity": [
+    {
+     "expression": "dup",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "dup"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `dup` is ambiguous, could be: [`dup`, `dup`]. SQLSTATE: 42704; line 1 pos 1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `dup` is ambiguous, could be: [`dup`, `dup`]. SQLSTATE: 42704; line 1 pos 1"
+     }
+    },
+    {
+     "expression": "DUP",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "DUP"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `DUP` is ambiguous, could be: [`DUP`, `DUP`]. SQLSTATE: 42704; line 1 pos 1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `DUP` is ambiguous, could be: [`DUP`, `DUP`]. SQLSTATE: 42704; line 1 pos 1"
+     }
+    },
+    {
+     "expression": "`dup`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "dup"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `dup` is ambiguous, could be: [`dup`, `dup`]. SQLSTATE: 42704; line 1 pos 1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `dup` is ambiguous, could be: [`dup`, `dup`]. SQLSTATE: 42704; line 1 pos 1"
+     }
+    },
+    {
+     "expression": "`DUP`",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "DUP"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `DUP` is ambiguous, could be: [`DUP`, `DUP`]. SQLSTATE: 42704; line 1 pos 1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `DUP` is ambiguous, could be: [`DUP`, `DUP`]. SQLSTATE: 42704; line 1 pos 1"
+     }
+    },
+    {
+     "expression": "Dup",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "Dup"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `Dup` is ambiguous, could be: [`Dup`, `Dup`]. SQLSTATE: 42704; line 1 pos 1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [AMBIGUOUS_REFERENCE] Reference `Dup` is ambiguous, could be: [`Dup`, `Dup`]. SQLSTATE: 42704; line 1 pos 1"
+     }
+    },
+    {
+     "expression": "a",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedAttribute",
+      "sql": "a"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
        null
       ]
      }
