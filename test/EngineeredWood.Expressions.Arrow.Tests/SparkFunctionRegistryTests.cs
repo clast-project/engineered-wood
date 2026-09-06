@@ -721,6 +721,67 @@ public sealed class SparkFunctionRegistryTests
         Assert.Throws<ArgumentException>(() => Eval(Ansi, "greatest(a)", batch));
     }
 
+
+    // ── DATE and TIMESTAMP literals reach the evaluator (#254) ──────────────────────────────
+
+    /// <summary>
+    /// A DATE literal evaluates as a DATE, and a TIMESTAMP literal as a timestamp.
+    /// </summary>
+    /// <remarks>
+    /// Both parsed and resolved before this and then threw at materialisation, which is the last
+    /// step. The two must not collapse into one type: measured, <c>CAST(DATE'…' AS STRING)</c> is
+    /// <c>2026-08-11</c>, where the same instant as a timestamp prints the time as well.
+    /// </remarks>
+    [Fact]
+    public void ADateLiteralEvaluatesAsADate()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        var date = Assert.IsType<Date32Array>(Eval(Ansi, "DATE'2026-08-11'", batch));
+        Assert.Equal(
+            new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero), date.GetDateTimeOffset(0));
+
+        Assert.Equal(2026, Assert.IsType<Int32Array>(Eval(Ansi, "year(DATE'2026-08-11')", batch)).GetValue(0));
+
+        Assert.Equal(
+            "2026-08-11",
+            Assert.IsType<StringArray>(
+                Eval(Ansi, "CAST(DATE'2026-08-11' AS STRING)", batch)).GetString(0));
+    }
+
+    [Fact]
+    public void ATimestampLiteralEvaluatesAsATimestamp()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        var instant = Assert.IsType<TimestampArray>(
+            Eval(Ansi, "TIMESTAMP'2026-08-11 12:30:00'", batch));
+
+        Assert.Equal(
+            new DateTimeOffset(2026, 8, 11, 12, 30, 0, TimeSpan.Zero), instant.GetTimestamp(0));
+
+        // The distinction the lowering exists for: the same calendar day printed as a timestamp
+        // keeps its time, where the DATE literal above does not have one.
+        Assert.Equal(
+            "2026-08-11 00:00:00",
+            Assert.IsType<StringArray>(
+                Eval(Ansi, "CAST(TIMESTAMP'2026-08-11 00:00:00' AS STRING)", batch)).GetString(0));
+    }
+
+    [Fact]
+    public void ALiteralComparesAgainstAColumnOfItsOwnKind()
+    {
+        var batch = Batch(
+            ("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))),
+            ("ts", Timestamps(new DateTimeOffset(2026, 8, 11, 12, 30, 0, TimeSpan.Zero))));
+
+        Assert.True(Assert.IsType<BooleanArray>(
+            Eval(Ansi, "DATE'2026-08-11' = dt", batch)).GetValue(0));
+
+        Assert.True(Assert.IsType<BooleanArray>(
+            Eval(Ansi, "TIMESTAMP'2026-08-11 12:30:00' = ts", batch)).GetValue(0));
+    }
+
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
 
     [Fact]

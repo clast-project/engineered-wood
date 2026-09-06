@@ -171,7 +171,6 @@ public sealed class SparkSqlParserTests
     [InlineData("true", LiteralValue.Kind.Boolean)]
     [InlineData("NULL", LiteralValue.Kind.Null)]
     [InlineData("X'ABCD'", LiteralValue.Kind.Binary)]
-    [InlineData("DATE'2026-08-11'", LiteralValue.Kind.DateTimeOffset)]
     public void LiteralsTakeSparksType(string sql, LiteralValue.Kind expected)
     {
         Assert.Equal(expected, Assert.IsType<LiteralExpression>(Parse(sql)).Value.Type);
@@ -269,6 +268,34 @@ public sealed class SparkSqlParserTests
         Assert.Equal(
             new[] { '\uD7BF', '\uDFFF' },
             Assert.IsType<LiteralExpression>(Parse(@"'\UFFFFFFFF'")).Value.AsString.ToCharArray());
+    }
+
+    /// <summary>
+    /// A DATE literal is lowered to a cast, where a TIMESTAMP literal stays a literal.
+    /// </summary>
+    /// <remarks>
+    /// The value cannot carry the difference: <c>SparkLiteral.Typed</c> makes both the same
+    /// <see cref="DateTimeOffset"/>, deliberately, so a literal and a column value compare on one
+    /// footing. Saying it in the TREE instead is the same kind of lowering as BETWEEN becoming
+    /// two comparisons, and it hands the work to the DATE cast, which is already measured. #254.
+    /// </remarks>
+    [Fact]
+    public void ADateLiteralIsLoweredToACast()
+    {
+        var lowered = Assert.IsType<FunctionCall>(Parse("DATE'2026-08-11'"));
+
+        Assert.Equal("cast", lowered.Name);
+        Assert.Equal("DATE", ((LiteralExpression)lowered.Arguments[1]).Value.AsString);
+
+        var instant = Assert.IsType<LiteralExpression>(lowered.Arguments[0]).Value;
+        Assert.Equal(LiteralValue.Kind.DateTimeOffset, instant.Type);
+        Assert.Equal(
+            new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero), instant.AsDateTimeOffset);
+
+        // A TIMESTAMP literal has nothing to disambiguate and stays one.
+        Assert.Equal(
+            LiteralValue.Kind.DateTimeOffset,
+            Assert.IsType<LiteralExpression>(Parse("TIMESTAMP'2026-08-11 12:30:00'")).Value.Type);
     }
 
     [Fact]

@@ -566,6 +566,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     else sb.AppendNull();
                 }
                 return sb.Build();
+            // A timestamp literal, and the instant a DATE literal carries before its cast. The
+            // type-inferring path could not build either, so `TIMESTAMP'…'` parsed and resolved
+            // and then failed at materialisation. Microseconds in UTC, matching what the readers
+            // produce and what SparkLiteral resolves a zone-less literal to. #254.
+            case LiteralValue.Kind.DateTimeOffset:
+                return BuildTimestampArray(
+                    values, length, new TimestampType(TimeUnit.Microsecond, "UTC"));
+
             case LiteralValue.Kind.Binary:
                 var binb = new BinaryArray.Builder();
                 for (int i = 0; i < length; i++)
