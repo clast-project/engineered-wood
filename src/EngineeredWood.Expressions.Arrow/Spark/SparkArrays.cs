@@ -382,22 +382,6 @@ internal static class SparkArrays
         return builder.Build();
     }
 
-    /// <summary>Renders a numeric cell the way Spark would print it.</summary>
-    /// <remarks>
-    /// Floating point goes through <see cref="SparkFloatText"/>, which reproduces Java's own
-    /// spelling — where the exponent starts, the digit that always follows the point, and an
-    /// unsigned exponent. Measured: every row of the corpus's <c>float-to-string</c> group is
-    /// exactly what <c>Double.toString</c> or <c>Float.toString</c> prints, and .NET's <c>"R"</c>
-    /// matched almost none of it. #248.
-    /// <para>
-    /// A decimal renders from its unscaled integer and scale rather than from the
-    /// <see cref="decimal"/> exact form, because that form covers only part of the range: past
-    /// decimal's ceiling it is null, and inside the ceiling it silently rounds a value carrying
-    /// more than 28 significant digits. Rendering from the buffer is exact across all of
-    /// precision 38, and is byte-identical to the old rendering everywhere the old one was
-    /// correct — verified over signs, trailing zeros and every scale.
-    /// </para>
-    /// </remarks>
     /// <summary>
     /// Reads a floating literal carrying Java's trailing type suffix, as in <c>1d</c>.
     /// </summary>
@@ -411,20 +395,27 @@ internal static class SparkArrays
     public static bool TryReadTypeSuffixed(string text, out double value)
     {
         value = 0d;
-        var span = text.Trim();
-        if (span.Length < 2)
+        var trimmed = text.Trim();
+        if (trimmed.Length < 2)
             return false;
 
-        var suffix = span[span.Length - 1];
+        var suffix = trimmed[trimmed.Length - 1];
         if (suffix is not ('d' or 'D' or 'f' or 'F'))
             return false;
 
-        var previous = span[span.Length - 2];
+        var previous = trimmed[trimmed.Length - 2];
         if (!((previous >= '0' && previous <= '9') || previous == '.'))
             return false;
 
+        // Read without the suffix, and without copying the text to drop it. The span overload
+        // lands on net8.0 and net10.0; netstandard2.0 has only the string one.
+#if NETSTANDARD2_0
         return double.TryParse(
-            span.Substring(0, span.Length - 1), NumberStyles.Float, Invariant, out value);
+            trimmed.Substring(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+#else
+        return double.TryParse(
+            trimmed.AsSpan(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+#endif
     }
 
     /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
@@ -441,6 +432,22 @@ internal static class SparkArrays
 #endif
     }
 
+    /// <summary>Renders a numeric cell the way Spark would print it.</summary>
+    /// <remarks>
+    /// Floating point goes through <see cref="SparkFloatText"/>, which reproduces Java's own
+    /// spelling — where the exponent starts, the digit that always follows the point, and an
+    /// unsigned exponent. Measured: every row of the corpus's <c>float-to-string</c> group is
+    /// exactly what <c>Double.toString</c> or <c>Float.toString</c> prints, and .NET's <c>"R"</c>
+    /// matched almost none of it. #248.
+    /// <para>
+    /// A decimal renders from its unscaled integer and scale rather than from the
+    /// <see cref="decimal"/> exact form, because that form covers only part of the range: past
+    /// decimal's ceiling it is null, and inside the ceiling it silently rounds a value carrying
+    /// more than 28 significant digits. Rendering from the buffer is exact across all of
+    /// precision 38, and is byte-identical to the old rendering everywhere the old one was
+    /// correct — verified over signs, trailing zeros and every scale.
+    /// </para>
+    /// </remarks>
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
     {
         FloatArray a => SparkFloatText.Render(a.GetValue(index)!.Value),
