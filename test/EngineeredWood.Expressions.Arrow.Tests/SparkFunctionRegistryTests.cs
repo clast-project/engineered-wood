@@ -499,12 +499,16 @@ public sealed class SparkFunctionRegistryTests
         // renderer the eager path used.
         Assert.DoesNotContain("1E+30", thrown.Message, StringComparison.Ordinal);
 
-        // The same for a decimal source, whose rendering comes from the unscaled buffer.
-        var decimals = Batch(("d", Decimals(10, 2, 1.00m, 12345.67m)));
+        // The same for a decimal source, whose rendering comes from the unscaled buffer — and
+        // through a cast to an INTEGRAL type, because that is one that reads Text. A cast from a
+        // decimal to a DECIMAL does not: it takes CastExactToDecimal, which never builds a
+        // CastInput and renders eagerly, so asserting on it would have proved nothing about the
+        // deferral. Row 1 is in range for decimal(18,2) and out of range for INT.
+        var decimals = Batch(("d", Decimals(18, 2, 1.00m, 99999999999.99m)));
         Assert.Contains(
-            "12345.67",
+            "99999999999.99",
             Assert.Throws<SparkEvaluationException>(
-                () => Eval(Ansi, "CAST(d AS DECIMAL(4,2))", decimals)).Message,
+                () => Eval(Ansi, "CAST(d AS INT)", decimals)).Message,
             StringComparison.Ordinal);
     }
 
