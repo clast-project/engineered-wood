@@ -129,12 +129,40 @@ public class StringComparisonCoercionTests
     }
 
     [Fact]
-    public void TheTargetComesFromAnOperandsOwnValueWhenItIsNotAColumn()
+    public void ACastIsTypedByItsTargetAndNotByTheValuesItProduced()
     {
-        // Not a column reference, so there is no declared type to read: the operand is typed
-        // from what it produced, which here is a float.
+        // Not a column, so there is no schema entry to read -- but a cast still has a declared
+        // type, and it is the one the coercion has to use. Typing it from its values instead
+        // loses exactly what a LiteralValue cannot carry, and each of these three shows one
+        // face of that. All measured; the corpus records them.
+
+        // A float, where the dialects then disagree about widening it.
         Assert.False(Evaluate(Ansi, "'0.1' = CAST(0.1 AS FLOAT)"));
         Assert.True(Evaluate(Legacy, "'0.1' = CAST(0.1 AS FLOAT)"));
+
+        // A DATE, whose values look like instants. Spark truncates the string to a date, so this
+        // is true; read as a timestamp it would compare 12:30 against midnight and answer false.
+        Assert.True(Evaluate(Ansi, "'2026-08-11 12:30:00' = CAST(ts AS DATE)"));
+        Assert.True(Evaluate(Legacy, "'2026-08-11 12:30:00' = CAST(ts AS DATE)"));
+
+        // A decimal(38,0) holding 10^30, which needs only 31 digits. Under the legacy dialect the
+        // string is cast to the DECLARED type, so 38 digits fit; typed from the value they would
+        // overflow a decimal(31,0) and answer null instead of false.
+        Assert.False(Evaluate(Legacy, "'99999999999999999999999999999999999999' = CAST(d AS DECIMAL(38,0))"));
+    }
+
+    [Fact]
+    public void AnAllNullCastStillTypesTheComparison()
+    {
+        // The values carry no type at all here, and `<=>` reads both sides regardless -- so the
+        // cast runs, and refuses. Measured: `s <=> CAST(NULL AS INT)` raises under ANSI and is
+        // true under the legacy dialect, where the failed cast makes it null <=> null.
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "s <=> CAST(NULL AS INT)"));
+        Assert.True(Evaluate(Legacy, "s <=> CAST(NULL AS INT)"));
+
+        // `=` short-circuits on the null instead, under both.
+        Assert.Null(Evaluate(Ansi, "s = CAST(NULL AS INT)"));
+        Assert.Null(Evaluate(Legacy, "s = CAST(NULL AS INT)"));
     }
 
     // ── A string the target cast refuses: the ordinary raise-or-null split ──

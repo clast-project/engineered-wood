@@ -820,6 +820,18 @@ GROUPS = {
         "dt = '2026-08-11'", "dt = '2026-08-11 12:30:00'", "dt > '1970-01-01'", "s = dt",
         "ts = '2026-08-11 12:30:00'", "ts = '2026-08-11'", "s = ts",
 
+        # An operand that is neither a column nor a literal still has a declared type, and it is
+        # the CAST's target rather than anything its values imply. Each of these separates the
+        # two: a date-typed operand read as an instant compares a timestamp-shaped string against
+        # 12:30 instead of truncating it, a decimal(38,0) read as the narrower decimal its value
+        # needs overflows a 38-digit string, and an all-null operand types nothing at all -- which
+        # `<=>` notices, because it reads both sides whatever their nullness.
+        "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+        "'2026-08-11' = CAST(ts AS DATE)",
+        "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+        "s <=> CAST(NULL AS INT)",
+        "s = CAST(NULL AS INT)",
+
         # IN does NOT follow the comparison rule -- under the legacy dialect it compares as
         # STRINGS rather than casting, so `s IN (a, b)` is false where `s = a` is null -- and a
         # binary operand takes no numeric-style coercion at all. Recorded here so the answers

@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 09:15:29.226401",
-      "2026-09-06 09:15:29.226401",
-      "2026-09-06 09:15:29.226401"
+      "2026-09-06 09:59:47.708446",
+      "2026-09-06 09:59:47.708446",
+      "2026-09-06 09:59:47.708446"
      ]
     }
    },
@@ -10637,6 +10637,102 @@
     }
    },
    {
+    "expression": "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2026-08-11 12:30:00' = CAST(ts AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'2026-08-11' = CAST(ts AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2026-08-11' = CAST(ts AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s <=> CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(s <=> CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s <=> CAST(NULL AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
     "expression": "ns IN (a, b)",
     "parse": {
      "ok": true,
@@ -15070,6 +15166,106 @@
       "ok": true,
       "node": "EqualTo",
       "sql": "(s = ts)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2026-08-11 12:30:00' = CAST(ts AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'2026-08-11' = CAST(ts AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2026-08-11' = CAST(ts AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s <=> CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(s <=> CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "s = CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = CAST(NULL AS INT))"
      },
      "type": {
       "ok": true,

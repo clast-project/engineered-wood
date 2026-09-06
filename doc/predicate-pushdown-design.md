@@ -952,6 +952,15 @@ losing comparison. `SparkFunctionRegistry` implements it by routing to the same
 `Cast` that `CAST(…)` reaches, dialect and all, so a comparison and an explicit
 cast cannot drift apart.
 
+The target is chosen from the other operand's **declared Arrow type**, kept from
+the array that operand already produced rather than re-derived from its values.
+A `LiteralValue` cannot carry a decimal's precision and scale, cannot tell a date
+from a timestamp, and says nothing at all when every row is null — and all three
+are reachable through a cast. Measured: `'2026-08-11 12:30:00' = CAST(ts AS DATE)`
+is true, because Spark truncates the string to a date; reading that operand as
+the instant its values look like compares 12:30 against midnight and answers
+false. Only a literal is typed from its value, which is what Spark does with one.
+
 Two pairs are measured, declared and deliberately not implemented (#259): `IN`,
 which resolves its common type as `STRING` under the legacy dialect where a
 comparison casts to a number, and a binary operand, whose recorded answer does
