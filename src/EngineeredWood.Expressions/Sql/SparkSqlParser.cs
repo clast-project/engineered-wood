@@ -219,10 +219,12 @@ public static class SparkSqlParser
 
         /// <summary>Parses <c>[NOT] IN (…)</c>.</summary>
         /// <remarks>
-        /// An all-literal list becomes a <see cref="SetPredicate"/>, which stats pruning can use.
-        /// A list containing expressions cannot — <see cref="SetPredicate"/> holds
-        /// <see cref="LiteralValue"/>s — so it expands to the disjunction of equalities that SQL
-        /// defines <c>IN</c> to mean, which carries the same three-valued behaviour.
+        /// Always a <see cref="SetPredicate"/>, whatever the list holds. It used to expand a list
+        /// containing expressions into the disjunction of equalities SQL defines <c>IN</c> to
+        /// mean — which is true of the three-valued logic and false of the TYPES. Spark resolves
+        /// one type over the operand and the whole list, so <c>a IN ('01')</c> is false under the
+        /// legacy dialect where <c>a = '01'</c> is true, and a disjunction cannot express that.
+        /// #261.
         /// </remarks>
         private Expression ParseInSuffix(Expression left, bool negated)
         {
@@ -243,21 +245,7 @@ public static class SparkSqlParser
             if (items.Count == 0)
                 throw Fail("IN requires at least one value");
 
-            if (items.TrueForAll(item => item is LiteralExpression))
-            {
-                var values = new List<LiteralValue>(items.Count);
-                foreach (var item in items)
-                    values.Add(((LiteralExpression)item).Value);
-
-                return new SetPredicate(left, values, negated ? SetOperator.NotIn : SetOperator.In);
-            }
-
-            var alternatives = new List<Predicate>(items.Count);
-            foreach (var item in items)
-                alternatives.Add(new ComparisonPredicate(left, ComparisonOperator.Equal, item));
-
-            Predicate any = alternatives.Count == 1 ? alternatives[0] : new OrPredicate(alternatives);
-            return negated ? new NotPredicate(any) : any;
+            return new SetPredicate(left, items, negated ? SetOperator.NotIn : SetOperator.In);
         }
 
         /// <summary>

@@ -852,6 +852,18 @@ GROUPS = {
         # exist, and declared as differences rather than implemented.
         "ns IN (a, b)", "s IN (a, b)", "fs IN (a, b)",
 
+        # A list containing COLUMNS, which #259 could not reach: the parser expanded it into a
+        # disjunction and each pair resolved its own type. `fs IN (a, g)` is what says the
+        # divergence is not legacy-only -- an int and a double resolve through double for the
+        # WHOLE list, where pairwise the string is cast to bigint against `a` and refuses.
+        "fs IN (a, g)", "ns IN (a, g)", "s IN (a, g)",
+        "ns IN (b)", "a IN (ns)", "a IN (ns, fs)",
+        "ns NOT IN (a, b)", "ns IN (a, NULL)", "s IN (a, NULL)",
+
+        # A list mixing a column and a string literal, where the string promotion has to see
+        # both, and the mixes Spark type-checks away rather than coercing.
+        "ns IN (a, 'x')", "fs IN (a, 'x')", "ns IN (a, bl)", "a IN (bl)",
+
         # A binary against a string is the pair where the OTHER operand moves: the binary is
         # rendered as text. The first of these is what says so -- X'FF' is not valid UTF-8, so
         # the two directions disagree about it, and only "both became text" makes it true.

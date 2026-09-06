@@ -71,6 +71,33 @@ public sealed class ExpressionBinder
         return BindPredicate(predicate);
     }
 
+    /// <summary>Binds every member of a list, returning the original when none moved.</summary>
+    /// <remarks>
+    /// Identity is what tells the caller whether to rebuild its node, and it matters: an
+    /// expression tree is rebuilt from the leaves up, so an allocation here is one per list per
+    /// bind even when nothing resolved.
+    /// </remarks>
+    private IReadOnlyList<Expression> BindAll(IReadOnlyList<Expression> expressions)
+    {
+        Expression[]? bound = null;
+        for (var i = 0; i < expressions.Count; i++)
+        {
+            var member = BindExpression(expressions[i]);
+            if (ReferenceEquals(member, expressions[i]) && bound is null)
+                continue;
+
+            if (bound is null)
+            {
+                bound = new Expression[expressions.Count];
+                for (var j = 0; j < i; j++) bound[j] = expressions[j];
+            }
+
+            bound[i] = member;
+        }
+
+        return bound ?? expressions;
+    }
+
     private Expression BindExpression(Expression expression)
     {
         switch (expression)
@@ -130,9 +157,11 @@ public sealed class ExpressionBinder
 
             case SetPredicate set:
                 var setOperand = BindExpression(set.Operand);
+                var setValues = BindAll(set.Values);
                 return ReferenceEquals(setOperand, set.Operand)
-                    ? set
-                    : new SetPredicate(setOperand, set.Values, set.Op);
+                    && ReferenceEquals(setValues, set.Values)
+                        ? set
+                        : new SetPredicate(setOperand, setValues, set.Op);
 
             default:
                 return predicate;

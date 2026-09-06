@@ -435,6 +435,11 @@ public static class StatisticsEvaluator
                 : FilterResult.AlwaysTrue;
         }
 
+        // A list holding anything but literals says nothing about a file: `x IN (a, b)` is a
+        // claim about two other COLUMNS, whose values statistics do not pair up with x's.
+        if (!set.TryGetLiteralValues(out var values))
+            return FilterResult.Unknown;
+
         var min = accessor.GetMinValue(stats, column!);
         var max = accessor.GetMaxValue(stats, column!);
         if (min is null || max is null)
@@ -443,7 +448,7 @@ public static class StatisticsEvaluator
         // For IN: AlwaysFalse if every value in the set is outside [min, max].
         // For NOT IN: complement.
         bool allOutside = true;
-        foreach (var v in set.Values)
+        foreach (var v in values)
         {
             int cmpVMin = SafeCompare(v, min.Value);
             int cmpVMax = SafeCompare(v, max.Value);

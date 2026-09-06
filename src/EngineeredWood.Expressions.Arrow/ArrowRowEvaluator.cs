@@ -203,69 +203,120 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// the overwhelmingly common set — a column against literals of its own type — needs none.
     /// </para>
     /// </remarks>
-    private IReadOnlyList<LiteralValue> CoerceSet(
-        IReadOnlyList<LiteralValue> members, ref LiteralValue?[] operand,
-        IArrowType? operandType, int rowCount)
+    private void CoerceSet(
+        ref LiteralValue?[] operand, IArrowType? operandType,
+        SetMember[] members, IArrowType?[] memberTypes, int rowCount)
     {
         if (_coercion is null)
-            return members;
+            return;
 
-        bool operandIsString = IsString(operandType, operand);
-        bool anyString = operandIsString;
-        bool anyOther = !operandIsString && FirstKind(operand) is not null;
+        bool anyString = IsString(operandType, operand);
+        bool anyOther = !anyString && (operandType is not null || FirstKind(operand) is not null);
 
-        foreach (var member in members)
+        for (var k = 0; k < members.Length; k++)
         {
-            if (member.IsNull) continue;
-            if (member.Type == LiteralValue.Kind.String) anyString = true;
-            else anyOther = true;
+            if (IsMemberString(members[k], memberTypes[k])) anyString = true;
+            else if (MemberIsTyped(members[k], memberTypes[k])) anyOther = true;
         }
 
         if (!anyString || !anyOther)
-            return members;   // one kind throughout: nothing to resolve
+            return;   // one kind throughout: nothing to resolve
 
-        var types = new List<IArrowType>(members.Count + 1)
+        // Resolved once and reused, because the type decides two things: which target the set
+        // takes, and how each member is rebuilt as an Arrow array. Inferring the second from
+        // values instead cannot build a decimal at all and reads a date as an instant.
+        var operandResolved = OperandType(operandType, operand);
+        var resolved = new IArrowType[members.Length];
+        var types = new List<IArrowType>(members.Length + 1) { operandResolved };
+        for (var k = 0; k < members.Length; k++)
         {
-            OperandType(operandType, operand),
-        };
-        foreach (var member in members)
-        {
-            if (!member.IsNull)
-                types.Add(ConstantArray(member, 1).Data.DataType);
+            resolved[k] = MemberType(members[k], memberTypes[k]);
+            types.Add(resolved[k]);
         }
 
         var target = _coercion.SetComparisonTarget(types);
         if (target is null)
-            return members;   // a set the registry has no rule for; compare it as it stands
+            return;   // a set the registry has no rule for; compare it as it stands
 
-        // Rebuilt against the operand's DECLARED type, not one inferred from its values. The
-        // inferring materialiser cannot build a decimal at all, and it reads a date as an
-        // instant -- which under the legacy dialect renders `dt` as "2026-08-11 00:00:00" and
-        // makes `dt IN ('2026-08-11')` false where Spark says true.
-        var operandArray = operandType is null
-            ? MaterializeAsArray(operand, rowCount)
-            : MaterializeAsArray(operand, rowCount, operandType);
-
-        operand = ArrowToLiteralValues(
-            _coercion.CastForComparison(operandArray, target, rowCount), rowCount);
-
-        // Cast per member rather than as one array: a mixed list has no single kind to
-        // materialise from, and this runs once per batch rather than once per row.
-        var coerced = new LiteralValue[members.Count];
-        for (var i = 0; i < members.Count; i++)
+        operand = CastMember(operand, operandResolved, target, rowCount);
+        for (var k = 0; k < members.Length; k++)
         {
-            if (members[i].IsNull)
-            {
-                coerced[i] = members[i];
-                continue;
-            }
+            // A constant is cast as a one-row array, not as one row per row of the batch.
+            members[k] = members[k].IsConstant
+                ? new SetMember(CastMember(
+                    new[] { members[k].Constant }, resolved[k], target, 1)[0])
+                : new SetMember(CastMember(members[k].PerRow, resolved[k], target, rowCount));
+        }
+    }
 
-            var one = ArrowToLiteralValues(
-                _coercion.CastForComparison(ConstantArray(members[i], 1), target, 1), 1);
-            coerced[i] = one[0] ?? LiteralValue.Null;
+    /// <summary>Whether a set member is a string, from its declared type or its value.</summary>
+    private static bool IsMemberString(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? member.Constant?.Type == LiteralValue.Kind.String
+            : IsString(declared, member.PerRow);
+
+    /// <summary>Whether a member brings a type to the resolution at all.</summary>
+    /// <remarks>
+    /// A declared type answers on its own — a column has one whether or not any row is populated
+    /// — so the values are read only for a member that has none, and a typed member is never
+    /// scanned. What is left with nothing either way is a null literal, which says nothing about
+    /// what the set resolves through.
+    /// </remarks>
+    private static bool MemberIsTyped(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? member.Constant.HasValue
+            : declared is not null || FirstKind(member.PerRow) is not null;
+
+    /// <summary>The Arrow type a set member resolves through.</summary>
+    private static IArrowType MemberType(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? (member.Constant is { } value
+                ? ConstantArray(value, 1).Data.DataType
+                : StringType.Default)
+            : OperandType(declared, member.PerRow);
+
+    /// <summary>Rebuilds one member of a set as <paramref name="target"/>.</summary>
+    private LiteralValue?[] CastMember(
+        LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
+        ArrowToLiteralValues(
+            _coercion!.CastForComparison(
+                MaterializeAsArray(values, rowCount, type), target, rowCount),
+            rowCount);
+
+    /// <summary>
+    /// One member of a set test: a constant, or a value per row.
+    /// </summary>
+    /// <remarks>
+    /// The distinction is worth a type because a literal list is the common one. Evaluating a
+    /// member through the ordinary expression path would repeat every literal across the batch,
+    /// so `x IN (1, 2)` over a hundred thousand rows would allocate two hundred thousand cells
+    /// for two values that never change.
+    /// </remarks>
+    private readonly struct SetMember
+    {
+        private readonly LiteralValue?[]? _perRow;
+
+        public SetMember(LiteralValue? constant)
+        {
+            _perRow = null;
+            Constant = constant;
         }
 
-        return coerced;
+        public SetMember(LiteralValue?[] perRow)
+        {
+            _perRow = perRow;
+            Constant = null;
+        }
+
+        public bool IsConstant => _perRow is null;
+
+        /// <summary>The value, when this member is a constant.</summary>
+        public LiteralValue? Constant { get; }
+
+        /// <summary>The values, when this member varies by row.</summary>
+        public LiteralValue?[] PerRow => _perRow!;
+
+        public LiteralValue? At(int row) => _perRow is null ? Constant : _perRow[row];
     }
 
     /// <summary>
@@ -477,7 +528,29 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)
     {
         var (operand, operandType) = EvalOperand(set.Operand, batch);
-        var values = CoerceSet(set.Values, ref operand, operandType, batch.Length);
+
+        // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
+        // of b. A LITERAL member stays a single value rather than being repeated per row --
+        // `x IN (1, 2)` is most of them, and repeating each one would cost an array the length
+        // of the batch for a value that does not vary.
+        var members = new SetMember[set.Values.Count];
+        var memberTypes = new IArrowType?[set.Values.Count];
+        for (var k = 0; k < set.Values.Count; k++)
+        {
+            if (set.Values[k] is LiteralExpression literal)
+            {
+                members[k] = new SetMember(
+                    literal.Value.IsNull ? null : (LiteralValue?)literal.Value);
+                continue;
+            }
+
+            var (values, type) = EvalOperand(set.Values[k], batch);
+            members[k] = new SetMember(values);
+            memberTypes[k] = type;
+        }
+
+        CoerceSet(ref operand, operandType, members, memberTypes, batch.Length);
+
         var result = new bool?[batch.Length];
         bool isIn = set.Op == SetOperator.In;
 
@@ -493,12 +566,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
             bool found = false;
             bool sawNullInList = false;
-            foreach (var lit in values)
+            foreach (var member in members)
             {
-                if (lit.IsNull) { sawNullInList = true; continue; }
+                var lit = member.At(i);
+                if (!lit.HasValue) { sawNullInList = true; continue; }
                 try
                 {
-                    if (v.Value.CompareTo(lit) == 0) { found = true; break; }
+                    if (v.Value.CompareTo(lit.Value) == 0) { found = true; break; }
                 }
                 catch (InvalidOperationException) { /* incompatible types */ }
             }

@@ -103,6 +103,14 @@ public static class Expressions
     public static SetPredicate NotIn(Expression operand, IReadOnlyList<LiteralValue> values) =>
         new(operand, values, SetOperator.NotIn);
 
+    /// <summary>A set membership test over expressions, which <c>IN</c> equally takes.</summary>
+    public static SetPredicate In(Expression operand, IReadOnlyList<Expression> values) =>
+        new(operand, values, SetOperator.In);
+
+    /// <summary>A negated set membership test over expressions.</summary>
+    public static SetPredicate NotIn(Expression operand, IReadOnlyList<Expression> values) =>
+        new(operand, values, SetOperator.NotIn);
+
     // ── Boolean connectives ──
 
     /// <summary>

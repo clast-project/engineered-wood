@@ -19,6 +19,33 @@ public class ExpressionBinderTests
     // ── Basic binding ──
 
     [Fact]
+    public void Bind_SetPredicate_BindsTheListToo()
+    {
+        // The list holds expressions (#261), so a reference inside it needs resolving as much as
+        // the operand does -- `id IN (age, 5)` names two columns.
+        var bound = Assert.IsType<SetPredicate>(Binder().Bind(Expressions.In(
+            Expressions.Ref("id"),
+            new Expression[] { Expressions.Ref("age"), new LiteralExpression(5) })));
+
+        Assert.Equal(1, Assert.IsType<BoundReference>(bound.Operand).FieldId);
+        Assert.Equal(3, Assert.IsType<BoundReference>(bound.Values[0]).FieldId);
+        Assert.Equal(new LiteralExpression(5), bound.Values[1]);
+    }
+
+    [Fact]
+    public void Bind_SetPredicate_OfLiterals_KeepsTheListInstance()
+    {
+        // The operand resolves, so the node itself is rebuilt -- but a list with nothing to
+        // resolve is handed back as it came, rather than copied once per bind.
+        var original = Expressions.In("id", 1, 2);
+        var bound = Assert.IsType<SetPredicate>(Binder().Bind(original));
+
+        Assert.Equal(1, Assert.IsType<BoundReference>(bound.Operand).FieldId);
+        Assert.Same(original.Values, bound.Values);
+    }
+
+
+    [Fact]
     public void Bind_UnboundReference_Resolves()
     {
         var bound = Binder().Bind(Expressions.Ref("id"));

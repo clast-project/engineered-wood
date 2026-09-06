@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 11:14:05.531095",
-      "2026-09-06 11:14:05.531095",
-      "2026-09-06 11:14:05.531095"
+      "2026-09-06 11:54:18.911001",
+      "2026-09-06 11:54:18.911001",
+      "2026-09-06 11:54:18.911001"
      ]
     }
    },
@@ -11145,6 +11145,238 @@
     }
    },
    {
+    "expression": "fs IN (a, g)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(fs IN (a, g))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns IN (a, g)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (a, g))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "s IN (a, g)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(s IN (a, g))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 4) ==\n(s IN (a, g)) AS r\n   ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns IN (b)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (b))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "a IN (ns)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(a IN (ns))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "a IN (ns, fs)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(a IN (ns, fs))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 4) ==\n(a IN (ns, fs)) AS r\n   ^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns NOT IN (a, b)",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (ns IN (a, b)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns IN (a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (a, NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "s IN (a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(s IN (a, NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 4) ==\n(s IN (a, NULL)) AS r\n   ^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns IN (a, 'x')",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (a, 'x'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 5) ==\n(ns IN (a, 'x')) AS r\n    ^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs IN (a, 'x')",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(fs IN (a, 'x'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 5) ==\n(fs IN (a, 'x')) AS r\n    ^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns IN (a, bl)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (a, bl))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#12 IN (a#0,bl#16) AS r#2315]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#31 IN (a#19,bl#35) AS r#2316]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as s"
+    }
+   },
+   {
+    "expression": "a IN (bl)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(a IN (bl))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#2317]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#2318]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+    }
+   },
+   {
     "expression": "CAST(X'FF' AS STRING) = X'FF'",
     "parse": {
      "ok": true,
@@ -16150,6 +16382,258 @@
        null,
        false
       ]
+     }
+    },
+    {
+     "expression": "fs IN (a, g)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(fs IN (a, g))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (a, g)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (a, g))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s IN (a, g)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(s IN (a, g))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (b)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (b))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "a IN (ns)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(a IN (ns))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a IN (ns, fs)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(a IN (ns, fs))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns NOT IN (a, b)",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (ns IN (a, b)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (a, NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (a, NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s IN (a, NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(s IN (a, NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (a, 'x')",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (a, 'x'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs IN (a, 'x')",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(fs IN (a, 'x'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (a, bl)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (a, bl))"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#12 IN (a#0,bl#16) AS r#1020]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#31 IN (a#19,bl#35) AS r#1021]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as s"
+     }
+    },
+    {
+     "expression": "a IN (bl)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(a IN (bl))"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#1022]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#1023]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
      }
     },
     {
