@@ -864,6 +864,11 @@ def cmd_conflict_semantics(args):
     }
 
 
+def _quote_name(name):
+    """A schema field name as a backticked SQL identifier."""
+    return "`" + name.replace("`", "``") + "`"
+
+
 def cmd_expr_oracle(args):
     """Ask Spark what an expression MEANS, for differential-testing the EW parser and registry.
 
@@ -906,7 +911,11 @@ def cmd_expr_oracle(args):
         applied.setdefault(key, spark.conf.get(key))
 
     schema = args.get("schema") or []
-    ddl = ", ".join(f"{f['name']} {f['type']}" for f in schema)
+    # Names are BACKTICKED here and in the aliases below, so a field can be called what the
+    # question needs it to be called. Interpolating a name raw makes `weird name int` a syntax
+    # error and would make a name like `A` -- which is what #181 is about -- depend on the DDL
+    # parser rather than on the resolver being measured.
+    ddl = ", ".join(f"{_quote_name(f['name'])} {f['type']}" for f in schema)
     frame = spark.createDataFrame([], ddl) if ddl else None
 
     # Rows are SQL literal TEXT, not JSON scalars, and each is cast to its declared type. JSON
@@ -919,7 +928,7 @@ def cmd_expr_oracle(args):
     if ddl and rows:
         selects = [
             "SELECT " + ", ".join(
-                f"CAST({value} AS {field['type']}) AS {field['name']}"
+                f"CAST({value} AS {field['type']}) AS {_quote_name(field['name'])}"
                 for value, field in zip(row, schema))
             for row in rows
         ]

@@ -192,6 +192,51 @@ public class WriterFeatureEnforcementTests : IDisposable
         Assert.Contains("delta.constraints.positive_id", ex.Message);
     }
 
+    // ── Identifier case: what Spark WROTE need not spell a column the way the schema does ──────
+
+    [Fact]
+    public async Task ACheckConstraintNamingTheColumnInAnotherCaseIsEvaluated()
+    {
+        // #181. `spark.sql.caseSensitive` defaults to false, so Spark resolves `ID` against a
+        // column named `id` and stores the constraint as the TEXT it was handed. A constraint is
+        // re-evaluated at every later write, so matching the name exactly refused every write to
+        // a table Spark created -- a compatibility failure on a table we did not create, rather
+        // than a strictness preference.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "ID > 0" });
+
+        Assert.Equal(1, await table.WriteAsync([Batch(1)]));
+    }
+
+    [Fact]
+    public async Task ACheckConstraintNamingTheColumnInAnotherCaseStillCatchesAViolation()
+    {
+        // The half that matters. The reference has to reach the SAME column, not merely stop
+        // throwing: a constraint that quietly resolved to nothing would admit every row, which
+        // looks like the fix and is worse than the defect it replaces.
+        await using var table = await CreateTableAsync(
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "ID > 0" });
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([Batch(-1)]));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task AGenerationExpressionNamingTheColumnInAnotherCaseComputesTheColumn()
+    {
+        // The other expression Delta stores as text, and the one whose failure is silent-shaped:
+        // a generated column nobody could compute refuses the write, so the same defect kept the
+        // table unwritable through a second path.
+        await using var table = await CreateGeneratedColumnTableAsync("ID + 1");
+
+        Assert.Equal(1, await table.WriteAsync([Batch(41)]));
+
+        var rows = await ReadAllAsync(table);
+        Assert.Equal(42L, rows.Single().Derived);
+    }
+
     [Fact]
     public async Task TheTransactionalAppendEnforcesTheSameConstraint()
     {

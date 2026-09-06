@@ -41,6 +41,11 @@ public sealed class SparkEvaluationCorpusTests
     // ...and the `legacy` section pins it off, which is the registry THOSE answers describe.
     private static readonly SparkFunctionRegistry Legacy = new(new SparkDialectOptions { Ansi = false });
 
+    /// <summary>The frame the `groups` and `legacy` sections were harvested against.</summary>
+    private static JsonElement RootSchema => Corpus.RootElement.GetProperty("schema");
+
+    private static JsonElement RootRows => Corpus.RootElement.GetProperty("rows");
+
     /// <summary>
     /// Expressions whose recorded answer cannot be compared, each with the reason.
     /// </summary>
@@ -98,8 +103,6 @@ public sealed class SparkEvaluationCorpusTests
     private static readonly Dictionary<string, string> KnownDifferences = new(StringComparer.Ordinal)
     {
         // ── DIVERGENT: we and Spark both answer, and disagree. Each has an issue. ──────────────
-        ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
-
         // Spark TYPE-CHECKS an IN list and refuses one whose members share no type -- in both
         // dialects, and with no string involved in `a IN (bl)` at all. It refuses at ANALYSIS,
         // so in a CHECK constraint the effect is not a rejected row: measured, a table carrying
@@ -242,15 +245,20 @@ public sealed class SparkEvaluationCorpusTests
         return known;
     }
 
-    private static RecordBatch BuildBatch()
+    /// <summary>Builds the frame one corpus section was harvested against.</summary>
+    /// <remarks>
+    /// Takes its schema and rows rather than reading the root's, because the corpus has more than
+    /// one: <c>identifier_case</c> carries a schema of its own, since names that differ only in
+    /// case cannot be added to the main one without making every reference to <c>a</c> ambiguous.
+    /// </remarks>
+    private static RecordBatch BuildBatch(JsonElement schemaElement, JsonElement rows)
     {
         var schema = new Schema.Builder();
         var arrays = new List<IArrowArray>();
-        var rows = Corpus.RootElement.GetProperty("rows");
         var rowCount = rows.GetArrayLength();
 
         var fieldIndex = 0;
-        foreach (var field in Corpus.RootElement.GetProperty("schema").EnumerateArray())
+        foreach (var field in schemaElement.EnumerateArray())
         {
             var name = field.GetProperty("name").GetString()!;
             var spark = field.GetProperty("type").GetString()!;
@@ -518,7 +526,8 @@ public sealed class SparkEvaluationCorpusTests
     public void EveryCorpusExpressionEvaluatesToSparksAnswer()
     {
         var differing = EvaluateSection(
-            Corpus.RootElement.GetProperty("groups"), Ansi, Excluded, out var compared, out var skipped);
+            Corpus.RootElement.GetProperty("groups"), RootSchema, RootRows,
+            Ansi, Excluded, out var compared, out var skipped);
 
         Assert.True(compared > 150, $"only {compared} expressions were compared");
         Assert.Equal(Excluded.Count, skipped);
@@ -551,7 +560,8 @@ public sealed class SparkEvaluationCorpusTests
             "false", legacy.GetProperty("conf").GetProperty("spark.sql.ansi.enabled").GetString());
 
         var differing = EvaluateSection(
-            legacy.GetProperty("groups"), Legacy, LegacyExcluded, out var compared, out var skipped);
+            legacy.GetProperty("groups"), RootSchema, RootRows,
+            Legacy, LegacyExcluded, out var compared, out var skipped);
 
         Assert.True(compared > 60, $"only {compared} expressions were compared");
         Assert.Equal(LegacyExcluded.Count, skipped);
@@ -559,16 +569,72 @@ public sealed class SparkEvaluationCorpusTests
     }
 
     /// <summary>
+    /// The same comparison against the section harvested with a schema whose names differ in case.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #181: Spark resolves identifiers case-insensitively by default, and we matched
+    /// exactly — so a CHECK constraint or generation expression Spark wrote, stored as text and
+    /// re-evaluated later, refused the whole write whenever it named a column in a case the
+    /// schema does not use. That is a compatibility failure on a table we did not create.
+    /// </para>
+    /// <para>
+    /// The section exists because resolution is a property of the SCHEMA. Two of the answers here
+    /// could not be reached from the main corpus at all, and both of them decided the fix:
+    /// <c>`WEIRD NAME`</c> resolves to a column named <c>weird name</c>, so backticks are about
+    /// which characters a name may contain and not about whether its case is honoured; and with
+    /// <c>dup</c> and <c>DUP</c> in one schema, the exactly-spelled <c>dup</c> is refused as
+    /// AMBIGUOUS_REFERENCE along with every other spelling — so an exact-match-first rule, which
+    /// is the obvious way to keep a dictionary lookup on the fast path, would answer where Spark
+    /// refuses.
+    /// </para>
+    /// <para>
+    /// Nothing is excluded and nothing is declared different: every expression in the section is
+    /// one we should match exactly.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void EveryIdentifierCaseExpressionResolvesTheWaySparkDoes()
+    {
+        var section = Corpus.RootElement.GetProperty("identifier_case");
+
+        // The section is only meaningful under Spark's DEFAULT resolution. A harvest that pinned
+        // caseSensitive on would record the opposite answers and read as a pile of differences.
+        Assert.False(
+            section.GetProperty("conf").TryGetProperty("spark.sql.caseSensitive", out _),
+            "the identifier_case section must be harvested under Spark's default resolution");
+
+        var differing = EvaluateSection(
+            section.GetProperty("groups"),
+            section.GetProperty("schema"),
+            section.GetProperty("rows"),
+            Ansi,
+            NoExclusions,
+            out var compared,
+            out var skipped);
+
+        Assert.True(compared > 20, $"only {compared} expressions were compared");
+        Assert.Equal(0, skipped);
+        AssertOnlyDeclaredDifferences(differing, NoDifferences);
+    }
+
+    private static readonly Dictionary<string, string> NoExclusions = new(StringComparer.Ordinal);
+
+    private static readonly Dictionary<string, string> NoDifferences = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// Evaluates every expression in one corpus section, returning those whose answer differs.
     /// </summary>
     private static Dictionary<string, string> EvaluateSection(
         JsonElement groups,
+        JsonElement schema,
+        JsonElement rows,
         SparkFunctionRegistry registry,
         Dictionary<string, string> excluded,
         out int compared,
         out int skipped)
     {
-        var batch = BuildBatch();
+        var batch = BuildBatch(schema, rows);
         var differing = new Dictionary<string, string>(StringComparer.Ordinal);
         compared = 0;
         skipped = 0;

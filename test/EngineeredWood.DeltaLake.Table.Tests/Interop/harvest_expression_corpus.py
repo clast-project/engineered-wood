@@ -21,6 +21,10 @@ was gathered under. They are pinned here and echoed into the fixture. Do not mer
 gathered under different settings. The `legacy` section is a SECOND corpus, gathered under a
 second conf with ansi off and kept beside the first rather than merged into it.
 
+THE SCHEMA IS PART OF THE DATA TOO, for the same reason. The `identifier_case` section is a THIRD
+corpus, gathered under the same conf against a schema carrying names that differ only in case --
+which the main schema cannot, since one such name would make every reference to `a` ambiguous.
+
 WHAT THE THREE ANSWERS ARE FOR:
   parse -- `sql` comes back fully parenthesised, which makes it a precedence and associativity
            oracle. `1 + 2 * 3` renders as `(1 + (2 * 3))`. Diffing our own rendering against
@@ -121,6 +125,70 @@ ROWS = [
      "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
+
+# --- Identifier case, which needs a schema of its own ----------------------------------
+# Issue #181. Spark resolves an identifier case-insensitively by default, and EngineeredWood did
+# not -- so a CHECK constraint or generation expression Spark wrote, which is stored as TEXT and
+# re-evaluated later, refused the whole write whenever it named a column in a case the schema does
+# not use.
+#
+# WHY A SECOND SCHEMA. Resolution is a property of the schema, not of the expression. The two
+# questions the issue asks -- what an AMBIGUOUS match does, and whether backticks make a reference
+# exact -- cannot be asked against SCHEMA above: it carries no name differing from another only in
+# case, and adding one would make `a` ambiguous for every other expression in the corpus. So this
+# is a separate section for the same reason `legacy` is one.
+#
+# The conf is CONF unchanged. `spark.sql.caseSensitive` is deliberately not pinned: its default,
+# false, is the rule a Spark-written table was created under, and pinning it here would record a
+# setting no writer of such a table had set.
+IDENTIFIER_CASE_SCHEMA = [
+    {"name": "a", "type": "int"},
+    # A name that is not all lower case, so "case-insensitive" is measured in both directions
+    # rather than only against a schema that never had an upper-case letter in it.
+    {"name": "mixedCase", "type": "int"},
+    # A name that can only be written quoted, which is where the backtick question lives.
+    {"name": "weird name", "type": "int"},
+    # The ambiguous pair. Only `dup` is ambiguous; the columns above stay resolvable, so one
+    # schema answers both halves of the issue.
+    {"name": "dup", "type": "int"},
+    {"name": "DUP", "type": "int"},
+]
+
+# Two rows: values and nulls. This section is about which column a name reaches, so distinct
+# values per column are what the answers have to distinguish -- and the null row keeps a null
+# answer in the record.
+IDENTIFIER_CASE_ROWS = [
+    ["1", "2", "3", "4", "5"],
+    ["NULL"] * 5,
+]
+
+IDENTIFIER_CASE_GROUPS = {
+    "resolution": [
+        # The reference from the issue, and the same name quoted. If backticks made a reference
+        # exact, these two would differ.
+        "a", "A", "`a`", "`A`",
+        # ...from the other direction: a schema name carrying upper-case letters, referenced in
+        # every case. `mixedcase` is the one an exact match would refuse in EITHER rule.
+        "mixedCase", "MIXEDCASE", "mixedcase", "MixedCase", "`MIXEDCASE`",
+        # A name that must be quoted to be written at all, so quoting and case are separated:
+        # these three are all the same column if quoting is only about the characters.
+        "`weird name`", "`WEIRD NAME`", "`Weird Name`",
+        # Case-insensitive resolution reaches through the rest of the grammar, or it is a
+        # property of a bare reference rather than of resolution.
+        "A + a", "CAST(A AS BIGINT)", "A IS NULL", "UPPER(A)",
+        # Absent in every case, so "not found" stays distinguishable from "found by folding".
+        "nothere", "NOTHERE",
+    ],
+    "ambiguity": [
+        # THE QUESTION THE FIX TURNS ON. If the exactly-spelled name won, `dup` and `DUP` would
+        # each resolve and only the odd spellings would refuse.
+        "dup", "DUP", "`dup`", "`DUP`", "Dup",
+        # A column that is not half of the pair, so an ambiguous schema is shown not to poison
+        # the names around it.
+        "a",
+    ],
+}
+
 
 # --- The corpus itself -----------------------------------------------------------------
 # Grouped so a failure points at a feature rather than at an index. Groups map onto the
@@ -981,6 +1049,14 @@ def main():
 
     legacy_by_expr = {r["expression"]: r for r in legacy["results"]}
 
+    ident_exprs = list(dict.fromkeys(e for g in IDENTIFIER_CASE_GROUPS.values() for e in g))
+    ident = _run_driver({"expressions": ident_exprs, "schema": IDENTIFIER_CASE_SCHEMA,
+                         "rows": IDENTIFIER_CASE_ROWS, "conf": CONF})
+    if not ident.get("ok"):
+        raise SystemExit("driver error (identifier-case): " + json.dumps(ident)[:2000])
+
+    ident_by_expr = {r["expression"]: r for r in ident["results"]}
+
     fixture = {
         "_comment": "Generated by harvest_expression_corpus.py. Do not edit by hand. "
                     "Answers come from Spark and are only valid under `conf`.",
@@ -1002,6 +1078,18 @@ def main():
             "groups": {name: [legacy_by_expr[e] for e in GROUPS[name] if e in legacy_by_expr]
                        for name in LEGACY_GROUPS},
         },
+        "identifier_case": {
+            "_comment": "A SECOND SCHEMA, under the same conf. Identifier resolution is a "
+                        "property of the schema, and the questions #181 asks -- ambiguity, and "
+                        "whether backticks make a reference exact -- need names that differ only "
+                        "in case. Adding those to the schema above would have made `a` ambiguous "
+                        "for the whole corpus.",
+            "conf": ident["conf"],
+            "schema": IDENTIFIER_CASE_SCHEMA,
+            "rows": IDENTIFIER_CASE_ROWS,
+            "groups": {name: [ident_by_expr[e] for e in exprs if e in ident_by_expr]
+                       for name, exprs in IDENTIFIER_CASE_GROUPS.items()},
+        },
     }
 
     os.makedirs(os.path.dirname(FIXTURE), exist_ok=True)
@@ -1016,6 +1104,7 @@ def main():
     print(f"{total} expressions -> {FIXTURE}")
     print(f"  parse ok: {parsed}/{total}   type ok: {typed}/{total}")
     print(f"  legacy (ansi off): {len(legacy_exprs)} expressions")
+    print(f"  identifier case (second schema): {len(ident_exprs)} expressions")
     print(f"  spark {result['spark_version']} on java {result['java_version']}")
 
 

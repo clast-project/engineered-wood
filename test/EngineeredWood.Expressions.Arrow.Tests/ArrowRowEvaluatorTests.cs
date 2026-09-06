@@ -492,6 +492,79 @@ public class ArrowRowEvaluatorTests
             Eval.EvaluatePredicate(Ex.Equal("y", 1), batch));
     }
 
+    // ── Column names resolve the way Spark resolves an identifier: #181 ──
+
+    [Theory]
+    [InlineData("x", "x")]
+    [InlineData("x", "X")]
+    [InlineData("myCol", "myCol")]
+    [InlineData("myCol", "MYCOL")]
+    [InlineData("myCol", "mycol")]
+    [InlineData("weird name", "WEIRD NAME")]
+    public void AColumnReferenceResolvesWithoutRegardToCase(string declared, string reference)
+    {
+        // Spark's default. The corpus pins this against Spark's own answers; stated directly
+        // here, including from a batch whose own name is mixed-case -- so "insensitive" is
+        // measured in both directions rather than only against an all-lower-case schema.
+        var batch = IntColumn(declared, 7);
+
+        Assert.True(Eval.EvaluatePredicate(Ex.Equal(reference, 7), batch).GetValue(0));
+    }
+
+    [Fact]
+    public void TwoColumnsDifferingOnlyInCaseMakeEverySpellingAmbiguous()
+    {
+        // Measured against Spark 4.0.1: with `dup` and `DUP` in one schema, all of `dup`, `DUP`,
+        // `` `dup` `` and `` `DUP` `` raise AMBIGUOUS_REFERENCE -- the exactly-spelled name does
+        // NOT win. An exact-match-first rule would have answered every one of them, so the fast
+        // path it offers is a wrong answer rather than a shortcut to the right one.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("dup", Int32Type.Default, true))
+            .Field(new Field("DUP", Int32Type.Default, true))
+            .Build();
+        var batch = new RecordBatch(
+            schema,
+            [
+                new Int32Array.Builder().Append(1).Build(),
+                new Int32Array.Builder().Append(2).Build(),
+            ],
+            1);
+
+        foreach (var spelling in new[] { "dup", "DUP", "Dup" })
+        {
+            var ex = Assert.Throws<ArgumentException>(
+                () => Eval.EvaluatePredicate(Ex.Equal(spelling, 1), batch));
+
+            // The message has to name BOTH columns: "ambiguous" alone leaves the reader of a
+            // failed write hunting a wide schema for the pair that collided.
+            Assert.Contains("ambiguous", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("'dup'", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("'DUP'", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void AnAmbiguousPairDoesNotPoisonTheColumnsAroundIt()
+    {
+        // Refusing is per REFERENCE, not per batch. Measured the same way: `a` still answers in a
+        // schema where `dup` and `DUP` collide.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("dup", Int32Type.Default, true))
+            .Field(new Field("DUP", Int32Type.Default, true))
+            .Field(new Field("a", Int32Type.Default, true))
+            .Build();
+        var batch = new RecordBatch(
+            schema,
+            [
+                new Int32Array.Builder().Append(1).Build(),
+                new Int32Array.Builder().Append(2).Build(),
+                new Int32Array.Builder().Append(3).Build(),
+            ],
+            1);
+
+        Assert.True(Eval.EvaluatePredicate(Ex.Equal("A", 3), batch).GetValue(0));
+    }
+
     // ── EvaluateExpression ──
 
     [Fact]
