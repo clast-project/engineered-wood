@@ -369,9 +369,16 @@ internal static class SparkLiteral
     {
         var (unscaled, scale) = SplitDecimal(text, sql, position);
 
-        if (Precision(unscaled) > MaxPrecision)
+        // Precision counts the SCALE as well as the digits, because a Spark decimal requires
+        // 0 <= scale <= precision <= 38: a value with a single significant digit is still too wide
+        // if its scale is. Measured — `1e-38BD` is a decimal(38,38) and `1e-39BD` is refused,
+        // by Spark's PARSER rather than at analysis, which is where this refuses too. Checking
+        // only the digit count let `1e-45BD` through as a scale-45 decimal no Spark type holds.
+        var precision = Math.Max(Precision(unscaled), scale);
+
+        if (precision > MaxPrecision)
             throw new SparkSqlParseException(
-                $"'{text}' has more than {MaxPrecision} digits, which is wider than any decimal",
+                $"'{text}' needs a precision of {precision}, and no decimal is wider than {MaxPrecision}",
                 sql, position);
 
         // System.Decimal holds a scale up to 28 and an unscaled value inside 96 bits. Inside that

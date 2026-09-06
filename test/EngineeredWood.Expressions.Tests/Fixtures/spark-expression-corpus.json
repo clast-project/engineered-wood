@@ -2263,9 +2263,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 05:18:41.887226",
-      "2026-09-06 05:18:41.887226",
-      "2026-09-06 05:18:41.887226"
+      "2026-09-06 05:31:32.941669",
+      "2026-09-06 05:31:32.941669",
+      "2026-09-06 05:31:32.941669"
      ]
     }
    },
@@ -8411,6 +8411,91 @@
       1,
       1
      ]
+    }
+   },
+   {
+    "expression": "0.00000000000000000000000000000000000001",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1E-38BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-38",
+      "1.0E-38",
+      "1.0E-38"
+     ]
+    }
+   },
+   {
+    "expression": "0.000000000000000000000000000000000000001",
+    "parse": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "type": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "1e-38BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1E-38BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-38",
+      "1.0E-38",
+      "1.0E-38"
+     ]
+    }
+   },
+   {
+    "expression": "1e-39BD",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e-39BD\n^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e-39BD) AS r\n ^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e-39BD) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e-45BD",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 45 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e-45BD\n^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 45 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e-45BD) AS r\n ^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 45 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e-45BD) AS r\n ^^^^^^^\n"
     }
    },
    {

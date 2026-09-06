@@ -667,6 +667,15 @@ GROUPS = {
         "0.0000000000000000000000000000000000001",
         "0000000000000000000000000000000000000001",
 
+        # Scale counts toward precision as well as digits: Spark's rule is
+        # max(digits, scale) <= 38, so a value with ONE significant digit can still be too wide if
+        # its scale is. Asked because the first cut of #173 checked only the digit count and let
+        # 1e-45BD through as a scale-45 decimal that no Spark type can hold.
+        "0.00000000000000000000000000000000000001",
+        "0.000000000000000000000000000000000000001",
+        "1e-38BD",
+        "1e-39BD",
+        "1e-45BD",
         # The BD suffix, which asks for a decimal explicitly.
         "12345678901234567890123456789012345678BD",
         "1.5BD",

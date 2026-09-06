@@ -347,15 +347,42 @@ public sealed class SparkSqlParserTests
             Assert.IsType<LiteralExpression>(Parse("1000000000000")).Value.Type);
     }
 
+    /// <summary>
+    /// A literal wider than any Spark decimal is refused, and width counts the SCALE.
+    /// </summary>
+    /// <remarks>
+    /// A Spark decimal requires 0 &lt;= scale &lt;= precision &lt;= 38, so the last two rows are
+    /// too wide on their scale alone — one significant digit each. Checking only the digit count
+    /// accepted <c>1e-45BD</c> as a scale-45 decimal that no Spark type can hold. Measured:
+    /// <c>1e-38BD</c> is a <c>decimal(38,38)</c> and <c>1e-39BD</c> is refused by Spark's own
+    /// parser, which is the stage this refuses at.
+    /// </remarks>
     [Theory]
     [InlineData("123456789012345678901234567890123456789")]
     [InlineData("0.123456789012345678901234567890123456789")]
     [InlineData("12345678901234567890123456789012345.6789")]
+    [InlineData("0.000000000000000000000000000000000000001")]
+    [InlineData("1e-39BD")]
+    [InlineData("1e-45BD")]
     public void ALiteralWiderThanAnyDecimalIsRefusedWithAQuotableReason(string sql)
     {
         var thrown = Assert.Throws<SparkSqlParseException>(() => Parse(sql));
-        Assert.Contains("38 digits", thrown.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("38", thrown.Reason, StringComparison.Ordinal);
         Assert.Equal(sql, thrown.Expression);
+    }
+
+    [Theory]
+    [InlineData("0.00000000000000000000000000000000000001", 38)]
+    [InlineData("1e-38BD", 38)]
+    [InlineData("0.0000000000000000000000000000000000001", 37)]
+    public void AScaleOfExactlyThirtyEightIsStillAccepted(string sql, int scale)
+    {
+        // The accepting side of the same boundary, so the check cannot be tightened by accident.
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+
+        Assert.Equal(LiteralValue.Kind.HighPrecisionDecimal, value.Type);
+        Assert.Equal(scale, value.AsHighPrecisionDecimal.Scale);
+        Assert.Equal("1", value.AsHighPrecisionDecimal.UnscaledValue.ToString());
     }
 
     [Fact]
