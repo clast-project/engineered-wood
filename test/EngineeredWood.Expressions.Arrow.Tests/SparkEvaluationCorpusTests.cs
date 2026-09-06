@@ -101,10 +101,15 @@ public sealed class SparkEvaluationCorpusTests
         ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
 
         // Spark TYPE-CHECKS an IN list and refuses one whose members share no type -- in both
-        // dialects, and with no string involved in `a IN (bl)` at all. That is an analysis-time
-        // check rather than a coercion, and EngineeredWood has no analysis phase: the registry
-        // declines to coerce, the set is compared as it stands, and we answer. Reproducing the
-        // refusal would mean writing a type checker, and is #261's open half.
+        // dialects, and with no string involved in `a IN (bl)` at all. It refuses at ANALYSIS,
+        // so in a CHECK constraint the effect is not a rejected row: measured, a table carrying
+        // one is readable and every Spark write against it fails, including a write that
+        // satisfies it.
+        //
+        // DECIDED AND NOT ADOPTED, #261. The general rule is "the members must share a type",
+        // which spans every type pair, and reproducing it for the pairs that happen to be
+        // measured would put the boundary somewhere arbitrary. The legacy list carries two more
+        // where ANSI -- the dialect Spark ships -- resolves the set and we already match it.
         ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
         ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
@@ -195,8 +200,11 @@ public sealed class SparkEvaluationCorpusTests
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
 
             // Spark's string promotion excludes boolean and binary, so it REFUSES these two sets
-            // at analysis rather than answering. See the ANSI list for why refusing is not
-            // reproduced; under ANSI these two resolve and we match.
+            // at analysis rather than answering -- under THIS dialect only. Measured, an ANSI
+            // session adds `CHECK (bl IN ('true'))` to a table quite happily and writes against
+            // it, and our answer is ANSI's; a legacy session then cannot write to that table at
+            // all. So what is left here is Spark disagreeing with itself across dialects. See
+            // the ANSI list, and #261 for the decision.
             ["bl IN ('true')"] = "#261: legacy Spark refuses a boolean/string set; we answer",
             ["bin IN ('A')"] = "#261: legacy Spark refuses a binary/string set; we answer",
 
