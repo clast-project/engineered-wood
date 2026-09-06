@@ -180,6 +180,79 @@ public class LiteralValueEqualityContractTests
     }
 
     /// <summary>
+    /// The same value in different numeric kinds gets different hashes, so a hash container does
+    /// not pile them into one bucket.
+    /// </summary>
+    /// <remarks>
+    /// A hash is allowed to collide, so this pins a QUALITY property rather than a contract --
+    /// but the property was measurably bad. Unmixed, every numeric zero hashed to 0, and so did
+    /// the null literal, <c>false</c> and midnight: an eleven-deep bucket on the single most
+    /// common value in any predicate. The kinds here all hash deterministically (unlike
+    /// <c>string</c>, whose hash is randomised per process), so demanding ZERO collisions across
+    /// this population is stable rather than lucky.
+    /// </remarks>
+    [Fact]
+    public void SameValueInDifferentKinds_DoesNotShareAHash()
+    {
+        var population = new List<LiteralValue>();
+        for (int i = 0; i < 64; i++)
+        {
+            population.Add(LiteralValue.Of(i));
+            population.Add(LiteralValue.Of((long)i));
+            population.Add(LiteralValue.Of((uint)i));
+            population.Add(LiteralValue.Of((ulong)i));
+            population.Add(LiteralValue.Of((float)i));
+            population.Add(LiteralValue.Of((double)i));
+            population.Add(LiteralValue.Of((decimal)i));
+            population.Add(LiteralValue.HighPrecisionDecimalOf(i, 0));
+        }
+
+        population.Add(LiteralValue.Null);
+        population.Add(LiteralValue.Of(false));
+        population.Add(LiteralValue.Of(true));
+
+        // Every value is distinct under Equals, so every shared hash is a pure collision.
+        Assert.Equal(population.Count, new HashSet<LiteralValue>(population).Count);
+
+        var buckets = population.GroupBy(v => v.GetHashCode()).ToList();
+        var worst = buckets.OrderByDescending(b => b.Count()).First();
+        Assert.True(
+            worst.Count() == 1,
+            $"hash {worst.Key} holds {worst.Count()}: "
+                + string.Join(", ", worst.Select(v => $"{v.Type}({v})")));
+        Assert.Equal(population.Count, buckets.Count);
+    }
+
+    /// <summary>
+    /// Documents the limitation the type docs warn about: <c>CompareTo</c> is not a total order,
+    /// so a sorted collection spanning kinds is unsafe.
+    /// </summary>
+    /// <remarks>
+    /// Not a guarantee anyone should rely on — it pins the behaviour the warning describes, so
+    /// that making the comparison total later fails here and prompts the docs to be updated with
+    /// it. Both failure modes are covered: the comparison throws for kinds it cannot relate, and
+    /// where it does answer, the answers are pairwise, so the container silently loses a value.
+    /// </remarks>
+    [Fact]
+    public void CompareTo_IsNotATotalOrder_SoSortedCollectionsAreUnsafe()
+    {
+        Assert.Throws<InvalidOperationException>(
+            () => new SortedSet<LiteralValue> { LiteralValue.Of(1), LiteralValue.Of("x") });
+
+        var dec = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse("9007199254740993"), 0);
+        var dbl = LiteralValue.Of(9007199254740992.0d);
+        var lng = LiteralValue.Of(9007199254740992L);
+
+        // Three values, all distinct under Equals.
+        Assert.Equal(3, new HashSet<LiteralValue> { dec, dbl, lng }.Count);
+
+        // Two survive a SortedSet, in either insertion order, and it claims to hold one it dropped.
+        Assert.Equal(2, new SortedSet<LiteralValue> { dec, dbl, lng }.Count);
+        Assert.Equal(2, new SortedSet<LiteralValue> { lng, dbl, dec }.Count);
+        Assert.Contains(dec, new SortedSet<LiteralValue> { dbl });
+    }
+
+    /// <summary>
     /// <see cref="SetPredicate"/>, the container the issue names, hashes in step with its own
     /// equality.
     /// </summary>

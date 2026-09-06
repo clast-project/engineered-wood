@@ -23,6 +23,20 @@ namespace EngineeredWood.Expressions;
 /// evaluating a predicate; ask the second when using a literal as a key or comparing two
 /// expression trees.
 /// </para>
+/// <para>
+/// WARNING: <see cref="CompareTo(LiteralValue)"/> is not a total order, so this type must not go
+/// into a sorted collection whose elements span kinds -- <see cref="SortedSet{T}"/>,
+/// <see cref="SortedDictionary{TKey, TValue}"/>, <c>List.Sort</c>, <c>OrderBy</c>. It implements
+/// <see cref="IComparable{T}"/> for the evaluators, which compare two values at a time and can
+/// take an answer of "these kinds do not compare"; a sort cannot. Measured, both ways it breaks:
+/// a <see cref="SortedSet{T}"/> holding an int THROWS when a string is added, and sorting a list
+/// of the two raises "Failed to compare two elements in the array"; and where the comparison does
+/// answer, the answers are pairwise, so a set built from the decimal 9007199254740993, the double
+/// 9007199254740992 and the long 9007199254740992 -- three values, all distinct under
+/// <see cref="Equals(LiteralValue)"/> -- silently stores TWO, in either insertion order, and
+/// reports Contains for a value it does not hold. Group by <see cref="Type"/> first, or sort with
+/// a comparer of your own.
+/// </para>
 /// </remarks>
 public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<LiteralValue>
 {
@@ -311,30 +325,49 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// <summary>A hash consistent with <see cref="Equals(LiteralValue)"/>.</summary>
     /// <remarks>
     /// Representation-based, matching the equality above: no kind is folded into another, because
-    /// values of two kinds are never equal. The kind itself is not mixed in -- two kinds may share
-    /// a hash, which a hash is allowed to do, and every such collision is resolved by
-    /// <see cref="Equals(LiteralValue)"/>.
+    /// values of two kinds are never equal. The kind is mixed in for the same reason -- once two
+    /// kinds can never be equal, separating them costs nothing and every value they shared a
+    /// bucket with was a pure collision.
+    /// <para>
+    /// Worth doing rather than nominal. Measured over 64 small values in each of the eight numeric
+    /// kinds plus the string, binary, date and time kinds -- 596 values, all distinct under
+    /// <see cref="Equals(LiteralValue)"/> -- the unmixed hash gave 268 distinct codes with a worst
+    /// bucket of ELEVEN: every numeric zero landed on 0, and so did the null literal, <c>false</c>
+    /// and midnight. Mixing gives 596 distinct codes and a worst bucket of one.
+    /// </para>
+    /// <para>
+    /// Deliberately NOT <see cref="CombineHash"/>, the file's own helper, which measured WORST of
+    /// the four mixes tried: 468 distinct and 256 values still sharing a bucket with another kind.
+    /// It is <c>33 * kind ^ hash</c>, and a kind is 0-16, so the XOR barely moves a small hash
+    /// and the two operands alias. Spreading the hash first and adding the small discriminator
+    /// after does not, which is why the multiply comes first here.
+    /// </para>
     /// </remarks>
-    public override int GetHashCode() => _kind switch
+    public override int GetHashCode()
     {
-        Kind.Null => 0,
-        Kind.Boolean => _inline.Boolean.GetHashCode(),
-        Kind.Int32 => _inline.Int32.GetHashCode(),
-        Kind.Int64 => _inline.Int64.GetHashCode(),
-        Kind.UInt32 => _inline.UInt32.GetHashCode(),
-        Kind.UInt64 => _inline.UInt64.GetHashCode(),
-        Kind.Float => _inline.Float.GetHashCode(),
-        Kind.Double => _inline.Double.GetHashCode(),
-        Kind.DateTimeOffset => CombineHash(_inline.DateTimeOffsetTicks.GetHashCode(), _inline.DateTimeOffsetMinutes.GetHashCode()),
+        int value = _kind switch
+        {
+            Kind.Null => 0,
+            Kind.Boolean => _inline.Boolean.GetHashCode(),
+            Kind.Int32 => _inline.Int32.GetHashCode(),
+            Kind.Int64 => _inline.Int64.GetHashCode(),
+            Kind.UInt32 => _inline.UInt32.GetHashCode(),
+            Kind.UInt64 => _inline.UInt64.GetHashCode(),
+            Kind.Float => _inline.Float.GetHashCode(),
+            Kind.Double => _inline.Double.GetHashCode(),
+            Kind.DateTimeOffset => CombineHash(_inline.DateTimeOffsetTicks.GetHashCode(), _inline.DateTimeOffsetMinutes.GetHashCode()),
 #if NET6_0_OR_GREATER
-        Kind.Half => _inline.Half.GetHashCode(),
-        Kind.DateOnly => _inline.DateOnly.GetHashCode(),
-        Kind.TimeOnly => _inline.TimeOnly.GetHashCode(),
+            Kind.Half => _inline.Half.GetHashCode(),
+            Kind.DateOnly => _inline.DateOnly.GetHashCode(),
+            Kind.TimeOnly => _inline.TimeOnly.GetHashCode(),
 #endif
-        Kind.Binary => BinaryHashCode((byte[]?)_ref),
-        Kind.HighPrecisionDecimal => CombineHash(_inline.Int32.GetHashCode(), _ref?.GetHashCode() ?? 0),
-        _ => _ref?.GetHashCode() ?? 0,
-    };
+            Kind.Binary => BinaryHashCode((byte[]?)_ref),
+            Kind.HighPrecisionDecimal => CombineHash(_inline.Int32.GetHashCode(), _ref?.GetHashCode() ?? 0),
+            _ => _ref?.GetHashCode() ?? 0,
+        };
+
+        return unchecked((value * 31) + (int)_kind);
+    }
 
     public static bool operator ==(LiteralValue left, LiteralValue right) => left.Equals(right);
     public static bool operator !=(LiteralValue left, LiteralValue right) => !left.Equals(right);
