@@ -349,15 +349,22 @@ internal static class SparkArrays
     /// </remarks>
     public static string ShortestRoundTrip(double value)
     {
-        for (var digits = 15; digits < 17; digits++)
-        {
-            var text = value.ToString($"G{digits}", Invariant);
-            if (double.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value)
-                return text;
-        }
+        // Unrolled onto constant format strings rather than built per iteration: this runs for
+        // every row of every cast, and there are only ever three rungs.
+        if (RoundTrips(value, "G15", out var fifteen))
+            return fifteen;
+
+        if (RoundTrips(value, "G16", out var sixteen))
+            return sixteen;
 
         // Seventeen significant digits always round-trip a double, so there is nothing to check.
         return value.ToString("G17", Invariant);
+    }
+
+    private static bool RoundTrips(double value, string format, out string text)
+    {
+        text = value.ToString(format, Invariant);
+        return double.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value;
     }
 
     /// <summary>Whether an integral Arrow type is narrower than <c>int</c>.</summary>
