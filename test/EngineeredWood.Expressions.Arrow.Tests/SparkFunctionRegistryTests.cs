@@ -585,6 +585,142 @@ public sealed class SparkFunctionRegistryTests
             SparkWideDecimals.Render(SparkWideDecimals.Read(value, 0)!.Value));
     }
 
+
+    // ── round, greatest and least (#182) ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// <c>round</c> is half AWAY FROM ZERO, which is what separates it from <c>bround</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("round(2.5)", "3")]
+    [InlineData("round(-2.5)", "-3")]
+    [InlineData("round(3.5)", "4")]
+    [InlineData("round(0.5)", "1")]
+    [InlineData("round(1.45, 1)", "1.5")]
+    [InlineData("round(-1.45, 1)", "-1.5")]
+    public void RoundGoesHalfAwayFromZero(string sql, string expected) =>
+        Assert.Equal(expected, Rendered(Ansi, sql, Batch(("a", Ints(1))), 0));
+
+    /// <summary>
+    /// A decimal's result type moves with the scale, and a WIDER scale still widens the precision.
+    /// </summary>
+    /// <remarks>
+    /// decimal(p,s) rounded to d becomes decimal(p - s + s' + 1, s') with s' = min(s, d). The
+    /// third row is the one that is not obvious: rounding a decimal(10,2) to five places leaves
+    /// the scale at 2 and still adds a digit of precision.
+    /// </remarks>
+    [Theory]
+    [InlineData("round(d, 1)", 10, 1)]
+    [InlineData("round(d, 0)", 9, 0)]
+    [InlineData("round(d, 5)", 11, 2)]
+    [InlineData("round(d, 2)", 11, 2)]
+    public void RoundingADecimalMovesItsType(string sql, int precision, int scale)
+    {
+        var batch = Batch(("d", Decimals(10, 2, 12.34m)));
+        var type = (Decimal128Type)Eval(Ansi, sql, batch).Data.DataType;
+
+        Assert.Equal(precision, type.Precision);
+        Assert.Equal(scale, type.Scale);
+    }
+
+    [Fact]
+    public void RoundingAnIntegralTypeKeepsItAndTakesANegativeScale()
+    {
+        var batch = Batch(("b", Longs(12345, 10)));
+        var rounded = Assert.IsType<Int64Array>(Eval(Ansi, "round(b, -2)", batch));
+
+        Assert.Equal(12300L, rounded.GetValue(0));
+        Assert.Equal(0L, rounded.GetValue(1));
+
+        // A non-negative scale has nothing to round on an integer.
+        Assert.Equal(12345L, Assert.IsType<Int64Array>(Eval(Ansi, "round(b, 2)", batch)).GetValue(0));
+    }
+
+    [Fact]
+    public void RoundingPastAnIntegralTypesRangeIsArithmeticOverflow()
+    {
+        // Measured: `round(a, -1)` over INT_MIN reports ARITHMETIC_OVERFLOW rather than
+        // CAST_OVERFLOW — rounding is arithmetic, not a conversion.
+        var batch = Batch(("a", Ints(int.MinValue)));
+
+        Assert.Equal(
+            "ARITHMETIC_OVERFLOW",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "round(a, -1)", batch)).ErrorClass);
+
+        Assert.True(Assert.IsType<Int32Array>(Eval(Legacy, "round(a, -1)", batch)).IsNull(0));
+    }
+
+    [Fact]
+    public void RoundLeavesAloneWhatHasNoFractionToLose()
+    {
+        var batch = Batch(("g", Doubles(double.NaN, double.PositiveInfinity, 2.5)));
+        var rounded = Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, 2)", batch));
+
+        Assert.True(double.IsNaN(rounded.GetValue(0)!.Value));
+        Assert.True(double.IsPositiveInfinity(rounded.GetValue(1)!.Value));
+
+        // A scale past what a double can hold is a no-op rather than an overflow.
+        Assert.Equal(2.5, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, 20)", batch)).GetValue(2));
+    }
+
+    /// <summary>
+    /// <c>greatest</c> and <c>least</c> SKIP nulls, which is the opposite of nearly everything else.
+    /// </summary>
+    [Fact]
+    public void GreatestAndLeastSkipNullsRatherThanPropagatingThem()
+    {
+        var batch = Batch(("a", Ints(1, null)), ("b", Longs(10, 10)));
+
+        var greatest = Assert.IsType<Int64Array>(Eval(Ansi, "greatest(a, b)", batch));
+        Assert.Equal(10L, greatest.GetValue(0));
+        Assert.Equal(10L, greatest.GetValue(1));      // a is null and is skipped, not propagated
+
+        Assert.Equal(1L, Assert.IsType<Int64Array>(Eval(Ansi, "least(a, b)", batch)).GetValue(0));
+
+        // A bare NULL is `void` and constrains neither the type nor the answer.
+        var withNull = Assert.IsType<Int32Array>(Eval(Ansi, "greatest(a, NULL)", batch));
+        Assert.Equal(1, withNull.GetValue(0));
+        Assert.True(withNull.IsNull(1));
+
+        // ...and every argument being null is the one case that answers null.
+        Assert.True(SparkFunctions.IsNull(Eval(Ansi, "greatest(NULL, NULL)", batch), 0));
+    }
+
+    [Fact]
+    public void GreatestAndLeastUnifyTheirArgumentTypes()
+    {
+        var batch = Batch(("a", Ints(1)), ("g", Doubles(2.5)), ("s", Strings("abc")), ("t", Strings("xyz")));
+
+        Assert.Equal(2.5, Assert.IsType<DoubleArray>(Eval(Ansi, "greatest(a, g)", batch)).GetValue(0));
+        Assert.Equal(1.0, Assert.IsType<DoubleArray>(Eval(Ansi, "least(a, g)", batch)).GetValue(0));
+        Assert.Equal("xyz", Assert.IsType<StringArray>(Eval(Ansi, "greatest(s, t)", batch)).GetString(0));
+    }
+
+    [Fact]
+    public void RoundRefusesAScaleThatVariesByRow()
+    {
+        // Spark requires a foldable scale and reports NON_FOLDABLE_INPUT for a column, so a scale
+        // that differs between rows cannot come from an expression it accepted. This registry
+        // sees columns rather than the tree, so it refuses the case it can actually see rather
+        // than silently rounding every row to the first row's scale.
+        var varying = Batch(("g", Doubles(2.5, 2.5)), ("n", Ints(1, 2)));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "round(g, n)", varying));
+
+        // A constant column is what a literal scale materialises as, and it still works.
+        var constant = Batch(("g", Doubles(2.55, 2.55)), ("n", Ints(1, 1)));
+        Assert.Equal(2.6, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, n)", constant)).GetValue(0));
+    }
+
+    [Fact]
+    public void GreatestNeedsTwoArguments()
+    {
+        // Measured: Spark reports WRONG_NUM_ARGS for one argument as well as for none, rather
+        // than treating a single argument as the identity.
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Throws<ArgumentException>(() => Eval(Ansi, "greatest(a)", batch));
+    }
+
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
 
     [Fact]

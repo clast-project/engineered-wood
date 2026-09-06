@@ -131,13 +131,16 @@ public sealed class SparkEvaluationCorpusTests
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
-        ["round(g, 2)"] = "#182: function not registered",
-        ["greatest(a, b)"] = "#182: function not registered",
-        ["greatest(a, g)"] = "#182: function not registered",
-        ["least(a, b)"] = "#182: function not registered",
-        ["DATE'2026-08-11'"] = "#182: a date literal parses but cannot be materialised as an Arrow array",
+        // The date and timestamp literals are the half of #182 this change does not do. They need
+        // LiteralValue to tell a DATE from a TIMESTAMP, which it cannot: SparkLiteral.Typed makes
+        // both a DateTimeOffset, deliberately, because DateOnly is not on every target framework.
+        // Their answers are harvested now, so the change that carries the distinction has them
+        // waiting. #254.
+        ["DATE'2026-08-11'"] = "#254: a date literal parses but cannot be materialised as an Arrow array",
+        ["year(DATE'2026-08-11')"] = "#254: a date literal cannot be materialised as an Arrow array",
+        ["CAST(DATE'2026-08-11' AS STRING)"] = "#254: a date literal cannot be materialised as an Arrow array",
         ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
-            "#182: a timestamp literal parses but cannot be materialised as an Arrow array",
+            "#254: a timestamp literal parses but cannot be materialised as an Arrow array",
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",
         ["1S"] = "parser refuses the smallint literal suffix; declared in SparkSqlParserTests",
@@ -215,11 +218,11 @@ public sealed class SparkEvaluationCorpusTests
 
             // Same root cause as the ANSI list's DATE literal.
             ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)"] =
-                "#182: a timestamp literal cannot be materialised as an Arrow array",
+                "#254: a timestamp literal cannot be materialised as an Arrow array",
             ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)"] =
-                "#182: a timestamp literal cannot be materialised as an Arrow array",
+                "#254: a timestamp literal cannot be materialised as an Arrow array",
             ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
-                "#182: a timestamp literal cannot be materialised as an Arrow array",
+                "#254: a timestamp literal cannot be materialised as an Arrow array",
         };
 
     private static HashSet<string> ExpressionsIn(JsonElement groups)
@@ -666,12 +669,12 @@ public sealed class SparkEvaluationCorpusTests
             }
 
             case DoubleArray a:
-                return NearlyEqual(expected.GetDouble(), a.GetValue(row)!.Value)
+                return NearlyEqual(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
                     : $"expected {expected}, got {a.GetValue(row)}";
 
             case FloatArray a:
-                return NearlyEqual(expected.GetDouble(), a.GetValue(row)!.Value)
+                return NearlyEqual(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
                     : $"expected {expected}, got {a.GetValue(row)}";
 
@@ -702,6 +705,26 @@ public sealed class SparkEvaluationCorpusTests
                 return $"no comparison for {actual.Data.DataType.Name}";
         }
     }
+
+    /// <summary>
+    /// A recorded floating-point answer, which is a JSON number unless it has no JSON form.
+    /// </summary>
+    /// <remarks>
+    /// NaN and the infinities are legitimate Spark answers and are not JSON values, so the
+    /// harvest records them as the names Java prints. Writing them as bare tokens is what Python
+    /// does by default, and it made the whole fixture unreadable here — the failure was the
+    /// corpus not loading at all rather than one comparison going wrong.
+    /// </remarks>
+    private static double ExpectedDouble(JsonElement expected) =>
+        expected.ValueKind == JsonValueKind.String
+            ? expected.GetString() switch
+            {
+                "NaN" => double.NaN,
+                "Infinity" => double.PositiveInfinity,
+                "-Infinity" => double.NegativeInfinity,
+                var other => double.Parse(other!, Invariant),
+            }
+            : expected.GetDouble();
 
     private static bool NearlyEqual(double expected, double actual)
     {

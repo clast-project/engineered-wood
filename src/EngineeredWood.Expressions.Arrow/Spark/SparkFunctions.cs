@@ -411,6 +411,38 @@ internal static class SparkFunctions
     /// <c>nullif(CAST(1.00 AS DECIMAL(10,2)), 1)</c> is null. Comparing the renderings would have
     /// returned the value instead.
     /// </remarks>
+    /// <summary>
+    /// Orders two cells of the SAME Arrow type, for <c>greatest</c> and <c>least</c>.
+    /// </summary>
+    /// <remarks>
+    /// Same type on both sides by construction — the caller unifies first — so this never has to
+    /// promote, and a decimal can be compared on its unscaled integer alone because the scales
+    /// already match. A decimal goes through <see cref="SparkWideDecimals.Compare"/>, which orders
+    /// the unscaled integers by their two halves and allocates nothing — this runs once per
+    /// argument per ROW, where reading a BigInteger copied sixteen bytes and allocated each time.
+    /// </remarks>
+    public static int CompareAt(IArrowArray left, IArrowArray right, int index) => left switch
+    {
+        Int8Array or Int16Array or Int32Array or Int64Array =>
+            SparkArrays.ReadInt64(left, index)!.Value.CompareTo(SparkArrays.ReadInt64(right, index)!.Value),
+
+        FloatArray or DoubleArray =>
+            SparkArrays.ReadDouble(left, index)!.Value.CompareTo(SparkArrays.ReadDouble(right, index)!.Value),
+
+        Decimal128Array a => SparkWideDecimals.Compare(a, (Decimal128Array)right, index),
+
+        StringArray a => string.CompareOrdinal(a.GetString(index), ((StringArray)right).GetString(index)),
+
+        BooleanArray a => a.GetValue(index)!.Value.CompareTo(((BooleanArray)right).GetValue(index)!.Value),
+
+        _ when SparkArrays.IsTemporal(left.Data.DataType) =>
+            SparkArrays.ReadInstant(left, index)!.Value.CompareTo(
+                SparkArrays.ReadInstant(right, index)!.Value),
+
+        _ => throw new NotSupportedException(
+            $"{left.Data.DataType.Name} cannot be ordered"),
+    };
+
     public static bool AreEqual(IArrowArray left, IArrowArray right, int index)
     {
         if (SparkArrays.IsTemporal(left.Data.DataType) || SparkArrays.IsTemporal(right.Data.DataType))
