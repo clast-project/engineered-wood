@@ -131,16 +131,6 @@ public sealed class SparkEvaluationCorpusTests
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
-        // The date and timestamp literals are the half of #182 this change does not do. They need
-        // LiteralValue to tell a DATE from a TIMESTAMP, which it cannot: SparkLiteral.Typed makes
-        // both a DateTimeOffset, deliberately, because DateOnly is not on every target framework.
-        // Their answers are harvested now, so the change that carries the distinction has them
-        // waiting. #254.
-        ["DATE'2026-08-11'"] = "#254: a date literal parses but cannot be materialised as an Arrow array",
-        ["year(DATE'2026-08-11')"] = "#254: a date literal cannot be materialised as an Arrow array",
-        ["CAST(DATE'2026-08-11' AS STRING)"] = "#254: a date literal cannot be materialised as an Arrow array",
-        ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
-            "#254: a timestamp literal parses but cannot be materialised as an Arrow array",
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",
         ["1S"] = "parser refuses the smallint literal suffix; declared in SparkSqlParserTests",
@@ -215,14 +205,6 @@ public sealed class SparkEvaluationCorpusTests
                 "#244: JDK 17 renders 18 digits where the shortest form needs 17",
             ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))"] =
                 "#244: JDK 17 renders 17 digits where the shortest form needs 16",
-
-            // Same root cause as the ANSI list's DATE literal.
-            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)"] =
-                "#254: a timestamp literal cannot be materialised as an Arrow array",
-            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)"] =
-                "#254: a timestamp literal cannot be materialised as an Arrow array",
-            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
-                "#254: a timestamp literal cannot be materialised as an Arrow array",
         };
 
     private static HashSet<string> ExpressionsIn(JsonElement groups)

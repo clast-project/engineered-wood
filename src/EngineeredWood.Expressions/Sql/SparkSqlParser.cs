@@ -511,7 +511,21 @@ public static class SparkSqlParser
                 var text = TextOf(Current);
                 var start = Current.Start;
                 Advance();
-                return new LiteralExpression(SparkLiteral.Typed(word, text, _sql, start));
+
+                var literal = new LiteralExpression(SparkLiteral.Typed(word, text, _sql, start));
+
+                // A DATE literal is LOWERED to a cast, the way BETWEEN is lowered to two
+                // comparisons and a bare boolean to `= TRUE`. The value it carries cannot say
+                // which it is: SparkLiteral.Typed makes a DATE and a TIMESTAMP the same
+                // DateTimeOffset, deliberately, so that a literal and a column value compare on
+                // one footing — and the alternative, a LiteralValue kind that distinguishes them,
+                // exists only on net6 and later, where construction, equality, hashing and
+                // ordering for it are all behind #if. Casting says the same thing in the tree
+                // instead of in the value, and reuses the DATE cast that is already measured.
+                // #254.
+                return Matches(word, "DATE")
+                    ? new FunctionCall("cast", new Expression[] { literal, Lit("DATE") })
+                    : literal;
             }
 
             Advance();
