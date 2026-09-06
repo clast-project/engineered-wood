@@ -511,7 +511,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             return other;
 
         if (!_options.Ansi)
-            return SparkNumericTypes.IsNumeric(other) ? Widest(other) : null;
+            return SparkNumericTypes.IsNumeric(other) ? LegacyTarget(other) : null;
 
         if (SparkNumericTypes.IsIntegral(other))
             return Int64Type.Default;
@@ -523,16 +523,32 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     }
 
     /// <summary>
-    /// A decimal read at the width <see cref="Cast"/> dispatches on, and anything else unchanged.
+    /// The legacy dialect's target: the operand's own type, or null when there is no cast to it.
     /// </summary>
     /// <remarks>
-    /// A <c>decimal(38,0)</c> can arrive as a <see cref="Decimal256Type"/>, which the cast has no
-    /// case for; its precision and scale are what the cast actually needs, and Spark's maximum
-    /// precision of 38 fits a <see cref="Decimal128Type"/> by definition.
+    /// A decimal needs reading at the width <see cref="Cast"/> dispatches on, since a
+    /// <c>decimal(38,0)</c> can arrive as a <see cref="Decimal256Type"/> and the cast has a case
+    /// only for <see cref="Decimal128Type"/>. Precision and scale are what it actually needs.
+    /// <para>
+    /// <b>Past Spark's maximum precision there is no rule and no cast.</b> Parquet's decimal runs
+    /// wider than Spark's — <c>ArrowSchemaConverter</c> builds a <see cref="Decimal256Type"/> for
+    /// precision above 38 — and no Spark expression can name such a type, so nothing measured
+    /// says what comparing a string against one means. Handing it on would be worse than
+    /// declining: <see cref="Decimal128Type"/> does not validate its precision, so a
+    /// <c>decimal(50,0)</c> became a 16-byte decimal claiming fifty digits and the comparison
+    /// answered from it. Measured, before this returned null.
+    /// </para>
     /// </remarks>
-    private static IArrowType Widest(IArrowType numeric) => numeric is Decimal256Type d
-        ? new Decimal128Type(d.Precision, d.Scale)
-        : numeric;
+    private static IArrowType? LegacyTarget(IArrowType numeric)
+    {
+        if (!SparkNumericTypes.IsDecimal(numeric))
+            return numeric;
+
+        var (precision, scale) = SparkNumericTypes.AsDecimal(numeric);
+        return precision <= SparkNumericTypes.MaxPrecision
+            ? new Decimal128Type(precision, scale)
+            : null;
+    }
 
     // ── CAST ───────────────────────────────────────────────────────────────────────────────
 

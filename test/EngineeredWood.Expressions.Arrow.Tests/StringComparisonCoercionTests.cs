@@ -221,6 +221,34 @@ public class StringComparisonCoercionTests
     public void TwoStringsAreNotCoerced() => Assert.False(Evaluate(Ansi, "s = 'other'"));
 
     [Fact]
+    public void ADecimalWiderThanSparkCanDeclareTakesNoLegacyCoercion()
+    {
+        // Parquet's decimal runs wider than Spark's: `ArrowSchemaConverter` builds a
+        // Decimal256Type for precision > 38, which no Spark expression can name. The legacy
+        // dialect casts to the operand's OWN type, and there is no cast to a decimal that wide --
+        // so the pair keeps the answer it had rather than failing on the way to one.
+        var type = new Decimal256Type(50, 0);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("wide", type, true))
+            .Field(new Field("s", StringType.Default, true))
+            .Build();
+
+        var validity = new ArrowBuffer.BitmapBuilder();
+        validity.Append(true);
+        var batch = new RecordBatch(schema, new IArrowArray[]
+        {
+            new Decimal256Array(new ArrayData(
+                type, 1, 0, 0, new[] { validity.Build(), new ArrowBuffer(new byte[32]) })),
+            new StringArray.Builder().Append("0").Build(),
+        }, 1);
+
+        Assert.Null(Evaluate(Legacy, "s = wide", batch));
+
+        // ANSI never reaches that cast -- every decimal goes to double, whatever its precision.
+        Assert.True(Evaluate(Ansi, "s = wide", batch));
+    }
+
+    [Fact]
     public void AnAllNullStringOperandIsNeverCastAndSoNeverRaises()
     {
         // No row has two values to compare, so there is nothing to cast and ANSI has nothing to
