@@ -228,28 +228,41 @@ public class LiteralValueEqualityContractTests
     /// so a sorted collection spanning kinds is unsafe.
     /// </summary>
     /// <remarks>
-    /// Not a guarantee anyone should rely on — it pins the behaviour the warning describes, so
-    /// that making the comparison total later fails here and prompts the docs to be updated with
-    /// it. Both failure modes are covered: the comparison throws for kinds it cannot relate, and
-    /// where it does answer, the answers are pairwise, so the container silently loses a value.
+    /// Documentation rather than a guarantee — making the comparison total later should fail here
+    /// and take the warning with it. The evidence is therefore stated about the COMPARER, which is
+    /// ours and specified, not about what a container does with a comparer that breaks its
+    /// contract, which is not: <see cref="SortedSet{T}"/> given an intransitive comparison has no
+    /// defined outcome, so an exact surviving count would pin the red-black tree's insertion order
+    /// rather than anything about this type. Only the two container facts that follow from a
+    /// single root comparison, and so hold for any binary search tree, are asserted.
     /// </remarks>
     [Fact]
     public void CompareTo_IsNotATotalOrder_SoSortedCollectionsAreUnsafe()
     {
-        Assert.Throws<InvalidOperationException>(
-            () => new SortedSet<LiteralValue> { LiteralValue.Of(1), LiteralValue.Of("x") });
-
         var dec = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse("9007199254740993"), 0);
         var dbl = LiteralValue.Of(9007199254740992.0d);
         var lng = LiteralValue.Of(9007199254740992L);
 
-        // Three values, all distinct under Equals.
+        // The comparer itself, which is the actual claim. It declines some pairs outright, and
+        // calls others equal that Equals separates -- so it cannot rank these three.
+        Assert.Throws<InvalidOperationException>(
+            () => LiteralValue.Of(1).CompareTo(LiteralValue.Of("x")));
+        Assert.Equal(0, dec.CompareTo(dbl));
+        Assert.False(dec.Equals(dbl));
+        Assert.NotEqual(0, dec.CompareTo(lng));
         Assert.Equal(3, new HashSet<LiteralValue> { dec, dbl, lng }.Count);
 
-        // Two survive a SortedSet, in either insertion order, and it claims to hold one it dropped.
-        Assert.Equal(2, new SortedSet<LiteralValue> { dec, dbl, lng }.Count);
-        Assert.Equal(2, new SortedSet<LiteralValue> { lng, dbl, dec }.Count);
+        // What that costs a sorted container. Adding a second element compares it against the
+        // root, so both of these follow from one comparison whatever the tree does afterwards:
+        // the throw escapes, and a set of one reports a member it does not hold.
+        Assert.Throws<InvalidOperationException>(
+            () => new SortedSet<LiteralValue> { LiteralValue.Of(1), LiteralValue.Of("x") });
         Assert.Contains(dec, new SortedSet<LiteralValue> { dbl });
+
+        // At least one of three distinct values is lost. WHICH, and how many, is the container's
+        // business under a comparer it was never promised, so that is deliberately not pinned.
+        Assert.True(new SortedSet<LiteralValue> { dec, dbl, lng }.Count < 3);
+        Assert.True(new SortedSet<LiteralValue> { lng, dbl, dec }.Count < 3);
     }
 
     /// <summary>

@@ -33,9 +33,10 @@ namespace EngineeredWood.Expressions;
 /// of the two raises "Failed to compare two elements in the array"; and where the comparison does
 /// answer, the answers are pairwise, so a set built from the decimal 9007199254740993, the double
 /// 9007199254740992 and the long 9007199254740992 -- three values, all distinct under
-/// <see cref="Equals(LiteralValue)"/> -- silently stores TWO, in either insertion order, and
-/// reports Contains for a value it does not hold. Group by <see cref="Type"/> first, or sort with
-/// a comparer of your own.
+/// <see cref="Equals(LiteralValue)"/> -- silently DROPS one, and reports Contains for a value it
+/// does not hold. How many it drops is not worth stating: a sorted container given an
+/// intransitive comparison has no defined behaviour at all, which is the point. Group by
+/// <see cref="Type"/> first, or sort with a comparer of your own.
 /// </para>
 /// </remarks>
 public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<LiteralValue>
