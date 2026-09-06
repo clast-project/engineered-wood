@@ -121,6 +121,15 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS DECIMAL(38,0))"] =
             "#244: JDK 17 renders 17 digits where the shortest form needs 16",
 
+        // The same two values through CAST(... AS STRING), which prints with the same
+        // Double.toString and so lands in the same band. That they are the SAME two, and that
+        // the other 26 rows of the float-to-string group agree exactly, is what says the
+        // divergence is the JDK's and not this library's. #248.
+        ["CAST(CAST(1e23 AS DOUBLE) AS STRING)"] =
+            "#244: JDK 17 prints 9.999999999999999E22 where the shortest form is 1.0E23",
+        ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS STRING)"] =
+            "#244: JDK 17 prints 17 digits where the shortest form needs 16",
+
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
         ["round(g, 2)"] = "#182: function not registered",
         ["greatest(a, b)"] = "#182: function not registered",

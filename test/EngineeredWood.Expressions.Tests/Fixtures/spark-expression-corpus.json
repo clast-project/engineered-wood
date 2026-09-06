@@ -2263,9 +2263,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-05 17:24:05.627842",
-      "2026-09-05 17:24:05.627842",
-      "2026-09-05 17:24:05.627842"
+      "2026-09-05 18:11:01.950073",
+      "2026-09-05 18:11:01.950073",
+      "2026-09-05 18:11:01.950073"
      ]
     }
    },
@@ -7567,6 +7567,568 @@
     "eval": {
      "ok": false,
      "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  12345.0 cannot be represented as Decimal(3, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(CAST(CAST(12345 AS DOUBLE) AS DECIMAL(3,0))) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   }
+  ],
+  "float-to-string": [
+   {
+    "expression": "CAST(CAST(1.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0",
+      "1.0",
+      "1.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(2.5 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(2.5BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.5",
+      "2.5",
+      "2.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1234567 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1234567 AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1234567.0",
+      "1234567.0",
+      "1234567.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(12345678 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(12345678 AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.2345678E7",
+      "1.2345678E7",
+      "1.2345678E7"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e7 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E7D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E7",
+      "1.0E7",
+      "1.0E7"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(9999999 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(9999999 AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9999999.0",
+      "9999999.0",
+      "9999999.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.001 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.001BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.001",
+      "0.001",
+      "0.001"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.0001 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.0001BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-4",
+      "1.0E-4",
+      "1.0E-4"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e-7 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E-7D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-7",
+      "1.0E-7",
+      "1.0E-7"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E30",
+      "1.0E30",
+      "1.0E30"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-1e30 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-1.0E30D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.0E30",
+      "-1.0E30",
+      "-1.0E30"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e-30 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E-30D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E-30",
+      "1.0E-30",
+      "1.0E-30"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.0BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.0BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('NaN' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('NaN' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('Infinity' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('Infinity' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Infinity",
+      "Infinity",
+      "Infinity"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-Infinity' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-Infinity' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-Infinity",
+      "-Infinity",
+      "-Infinity"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e23 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(9.999999999999999E22D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9.999999999999999E22",
+      "9.999999999999999E22",
+      "9.999999999999999E22"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(3.333333333333333E17 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(3.3333333333333331E17D AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3.3333333333333331E17",
+      "3.3333333333333331E17",
+      "3.3333333333333331E17"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.3333333333333333 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.3333333333333333BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.3333333333333333",
+      "0.3333333333333333",
+      "0.3333333333333333"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0E30",
+      "1.0E30",
+      "1.0E30"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.1 AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.1BD AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.1",
+      "0.1",
+      "0.1"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(1.5 AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.5BD AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      "1.5",
+      "1.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.3333333 AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.3333333BD AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.3333333",
+      "0.3333333",
+      "0.3333333"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('NaN' AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('NaN' AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(g AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(g AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.5",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(f AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(f AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.5",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "concat(s, g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat(s, g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc2.5",
+      null,
+      "0.0"
+     ]
     }
    }
   ],

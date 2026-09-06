@@ -308,7 +308,7 @@ public sealed class SparkFunctionRegistryTests
             Rendered(Ansi, "CAST(g AS DECIMAL(38,30))", batch, 0));
 
         // Sixteen digits, and the value that made this depend on the target framework: net472's
-        // ToString("R") renders it with seventeen. SparkArrays.ShortestRoundTrip is what keeps
+        // ToString("R") renders it with seventeen. SparkFloatText.ShortestRoundTrip is what keeps
         // every build answering the same thing.
         Assert.Equal("0.33333333333333330000",
             Rendered(Ansi, "CAST(g AS DECIMAL(38,20))", batch, 1));
@@ -319,15 +319,15 @@ public sealed class SparkFunctionRegistryTests
     {
         // Asserted directly as well as through the cast, because the difference it guards against
         // shows up on one target framework only and would otherwise be invisible here.
-        Assert.Equal("0.3333333333333333", SparkArrays.ShortestRoundTrip(0.3333333333333333));
-        Assert.Equal("0.1", SparkArrays.ShortestRoundTrip(0.1));
-        Assert.Equal("2.5", SparkArrays.ShortestRoundTrip(2.5));
+        Assert.Equal("0.3333333333333333", SparkFloatText.ShortestRoundTrip(0.3333333333333333));
+        Assert.Equal("0.1", SparkFloatText.ShortestRoundTrip(0.1));
+        Assert.Equal("2.5", SparkFloatText.ShortestRoundTrip(2.5));
 
         // Every rendering must read back as the value it came from, whichever rung produced it.
         foreach (var value in new[] { 0.1, 2.5, 1e30, -1e30, 1.0000000150474662E30, 5e-324, double.MaxValue })
         {
             Assert.Equal(value, double.Parse(
-                SparkArrays.ShortestRoundTrip(value), NumberStyles.Float, CultureInfo.InvariantCulture));
+                SparkFloatText.ShortestRoundTrip(value), NumberStyles.Float, CultureInfo.InvariantCulture));
         }
     }
 
@@ -382,6 +382,98 @@ public sealed class SparkFunctionRegistryTests
         var type = (Decimal128Type)result.Data.DataType;
         return SparkWideDecimals.Render(
             new SparkWideDecimals.Operand(SparkWideDecimals.Read(result, row)!.Value.Unscaled, 38, type.Scale));
+    }
+
+
+    // ── Printing a float or a double, which is Java's spelling and not .NET's (#248) ────────
+
+    /// <summary>
+    /// Java switches to scientific notation outside [1e-3, 1e7), and .NET switches elsewhere.
+    /// </summary>
+    /// <remarks>
+    /// Every expectation is what <c>Double.toString</c> prints, which is what the corpus measured
+    /// Spark printing. The .NET rendering each replaces is in the comment beside it — this is the
+    /// half of #248 that has nothing to do with digit counts.
+    /// </remarks>
+    [Theory]
+    [InlineData(1.0, "1.0")]                    // "R" gives 1
+    [InlineData(2.5, "2.5")]
+    [InlineData(1234567.0, "1234567.0")]        // the last magnitude that prints plainly
+    [InlineData(12345678.0, "1.2345678E7")]     // "R" gives 12345678
+    [InlineData(1e7, "1.0E7")]                  // "R" gives 10000000
+    [InlineData(9999999.0, "9999999.0")]
+    [InlineData(0.001, "0.001")]                // the smallest that prints plainly
+    [InlineData(0.0001, "1.0E-4")]              // "R" gives 0.0001
+    [InlineData(1e-7, "1.0E-7")]                // "R" gives 1E-07
+    [InlineData(1e30, "1.0E30")]                // "R" gives 1E+30
+    [InlineData(-1e30, "-1.0E30")]
+    [InlineData(1e-30, "1.0E-30")]
+    [InlineData(0.0, "0.0")]                    // "R" gives 0
+    [InlineData(0.3333333333333333, "0.3333333333333333")]
+    [InlineData(double.NaN, "NaN")]
+    [InlineData(double.PositiveInfinity, "Infinity")]
+    [InlineData(double.NegativeInfinity, "-Infinity")]
+    public void ADoublePrintsTheWayJavaPrintsIt(double value, string expected) =>
+        Assert.Equal(expected, SparkFloatText.Render(value));
+
+    /// <summary>
+    /// A float prints as a FLOAT, which is the opposite of what the cast to a decimal does.
+    /// </summary>
+    /// <remarks>
+    /// <c>0.3333333f</c> prints as <c>0.3333333</c> here and converts to a decimal as the widened
+    /// double's 0.3333333134651184 — measured on both paths. One ladder could not serve both.
+    /// </remarks>
+    [Theory]
+    [InlineData(1e30f, "1.0E30")]
+    [InlineData(0.1f, "0.1")]
+    [InlineData(1.5f, "1.5")]
+    [InlineData(0.3333333f, "0.3333333")]
+    [InlineData(float.NaN, "NaN")]
+    [InlineData(float.PositiveInfinity, "Infinity")]
+    public void AFloatPrintsAsAFloatAndNotAsTheWidenedDouble(float value, string expected) =>
+        Assert.Equal(expected, SparkFloatText.Render(value));
+
+    [Fact]
+    public void NegativeZeroKeepsItsSignWhenItSurvivesToTheRenderer()
+    {
+        // Java prints -0.0, and the sign bit is the only way to see it: `value < 0` is false.
+        Assert.Equal("-0.0", SparkFloatText.Render(-0.0));
+        Assert.Equal("0.0", SparkFloatText.Render(0.0));
+
+        // It does NOT survive the SQL literal, which is why the corpus records 0.0 for
+        // CAST(CAST(-0.0 AS DOUBLE) AS STRING): a fractional literal is a DECIMAL in Spark, and a
+        // decimal has no negative zero to carry through the negation.
+        var batch = Batch(("g", Doubles(1.0)));
+        Assert.Equal("0.0", Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(CAST(-0.0 AS DOUBLE) AS STRING)", batch)).GetString(0));
+    }
+
+    [Fact]
+    public void CastingAColumnToStringUsesTheSameSpelling()
+    {
+        var batch = Batch(("g", Doubles(2.5, 1e30)), ("f", Floats(1.5f, 0.3333333f)));
+
+        var doubles = Assert.IsType<StringArray>(Eval(Ansi, "CAST(g AS STRING)", batch));
+        Assert.Equal("2.5", doubles.GetString(0));
+        Assert.Equal("1.0E30", doubles.GetString(1));
+
+        var floats = Assert.IsType<StringArray>(Eval(Ansi, "CAST(f AS STRING)", batch));
+        Assert.Equal("1.5", floats.GetString(0));
+        Assert.Equal("0.3333333", floats.GetString(1));
+    }
+
+    [Fact]
+    public void TheFloatLadderIsShortestAndPortable()
+    {
+        // Nine significant digits always round-trip a float; the ladder stops earlier when it can.
+        foreach (var value in new[] { 0.1f, 1.5f, 0.3333333f, 1e30f, float.Epsilon, float.MaxValue })
+        {
+            Assert.Equal(value, float.Parse(
+                SparkFloatText.ShortestRoundTrip(value), NumberStyles.Float, CultureInfo.InvariantCulture));
+        }
+
+        Assert.Equal("0.1", SparkFloatText.ShortestRoundTrip(0.1f));
+        Assert.Equal("0.3333333", SparkFloatText.ShortestRoundTrip(0.3333333f));
     }
 
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────

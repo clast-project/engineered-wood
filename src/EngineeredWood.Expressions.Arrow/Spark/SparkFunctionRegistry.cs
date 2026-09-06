@@ -815,7 +815,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             if (double.IsNaN(value) || double.IsInfinity(value))
                 continue;
 
-            var text = SparkArrays.ShortestRoundTrip(value);
+            var text = SparkFloatText.ShortestRoundTrip(value);
 
             if (SparkDecimalText.TryRead(text, target, out var unscaled) == SparkDecimalText.Result.Ok)
             {
