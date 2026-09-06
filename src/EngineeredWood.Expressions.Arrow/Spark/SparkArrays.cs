@@ -17,18 +17,43 @@ internal static class SparkArrays
     /// <summary>A value about to be cast, kept in whichever form is faithful to its source.</summary>
     internal readonly struct CastInput
     {
+        private readonly string? _text;
+        private readonly IArrowArray? _array;
+        private readonly int _index;
+
+        /// <summary>A value whose text is already known, and cheap.</summary>
+        /// <remarks>
+        /// The boolean and temporal sources, where the rendering is a constant or an already
+        /// formatted instant. Nothing is deferred because there is nothing to defer.
+        /// </remarks>
         public CastInput(double number, decimal? exact, string text)
         {
             AsDouble = number;
             Exact = exact;
-            Text = text;
+            _text = text;
+            _array = null;
+            _index = 0;
+            IsNumeric = true;
+            FromString = false;
+        }
+
+        /// <summary>A numeric cell whose text is rendered only if something asks for it.</summary>
+        public CastInput(double number, decimal? exact, IArrowArray array, int index)
+        {
+            AsDouble = number;
+            Exact = exact;
+            _text = null;
+            _array = array;
+            _index = index;
             IsNumeric = true;
             FromString = false;
         }
 
         public CastInput(string text)
         {
-            Text = text;
+            _text = text;
+            _array = null;
+            _index = 0;
             FromString = true;
             IsNumeric = double.TryParse(
                 text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
@@ -63,8 +88,27 @@ internal static class SparkArrays
 
         public double AsDouble { get; }
 
-        /// <summary>The source rendered as Spark would render it, for error messages and casts to string.</summary>
-        public string Text { get; }
+        /// <summary>
+        /// The source rendered as Spark would render it, for error messages and casts to string.
+        /// </summary>
+        /// <remarks>
+        /// <b>Rendered on demand for a numeric source, which is what #251 was.</b> It used to be
+        /// formatted for every row of every cast, and only two things ever read it: a cast whose
+        /// target is a string, where it is the answer, and an error message, which fires on a row
+        /// that is being refused. <c>CAST(g AS INT)</c> over a million rows was formatting a
+        /// million doubles and discarding all of them — measured at 265 MB of the 1M-row cast's
+        /// allocation.
+        /// <para>
+        /// Nothing memoises it, because a <c>readonly struct</c> has nowhere to put the result.
+        /// That costs nothing: every path that reads it reads it once, on the row it is about to
+        /// refuse or convert.
+        /// </para>
+        /// <para>
+        /// Holding the array also keeps it alive across the deferral, which is what the span
+        /// taken inside <see cref="Render"/> needs — see <c>doc/arrow-span-lifetime.md</c>.
+        /// </para>
+        /// </remarks>
+        public string Text => _text ?? Render(_array!, _index, Exact);
 
         /// <summary>Whether the value can take part in a numeric cast at all.</summary>
         public bool IsNumeric { get; }
@@ -252,7 +296,7 @@ internal static class SparkArrays
             ? ReadDecimal(array, index)
             : null;
 
-        return new CastInput(asDouble.Value, exact, Render(array, index, exact));
+        return new CastInput(asDouble.Value, exact, array, index);
     }
 
     /// <summary>Renders an instant the way Spark prints it.</summary>
