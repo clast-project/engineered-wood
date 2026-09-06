@@ -1027,3 +1027,27 @@ reader.
 pruning, and the dictionary never reaches Arrow (dictionary-encoded columns are
 always materialised), so it cannot accelerate row-level filtering either.
 Tracked as [#57](https://github.com/clast-project/engineered-wood/issues/57).
+
+### Correctness / interop issues
+
+Each of these answers where Spark answers differently, rather than refusing, so
+none is caught by the "refuses by name" rule above. All are pinned by the
+`string-coercion` group of `spark-expression-corpus.json` and declared in
+`SparkEvaluationCorpusTests`, so each is a live measurement.
+
+**A string carrying an exponent casts to an integral.** `CAST('1e3' AS BIGINT)`
+is 1000 for us; Spark refuses it under ANSI and nulls it under the legacy
+dialect, because its string-to-integral parse takes a sign, digits and an
+optional fraction and never an exponent. Fail-open: `'1e3' = a` answers false
+where Spark refuses to evaluate the constraint at all. The floating and decimal
+targets are right, so this is the integral parse specifically
+([#258](https://github.com/clast-project/engineered-wood/issues/258)). The same
+issue records the opposite-direction case: `CAST('1d' AS DOUBLE)` is 1.0 to
+Spark, since Java accepts a type suffix, and we refuse it.
+
+**`IN` inherits the comparison coercion, which is wrong under the legacy
+dialect.** Spark resolves `IN`'s common type as `STRING` there, where a
+comparison casts the string to a number, so `fs IN (a, b)` over `'1.5'` is false
+in Spark and true here. ANSI agrees. A binary operand takes no coercion at all —
+`s = bin` is false in Spark and null here
+([#259](https://github.com/clast-project/engineered-wood/issues/259)).

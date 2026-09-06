@@ -98,9 +98,16 @@ public sealed class SparkEvaluationCorpusTests
     private static readonly Dictionary<string, string> KnownDifferences = new(StringComparer.Ordinal)
     {
         // ── DIVERGENT: we and Spark both answer, and disagree. Each has an issue. ──────────────
-        ["s = a"] = "#180: Spark refuses string/number comparison under ANSI; we return a value",
-        ["s < a"] = "#180: Spark refuses string/number comparison under ANSI; we return a value",
         ["A"] = "#181: Spark resolves identifiers case-insensitively; we do not",
+
+        // The comparison coerces the string correctly now (#180); what is left is the CAST
+        // underneath it, which reads an exponent where Spark's integral parse does not.
+        ["'1e3' = a"] = "#258: we cast '1e3' to an integral where Spark refuses it",
+
+        // Spark answers false rather than refusing, so a rule exists -- but the recorded answer
+        // does not say which way it resolves, and a guess would be a silent wrong answer.
+        ["s = bin"] = "#259: string against binary takes no coercion here",
+        ["'00' = bin"] = "#259: string against binary takes no coercion here",
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -186,6 +193,19 @@ public sealed class SparkEvaluationCorpusTests
             // The struct column the harness cannot build, exactly as in the ANSI list.
             ["nested.arr[99]"] = "struct columns are not modelled",
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
+
+            // The same cast and binary differences the ANSI list carries. #258 shows up here as
+            // a wrong VALUE rather than a missing refusal: legacy Spark nulls '1e3' and we
+            // answer 1000, so the comparison answers false where Spark answers null.
+            ["'1e3' = a"] = "#258: we cast '1e3' to an integral where legacy Spark nulls it",
+            ["s = bin"] = "#259: string against binary takes no coercion here",
+            ["'00' = bin"] = "#259: string against binary takes no coercion here",
+
+            // IN resolves its common type as STRING under this dialect, where a comparison casts
+            // the string to a number. The parser expands `x IN (expr, …)` into a disjunction of
+            // equalities, so IN inherits the comparison rule -- right under ANSI, wrong here.
+            ["s IN (a, b)"] = "#259: legacy IN compares as strings; we compare as numbers",
+            ["fs IN (a, b)"] = "#259: legacy IN compares as strings; we compare as numbers",
 
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -367,11 +387,35 @@ public sealed class SparkEvaluationCorpusTests
                 return b.Build();
             }
 
-            // binary and struct: the corpus records both in forms that are Python reprs rather
-            // than values, so nothing here could be compared against them anyway.
+            // The corpus records a binary EXPRESSION as a Python bytearray repr, which is why
+            // `X'ABCD'` is excluded -- but a binary COLUMN is only ever an operand, and an
+            // expression over one answers with something comparable. `s = bin` is a boolean.
+            case "binary":
+            {
+                var b = new BinaryArray.Builder();
+                foreach (var v in literals)
+                {
+                    if (IsNull(v)) b.AppendNull();
+                    else b.Append(HexBytes(Unquote(v.Substring(1))));
+                }
+
+                return b.Build();
+            }
+
+            // struct: recorded as a Python repr, and not modelled by the evaluator either.
             default:
                 return null;
         }
+    }
+
+    /// <summary>Reads the corpus's <c>X'00'</c> form, with the prefix and quotes already off.</summary>
+    private static byte[] HexBytes(string hex)
+    {
+        var bytes = new byte[hex.Length / 2];
+        for (var i = 0; i < bytes.Length; i++)
+            bytes[i] = byte.Parse(hex.Substring(i * 2, 2), NumberStyles.HexNumber, Invariant);
+
+        return bytes;
     }
 
     private static Decimal128Array BuildDecimal(Decimal128Type type, string[] literals)
