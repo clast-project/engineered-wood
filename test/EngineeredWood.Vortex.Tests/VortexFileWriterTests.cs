@@ -1334,7 +1334,67 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Predicate_FloatZonesPruneByNaNCount()
+    {
+        // Vortex min/max EXCLUDE NaN (ArrayStatsComputer skips it), so a zone holding [1.0, NaN]
+        // records the same bounds as one holding [1.0, 1.0]. NaN is ABOVE every value in SQL's
+        // order, so `v > 500` is TRUE of that hidden row and the zone cannot be dropped on its
+        // maximum -- while a zone whose recorded nan_count is 0 still can. Telling the two apart is
+        // the whole job of the count (#214).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                // zone 0: plain finite values, no NaN. zone 1: the same values plus one NaN.
+                foreach (bool withNaN in new[] { false, true })
+                {
+                    var b = new DoubleArray.Builder();
+                    for (int i = 0; i < 49; i++) b.Append(i);
+                    b.Append(withNaN ? double.NaN : 49.0);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, 50));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+
+            int kept = 0;
+            await foreach (var batch in reader.ReadAllAsync(
+                               Pred.GreaterThan("v", LiteralValue.Of(500.0))))
+            {
+                kept++;
+                // The NaN is the only value in the file that satisfies the predicate.
+                Assert.Contains(
+                    Enumerable.Range(0, batch.Length)
+                        .Select(i => ((DoubleArray)batch.Column(0)).GetValue(i)!.Value),
+                    double.IsNaN);
+            }
+            Assert.Equal(1, kept);
+
+            // The direction a NaN cannot reach still prunes both zones.
+            int below = 0;
+            await foreach (var _ in reader.ReadAllAsync(
+                               Pred.LessThan("v", LiteralValue.Of(-1.0))))
+            {
+                below++;
+            }
+            Assert.Equal(0, below);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Predicate_EqualKeepsZonesContainingValue()
+
     {
         // 3 zones × 50 rows: 0..49, 50..99, 100..149. Predicate v == 75
         // keeps only zone 1 (range 50..99).

@@ -99,4 +99,43 @@ public class DeltaLiteralDecoderTests
         Assert.Equal(
             LiteralValue.Of(new DateTimeOffset(2021, 6, 1, 0, 0, 0, TimeSpan.Zero)), lit!.Value);
     }
+
+    // â”€â”€ Non-finite float bounds (#214) â”€â”€
+
+    [Theory]
+    [InlineData("\"NaN\"", double.NaN)]
+    [InlineData("\"Infinity\"", double.PositiveInfinity)]
+    [InlineData("\"-Infinity\"", double.NegativeInfinity)]
+    public void Double_NonFiniteBoundsArriveQuoted(string json, double expected)
+    {
+        // JSON has no NaN and no infinity, so Delta's stats carry all three as STRINGS. These are
+        // Spark 4.0's own spellings, read out of the commit JSON of a table it wrote. Refusing them
+        // was safe but blind: an undecodable bound is Unknown, so a double column reaching either
+        // end of the range gave up pruning entirely.
+        var lit = DeltaLiteralDecoder.FromJson(Json(json), "double");
+        Assert.NotNull(lit);
+        Assert.Equal(LiteralValue.Kind.Double, lit!.Value.Type);
+        Assert.Equal(LiteralValue.Of(expected), lit.Value);
+    }
+
+    [Fact]
+    public void Float_NonFiniteBoundsArriveQuoted()
+    {
+        var lit = DeltaLiteralDecoder.FromJson(Json("\"NaN\""), "float");
+        Assert.NotNull(lit);
+        Assert.Equal(LiteralValue.Kind.Float, lit!.Value.Type);
+        Assert.Equal(LiteralValue.Of(float.NaN), lit.Value);
+    }
+
+    [Theory]
+    [InlineData("\"nan\"")]
+    [InlineData("\"inf\"")]
+    [InlineData("\"1.5\"")]
+    [InlineData("\"\"")]
+    public void Double_OtherStringsAreStillRefused(string json)
+    {
+        // Only the three names are accepted. A quoted NUMBER is refused too: nothing writes one,
+        // and reading it would mean guessing at a producer this decoder has never met.
+        Assert.Null(DeltaLiteralDecoder.FromJson(Json(json), "double"));
+    }
 }

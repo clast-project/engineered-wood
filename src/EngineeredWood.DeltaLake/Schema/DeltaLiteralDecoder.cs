@@ -43,12 +43,19 @@ internal static class DeltaLiteralDecoder
                     return value.ValueKind == JsonValueKind.Number
                         ? (LiteralValue?)LiteralValue.Of((int)value.GetSByte()) : null;
                 case "float":
+                    if (value.ValueKind == JsonValueKind.String)
+                        return NonFinite(value.GetString()) is double sf
+                            ? (LiteralValue?)LiteralValue.Of((float)sf) : null;
                     return value.ValueKind == JsonValueKind.Number
                         ? (LiteralValue?)LiteralValue.Of(value.GetSingle()) : null;
                 case "double":
+                    if (value.ValueKind == JsonValueKind.String)
+                        return NonFinite(value.GetString()) is double sd
+                            ? (LiteralValue?)LiteralValue.Of(sd) : null;
                     return value.ValueKind == JsonValueKind.Number
                         ? (LiteralValue?)LiteralValue.Of(value.GetDouble()) : null;
                 case "boolean":
+
                     return value.ValueKind switch
                     {
                         JsonValueKind.True => (LiteralValue?)LiteralValue.Of(true),
@@ -244,7 +251,32 @@ internal static class DeltaLiteralDecoder
         return MakeDecimalLiteral(unscaled, scale);
     }
 
+    /// <summary>
+    /// The three float bounds JSON cannot spell as numbers, or <see langword="null"/> for any other
+    /// string.
+    /// </summary>
+    /// <remarks>
+    /// JSON has no NaN and no infinity, so Delta's stats carry them QUOTED. Measured against Spark
+    /// 4.0: a double column holding <c>[3.0, NaN]</c> commits
+    /// <c>"minValues":{"g":3.0},"maxValues":{"g":"NaN"}</c>, and one holding both infinities commits
+    /// <c>"-Infinity"</c> / <c>"Infinity"</c>. Those are Java's <c>Double.toString</c> spellings.
+    /// <para>
+    /// Refusing them was safe -- an undecodable bound reads as Unknown and keeps the file -- but it
+    /// gave up ALL pruning on any float column reaching either end of the range, which is not rare.
+    /// Reading them is also what makes a Spark-written NaN maximum visible as a maximum, rather than
+    /// as a missing bound.
+    /// </para>
+    /// </remarks>
+    private static double? NonFinite(string? text) => text switch
+    {
+        "NaN" => double.NaN,
+        "Infinity" => double.PositiveInfinity,
+        "-Infinity" => double.NegativeInfinity,
+        _ => null,
+    };
+
     private static LiteralValue? ParseDate(string s) =>
+
         DateTimeOffset.TryParseExact(s, "yyyy-MM-dd",
             CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto)
             ? (LiteralValue?)LiteralValue.Of(dto)
