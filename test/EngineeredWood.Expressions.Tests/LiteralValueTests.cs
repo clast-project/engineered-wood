@@ -167,7 +167,8 @@ public class LiteralValueTests
         Assert.NotEqual((LiteralValue)1.5f, (LiteralValue)1.5d);
         Assert.NotEqual(LiteralValue.Of(1m), LiteralValue.HighPrecisionDecimalOf(1, 0));
 
-        // The SQL answer is unchanged, and is what every evaluator asks for.
+        // The SQL answer is unchanged. It is what the evaluators ask for, through
+        // ArrowRowEvaluator.ValueEqual and StatisticsEvaluator.ConstantCompare.
         Assert.Equal(0, ((LiteralValue)42).CompareTo((LiteralValue)42L));
         Assert.Equal(0, ((LiteralValue)1).CompareTo((LiteralValue)1.0d));
         Assert.Equal(0, ((LiteralValue)1.5f).CompareTo((LiteralValue)1.5d));

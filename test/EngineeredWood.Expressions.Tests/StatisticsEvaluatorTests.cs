@@ -508,6 +508,54 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysFalse, Eval(p, stats));
     }
 
+    /// <summary>
+    /// Folding two literals under <c>&lt;=&gt;</c> asks the SQL comparison, so it keeps matching
+    /// across numeric kinds after #206 made <c>Equals</c> representation-based.
+    /// </summary>
+    /// <remarks>
+    /// This path read <c>a.Equals(b)</c>, which was SQL's relation until #206 and is not any more.
+    /// Left alone it would have answered <c>AlwaysFalse</c> for <c>1 &lt;=&gt; 1.0d</c> -- a wrong
+    /// prune, and a divergence from the row evaluator, which reaches <c>CompareTo</c>.
+    /// </remarks>
+    [Theory]
+    [InlineData(1, 1.0d, true)]
+    [InlineData(1, 2.0d, false)]
+    public void NullSafeEqual_TwoLiterals_MatchesAcrossNumericKinds(int left, double right, bool expected)
+    {
+        Assert.Equal(
+            expected ? FilterResult.AlwaysTrue : FilterResult.AlwaysFalse,
+            EvalLiterals(LiteralValue.Of(left), LiteralValue.Of(right)));
+
+        Assert.Equal(
+            expected ? FilterResult.AlwaysTrue : FilterResult.AlwaysFalse,
+            EvalLiterals(LiteralValue.Of(left), LiteralValue.Of((long)right)));
+    }
+
+    /// <summary>
+    /// <c>&lt;=&gt;</c> over two literals answers for every pair instead of throwing out of a
+    /// pruning entry point.
+    /// </summary>
+    /// <remarks>
+    /// Measured before #206, all three of these raised <c>InvalidOperationException</c> from
+    /// <c>Equals</c> and escaped <c>StatisticsEvaluator.Evaluate</c> -- the null handling lives in
+    /// <c>CompareTo</c>, which this path did not reach, and <c>ConstantCompare</c>'s try/catch was
+    /// bypassed. A caller pruning row groups got an exception for <c>x &lt;=&gt; NULL</c>.
+    /// </remarks>
+    [Fact]
+    public void NullSafeEqual_TwoLiterals_DoesNotThrow_ForNullOrIncomparableKinds()
+    {
+        Assert.Equal(FilterResult.AlwaysTrue, EvalLiterals(LiteralValue.Null, LiteralValue.Null));
+        Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Of(1), LiteralValue.Null));
+        Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Null, LiteralValue.Of(1)));
+        Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Of("x"), LiteralValue.Of(1)));
+    }
+
+    private static FilterResult EvalLiterals(LiteralValue a, LiteralValue b) =>
+        Eval(
+            new ComparisonPredicate(
+                new LiteralExpression(a), ComparisonOperator.NullSafeEqual, new LiteralExpression(b)),
+            new TestStats());
+
     // ── Function calls (not supported) ──
 
     [Fact]
