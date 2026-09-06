@@ -27,9 +27,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 {
     private readonly IFunctionRegistry? _functions;
 
+    /// <summary>The registry's comparison rules, when it has any. See <see cref="CoerceStrings"/>.</summary>
+    private readonly IComparisonCoercion? _coercion;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
+        _coercion = functions as IComparisonCoercion;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -121,8 +125,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalComparison(ComparisonPredicate cmp, RecordBatch batch)
     {
-        var left = EvalExpression(cmp.Left, batch);
-        var right = EvalExpression(cmp.Right, batch);
+        var (left, leftType) = EvalOperand(cmp.Left, batch);
+        var (right, rightType) = EvalOperand(cmp.Right, batch);
+        CoerceStrings(cmp, leftType, rightType, ref left, ref right);
         var result = new bool?[batch.Length];
 
         for (int i = 0; i < batch.Length; i++)
@@ -166,11 +171,177 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             }
             catch (InvalidOperationException)
             {
-                // Type-incompatible compare → null, like SQL.
+                // A pair with no comparison between them at all -- a string against a binary, or
+                // anything at all when no registry was supplied to coerce with. Not the
+                // string-against-number case any more: that one is cast before the loop, and
+                // under ANSI a malformed value raises out of the cast rather than arriving here.
                 result[i] = null;
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Casts a string operand to what it must be to compare against the other one, in place.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark compares a string against a non-string by CASTING THE STRING — it does not refuse,
+    /// and it does not render the other side as text. Without this the comparison reached
+    /// <see cref="LiteralValue.CompareTo(LiteralValue)"/>, which has no cross-kind branch for a
+    /// string, and every such comparison answered null: not only <c>s = a</c> over a malformed
+    /// string, where Spark refuses under ANSI, but <c>'1' = a</c> over a valid one, where Spark
+    /// answers true. The wrong answer was the larger half. #180.
+    /// </para>
+    /// <para>
+    /// The target is dialect-dependent, so the registry chooses it — see
+    /// <see cref="IComparisonCoercion"/>. Without a registry there is nothing to cast with and
+    /// the comparison is left as it was.
+    /// </para>
+    /// <para>
+    /// <b>A row whose other operand is null is not cast, and <c>&lt;=&gt;</c> is the exception.</b>
+    /// Spark's relational operators evaluate nothing once an operand is null, so a malformed
+    /// string sitting opposite a null is never read and never refused; null-safe equality has no
+    /// such short-circuit and does refuse. Measured over a row of <c>(a = NULL, s = 'abc')</c>:
+    /// <c>s = a</c> is null under ANSI, in both operand orders, while <c>s &lt;=&gt; a</c> raises
+    /// CAST_INVALID_INPUT. Without the mask a batch mixing one such row with an ordinary one
+    /// would refuse a write Spark accepts.
+    /// </para>
+    /// </remarks>
+    private void CoerceStrings(
+        ComparisonPredicate cmp, IArrowType? leftType, IArrowType? rightType,
+        ref LiteralValue?[] left, ref LiteralValue?[] right)
+    {
+        if (_coercion is null)
+            return;
+
+        bool leftIsString = IsString(leftType, left);
+        if (leftIsString == IsString(rightType, right))
+            return;   // two strings, or neither: nothing to coerce
+
+        var strings = leftIsString ? left : right;
+        var other = leftIsString ? right : left;
+        int rowCount = strings.Length;
+
+        var coerced = _coercion.CoerceStringForComparison(
+            MaterializeAsArray(
+                cmp.Op == ComparisonOperator.NullSafeEqual ? strings : NulledWhere(strings, other),
+                rowCount),
+            OperandType(leftIsString ? rightType : leftType, other),
+            rowCount);
+
+        if (coerced is null)
+            return;   // a pair the registry has no rule for; compare it as it stands
+
+        var values = ArrowToLiteralValues(coerced, rowCount);
+        if (leftIsString) left = values;
+        else right = values;
+    }
+
+    /// <summary>
+    /// Evaluates a comparison operand, keeping the Arrow type when the operand declares one.
+    /// </summary>
+    /// <remarks>
+    /// The same calls <see cref="EvalExpression"/> makes for these three cases, with the array
+    /// KEPT rather than discarded — no operand is evaluated twice. The type is what a
+    /// <see cref="LiteralValue"/> array cannot carry and what the coercion turns on: a decimal's
+    /// precision and scale, a date against a timestamp, and the type of an operand whose every
+    /// row is null. All three are reachable through a cast, whose result carries exactly the type
+    /// the cast was asked for — measured, <c>'2026-08-11 12:30:00' = CAST(ts AS DATE)</c> is true
+    /// in Spark, and reading that operand as the instant its values look like would compare the
+    /// string against midnight instead of truncating it.
+    /// <para>
+    /// A literal is deliberately not routed through an array. It is typed from its own value,
+    /// which is what Spark does with one, and materialising a constant array per comparison would
+    /// put an allocation on the hot path for the sake of a type already known.
+    /// </para>
+    /// </remarks>
+    private (LiteralValue?[] Values, IArrowType? Type) EvalOperand(
+        Expression expression, RecordBatch batch)
+    {
+        IArrowArray array;
+        switch (expression)
+        {
+            case UnboundReference u: array = GetColumn(batch, u.Name); break;
+            case BoundReference b: array = GetColumn(batch, b.Name); break;
+            case FunctionCall fc: array = InvokeFunction(fc, batch); break;
+            default: return (EvalExpression(expression, batch), null);
+        }
+
+        return (ArrowToLiteralValues(array, batch.Length), array.Data.DataType);
+    }
+
+    /// <summary>Whether an operand is a string: from its declared type, or from its values.</summary>
+    /// <remarks>
+    /// The declared type answers even for an all-null operand, where the values cannot, and that
+    /// matters in both directions. An all-null string casts to null under every target and so
+    /// cannot change an answer; an all-null operand on the OTHER side still types the cast, and
+    /// <c>&lt;=&gt;</c> reads it — measured, <c>s &lt;=&gt; CAST(NULL AS INT)</c> raises under
+    /// ANSI rather than answering false.
+    /// </remarks>
+    private static bool IsString(IArrowType? declared, LiteralValue?[] values) =>
+        declared is not null
+            ? declared is StringType
+            : FirstKind(values) == LiteralValue.Kind.String;
+
+    /// <summary>
+    /// <paramref name="values"/> with a null wherever <paramref name="mask"/> is null.
+    /// </summary>
+    /// <remarks>
+    /// Returns the original array when there is nothing to null out, which is the ordinary case:
+    /// a column with no nulls opposite it costs one pass and no allocation.
+    /// </remarks>
+    private static LiteralValue?[] NulledWhere(LiteralValue?[] values, LiteralValue?[] mask)
+    {
+        LiteralValue?[]? masked = null;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (mask[i].HasValue || !values[i].HasValue)
+                continue;
+
+            masked ??= (LiteralValue?[])values.Clone();
+            masked[i] = null;
+        }
+
+        return masked ?? values;
+    }
+
+    /// <summary>The kind an operand's values carry, or null when every row is null.</summary>
+    /// <remarks>
+    /// One array holds one kind — it is built from one Arrow array, one literal, or one
+    /// predicate — so the first non-null value speaks for all of them.
+    /// </remarks>
+    private static LiteralValue.Kind? FirstKind(LiteralValue?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (value.HasValue)
+                return value.Value.Type;
+        }
+
+        return null;
+    }
+
+    /// <summary>The Arrow type of a comparison operand, for choosing what to cast against.</summary>
+    /// <remarks>
+    /// The declared type where the operand has one. A literal has none, and is typed from its own
+    /// value through the rules Spark gives one — <c>1.5</c> is a <c>decimal(2,1)</c>, which is
+    /// what <see cref="ConstantArray"/> already encodes.
+    /// </remarks>
+    private static IArrowType OperandType(IArrowType? declared, LiteralValue?[] values)
+    {
+        if (declared is not null)
+            return declared;
+
+        foreach (var value in values)
+        {
+            if (value.HasValue)
+                return ConstantArray(value.Value, 1).Data.DataType;
+        }
+
+        // An untyped operand null in every row — a bare NULL literal. String is the type with no
+        // coercion rule, so the comparison is left as it stands.
+        return StringType.Default;
     }
 
     private bool?[] EvalUnary(UnaryPredicate unary, RecordBatch batch)

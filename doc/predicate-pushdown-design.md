@@ -921,6 +921,51 @@ writing session rather than to the table or the expression text. Binding at
 registry construction keeps those two lifetimes separate without giving up the
 simplicity.
 
+#### What a comparison does with a string operand
+
+Added 2026-09-06, closing #180. Comparing a string against a non-string is the
+second dialect-dependent surface, and it lives on the registry for the same
+reason the first one does — the evaluator has no dialect to consult.
+
+Spark does not refuse the pair and does not render the other side as text: it
+**casts the string**, and the target is measured rather than guessable.
+
+- **ANSI** widens a numeric target first: `BIGINT` for every integral width, and
+  `DOUBLE` for `float`, `double` and `decimal` alike.
+- **The legacy dialect** casts to the other operand's own type.
+- **Boolean, date and timestamp** take the other operand's type under both. The
+  dialects then differ only in what a malformed value does, which is the
+  ordinary raise-or-null split.
+
+The widening is not cosmetic. Each of these is one expression with two answers,
+and all six are pinned by the corpus's `string-coercion` group:
+
+| expression | ANSI | legacy | why |
+|---|---|---|---|
+| `'32768' = sh` | false | null | overflows the `smallint`, not a `bigint` |
+| `'0.1' = f` | false | true | `0.1f` widened is not the double `0.1` |
+| `'1000000000000000000000000000001' = d4` | true | false | one double, two `decimal(38,0)`s |
+
+`ArrowRowEvaluator` asks for `IComparisonCoercion` with an `as` cast, so a host
+registry that does not implement it keeps the previous behaviour rather than
+losing comparison. `SparkFunctionRegistry` implements it by routing to the same
+`Cast` that `CAST(…)` reaches, dialect and all, so a comparison and an explicit
+cast cannot drift apart.
+
+The target is chosen from the other operand's **declared Arrow type**, kept from
+the array that operand already produced rather than re-derived from its values.
+A `LiteralValue` cannot carry a decimal's precision and scale, cannot tell a date
+from a timestamp, and says nothing at all when every row is null — and all three
+are reachable through a cast. Measured: `'2026-08-11 12:30:00' = CAST(ts AS DATE)`
+is true, because Spark truncates the string to a date; reading that operand as
+the instant its values look like compares 12:30 against midnight and answers
+false. Only a literal is typed from its value, which is what Spark does with one.
+
+Two pairs are measured, declared and deliberately not implemented (#259): `IN`,
+which resolves its common type as `STRING` under the legacy dialect where a
+comparison casts to a number, and a binary operand, whose recorded answer does
+not say which way Spark resolves it.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic

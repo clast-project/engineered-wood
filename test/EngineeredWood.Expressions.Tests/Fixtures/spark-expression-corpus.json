@@ -58,6 +58,14 @@
    "type": "string"
   },
   {
+   "name": "ns",
+   "type": "string"
+  },
+  {
+   "name": "fs",
+   "type": "string"
+  },
+  {
    "name": "ts",
    "type": "timestamp"
   },
@@ -92,6 +100,8 @@
    "'0.1'",
    "'abc'",
    "'abc'",
+   "'1'",
+   "'1.5'",
    "'2026-08-11 12:30:00'",
    "'2026-08-11'",
    "true",
@@ -99,6 +109,8 @@
    "named_struct('arr', array(1, 2, 3), 'm', map('k', 7), 'name', 'leaf')"
   ],
   [
+   "NULL",
+   "NULL",
    "NULL",
    "NULL",
    "NULL",
@@ -130,6 +142,8 @@
    "'0.5'",
    "''",
    "'xyz'",
+   "'0'",
+   "'0.5'",
    "'1970-01-01 00:00:00'",
    "'1970-01-01'",
    "false",
@@ -2263,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-06 06:07:40.011133",
-      "2026-09-06 06:07:40.011133",
-      "2026-09-06 06:07:40.011133"
+      "2026-09-06 09:59:47.708446",
+      "2026-09-06 09:59:47.708446",
+      "2026-09-06 09:59:47.708446"
      ]
     }
    },
@@ -4306,11 +4320,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#903]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#911]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#904]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as sm"
+     "error": "AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `weird name` cannot be resolved. Did you mean one of the following? [`bin`, `a`, `d1`, `d2`, `d3`]. SQLSTATE: 42703; line 1 pos 1;\n'Project ['weird name AS r#912]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
     }
    },
    {
@@ -9045,11 +9059,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, a#0) AS r#1851]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, a#0) AS r#1859]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fals"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#21, a#17) AS r#1852]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 as smallint) AS "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, a#19) AS r#1860]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
     }
    },
    {
@@ -9061,11 +9075,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, cast(sh#2 as int)) AS r#1853]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ts#12, dt#13, bl#14, bin#15, nested#16], fa"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, cast(sh#2 as int)) AS r#1861]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#21, cast(sh#19 as int)) AS r#1854]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#17, cast(10 as bigint) AS b#18L, cast(2 "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, cast(sh#21 as int)) AS r#1862]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
     }
    },
    {
@@ -9537,6 +9551,1276 @@
       "2026-08-11",
       "2026-08-11",
       "2026-08-11"
+     ]
+    }
+   }
+  ],
+  "string-coercion": [
+   {
+    "expression": "s = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = a) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "s < a",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(s < a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s < a) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "s <=> a",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(s <=> a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s <=> a) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "a = ns",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(a = ns)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns <> a",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (ns = a))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns < a",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(ns < a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns > a",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(ns > a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns <= a",
+    "parse": {
+     "ok": true,
+     "node": "LessThanOrEqual",
+     "sql": "(ns <= a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns >= a",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThanOrEqual",
+     "sql": "(ns >= a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns <=> a",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(ns <=> a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns = sh",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ns = b",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns = f",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = f)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns = g",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns = d1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns = d4",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "fs = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs = a) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs = sh",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs = sh) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs = b",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs = b) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs = f",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = f)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "fs = g",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "fs = d1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s = b",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = b) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = f",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = f)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = f) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = g",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = g) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = d1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = d1) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'32768' = sh",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('32768' = sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'2147483648' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2147483648' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'0.1' = CAST(0.1 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('0.1' = CAST(0.1BD AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'1000000000000000000000000000001' = d4",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1000000000000000000000000000001' = d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'1000000000000000000000000000001' > d4",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "('1000000000000000000000000000001' > d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "'1' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'1.5' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1.5' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1.5' = a) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'abc' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('abc' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('abc' = a) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns = 1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "fs = 1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(fs = 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs = 1) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = 1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = 1) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns = 1.5",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = 1.5BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'  1  ' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('  1  ' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'1e3' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1e3' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1e3' = a) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1e3' = g",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1e3' = g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'99999999999999999999' = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('99999999999999999999' = a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '99999999999999999999' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('99999999999999999999' = a) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'NaN' = CAST('NaN' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('NaN' = CAST('NaN' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "'Infinity' > g",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "('Infinity' > g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "'NaN' > g",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "('NaN' > g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ns BETWEEN a AND b",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "between(ns, a, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "s BETWEEN a AND b",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "between(s, a, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 4) ==\n(s BETWEEN a AND b) AS r\n   ^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'true' = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('true' = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'1' = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('1' = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = bl) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "dt = '2026-08-11'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(dt = '2026-08-11')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "dt = '2026-08-11 12:30:00'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(dt = '2026-08-11 12:30:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "dt > '1970-01-01'",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(dt > '1970-01-01')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s = dt",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = dt)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = dt) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ts = '2026-08-11 12:30:00'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ts = '2026-08-11 12:30:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ts = '2026-08-11'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ts = '2026-08-11')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s = ts",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = ts)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"TIMESTAMP\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = ts) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2026-08-11 12:30:00' = CAST(ts AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'2026-08-11' = CAST(ts AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2026-08-11' = CAST(ts AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s <=> CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(s <=> CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s <=> CAST(NULL AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "ns IN (a, b)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ns IN (a, b))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "s IN (a, b)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(s IN (a, b))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 4) ==\n(s IN (a, b)) AS r\n   ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs IN (a, b)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(fs IN (a, b))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 5) ==\n(fs IN (a, b)) AS r\n    ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "s = bin",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = bin)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "'00' = bin",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('00' = bin)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      null
      ]
     }
    }
@@ -12729,6 +14013,1368 @@
       "ok": true,
       "values": [
        null,
+       null,
+       null
+      ]
+     }
+    }
+   ],
+   "string-coercion": [
+    {
+     "expression": "s = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s < a",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(s < a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s <=> a",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(s <=> a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a = ns",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(a = ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns <> a",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (ns = a))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns < a",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(ns < a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns > a",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(ns > a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns <= a",
+     "parse": {
+      "ok": true,
+      "node": "LessThanOrEqual",
+      "sql": "(ns <= a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns >= a",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThanOrEqual",
+      "sql": "(ns >= a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns <=> a",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(ns <=> a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns = sh",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = sh)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ns = b",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns = f",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = f)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns = g",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns = d1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns = d4",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = sh",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = sh)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = b",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "fs = f",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = f)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = g",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = d1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = b",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s = f",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = f)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s = g",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "s = d1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'32768' = sh",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('32768' = sh)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'2147483648' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2147483648' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'0.1' = CAST(0.1 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('0.1' = CAST(0.1BD AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'1000000000000000000000000000001' = d4",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1000000000000000000000000000001' = d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'1000000000000000000000000000001' > d4",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "('1000000000000000000000000000001' > d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'1' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'1.5' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1.5' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'abc' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('abc' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns = 1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs = 1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(fs = 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = 1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns = 1.5",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = 1.5BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'  1  ' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('  1  ' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'1e3' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1e3' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1e3' = g",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1e3' = g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'99999999999999999999' = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('99999999999999999999' = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'NaN' = CAST('NaN' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('NaN' = CAST('NaN' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'Infinity' > g",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "('Infinity' > g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'NaN' > g",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "('NaN' > g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ns BETWEEN a AND b",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "between(ns, a, b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "s BETWEEN a AND b",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "between(s, a, b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'true' = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('true' = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'1' = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('1' = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "dt = '2026-08-11'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(dt = '2026-08-11')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "dt = '2026-08-11 12:30:00'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(dt = '2026-08-11 12:30:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "dt > '1970-01-01'",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(dt > '1970-01-01')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = dt",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = dt)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ts = '2026-08-11 12:30:00'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ts = '2026-08-11 12:30:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ts = '2026-08-11'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ts = '2026-08-11')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = ts",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = ts)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2026-08-11 12:30:00' = CAST(ts AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'2026-08-11' = CAST(ts AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2026-08-11' = CAST(ts AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s <=> CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(s <=> CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "s = CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns IN (a, b)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ns IN (a, b))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "s IN (a, b)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(s IN (a, b))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "fs IN (a, b)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(fs IN (a, b))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s = bin",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = bin)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'00' = bin",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('00' = bin)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
        null,
        null
       ]

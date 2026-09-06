@@ -59,3 +59,37 @@ public interface IFunctionRegistry
     /// </summary>
     IArrowArray Invoke(string name, IReadOnlyList<IArrowArray> args, int rowCount);
 }
+
+/// <summary>
+/// A function registry that also knows how a comparison coerces a string operand.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and separate from <see cref="IFunctionRegistry"/> because it answers a different
+/// question. A registry says what <c>cast</c> does; this says when a comparison inserts one.
+/// <see cref="ArrowRowEvaluator"/> asks for it with an <c>as</c> cast, so a registry that does
+/// not implement it leaves comparison exactly as it was.
+/// </para>
+/// <para>
+/// It exists because the rule is dialect-dependent and the evaluator has no dialect. Measured
+/// against Spark 4.0, ANSI compares <c>'0.1'</c> against a <c>float</c> column through
+/// <c>double</c> and the legacy dialect compares it as a <c>float</c> — the same expression,
+/// two answers, and only the registry knows which. See the <c>string-coercion</c> group of
+/// <c>Fixtures/spark-expression-corpus.json</c>.
+/// </para>
+/// </remarks>
+public interface IComparisonCoercion
+{
+    /// <summary>
+    /// Casts a string operand to the type it must take to be compared against a value of
+    /// <paramref name="otherType"/>, or returns null when this pair takes no coercion and
+    /// should be compared as it stands.
+    /// </summary>
+    /// <remarks>
+    /// Returning null is not a failure: a string against a binary is a pair Spark does not
+    /// resolve this way, and a string against a string needs nothing. Under a raising dialect
+    /// this may throw rather than return, because a comparison against a value the cast refuses
+    /// is a refused comparison.
+    /// </remarks>
+    IArrowArray? CoerceStringForComparison(IArrowArray strings, IArrowType otherType, int rowCount);
+}

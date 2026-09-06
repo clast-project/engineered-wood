@@ -29,7 +29,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// Each refuses by name rather than silently producing nothing.
 /// </para>
 /// </remarks>
-public sealed class SparkFunctionRegistry : IFunctionRegistry
+public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoercion
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -444,6 +444,110 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         var values = new long?[rowCount];
         for (var i = 0; i < rowCount; i++) values[i] = 0L;
         return SparkArrays.BuildIntegral(values, type, rowCount);
+    }
+
+    // ── COMPARISON COERCION ────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The cast is the SAME one <c>CAST(...)</c> reaches, dialect and all, so a comparison and an
+    /// explicit cast cannot drift apart: <c>s = a</c> refuses exactly the strings
+    /// <c>CAST(s AS BIGINT)</c> refuses.
+    /// </remarks>
+    public IArrowArray? CoerceStringForComparison(
+        IArrowArray strings, IArrowType otherType, int rowCount)
+    {
+        if (strings is null)
+            throw new ArgumentNullException(nameof(strings));
+        if (otherType is null)
+            throw new ArgumentNullException(nameof(otherType));
+
+        var target = ComparisonTarget(otherType);
+        return target is null
+            ? null
+            : Cast(strings, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+    }
+
+    /// <summary>
+    /// The type a string is cast to before being compared against <paramref name="other"/>, or
+    /// null when the pair takes no coercion.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One rule with one exception: the string takes the other operand's OWN type, and ANSI
+    /// widens a numeric one first — to <c>BIGINT</c> for every integral width, and to
+    /// <c>DOUBLE</c> for float, double and decimal alike. Boolean, date and timestamp take the
+    /// other side's type under both dialects; the dialects then differ only in what a malformed
+    /// value does, which is the ordinary raise-or-null split.
+    /// </para>
+    /// <para>
+    /// <b>The widening is not cosmetic, and it is the half the issue did not record.</b> Each of
+    /// these is one expression with two answers, measured against Spark 4.0 and pinned by the
+    /// <c>string-coercion</c> group of the corpus:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><c>'32768' = sh</c> over a <c>smallint</c>: false under ANSI, where the string
+    ///     becomes a <c>bigint</c>; null under the legacy dialect, where it overflows the
+    ///     <c>smallint</c> it is cast to.</item>
+    ///   <item><c>'0.1' = CAST(0.1 AS FLOAT)</c>: false under ANSI, where <c>0.1</c> as a double
+    ///     is not <c>0.1f</c> widened; true under the legacy dialect, which casts to
+    ///     <c>float</c>.</item>
+    ///   <item><c>'1000000000000000000000000000001' = d4</c> over a <c>decimal(38,0)</c>: true
+    ///     under ANSI, where both sides collapse to the same double; false under the legacy
+    ///     dialect, which keeps the decimal exact.</item>
+    /// </list>
+    /// <para>
+    /// Binary is deliberately absent. Spark answers <c>'00' = bin</c> with false rather than
+    /// refusing, so a rule exists, but no measurement here says what it is — and a guess would
+    /// be a silent wrong answer rather than the null we return today. Declared in
+    /// <c>SparkEvaluationCorpusTests</c>.
+    /// </para>
+    /// </remarks>
+    private IArrowType? ComparisonTarget(IArrowType other)
+    {
+        // No widening for these: a string against a boolean, a date or a timestamp is cast
+        // straight to it, under both dialects.
+        if (other is BooleanType || other is TimestampType || SparkArrays.IsDateType(other))
+            return other;
+
+        if (!_options.Ansi)
+            return SparkNumericTypes.IsNumeric(other) ? LegacyTarget(other) : null;
+
+        if (SparkNumericTypes.IsIntegral(other))
+            return Int64Type.Default;
+
+        if (SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other))
+            return DoubleType.Default;
+
+        return null;
+    }
+
+    /// <summary>
+    /// The legacy dialect's target: the operand's own type, or null when there is no cast to it.
+    /// </summary>
+    /// <remarks>
+    /// A decimal needs reading at the width <see cref="Cast"/> dispatches on, since a
+    /// <c>decimal(38,0)</c> can arrive as a <see cref="Decimal256Type"/> and the cast has a case
+    /// only for <see cref="Decimal128Type"/>. Precision and scale are what it actually needs.
+    /// <para>
+    /// <b>Past Spark's maximum precision there is no rule and no cast.</b> Parquet's decimal runs
+    /// wider than Spark's — <c>ArrowSchemaConverter</c> builds a <see cref="Decimal256Type"/> for
+    /// precision above 38 — and no Spark expression can name such a type, so nothing measured
+    /// says what comparing a string against one means. Handing it on would be worse than
+    /// declining: <see cref="Decimal128Type"/> does not validate its precision, so a
+    /// <c>decimal(50,0)</c> became a 16-byte decimal claiming fifty digits and the comparison
+    /// answered from it. Measured, before this returned null.
+    /// </para>
+    /// </remarks>
+    private static IArrowType? LegacyTarget(IArrowType numeric)
+    {
+        if (!SparkNumericTypes.IsDecimal(numeric))
+            return numeric;
+
+        var (precision, scale) = SparkNumericTypes.AsDecimal(numeric);
+        return precision <= SparkNumericTypes.MaxPrecision
+            ? new Decimal128Type(precision, scale)
+            : null;
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────────────────────

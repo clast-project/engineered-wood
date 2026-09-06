@@ -67,7 +67,7 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 # only make the fixture harder to read.
 LEGACY_GROUPS = (
     "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
-    "double-to-decimal")
+    "double-to-decimal", "string-coercion")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -86,6 +86,11 @@ SCHEMA = [
     {"name": "d5", "type": "decimal(38,38)"},
     {"name": "s", "type": "string"},
     {"name": "t", "type": "string"},
+    # Strings a numeric cast ACCEPTS, which `s` and `t` deliberately are not. `ns` is valid for
+    # every numeric target; `fs` is valid for a floating one and not for an integral one, which
+    # is the pair that tells the two dialects' comparison targets apart. #180.
+    {"name": "ns", "type": "string"},
+    {"name": "fs", "type": "string"},
     {"name": "ts", "type": "timestamp"},
     {"name": "dt", "type": "date"},
     {"name": "bl", "type": "boolean"},
@@ -106,11 +111,13 @@ SCHEMA = [
 ROWS = [
     ["1", "10", "2", "1.5", "2.5", "'12.34'", "'1.2345'", "'9.99'",
      "'1000000000000000000000000000000'", "'0.1'", "'abc'", "'abc'",
+     "'1'", "'1.5'",
      "'2026-08-11 12:30:00'", "'2026-08-11'", "true", "X'00'",
      "named_struct('arr', array(1, 2, 3), 'm', map('k', 7), 'name', 'leaf')"],
-    ["NULL"] * 17,
+    ["NULL"] * 19,
     ["-2147483648", "0", "-1", "0.0", "0.0", "'0.00'", "'0.0000'", "'0.0'",
      "'-1000000000000000000000000000000'", "'0.5'", "''", "'xyz'",
+     "'0'", "'0.5'",
      "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
@@ -758,6 +765,79 @@ GROUPS = {
         "TIMESTAMP'2026-08-11 12:30:00' = ts",
         "year(DATE'2026-08-11')",
         "CAST(DATE'2026-08-11' AS STRING)",
+    ],
+    # Comparing a string against a non-string. Spark CASTS THE STRING, and the target is not the
+    # same under the two dialects -- which is why every expression here is asked twice. #180.
+    #
+    #   ANSI   widens a numeric target first: BIGINT for every integral width, DOUBLE for float,
+    #          double AND decimal.
+    #   legacy casts to the other side's own type, so the string can overflow a SMALLINT, land
+    #          exactly on a FLOAT, or stay exact against a DECIMAL(38,0).
+    #
+    # Boolean, date and timestamp take the other side's type under BOTH dialects. The dialect
+    # difference for those is only what a malformed value does: raise, or null.
+    "string-coercion": [
+        # The two the issue names, plus the null-safe operator -- and then the VALID comparisons
+        # those hid. EngineeredWood answers null for every one of these today, including the ones
+        # Spark answers with a value, which is the larger half of the defect.
+        "s = a", "s < a", "s <=> a",
+        "ns = a", "a = ns", "ns <> a", "ns < a", "ns > a", "ns <= a", "ns >= a", "ns <=> a",
+
+        # Which target the numeric side picks, across every numeric type.
+        "ns = sh", "ns = b", "ns = f", "ns = g", "ns = d1", "ns = d4",
+        "fs = a", "fs = sh", "fs = b", "fs = f", "fs = g", "fs = d1",
+        "s = b", "s = f", "s = g", "s = d1",
+
+        # The four that tell the two targets apart, each sharp because one candidate target
+        # answers differently from the other:
+        #   '32768' and '2147483648' overflow SMALLINT and INT, and not BIGINT
+        #   '0.1' is exact as a FLOAT and is not as a DOUBLE
+        #   10^30+1 is exact as DECIMAL(38,0) and is not as a DOUBLE
+        "'32768' = sh", "'2147483648' = a",
+        "'0.1' = CAST(0.1 AS FLOAT)",
+        "'1000000000000000000000000000001' = d4",
+        "'1000000000000000000000000000001' > d4",
+
+        # A string literal against a numeric column, and a numeric literal against a string
+        # column: the string is the side that is cast, whichever side it is on.
+        "'1' = a", "'1.5' = a", "'abc' = a", "ns = 1", "fs = 1", "s = 1", "ns = 1.5",
+
+        # What the string cast itself accepts on the way through: padding is trimmed, scientific
+        # notation reaches a floating target and not an integral one, and 20 digits overflow.
+        "'  1  ' = a", "'1e3' = a", "'1e3' = g", "'99999999999999999999' = a",
+
+        # NaN and infinity, where Spark's float order is not .NET's and the coerced value has to
+        # land on the same side of it.
+        "'NaN' = CAST('NaN' AS DOUBLE)", "'Infinity' > g", "'NaN' > g",
+
+        # BETWEEN desugars into two comparisons, so it follows the comparison rule.
+        "ns BETWEEN a AND b", "s BETWEEN a AND b",
+
+        # Boolean and temporal, the same shape against a target that needs no widening. Spark
+        # takes 'true', 'TRUE', '1', 'yes' and 't' as booleans, and truncates a timestamp-shaped
+        # string to a DATE rather than rendering the date as a string.
+        "'true' = bl", "'1' = bl", "s = bl",
+        "dt = '2026-08-11'", "dt = '2026-08-11 12:30:00'", "dt > '1970-01-01'", "s = dt",
+        "ts = '2026-08-11 12:30:00'", "ts = '2026-08-11'", "s = ts",
+
+        # An operand that is neither a column nor a literal still has a declared type, and it is
+        # the CAST's target rather than anything its values imply. Each of these separates the
+        # two: a date-typed operand read as an instant compares a timestamp-shaped string against
+        # 12:30 instead of truncating it, a decimal(38,0) read as the narrower decimal its value
+        # needs overflows a 38-digit string, and an all-null operand types nothing at all -- which
+        # `<=>` notices, because it reads both sides whatever their nullness.
+        "'2026-08-11 12:30:00' = CAST(ts AS DATE)",
+        "'2026-08-11' = CAST(ts AS DATE)",
+        "'99999999999999999999999999999999999999' = CAST(d4 AS DECIMAL(38,0))",
+        "s <=> CAST(NULL AS INT)",
+        "s = CAST(NULL AS INT)",
+
+        # IN does NOT follow the comparison rule -- under the legacy dialect it compares as
+        # STRINGS rather than casting, so `s IN (a, b)` is false where `s = a` is null -- and a
+        # binary operand takes no numeric-style coercion at all. Recorded here so the answers
+        # exist, and declared as differences rather than implemented.
+        "ns IN (a, b)", "s IN (a, b)", "fs IN (a, b)",
+        "s = bin", "'00' = bin",
     ],
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
