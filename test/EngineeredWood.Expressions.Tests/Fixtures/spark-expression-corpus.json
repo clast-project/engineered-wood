@@ -2261,9 +2261,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-05 08:21:58.532097",
-      "2026-09-05 08:21:58.532097",
-      "2026-09-05 08:21:58.532097"
+      "2026-09-05 16:35:17.819690",
+      "2026-09-05 16:35:17.819690",
+      "2026-09-05 16:35:17.819690"
      ]
     }
    },
@@ -6276,6 +6276,808 @@
     }
    }
   ],
+  "integral-cast-overflow": [
+   {
+    "expression": "CAST(d4 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(d4 AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"BIGINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(d4 AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS SMALLINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"SMALLINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(d4 AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d4 AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1000000000000000000000000000000BD AS DECIMAL(38,0)) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1000000000000000000000000000000BD AS DECIMAL(38,0)) AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"BIGINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-1000000000000000000000000000000BD AS DECIMAL(38,0)) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -1000000000000000000000000000000BD of the type \"DECIMAL(38,0)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(2.9 AS DECIMAL(10,1)) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(2.9BD AS DECIMAL(10,1)) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-2.9 AS DECIMAL(10,1)) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-2.9BD AS DECIMAL(10,1)) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2,
+      -2,
+      -2
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(4294967298.5 AS DECIMAL(20,1)) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(4294967298.5BD AS DECIMAL(20,1)) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 4294967298.5BD of the type \"DECIMAL(20,1)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(300 AS DECIMAL(10,0)) AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(300 AS DECIMAL(10,0)) AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 300BD of the type \"DECIMAL(10,0)\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(70000 AS DECIMAL(10,0)) AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(70000 AS DECIMAL(10,0)) AS SMALLINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 70000BD of the type \"DECIMAL(10,0)\" cannot be cast to \"SMALLINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1.0E30D of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(-1e30 AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-1.0E30D AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -1.0E30D of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS DOUBLE) AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1.0E30D of the type \"DOUBLE\" cannot be cast to \"BIGINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(4294967298.5 AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(4294967298.5BD AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 4.2949672985E9D of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(300 AS DOUBLE) AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(300 AS DOUBLE) AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 300.0D of the type \"DOUBLE\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS FLOAT) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS FLOAT) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1.0E30 of the type \"FLOAT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(2.9 AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(2.9BD AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('NaN' AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('NaN' AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value NaN of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST('Infinity' AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('Infinity' AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value Infinity of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST('-Infinity' AS DOUBLE) AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-Infinity' AS DOUBLE) AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -Infinity of the type \"DOUBLE\" cannot be cast to \"BIGINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(4294967298 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(4294967298L AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 4294967298L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(300 AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(300 AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 300 of the type \"INT\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(-300 AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-300 AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -300 of the type \"INT\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(70000 AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(70000 AS SMALLINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 70000 of the type \"INT\" cannot be cast to \"SMALLINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(b AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(b AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      10,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "CAST('4294967298' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('4294967298' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '4294967298' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('4294967298' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('300' AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('300' AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '300' of the type \"STRING\" cannot be cast to \"TINYINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('300' AS TINYINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('12.5' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('12.5' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '12.5' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('12.5' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e30' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e30' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e30' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e30' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('abc' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('abc' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('abc' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(CAST(4294967298.5 AS DOUBLE) AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(4294967298.5BD AS DOUBLE) AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 4.2949672985E9D of the type \"DOUBLE\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(1e30 AS DOUBLE) AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1.0E30D of the type \"DOUBLE\" cannot be cast to \"TINYINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(CAST(-1e30 AS DOUBLE) AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(-1.0E30D AS DOUBLE) AS SMALLINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -1.0E30D of the type \"DOUBLE\" cannot be cast to \"SMALLINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value TIMESTAMP '9999-12-31 23:59:59' of the type \"TIMESTAMP\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS SMALLINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value TIMESTAMP '9999-12-31 23:59:59' of the type \"TIMESTAMP\" cannot be cast to \"SMALLINT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      253402300799,
+      253402300799,
+      253402300799
+     ]
+    }
+   },
+   {
+    "expression": "CAST('-12.9' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-12.9' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '-12.9' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('-12.9' AS INT)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('300.5' AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('300.5' AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '300.5' of the type \"STRING\" cannot be cast to \"TINYINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('300.5' AS TINYINT)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TRY_CAST(300 AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(300 AS TINYINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "tinyint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST(d4 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(d4 AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST(CAST(1e30 AS DOUBLE) AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(CAST(1.0E30D AS DOUBLE) AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('12.5' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('12.5' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST(true AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(true AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "CAST(a AS BIGINT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(a AS BIGINT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "CAST(g AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(g AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      null,
+      0
+     ]
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -8021,6 +8823,948 @@
        null,
        null,
        null
+      ]
+     }
+    }
+   ],
+   "integral-cast-overflow": [
+    {
+     "expression": "CAST(d4 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1073741824,
+       null,
+       -1073741824
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       5076944270305263616,
+       null,
+       -5076944270305263616
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS SMALLINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d4 AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d4 AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1000000000000000000000000000000BD AS DECIMAL(38,0)) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1073741824,
+       1073741824,
+       1073741824
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1000000000000000000000000000000BD AS DECIMAL(38,0)) AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       5076944270305263616,
+       5076944270305263616,
+       5076944270305263616
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(-1000000000000000000000000000000BD AS DECIMAL(38,0)) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1073741824,
+       -1073741824,
+       -1073741824
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(2.9 AS DECIMAL(10,1)) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(2.9BD AS DECIMAL(10,1)) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-2.9 AS DECIMAL(10,1)) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(-2.9BD AS DECIMAL(10,1)) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2,
+       -2,
+       -2
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(4294967298.5 AS DECIMAL(20,1)) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(4294967298.5BD AS DECIMAL(20,1)) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(300 AS DECIMAL(10,0)) AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(300 AS DECIMAL(10,0)) AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       44,
+       44,
+       44
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(70000 AS DECIMAL(10,0)) AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(70000 AS DECIMAL(10,0)) AS SMALLINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       4464,
+       4464,
+       4464
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1e30 AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483647,
+       2147483647,
+       2147483647
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-1e30 AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(-1.0E30D AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1e30 AS DOUBLE) AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       9223372036854775807,
+       9223372036854775807,
+       9223372036854775807
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(4294967298.5 AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(4294967298.5BD AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483647,
+       2147483647,
+       2147483647
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(300 AS DOUBLE) AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(300 AS DOUBLE) AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       44,
+       44,
+       44
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1e30 AS FLOAT) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1.0E30D AS FLOAT) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483647,
+       2147483647,
+       2147483647
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(2.9 AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(2.9BD AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('NaN' AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('NaN' AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('Infinity' AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('Infinity' AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483647,
+       2147483647,
+       2147483647
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-Infinity' AS DOUBLE) AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-Infinity' AS DOUBLE) AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -9223372036854775808,
+       -9223372036854775808,
+       -9223372036854775808
+      ]
+     }
+    },
+    {
+     "expression": "CAST(4294967298 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(4294967298L AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "CAST(300 AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(300 AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       44,
+       44,
+       44
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-300 AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-300 AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -44,
+       -44,
+       -44
+      ]
+     }
+    },
+    {
+     "expression": "CAST(70000 AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(70000 AS SMALLINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       4464,
+       4464,
+       4464
+      ]
+     }
+    },
+    {
+     "expression": "CAST(b AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(b AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       10,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST('4294967298' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('4294967298' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('300' AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('300' AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('12.5' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('12.5' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       12,
+       12,
+       12
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e30' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e30' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('abc' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('abc' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(4294967298.5 AS DOUBLE) AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(4294967298.5BD AS DOUBLE) AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1,
+       -1,
+       -1
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(1e30 AS DOUBLE) AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(1.0E30D AS DOUBLE) AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1,
+       -1,
+       -1
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-1e30 AS DOUBLE) AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(-1.0E30D AS DOUBLE) AS SMALLINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS SMALLINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '9999-12-31 23:59:59' AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       253402300799,
+       253402300799,
+       253402300799
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-12.9' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-12.9' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -12,
+       -12,
+       -12
+      ]
+     }
+    },
+    {
+     "expression": "CAST('300.5' AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('300.5' AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(300 AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(300 AS TINYINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "tinyint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(d4 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(d4 AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(CAST(1e30 AS DOUBLE) AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(CAST(1.0E30D AS DOUBLE) AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('12.5' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('12.5' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(true AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(true AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "CAST(a AS BIGINT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(a AS BIGINT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "CAST(g AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(g AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null,
+       0
       ]
      }
     }

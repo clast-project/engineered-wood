@@ -84,15 +84,19 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
                 Expect(name, args, 1);
                 return Negate(args[0], rowCount);
 
-            // try_cast is a cast that never raises: the ANSI failures become null, which is
-            // exactly what the non-ANSI dialect does for every cast.
+            // try_cast is a cast that never raises. It is NOT the legacy dialect, though one flag
+            // covered both for as long as every non-raising answer was null: the legacy dialect
+            // ANSWERS an overflowing integral cast — 300 as a TINYINT is 44 — where try_cast
+            // yields null under either dialect. Measured; see SparkIntegralCasts and #243.
             case "cast":
                 Expect(name, args, 2);
-                return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: _options.Ansi);
+                return Cast(
+                    args[0], TargetTypeOf(args[1]), rowCount,
+                    raising: _options.Ansi, legacy: !_options.Ansi);
 
             case "try_cast":
                 Expect(name, args, 2);
-                return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: false);
+                return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: false, legacy: false);
 
             case "length":
                 Expect(name, args, 1);
@@ -453,7 +457,17 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         return SparkArrays.ParseTypeName(text!);
     }
 
-    private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising)
+    /// <summary>
+    /// Casts a column, where <paramref name="raising"/> and <paramref name="legacy"/> together say
+    /// what a failure does.
+    /// </summary>
+    /// <remarks>
+    /// Three states, not two: <c>raising</c> is ANSI's cast, <c>legacy</c> is the non-ANSI
+    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force. Only
+    /// <see cref="CastToIntegral"/> tells the last two apart — every other target nulls under both
+    /// — so <paramref name="legacy"/> reaches only that one.
+    /// </remarks>
+    private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
         if (target is Decimal128Type decimalTarget)
             return CastToDecimal(source, decimalTarget, rowCount, raising);
@@ -462,7 +476,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             return CastToString(source, rowCount);
 
         if (SparkNumericTypes.IsIntegral(target))
-            return CastToIntegral(source, target, rowCount, raising);
+            return CastToIntegral(source, target, rowCount, raising, legacy);
 
         if (target is DoubleType or FloatType)
             return CastToFloatingPoint(source, target, rowCount, raising);
@@ -573,9 +587,27 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
         return SparkArrays.BuildTimestamp(instants, rowCount);
     }
 
-    private IArrowArray CastToIntegral(IArrowArray source, IArrowType target, int rowCount, bool raising)
+    /// <summary>Casts a column to an integral type.</summary>
+    /// <remarks>
+    /// Under ANSI an overflow raises and the source type only decides the error class. With the
+    /// legacy dialect it decides the ANSWER, and there are four rules rather than one — see
+    /// <see cref="SparkIntegralCasts"/>, where each is measured. #243.
+    /// </remarks>
+    private IArrowArray CastToIntegral(
+        IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
         var values = new long?[rowCount];
+        var described = SparkArrays.Describe(target);
+        var family = SparkIntegralCasts.FamilyOf(source.Data.DataType);
+
+        // Every failure of a STRING source is CAST_INVALID_INPUT and never CAST_OVERFLOW, whether
+        // the text was malformed or merely too large. Measured, and it follows from the parse
+        // being what failed: Spark's integral parser does not read a value it cannot hold, so
+        // there is no overflow for it to report.
+        SparkEvaluationException Refuse(string text) =>
+            family == SparkIntegralCasts.Source.Text
+                ? SparkEvaluationException.InvalidCast(text, described)
+                : SparkEvaluationException.CastOverflow(text, described);
 
         for (var i = 0; i < rowCount; i++)
         {
@@ -586,34 +618,33 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             // Spark refuses a date-to-integer cast outright, while a timestamp becomes epoch
             // seconds. Measured: CAST(DATE'…' AS LONG) is an error.
             if (value.Value.IsDate)
-            {
-                throw new NotSupportedException(
-                    $"cast from DATE to {SparkArrays.Describe(target)} is not allowed");
-            }
+                throw new NotSupportedException($"cast from DATE to {described} is not allowed");
 
             if (!value.Value.IsNumeric)
             {
                 if (!raising) continue;
-                throw SparkEvaluationException.InvalidCast(
-                    value.Value.Text, SparkArrays.Describe(target));
+                throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
             }
 
             // No exact form means the magnitude is past decimal's range, and so past every
             // integral type's range too.
             if (value.Value.Exact is not { } exact)
             {
-                if (!raising) continue;
-                throw SparkEvaluationException.CastOverflow(
-                    value.Value.Text, SparkArrays.Describe(target));
+                if (raising) throw Refuse(value.Value.Text);
+
+                values[i] = Overflowed(i, value.Value.AsDouble);
+                continue;
             }
 
-            // A string must already be an integer. Numbers truncate toward zero, but
-            // CAST('12.5' AS INT) is refused rather than becoming 12 — measured.
-            if (value.Value.FromString && exact != decimal.Truncate(exact))
+            // A string carrying a fraction is where the dialects part: ANSI refuses it, and the
+            // legacy dialect TRUNCATES toward zero and carries on to the range check below. Both
+            // measured — CAST('12.5' AS INT) is an error under ANSI and 12 without it, while
+            // CAST('300.5' AS TINYINT) is null because 300 does not fit rather than because of
+            // the fraction. try_cast takes ANSI's reading of the value and nulls it.
+            if (!legacy && value.Value.FromString && exact != decimal.Truncate(exact))
             {
                 if (!raising) continue;
-                throw SparkEvaluationException.InvalidCast(
-                    value.Value.Text, SparkArrays.Describe(target));
+                throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
             }
 
             var truncated = decimal.Truncate(exact);
@@ -621,15 +652,25 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry
             if (truncated < long.MinValue || truncated > long.MaxValue
                 || !SparkArrays.FitsIn((long)truncated, target))
             {
-                if (!raising) continue;
-                throw SparkEvaluationException.CastOverflow(
-                    value.Value.Text, SparkArrays.Describe(target));
+                if (raising) throw Refuse(value.Value.Text);
+
+                values[i] = Overflowed(i, value.Value.AsDouble);
+                continue;
             }
 
             values[i] = (long)truncated;
         }
 
         return SparkArrays.BuildIntegral(values, target, rowCount);
+
+        // What the legacy dialect answers for this row: a different rule per source family, and
+        // null both for the two families that have none and for try_cast, which never answers.
+        long? Overflowed(int index, double asDouble) => !legacy ? null : family switch
+        {
+            SparkIntegralCasts.Source.Exact => SparkIntegralCasts.Wrap(source, index, target),
+            SparkIntegralCasts.Source.Floating => SparkIntegralCasts.Saturate(asDouble, target),
+            _ => null,
+        };
     }
 
     private IArrowArray CastToFloatingPoint(IArrowArray source, IArrowType target, int rowCount, bool raising)

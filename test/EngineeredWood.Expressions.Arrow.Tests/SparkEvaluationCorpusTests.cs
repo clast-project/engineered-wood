@@ -108,6 +108,8 @@ public sealed class SparkEvaluationCorpusTests
         ["greatest(a, g)"] = "#182: function not registered",
         ["least(a, b)"] = "#182: function not registered",
         ["DATE'2026-08-11'"] = "#182: a date literal parses but cannot be materialised as an Arrow array",
+        ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
+            "#182: a timestamp literal parses but cannot be materialised as an Arrow array",
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",
         ["1S"] = "parser refuses the smallint literal suffix; declared in SparkSqlParserTests",
@@ -173,8 +175,23 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"
              + " + CAST(60000000000000000000000000000000000000 AS DECIMAL(38,0))"] =
                 "#173: the parser cannot read a 38-digit literal, so this never reaches evaluation",
-            ["CAST(d4 AS INT)"] =
-                "#243: legacy WRAPS an integral cast (10^30 -> 1073741824); we return null",
+            // Blocked by #173 rather than by the cast: SparkLiteral.ParseDecimal cannot read a
+            // 31-digit literal, so these never reach evaluation. `CAST(d4 AS INT)` measures the
+            // same rule through a column and does pass.
+            ["CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)"] =
+                "#173: the parser cannot read a 31-digit literal",
+            ["CAST(CAST(1000000000000000000000000000000 AS DECIMAL(38,0)) AS BIGINT)"] =
+                "#173: the parser cannot read a 31-digit literal",
+            ["CAST(CAST(-1000000000000000000000000000000 AS DECIMAL(38,0)) AS INT)"] =
+                "#173: the parser cannot read a 31-digit literal",
+
+            // Same root cause as the ANSI list's DATE literal.
+            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)"] =
+                "#182: a timestamp literal cannot be materialised as an Arrow array",
+            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS SMALLINT)"] =
+                "#182: a timestamp literal cannot be materialised as an Arrow array",
+            ["CAST(TIMESTAMP'9999-12-31 23:59:59' AS BIGINT)"] =
+                "#182: a timestamp literal cannot be materialised as an Arrow array",
         };
 
     private static HashSet<string> ExpressionsIn(JsonElement groups)
@@ -645,6 +662,14 @@ public sealed class SparkEvaluationCorpusTests
                     ? null
                     : $"expected {expected}, got {a.GetValue(row)}";
 
+            // TINYINT arrived with #243's integral-cast group. Without it the comparison reported
+            // "no comparison for int8", which reads like a limit of the fixture and was a hole in
+            // the harness.
+            case Int8Array a:
+                return expected.GetInt64() == a.GetValue(row)!.Value
+                    ? null
+                    : $"expected {expected}, got {a.GetValue(row)}";
+
             default:
                 return $"no comparison for {actual.Data.DataType.Name}";
         }
@@ -696,6 +721,7 @@ public sealed class SparkEvaluationCorpusTests
         BooleanArray a => a.GetValue(row)?.ToString() ?? "null",
         StringArray a => $"'{a.GetString(row)}'",
         Decimal128Array a => SparkWideDecimals.Render(SparkWideDecimals.Read(a, row)!.Value),
+        Int8Array a => a.GetValue(row)?.ToString() ?? "null",
         _ => "value",
     };
 }

@@ -76,6 +76,172 @@ public sealed class SparkFunctionRegistryTests
     private static IArrowArray Eval(SparkFunctionRegistry registry, string sql, RecordBatch batch) =>
         new ArrowRowEvaluator(registry).EvaluateExpression(SparkSqlParser.ParseExpression(sql), batch);
 
+
+    // ── Integral casts under the legacy dialect: four source families, four rules (#243) ────
+
+    /// <summary>
+    /// An exact source WRAPS to the target's width.
+    /// </summary>
+    /// <remarks>
+    /// The rule #243 was filed on, and the only one of the four that matches it. Read from the
+    /// unscaled integer rather than from the <see cref="decimal"/> the evaluator holds, because
+    /// 10^30 has no decimal form at all — which is why it used to answer null instead.
+    /// </remarks>
+    [Fact]
+    public void TheLegacyDialectWrapsAnExactSourceToTheTargetWidth()
+    {
+        var wide = WideDecimalBatch(("big", System.Numerics.BigInteger.Pow(10, 30)));
+
+        // 10^30 mod 2^32, and 10^30 mod 2^64. Both measured.
+        Assert.Equal(1073741824,
+            Assert.IsType<Int32Array>(Eval(Legacy, "CAST(big AS INT)", wide)).GetValue(0));
+        Assert.Equal(5076944270305263616L,
+            Assert.IsType<Int64Array>(Eval(Legacy, "CAST(big AS BIGINT)", wide)).GetValue(0));
+
+        // 10^30 carries a factor of 2^30, so its low 16 and 8 bits are zero.
+        Assert.Equal((short)0,
+            Assert.IsType<Int16Array>(Eval(Legacy, "CAST(big AS SMALLINT)", wide)).GetValue(0));
+
+        var negative = WideDecimalBatch(("big", -System.Numerics.BigInteger.Pow(10, 30)));
+        Assert.Equal(-1073741824,
+            Assert.IsType<Int32Array>(Eval(Legacy, "CAST(big AS INT)", negative)).GetValue(0));
+
+        // An integral source narrowing takes the same rule, and so does a decimal inside
+        // System.Decimal's range.
+        var narrow = Batch(("b", Longs(300, -300, 4294967298L)));
+        var bytes = Assert.IsType<Int8Array>(Eval(Legacy, "CAST(b AS TINYINT)", narrow));
+        Assert.Equal((sbyte)44, bytes.GetValue(0));
+        Assert.Equal((sbyte)-44, bytes.GetValue(1));
+        Assert.Equal(2,
+            Assert.IsType<Int32Array>(Eval(Legacy, "CAST(b AS INT)", narrow)).GetValue(2));
+
+        // The fraction goes before the width does: 4294967298.5 truncates to 4294967298, whose
+        // low 32 bits are 2.
+        var fractional = Batch(("d", Decimals(20, 1, 4294967298.5m)));
+        Assert.Equal(2,
+            Assert.IsType<Int32Array>(Eval(Legacy, "CAST(d AS INT)", fractional)).GetValue(0));
+    }
+
+    /// <summary>
+    /// A floating-point source SATURATES, and the clamp is at int even for a narrower target.
+    /// </summary>
+    /// <remarks>
+    /// Scala's <c>toInt</c> saturates where <c>BigDecimal.longValue</c> wraps, so the same value
+    /// answers differently depending on which type held it: 1e30 as a double is int.MaxValue and
+    /// as a decimal is 1073741824. Generalising the wrap across families would have got every
+    /// line here wrong.
+    /// </remarks>
+    [Fact]
+    public void TheLegacyDialectSaturatesAFloatingSourceAtIntAndThenWraps()
+    {
+        var batch = Batch(("g", Doubles(1e30, -1e30, 4294967298.5, 300.0)));
+
+        var ints = Assert.IsType<Int32Array>(Eval(Legacy, "CAST(g AS INT)", batch));
+        Assert.Equal(int.MaxValue, ints.GetValue(0));
+        Assert.Equal(int.MinValue, ints.GetValue(1));
+        Assert.Equal(int.MaxValue, ints.GetValue(2));
+
+        Assert.Equal(long.MaxValue,
+            Assert.IsType<Int64Array>(Eval(Legacy, "CAST(g AS BIGINT)", batch)).GetValue(0));
+
+        // The two rows that separate "clamp at the target" from "clamp at int, then wrap".
+        // Clamping at the target would answer 127 and 127 instead of -1 and 44.
+        var bytes = Assert.IsType<Int8Array>(Eval(Legacy, "CAST(g AS TINYINT)", batch));
+        Assert.Equal((sbyte)-1, bytes.GetValue(2));
+        Assert.Equal((sbyte)44, bytes.GetValue(3));
+
+        // NaN is zero and an infinity clamps, neither of which has an integer to truncate.
+        var special = Batch(("g", Doubles(double.NaN, double.PositiveInfinity)));
+        var edge = Assert.IsType<Int32Array>(Eval(Legacy, "CAST(g AS INT)", special));
+        Assert.Equal(0, edge.GetValue(0));
+        Assert.Equal(int.MaxValue, edge.GetValue(1));
+    }
+
+    /// <summary>
+    /// A string source yields NULL when it does not fit, and truncates a fraction.
+    /// </summary>
+    /// <remarks>
+    /// Out of range is a failed PARSE for a string rather than an overflow, which is also why
+    /// every string failure is CAST_INVALID_INPUT under ANSI and never CAST_OVERFLOW. The
+    /// fraction is the one place the two dialects read the same text differently.
+    /// </remarks>
+    [Fact]
+    public void AStringSourceNullsWhenItDoesNotFitAndTruncatesAFraction()
+    {
+        var batch = Batch(("s", Strings("4294967298", "12.5", "-12.9", "300.5")));
+
+        var ints = Assert.IsType<Int32Array>(Eval(Legacy, "CAST(s AS INT)", batch));
+        Assert.True(ints.IsNull(0));
+        Assert.Equal(12, ints.GetValue(1));
+        Assert.Equal(-12, ints.GetValue(2));
+
+        // Truncated first, then out of range for the target — so null for the range and not for
+        // the fraction.
+        Assert.True(Assert.IsType<Int8Array>(Eval(Legacy, "CAST(s AS TINYINT)", batch)).IsNull(3));
+
+        // ANSI refuses the same text, and names the parse rather than the range.
+        foreach (var sql in new[] { "CAST(s AS INT)", "CAST(s AS TINYINT)" })
+        {
+            Assert.Equal(
+                "CAST_INVALID_INPUT",
+                Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, batch)).ErrorClass);
+        }
+    }
+
+    /// <summary>
+    /// try_cast is not the legacy dialect, though neither of them raises.
+    /// </summary>
+    /// <remarks>
+    /// One flag covered both for as long as every non-raising answer was null. It stops covering
+    /// them the moment the legacy dialect answers a VALUE, and the corpus caught exactly that:
+    /// try_cast yields null under EITHER dialect, including for the fraction the legacy cast
+    /// truncates.
+    /// </remarks>
+    [Fact]
+    public void TryCastNullsWhereTheLegacyDialectAnswers()
+    {
+        var numbers = Batch(("b", Longs(300)));
+        Assert.Equal((sbyte)44,
+            Assert.IsType<Int8Array>(Eval(Legacy, "CAST(b AS TINYINT)", numbers)).GetValue(0));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.True(Assert.IsType<Int8Array>(
+                Eval(registry, "TRY_CAST(b AS TINYINT)", numbers)).IsNull(0));
+        }
+
+        var text = Batch(("s", Strings("12.5")));
+        Assert.Equal(12, Assert.IsType<Int32Array>(Eval(Legacy, "CAST(s AS INT)", text)).GetValue(0));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.True(Assert.IsType<Int32Array>(
+                Eval(registry, "TRY_CAST(s AS INT)", text)).IsNull(0));
+        }
+    }
+
+    /// <summary>
+    /// A temporal source yields null rather than wrapping, which no other exact-valued source does.
+    /// </summary>
+    /// <remarks>
+    /// Spark checks that the epoch second round-trips through the target rather than truncating
+    /// it, so this is the family that would have been wrong had #243's wrap been generalised.
+    /// Unchanged behaviour, asserted because nothing else pins it.
+    /// </remarks>
+    [Fact]
+    public void ATemporalSourceNullsRatherThanWrapping()
+    {
+        // 9999-12-31T23:59:59Z, whose epoch second fits a BIGINT and no narrower type.
+        var batch = Batch(("ts", Timestamps(
+            DateTimeOffset.FromUnixTimeSeconds(253402300799L))));
+
+        Assert.Equal(253402300799L,
+            Assert.IsType<Int64Array>(Eval(Legacy, "CAST(ts AS BIGINT)", batch)).GetValue(0));
+
+        Assert.True(Assert.IsType<Int32Array>(Eval(Legacy, "CAST(ts AS INT)", batch)).IsNull(0));
+        Assert.True(Assert.IsType<Int16Array>(Eval(Legacy, "CAST(ts AS SMALLINT)", batch)).IsNull(0));
+    }
+
     // ── Arithmetic values ──────────────────────────────────────────────────────────────────
 
     [Fact]

@@ -54,9 +54,10 @@ internal static class SparkArrays
 
         /// <summary>Whether the value arrived as text rather than as a number.</summary>
         /// <remarks>
-        /// It changes what an integral cast accepts. A number truncates toward zero, so
-        /// <c>CAST(1.7 AS INT)</c> is 1 — but a string must already be an integer, and
-        /// <c>CAST('12.5' AS INT)</c> is refused rather than becoming 12. Both measured.
+        /// It changes what an integral cast accepts UNDER ANSI. A number truncates toward zero,
+        /// so <c>CAST(1.7 AS INT)</c> is 1, while a string must already be an integer and
+        /// <c>CAST('12.5' AS INT)</c> is refused rather than becoming 12. Both measured — but the
+        /// refusal is ANSI's alone: the legacy dialect truncates a string too, and answers 12.
         /// </remarks>
         public bool FromString { get; }
 
@@ -125,7 +126,7 @@ internal static class SparkArrays
     }
 
     /// <summary>The raw unscaled integer behind a Decimal128 cell.</summary>
-    private static System.Numerics.BigInteger Unscaled(Decimal128Array array, int index)
+    internal static System.Numerics.BigInteger Unscaled(Decimal128Array array, int index)
     {
         // GC.KeepAlive because `array` is otherwise dead once the span is taken, and the span
         // points into its buffer. See doc/arrow-span-lifetime.md.
