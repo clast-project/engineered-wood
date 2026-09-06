@@ -49,6 +49,30 @@ internal static class SparkArrays
             FromString = false;
         }
 
+        /// <summary>A binary value, which renders and takes part in no numeric cast.</summary>
+        /// <remarks>
+        /// Spark decodes the bytes as UTF-8 and replaces what is not valid rather than refusing,
+        /// so <c>CAST(X'FF' AS STRING)</c> is U+FFFD. <see cref="System.Text.Encoding.UTF8"/>
+        /// replaces on the same terms as Java's <c>new String(bytes, UTF_8)</c>.
+        /// <para>
+        /// <see cref="IsNumeric"/> is false, which is what makes every other cast refuse it: a
+        /// binary is not a number in Spark either, and reading its rendering as one would accept
+        /// <c>CAST(X'3132' AS INT)</c> as 12.
+        /// </para>
+        /// </remarks>
+        public static CastInput FromBinary(byte[] bytes) => new(bytes);
+
+        private CastInput(byte[] bytes)
+        {
+            _text = System.Text.Encoding.UTF8.GetString(bytes);
+            _array = null;
+            _index = 0;
+            FromString = false;
+            IsNumeric = false;
+            AsDouble = 0d;
+            Exact = null;
+        }
+
         public CastInput(string text)
         {
             _text = text;
@@ -266,6 +290,16 @@ internal static class SparkArrays
 
         if (array is StringArray strings)
             return strings.IsNull(index) ? null : new CastInput(strings.GetString(index));
+
+        // AFTER the string case, deliberately: Apache.Arrow's StringArray derives from
+        // BinaryArray, so this pattern matches one too and would take its bytes instead of its
+        // text. Every other cast refuses a binary, which is what CastInput.FromBinary encodes.
+        if (array is BinaryArray binary)
+        {
+            return binary.IsNull(index)
+                ? null
+                : CastInput.FromBinary(binary.GetBytes(index).ToArray());
+        }
 
         if (array is BooleanArray booleans)
         {

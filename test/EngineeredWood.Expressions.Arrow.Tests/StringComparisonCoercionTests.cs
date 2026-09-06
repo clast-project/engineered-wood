@@ -215,6 +215,92 @@ public class StringComparisonCoercionTests
         Assert.Equal(expected, Evaluate(Legacy, expression));
     }
 
+    // ── A binary is the pair where the OTHER operand moves ──
+
+    [Fact]
+    public void ABinaryComparedAgainstAStringIsRenderedAsText()
+    {
+        // THE discriminator, and the reason this is not a guess. X'FF' is not valid UTF-8, so
+        // the two candidate directions disagree about it: rendered as text it is U+FFFD, and
+        // that is what the left side already is -- true. Cast the other way, U+FFFD's three
+        // UTF-8 bytes (EF BF BD) are not FF, and it would be false. Spark says true.
+        Assert.True(Evaluate(Ansi, "CAST(X'FF' AS STRING) = X'FF'"));
+        Assert.True(Evaluate(Legacy, "CAST(X'FF' AS STRING) = X'FF'"));
+
+        // The same rule on values where both directions would agree, so the ordering is covered.
+        Assert.True(Evaluate(Ansi, "'A' = X'41'"));
+        Assert.True(Evaluate(Ansi, "X'41' < 'B'"));
+        Assert.False(Evaluate(Ansi, "s = X'41'"));
+    }
+
+    [Fact]
+    public void TwoBinariesAreComparedAsBinaries()
+    {
+        // No string on either side, so nothing moves and the bytes compare as bytes.
+        Assert.True(Evaluate(Ansi, "X'41' = X'41'"));
+        Assert.False(Evaluate(Ansi, "X'41' = X'42'"));
+    }
+
+    // ── IN resolves ONE type over the operand and the whole list ──
+
+    [Theory]
+    [InlineData("'1' IN (1, 2)", true)]
+    [InlineData("a IN ('1', '2')", true)]
+    [InlineData("a IN (1, 2)", true)]            // no string anywhere: untouched
+    [InlineData("'1' NOT IN (1, 2)", false)]
+    [InlineData("dt IN ('2026-08-11')", true)]
+    public void AMixedSetIsComparedThroughOneTypeUnderBothDialects(string expression, bool expected)
+    {
+        // Every one of these answered FALSE before #259: the set compared through
+        // LiteralValue.CompareTo, which has no cross-kind branch for a string, so a string never
+        // matched a number however equal the two were.
+        Assert.Equal(expected, Evaluate(Ansi, expression));
+        Assert.Equal(expected, Evaluate(Legacy, expression));
+    }
+
+    [Fact]
+    public void TheLegacyDialectResolvesASetThroughTextAndAnsiThroughTheNumber()
+    {
+        // THE discriminator, and the reason IN cannot borrow the comparison rule: 1 and 01 are
+        // the same number and different text. `a = '01'` is true under both dialects; the set is
+        // false under the legacy one, because the list resolves to STRING.
+        Assert.True(Evaluate(Ansi, "a IN ('01')"));
+        Assert.False(Evaluate(Legacy, "a IN ('01')"));
+        Assert.True(Evaluate(Ansi, "a = '01'"));
+        Assert.True(Evaluate(Legacy, "a = '01'"));
+
+        // The same split on a floating operand, where the trailing zero is what differs.
+        Assert.True(Evaluate(Ansi, "g IN ('2.50')"));
+        Assert.False(Evaluate(Legacy, "g IN ('2.50')"));
+
+        // ...and on a date, which the legacy dialect renders rather than parses.
+        Assert.True(Evaluate(Ansi, "dt IN ('2026-08-11 12:30:00')"));
+        Assert.False(Evaluate(Legacy, "dt IN ('2026-08-11 12:30:00')"));
+    }
+
+    [Fact]
+    public void AnsiRefusesASetMemberTheResolvedTypeCannotRead()
+    {
+        // The set resolves through bigint, so a string that is not an integer refuses -- exactly
+        // as the same value would in a comparison.
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "s IN (1, 2)"));
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "a IN ('1.5')"));
+
+        // The legacy dialect resolves through text instead, where nothing fails to read.
+        Assert.False(Evaluate(Legacy, "s IN (1, 2)"));
+        Assert.False(Evaluate(Legacy, "a IN ('1.5')"));
+    }
+
+    [Fact]
+    public void ANullInTheListKeepsItsThreeValuedAnswerThroughTheCoercion()
+    {
+        // No match plus a null in the list is unknown, not false -- and the coercion must not
+        // turn the null into a value on the way through.
+        Assert.Null(Evaluate(Legacy, "s IN (1, NULL)"));
+        Assert.True(Evaluate(Legacy, "'1' IN (1, NULL)"));
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "s IN (1, NULL)"));
+    }
+
     // ── What is deliberately left alone ──
 
     [Fact]

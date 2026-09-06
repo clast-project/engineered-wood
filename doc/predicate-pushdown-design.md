@@ -961,10 +961,30 @@ is true, because Spark truncates the string to a date; reading that operand as
 the instant its values look like compares 12:30 against midnight and answers
 false. Only a literal is typed from its value, which is what Spark does with one.
 
-Two pairs are measured, declared and deliberately not implemented (#259): `IN`,
-which resolves its common type as `STRING` under the legacy dialect where a
-comparison casts to a number, and a binary operand, whose recorded answer does
-not say which way Spark resolves it.
+A binary is the pair where the OTHER operand moves: measured,
+`CAST(X'FF' AS STRING) = X'FF'` is true, which only holds if both sides became
+text — cast the other way, U+FFFD's three UTF-8 bytes are not `FF`. Both
+dialects agree. #259.
+
+#### `IN` is not the disjunction of equalities it resembles
+
+Spark resolves **one** type over the operand and the whole list, where a
+comparison resolves each pair on its own, and the two disagree. Measured:
+`a IN ('01')` is false under the legacy dialect — the list resolves to text, and
+`'1'` is not `'01'` — while `a = '01'` is true under both. ANSI takes the
+non-string members' common type and applies the comparison rule to it, so
+`ns IN (1.5, 2)` resolves through `double` and `ns IN (1, 2)` through `bigint`.
+
+`SetComparisonTarget` answers with one type for every member rather than a
+moving side. Before it, a mixed set compared through `LiteralValue.CompareTo`,
+which has no cross-kind branch for a string, so `ns IN (1, 2)` over the string
+`'1'` was false where Spark says true in both dialects.
+
+Two cases stay declared (#261): a list containing COLUMNS, which the parser
+still expands into a disjunction because `SetPredicate` holds `LiteralValue`s
+and cannot carry an expression, and the sets Spark refuses in the analyzer —
+its string promotion excludes boolean and binary, so `bl IN ('true')` is an
+analysis error under the legacy dialect and an answer for us.
 
 ### Function set
 

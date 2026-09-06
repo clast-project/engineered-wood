@@ -450,22 +450,137 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
     /// <inheritdoc />
     /// <remarks>
+    /// Two rules, and they move different operands.
+    /// <list type="bullet">
+    ///   <item>A STRING against a number, a boolean or an instant is cast to it —
+    ///     <see cref="StringComparisonTarget"/> for which type exactly, since the dialects
+    ///     disagree.</item>
+    ///   <item>A BINARY against a string is rendered AS a string, and it is the binary that
+    ///     moves. Measured: <c>CAST(X'FF' AS STRING) = X'FF'</c> is true, which only holds if
+    ///     both sides became text — cast the other way, U+FFFD's three UTF-8 bytes are not
+    ///     <c>FF</c>. Both dialects agree, and so do <c>'A' = bin</c> (true against
+    ///     <c>X'41'</c>) and <c>'B' &gt; bin</c>.</item>
+    /// </list>
+    /// A pair with no rule gets null from both operands and is compared as it stands.
+    /// </remarks>
+    public IArrowType? ComparisonTarget(IArrowType operand, IArrowType other)
+    {
+        if (operand is null)
+            throw new ArgumentNullException(nameof(operand));
+        if (other is null)
+            throw new ArgumentNullException(nameof(other));
+
+        if (operand is StringType)
+            return StringComparisonTarget(other);
+
+        // Checked after the string case: a string operand is never the one that moves here.
+        return operand is BinaryType && other is StringType ? StringType.Default : null;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// One type over the operand and every member, which is Spark's model for <c>IN</c> and not
+    /// the pairwise one a comparison uses. The dialects reach it differently:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><b>ANSI</b> takes the members that are not strings, finds their common type, and
+    ///     applies the comparison rule to it — so <c>ns IN (1.5, 2)</c> resolves through
+    ///     <c>double</c> because a decimal and an int do, while <c>ns IN (1, 2)</c> resolves
+    ///     through <c>bigint</c>.</item>
+    ///   <item><b>The legacy dialect</b> promotes everything to STRING instead. That is what
+    ///     makes <c>a IN ('01')</c> false where <c>a = '01'</c> is true, and
+    ///     <c>d1 IN ('12.340')</c> false where the numbers are equal.</item>
+    /// </list>
+    /// <para>
+    /// Spark's string promotion excludes boolean and binary, and measured, it refuses those sets
+    /// outright rather than answering: <c>bl IN ('true')</c> and <c>bin IN ('A')</c> are
+    /// analysis errors under the legacy dialect and answers under ANSI. Refusing is not
+    /// reproduced here — this returns null, the set is compared as it stands, and the difference
+    /// is declared in <c>SparkEvaluationCorpusTests</c>.
+    /// </para>
+    /// </remarks>
+    public IArrowType? SetComparisonTarget(IReadOnlyList<IArrowType> memberTypes)
+    {
+        if (memberTypes is null)
+            throw new ArgumentNullException(nameof(memberTypes));
+
+        var common = CommonTypeOfNonStrings(memberTypes, out bool anyString);
+        if (!anyString || common is null)
+            return null;   // no string to promote, all strings already, or no common type
+
+        if (_options.Ansi)
+        {
+            // A binary renders as text here for the same reason it does in a comparison, and
+            // measured it answers rather than refusing: `bin IN ('A')` is false under ANSI.
+            return common is BinaryType ? StringType.Default : StringComparisonTarget(common);
+        }
+
+        return SparkNumericTypes.IsNumeric(common)
+            || SparkArrays.IsDateType(common)
+            || common is TimestampType
+                ? StringType.Default
+                : null;
+    }
+
+    /// <summary>
+    /// The type the non-string members share, or null when they have none.
+    /// </summary>
+    /// <remarks>
+    /// Two members of the same type need no unification, which is what keeps a set of dates or
+    /// booleans out of <see cref="SparkNumericTypes.CommonType"/> — it speaks for numbers, and
+    /// refuses everything else by design.
+    /// </remarks>
+    private static IArrowType? CommonTypeOfNonStrings(
+        IReadOnlyList<IArrowType> memberTypes, out bool anyString)
+    {
+        anyString = false;
+        IArrowType? common = null;
+
+        foreach (var type in memberTypes)
+        {
+            if (type is StringType)
+            {
+                anyString = true;
+                continue;
+            }
+
+            if (common is null)
+            {
+                common = type;
+                continue;
+            }
+
+            if (common.GetType() == type.GetType() && !SparkNumericTypes.IsDecimal(type))
+                continue;
+
+            try
+            {
+                common = SparkNumericTypes.CommonType(common, type);
+            }
+            catch (NotSupportedException)
+            {
+                return null;
+            }
+        }
+
+        return common;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
     /// The cast is the SAME one <c>CAST(...)</c> reaches, dialect and all, so a comparison and an
     /// explicit cast cannot drift apart: <c>s = a</c> refuses exactly the strings
     /// <c>CAST(s AS BIGINT)</c> refuses.
     /// </remarks>
-    public IArrowArray? CoerceStringForComparison(
-        IArrowArray strings, IArrowType otherType, int rowCount)
+    public IArrowArray CastForComparison(IArrowArray operand, IArrowType target, int rowCount)
     {
-        if (strings is null)
-            throw new ArgumentNullException(nameof(strings));
-        if (otherType is null)
-            throw new ArgumentNullException(nameof(otherType));
+        if (operand is null)
+            throw new ArgumentNullException(nameof(operand));
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
 
-        var target = ComparisonTarget(otherType);
-        return target is null
-            ? null
-            : Cast(strings, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+        return Cast(operand, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
     }
 
     /// <summary>
@@ -497,13 +612,11 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     ///     dialect, which keeps the decimal exact.</item>
     /// </list>
     /// <para>
-    /// Binary is deliberately absent. Spark answers <c>'00' = bin</c> with false rather than
-    /// refusing, so a rule exists, but no measurement here says what it is — and a guess would
-    /// be a silent wrong answer rather than the null we return today. Declared in
-    /// <c>SparkEvaluationCorpusTests</c>.
+    /// Binary is not here because a binary does not cast a string: it is the binary that moves.
+    /// See <see cref="ComparisonTarget"/>.
     /// </para>
     /// </remarks>
-    private IArrowType? ComparisonTarget(IArrowType other)
+    private IArrowType? StringComparisonTarget(IArrowType other)
     {
         // No widening for these: a string against a boolean, a date or a timestamp is cast
         // straight to it, under both dialects.
