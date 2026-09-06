@@ -707,7 +707,7 @@ public class StatisticsEvaluatorTests
                 new LiteralExpression(LiteralValue.Of(5.0d))), finite));
     }
 
-    // â”€â”€ A NaN the bounds do not mention (#214) â”€â”€
+    // ── A NaN the bounds do not mention (#214) ──
     //
     // Formats that follow Parquet's spec never write a NaN to min/max, so a file holding
     // [1.0, NaN] presents as an ordinary min = max = 1.0. Every conclusion below is checked

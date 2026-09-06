@@ -100,7 +100,7 @@ public class DeltaLiteralDecoderTests
             LiteralValue.Of(new DateTimeOffset(2021, 6, 1, 0, 0, 0, TimeSpan.Zero)), lit!.Value);
     }
 
-    // â”€â”€ Non-finite float bounds (#214) â”€â”€
+    // ── Non-finite float bounds (#214) ──
 
     [Theory]
     [InlineData("\"NaN\"", double.NaN)]

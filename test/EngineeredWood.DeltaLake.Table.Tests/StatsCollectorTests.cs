@@ -452,7 +452,7 @@ public class StatsCollectorTests
         }
     }
 
-    // â”€â”€ NaN and the infinities (#214) â”€â”€
+    // ── NaN and the infinities (#214) ──
     //
     // Expectations here are Spark 4.0's own output, read out of the commit JSON of a Delta table
     // it wrote: a double column holding [3.0, NaN] commits
