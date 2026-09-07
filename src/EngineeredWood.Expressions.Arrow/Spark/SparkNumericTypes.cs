@@ -23,6 +23,13 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 ///     <c>decimal(10,2) % decimal(6,4)</c> is <c>decimal(6,4)</c>.</item>
 ///   <item><c>decimal(38,10)</c> squared clamps to <c>decimal(38,6)</c>, sacrificing scale to
 ///     stay within the maximum precision.</item>
+///   <item><b>Floating point wins over decimal, not the other way round.</b> Every mix of a
+///     decimal with a <c>float</c> or a <c>double</c> is a <c>double</c> — including
+///     <c>decimal + float</c>, which is a double rather than a float — and the arithmetic is
+///     then done in double: measured, <c>decimal(38,38) 0.1 + double 0.2</c> is
+///     <c>0.30000000000000004</c>, the double answer rather than the exact one. This holds in
+///     both dialects and in every context: arithmetic, <c>greatest</c>/<c>least</c>,
+///     <c>coalesce</c>/<c>if</c>/<c>CASE</c> and comparison. #277.</item>
 /// </list>
 /// <para>
 /// These are ANSI-mode answers. The corpus was harvested with
@@ -45,12 +52,17 @@ internal static class SparkNumericTypes
     /// <exception cref="NotSupportedException">Either operand is not a supported numeric type.</exception>
     public static IArrowType ArithmeticResult(string op, IArrowType left, IArrowType right)
     {
-        // Decimal is contagious: if either side is one, the other is read as the decimal that
-        // represents it exactly, and the decimal rules below apply.
-        if (IsDecimal(left) || IsDecimal(right))
+        // Decimal is contagious over the INTEGRAL types only: an int is read as the decimal that
+        // holds it exactly and the decimal rules below apply. Against a float or a double it is
+        // the other way round -- see the remarks on FLOATING POINT WINS -- so this asks for a
+        // decimal on one side and no floating point on either.
+        if ((IsDecimal(left) || IsDecimal(right)) && !IsFloatingPoint(left) && !IsFloatingPoint(right))
             return DecimalResult(op, AsDecimal(left), AsDecimal(right));
 
-        // `/` is never integer division. Two ints divide to a double.
+        // `/` is never integer division, and it is double even for two floats. Measured:
+        // `f / f` is a double where `f % f` is a float. This sits below the decimal branch
+        // because decimal / decimal IS a decimal -- `decimal(10,2) / decimal(6,4)` is
+        // decimal(21,9) -- and above the floating-point one because nothing else divides.
         if (op == "/")
             return DoubleType.Default;
 
@@ -89,6 +101,11 @@ internal static class SparkNumericTypes
                     $"no common type for {left.Name} and {right.Name}");
         }
 
+        // Floating point is checked BEFORE decimal for the same reason it is in
+        // `ArithmeticResult`: a decimal unified with a double is a double, not a decimal.
+        if (IsFloatingPoint(left) || IsFloatingPoint(right))
+            return DoubleOrFloat(left, right);
+
         if (IsDecimal(left) || IsDecimal(right))
         {
             var (lp, ls) = AsDecimal(left);
@@ -96,9 +113,6 @@ internal static class SparkNumericTypes
             var scale = Math.Max(ls, rs);
             return Clamp(Math.Max(lp - ls, rp - rs) + scale, scale);
         }
-
-        if (IsFloatingPoint(left) || IsFloatingPoint(right))
-            return DoubleOrFloat(left, right);
 
         if (IsIntegral(left) && IsIntegral(right))
             return WiderIntegral(left, right);
