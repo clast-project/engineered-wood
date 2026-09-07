@@ -105,23 +105,25 @@ dotnet run -c Release -f net10.0 --project test/EngineeredWood.Parquet.Benchmark
 
 Each file holds 2,000,000 floats, so the **element count is constant across rows of the table** and
 only the list shape varies. `Plain` is uncompressed PLAIN floats (the level work is a large share of
-the read); `Default` is the library's defaults, Snappy + BYTE_STREAM_SPLIT (what a real embedding
-file looks like).
+the read); `Compressed` is Snappy + BYTE_STREAM_SPLIT, where decompression and value decoding
+dominate. Both settings are pinned in the benchmark. BYTE_STREAM_SPLIT was the float default when
+these numbers were taken and is opt-in since #269, so the arm no longer tracks
+`ParquetWriteOptions.Default` — it is held fixed to keep the table comparable.
 
 | Length | Layout | General | Fast path | Speedup | Allocated (general → fast) |
 | ---: | --- | ---: | ---: | ---: | --- |
 | 3 | Plain | 12.774 ms | 5.621 ms | **2.27×** | 20.8 MB → 5.2 MB (0.25×) |
-| 3 | Default | 11.999 ms | 5.040 ms | **2.38×** | 20.8 MB → 5.2 MB (0.25×) |
+| 3 | Compressed | 11.999 ms | 5.040 ms | **2.38×** | 20.8 MB → 5.2 MB (0.25×) |
 | 8 | Plain | 12.315 ms | 5.087 ms | **2.42×** | 17.6 MB → 1.96 MB (0.11×) |
-| 8 | Default | 11.992 ms | 4.963 ms | **2.42×** | 17.6 MB → 1.96 MB (0.11×) |
+| 8 | Compressed | 11.992 ms | 4.963 ms | **2.42×** | 17.6 MB → 1.96 MB (0.11×) |
 | 16 | Plain | 12.103 ms | 4.761 ms | **2.54×** | 16.6 MB → 0.98 MB (0.06×) |
-| 16 | Default | 12.635 ms | 5.185 ms | **2.44×** | 16.6 MB → 0.99 MB (0.06×) |
+| 16 | Compressed | 12.635 ms | 5.185 ms | **2.44×** | 16.6 MB → 0.99 MB (0.06×) |
 | 64 | Plain | 12.784 ms | 5.081 ms | **2.52×** | 15.9 MB → 0.38 MB (0.02×) |
-| 64 | Default | 13.368 ms | 3.839 ms | **3.48×** | 15.9 MB → 0.25 MB (0.02×) |
+| 64 | Compressed | 13.368 ms | 3.839 ms | **3.48×** | 15.9 MB → 0.25 MB (0.02×) |
 | 256 | Plain | 11.168 ms | 3.381 ms | **3.30×** | 15.7 MB → 0.07 MB (0.004×) |
-| 256 | Default | 13.718 ms | 6.467 ms | **2.12×** | 16.6 MB → 1.02 MB (0.06×) |
+| 256 | Compressed | 13.718 ms | 6.467 ms | **2.12×** | 16.6 MB → 1.02 MB (0.06×) |
 | 768 | Plain | 11.725 ms | 3.773 ms | **3.11×** | 15.7 MB → 0.028 MB (0.002×) |
-| 768 | Default | 13.607 ms | 6.068 ms | **2.24×** | 16.0 MB → 0.36 MB (0.02×) |
+| 768 | Compressed | 13.607 ms | 6.068 ms | **2.24×** | 16.0 MB → 0.36 MB (0.02×) |
 
 Reading the table:
 
@@ -133,9 +135,9 @@ Reading the table:
   of `rowCount × n` (definition and repetition levels) — ~16 MB per read here, all of it Gen2 LOH
   traffic. The fast path allocates only the offsets array (`rowCount + 1` ints) and the Arrow
   buffers, and at `n = 768` reports **zero** Gen0/1/2 collections.
-- **The `Default` (Snappy + BYTE_STREAM_SPLIT) rows show smaller ratios at large `n`** because
+- **The `Compressed` (Snappy + BYTE_STREAM_SPLIT) rows show smaller ratios at large `n`** because
   decompression and value decoding — work the fast path cannot remove — become the dominant term.
-  That is the honest number for a real embedding file; the `Plain` rows isolate what the technique
+  That is the honest number for a size-tuned file; the `Plain` rows isolate what the technique
   itself is worth.
 
 ### Detector scan: scalar vs vectorised comparison

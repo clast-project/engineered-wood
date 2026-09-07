@@ -20,8 +20,13 @@ public enum FixedListLayout
     /// <summary>Uncompressed PLAIN floats: the level work is a large share of the read.</summary>
     Plain,
 
-    /// <summary>Library defaults (Snappy + BYTE_STREAM_SPLIT): what a real embedding file looks like.</summary>
-    Default,
+    /// <summary>
+    /// Snappy + BYTE_STREAM_SPLIT: decompression and value decoding dominate, so this bounds what the
+    /// fast path is worth on a file tuned for size. Both are pinned rather than taken from
+    /// <see cref="ParquetWriteOptions.Default"/> — BYTE_STREAM_SPLIT stopped being the float default
+    /// in #269, and letting this arm drift would silently change what the recorded numbers mean.
+    /// </summary>
+    Compressed,
 }
 
 /// <summary>
@@ -43,7 +48,7 @@ public class FixedListReadBenchmarks
     [Params(3, 8, 16, 64, 256, 768)]
     public int Length { get; set; }
 
-    [Params(FixedListLayout.Plain, FixedListLayout.Default)]
+    [Params(FixedListLayout.Plain, FixedListLayout.Compressed)]
     public FixedListLayout Layout { get; set; }
 
     private string FilePath { get; set; } = null!;
@@ -257,7 +262,11 @@ internal static class FixedListBenchmarkData
                 FloatingPointEncoding = FloatingPointEncoding.Plain,
                 DictionaryEnabled = false,
             }
-            : ParquetWriteOptions.Default;
+            : ParquetWriteOptions.Default with
+            {
+                Compression = CompressionCodec.Snappy,
+                FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+            };
 
         await using var file = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(file, ownsFile: false, options);

@@ -87,7 +87,16 @@ Parquet spec in late 2024 are not supported on either path.
 **Encoding strategies on write.** The decoder supports
 `BYTE_STREAM_SPLIT` for `INT32`/`INT64`/`FIXED_LEN_BYTE_ARRAY`, but
 `EncodingStrategyResolver` never emits BSS for these types — only for
-`FLOAT`/`DOUBLE`. V1 data pages always emit `PLAIN` regardless of type.
+`FLOAT`/`DOUBLE`, and only when asked for by name: since #269 the default
+float encoding is `PLAIN`, because Spark's vectorized reader rejects
+`BYTE_STREAM_SPLIT`.
+
+**V1 data pages ignore the encoding options.** A V1 data page always emits
+`PLAIN` regardless of type, so setting `FloatingPointEncoding`,
+`ByteArrayEncoding` or `IntegerEncoding` alongside
+`DataPageVersion.V1` silently has no effect — the option is accepted and
+discarded. The format permits any encoding in a V1 page; this is an
+implementation gap, not a spec limit.
 
 **Arrow types rejected on write.** `ArrowToSchemaConverter.MapArrowType`
 throws `NotSupportedException` for `Date64Type`, `IntervalType` (any

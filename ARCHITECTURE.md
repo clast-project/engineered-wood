@@ -332,7 +332,7 @@ ParquetFileWriter.WriteRowGroupAsync(RecordBatch)
 |---|---|---|
 | Boolean | RLE (1-bit) | PLAIN |
 | Int32, Int64 | DELTA_BINARY_PACKED | PLAIN |
-| Float, Double | BYTE_STREAM_SPLIT | PLAIN |
+| Float, Double | PLAIN (BYTE_STREAM_SPLIT or ALP opt-in) | PLAIN |
 | ByteArray | DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, or FSST | PLAIN |
 | FixedLenByteArray | DELTA_BYTE_ARRAY | PLAIN |
 

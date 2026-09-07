@@ -1403,11 +1403,71 @@ public class ParquetFileWriterTests : IDisposable
         Assert.Contains(Encoding.DeltaBinaryPacked, metadata.RowGroups[0].Columns[0].MetaData!.Encodings);
     }
 
+    /// <summary>
+    /// The default float encoding is PLAIN, and nothing else asserted that. BYTE_STREAM_SPLIT
+    /// compresses better and was the default until #269, but Spark's vectorized Parquet reader
+    /// rejects it outright in either data page version (SPARK-37975, open, no fix version) — so an
+    /// EW-written float column was unreadable by the most widely deployed Parquet consumer, and every
+    /// cheaper oracle we had (PyArrow, DuckDB, delta-rs, Polars, DataFusion) decodes it happily and
+    /// said nothing. Pin the default here so a future encoding change has to be deliberate.
+    /// </summary>
+    [Theory]
+    [InlineData(DataPageVersion.V1)]
+    [InlineData(DataPageVersion.V2)]
+    public async Task DefaultOptions_FloatAndDouble_UsePlainNotByteStreamSplit(DataPageVersion pageVersion)
+    {
+        Assert.Equal(FloatingPointEncoding.Plain, ParquetWriteOptions.Default.FloatingPointEncoding);
+
+        string path = TempPath($"default_float_{pageVersion}.parquet");
+        // Uncompressed and dictionary off so the fallback encoding is what reaches the file;
+        // everything else is left at the library defaults, which is the point of the test.
+        var options = ParquetWriteOptions.Default with
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = false,
+            DataPageVersion = pageVersion,
+        };
+
+        var floats = new FloatArray.Builder();
+        var doubles = new DoubleArray.Builder();
+        for (int i = 0; i < 200; i++)
+        {
+            floats.Append(i * 1.1f);
+            doubles.Append(i * 2.718);
+        }
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("f32", FloatType.Default, false))
+            .Field(new Field("f64", DoubleType.Default, false))
+            .Build();
+        var batch = new RecordBatch(schema, [floats.Build(), doubles.Build()], 200);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        foreach (var column in metadata.RowGroups[0].Columns)
+        {
+            Assert.Contains(Encoding.Plain, column.MetaData!.Encodings);
+            Assert.DoesNotContain(Encoding.ByteStreamSplit, column.MetaData!.Encodings);
+        }
+    }
+
     [Fact]
     public async Task V2Encoding_Float_UsesByteStreamSplit()
     {
         string path = TempPath("v2_bss_float.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+        };
         var builder = new FloatArray.Builder();
         for (int i = 0; i < 200; i++) builder.Append(i * 1.1f);
 
@@ -1432,7 +1492,11 @@ public class ParquetFileWriterTests : IDisposable
     public async Task V2Encoding_Double_UsesByteStreamSplit()
     {
         string path = TempPath("v2_bss_double.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+        };
         var builder = new DoubleArray.Builder();
         for (int i = 0; i < 200; i++) builder.Append(i * 2.718);
 

@@ -125,6 +125,73 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// <para>EW writes a FLOAT and a DOUBLE column; the reference implementation must decode the
+    /// values, not merely plan the scan. Every other schema in this tier is integers and strings, so
+    /// until this test existed Spark had never been asked to materialize a floating-point column EW
+    /// wrote — and EW's default encoding for one was BYTE_STREAM_SPLIT, which Spark's vectorized
+    /// reader rejects outright (issue #269).</para>
+    ///
+    /// <para>This looks like something tier 1 covers, and it is not: delta-rs, DuckDB and PyArrow all
+    /// decode BYTE_STREAM_SPLIT without complaint, so every cheaper oracle passed while the files were
+    /// unreadable by the most widely deployed one. The distinguishing capability here is Spark's
+    /// VECTORIZED reader specifically, which is a separate decoder from the parquet-java path Spark
+    /// falls back to, and it is on by default.</para>
+    ///
+    /// <para>Note where the failure lands: Spark reads the log, prunes on our stats and reports the
+    /// right row count before throwing, so a row-count-only assertion passes on an unreadable table.
+    /// The values must be compared for this test to bite. They are also chosen distinct enough that
+    /// the writer's dictionary declines them, so the fallback encoding — the thing under test —
+    /// is what actually reaches the file.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task EwWritten_FloatAndDoubleColumns_SparkDecodesTheValues()
+    {
+        Spark.Require();
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("f32", FloatType.Default, false))
+            .Field(new Field("f64", DoubleType.Default, false))
+            .Build();
+
+        long[] ids = [1, 2, 3, 4, 5, 6, 7, 8];
+        float[] f32 = [0.25f, 1.75f, -2.5f, 3.125f, 4.5f, -5.75f, 6.0f, 7.875f];
+        double[] f64 = [0.25, 1.75, -2.5, 3.125, 4.5, -5.75, 6.0, 7.875];
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync(
+        [
+            new RecordBatch(
+                schema,
+                [
+                    new Int64Array.Builder().AppendRange(ids).Build(),
+                    new FloatArray.Builder().AppendRange(f32).Build(),
+                    new DoubleArray.Builder().AppendRange(f64).Build(),
+                ],
+                ids.Length),
+        ]);
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+
+        Assert.Equal(ids.Length, result.GetProperty("row_count").GetInt32());
+
+        var decoded = new List<(long Id, float F32, double F64)>();
+        foreach (var row in result.GetProperty("rows").EnumerateArray())
+        {
+            decoded.Add((
+                row.GetProperty("id").GetInt64(),
+                row.GetProperty("f32").GetSingle(),
+                row.GetProperty("f64").GetDouble()));
+        }
+
+        decoded.Sort();
+        Assert.Equal(
+            Enumerable.Range(0, ids.Length).Select(i => (ids[i], f32[i], f64[i])).ToList(),
+            decoded);
+    }
+
+    /// <summary>
     /// <para>Two independent EW handles blind-append concurrently (slice 9 step 3). The second holds a
     /// stale snapshot, so its commit collides and REBASES onto the winner through the optimistic-
     /// concurrency loop rather than failing. The reference implementation must then read all rows.</para>
