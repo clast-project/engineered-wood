@@ -99,12 +99,18 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | DELTA_BINARY_PACKED | yes | yes |
 | DELTA_LENGTH_BYTE_ARRAY | yes | yes |
 | DELTA_BYTE_ARRAY | yes | yes |
-| BYTE_STREAM_SPLIT | yes | yes |
+| BYTE_STREAM_SPLIT | yes | opt-in |
 | RLE (levels) | yes | yes |
 | BIT_PACKED (deprecated, levels) | yes | — |
 | ALP (experimental) | yes | opt-in |
 | PFOR (experimental) | yes | opt-in |
 | FSST (experimental) | yes | opt-in |
+
+BYTE_STREAM_SPLIT is ratified and widely readable, but it is **opt-in on write** because
+Spark's vectorized Parquet reader — on by default — cannot decode it in either data page version
+(SPARK-37975, open). Turn it on per file with
+`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit` when the
+consumers are known; it compresses smooth float series far better than PLAIN.
 
 The last three are **unratified parquet-format proposals**, gated behind
 `[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0005` for PFOR,

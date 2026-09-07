@@ -40,8 +40,13 @@ internal static class EncodingStrategyResolver
 #pragma warning disable EWPARQUET0001 // ALP is intentionally selectable; the experimental signal lives on the enum value, not internal dispatch.
                 FloatingPointEncoding.Alp => Encoding.Alp,
 #pragma warning restore EWPARQUET0001
+                FloatingPointEncoding.ByteStreamSplit => Encoding.ByteStreamSplit,
                 FloatingPointEncoding.Plain => Encoding.Plain,
-                _ => Encoding.ByteStreamSplit,
+                // Every arm above is named, and the catch-all is PLAIN rather than
+                // BYTE_STREAM_SPLIT. BSS is still the enum's ZERO value, so a fall-through to it
+                // would hand `default(FloatingPointEncoding)` an encoding Spark's vectorized reader
+                // rejects; PLAIN is the safe answer for an enum value added later too.
+                _ => Encoding.Plain,
             },
             PhysicalType.ByteArray => byteArrayEncoding switch
             {

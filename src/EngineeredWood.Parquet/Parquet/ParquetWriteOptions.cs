@@ -26,9 +26,20 @@ public enum FloatingPointEncoding
 {
     /// <summary>
     /// BYTE_STREAM_SPLIT: byte-interleaving encoding that pairs well with a generic compressor.
-    /// Supported by parquet-mr ≥ 1.12 (mid-2021) and contemporaneous parquet-cpp/Arrow/DuckDB
-    /// builds. This is the default.
+    /// Compresses far better than PLAIN on smooth series and costs nothing on high-entropy data,
+    /// but it is opt-in rather than the default because a major reader cannot decode it.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Spark's vectorized Parquet reader cannot read this encoding</b>, in either data page
+    /// version, and that reader is on by default. A file written this way fails with
+    /// <c>SparkUnsupportedOperationException: Unsupported encoding: BYTE_STREAM_SPLIT</c> the moment
+    /// the column is materialized — planning, pruning, and row counts all succeed first, so the
+    /// failure surfaces late. Measured on Spark 4.0.1 and 4.1.1; SPARK-37975 tracks it and is open
+    /// with no fix version, while its parent SPARK-36879 delivered every other V2 encoding in 3.3.0.
+    /// Reading with <c>spark.sql.parquet.enableVectorizedReader=false</c> works, because that path
+    /// goes through parquet-java, which has supported the encoding since 1.12.0.</para>
+    /// <para>fastparquet also refuses it. PyArrow, Polars, DuckDB, and DataFusion all read it.</para>
+    /// </remarks>
     ByteStreamSplit,
 
     /// <summary>
@@ -50,8 +61,9 @@ public enum FloatingPointEncoding
 
     /// <summary>
     /// PLAIN: write IEEE-754 values uncompressed. Universal lowest-common-denominator —
-    /// readable by every Parquet implementation. Choose this for maximum reader compatibility
-    /// or when an outer codec (e.g. Zstd) already exploits byte-level correlation.
+    /// readable by every Parquet implementation, including Spark's vectorized reader. This is the
+    /// default, for that reason. An outer codec (e.g. Zstd) still exploits byte-level correlation,
+    /// which recovers part of what <see cref="ByteStreamSplit"/> would have bought.
     /// </summary>
     Plain,
 }
@@ -242,10 +254,13 @@ public sealed record ParquetWriteOptions
 
     /// <summary>
     /// Non-dictionary fallback encoding for FLOAT and DOUBLE columns when using V2 data pages.
-    /// Default is <see cref="FloatingPointEncoding.ByteStreamSplit"/>; set to
-    /// <see cref="FloatingPointEncoding.Alp"/> for decimal-like floating-point data.
+    /// Default is <see cref="FloatingPointEncoding.Plain"/>, the only choice every reader can
+    /// decode — notably Spark's vectorized reader, which rejects
+    /// <see cref="FloatingPointEncoding.ByteStreamSplit"/>. Set
+    /// <see cref="FloatingPointEncoding.ByteStreamSplit"/> for a substantially smaller file when the
+    /// consumers are known, or <see cref="FloatingPointEncoding.Alp"/> for decimal-like data.
     /// </summary>
-    public FloatingPointEncoding FloatingPointEncoding { get; init; } = FloatingPointEncoding.ByteStreamSplit;
+    public FloatingPointEncoding FloatingPointEncoding { get; init; } = FloatingPointEncoding.Plain;
 
     /// <summary>
     /// Non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data pages.

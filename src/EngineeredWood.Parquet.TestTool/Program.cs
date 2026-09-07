@@ -134,6 +134,10 @@ static async Task<int> CreateTestFile(string[] args)
         RowGroupMaxRows = totalRows,
         DataPageSize = 64 * 1024, // 64 KB pages → many pages even for small test files
         DictionaryEnabled = true,
+        // The point of this file is to exercise every encoding, so BYTE_STREAM_SPLIT is asked for
+        // by name. It stopped being the float default in #269 (Spark's vectorized reader cannot
+        // decode it), and without this line seq_f32/seq_f64 would silently be written PLAIN.
+        FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
         // seq_bin uses DeltaByteArray; seq_str uses DeltaLengthByteArray (default).
         // Override seq_bin's encoding via ColumnEncodings.
         ColumnEncodings = new Dictionary<string, ByteArrayEncoding>

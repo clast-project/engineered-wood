@@ -15,12 +15,15 @@ internal static class CheckpointParquetOptions
     /// Narrows <paramref name="options"/> to encodings every Delta reader supports.
     /// </summary>
     /// <remarks>
-    /// FLOAT/DOUBLE columns default to <c>BYTE_STREAM_SPLIT</c>, which Spark 4.0's vectorized Parquet
-    /// reader rejects outright ("Unsupported encoding: BYTE_STREAM_SPLIT"). A checkpoint is read as one
-    /// file, so a single such column makes the WHOLE checkpoint unreadable — and with it the table, once
-    /// the commits it summarises age out. Any table with a float, double or decimal column produced one,
-    /// because <c>stats_parsed</c> carries per-file bounds for those columns. A data file's encoding is
-    /// the caller's trade-off to make; the transaction log's is not.
+    /// Spark's vectorized Parquet reader rejects <c>BYTE_STREAM_SPLIT</c> outright ("Unsupported
+    /// encoding: BYTE_STREAM_SPLIT"). A checkpoint is read as one file, so a single such column makes
+    /// the WHOLE checkpoint unreadable — and with it the table, once the commits it summarises age
+    /// out. Any table with a float, double or decimal column produces one, because <c>stats_parsed</c>
+    /// carries per-file bounds for those columns.
+    /// <para>Since #269 that encoding is no longer EW's default, so for a caller who passes nothing
+    /// this narrowing is a no-op. It stays because a caller MAY still select it, and the trade-off is
+    /// not the same on both sides: a data file's encoding is theirs to choose, the transaction log's
+    /// is not.</para>
     /// </remarks>
     public static ParquetWriteOptions For(ParquetWriteOptions? options) =>
         (options ?? ParquetWriteOptions.Default) with
