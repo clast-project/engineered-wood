@@ -1384,7 +1384,11 @@ public class ParquetFileWriterTests : IDisposable
     {
         string path = TempPath("v2_delta_int32.parquet");
         // High cardinality forces non-dictionary path; V2 default → DELTA_BINARY_PACKED
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
+        };
         var values = Enumerable.Range(0, 200).ToArray();
         var batch = MakeBatch(
             new Field("id", Int32Type.Default, nullable: false),
@@ -1467,6 +1471,7 @@ public class ParquetFileWriterTests : IDisposable
         {
             Compression = CompressionCodec.Uncompressed,
             FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
         };
         var builder = new FloatArray.Builder();
         for (int i = 0; i < 200; i++) builder.Append(i * 1.1f);
@@ -1496,6 +1501,7 @@ public class ParquetFileWriterTests : IDisposable
         {
             Compression = CompressionCodec.Uncompressed,
             FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
         };
         var builder = new DoubleArray.Builder();
         for (int i = 0; i < 200; i++) builder.Append(i * 2.718);
@@ -1521,7 +1527,11 @@ public class ParquetFileWriterTests : IDisposable
     public async Task V2Encoding_String_UsesDeltaLengthByteArray()
     {
         string path = TempPath("v2_dlba_string.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
+        };
         var builder = new StringArray.Builder();
         for (int i = 0; i < 200; i++) builder.Append($"value_{i:D5}");
 
@@ -1546,7 +1556,11 @@ public class ParquetFileWriterTests : IDisposable
     public async Task V2Encoding_Boolean_UsesRle()
     {
         string path = TempPath("v2_rle_bool.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
+        };
         var builder = new BooleanArray.Builder();
         for (int i = 0; i < 100; i++) builder.Append(i % 3 == 0);
 
@@ -1571,7 +1585,11 @@ public class ParquetFileWriterTests : IDisposable
     public async Task V2Encoding_NullableInt32_DeltaBinaryPacked()
     {
         string path = TempPath("v2_delta_nullable.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
+        };
         var builder = new Int32Array.Builder();
         for (int i = 0; i < 200; i++)
         {
@@ -1599,7 +1617,11 @@ public class ParquetFileWriterTests : IDisposable
     public async Task V2Encoding_WithCompression_Snappy()
     {
         string path = TempPath("v2_advanced_snappy.parquet");
-        var options = new ParquetWriteOptions { Compression = CompressionCodec.Snappy };
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Snappy,
+            DataPageVersion = DataPageVersion.V2,   // the subject of the test, not a default to inherit
+        };
 
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int32Type.Default, false))

@@ -41,10 +41,11 @@ internal static class EncodingStrategyResolver
                 FloatingPointEncoding.Alp => Encoding.Alp,
 #pragma warning restore EWPARQUET0001
                 FloatingPointEncoding.ByteStreamSplit => Encoding.ByteStreamSplit,
-                // PLAIN is the catch-all, not BYTE_STREAM_SPLIT: it is the default, and it is the
-                // only float encoding every reader decodes. ByteStreamSplit is still the enum's
-                // ZERO value, so a fall-through here would hand `default(FloatingPointEncoding)` an
-                // encoding Spark's vectorized reader rejects. Name every arm instead.
+                FloatingPointEncoding.Plain => Encoding.Plain,
+                // Every arm above is named, and the catch-all is PLAIN rather than
+                // BYTE_STREAM_SPLIT. BSS is still the enum's ZERO value, so a fall-through to it
+                // would hand `default(FloatingPointEncoding)` an encoding Spark's vectorized reader
+                // rejects; PLAIN is the safe answer for an enum value added later too.
                 _ => Encoding.Plain,
             },
             PhysicalType.ByteArray => byteArrayEncoding switch
