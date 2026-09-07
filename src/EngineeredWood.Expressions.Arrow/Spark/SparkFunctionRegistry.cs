@@ -1208,6 +1208,173 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
     // ── Conditionals ───────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Unifies a conditional's branches and picks the chosen cell from each row.
+    /// </summary>
+    /// <remarks>
+    /// The whole conditional family goes through here - <c>coalesce</c>/<c>nvl</c>/<c>ifnull</c>,
+    /// <c>if</c> and <c>CASE</c> - because they share one rule. <c>greatest</c>/<c>least</c> do
+    /// NOT: measured, they REFUSE a string against a number in both dialects
+    /// (<c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c>) where the family here coerces, so they keep
+    /// <see cref="UnifiedType"/> and its refusal. #278.
+    /// </remarks>
+    private IArrowArray UnifyBranches(
+        IReadOnlyList<IArrowArray> branches, int[] choice, int rowCount)
+    {
+        var type = ConditionalType(branches, rowCount);
+        return SparkFunctions.Unify(
+            type, CoerceBranches(type, branches, choice, rowCount), choice, rowCount);
+    }
+
+    /// <summary>The type a conditional's branches unify to, string coercion included.</summary>
+    /// <remarks>
+    /// A bare <c>NULL</c> is <c>void</c> in Spark and constrains nothing, so
+    /// <c>coalesce(a, NULL)</c> is an <c>int</c>. The evaluator has no void type and materialises
+    /// such a literal as an all-null STRING column, so that shape is what gets left out of the
+    /// fold — and left out on BOTH counts, being all-null and being a string.
+    /// <para>
+    /// <b>Only that shape.</b> A typed null still carries its type and still constrains the
+    /// result: measured, <c>coalesce(CAST(NULL AS INT), '2')</c> is a <c>bigint</c> in Spark, not
+    /// the string that dropping the all-null int would give, and
+    /// <c>coalesce(CAST(NULL AS INT), CAST(NULL AS STRING), '7')</c> is a bigint too. Dropping
+    /// every all-null branch — which is what <c>greatest</c>/<c>least</c> do — got the first of
+    /// those wrong, and the corpus caught it.
+    /// </para>
+    /// <para>
+    /// What remains is narrow and batch-dependent: a real string COLUMN that happens to hold
+    /// nothing but nulls in this batch is indistinguishable from the placeholder and is dropped
+    /// with it. Removing that needs the evaluator to stop spelling a null literal as a string,
+    /// which is a change of its own.
+    /// </para>
+    /// </remarks>
+    private IArrowType ConditionalType(IReadOnlyList<IArrowArray> branches, int rowCount)
+    {
+        IArrowType? type = null;
+
+        foreach (var branch in branches)
+        {
+            if (branch is StringArray && AllNull(branch, rowCount))
+                continue;
+
+            var candidate = branch.Data.DataType;
+            type = type is null ? candidate : UnifyBranchTypes(type, candidate);
+        }
+
+        return type ?? StringType.Default;
+    }
+
+    private IArrowType UnifyBranchTypes(IArrowType left, IArrowType right)
+    {
+        if (left is StringType && right is StringType)
+            return StringType.Default;
+
+        if (left is StringType || right is StringType)
+        {
+            return ConditionalStringTarget(left is StringType ? right : left)
+                ?? throw new NotSupportedException(
+                    $"no common type for {left.Name} and {right.Name}");
+        }
+
+        return SparkNumericTypes.CommonType(left, right);
+    }
+
+    /// <summary>
+    /// What a string branch unifies with another type to, or null when Spark refuses the pair.
+    /// </summary>
+    /// <remarks>
+    /// <b>The two dialects choose OPPOSITE directions</b>, which is the whole difficulty. Under
+    /// ANSI the STRING moves to the other type; under the legacy dialect the OTHER TYPE moves to
+    /// string. Measured on 4.0.3: <c>coalesce(CAST(1 AS INT), '2')</c> is a <c>bigint</c> holding
+    /// 1 under ANSI and a <c>string</c> holding <c>'1'</c> under legacy. Same shape as #180/#259,
+    /// where a comparison picked different cast targets per dialect.
+    /// <para>
+    /// ANSI widens rather than casting to the operand's own type: every integral width goes to
+    /// <c>bigint</c> and every fractional one - float, double and decimal alike - to
+    /// <c>double</c>. Boolean, binary, date and timestamp take the string directly.
+    /// </para>
+    /// <para>
+    /// The refusals are measured too, not a fallback. Legacy refuses a string against a boolean
+    /// and against a binary while ANSI answers both, so the null here is a real answer.
+    /// </para>
+    /// <para>
+    /// This is NOT <see cref="StringComparisonTarget"/>, though the ANSI halves agree. That one's
+    /// legacy half moves the string to the number, the opposite of this one, and it excludes
+    /// binary because in a comparison it is the binary that moves. Two rules that look alike and
+    /// were measured apart.
+    /// </para>
+    /// </remarks>
+    private IArrowType? ConditionalStringTarget(IArrowType other)
+    {
+        if (!_options.Ansi)
+        {
+            return SparkNumericTypes.IsNumeric(other)
+                   || SparkArrays.IsDateType(other)
+                   || other is TimestampType
+                ? StringType.Default
+                : null;
+        }
+
+        if (SparkNumericTypes.IsIntegral(other))
+            return Int64Type.Default;
+
+        if (SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other))
+            return DoubleType.Default;
+
+        if (other is BooleanType or BinaryType or TimestampType || SparkArrays.IsDateType(other))
+            return other;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Casts the string branches to the unified type, over the rows that actually select them.
+    /// </summary>
+    /// <remarks>
+    /// <b>Masked to the winning rows, which is the point.</b> Spark evaluates only the branch a
+    /// row chooses, so a string no row selects is never converted and never fails: measured,
+    /// <c>coalesce(CAST(1 AS INT), 'abc')</c> answers 1 under ANSI, while
+    /// <c>coalesce(CAST(NULL AS INT), 'abc')</c> raises <c>CAST_INVALID_INPUT</c> because there
+    /// the string IS chosen. Casting the column whole would fail the first one too.
+    /// <para>
+    /// Only the ANSI direction reaches the cast. Under legacy a string branch makes the unified
+    /// type <c>string</c>, and <see cref="SparkFunctions.Unify"/> renders each branch itself.
+    /// </para>
+    /// <para>
+    /// The cast is the SAME one <c>CAST(...)</c> reaches, dialect and all, so the string rules
+    /// paid for in #174, #243 and #258 apply here without being restated.
+    /// </para>
+    /// </remarks>
+    private IArrowArray[] CoerceBranches(
+        IArrowType type, IReadOnlyList<IArrowArray> branches, int[] choice, int rowCount)
+    {
+        var prepared = new IArrowArray[branches.Count];
+        for (var i = 0; i < branches.Count; i++)
+            prepared[i] = branches[i];
+
+        if (type is StringType)
+            return prepared;
+
+        for (var i = 0; i < prepared.Length; i++)
+        {
+            if (prepared[i] is not StringArray strings)
+                continue;
+
+            var masked = new StringArray.Builder();
+            for (var row = 0; row < rowCount; row++)
+            {
+                if (choice[row] == i && !strings.IsNull(row))
+                    masked.Append(strings.GetString(row)!);
+                else
+                    masked.AppendNull();
+            }
+
+            prepared[i] = Cast(
+                masked.Build(), type, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+        }
+
+        return prepared;
+    }
+
     /// <summary>The type a set of branches unifies to.</summary>
     private static IArrowType UnifiedType(IEnumerable<IArrowArray> branches)
     {
@@ -1251,6 +1418,15 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     {
         var source = args[0];
         var scale = args.Count > 1 ? RoundScale(args[1], rowCount) : 0;
+
+        // A string argument is read as a DOUBLE, in both dialects -- measured, `round('1.5', 2)`
+        // is a double 1.5 under each. Only the failure differs, and the shared cast already knows
+        // it: ANSI raises on `round('abc', 2)` where legacy answers null. #278.
+        if (source.Data.DataType is StringType)
+        {
+            source = Cast(
+                source, DoubleType.Default, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+        }
 
         if (source.Data.DataType is Decimal128Type decimals)
             return RoundDecimal(source, decimals, scale, rowCount);
@@ -1518,7 +1694,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return SparkFunctions.Unify(type, unified, choice, rowCount);
     }
 
-    private static IArrowArray Coalesce(IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray Coalesce(IReadOnlyList<IArrowArray> args, int rowCount)
     {
         if (args.Count == 0)
             throw new ArgumentException("coalesce needs at least one argument", nameof(args));
@@ -1537,7 +1713,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             }
         }
 
-        return SparkFunctions.Unify(UnifiedType(args), args, choice, rowCount);
+        return UnifyBranches(args, choice, rowCount);
     }
 
     /// <summary>
@@ -1566,7 +1742,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return SparkFunctions.Unify(args[0].Data.DataType, args, choice, rowCount);
     }
 
-    private static IArrowArray If(IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray If(IReadOnlyList<IArrowArray> args, int rowCount)
     {
         var branches = new[] { args[1], args[2] };
         var choice = new int[rowCount];
@@ -1574,7 +1750,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         for (var row = 0; row < rowCount; row++)
             choice[row] = IsTrue(args[0], row) ? 0 : 1;
 
-        return SparkFunctions.Unify(UnifiedType(branches), branches, choice, rowCount);
+        return UnifyBranches(branches, choice, rowCount);
     }
 
     /// <summary>
@@ -1585,7 +1761,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     /// A CASE with no ELSE and no matching branch is null — measured,
     /// <c>CASE WHEN a &gt; 0 THEN 1 END</c> gives null where the condition fails.
     /// </remarks>
-    private static IArrowArray Case(IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray Case(IReadOnlyList<IArrowArray> args, int rowCount)
     {
         if (args.Count < 2)
             throw new ArgumentException("case needs at least one when/then pair", nameof(args));
@@ -1613,7 +1789,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             }
         }
 
-        return SparkFunctions.Unify(UnifiedType(values), values, choice, rowCount);
+        return UnifyBranches(values, choice, rowCount);
     }
 
     /// <summary>A condition is taken only when it is true — null is not.</summary>
