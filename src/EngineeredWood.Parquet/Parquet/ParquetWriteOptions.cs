@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using EngineeredWood.Compression;
 
 namespace EngineeredWood.Parquet;
@@ -438,9 +439,55 @@ public sealed record ParquetWriteOptions
         BatchBitPackedRuns ? Data.RleBitPackedEncoder.MaxLiteralGroups : 1;
 
     /// <summary>
-    /// Application identifier written to the file footer's <c>created_by</c> field.
+    /// Application identifier written to the file footer's <c>created_by</c> field. Defaults to
+    /// <c>EngineeredWood version &lt;semver&gt; (build &lt;commit&gt;)</c>.
     /// </summary>
-    public string CreatedBy { get; init; } = "EngineeredWood";
+    /// <remarks>
+    /// <para>The spelling matters, and a bare application name is actively harmful. Readers use
+    /// <c>created_by</c> to decide whether a file needs a version-keyed workaround, and they fail
+    /// CLOSED: parquet-java's <c>CorruptDeltaByteArrays</c> treats a <c>created_by</c> its
+    /// <c>VersionParser</c> cannot parse as possibly affected by PARQUET-246, so Spark's
+    /// non-vectorized reader refused every DELTA_BYTE_ARRAY column we wrote — for a bug in
+    /// parquet-mr before 1.8.0 that our writer never had.</para>
+    /// <para>MEASURED: identical rows and encoding, only this string differing, the bare name
+    /// fails and every <c>&lt;app&gt; version &lt;v&gt;</c> spelling is read correctly. Supplying
+    /// your own value is fine; keeping the <c>version</c> keyword in it is what stops readers
+    /// assuming the worst.</para>
+    /// </remarks>
+    public string CreatedBy { get; init; } = CreatedByDefault.Value;
+
+    /// <summary>
+    /// Holds the default <see cref="CreatedBy"/>, built once from the assembly's own version.
+    /// </summary>
+    /// <remarks>
+    /// A nested type rather than a static field on <see cref="ParquetWriteOptions"/>, because
+    /// <see cref="Default"/> is itself a static field declared FURTHER UP this class. Static field
+    /// initializers run in declaration order, so a sibling field here would still be null when
+    /// <c>Default = new()</c> ran, and <c>Default.CreatedBy</c> would be null with nothing to say
+    /// so. A nested class initializes on first access to its own field instead, whatever order the
+    /// outer class's fields are declared in.
+    /// </remarks>
+    private static class CreatedByDefault
+    {
+        internal static readonly string Value = Build();
+
+        private static string Build()
+        {
+            var assembly = typeof(ParquetWriteOptions).Assembly;
+            string version =
+                assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                ?? assembly.GetName().Version?.ToString()
+                ?? "0.0.0";
+
+            // SourceLink stamps the informational version as "<semver>+<commit sha>". parquet-mr's
+            // own format puts the commit in a "(build ...)" suffix, so split it there rather than
+            // leaving a "+" in the middle of the version token.
+            int plus = version.IndexOf('+');
+            return plus < 0
+                ? $"EngineeredWood version {version}"
+                : $"EngineeredWood version {version.Substring(0, plus)} (build {version.Substring(plus + 1)})";
+        }
+    }
 
     /// <summary>
     /// Optional key-value metadata to include in the file footer.

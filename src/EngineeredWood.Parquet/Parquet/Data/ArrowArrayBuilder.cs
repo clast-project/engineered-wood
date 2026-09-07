@@ -1094,6 +1094,32 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>The Parquet physical type for this column.</summary>
     public PhysicalType PhysicalType => _physicalType;
 
+    // A DELTA_BYTE_ARRAY value takes its prefix from the value BEFORE it, and parquet-mr before
+    // 1.8.0 let that reference cross a page boundary (PARQUET-246), so such a page cannot be
+    // decoded on its own. Holding the chunk's last decoded value here lets the next page resolve
+    // that prefix instead of silently reading zeros out of its own empty output buffer. One
+    // value-sized copy per page, and a conforming writer never consults it: it restarts the prefix
+    // at every page, so the first value's prefix length is zero.
+    private byte[]? _deltaByteArrayCarry;
+    private int _deltaByteArrayCarryLength;
+
+    /// <summary>
+    /// The last DELTA_BYTE_ARRAY value decoded in this column chunk, or empty when no page has been
+    /// decoded yet or the pages were not read in order.
+    /// </summary>
+    public ReadOnlySpan<byte> DeltaByteArrayCarry =>
+        _deltaByteArrayCarry is null ? default : _deltaByteArrayCarry.AsSpan(0, _deltaByteArrayCarryLength);
+
+    /// <summary>Records this page's last value so the next page can build a prefix on it.</summary>
+    public void SetDeltaByteArrayCarry(ReadOnlySpan<byte> value)
+    {
+        if (_deltaByteArrayCarry is null || _deltaByteArrayCarry.Length < value.Length)
+            _deltaByteArrayCarry = new byte[Math.Max(value.Length, 64)];
+
+        value.CopyTo(_deltaByteArrayCarry);
+        _deltaByteArrayCarryLength = value.Length;
+    }
+
     /// <summary>
     /// The declared <c>TimeUnit</c> when this column is an extended-precision timestamp carrier,
     /// otherwise <see langword="null"/>.

@@ -45,6 +45,10 @@ internal static class DeltaByteArrayDecoder
         // Step 3: Raw suffix bytes follow the suffix length block
         var rawSuffixes = suffixData.Slice(suffixLengthDecoder.BytesConsumed);
 
+        // The last value of the PREVIOUS page in this chunk, when the pages were read in order.
+        // Only a page whose first value carries a prefix consults it -- see below.
+        var carry = state.DeltaByteArrayCarry;
+
         // Step 4: Reconstruct values by combining prefix from previous value + suffix
         // Compute total output size
         var valueLengths = new int[count];
@@ -60,16 +64,25 @@ internal static class DeltaByteArrayDecoder
                     $"DELTA_BYTE_ARRAY value at index {i} has a negative prefix ({prefixLen}) or suffix " +
                     $"({suffixLen}) length.");
 
-            // A value is the first prefixLen bytes of the PREVIOUS value plus a suffix. A prefix that does
-            // not fit inside the previous value -- including ANY prefix on the first value, which has no
-            // predecessor -- would be reconstructed from the zero-filled bytes reserved for this value:
-            // neither what was encoded nor an error. The output buffer is sized from these same lengths,
-            // so nothing reads out of bounds and nothing throws; it just comes out wrong.
-            int previousLength = i == 0 ? 0 : valueLengths[i - 1];
+            // A value is the first prefixLen bytes of the PREVIOUS value plus a suffix. A prefix that
+            // does not fit inside the previous value would be reconstructed from the zero-filled bytes
+            // reserved for this value: neither what was encoded nor an error. The output buffer is
+            // sized from these same lengths, so nothing reads out of bounds and nothing throws; it
+            // just comes out wrong. Refuse instead.
+            //
+            // The first value's predecessor is the last value of the PREVIOUS PAGE. A conforming
+            // writer restarts the prefix at each page, so it has none and the length below is zero.
+            // parquet-mr before 1.8.0 did not (PARQUET-246), and such a page is decodable only when
+            // the chunk was read in order -- which is exactly when the carry is populated.
+            int previousLength = i == 0 ? carry.Length : valueLengths[i - 1];
             if (prefixLen > previousLength)
                 throw new ParquetFormatException(
                     $"DELTA_BYTE_ARRAY value at index {i} claims a {prefixLen}-byte prefix of a value that " +
-                    $"is {previousLength} bytes long.");
+                    $"is {previousLength} bytes long." + (i == 0
+                        ? " A prefix on a page's first value continues the previous page (PARQUET-246," +
+                          " written by parquet-mr before 1.8.0), so the page cannot be decoded on its" +
+                          " own; read the column chunk from its first page."
+                        : string.Empty));
 
             valueLengths[i] = prefixLen + suffixLen;
             if (fixedWidth && valueLengths[i] != typeLength)
@@ -105,9 +118,14 @@ internal static class DeltaByteArrayDecoder
             int prefixLen = prefixLengths[i];
             int suffixLen = suffixLengths[i];
 
-            // Copy prefix from previous value
+            // Copy prefix from the previous value -- the previous PAGE's last value for the first
+            // value here, this page's own output for the rest. The loop above already proved the
+            // prefix fits whichever one applies.
             if (prefixLen > 0)
-                outputData.AsSpan(prevOffset, prefixLen).CopyTo(outputData.AsSpan(outputPos));
+            {
+                var source = i == 0 ? carry : outputData.AsSpan(prevOffset, prefixLen);
+                source.Slice(0, prefixLen).CopyTo(outputData.AsSpan(outputPos));
+            }
 
             // Copy suffix from raw data
             if (suffixLen > 0)
@@ -119,6 +137,10 @@ internal static class DeltaByteArrayDecoder
             suffixPos += suffixLen;
         }
         offsets[count] = outputPos;
+
+        // Hand the last value to the next page, which may build its own first value on it.
+        if (count > 0)
+            state.SetDeltaByteArrayCarry(outputData.AsSpan(prevOffset, prevLength));
 
         if (fixedWidth)
         {
