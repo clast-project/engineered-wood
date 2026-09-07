@@ -388,8 +388,15 @@ public sealed class SparkEvaluationCorpusTests
                     continue;
                 }
 
+                // The same hazard the triage was corrected for on #291: skipping silently drops
+                // the expression from a test whose whole contract is that the differences are
+                // EXACTLY the declared ones, and a shrinking corpus would look like a passing one.
+                // No entry in the fixture lacks `eval` today; this keeps it that way loudly.
                 if (!entry.TryGetProperty("eval", out var eval))
+                {
+                    differing[expression] = "corpus entry carries no eval answer";
                     continue;
+                }
 
                 var expectedOk = eval.GetProperty("ok").GetBoolean();
 

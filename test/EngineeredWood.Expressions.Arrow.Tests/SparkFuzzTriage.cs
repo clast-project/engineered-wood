@@ -226,8 +226,12 @@ public sealed class SparkFuzzTriage
     {
         var expression = entry.GetProperty("expression").GetString()!;
 
+        // No `eval` at all means the corpus was harvested without rows, or was truncated. Calling
+        // that agreement would report a clean run for a corpus that answered nothing -- the one
+        // failure this whole file exists to remove -- so it is named instead.
         if (!entry.TryGetProperty("eval", out var eval))
-            return new Finding(Verdict.Agree, group, expression, "", "");
+            return new Finding(Verdict.Unusable, group, expression,
+                "corpus entry carries no eval answer", "corpus entry carries no eval answer");
 
         var sparkOk = eval.GetProperty("ok").GetBoolean();
         var (array, threw) = Evaluate(expression, batch, registry);
