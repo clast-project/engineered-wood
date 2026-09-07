@@ -1463,6 +1463,152 @@ public class ParquetFileWriterTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A V1 data page honours the encoding options, same as a V2 page (#270). It used to write PLAIN
+    /// for every type no matter what was asked for — the option was accepted and discarded, with the
+    /// footer honestly reporting PLAIN and nothing reporting that a choice had been dropped.
+    /// </summary>
+    /// <remarks>
+    /// The encoding lives in the page header on both page versions, and the values section holds the
+    /// same bytes; only the level framing and the compression boundary are V1-specific. Every encoding
+    /// below is long ratified, and the reader already dispatched on the V1 header's encoding field, so
+    /// this is a write-side gap rather than a format limit — pyarrow writes V1 BYTE_STREAM_SPLIT too.
+    /// </remarks>
+    [Theory]
+    [InlineData(DataPageVersion.V1)]
+    [InlineData(DataPageVersion.V2)]
+    public async Task EncodingOptions_AreHonoured_OnBothPageVersions(DataPageVersion pageVersion)
+    {
+        string path = TempPath($"encodings_{pageVersion}.parquet");
+        var options = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = pageVersion,
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = false,   // otherwise the dictionary answers and no fallback is reached
+            FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit,
+            IntegerEncoding = IntegerEncoding.DeltaBinaryPacked,
+            ByteArrayEncoding = ByteArrayEncoding.DeltaByteArray,
+        };
+
+        const int rows = 200;
+        var i32 = new Int32Array.Builder();
+        var f64 = new DoubleArray.Builder();
+        var str = new StringArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            i32.Append(i * 7);
+            f64.Append(i * 2.718);
+            str.Append($"prefix-shared-{i:D5}");
+        }
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("i32", Int32Type.Default, false))
+            .Field(new Field("f64", DoubleType.Default, false))
+            .Field(new Field("str", StringType.Default, false))
+            .Build();
+        var batch = new RecordBatch(schema, [i32.Build(), f64.Build(), str.Build()], rows);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var columns = metadata.RowGroups[0].Columns;
+
+        Assert.Contains(Encoding.DeltaBinaryPacked, columns[0].MetaData!.Encodings);
+        Assert.Contains(Encoding.ByteStreamSplit, columns[1].MetaData!.Encodings);
+        Assert.Contains(Encoding.DeltaByteArray, columns[2].MetaData!.Encodings);
+
+        // And the values still survive the round trip on the encoding that was actually written.
+        await foreach (var readBatch in reader.ReadAllAsync())
+        {
+            var readInts = (Int32Array)readBatch.Column(0);
+            var readDoubles = (DoubleArray)readBatch.Column(1);
+            var readStrings = (StringArray)readBatch.Column(2);
+            for (int i = 0; i < rows; i++)
+            {
+                Assert.Equal(i * 7, readInts.GetValue(i));
+                Assert.Equal(i * 2.718, readDoubles.GetValue(i));
+                Assert.Equal($"prefix-shared-{i:D5}", readStrings.GetString(i));
+            }
+        }
+    }
+
+    /// <summary>
+    /// PLAIN byte arrays stay reachable. Before #270, <see cref="DataPageVersion.V1"/> wrote PLAIN for
+    /// every type, so selecting V1 was the only way to ask for them; now that V1 honours the options,
+    /// <see cref="ByteArrayEncoding.Plain"/> is how, on either page version.
+    /// </summary>
+    [Theory]
+    [InlineData(DataPageVersion.V1)]
+    [InlineData(DataPageVersion.V2)]
+    public async Task ByteArrayEncodingPlain_WritesPlain_OnBothPageVersions(DataPageVersion pageVersion)
+    {
+        string path = TempPath($"plain_ba_{pageVersion}.parquet");
+        var options = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = pageVersion,
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = false,
+            ByteArrayEncoding = ByteArrayEncoding.Plain,
+        };
+
+        var str = new StringArray.Builder();
+        for (int i = 0; i < 200; i++) str.Append($"value-{i:D5}");
+        var batch = MakeBatch(new Field("s", StringType.Default, nullable: false), str.Build());
+
+        await WriteAndVerify(path, batch, readBatch =>
+        {
+            var col = (StringArray)readBatch.Column(0);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal($"value-{i:D5}", col.GetString(i));
+        }, options);
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Contains(Encoding.Plain, metadata.RowGroups[0].Columns[0].MetaData!.Encodings);
+        Assert.DoesNotContain(
+            Encoding.DeltaLengthByteArray, metadata.RowGroups[0].Columns[0].MetaData!.Encodings);
+    }
+
+    /// <summary>
+    /// FSST is the one option a V1 page cannot honour — it needs a symbol table page only the V2
+    /// writer emits — so the combination is refused rather than quietly downgraded to
+    /// DELTA_LENGTH_BYTE_ARRAY. A silent downgrade is the exact defect #270 was filed for.
+    /// </summary>
+    [Fact]
+    public async Task FsstOnV1Pages_IsRefused_NotSilentlyDowngraded()
+    {
+        string path = TempPath("fsst_v1.parquet");
+#pragma warning disable EWPARQUET0003
+        var options = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = DataPageVersion.V1,
+            ByteArrayEncoding = ByteArrayEncoding.Fsst,
+        };
+#pragma warning restore EWPARQUET0003
+
+        var str = new StringArray.Builder();
+        for (int i = 0; i < 200; i++) str.Append($"http://example.com/path/{i:D5}");
+        var batch = MakeBatch(new Field("s", StringType.Default, nullable: false), str.Build());
+
+        await using var file = new LocalSequentialFile(path);
+        await using var writer = new ParquetFileWriter(file, ownsFile: false, options);
+
+        // Columns are encoded in parallel, so a per-column refusal reaches the caller wrapped, the
+        // same as any other failure raised while writing one.
+        var ex = await Assert.ThrowsAsync<AggregateException>(
+            async () => await writer.WriteRowGroupAsync(batch));
+        var inner = Assert.IsType<NotSupportedException>(ex.Flatten().InnerExceptions.Single());
+        Assert.Contains("DataPageVersion.V2", inner.Message);
+    }
+
     [Fact]
     public async Task V2Encoding_Float_UsesByteStreamSplit()
     {
@@ -2743,14 +2889,14 @@ public class ParquetFileWriterTests : IDisposable
     [Fact]
     public void EncodingStrategyResolver_V2_Int32_DeltaBinaryPacked()
     {
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Int32, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.Int32, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.DeltaBinaryPacked, enc);
     }
 
     [Fact]
     public void EncodingStrategyResolver_V2_Float_ByteStreamSplit()
     {
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.ByteStreamSplit, enc);
     }
 
@@ -2758,7 +2904,7 @@ public class ParquetFileWriterTests : IDisposable
     public void EncodingStrategyResolver_V2_Float_Alp()
     {
 #pragma warning disable EWPARQUET0001 // Test exercises the experimental enum value intentionally.
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.Alp, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.Alp, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.Alp, enc);
 #pragma warning restore EWPARQUET0001
     }
@@ -2766,30 +2912,45 @@ public class ParquetFileWriterTests : IDisposable
     [Fact]
     public void EncodingStrategyResolver_V2_Double_Plain()
     {
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Double, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.Plain, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.Double, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.Plain, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.Plain, enc);
     }
 
     [Fact]
     public void EncodingStrategyResolver_V2_ByteArray_Default_DLBA()
     {
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.DeltaLengthByteArray, enc);
     }
 
     [Fact]
     public void EncodingStrategyResolver_V2_ByteArray_DBA()
     {
-        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
+        var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaByteArray, FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.DeltaByteArray, enc);
     }
 
-    [Fact]
-    public void EncodingStrategyResolver_Fallback_V1_AlwaysPlain()
+    /// <summary>
+    /// The fallback encoding no longer depends on the data page version (#270). It used to return
+    /// PLAIN for V1 whatever the caller asked for, which is how <c>FloatingPointEncoding</c>,
+    /// <c>ByteArrayEncoding</c> and <c>IntegerEncoding</c> came to be accepted and silently discarded
+    /// on that page version.
+    /// </summary>
+    [Theory]
+    [InlineData(DataPageVersion.V1)]
+    [InlineData(DataPageVersion.V2)]
+    public void EncodingStrategyResolver_Fallback_HonoursOptionsOnBothPageVersions(
+        DataPageVersion pageVersion)
     {
-        var options = new ParquetWriteOptions { DataPageVersion = DataPageVersion.V1 };
-        var enc = EncodingStrategyResolver.GetFallbackEncoding(PhysicalType.Int32, options);
-        Assert.Equal(Encoding.Plain, enc);
+        var options = new ParquetWriteOptions { DataPageVersion = pageVersion };
+        Assert.Equal(
+            Encoding.DeltaBinaryPacked,
+            EncodingStrategyResolver.GetFallbackEncoding(PhysicalType.Int32, options));
+
+        var plainInts = options with { IntegerEncoding = IntegerEncoding.Plain };
+        Assert.Equal(
+            Encoding.Plain,
+            EncodingStrategyResolver.GetFallbackEncoding(PhysicalType.Int32, plainInts));
     }
 
     [Fact]

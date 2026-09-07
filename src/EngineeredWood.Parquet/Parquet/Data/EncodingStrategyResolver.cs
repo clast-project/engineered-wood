@@ -17,9 +17,12 @@ internal static class EncodingStrategyResolver
         options.DictionaryEnabled && physicalType != PhysicalType.Boolean;
 
     /// <summary>
-    /// Gets the non-dictionary encoding for a V2 data page based on the physical type.
+    /// Gets the non-dictionary encoding for a data page based on the physical type and the caller's
+    /// encoding options. The answer does not depend on the data page version: the values section of a
+    /// V1 page and of a V2 page hold the same bytes, and the format carries the encoding in the page
+    /// header either way. Only the level framing and the compression boundary differ.
     /// </summary>
-    public static Encoding GetV2Encoding(
+    public static Encoding GetValueEncoding(
         PhysicalType physicalType,
         ByteArrayEncoding byteArrayEncoding,
         FloatingPointEncoding floatingPointEncoding,
@@ -50,6 +53,7 @@ internal static class EncodingStrategyResolver
             },
             PhysicalType.ByteArray => byteArrayEncoding switch
             {
+                ByteArrayEncoding.Plain => Encoding.Plain,
                 ByteArrayEncoding.DeltaByteArray => Encoding.DeltaByteArray,
 #pragma warning disable EWPARQUET0003 // FSST is intentionally selectable; the experimental signal lives on the enum values, not internal dispatch.
                 ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16 => Encoding.Fsst,
@@ -62,17 +66,10 @@ internal static class EncodingStrategyResolver
         };
 
     /// <summary>
-    /// Gets the encoding for V1 data pages (always PLAIN).
-    /// </summary>
-    public static Encoding GetV1Encoding() => Encoding.Plain;
-
-    /// <summary>
     /// Resolves the fallback encoding for a column whose dictionary was abandoned
-    /// (e.g. cardinality too high). Returns the appropriate V2 encoding for the type.
+    /// (e.g. cardinality too high).
     /// </summary>
     public static Encoding GetFallbackEncoding(PhysicalType physicalType, ParquetWriteOptions options) =>
-        options.DataPageVersion == DataPageVersion.V2
-            ? GetV2Encoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding,
-                options.IntegerEncoding)
-            : GetV1Encoding();
+        GetValueEncoding(physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding,
+            options.IntegerEncoding);
 }

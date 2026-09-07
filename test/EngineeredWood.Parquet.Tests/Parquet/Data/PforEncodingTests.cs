@@ -758,18 +758,18 @@ public class PforEncodingTests : IDisposable
     [Fact]
     public void Resolver_SelectsPforForIntegerColumnsOnly()
     {
-        Assert.Equal(Encoding.Pfor, EncodingStrategyResolver.GetV2Encoding(
+        Assert.Equal(Encoding.Pfor, EncodingStrategyResolver.GetValueEncoding(
             PhysicalType.Int32, ByteArrayEncoding.DeltaLengthByteArray,
             FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.Pfor));
-        Assert.Equal(Encoding.Pfor, EncodingStrategyResolver.GetV2Encoding(
+        Assert.Equal(Encoding.Pfor, EncodingStrategyResolver.GetValueEncoding(
             PhysicalType.Int64, ByteArrayEncoding.DeltaLengthByteArray,
             FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.Pfor));
 
         // The setting names an integer encoding and must not leak onto anything else.
-        Assert.Equal(Encoding.ByteStreamSplit, EncodingStrategyResolver.GetV2Encoding(
+        Assert.Equal(Encoding.ByteStreamSplit, EncodingStrategyResolver.GetValueEncoding(
             PhysicalType.Double, ByteArrayEncoding.DeltaLengthByteArray,
             FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.Pfor));
-        Assert.Equal(Encoding.DeltaLengthByteArray, EncodingStrategyResolver.GetV2Encoding(
+        Assert.Equal(Encoding.DeltaLengthByteArray, EncodingStrategyResolver.GetValueEncoding(
             PhysicalType.ByteArray, ByteArrayEncoding.DeltaLengthByteArray,
             FloatingPointEncoding.ByteStreamSplit, IntegerEncoding.Pfor));
     }
