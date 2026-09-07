@@ -1104,9 +1104,20 @@ internal sealed class ColumnBuildState : IDisposable
     private int _deltaByteArrayCarryLength;
 
     /// <summary>
-    /// The last DELTA_BYTE_ARRAY value decoded in this column chunk, or empty when no page has been
-    /// decoded yet or the pages were not read in order.
+    /// The last DELTA_BYTE_ARRAY value decoded into this state, or empty when no page has been
+    /// decoded into it yet.
     /// </summary>
+    /// <remarks>
+    /// Nothing here invalidates the carry, so it is only meaningful under the invariant every
+    /// caller currently holds: a fresh state per read, decoded from a CONTIGUOUS run of pages
+    /// (<c>for p = startPage..endPage</c> in both page-map paths, and the whole chunk otherwise).
+    /// Skipping a page mid-run would leave this holding a non-adjacent value, and a cross-page
+    /// prefix would then resolve against the wrong bytes silently -- which is the failure the carry
+    /// exists to prevent. A caller that ever needs to skip must decode into a new state, or clear
+    /// this first. Starting a run PAST the chunk's first page is safe and needs nothing: the state
+    /// is new, so the carry is empty and the decoder refuses a page that depends on a predecessor
+    /// it does not have.
+    /// </remarks>
     public ReadOnlySpan<byte> DeltaByteArrayCarry =>
         _deltaByteArrayCarry is null ? default : _deltaByteArrayCarry.AsSpan(0, _deltaByteArrayCarryLength);
 

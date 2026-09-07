@@ -12,7 +12,10 @@ namespace EngineeredWood.Tests.Parquet.Data;
 /// <summary>
 /// PARQUET-246: parquet-mr before 1.8.0 wrote DELTA_BYTE_ARRAY pages whose FIRST value takes its
 /// prefix from the LAST VALUE OF THE PREVIOUS PAGE, so the pages are not independently decodable.
-/// Our decoder used to be page-local and silently copied NUL bytes where that prefix belonged.
+/// Our decoder was page-local and REFUSED such a page -- its prefix-length validation rejects a
+/// prefix with no predecessor rather than copying the zero bytes reserved for the value, so this
+/// was a capability gap and never silent corruption. parquet-java reads those files correctly with
+/// <c>parquet.split.files=false</c>, by carrying the prefix across the boundary; now so do we.
 /// </summary>
 /// <remarks>
 /// These pages are built by hand because <c>parquet-testing</c> has no affected file: every
