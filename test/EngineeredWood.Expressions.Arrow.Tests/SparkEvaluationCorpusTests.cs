@@ -146,6 +146,12 @@ public sealed class SparkEvaluationCorpusTests
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
+        // ANSI resolves a binary against a string TO binary, moving the string in as UTF-8. We
+        // refuse the pair, because `Cast` has no binary target and `Unify` has no binary branch,
+        // so there is no column to resolve it to. Declared rather than dropped from the corpus:
+        // the legacy dialect refuses this pair outright and we match it there, so the entry is
+        // what says the two dialects are not both agreeing for the same reason. #295.
+        ["coalesce(X'00', '2')"] = "#295: ANSI resolves binary; we have no cast to it",
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",
         ["1S"] = "parser refuses the smallint literal suffix; declared in SparkSqlParserTests",

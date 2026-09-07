@@ -530,6 +530,9 @@ GROUPS = {
         # boolean and renders the date, so these two disagree about more than the target.
         "coalesce(true, '2')",
         "coalesce(CAST('2026-01-01' AS DATE), '2')",
+        # Binary is the one target in this rule we cannot build: ANSI resolves it and we refuse,
+        # which is declared in SparkEvaluationCorpusTests rather than hidden. #295.
+        "coalesce(X'00', '2')",
         # A bare NULL is `void` and constrains nothing: this is an int, not the bigint that
         # unifying with a string placeholder would give.
         "coalesce(a, NULL)",

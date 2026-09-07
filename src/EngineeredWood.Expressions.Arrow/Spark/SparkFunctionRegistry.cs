@@ -1253,7 +1253,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
         foreach (var branch in branches)
         {
-            if (branch is StringArray && AllNull(branch, rowCount))
+            if (IsNullLiteralPlaceholder(branch, rowCount))
                 continue;
 
             var candidate = branch.Data.DataType;
@@ -1261,6 +1261,27 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         }
 
         return type ?? StringType.Default;
+    }
+
+    /// <summary>Whether a branch is the all-null string column a bare <c>NULL</c> arrives as.</summary>
+    /// <remarks>
+    /// Asks Arrow for the null count rather than reading every row: this runs once per branch on
+    /// every conditional evaluation, and a column already knows how many nulls it holds. The scan
+    /// remains for the case where the array's length does not match the rows being evaluated,
+    /// where the count says nothing about the range in question.
+    /// <para>
+    /// Keyed on the logical <see cref="StringType"/> rather than on <c>is StringArray</c>, so any
+    /// other array class carrying the same type is treated the same way.
+    /// </para>
+    /// </remarks>
+    private static bool IsNullLiteralPlaceholder(IArrowArray branch, int rowCount)
+    {
+        if (branch.Data.DataType is not StringType)
+            return false;
+
+        return branch.Length == rowCount
+            ? branch.NullCount == rowCount
+            : AllNull(branch, rowCount);
     }
 
     private IArrowType UnifyBranchTypes(IArrowType left, IArrowType right)
@@ -1320,9 +1341,15 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         if (SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other))
             return DoubleType.Default;
 
-        if (other is BooleanType or BinaryType or TimestampType || SparkArrays.IsDateType(other))
+        if (other is BooleanType or TimestampType || SparkArrays.IsDateType(other))
             return other;
 
+        // BINARY IS MEASURED AND STILL DECLINED. ANSI resolves `coalesce(X'00', '2')` to binary,
+        // moving the string into it as UTF-8 -- but `Cast` has no binary target and `Unify` has no
+        // binary branch, so naming that type here would promise a column nothing can build and
+        // trade "no common type" for "cast to 'BINARY' is not implemented" one call later.
+        // Declining keeps the refusal this pair already had before #278 and keeps this function
+        // honest about what it can deliver. #295, and declared in the corpus so it cannot drift.
         return null;
     }
 

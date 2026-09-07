@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-07 13:41:55.713506",
-      "2026-09-07 13:41:55.713506",
-      "2026-09-07 13:41:55.713506"
+      "2026-09-07 14:00:29.004085",
+      "2026-09-07 14:00:29.004085",
+      "2026-09-07 14:00:29.004085"
      ]
     }
    },
@@ -6582,6 +6582,26 @@
     }
    },
    {
+    "expression": "coalesce(X'00', '2')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(X'00', '2')"
+    },
+    "type": {
+     "ok": true,
+     "type": "binary"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bytearray(b'\\x00')",
+      "bytearray(b'\\x00')",
+      "bytearray(b'\\x00')"
+     ]
+    }
+   },
+   {
     "expression": "coalesce(a, NULL)",
     "parse": {
      "ok": true,
@@ -6746,11 +6766,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1399]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1403]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1400]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1404]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
     }
    },
    {
@@ -6762,11 +6782,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1401]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1405]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1402]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1406]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
     }
    }
   ],
@@ -10741,11 +10761,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, a#0) AS r#2195]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fals"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, a#0) AS r#2199]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fals"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, a#19) AS r#2196]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, a)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"a\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, a#19) AS r#2200]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
     }
    },
    {
@@ -10757,11 +10777,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, cast(sh#2 as int)) AS r#2197]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#4, cast(sh#2 as int)) AS r#2201]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, cast(sh#21 as int)) AS r#2198]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.NON_FOLDABLE_INPUT] Cannot resolve \"round(g, sh)\" due to data type mismatch: the input `scale` should be a foldable \"INT\" expression; however, got \"sh\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(g#23, cast(sh#21 as int)) AS r#2202]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
     }
    },
    {
@@ -13035,11 +13055,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#12 IN (a#0,bl#16) AS r#2651]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#12 IN (a#0,bl#16) AS r#2655]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#31 IN (a#19,bl#35) AS r#2652]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as s"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(ns IN (a, bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"STRING\", \"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [ns#31 IN (a#19,bl#35) AS r#2656]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as s"
     }
    },
    {
@@ -13051,11 +13071,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#2653]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#2657]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#2654]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#2658]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
     }
    },
    {
@@ -20093,6 +20113,22 @@
      }
     },
     {
+     "expression": "coalesce(X'00', '2')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(X'00', '2')"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1266]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1267]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+     }
+    },
+    {
      "expression": "coalesce(a, NULL)",
      "parse": {
       "ok": true,
@@ -20261,11 +20297,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1298]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1300]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1299]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1301]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
      }
     },
     {
@@ -20277,11 +20313,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1300]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1302]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1301]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1303]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
      }
     }
    ]
