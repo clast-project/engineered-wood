@@ -1152,7 +1152,14 @@ def main():
                     "Answers come from Spark and are only valid under `conf`.",
         # Derived, not typed. It said "pyspark 4.0.1" while `spark_version` beside it read
         # 4.0.3, because the version moved with the venv and the prose did not.
-        "source": f"delta-spark interop tier (pyspark {result['spark_version']})",
+        #
+        # It says SPARK, not pyspark, and the distinction is the point: this value is
+        # `spark.version` off the live session -- the JVM that actually computed the answers --
+        # not the version of the pyspark package that started it. They agree in a stock venv and
+        # are free not to, and it is the JVM's version that an answer is a property of. Same
+        # reasoning as recording `java_version`. The tier keeps its name because that is the
+        # harness the harvest runs through, not a version claim about delta-spark.
+        "source": f"delta-spark interop tier (spark {result['spark_version']})",
         "conf": result["conf"],
         # The JVM belongs next to the conf, not in the prose. Anything that renders a double goes
         # through Double.toString, which did not produce the shortest representation before JDK 19
