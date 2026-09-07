@@ -1084,8 +1084,11 @@ internal static class ColumnChunkWriter
         int valuesLength = EncodeValuesToBuffer(
             array, offset, numValues, nonNullCount, physicalType, typeLength,
             valueDefLevels, options, fsstColumn: null, valueIndex: 0, out valueEncoding);
-        // Copied out because CompressTo below reads a span of t_valuesBuffer while the body it is
-        // handed must already hold the levels in front of those bytes.
+        // A view into the shared encode buffer, not a copy — valid only until the next call that
+        // writes t_valuesBuffer, and consumed below when the body is assembled. The staging through
+        // `uncompressedBody` is what the V1 page format costs: levels sit IN FRONT of the values and
+        // the whole thing is compressed as one unit, so the values cannot be compressed where they
+        // lie. The V2 path has no such constraint and calls CompressTo on this buffer directly.
         var valuesBytes = t_valuesBuffer.AsSpan(0, valuesLength);
 
         // Concatenate levels + values, then compress together (V1)
