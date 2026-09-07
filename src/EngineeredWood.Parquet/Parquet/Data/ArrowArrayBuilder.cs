@@ -1094,6 +1094,43 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>The Parquet physical type for this column.</summary>
     public PhysicalType PhysicalType => _physicalType;
 
+    // A DELTA_BYTE_ARRAY value takes its prefix from the value BEFORE it, and parquet-mr before
+    // 1.8.0 let that reference cross a page boundary (PARQUET-246), so such a page cannot be
+    // decoded on its own. Holding the chunk's last decoded value here lets the next page resolve
+    // that prefix instead of silently reading zeros out of its own empty output buffer. One
+    // value-sized copy per page, and a conforming writer never consults it: it restarts the prefix
+    // at every page, so the first value's prefix length is zero.
+    private byte[]? _deltaByteArrayCarry;
+    private int _deltaByteArrayCarryLength;
+
+    /// <summary>
+    /// The last DELTA_BYTE_ARRAY value decoded into this state, or empty when no page has been
+    /// decoded into it yet.
+    /// </summary>
+    /// <remarks>
+    /// Nothing here invalidates the carry, so it is only meaningful under the invariant every
+    /// caller currently holds: a fresh state per read, decoded from a CONTIGUOUS run of pages
+    /// (<c>for p = startPage..endPage</c> in both page-map paths, and the whole chunk otherwise).
+    /// Skipping a page mid-run would leave this holding a non-adjacent value, and a cross-page
+    /// prefix would then resolve against the wrong bytes silently -- which is the failure the carry
+    /// exists to prevent. A caller that ever needs to skip must decode into a new state, or clear
+    /// this first. Starting a run PAST the chunk's first page is safe and needs nothing: the state
+    /// is new, so the carry is empty and the decoder refuses a page that depends on a predecessor
+    /// it does not have.
+    /// </remarks>
+    public ReadOnlySpan<byte> DeltaByteArrayCarry =>
+        _deltaByteArrayCarry is null ? default : _deltaByteArrayCarry.AsSpan(0, _deltaByteArrayCarryLength);
+
+    /// <summary>Records this page's last value so the next page can build a prefix on it.</summary>
+    public void SetDeltaByteArrayCarry(ReadOnlySpan<byte> value)
+    {
+        if (_deltaByteArrayCarry is null || _deltaByteArrayCarry.Length < value.Length)
+            _deltaByteArrayCarry = new byte[Math.Max(value.Length, 64)];
+
+        value.CopyTo(_deltaByteArrayCarry);
+        _deltaByteArrayCarryLength = value.Length;
+    }
+
     /// <summary>
     /// The declared <c>TimeUnit</c> when this column is an extended-precision timestamp carrier,
     /// otherwise <see langword="null"/>.

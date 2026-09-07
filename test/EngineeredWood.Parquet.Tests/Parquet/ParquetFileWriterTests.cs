@@ -1379,6 +1379,51 @@ public class ParquetFileWriterTests : IDisposable
 
     // --- V2 Advanced Encoding Tests ---
 
+    /// <summary>
+    /// <para>The default <c>created_by</c> must carry a parseable version. Readers use that field to
+    /// decide whether a file needs a version-keyed workaround and they fail CLOSED: parquet-java's
+    /// <c>CorruptDeltaByteArrays</c> treats a <c>created_by</c> its <c>VersionParser</c> cannot read
+    /// as possibly affected by PARQUET-246, so a bare application name made Spark's non-vectorized
+    /// reader refuse every DELTA_BYTE_ARRAY column we wrote (#275).</para>
+    ///
+    /// <para>The " version " keyword is the load-bearing part — measured, every
+    /// <c>&lt;app&gt; version &lt;v&gt;</c> spelling is accepted and the bare name is not.</para>
+    ///
+    /// <para>The emptiness assertion is not padding. <c>ParquetWriteOptions.Default</c> is a static
+    /// field declared above the default's own storage, and a first attempt held that default in a
+    /// sibling static field: initializers run in declaration order, so <c>Default</c> was built
+    /// while the field was still null and <c>Default.CreatedBy</c> came out EMPTY, silently. Only
+    /// reading the value back catches that.</para>
+    /// </summary>
+    [Fact]
+    public async Task DefaultCreatedBy_CarriesAParseableVersion()
+    {
+        string createdBy = ParquetWriteOptions.Default.CreatedBy;
+
+        Assert.False(string.IsNullOrWhiteSpace(createdBy));
+        Assert.StartsWith("EngineeredWood version ", createdBy, StringComparison.Ordinal);
+        // parquet-java's VersionParser wants a semantic version after the keyword.
+        Assert.Matches(@"^EngineeredWood version \d+\.\d+\.\d+", createdBy);
+
+        // And it must survive the round trip into the footer, since that is where readers look.
+        string path = TempPath("default_created_by.parquet");
+        var batch = MakeBatch(
+            new Field("id", Int32Type.Default, nullable: false),
+            new Int32Array.Builder().AppendRange(Enumerable.Range(0, 10)).Build());
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, ParquetWriteOptions.Default))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(createdBy, metadata.CreatedBy);
+    }
+
     [Fact]
     public async Task V2Encoding_Int32_UsesDeltaBinaryPacked()
     {
