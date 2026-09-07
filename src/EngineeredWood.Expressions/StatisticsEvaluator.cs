@@ -150,7 +150,7 @@ public static class StatisticsEvaluator
         bool minExact = accessor.IsMinExact(stats, column);
         bool maxExact = accessor.IsMaxExact(stats, column);
 
-        return op switch
+        var result = op switch
         {
             ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual =>
                 EvaluateEqual(min.Value, max.Value, value, minExact, maxExact, nullCount),
@@ -169,7 +169,88 @@ public static class StatisticsEvaluator
             ComparisonOperator.NotStartsWith => FilterResult.Unknown,
             _ => FilterResult.Unknown,
         };
+
+        // Everything above reasons about the rows the bounds describe. On a floating column the
+        // bounds may not describe all of them, so a definite answer has to survive the row they miss.
+        if (result != FilterResult.Unknown
+            && MayContainNaN(min.Value, max.Value, stats, accessor, column)
+            && NaNRowAnswer(op, value) != result)
+        {
+            return FilterResult.Unknown;
+        }
+
+        return result;
     }
+
+    /// <summary>
+    /// Whether a NaN may sit in this column outside what its bounds say.
+    /// </summary>
+    /// <remarks>
+    /// The bounds of a floating column do not settle the question, because the producers disagree
+    /// about what they mean. Parquet's spec says NaN must NOT be written to min/max, and Vortex
+    /// does the same, so <c>[1.0, NaN]</c> presents as a perfectly ordinary <c>min = max = 1.0</c>.
+    /// Spark's Delta writer does the opposite and records the NaN as the maximum -- measured, the
+    /// JSON string <c>"NaN"</c> -- while delta-rs, writing the SAME format, drops it and leaves the
+    /// finite bound. A reader cannot tell those two files apart.
+    /// <para>
+    /// So the only thing that settles it is a separate count, which is exactly what
+    /// <see cref="INanCountAccessor{TStats}"/> carries. Absent one, assume a NaN may be there.
+    /// </para>
+    /// </remarks>
+    private static bool MayContainNaN<TStats>(
+        LiteralValue min, LiteralValue max, TStats stats,
+        IStatisticsAccessor<TStats> accessor, string column)
+    {
+        if (!min.IsFloatingPoint && !max.IsFloatingPoint)
+            return false;
+
+        return accessor is not INanCountAccessor<TStats> nanAccessor
+            || nanAccessor.GetNanCount(stats, column) is not 0;
+    }
+
+    /// <summary>
+    /// What the predicate answers for a row holding NaN, as a <see cref="FilterResult"/> so it can
+    /// be compared against the answer the bounds gave.
+    /// </summary>
+    /// <remarks>
+    /// NaN sits at the TOP of SQL's order (#204), which is what makes this asymmetric rather than
+    /// simply fatal to pruning. <c>col &gt; 5.0</c> is TRUE of a NaN row, so an AlwaysFalse derived
+    /// from a finite maximum is wrong and the row group must be kept; <c>col &lt; 5.0</c> is FALSE
+    /// of it, so the same AlwaysFalse survives. Equality survives too -- a NaN equals nothing but
+    /// another NaN -- which is what keeps <c>=</c> and <c>IN</c> pruning on float columns.
+    /// <para>
+    /// The order comes from <see cref="LiteralValue.CompareTo(LiteralValue, out bool)"/> rather
+    /// than being restated here, so the NaN a predicate names compares against the NaN a column
+    /// holds by exactly one rule.
+    /// </para>
+    /// </remarks>
+    private static FilterResult NaNRowAnswer(ComparisonOperator op, LiteralValue value)
+    {
+        int c = SafeCompare(s_nan, value);
+        if (c == int.MinValue)
+            return FilterResult.Unknown;
+
+        return op switch
+        {
+            ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual => Of(c == 0),
+            ComparisonOperator.NotEqual => Of(c != 0),
+            ComparisonOperator.LessThan => Of(c < 0),
+            ComparisonOperator.LessThanOrEqual => Of(c <= 0),
+            ComparisonOperator.GreaterThan => Of(c > 0),
+            ComparisonOperator.GreaterThanOrEqual => Of(c >= 0),
+            // STARTS WITH is a string operator; a float column never reaches it with an answer.
+            _ => FilterResult.Unknown,
+        };
+
+        static FilterResult Of(bool answer) =>
+            answer ? FilterResult.AlwaysTrue : FilterResult.AlwaysFalse;
+    }
+
+    /// <summary>
+    /// The NaN a hidden row would hold. Kind <c>Double</c> for every float width: the comparison
+    /// widens to double, and NaN's place in the order does not depend on how many bits it took.
+    /// </summary>
+    private static readonly LiteralValue s_nan = LiteralValue.Of(double.NaN);
 
     private static FilterResult EvaluateEqual(
         LiteralValue min, LiteralValue max, LiteralValue v,
@@ -445,6 +526,11 @@ public static class StatisticsEvaluator
         if (min is null || max is null)
             return FilterResult.Unknown;
 
+        // A hidden NaN matches nothing but a NaN, so an IN list of ordinary numbers still prunes a
+        // float column -- unlike `>`, which a NaN row satisfies. Only a NaN IN the list can be
+        // matched by the row the bounds do not describe.
+        bool mayBeNaN = MayContainNaN(min.Value, max.Value, stats, accessor, column!);
+
         // For IN: AlwaysFalse if every value in the set is outside [min, max].
         // For NOT IN: complement.
         bool allOutside = true;
@@ -456,6 +542,12 @@ public static class StatisticsEvaluator
                 return FilterResult.Unknown;
 
             if (cmpVMin >= 0 && cmpVMax <= 0)
+            {
+                allOutside = false;
+                break;
+            }
+
+            if (mayBeNaN && SafeCompare(s_nan, v) is 0 or int.MinValue)
             {
                 allOutside = false;
                 break;

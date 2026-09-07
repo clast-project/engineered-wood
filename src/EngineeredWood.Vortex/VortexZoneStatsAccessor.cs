@@ -49,7 +49,8 @@ internal sealed class VortexZoneCursor
 /// against natural .NET types (<c>DateOnly</c>, <c>TimeOnly</c>,
 /// <see cref="DateTimeOffset"/>) without knowing each column's storage unit.
 /// </remarks>
-internal sealed class VortexZoneStatsAccessor : IStatisticsAccessor<VortexZoneCursor>
+internal sealed class VortexZoneStatsAccessor
+    : IStatisticsAccessor<VortexZoneCursor>, INanCountAccessor<VortexZoneCursor>
 {
     private readonly Apache.Arrow.Schema _schema;
 
@@ -81,6 +82,22 @@ internal sealed class VortexZoneStatsAccessor : IStatisticsAccessor<VortexZoneCu
         // NullCount is a non-nullable u64. Cast unchecked — zone sizes vastly
         // smaller than long.MaxValue in any realistic file.
         return unchecked((long)stats.NullCount.GetValue(cursor.ZoneIndex)!.Value);
+    }
+
+    /// <summary>
+    /// The zone's NaN count, which the writer records for every Float32/Float64 column.
+    /// </summary>
+    /// <remarks>
+    /// Vortex min/max EXCLUDE NaN (<c>ArrayStatsComputer.MinMaxFloat64</c> skips it), so a zone
+    /// holding <c>[1.0, NaN]</c> has the same bounds as one holding <c>[1.0, 1.0]</c>. Without this
+    /// count the evaluator could not tell them apart and would have to refuse to prune either on
+    /// <c>&gt;</c> -- so answering it is what keeps ordinary float pruning working here.
+    /// </remarks>
+    public long? GetNanCount(VortexZoneCursor cursor, string column)
+    {
+        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.NaNCount is null)
+            return null;
+        return unchecked((long)stats.NaNCount.GetValue(cursor.ZoneIndex)!.Value);
     }
 
     public long? GetValueCount(VortexZoneCursor cursor, string column)

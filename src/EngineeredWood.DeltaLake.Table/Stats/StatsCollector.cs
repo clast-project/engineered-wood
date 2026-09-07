@@ -299,11 +299,13 @@ internal static class StatsCollector
             case Int8Array int8:
                 CollectNumericMinMax(name, int8, minValues, maxValues);
                 break;
+            // The floating cases pass an isNaN test, because a NaN does not belong where
+            // T.CompareTo puts it -- see CollectNumericMinMax.
             case DoubleArray dbl:
-                CollectNumericMinMax(name, dbl, minValues, maxValues);
+                CollectNumericMinMax(name, dbl, minValues, maxValues, double.IsNaN);
                 break;
             case FloatArray flt:
-                CollectNumericMinMax(name, flt, minValues, maxValues);
+                CollectNumericMinMax(name, flt, minValues, maxValues, float.IsNaN);
                 break;
             case StringArray str:
                 CollectStringMinMax(name, str, minValues, maxValues);
@@ -341,10 +343,23 @@ internal static class StatsCollector
         }
     }
 
+    /// <summary>
+    /// Bounds for a numeric column. <paramref name="isNaN"/> is supplied for the floating types
+    /// only, and moves NaN from the bottom of the order to the top.
+    /// </summary>
+    /// <remarks>
+    /// <c>double.CompareTo</c> sorts NaN BELOW every value, so a file holding <c>[1.0, NaN]</c>
+    /// was recorded as <c>min = NaN, max = 1.0</c>. Under the order the reader uses (#204) those
+    /// bounds are not merely imprecise, they are INVERTED -- <c>min &gt; max</c>, which every
+    /// consumer of a range assumes cannot happen. Measured, Spark writes that same file as
+    /// <c>min = 3.0, max = "NaN"</c>: the NaN is the maximum, and an all-NaN column is
+    /// <c>min = max = "NaN"</c>. Both fall out of ordering NaN at the top.
+    /// </remarks>
     private static void CollectNumericMinMax<T>(
         string name, PrimitiveArray<T> array,
         Dictionary<string, object?> minValues,
-        Dictionary<string, object?> maxValues)
+        Dictionary<string, object?> maxValues,
+        Func<T, bool>? isNaN = null)
         where T : struct, IEquatable<T>, IComparable<T>
     {
         T? min = null;
@@ -355,22 +370,34 @@ internal static class StatsCollector
             if (array.IsNull(i)) continue;
             T val = array.GetValue(i)!.Value;
 
-            if (min is null || val.CompareTo(min.Value) < 0) min = val;
-            if (max is null || val.CompareTo(max.Value) > 0) max = val;
+            if (min is null || Compare(val, min.Value, isNaN) < 0) min = val;
+            if (max is null || Compare(val, max.Value, isNaN) > 0) max = val;
         }
 
         // Merge with existing values from previous batches
         if (min is not null)
         {
             if (minValues.TryGetValue(name, out var existingMin) && existingMin is T em)
-                min = min.Value.CompareTo(em) < 0 ? min : em;
+                min = Compare(min.Value, em, isNaN) < 0 ? min : em;
             minValues[name] = min;
         }
         if (max is not null)
         {
             if (maxValues.TryGetValue(name, out var existingMax) && existingMax is T ex)
-                max = max.Value.CompareTo(ex) > 0 ? max : ex;
+                max = Compare(max.Value, ex, isNaN) > 0 ? max : ex;
             maxValues[name] = max;
+        }
+
+        static int Compare(T a, T b, Func<T, bool>? isNaN)
+        {
+            if (isNaN is null)
+                return a.CompareTo(b);
+
+            bool aNaN = isNaN(a);
+            bool bNaN = isNaN(b);
+            if (aNaN || bNaN)
+                return aNaN && bNaN ? 0 : aNaN ? 1 : -1;
+            return a.CompareTo(b);
         }
     }
 
@@ -700,12 +727,42 @@ internal static class StatsCollector
             case int i: writer.WriteNumberValue(i); break;
             case short s: writer.WriteNumberValue(s); break;
             case sbyte sb: writer.WriteNumberValue(sb); break;
-            case double d: writer.WriteNumberValue(d); break;
-            case float f: writer.WriteNumberValue(f); break;
+            case double d:
+                if (double.IsNaN(d) || double.IsInfinity(d))
+                    writer.WriteStringValue(NonFiniteName(double.IsNaN(d), d > 0));
+                else
+                    writer.WriteNumberValue(d);
+                break;
+            case float f:
+                if (float.IsNaN(f) || float.IsInfinity(f))
+                    writer.WriteStringValue(NonFiniteName(float.IsNaN(f), f > 0));
+                else
+                    writer.WriteNumberValue(f);
+                break;
             case decimal dm: writer.WriteNumberValue(dm); break;
             case string str: writer.WriteStringValue(str); break;
             case bool b: writer.WriteBooleanValue(b); break;
             default: writer.WriteNullValue(); break;
         }
     }
+
+    /// <summary>
+    /// Spells a non-finite bound the way Delta's stats JSON carries it: a quoted STRING, because
+    /// JSON has no NaN or infinity.
+    /// </summary>
+    /// <remarks>
+    /// The names are Java's <c>Double.toString</c> spellings, which is what Spark emits -- measured
+    /// against Spark 4.0, a double column holding an infinity writes
+    /// <c>"minValues":{"g":"-Infinity"},"maxValues":{"g":"Infinity"}</c>. Writing the .NET number
+    /// instead was not an option and never had been: <see cref="Utf8JsonWriter.WriteNumberValue(double)"/>
+    /// THROWS <see cref="ArgumentException"/> for all three values, so until now a Delta write of any
+    /// column containing a NaN or an infinity failed outright rather than writing a wrong bound.
+    /// <para>
+    /// delta-rs, writing the same format, does something third: it omits a NaN from the bounds and
+    /// writes <c>null</c> for an infinity. Spark's spelling is the one to match -- it loses nothing,
+    /// and it is the only one that leaves a NaN visible to a reader.
+    /// </para>
+    /// </remarks>
+    private static string NonFiniteName(bool isNaN, bool isPositive) =>
+        isNaN ? "NaN" : isPositive ? "Infinity" : "-Infinity";
 }

@@ -102,6 +102,13 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// <summary>Returns true if this value is null.</summary>
     public bool IsNull => _kind == Kind.Null;
 
+    /// <summary>
+    /// Whether this value has a floating-point kind, and so belongs to the only order that
+    /// contains a NaN. A bound of this kind may be describing a column whose NaNs the bound
+    /// itself does not mention -- see <see cref="StatisticsEvaluator"/>.
+    /// </summary>
+    internal bool IsFloatingPoint => _kind is Kind.Float or Kind.Double or Kind.Half;
+
     /// <summary>The null literal.</summary>
     public static LiteralValue Null { get; } = default;
 
