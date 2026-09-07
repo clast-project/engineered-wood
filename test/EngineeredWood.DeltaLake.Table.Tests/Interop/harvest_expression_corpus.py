@@ -71,7 +71,10 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 # only make the fixture harder to read.
 LEGACY_GROUPS = (
     "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
-    "double-to-decimal", "string-coercion", "numeric-text")
+    "double-to-decimal", "string-coercion", "numeric-text",
+    # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
+    # legacy answers are a different rule rather than a different failure mode.
+    "conditional-string-coercion")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -479,6 +482,74 @@ GROUPS = {
         # Rendered as well as valued: a wrong pick and a wrong spelling are different defects.
         "CAST(greatest(CAST('NaN' AS DOUBLE), -1.5BD) AS STRING)",
         "CAST(least(CAST('NaN' AS DOUBLE), CAST('-Infinity' AS DOUBLE)) AS STRING)",
+    ],
+
+    # Issue #278, found by fuzz_expressions.py: we refused a string branch against a numeric one
+    # with "no common type for int64 and utf8". Spark coerces -- and the TWO DIALECTS COERCE IN
+    # OPPOSITE DIRECTIONS, which is the whole reason this group is in LEGACY_GROUPS while #277's
+    # is not. Under ANSI the STRING moves to the other type; under legacy the OTHER TYPE moves to
+    # string. `coalesce(CAST(1 AS INT), '2')` is a bigint holding 1 under ANSI and a string
+    # holding '1' under legacy.
+    #
+    # The family is coalesce/nvl/ifnull/if/CASE. greatest/least are NOT in it: they refuse the
+    # same pair under both dialects, and the two guards at the end of this list pin that so the
+    # coercion cannot leak into them.
+    "conditional-string-coercion": [
+        # ANSI widens: every integral width goes to bigint, every fractional one to double.
+        "coalesce(CAST(1 AS INT), '2')",
+        "coalesce(CAST(1 AS BIGINT), '2')",
+        "coalesce(CAST(1 AS SMALLINT), '2')",
+        "coalesce(CAST(1 AS TINYINT), '2')",
+        "coalesce(CAST(1.5 AS FLOAT), '2')",
+        "coalesce(CAST(1.5 AS DOUBLE), '2')",
+        "coalesce(CAST(1.5 AS DECIMAL(10,2)), '2')",
+        # Operand order does not change the target.
+        "coalesce('2', CAST(1 AS INT))",
+        # The rest of the family answers the same way.
+        "nvl(CAST(1 AS INT), '2')",
+        "ifnull(CAST(1 AS INT), '2')",
+        "if(true, CAST(1 AS INT), '2')",
+        "if(false, CAST(1.5 AS DECIMAL(10,2)), '2')",
+        "CASE WHEN true THEN CAST(1 AS INT) ELSE '2' END",
+        "CASE WHEN false THEN CAST(1 AS INT) ELSE '2' END",
+        # ONLY THE CHOSEN BRANCH IS CONVERTED. The first answers 1 and does not raise even though
+        # 'abc' is not a number, because no row selects it; the second raises under ANSI because
+        # the string IS what the row gets. This pair is the reason the cast is masked to the
+        # winning rows rather than applied to the column.
+        "coalesce(CAST(1 AS INT), 'abc')",
+        "coalesce(CAST(NULL AS INT), 'abc')",
+        "coalesce(CAST(NULL AS INT), '2')",
+        # A string that reaches an INTEGRAL target obeys the integral rules, so a decimal point or
+        # an exponent is refused under ANSI where a double target would take it. #243, #258.
+        "ifnull(CAST(NULL AS DOUBLE), '  1.5  ')",
+        "ifnull(CAST(NULL AS INT), '1e2')",
+        "ifnull(CAST(NULL AS BIGINT), '2.7')",
+        # Three branches fold pairwise, so the target keeps widening.
+        "coalesce(CAST(NULL AS INT), '2', CAST(3.5 AS DOUBLE))",
+        # Non-numeric partners. ANSI takes the string into a boolean or a date; legacy REFUSES the
+        # boolean and renders the date, so these two disagree about more than the target.
+        "coalesce(true, '2')",
+        "coalesce(CAST('2026-01-01' AS DATE), '2')",
+        # Binary is the one target in this rule we cannot build: ANSI resolves it and we refuse,
+        # which is declared in SparkEvaluationCorpusTests rather than hidden. #295.
+        "coalesce(X'00', '2')",
+        # A bare NULL is `void` and constrains nothing: this is an int, not the bigint that
+        # unifying with a string placeholder would give.
+        "coalesce(a, NULL)",
+        # round() takes a string as a DOUBLE under both dialects; only the failure differs.
+        "round('1.5', 2)",
+        "round('1.5')",
+        "round('abc', 2)",
+        "round(CAST(NULL AS STRING), 2)",
+        # nullif keeps its FIRST argument's type rather than a unified one, under both dialects.
+        "nullif(CAST(1 AS INT), '1')",
+        "nullif(CAST(1 AS INT), '2')",
+        "nullif('1', CAST(1 AS INT))",
+        # THE GUARDS. greatest/least refuse a string against a number in BOTH dialects. They share
+        # every other part of this machinery, so without these the coercion could spread into them
+        # unnoticed.
+        "greatest(CAST(1 AS INT), '2')",
+        "least(CAST(1 AS INT), '2')",
     ],
 
     "wide-decimal": [
