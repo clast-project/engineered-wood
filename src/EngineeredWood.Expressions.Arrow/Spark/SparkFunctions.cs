@@ -426,8 +426,8 @@ internal static class SparkFunctions
         Int8Array or Int16Array or Int32Array or Int64Array =>
             SparkArrays.ReadInt64(left, index)!.Value.CompareTo(SparkArrays.ReadInt64(right, index)!.Value),
 
-        FloatArray or DoubleArray =>
-            SparkArrays.ReadDouble(left, index)!.Value.CompareTo(SparkArrays.ReadDouble(right, index)!.Value),
+        FloatArray or DoubleArray => CompareDoubles(
+            SparkArrays.ReadDouble(left, index)!.Value, SparkArrays.ReadDouble(right, index)!.Value),
 
         Decimal128Array a => SparkWideDecimals.Compare(a, (Decimal128Array)right, index),
 
@@ -442,6 +442,39 @@ internal static class SparkFunctions
         _ => throw new NotSupportedException(
             $"{left.Data.DataType.Name} cannot be ordered"),
     };
+
+    /// <summary>Orders two floating-point values the way Spark does, which is not .NET's way.</summary>
+    /// <remarks>
+    /// Spark's <c>SQLOrderingUtil.compareDoubles</c> puts <b>NaN above everything</b>, +Infinity
+    /// included, and treats <c>-0.0</c> and <c>0.0</c> as equal. <see cref="double.CompareTo(double)"/>
+    /// does the opposite on both counts: NaN sorts below everything and -0.0 below 0.0. Measured
+    /// against Spark 4.0.3: <c>greatest(NaN, 2.0)</c> is NaN, <c>greatest(NaN, Infinity)</c> is
+    /// NaN, <c>least(NaN, -Infinity)</c> is -Infinity, and NaN against itself is equal.
+    /// <para>
+    /// This surfaced only once #277 stopped refusing a decimal mixed with a double: before that,
+    /// <c>greatest(CAST('NaN' AS DOUBLE), -1.5BD)</c> threw, and afterwards it quietly answered
+    /// -1.5 where Spark answers NaN. Trading a loud refusal for a silent wrong answer is worse
+    /// than either, so the ordering is corrected in the same change.
+    /// </para>
+    /// <para>
+    /// Only <c>greatest</c> and <c>least</c> reach this — <see cref="CompareAt"/> has no other
+    /// caller — so the comparison operators, which answer their own way, are untouched.
+    /// </para>
+    /// </remarks>
+    private static int CompareDoubles(double x, double y)
+    {
+        if (x < y) return -1;
+        if (x > y) return 1;
+
+        // Settles -0.0 against 0.0 as EQUAL, which is the half `CompareTo` gets wrong quietly.
+        if (x == y) return 0;
+
+        // Nothing but a NaN reaches here: it is false against every comparison, itself included.
+        var leftIsNaN = double.IsNaN(x);
+        var rightIsNaN = double.IsNaN(y);
+        if (leftIsNaN && rightIsNaN) return 0;
+        return leftIsNaN ? 1 : -1;
+    }
 
     public static bool AreEqual(IArrowArray left, IArrowArray right, int index)
     {

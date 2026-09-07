@@ -391,6 +391,96 @@ GROUPS = {
         "s = a", "s < a", "dt < ts",
         "concat(s, d1)", "greatest(a, g)", "coalesce(d1, a)",
     ],
+    # Issue #277, found by fuzz_expressions.py: we refused every mix of a decimal with a float
+    # or a double, on the theory that neither has an exact decimal representation. Spark does not
+    # refuse -- it goes the OTHER WAY, promoting the decimal to double and doing the arithmetic
+    # there. Measured identical under both dialects, which is why this group is not in
+    # LEGACY_GROUPS: asking twice would double the fixture for no second answer.
+    #
+    # DIVISION AND MODULO ARE WRITTEN WITH LITERALS, not columns. The boundary row zeroes f, g,
+    # d1 and d2, so `(d1 / g)` divides by zero there -- and `eval` is answered per EXPRESSION, so
+    # one erroring row would replace the answers for all three and the values this group exists to
+    # pin would be lost. The column forms are kept for the operators that have no zero problem.
+    "decimal-float-mixing": [
+        # Arithmetic, both operand orders. The result is a double every time, never a decimal
+        # and never a float.
+        "(d1 + g)",
+        "(d1 - g)",
+        "(d1 * g)",
+        "(g + d1)",
+        "(d3 + g)",
+        "(d5 + g)",
+        # decimal + float is a DOUBLE, not a float -- the case most likely to be guessed wrong.
+        "(d1 + f)",
+        "(d1 * f)",
+        "(f + d1)",
+        # Division and modulo, over literals for the reason above.
+        "(CAST(12.34 AS DECIMAL(10,2)) / CAST(2.5 AS DOUBLE))",
+        "(CAST(2.5 AS DOUBLE) / CAST(12.34 AS DECIMAL(10,2)))",
+        "(CAST(12.34 AS DECIMAL(10,2)) % CAST(2.5 AS DOUBLE))",
+        "(CAST(2.5 AS DOUBLE) % CAST(12.34 AS DECIMAL(10,2)))",
+        # The arithmetic is genuinely done in double, not in decimal and then converted: an exact
+        # decimal 0.1 plus a double 0.2 gives the DOUBLE answer, ulp and all.
+        "(CAST(0.1 AS DECIMAL(38,38)) + CAST(0.2 AS DOUBLE))",
+        "(CAST(1 AS DECIMAL(38,0)) * CAST(3.0 AS DOUBLE))",
+        # The same promotion in every other context that unifies two types.
+        "greatest(d1, g)",
+        "least(d1, g)",
+        "greatest(d1, f)",
+        "greatest(f, d1)",
+        "coalesce(d1, g)",
+        "coalesce(d1, f)",
+        "nvl(d1, g)",
+        "if(true, d1, g)",
+        "CASE WHEN true THEN d1 ELSE g END",
+        "(d1 = g)",
+        "(d1 < g)",
+        # THE NEIGHBOURS. None of these involves a decimal-with-float mix, and all of them sit on
+        # a branch the fix reordered, so they are pinned here to stop it drifting back. `/` is a
+        # double even for two floats while `%` is a float; decimal / decimal stays a decimal;
+        # and unifying an integral with a decimal is still a decimal.
+        "(CAST(1.5 AS FLOAT) / CAST(1.5 AS FLOAT))",
+        "(CAST(1.5 AS FLOAT) % CAST(1.5 AS FLOAT))",
+        "(f + f)",
+        "(f * f)",
+        "(a / a)",
+        "(CAST(1 AS INT) / CAST(1.5 AS FLOAT))",
+        "(CAST(12.34 AS DECIMAL(10,2)) / CAST(1.2345 AS DECIMAL(6,4)))",
+        "(CAST(12.34 AS DECIMAL(10,2)) % CAST(1.2345 AS DECIMAL(6,4)))",
+        "coalesce(f, f)",
+        "coalesce(a, f)",
+        "greatest(a, f)",
+        "coalesce(a, d1)",
+        "greatest(d1, d2)",
+    ],
+
+    # Spark orders NaN ABOVE everything, +Infinity included, and treats -0.0 and 0.0 as equal --
+    # `SQLOrderingUtil.compareDoubles`. .NET's `double.CompareTo` does the opposite on both
+    # counts, so `greatest` and `least` picked the wrong operand.
+    #
+    # This was reachable only after #277 stopped refusing a decimal mixed with a double: before
+    # that the decimal cases threw, and afterwards they quietly answered the wrong value. The
+    # pure-double cases were wrong all along and nothing here had asked about them.
+    "greatest-least-nan": [
+        "greatest(CAST('NaN' AS DOUBLE), CAST(1.0 AS DOUBLE))",
+        "least(CAST('NaN' AS DOUBLE), CAST(1.0 AS DOUBLE))",
+        # NaN outranks the largest ordinary value there is.
+        "greatest(CAST('NaN' AS DOUBLE), CAST('Infinity' AS DOUBLE))",
+        "least(CAST('NaN' AS DOUBLE), CAST('-Infinity' AS DOUBLE))",
+        # NaN against itself is EQUAL here, which is not what `=` says about it.
+        "greatest(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))",
+        "least(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))",
+        "greatest(CAST('NaN' AS FLOAT), CAST(2.0 AS FLOAT))",
+        "least(CAST('NaN' AS FLOAT), CAST(2.0 AS FLOAT))",
+        # The mixes that only #277 made reachable.
+        "greatest(CAST('NaN' AS DOUBLE), -1.5BD)",
+        "least(CAST('NaN' AS DOUBLE), -1.5BD)",
+        "greatest(CAST('NaN' AS FLOAT), 2.5BD)",
+        # Rendered as well as valued: a wrong pick and a wrong spelling are different defects.
+        "CAST(greatest(CAST('NaN' AS DOUBLE), -1.5BD) AS STRING)",
+        "CAST(least(CAST('NaN' AS DOUBLE), CAST('-Infinity' AS DOUBLE)) AS STRING)",
+    ],
+
     "wide-decimal": [
         # Spark decimals reach precision 38; System.Decimal stops near 7.9e28. Everything here
         # lives above that line, so none of it could be evaluated exactly before issue #131 and
@@ -1060,7 +1150,16 @@ def main():
     fixture = {
         "_comment": "Generated by harvest_expression_corpus.py. Do not edit by hand. "
                     "Answers come from Spark and are only valid under `conf`.",
-        "source": "delta-spark interop tier (pyspark 4.0.1)",
+        # Derived, not typed. It said "pyspark 4.0.1" while `spark_version` beside it read
+        # 4.0.3, because the version moved with the venv and the prose did not.
+        #
+        # It says SPARK, not pyspark, and the distinction is the point: this value is
+        # `spark.version` off the live session -- the JVM that actually computed the answers --
+        # not the version of the pyspark package that started it. They agree in a stock venv and
+        # are free not to, and it is the JVM's version that an answer is a property of. Same
+        # reasoning as recording `java_version`. The tier keeps its name because that is the
+        # harness the harvest runs through, not a version claim about delta-spark.
+        "source": f"delta-spark interop tier (spark {result['spark_version']})",
         "conf": result["conf"],
         # The JVM belongs next to the conf, not in the prose. Anything that renders a double goes
         # through Double.toString, which did not produce the shortest representation before JDK 19
