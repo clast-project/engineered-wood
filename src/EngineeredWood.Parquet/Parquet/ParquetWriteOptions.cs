@@ -19,8 +19,8 @@ public enum DataPageVersion
 }
 
 /// <summary>
-/// Controls the non-dictionary fallback encoding for FLOAT and DOUBLE columns
-/// when using V2 data pages.
+/// Controls the non-dictionary fallback encoding for FLOAT and DOUBLE columns, on both data page
+/// versions.
 /// </summary>
 public enum FloatingPointEncoding
 {
@@ -69,8 +69,8 @@ public enum FloatingPointEncoding
 }
 
 /// <summary>
-/// Controls the non-dictionary fallback encoding for INT32 and INT64 columns when using V2 data
-/// pages.
+/// Controls the non-dictionary fallback encoding for INT32 and INT64 columns, on both data page
+/// versions.
 /// </summary>
 public enum IntegerEncoding
 {
@@ -110,8 +110,10 @@ public enum IntegerEncoding
 }
 
 /// <summary>
-/// Controls the non-dictionary fallback encoding for BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY columns
-/// when using V2 data pages.
+/// Controls the non-dictionary fallback encoding for BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY columns.
+/// Every value but <see cref="ByteArrayEncoding.Fsst"/> and <see cref="ByteArrayEncoding.Fsst16"/>
+/// applies to both data page versions; those two are V2 only and are refused on V1 rather than
+/// silently downgraded.
 /// </summary>
 public enum ByteArrayEncoding
 {
@@ -161,6 +163,19 @@ public enum ByteArrayEncoding
     /// </remarks>
     [Experimental("EWPARQUET0003")]
     Fsst16,
+
+    /// <summary>
+    /// PLAIN: a 4-byte little-endian length before each value (BYTE_ARRAY), or the raw fixed-width
+    /// bytes with no length at all (FIXED_LEN_BYTE_ARRAY). The lowest common denominator, readable
+    /// by every Parquet implementation ever written.
+    /// </summary>
+    /// <remarks>
+    /// Until #270, <see cref="DataPageVersion.V1"/> wrote PLAIN for every type no matter what these
+    /// options said, so selecting V1 was the only way to ask for plain byte arrays. Now that a V1
+    /// page honours the encoding options like a V2 page does, this value is how you ask for it — on
+    /// either page version.
+    /// </remarks>
+    Plain,
 }
 
 /// <summary>

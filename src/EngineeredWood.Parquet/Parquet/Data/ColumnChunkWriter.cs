@@ -310,6 +310,23 @@ internal static class ColumnChunkWriter
         // up front — before any page is written — and the pages below are slices of the result.
         // A null here means FSST declined this chunk (nothing to train on, or no size win), and
         // the pages fall back to DELTA_LENGTH_BYTE_ARRAY.
+        // FSST is the one encoding option a V1 page cannot honour: it trains a per-chunk symbol table
+        // written as its own page, and only the V2 page writer carries one. Every other option now
+        // applies to both page versions (#270), so quietly writing DELTA_LENGTH_BYTE_ARRAY here would
+        // leave exactly one place where an encoding is accepted and discarded. Say so instead.
+        if (options.DataPageVersion == DataPageVersion.V1
+            && physicalType == PhysicalType.ByteArray
+#pragma warning disable EWPARQUET0003 // Reporting the caller's own opt-in back to them; not a new use.
+            && options.ByteArrayEncoding is ByteArrayEncoding.Fsst or ByteArrayEncoding.Fsst16)
+#pragma warning restore EWPARQUET0003
+        {
+            throw new NotSupportedException(
+                $"FSST requires {nameof(DataPageVersion)}.{nameof(DataPageVersion.V2)}: it writes a "
+                + "per-column-chunk symbol table page that V1 data pages have no place for. Set "
+                + $"{nameof(ParquetWriteOptions.DataPageVersion)} to V2, or choose another "
+                + $"{nameof(ByteArrayEncoding)} for this column.");
+        }
+
         FsstCompressedColumn? fsstColumn = null;
         int symbolTablePageSize = 0;
         if (UsesFsst(physicalType, options) && nonNullCount > 0)
@@ -353,8 +370,7 @@ internal static class ColumnChunkWriter
                 WriteDataPageV1(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
                     valueDefLevels, options, defEncoder, repEncoder,
-                    ref totalUncompressedSize, ref totalCompressedSize);
-                pageEncoding = Encoding.Plain;
+                    ref totalUncompressedSize, ref totalCompressedSize, out pageEncoding);
             }
 
             encodings.Add(pageEncoding);
@@ -1040,7 +1056,8 @@ internal static class ColumnChunkWriter
         int[]? defLevels, int[]? repLevels, int[]? valueDefLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        ref int totalUncompressed, ref int totalCompressed)
+        ref int totalUncompressed, ref int totalCompressed,
+        out Encoding valueEncoding)
     {
         // Encode levels
         int repRleLen = 0, defRleLen = 0;
@@ -1059,9 +1076,20 @@ internal static class ColumnChunkWriter
             defRleLen = defEncoder.Length;
         }
 
-        // Encode values (use normalized valueDefLevels for null detection)
-        byte[] valuesBytes = EncodeValues(array, offset, numValues, nonNullCount,
-            physicalType, typeLength, valueDefLevels);
+        // Encode values with the same type-aware dispatch the V2 path uses (use normalized
+        // valueDefLevels for null detection). A V1 page's values section is byte-for-byte what a V2
+        // page's would be — the page header carries the encoding either way — so the only thing that
+        // was ever V1-specific here is the level framing and the compression boundary below.
+        // FSST is passed as absent: it is refused for V1 in WriteColumnCore before reaching here.
+        int valuesLength = EncodeValuesToBuffer(
+            array, offset, numValues, nonNullCount, physicalType, typeLength,
+            valueDefLevels, options, fsstColumn: null, valueIndex: 0, out valueEncoding);
+        // A view into the shared encode buffer, not a copy — valid only until the next call that
+        // writes t_valuesBuffer, and consumed below when the body is assembled. The staging through
+        // `uncompressedBody` is what the V1 page format costs: levels sit IN FRONT of the values and
+        // the whole thing is compressed as one unit, so the values cannot be compressed where they
+        // lie. The V2 path has no such constraint and calls CompressTo on this buffer directly.
+        var valuesBytes = t_valuesBuffer.AsSpan(0, valuesLength);
 
         // Concatenate levels + values, then compress together (V1)
         int repPrefixedLen = repRleLen > 0 ? 4 + repRleLen : 0;
@@ -1099,7 +1127,7 @@ internal static class ColumnChunkWriter
             DataPageHeader = new DataPageHeader
             {
                 NumValues = numValues,
-                Encoding = Encoding.Plain,
+                Encoding = valueEncoding,
                 DefinitionLevelEncoding = Encoding.Rle,
                 RepetitionLevelEncoding = Encoding.Rle,
             },
@@ -1157,6 +1185,7 @@ internal static class ColumnChunkWriter
         out Encoding encoding)
     {
         bool useDba = options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray;
+        bool usePlainBa = options.ByteArrayEncoding == ByteArrayEncoding.Plain;
 #pragma warning disable EWPARQUET0001 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
         bool useAlp = options.FloatingPointEncoding == FloatingPointEncoding.Alp;
 #pragma warning restore EWPARQUET0001
@@ -1177,7 +1206,7 @@ internal static class ColumnChunkWriter
             return 0;
         }
 
-        encoding = EncodingStrategyResolver.GetV2Encoding(
+        encoding = EncodingStrategyResolver.GetValueEncoding(
             physicalType, options.ByteArrayEncoding, options.FloatingPointEncoding, options.IntegerEncoding);
 
         // FSST is decided per column chunk, not per page: when the chunk declined it (nothing
@@ -1209,6 +1238,7 @@ internal static class ColumnChunkWriter
                 array, offset, numValues, nonNullCount, defLevels, ref encoding),
             PhysicalType.Double when usePlainFp => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.Double => EncodeBssDoubleToBuffer(array, offset, numValues, nonNullCount, defLevels),
+            PhysicalType.ByteArray when usePlainBa => EncodePlainToBuffer(array, offset, numValues, nonNullCount, physicalType, typeLength, defLevels),
             PhysicalType.ByteArray when useDba => EncodeDbaByteArrayToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.ByteArray => EncodeDlbaToBuffer(array, offset, numValues, nonNullCount, defLevels),
             PhysicalType.FixedLenByteArray when useDba => EncodeDbaFlbaToBuffer(array, offset, numValues, nonNullCount, defLevels, typeLength),
