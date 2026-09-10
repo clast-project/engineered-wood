@@ -205,8 +205,9 @@ public sealed class SparkDecimalTextTests
     public void ReadsADigitFromAnyScript()
     {
         // Every BMP character in category Nd, which is the set Character.digit(c, 10) reads and
-        // therefore the set BigDecimal reads. Six scripts, so the rule is a category and not one
-        // block: Arabic-Indic, its extended form, Devanagari, Bengali, Thai, NKo and fullwidth.
+        // therefore the set BigDecimal reads. Seven spellings of three, so the rule is a category
+        // and not one block: Arabic-Indic, its extended form, Devanagari, Bengali, Thai, NKo and
+        // fullwidth.
         foreach (var three in new[] { 0x0663, 0x06F3, 0x0969, 0x09E9, 0x0E53, 0x07C3, 0xFF13 })
             Assert.Equal("3", Unscaled(U(three)));
 

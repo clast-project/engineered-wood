@@ -1152,7 +1152,7 @@ GROUPS = {
         # cast.
         r"'\u0663' + 1", r"'\u0663' > CAST(2 AS DECIMAL(10,0))",
 
-        # Five more scripts, so the rule is a Unicode CATEGORY and not one block.
+        # Six more spellings of three, so the rule is a Unicode CATEGORY and not one block.
         r"CAST('\u06F3' AS DECIMAL(10,2))",   # EXTENDED ARABIC-INDIC DIGIT THREE
         r"CAST('\u0969' AS DECIMAL(10,2))",   # DEVANAGARI DIGIT THREE
         r"CAST('\u09E9' AS DECIMAL(10,2))",   # BENGALI DIGIT THREE
