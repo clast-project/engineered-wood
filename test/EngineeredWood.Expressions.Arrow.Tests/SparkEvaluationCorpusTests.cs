@@ -221,6 +221,20 @@ public sealed class SparkEvaluationCorpusTests
             ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
             ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
+            // #296, found by the `unicode-digits` group and nothing to do with the digit:
+            // ArithmeticResult has no string branch at all, so any string operand reaches
+            // IntegralRank and throws. #180/#259 did this for comparison and arithmetic was never
+            // measured.
+            //
+            // IT IS DECLARED HERE AND NOT IN THE ANSI LIST BECAUSE ONLY THIS DIALECT SEES IT.
+            // The comparison counts any throw as agreement when Spark refuses, and under ANSI
+            // Spark refuses this string as a BIGINT -- so the ANSI section passes on a right
+            // answer for a wrong reason, and the legacy section, where Spark answers NULL, is the
+            // only place the gap is visible. Deleting this entry once #296 lands is what proves
+            // the fix; the ANSI side would not have moved either way.
+            ["'" + Backslash + "u0663' + 1"] =
+                "#296: arithmetic has no string coercion; we throw",
+
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce
             // the shortest representation before JDK 19 (JDK-4511638). This corpus was gathered on

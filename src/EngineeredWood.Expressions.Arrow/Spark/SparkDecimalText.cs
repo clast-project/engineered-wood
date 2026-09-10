@@ -163,6 +163,15 @@ internal static class SparkDecimalText
     /// trailing point (<c>'42.'</c>), a leading point (<c>'.5'</c>), an explicit plus and
     /// surrounding space, and refuses a thousands separator, an empty string and the words .NET's
     /// parser reads as infinities and NaN.
+    /// <para>
+    /// <b>The digits are Unicode-wide and the structure is not</b> — see <see cref="DigitValue"/>.
+    /// Every character this method compares literally — the sign, the point, the exponent marker —
+    /// must be ASCII, and each was measured on its own against a mantissa of digits Spark does
+    /// read: an ARABIC DECIMAL SEPARATOR (U+066B), a FULLWIDTH FULL STOP (U+FF0E), a MINUS SIGN
+    /// (U+2212), a FULLWIDTH PLUS SIGN (U+FF0B) and a FULLWIDTH LATIN CAPITAL LETTER E (U+FF25)
+    /// are all CAST_INVALID_INPUT. Scripts may be mixed freely, though: an ARABIC-INDIC DIGIT
+    /// THREE beside a DEVANAGARI DIGIT THREE reads as 33.
+    /// </para>
     /// </remarks>
     private static bool TrySplit(string text, out string digits, out bool negative, out long exponent)
     {
@@ -180,7 +189,7 @@ internal static class SparkDecimalText
         }
 
         var integerStart = i;
-        while (i < end && IsDigit(text[i])) i++;
+        while (i < end && DigitValue(text[i]) >= 0) i++;
         var integerEnd = i;
 
         var fractionStart = i;
@@ -189,7 +198,7 @@ internal static class SparkDecimalText
         {
             i++;
             fractionStart = i;
-            while (i < end && IsDigit(text[i])) i++;
+            while (i < end && DigitValue(text[i]) >= 0) i++;
             fractionEnd = i;
         }
 
@@ -209,15 +218,18 @@ internal static class SparkDecimalText
                 i++;
             }
 
+            // The EXPONENT takes the wide digit set too -- only its marker and its sign are
+            // ASCII-bound. Measured: '1e<ARABIC-INDIC THREE>' to DECIMAL(10,2) is 1000.00.
             var exponentStart = i;
             long value = 0;
-            while (i < end && IsDigit(text[i]))
+            int exponentDigit;
+            while (i < end && (exponentDigit = DigitValue(text[i])) >= 0)
             {
                 // Clamped rather than overflowed. Java refuses an exponent outside `int`, and this
                 // stops before it can wrap; the clamp is far enough out that no value survives the
                 // digit check below either way.
                 if (value <= int.MaxValue)
-                    value = (value * 10) + (text[i] - '0');
+                    value = (value * 10) + exponentDigit;
 
                 i++;
             }
@@ -245,6 +257,14 @@ internal static class SparkDecimalText
     /// check reads; TRAILING zeros stay, because they are — <c>1.00</c> has an unscaled value of
     /// 100 and a precision of 3. An all-zero value returns the empty string and is counted as one
     /// digit at the call site.
+    /// <para>
+    /// <b>Digits are normalised to ASCII on the way in</b>, which is why this reads a VALUE rather
+    /// than comparing characters: <c>BigInteger.Parse</c> under
+    /// <see cref="NumberStyles.None"/> and the invariant culture reads <c>[0-9]</c> and nothing
+    /// else, so an ARABIC-INDIC DIGIT ZERO has to be recognised as a leading zero here and the
+    /// digits that survive have to be spelt in ASCII by the time they reach it. See
+    /// <see cref="DigitValue"/>.
+    /// </para>
     /// </remarks>
     private static string StripLeadingZeros(
         string text, int integerStart, int integerEnd, int fractionStart, int fractionEnd)
@@ -254,14 +274,16 @@ internal static class SparkDecimalText
 
         for (var i = integerStart; i < integerEnd; i++)
         {
-            if (length == 0 && text[i] == '0') continue;
-            joined[length++] = text[i];
+            var digit = DigitValue(text[i]);
+            if (length == 0 && digit == 0) continue;
+            joined[length++] = (char)('0' + digit);
         }
 
         for (var i = fractionStart; i < fractionEnd; i++)
         {
-            if (length == 0 && text[i] == '0') continue;
-            joined[length++] = text[i];
+            var digit = DigitValue(text[i]);
+            if (length == 0 && digit == 0) continue;
+            joined[length++] = (char)('0' + digit);
         }
 
         return new string(joined, 0, length);
@@ -288,7 +310,46 @@ internal static class SparkDecimalText
         return (start, end);
     }
 
-    private static bool IsDigit(char c) => c >= '0' && c <= '9';
+    /// <summary>
+    /// The value of <paramref name="c"/> as a decimal digit, or -1 when it is not one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A digit is not only <c>[0-9]</c> here.</b> Spark hands the string to Java's
+    /// <c>BigDecimal</c>, which reads whatever <c>Character.digit(c, 10)</c> reads — every BMP
+    /// character in Unicode category Nd — so an ARABIC-INDIC DIGIT THREE (U+0663) cast to
+    /// <c>DECIMAL(10,0)</c> is 3, and we refused it. #283.
+    /// </para>
+    /// <para>
+    /// <b>The decimal target is the only one this is true of</b>, which is why the wide set lives
+    /// in this file rather than in the shared parse. Measured across every numeric target: INT,
+    /// BIGINT, SMALLINT, TINYINT, DOUBLE and FLOAT all answer CAST_INVALID_INPUT for the same
+    /// string, because their parses are <c>UTF8String.toLong</c> and <c>Double.parseDouble</c> and
+    /// both of those compare against <c>'0'</c>..<c>'9'</c>. So
+    /// <see cref="SparkIntegralCasts.Classify"/> keeps its ASCII digit test ON PURPOSE, and
+    /// widening it to match this would be a divergence rather than a fix.
+    /// </para>
+    /// <para>
+    /// <see cref="CharUnicodeInfo.GetDecimalDigitValue(char)"/> is that same set, MEASURED and not
+    /// assumed: dumping every BMP character each one accepts yields the identical 370 characters
+    /// carrying the identical values on JDK 17.0.20, .NET 10 and .NET Framework 4.7.2 — so the
+    /// netstandard2.0 build does not read a narrower Unicode table than the net10.0 one, which is
+    /// the shape of trap #202 hit.
+    /// </para>
+    /// <para>
+    /// <b>Taking a <see cref="char"/> rather than a code point is the rule, not a shortcut.</b>
+    /// BigDecimal walks UTF-16 units, so a supplementary-plane digit is refused however plainly it
+    /// is one: measured, U+1D7D1 MATHEMATICAL BOLD DIGIT THREE — which <c>Character.isDigit(int)</c>
+    /// accepts — is CAST_INVALID_INPUT. Each half of its surrogate pair fails this test on its own,
+    /// which is exactly the answer wanted.
+    /// </para>
+    /// <para>
+    /// The ASCII case is answered before the table lookup because this runs once per character per
+    /// row, and all but a vanishing fraction of the strings that reach it are ASCII.
+    /// </para>
+    /// </remarks>
+    private static int DigitValue(char c) =>
+        c >= '0' && c <= '9' ? c - '0' : CharUnicodeInfo.GetDecimalDigitValue(c);
 
     /// <summary>Narrows a value the range check has already proved fits 128 bits.</summary>
     /// <remarks>

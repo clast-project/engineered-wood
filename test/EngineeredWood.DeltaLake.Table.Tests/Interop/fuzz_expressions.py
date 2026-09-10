@@ -114,8 +114,16 @@ NUMERIC_TEXT = [
     "'true'", "'null'", "'NULL'",
     "'99999999999999999999999999999999999999999'",
     "'0.00000000000000000000000000000000000000001'",
-    "'٣'",   # ARABIC-INDIC DIGIT THREE -- a digit to Character.isDigit, not to a parser
-    "'１'",   # FULLWIDTH DIGIT ONE
+    # Non-ASCII digits, which found #283. The comment here used to say they were "a digit to
+    # Character.isDigit, not to a parser"; measured, that is backwards for one target. Spark's
+    # string-to-DECIMAL parse is BigDecimal and reads every BMP character in category Nd, while
+    # every integral and floating target refuses them -- so which of these two answers is right
+    # depends on the CAST TYPE the template picked, and a template that casts to DECIMAL is the
+    # only one that can find it.
+    "'٣'",   # ARABIC-INDIC DIGIT THREE, category Nd
+    "'１'",   # FULLWIDTH DIGIT ONE, category Nd
+    "'³'",   # SUPERSCRIPT THREE -- digit-LIKE, category No, refused by every target
+    "'𝟑'",  # U+1D7D1, category Nd but supplementary: BigDecimal reads code UNITS and refuses it
 ]
 
 # General strings, for the string functions and the LIKE family.
