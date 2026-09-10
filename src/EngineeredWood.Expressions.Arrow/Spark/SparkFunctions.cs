@@ -320,8 +320,8 @@ internal static class SparkFunctions
             var bytes = new BinaryArray.Builder();
             for (var i = 0; i < rowCount; i++)
             {
-                var value = choice[i] < 0 ? null : SparkArrays.ReadBytes(sources[choice[i]], i);
-                if (value is null) bytes.AppendNull(); else bytes.Append(value.AsSpan());
+                if (choice[i] < 0) bytes.AppendNull();
+                else SparkArrays.AppendBytes(bytes, sources[choice[i]], i);
             }
 
             return bytes.Build();
@@ -453,8 +453,7 @@ internal static class SparkFunctions
         // ordinals. Only greatest/least reach this, and only over a binary/binary pair -- a
         // binary against a STRING is refused by both dialects, unlike coalesce, which coerces it.
         // #295.
-        BinaryArray a => SparkArrays.CompareBytes(
-            SparkArrays.ReadBytes(a, index)!, SparkArrays.ReadBytes(right, index)!),
+        BinaryArray => SparkArrays.CompareBytes(left, right, index),
 
         BooleanArray a => a.GetValue(index)!.Value.CompareTo(((BooleanArray)right).GetValue(index)!.Value),
 
@@ -515,14 +514,11 @@ internal static class SparkFunctions
         // binary against a STRING keeps that string route, and that is Spark's answer too --
         // measured, `nullif(X'FF', CAST(X'FF' AS STRING))` is NULL, because there it is the
         // binary that is rendered as text (#262) rather than the string that is encoded. #295.
-        if (left is BinaryArray && right is BinaryArray)
+        if (left is BinaryArray leftBytes && right is BinaryArray rightBytes)
         {
-            var first = SparkArrays.ReadBytes(left, index);
-            var second = SparkArrays.ReadBytes(right, index);
-
-            return first is null || second is null
-                ? first is null && second is null
-                : SparkArrays.CompareBytes(first, second) == 0;
+            return leftBytes.IsNull(index) || rightBytes.IsNull(index)
+                ? leftBytes.IsNull(index) && rightBytes.IsNull(index)
+                : SparkArrays.CompareBytes(left, right, index) == 0;
         }
 
         if (left is BooleanArray a && right is BooleanArray b)

@@ -1223,9 +1223,9 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             return CastIntegralToBinary(source, type, rowCount);
         }
 
-        // StringArray first: it derives from BinaryArray, and only ReadBytes' own ordering keeps
-        // that harmless.
-        if (source is not StringArray and not BinaryArray)
+        // One check, not one per row -- and a StringArray satisfies it, because it derives from
+        // BinaryArray and its buffer already holds the UTF-8 this cast wants.
+        if (source is not BinaryArray bytes)
         {
             throw new NotSupportedException(
                 $"Spark has no cast from {SparkArrays.Describe(type)} to BINARY in either dialect");
@@ -1234,11 +1234,12 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         var builder = new BinaryArray.Builder();
         for (var i = 0; i < rowCount; i++)
         {
-            var bytes = SparkArrays.ReadBytes(source, i);
-            if (bytes is null) builder.AppendNull();
-            else builder.Append(bytes.AsSpan());
+            if (bytes.IsNull(i)) builder.AppendNull();
+            else builder.Append(bytes.GetBytes(i));
         }
 
+        // The spans above point into `bytes`'s buffer; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(bytes);
         return builder.Build();
     }
 
