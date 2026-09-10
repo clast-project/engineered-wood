@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-10 07:55:59.423373",
-      "2026-09-10 07:55:59.423373",
-      "2026-09-10 07:55:59.423373"
+      "2026-09-10 12:17:08.697321",
+      "2026-09-10 12:17:08.697321",
+      "2026-09-10 12:17:08.697321"
      ]
     }
    },
@@ -14423,6 +14423,712 @@
     }
    }
   ],
+  "nullif-equality": [
+   {
+    "expression": "nullif(1, 7.9e28)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1, 7.9E28D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1, 1e29)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1, 1.0E29D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1, 1e308)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1, 1.0E308D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST('NaN' AS DOUBLE), 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST('NaN' AS DOUBLE), 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1, CAST('Infinity' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1, CAST('Infinity' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST('Infinity' AS DOUBLE), CAST('Infinity' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST('Infinity' AS DOUBLE), CAST('Infinity' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1e29, CAST(1e29 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1.0E29D, CAST(1.0E29D AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(1e29 AS DECIMAL(38,0)), 1e29)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST(1.0E29D AS DECIMAL(38,0)), 1.0E29D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1e29, 2e29)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1.0E29D, 2.0E29D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+29,
+      1e+29,
+      1e+29
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1e308, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1.0E308D, 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+308,
+      1e+308,
+      1e+308
+     ]
+    }
+   },
+   {
+    "expression": "nullif(1e308, 1e308)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(1.0E308D, 1.0E308D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 1e38)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)), 1.0E38D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(0.0 AS DOUBLE), CAST(-0.0 AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST(0.0BD AS DOUBLE), CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('NaN' AS DOUBLE) <=> CAST('NaN' AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(CAST('NaN' AS DOUBLE) <=> CAST('NaN' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.0 AS DOUBLE) = CAST(-0.0 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.0BD AS DOUBLE) = CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "greatest(1, 1e308)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(1, 1.0E308D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+308,
+      1e+308,
+      1e+308
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(1, 1e308)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(1, 1.0E308D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "nullif('1', 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('1', 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif('1.0', 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('1.0', 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.0' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nullif('1.0', 1)) AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nullif('1e0', 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('1e0', 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e0' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nullif('1e0', 1)) AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nullif(' 1', 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(' 1', 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif('abc', 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('abc', 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nullif('abc', 1)) AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nullif('x', 1e308)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('x', 1.0E308D)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nullif('x', 1e308)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nullif('1.0', '1')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('1.0', '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0",
+      "1.0",
+      "1.0"
+     ]
+    }
+   },
+   {
+    "expression": "16777217 = CAST(16777216 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(16777217 = CAST(16777216 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "16777217 > CAST(16777216 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(16777217 > CAST(16777216 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "16777217 <=> CAST(16777216 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(16777217 <=> CAST(16777216 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(16777216 AS FLOAT) IN (16777217)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(16777216 AS FLOAT) IN (16777217))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "nullif(16777217, CAST(16777216 AS FLOAT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(16777217, CAST(16777216 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      16777217,
+      16777217,
+      16777217
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(16777216 AS FLOAT), 16777217)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST(16777216 AS FLOAT), 16777217)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      16777216.0,
+      16777216.0,
+      16777216.0
+     ]
+    }
+   },
+   {
+    "expression": "greatest(16777217, CAST(16777216 AS FLOAT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(16777217, CAST(16777216 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      16777217.0,
+      16777217.0,
+      16777217.0
+     ]
+    }
+   },
+   {
+    "expression": "9007199254740993 = CAST(9007199254740992 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(9007199254740993L = CAST(9007199254740992L AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -21067,6 +21773,728 @@
      }
     }
    ],
+   "nullif-equality": [
+    {
+     "expression": "nullif(1, 7.9e28)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1, 7.9E28D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1, 1e29)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1, 1.0E29D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1, 1e308)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1, 1.0E308D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST('NaN' AS DOUBLE), 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST('NaN' AS DOUBLE), 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "NaN",
+       "NaN",
+       "NaN"
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1, CAST('Infinity' AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1, CAST('Infinity' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       1,
+       1
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST('Infinity' AS DOUBLE), CAST('Infinity' AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST('Infinity' AS DOUBLE), CAST('Infinity' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1e29, CAST(1e29 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1.0E29D, CAST(1.0E29D AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(1e29 AS DECIMAL(38,0)), 1e29)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST(1.0E29D AS DECIMAL(38,0)), 1.0E29D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1e29, 2e29)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1.0E29D, 2.0E29D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+29,
+       1e+29,
+       1e+29
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1e308, 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1.0E308D, 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+308,
+       1e+308,
+       1e+308
+      ]
+     }
+    },
+    {
+     "expression": "nullif(1e308, 1e308)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(1.0E308D, 1.0E308D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 1e38)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)), 1.0E38D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(0.0 AS DOUBLE), CAST(-0.0 AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST(0.0BD AS DOUBLE), CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('NaN' AS DOUBLE) <=> CAST('NaN' AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(CAST('NaN' AS DOUBLE) <=> CAST('NaN' AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.0 AS DOUBLE) = CAST(-0.0 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.0BD AS DOUBLE) = CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "greatest(1, 1e308)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(1, 1.0E308D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+308,
+       1e+308,
+       1e+308
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(1, 1e308)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(1, 1.0E308D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "nullif('1', 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('1', 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('1.0', 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('1.0', 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('1e0', 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('1e0', 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1e0",
+       "1e0",
+       "1e0"
+      ]
+     }
+    },
+    {
+     "expression": "nullif(' 1', 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(' 1', 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('abc', 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('abc', 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "abc",
+       "abc",
+       "abc"
+      ]
+     }
+    },
+    {
+     "expression": "nullif('x', 1e308)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('x', 1.0E308D)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "x",
+       "x",
+       "x"
+      ]
+     }
+    },
+    {
+     "expression": "nullif('1.0', '1')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('1.0', '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.0",
+       "1.0",
+       "1.0"
+      ]
+     }
+    },
+    {
+     "expression": "16777217 = CAST(16777216 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(16777217 = CAST(16777216 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "16777217 > CAST(16777216 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(16777217 > CAST(16777216 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "16777217 <=> CAST(16777216 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(16777217 <=> CAST(16777216 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(16777216 AS FLOAT) IN (16777217)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(16777216 AS FLOAT) IN (16777217))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "nullif(16777217, CAST(16777216 AS FLOAT))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(16777217, CAST(16777216 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(16777216 AS FLOAT), 16777217)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST(16777216 AS FLOAT), 16777217)"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "greatest(16777217, CAST(16777216 AS FLOAT))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(16777217, CAST(16777216 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       16777216.0,
+       16777216.0,
+       16777216.0
+      ]
+     }
+    },
+    {
+     "expression": "9007199254740993 = CAST(9007199254740992 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(9007199254740993L = CAST(9007199254740992L AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    }
+   ],
    "conditional-string-coercion": [
     {
      "expression": "coalesce(CAST(1 AS INT), '2')",
@@ -21497,11 +22925,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#1408]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#1552]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#1409]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#1553]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -21533,11 +22961,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1414]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1558]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1415]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1559]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -21709,11 +23137,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1448]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1592]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1449]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#1593]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
      }
     },
     {
@@ -21725,11 +23153,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1450]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1594]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1451]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1595]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
      }
     }
    ]

@@ -76,6 +76,11 @@ LEGACY_GROUPS = (
     # raising CAST_INVALID_INPUT under ANSI and answering NULL without it, and recording only half
     # of that would leave the legacy registry's version of the rule unmeasured.
     "unicode-digits",
+    # #290. The equality answers themselves are dialect-independent, and that is worth RECORDING
+    # rather than assuming: what the second harvest actually pins is #298's string rows, which
+    # refuse under ANSI and answer under legacy, and #299's float rows, which answer differently
+    # in each. Both were found by this group and neither is visible from one dialect.
+    "nullif-equality",
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
     "conditional-string-coercion")
@@ -1188,6 +1193,66 @@ GROUPS = {
         r"CAST('\u0663.\u0665\u0665' AS DECIMAL(10,1))",
         r"CAST('\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663"
         r"\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663' AS DECIMAL(38,2))",
+    ],
+
+    # Equality between operands that have no exact System.Decimal form, which is `nullif`'s
+    # question alone -- the comparison operators answer their own way and never take this route.
+    # #290: a magnitude past decimal's ceiling near 7.9e28, and every NaN and infinity, reached a
+    # checked conversion that threw a bare OverflowException out of the evaluator.
+    #
+    # THE CEILING IS System.Decimal's, NOT SPARK'S, which is why the boundary rows look arbitrary
+    # from Spark's side: 7.9e28 answers and 1e29 crashed, and Spark has no boundary there at all.
+    "nullif-equality": [
+        # Either side of that ceiling, and far past it.
+        "nullif(1, 7.9e28)", "nullif(1, 1e29)", "nullif(1, 1e308)",
+
+        # Non-finite, which has no exact form at any magnitude -- and where Spark holds a NaN
+        # EQUAL to itself, so an IEEE `==` in the fallback would answer NaN where Spark says NULL.
+        "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))",
+        "nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT))",
+        "nullif(CAST('NaN' AS DOUBLE), 1)",
+        "nullif(1, CAST('Infinity' AS DOUBLE))",
+        "nullif(CAST('Infinity' AS DOUBLE), CAST('Infinity' AS DOUBLE))",
+
+        # The SAME pair either way round. Only one order crashed, because the two sides signalled
+        # "no exact form" with two different exceptions and only one of them was caught.
+        "nullif(1e29, CAST(1e29 AS DECIMAL(38,0)))",
+        "nullif(CAST(1e29 AS DECIMAL(38,0)), 1e29)",
+
+        # Wide and NOT equal, so "neither has an exact form" must not collapse to "equal".
+        "nullif(1e29, 2e29)", "nullif(1e308, 1)", "nullif(1e308, 1e308)",
+
+        # A decimal whose nearest double lands ON the other operand: 38 nines rounds to 1e38.
+        "nullif(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 1e38)",
+
+        # Signed zero, which the exact path and the double path must BOTH call equal.
+        "nullif(CAST(0.0 AS DOUBLE), CAST(-0.0 AS DOUBLE))",
+
+        # Controls: the operators that never took this route, carrying Spark's NaN rule so the
+        # fallback above is agreeing with them rather than holding a second opinion.
+        "CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE)",
+        "CAST('NaN' AS DOUBLE) <=> CAST('NaN' AS DOUBLE)",
+        "CAST('NaN' AS DOUBLE) IN (CAST('NaN' AS DOUBLE))",
+        "CAST(0.0 AS DOUBLE) = CAST(-0.0 AS DOUBLE)",
+        "greatest(1, 1e308)", "coalesce(1, 1e308)",
+
+        # A STRING operand, where the coercion is a different rule again and we compare as text.
+        # #298. 'nullif(...1.0..., 1)' is the discriminator: as text it is neither answer.
+        "nullif('1', 1)", "nullif('1.0', 1)", "nullif('1e0', 1)", "nullif(' 1', 1)",
+        "nullif('abc', 1)", "nullif('x', 1e308)", "nullif('1.0', '1')",
+
+        # An integral against a FLOAT, where the two dialects pick DIFFERENT common types and we
+        # answer ANSI's under both. #299. 16777217 is the first integer a float cannot hold.
+        "16777217 = CAST(16777216 AS FLOAT)",
+        "16777217 > CAST(16777216 AS FLOAT)",
+        "16777217 <=> CAST(16777216 AS FLOAT)",
+        "CAST(16777216 AS FLOAT) IN (16777217)",
+        "nullif(16777217, CAST(16777216 AS FLOAT))",
+        "nullif(CAST(16777216 AS FLOAT), 16777217)",
+        "greatest(16777217, CAST(16777216 AS FLOAT))",
+        # ...and the same shape against a DOUBLE, which does NOT split: both dialects unify to
+        # double, so this row is what says #299 is about float specifically.
+        "9007199254740993 = CAST(9007199254740992 AS DOUBLE)",
     ],
 
     "ansi-sensitive": [

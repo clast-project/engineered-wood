@@ -1563,4 +1563,100 @@ public sealed class SparkFunctionRegistryTests
         var result = Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(b AS TIMESTAMP)", batch));
         Assert.Equal(seconds, result.GetTimestamp(0)!.Value.ToUnixTimeSeconds());
     }
+
+    // ── nullif over operands with no exact System.Decimal form (#290) ───────────────────────
+
+    /// <summary>
+    /// A value <see cref="decimal"/> cannot hold no longer escapes as a bare BCL exception.
+    /// </summary>
+    /// <remarks>
+    /// <c>SparkFunctions.AreEqual</c> compares exactly where both sides have an exact form and
+    /// degrades to a double otherwise, and the degrade is signalled by an exception. The
+    /// Decimal128 route raised <c>NotSupportedException</c> and was caught; a wide FLOAT or DOUBLE
+    /// reached a checked conversion and raised <see cref="OverflowException"/>, which was not —
+    /// so it left the evaluator as a raw BCL exception a caller cannot tell from a defect.
+    /// <para>
+    /// <b>The boundary is <see cref="decimal"/>'s, not Spark's</b>, which is what makes the pair
+    /// below look arbitrary from Spark's side: 7.9e28 answered and 1e29 crashed, and Spark has no
+    /// boundary anywhere near either. <c>nullif</c> is the only function that reaches this — the
+    /// comparison operators answer their own way, and the corpus carries them as controls.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("nullif(g, 1e29)")]
+    [InlineData("nullif(1e29, g)")]
+    [InlineData("nullif(g, 1e308)")]
+    [InlineData("nullif(g, CAST('NaN' AS DOUBLE))")]
+    [InlineData("nullif(g, CAST('Infinity' AS DOUBLE))")]
+    public void NullIfDoesNotLeakAnOverflowExceptionForAValueDecimalCannotHold(string sql)
+    {
+        var batch = Batch(("g", Doubles(1d)));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Eval(registry, sql, batch);
+
+            // Nothing here is equal, so the answer is the first operand rather than null. What is
+            // being asserted is that there IS an answer.
+            Assert.False(result.IsNull(0));
+        }
+    }
+
+    /// <summary>
+    /// The pair either way round, which used to disagree about whether to crash.
+    /// </summary>
+    /// <remarks>
+    /// Two spellings of one comparison: <c>1e29</c> has no exact <see cref="decimal"/> form and
+    /// neither does a <c>decimal(38,0)</c> holding it, so both sides degrade — but the two sides
+    /// raised DIFFERENT exceptions and only the decimal one was caught, so writing the double
+    /// first crashed and writing it second answered. Spark answers NULL to both.
+    /// </remarks>
+    [Fact]
+    public void TheSamePairAnswersTheSameWhicheverSideIsWrittenFirst()
+    {
+        // The literal 1e29 is a DOUBLE and the column is a decimal(38,0) holding the same value,
+        // so the two expressions are the same comparison with the operands swapped.
+        var batch = WideDecimalBatch(("d", System.Numerics.BigInteger.Pow(10, 29)));
+
+        Assert.True(Eval(Ansi, "nullif(1e29, d)", batch).IsNull(0));
+        Assert.True(Eval(Ansi, "nullif(d, 1e29)", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// The double fallback holds a NaN equal to itself, which is Spark's rule and not IEEE's.
+    /// </summary>
+    /// <remarks>
+    /// <b>Only reachable once the crash above is fixed</b>, and it is the half that would have
+    /// turned a loud error into a silent wrong answer: <c>==</c> on two NaNs is false, so a
+    /// literal degrade to <c>ReadDouble(a) == ReadDouble(b)</c> would answer NaN where Spark
+    /// answers NULL. Measured — <c>nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))</c> is
+    /// NULL, and <c>=</c>, <c>&lt;=&gt;</c> and <c>IN</c> already agreed that NaN equals itself.
+    /// </remarks>
+    [Fact]
+    public void TheDoubleFallbackUsesSparksNaNEquality()
+    {
+        var nan = Batch(("g", Doubles(double.NaN)));
+
+        Assert.True(Eval(Ansi, "nullif(g, CAST('NaN' AS DOUBLE))", nan).IsNull(0));
+        Assert.True(Eval(Ansi, "nullif(g, CAST('NaN' AS FLOAT))", nan).IsNull(0));
+        Assert.True(Eval(Legacy, "nullif(g, CAST('NaN' AS DOUBLE))", nan).IsNull(0));
+
+        // ...and a NaN against anything else is still unequal, so the rule has not become
+        // "everything without an exact form is equal".
+        Assert.False(Eval(Ansi, "nullif(g, 1e308)", nan).IsNull(0));
+
+        // Signed zero is equal on both paths -- the exact one and this one.
+        var zero = Batch(("g", Doubles(0d)));
+        Assert.True(Eval(Ansi, "nullif(g, CAST(-0.0 AS DOUBLE))", zero).IsNull(0));
+    }
+
+    /// <summary>Two wide doubles that are not equal must not collapse to null.</summary>
+    [Fact]
+    public void TwoValuesWithNoExactFormAreStillCompared()
+    {
+        var batch = Batch(("g", Doubles(1e29)));
+
+        Assert.False(Eval(Ansi, "nullif(g, 2e29)", batch).IsNull(0));
+        Assert.True(Eval(Ansi, "nullif(g, 1e29)", batch).IsNull(0));
+    }
 }

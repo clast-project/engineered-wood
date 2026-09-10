@@ -223,12 +223,44 @@ internal static class SparkArrays
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int32Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index),
-        FloatArray a => a.IsNull(index) ? null : (decimal?)a.GetValue(index),
-        DoubleArray a => a.IsNull(index) ? null : (decimal?)a.GetValue(index),
+        FloatArray a => a.IsNull(index) ? null : ExactDecimal(a.GetValue(index)!.Value, a),
+        DoubleArray a => a.IsNull(index) ? null : ExactDecimal(a.GetValue(index)!.Value, a),
         Decimal128Array a => a.IsNull(index) ? null : ExactDecimal(a, index),
         _ => throw new NotSupportedException(
             $"{array.Data.DataType.Name} is not a numeric array"),
     };
+
+    /// <summary>
+    /// A floating-point value as an exact <see cref="decimal"/>, refusing when it has no such form.
+    /// </summary>
+    /// <remarks>
+    /// <b>Refuses with the same exception the Decimal128 route refuses with, and that is the whole
+    /// point.</b> A checked conversion from a double signals out-of-range by throwing
+    /// <see cref="OverflowException"/> where <see cref="ExactDecimal(Decimal128Array,int)"/> throws
+    /// <see cref="NotSupportedException"/> — so "this value has no exact <see cref="decimal"/>
+    /// form" had TWO signals, and <see cref="SparkFunctions.AreEqual"/> caught only one of them.
+    /// The other escaped the evaluator as a bare BCL exception. #290.
+    /// <para>
+    /// Everything <see cref="decimal"/> cannot hold arrives here: a magnitude past its ceiling near
+    /// 7.9228e28, and every NaN and infinity, none of which has an exact form at all. Written as a
+    /// caught conversion rather than a range test because the boundary is <see cref="decimal"/>'s
+    /// own and a hand-written bound would have to be exact at it; the conversion already knows.
+    /// It costs an exception only on the values that had none anyway.
+    /// </para>
+    /// </remarks>
+    private static decimal ExactDecimal(double value, IArrowArray array)
+    {
+        try
+        {
+            return (decimal)value;
+        }
+        catch (OverflowException)
+        {
+            throw new NotSupportedException(
+                $"a {array.Data.DataType.Name} value of {value} has no exact System.Decimal form; " +
+                "a caller that can degrade to a double does so, and one needing exactness refuses");
+        }
+    }
 
     /// <summary>
     /// A Decimal128 cell as an exact <see cref="decimal"/>, refusing when it does not fit.

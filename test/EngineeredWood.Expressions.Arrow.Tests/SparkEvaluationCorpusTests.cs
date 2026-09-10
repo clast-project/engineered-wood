@@ -116,6 +116,21 @@ public sealed class SparkEvaluationCorpusTests
         ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
         ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
+        // #298, found by the `nullif-equality` group. AreEqual -- which only `nullif` reaches --
+        // compares a string operand against a number AS TEXT, where Spark casts the string to the
+        // OTHER operand's type and, under ANSI, refuses one that will not cast. The comparison
+        // operators already coerce correctly (#260/#262/#263); this is the one call site that
+        // never got the rule.
+        //
+        // `nullif(' 1', 1)` is the row that shows it is not merely an error-class difference: we
+        // return ' 1' where Spark returns NULL, because ' 1' casts to the INT 1 and only the text
+        // differs. `nullif('1', 1)` agrees by luck and is in the corpus beside it to say so.
+        ["nullif(' 1', 1)"] = "#298: nullif compares a string as text; ' 1' casts to 1",
+        ["nullif('1.0', 1)"] = "#298: nullif compares a string as text",
+        ["nullif('1e0', 1)"] = "#298: nullif compares a string as text",
+        ["nullif('abc', 1)"] = "#298: nullif compares a string as text",
+        ["nullif('x', 1e308)"] = "#298: nullif compares a string as text",
+
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -234,6 +249,30 @@ public sealed class SparkEvaluationCorpusTests
             // the fix; the ANSI side would not have moved either way.
             ["'" + Backslash + "u0663' + 1"] =
                 "#296: arithmetic has no string coercion; we throw",
+            // #298, the two rows of it this dialect can see. The other three refuse under ANSI
+            // and ANSWER here, agreeing with us -- so a one-dialect corpus would have called
+            // those three fixed.
+            ["nullif(' 1', 1)"] = "#298: nullif compares a string as text; ' 1' casts to 1",
+            ["nullif('1.0', 1)"] = "#298: nullif compares a string as text; legacy truncates to 1",
+
+            // #299, and visible ONLY here. An integral compared with a FLOAT unifies to double
+            // under ANSI -- because int->float is lossy and ANSI refuses to lose bits -- and to
+            // FLOAT under this dialect, which rounds the integral onto the float and makes the
+            // two equal. We answer ANSI's rule under both. 16777217 is the first integer a float
+            // cannot hold.
+            //
+            // `greatest` shows it in the TYPE as well as the value, double against float, so it
+            // is a resolution difference and not only an evaluation one. The corpus carries
+            // `9007199254740993 = CAST(9007199254740992 AS DOUBLE)` beside these: it agrees in
+            // both dialects, which is what says #299 is about float specifically and not about
+            // floating point.
+            ["16777217 = CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
+            ["16777217 > CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
+            ["16777217 <=> CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
+            ["CAST(16777216 AS FLOAT) IN (16777217)"] = "#299: legacy unifies int/float as float",
+            ["greatest(16777217, CAST(16777216 AS FLOAT))"] = "#299: legacy resolves float, not double",
+            ["nullif(16777217, CAST(16777216 AS FLOAT))"] = "#299: legacy unifies int/float as float",
+            ["nullif(CAST(16777216 AS FLOAT), 16777217)"] = "#299: legacy unifies int/float as float",
 
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce
