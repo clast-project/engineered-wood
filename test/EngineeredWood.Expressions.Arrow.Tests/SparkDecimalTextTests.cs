@@ -176,6 +176,159 @@ public sealed class SparkDecimalTextTests
     public void AcceptsAPointWithoutDigitsOnOneSide(string text, int scale, string expected) =>
         Assert.Equal(expected, Unscaled(text, 38, scale));
 
+    // ── Which CHARACTERS are digits, #283 ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A string built from UTF-16 code units, so the source of these tests stays ASCII.
+    /// </summary>
+    /// <remarks>
+    /// Spelling the characters out is not only about a readable diff: the rule under test is
+    /// stated in code UNITS — Java's <c>BigDecimal</c> walks a <c>char[]</c> — and a supplementary
+    /// digit written as one glyph would hide the surrogate pair that is the whole reason it is
+    /// refused.
+    /// </remarks>
+    private static string U(params int[] units)
+    {
+        var chars = new char[units.Length];
+        for (var i = 0; i < units.Length; i++)
+            chars[i] = (char)units[i];
+
+        return new string(chars);
+    }
+
+    private const int ArabicIndicZero = 0x0660;
+    private const int ArabicIndicThree = 0x0663;
+    private const int ArabicIndicFive = 0x0665;
+    private const int DevanagariThree = 0x0969;
+
+    [Fact]
+    public void ReadsADigitFromAnyScript()
+    {
+        // Every BMP character in category Nd, which is the set Character.digit(c, 10) reads and
+        // therefore the set BigDecimal reads. Seven spellings of three, so the rule is a category
+        // and not one block: Arabic-Indic, its extended form, Devanagari, Bengali, Thai, NKo and
+        // fullwidth.
+        foreach (var three in new[] { 0x0663, 0x06F3, 0x0969, 0x09E9, 0x0E53, 0x07C3, 0xFF13 })
+            Assert.Equal("3", Unscaled(U(three)));
+
+        // Scripts may be mixed inside one number -- measured, Spark reads this as 33 rather than
+        // objecting that the digits disagree about where they came from.
+        Assert.Equal("33", Unscaled(U(ArabicIndicThree, DevanagariThree)));
+
+        // ...and mixed with ASCII, on either side of it.
+        Assert.Equal("13", Unscaled(U('1', ArabicIndicThree)));
+        Assert.Equal("31", Unscaled(U(ArabicIndicThree, '1')));
+
+        // A leading zero that is not '0' still has to be recognised as one, because the digit
+        // COUNT feeds the too-many-digits rule and a leading zero is not part of it.
+        Assert.Equal("3", Unscaled(U(ArabicIndicZero, ArabicIndicThree)));
+    }
+
+    [Fact]
+    public void ReadsADigitInTheExponentToo()
+    {
+        // The exponent takes the same digit set; only its marker is ASCII-bound.
+        Assert.Equal("1000", Unscaled(U('1', 'e', ArabicIndicThree)));
+        Assert.Equal("300", Unscaled(U(ArabicIndicThree, 'e', '2')));
+    }
+
+    [Fact]
+    public void RoundsAndCountsDigitsTheSameWhicheverScriptSpellsThem()
+    {
+        // Half-up at the target's scale, on digits the ASCII path never sees: 3.55 to scale 1.
+        Assert.Equal("36", Unscaled(U(ArabicIndicThree, '.', ArabicIndicFive, ArabicIndicFive), 38, 1));
+
+        // Long enough to leave BigDecimal's compact path, and to reach the digit-count rule: 38
+        // Arabic-Indic threes fit DECIMAL(38,0), and a 39th is refused as a property of the
+        // STRING rather than of the target.
+        var thirtyEight = new int[38];
+        for (var i = 0; i < thirtyEight.Length; i++) thirtyEight[i] = ArabicIndicThree;
+
+        Assert.Equal(new string('3', 38), Unscaled(U(thirtyEight)));
+
+        var thirtyNine = new int[39];
+        for (var i = 0; i < thirtyNine.Length; i++) thirtyNine[i] = ArabicIndicThree;
+
+        Assert.Equal(SparkDecimalText.Result.TooManyDigits, Outcome(U(thirtyNine)));
+    }
+
+    [Fact]
+    public void RefusesACharacterThatIsMerelyDigitLIKE()
+    {
+        // Category No and Nl. Character.digit returns -1 for all three, so BigDecimal refuses
+        // them however plainly they name a three -- measured, each is CAST_INVALID_INPUT.
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0x00B3)));  // SUPERSCRIPT THREE
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0x2162)));  // ROMAN NUMERAL THREE
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0x2462)));  // CIRCLED DIGIT THREE
+    }
+
+    [Fact]
+    public void RefusesADigitOutsideTheBasicMultilingualPlane()
+    {
+        // U+1D7D1 MATHEMATICAL BOLD DIGIT THREE is category Nd and Character.isDigit(int) accepts
+        // it -- but BigDecimal reads code UNITS, and Character.digit(char, 10) sees two
+        // surrogates and refuses both. Measured against Spark: CAST_INVALID_INPUT.
+        //
+        // This is the one place where "any character Character.isDigit accepts", the rule as #283
+        // stated it, gives the wrong answer.
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0xD835, 0xDFD1)));
+
+        // Each half alone, so a lone surrogate cannot slip through either.
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0xD835)));
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0xDFD1)));
+    }
+
+    [Fact]
+    public void TheStructureAroundTheDigitsStaysAscii()
+    {
+        // Sign, point and exponent marker are compared literally, and each was measured on its
+        // own against a mantissa Spark does read -- so none of these is refused for want of a
+        // digit.
+        Assert.Equal(SparkDecimalText.Result.Malformed,
+            Outcome(U(ArabicIndicThree, 0x066B, ArabicIndicFive)));   // ARABIC DECIMAL SEPARATOR
+        Assert.Equal(SparkDecimalText.Result.Malformed,
+            Outcome(U(0xFF13, 0xFF0E, 0xFF15)));                      // FULLWIDTH FULL STOP
+        Assert.Equal(SparkDecimalText.Result.Malformed,
+            Outcome(U(0x2212, ArabicIndicThree)));                    // MINUS SIGN
+        Assert.Equal(SparkDecimalText.Result.Malformed,
+            Outcome(U(0xFF0B, 0xFF13)));                              // FULLWIDTH PLUS SIGN
+        Assert.Equal(SparkDecimalText.Result.Malformed,
+            Outcome(U(ArabicIndicFive, 0xFF25, 0x0662)));             // FULLWIDTH E
+
+        // ...and the trim is unchanged: it takes characters at or below the space, so a
+        // LEFT-TO-RIGHT MARK is part of the number and makes it malformed.
+        Assert.Equal(SparkDecimalText.Result.Malformed, Outcome(U(0x200E, ArabicIndicThree)));
+
+        // The ASCII spellings of the same three, to show the refusals above are about the
+        // character and not about the shape.
+        Assert.Equal("-3", Unscaled(U('-', ArabicIndicThree)));
+        Assert.Equal("3", Unscaled(U('+', ArabicIndicThree)));
+        Assert.Equal("35", Unscaled(U(ArabicIndicThree, '.', ArabicIndicFive), 38, 1));
+    }
+
+    [Fact]
+    public void TheWideDigitSetIsTheDecimalTargetsAlone()
+    {
+        // Spark's integral parse is UTF8String.toLong, which compares BYTES -- so the SAME string
+        // that reads as 3 here is CAST_INVALID_INPUT as an INT. Asserted from this file because
+        // the two rules only make sense next to each other; widening the integral one to match
+        // would be a divergence, not a fix. #283.
+        Assert.Equal("3", Unscaled(U(ArabicIndicThree)));
+
+        Assert.Equal(
+            SparkIntegralCasts.TextForm.Invalid,
+            SparkIntegralCasts.Classify(U(ArabicIndicThree)));
+
+        var thrown = Assert.Throws<SparkEvaluationException>(
+            () => Evaluate(Ansi, "CAST(s AS INT)", U(ArabicIndicThree)));
+
+        Assert.Equal("CAST_INVALID_INPUT", thrown.ErrorClass);
+
+        // The floating parse is Double.parseDouble, which is ASCII too.
+        Assert.Throws<SparkEvaluationException>(
+            () => Evaluate(Ansi, "CAST(s AS DOUBLE)", U(ArabicIndicThree)));
+    }
+
     // ── Through the evaluator, which is where the error classes become visible ────────────────
 
     private static readonly SparkFunctionRegistry Ansi = new();

@@ -72,6 +72,10 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 LEGACY_GROUPS = (
     "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
     "double-to-decimal", "string-coercion", "numeric-text",
+    # #283. The decimal answers are the same in both dialects; the OTHER targets are what differ,
+    # raising CAST_INVALID_INPUT under ANSI and answering NULL without it, and recording only half
+    # of that would leave the legacy registry's version of the rule unmeasured.
+    "unicode-digits",
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
     "conditional-string-coercion")
@@ -1125,6 +1129,65 @@ GROUPS = {
         "CAST('1e3d' AS DOUBLE)", "CAST('1f' AS FLOAT)",
         "CAST('NaNd' AS DOUBLE)", "CAST('Infinityf' AS DOUBLE)", "CAST('1l' AS DOUBLE)",
         "CAST('1 d' AS DOUBLE)", "CAST('1d' AS DECIMAL(20,4))",
+    ],
+    # Which CHARACTERS count as digits, which #258 never asked. Spark's string-to-DECIMAL parse is
+    # java.math.BigDecimal, and BigDecimal reads whatever Character.digit(c, 10) reads -- every BMP
+    # character in Unicode category Nd. No other numeric target does: the integral parse is
+    # UTF8String.toLong and the floating one is Double.parseDouble, and both compare against
+    # '0'..'9'. #283 read this as a property of "Spark's string-to-number parse"; the first block
+    # below is what says it belongs to the decimal target alone.
+    #
+    # Written as \u escapes rather than as the characters themselves, deliberately: the corpus is
+    # read as a table and a diff of it should stay legible, and the escapes also put EngineeredWood's
+    # own unescaping (#179) on the same path as Spark's. Verified equal to the literal characters --
+    # both spellings were measured and gave identical answers.
+    "unicode-digits": [
+        # The repro, then the same digit against every other numeric target.
+        r"CAST('\u0663' AS DECIMAL(10,0))", r"CAST('\u0663' AS DECIMAL(10,2))",
+        r"CAST('\u0663' AS INT)", r"CAST('\u0663' AS BIGINT)",
+        r"CAST('\u0663' AS SMALLINT)", r"CAST('\u0663' AS TINYINT)",
+        r"CAST('\u0663' AS DOUBLE)", r"CAST('\u0663' AS FLOAT)",
+        # Comparison and arithmetic coerce the string to DOUBLE, so they follow that target and
+        # not the decimal one -- which is what makes the rule's narrowness visible from outside a
+        # cast.
+        r"'\u0663' + 1", r"'\u0663' > CAST(2 AS DECIMAL(10,0))",
+
+        # Six more spellings of three, so the rule is a Unicode CATEGORY and not one block.
+        r"CAST('\u06F3' AS DECIMAL(10,2))",   # EXTENDED ARABIC-INDIC DIGIT THREE
+        r"CAST('\u0969' AS DECIMAL(10,2))",   # DEVANAGARI DIGIT THREE
+        r"CAST('\u09E9' AS DECIMAL(10,2))",   # BENGALI DIGIT THREE
+        r"CAST('\u0E53' AS DECIMAL(10,2))",   # THAI DIGIT THREE
+        r"CAST('\u07C3' AS DECIMAL(10,2))",   # NKO DIGIT THREE
+        r"CAST('\uFF13' AS DECIMAL(10,2))",   # FULLWIDTH DIGIT THREE
+
+        # Digit-LIKE characters outside category Nd, and one that IS Nd but is not in the BMP:
+        # BigDecimal walks UTF-16 units, so a surrogate pair is not a digit to it however plainly
+        # Character.isDigit(int) says it is.
+        r"CAST('\u00B3' AS DECIMAL(10,2))",        # SUPERSCRIPT THREE
+        r"CAST('\u2162' AS DECIMAL(10,2))",        # ROMAN NUMERAL THREE
+        r"CAST('\u2462' AS DECIMAL(10,2))",        # CIRCLED DIGIT THREE
+        r"CAST('\uD835\uDFD1' AS DECIMAL(10,2))",  # U+1D7D1 MATHEMATICAL BOLD DIGIT THREE
+
+        # The STRUCTURE stays ASCII while the digits around it do not. Sign, point and exponent
+        # marker each measured on its own, against a mantissa Spark does read.
+        r"CAST('-\u0663' AS DECIMAL(10,2))", r"CAST('+\u0663' AS DECIMAL(10,2))",
+        r"CAST(' \u0663 ' AS DECIMAL(10,2))",
+        r"CAST('\u0663.\u0665' AS DECIMAL(10,2))",
+        r"CAST('\u0663e2' AS DECIMAL(10,2))", r"CAST('1e\u0663' AS DECIMAL(10,2))",
+        r"CAST('\u0663\u066B\u0665' AS DECIMAL(10,2))",  # ARABIC DECIMAL SEPARATOR
+        r"CAST('\uFF13\uFF0E\uFF15' AS DECIMAL(10,2))",  # FULLWIDTH FULL STOP
+        r"CAST('\u2212\u0663' AS DECIMAL(10,2))",        # MINUS SIGN
+        r"CAST('\uFF0B\uFF13' AS DECIMAL(10,2))",        # FULLWIDTH PLUS SIGN
+        r"CAST('\u0665\uFF25\u0662' AS DECIMAL(10,2))",  # FULLWIDTH LATIN CAPITAL LETTER E
+        r"CAST('\u200E\u0663' AS DECIMAL(10,2))",        # LEFT-TO-RIGHT MARK, which the trim keeps
+
+        # Mixing, a leading zero that is not '0', rounding, and a mantissa long enough to leave
+        # BigDecimal's compact path.
+        r"CAST('1\u0663' AS DECIMAL(10,2))", r"CAST('\u0663\u0969' AS DECIMAL(10,2))",
+        r"CAST('\u0660\u0663' AS DECIMAL(10,2))",
+        r"CAST('\u0663.\u0665\u0665' AS DECIMAL(10,1))",
+        r"CAST('\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663"
+        r"\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663\u0663' AS DECIMAL(38,2))",
     ],
 
     "ansi-sensitive": [

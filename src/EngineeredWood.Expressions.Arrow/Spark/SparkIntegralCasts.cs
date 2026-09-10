@@ -88,6 +88,14 @@ internal static class SparkIntegralCasts
     /// instead — whether it survives truncation — accepted all three. The legacy dialect
     /// truncates every one of them.
     /// </para>
+    /// <para>
+    /// <b>The digit test below is ASCII on purpose</b>, and diverges from
+    /// <c>SparkDecimalText.DigitValue</c> for a measured reason rather than an oversight: Spark's
+    /// integral parse is <c>UTF8String.toLong</c>, which compares BYTES against <c>'0'</c>..
+    /// <c>'9'</c>, where the decimal parse is <c>BigDecimal</c> and reads any Unicode Nd digit. So
+    /// an ARABIC-INDIC DIGIT THREE is 3 as a DECIMAL and CAST_INVALID_INPUT as an INT, BIGINT,
+    /// SMALLINT or TINYINT. #283.
+    /// </para>
     /// </remarks>
     public static TextForm Classify(string text)
     {
