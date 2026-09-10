@@ -457,8 +457,10 @@ internal static class SparkFunctions
     /// than either, so the ordering is corrected in the same change.
     /// </para>
     /// <para>
-    /// Only <c>greatest</c> and <c>least</c> reach this — <see cref="CompareAt"/> has no other
-    /// caller — so the comparison operators, which answer their own way, are untouched.
+    /// <c>greatest</c>, <c>least</c> and — since #290 — the double fallback in
+    /// <see cref="AreEqual"/> reach this. The comparison operators answer their own way and are
+    /// untouched; measured, they already hold NaN equal to itself, which is what makes reusing
+    /// this rule here agreement rather than a second opinion.
     /// </para>
     /// </remarks>
     private static int CompareDoubles(double x, double y)
@@ -505,7 +507,24 @@ internal static class SparkFunctions
         }
         catch (NotSupportedException)
         {
-            return SparkArrays.ReadDouble(left, index) == SparkArrays.ReadDouble(right, index);
+            // Reached when a value has no exact System.Decimal form: a magnitude past decimal's
+            // ceiling near 7.9e28, or a NaN or an infinity. Until #290 that was true of the
+            // Decimal128 side ONLY -- a wide FLOAT or DOUBLE threw OverflowException instead and
+            // escaped the evaluator, so `nullif(1, 1e29)` crashed while
+            // `nullif(CAST(1e29 AS DECIMAL(38,0)), 1e29)` answered. The same pair, and which side
+            // was written first decided it.
+            //
+            // COMPARED WITH SPARK'S NaN RULE, NOT IEEE'S, and this half is only reachable now that
+            // the crash is not. Measured: `nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))` is
+            // NULL, so Spark holds NaN equal to itself here exactly as `=`, `<=>` and `IN` do --
+            // `==` on two NaNs is false, and fixing the crash with it would have traded a loud
+            // error for a silent wrong answer.
+            var first = SparkArrays.ReadDouble(left, index);
+            var second = SparkArrays.ReadDouble(right, index);
+
+            return first is null || second is null
+                ? first is null && second is null
+                : CompareDoubles(first.Value, second.Value) == 0;
         }
     }
 
