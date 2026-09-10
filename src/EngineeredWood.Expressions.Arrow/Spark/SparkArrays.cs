@@ -572,6 +572,50 @@ internal static class SparkArrays
     public static decimal Rescale(decimal value, int scale) =>
         Math.Round(value, Math.Min(scale, 28), MidpointRounding.AwayFromZero);
 
+    /// <summary>The bytes a cell contributes to a binary result, or null when the cell is null.</summary>
+    /// <remarks>
+    /// <b>The string case is Spark's string-to-binary cast</b>, which is a UTF-8 encode and
+    /// nothing else — measured, <c>CAST('é' AS BINARY)</c> is <c>C3A9</c> and <c>CAST('' AS
+    /// BINARY)</c> is empty rather than null. Every other source type is refused, and by the
+    /// CALLER rather than here, because the two dialects disagree about integrals. #295.
+    /// <para>
+    /// <b>The string case must be tested FIRST</b>, for the reason
+    /// <see cref="ReadForCast(IArrowArray,int)"/> gives: Apache.Arrow's <see cref="StringArray"/>
+    /// derives from <see cref="BinaryArray"/>, so a <c>BinaryArray</c> pattern matches one too.
+    /// Here the two happen to agree — a StringArray's buffer already holds its UTF-8 — but
+    /// relying on that would make the order look incidental when it is not.
+    /// </para>
+    /// </remarks>
+    public static byte[]? ReadBytes(IArrowArray array, int index) => array switch
+    {
+        StringArray a => a.IsNull(index) ? null : System.Text.Encoding.UTF8.GetBytes(a.GetString(index)),
+        BinaryArray a => a.IsNull(index) ? null : a.GetBytes(index).ToArray(),
+        _ => throw new NotSupportedException(
+            $"{Describe(array.Data.DataType)} cannot be read as binary"),
+    };
+
+    /// <summary>
+    /// Orders two byte strings the way Spark orders a binary column.
+    /// </summary>
+    /// <remarks>
+    /// <b>Unsigned, and measured rather than assumed</b>: <c>greatest(X'00', X'FF')</c> is
+    /// <c>FF</c> and <c>greatest(X'7F', X'80')</c> is <c>80</c>, so a signed <see cref="sbyte"/>
+    /// comparison — which .NET's <c>byte</c> is not, but a careless port from Java's signed
+    /// <c>byte</c> would be — gets both backwards. A shorter array that is a prefix of a longer
+    /// one sorts first: <c>greatest(X'01', X'0100')</c> is <c>0100</c>.
+    /// </remarks>
+    public static int CompareBytes(byte[] left, byte[] right)
+    {
+        var shared = Math.Min(left.Length, right.Length);
+        for (var i = 0; i < shared; i++)
+        {
+            if (left[i] != right[i])
+                return left[i] < right[i] ? -1 : 1;
+        }
+
+        return left.Length.CompareTo(right.Length);
+    }
+
     /// <summary>The Spark spelling of an Arrow type, for error messages.</summary>
     public static string Describe(IArrowType type) => type switch
     {
@@ -582,6 +626,7 @@ internal static class SparkArrays
         FloatType => "FLOAT",
         DoubleType => "DOUBLE",
         StringType => "STRING",
+        BinaryType => "BINARY",
         BooleanType => "BOOLEAN",
         Decimal128Type d => $"DECIMAL({d.Precision},{d.Scale})",
         Decimal256Type d => $"DECIMAL({d.Precision},{d.Scale})",
@@ -643,6 +688,7 @@ internal static class SparkArrays
             "FLOAT" or "REAL" => FloatType.Default,
             "DOUBLE" => DoubleType.Default,
             "STRING" => StringType.Default,
+            "BINARY" => BinaryType.Default,
             "BOOLEAN" or "BOOL" => BooleanType.Default,
             "DATE" => Date32Type.Default,
             // Microseconds in UTC, matching what the readers produce and the fixed timezone

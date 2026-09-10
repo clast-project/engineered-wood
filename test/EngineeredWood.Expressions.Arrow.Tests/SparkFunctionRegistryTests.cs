@@ -1659,4 +1659,217 @@ public sealed class SparkFunctionRegistryTests
         Assert.False(Eval(Ansi, "nullif(g, 2e29)", batch).IsNull(0));
         Assert.True(Eval(Ansi, "nullif(g, 1e29)", batch).IsNull(0));
     }
+
+    // ── CAST to and from BINARY, and the conditionals that needed it (#295) ─────────────────
+
+    private static RecordBatch BinaryBatch(params byte[]?[] values)
+    {
+        var b = new BinaryArray.Builder();
+        foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(v.AsSpan()); }
+        return Batch(("bin", b.Build()));
+    }
+
+    /// <summary>The hex of the single cell of a binary result.</summary>
+    private static string Hex(IArrowArray array) =>
+        BitConverter.ToString(
+            Assert.IsType<BinaryArray>(array).GetBytes(0).ToArray()).Replace("-", string.Empty);
+
+    [Theory]
+    // A string is a UTF-8 encode, in both dialects, and the empty string is bytes rather than null.
+    [InlineData("CAST('a' AS BINARY)", "61")]
+    [InlineData("CAST('abc' AS BINARY)", "616263")]
+    [InlineData("CAST('' AS BINARY)", "")]
+    // Two bytes for one char, which is what says the encode is UTF-8 and not Latin-1.
+    [InlineData("CAST('é' AS BINARY)", "C3A9")]
+    // Binary to binary is the identity.
+    [InlineData("CAST(X'00FF' AS BINARY)", "00FF")]
+    [InlineData("CAST(bin AS BINARY)", "0102")]
+    public void CastsToBinaryUnderBothDialects(string sql, string hex)
+    {
+        var batch = BinaryBatch(new byte[] { 0x01, 0x02 });
+
+        Assert.Equal(hex, Hex(Eval(Ansi, sql, batch)));
+        Assert.Equal(hex, Hex(Eval(Legacy, sql, batch)));
+    }
+
+    [Fact]
+    public void ANullStringCastsToANullBinary()
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.True(Eval(Ansi, "CAST(CAST(NULL AS STRING) AS BINARY)", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// An integral casts to binary under the LEGACY dialect only, big-endian at its own width.
+    /// </summary>
+    /// <remarks>
+    /// <b>The dialect split here is the part #295 did not name</b>, and it runs the opposite way
+    /// to the conditional's: ANSI refuses this cast (<c>DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION</c>,
+    /// whose whole content is "turn ANSI off") while legacy performs it, where for
+    /// <c>coalesce(X'00', '2')</c> it is ANSI that resolves and legacy that refuses.
+    /// <para>
+    /// The WIDTH is the source type's and not the value's — 1 as a BIGINT is eight bytes and 1 as
+    /// a TINYINT is one — and a negative value is its two's complement.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("CAST(CAST(1 AS TINYINT) AS BINARY)", "01")]
+    [InlineData("CAST(CAST(1 AS SMALLINT) AS BINARY)", "0001")]
+    [InlineData("CAST(CAST(1 AS INT) AS BINARY)", "00000001")]
+    [InlineData("CAST(CAST(1 AS BIGINT) AS BINARY)", "0000000000000001")]
+    [InlineData("CAST(CAST(-2 AS SMALLINT) AS BINARY)", "FFFE")]
+    [InlineData("CAST(9223372036854775807 AS BINARY)", "7FFFFFFFFFFFFFFF")]
+    public void AnIntegralCastsToBinaryOnlyUnderTheLegacyDialect(string sql, string hex)
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Equal(hex, Hex(Eval(Legacy, sql, batch)));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, sql, batch));
+    }
+
+    [Fact]
+    public void TryCastRefusesAnIntegralToBinaryUnderEitherDialect()
+    {
+        // try_cast type-checks the way ANSI does, so the legacy allowance above does not reach it
+        // — measured, TRY_CAST(CAST(1 AS INT) AS BINARY) is CAST_WITHOUT_SUGGESTION with ansi off.
+        // This is why CastToBinary keys on `legacy` rather than on `!raising`.
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Throws<NotSupportedException>(
+            () => Eval(Legacy, "TRY_CAST(CAST(1 AS INT) AS BINARY)", batch));
+
+        // ...while a string reaches try_cast perfectly well.
+        Assert.Equal("61", Hex(Eval(Legacy, "TRY_CAST('a' AS BINARY)", batch)));
+    }
+
+    [Theory]
+    [InlineData("CAST(CAST(1.5 AS DOUBLE) AS BINARY)")]
+    [InlineData("CAST(CAST(1.5 AS FLOAT) AS BINARY)")]
+    [InlineData("CAST(CAST(1.5 AS DECIMAL(10,2)) AS BINARY)")]
+    [InlineData("CAST(true AS BINARY)")]
+    [InlineData("CAST(DATE'2026-08-11' AS BINARY)")]
+    public void NoOtherSourceTypeCastsToBinaryInEitherDialect(string sql)
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, sql, batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Legacy, sql, batch));
+    }
+
+    /// <summary>
+    /// A binary/string conditional resolves to BINARY under ANSI and is refused under legacy.
+    /// </summary>
+    /// <remarks>
+    /// The pair #295 was filed for. #278 measured this rule and had to decline the binary half,
+    /// because naming the type would have promised a column neither <c>Cast</c> nor
+    /// <c>SparkFunctions.Unify</c> could then build. Both exist now.
+    /// <para>
+    /// Either operand order resolves — <c>coalesce('2', X'00')</c> is binary too, holding the
+    /// string's UTF-8 — which is what makes this a unification rather than "the first argument
+    /// wins".
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("coalesce(X'00', '2')", "00")]
+    [InlineData("coalesce('2', X'00')", "32")]
+    [InlineData("coalesce(CAST(NULL AS BINARY), '2')", "32")]
+    [InlineData("if(true, X'00', '2')", "00")]
+    [InlineData("if(false, X'00', '2')", "32")]
+    [InlineData("CASE WHEN false THEN X'00' ELSE '2' END", "32")]
+    [InlineData("ifnull(X'00', '2')", "00")]
+    [InlineData("nvl(X'00', '2')", "00")]
+    public void AConditionalOverBinaryAndStringResolvesUnderAnsiOnly(string sql, string hex)
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Equal(hex, Hex(Eval(Ansi, sql, batch)));
+        Assert.Throws<NotSupportedException>(() => Eval(Legacy, sql, batch));
+    }
+
+    [Fact]
+    public void AConditionalOverTwoBinariesNeedsNoStringRuleAndWorksInBothDialects()
+    {
+        // Not a coercion question at all, and broken for the same reason: `Unify` had no binary
+        // branch, so even `coalesce(X'00', X'01')` — where both branches already agree — could
+        // not build its result.
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.Equal("00", Hex(Eval(registry, "coalesce(X'00', X'01')", batch)));
+            Assert.Equal("01", Hex(Eval(registry, "coalesce(CAST(NULL AS BINARY), X'01')", batch)));
+            Assert.Equal("0102", Hex(Eval(registry, "coalesce(bin, X'01')", BinaryBatch(new byte[] { 0x01, 0x02 }))));
+        }
+
+        // ...and binary still does not absorb everything: these are refused in both dialects.
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "coalesce(X'00', 1)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "coalesce(X'00', true)", batch));
+    }
+
+    /// <summary>
+    /// greatest/least order a binary pair as UNSIGNED bytes, with a prefix sorting first.
+    /// </summary>
+    /// <remarks>
+    /// Measured, and a signed reading gets the first two backwards: Java's <c>byte</c> is signed,
+    /// so a careless port would call <c>X'FF'</c> less than <c>X'00'</c>. Spark answers
+    /// <c>greatest(X'00', X'FF')</c> = <c>FF</c> and <c>greatest(X'7F', X'80')</c> = <c>80</c>.
+    /// <para>
+    /// They also keep #278's split: a binary against a STRING is refused by both dialects, where
+    /// the conditional family above coerces it.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("greatest(X'00', X'01')", "01")]
+    [InlineData("least(X'00', X'01')", "00")]
+    [InlineData("greatest(X'00', X'FF')", "FF")]
+    [InlineData("greatest(X'7F', X'80')", "80")]
+    [InlineData("greatest(X'01', X'0100')", "0100")]
+    [InlineData("least(X'01', X'0100')", "01")]
+    public void GreatestAndLeastOrderBinaryAsUnsignedBytes(string sql, string hex)
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Equal(hex, Hex(Eval(Ansi, sql, batch)));
+        Assert.Equal(hex, Hex(Eval(Legacy, sql, batch)));
+    }
+
+    [Fact]
+    public void GreatestRefusesABinaryAgainstAStringInBothDialects()
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "greatest(X'00', '2')", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Legacy, "least(X'00', '2')", batch));
+    }
+
+    /// <summary>
+    /// nullif compares two binaries by BYTES, and a binary against a string as TEXT.
+    /// </summary>
+    /// <remarks>
+    /// The two routes give different answers and both are Spark's. <c>X'FF'</c> and <c>X'FE'</c>
+    /// decode to the same U+FFFD, and against another BINARY they are still unequal — but
+    /// <c>nullif(X'FF', CAST(X'FF' AS STRING))</c> is NULL, because a binary meeting a STRING is
+    /// the pair where the BINARY is rendered as text (#262) rather than the string encoded.
+    /// So the byte branch has to sit after the string one, not before it.
+    /// </remarks>
+    [Fact]
+    public void NullIfComparesBinaryByBytesAndAStringByText()
+    {
+        var batch = BinaryBatch(new byte[] { 0x00 });
+
+        Assert.Equal("00", Hex(Eval(Ansi, "nullif(X'00', X'01')", batch)));
+        Assert.True(Eval(Ansi, "nullif(X'00', X'00')", batch).IsNull(0));
+
+        // Both decode to U+FFFD; as bytes they differ, and Spark says they differ.
+        Assert.Equal("FF", Hex(Eval(Ansi, "nullif(X'FF', X'FE')", batch)));
+
+        // ...and the string route, which calls the same two bytes equal because both render as
+        // U+FFFD. Measured: NULL.
+        Assert.True(Eval(Ansi, "nullif(X'FF', CAST(X'FF' AS STRING))", batch).IsNull(0));
+
+        // nullif takes the FIRST argument's type, so this one answers binary in BOTH dialects
+        // even though `coalesce` over the same pair is refused under legacy.
+        Assert.Equal("00", Hex(Eval(Legacy, "nullif(X'00', '2')", batch)));
+    }
 }

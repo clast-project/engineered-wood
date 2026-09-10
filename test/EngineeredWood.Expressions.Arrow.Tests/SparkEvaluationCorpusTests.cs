@@ -63,9 +63,9 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(dt AS TIMESTAMP)"] = "timestamp localised to the harvest machine's zone",
         ["TIMESTAMP'2026-08-11 12:30:00'"] = "timestamp localised to the harvest machine's zone",
 
-        // str(bytearray) is Python's repr, not a value encoding.
-        ["X'ABCD'"] = "binary recorded as a Python bytearray repr",
-        ["x'00'"] = "binary recorded as a Python bytearray repr",
+        // The two binary rows used to sit here, excluded because `default=str` recorded a
+        // bytearray as PYTHON'S REPR rather than as a value. #295 records binary as hex instead,
+        // so they are compared now — and so is every binary answer the new group asks for.
 
         // Frozen at harvest time; re-harvesting moves them and they are not a function of input.
         ["current_date()"] = "value is the harvest date",
@@ -116,6 +116,17 @@ public sealed class SparkEvaluationCorpusTests
         ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
         ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
+        // #301, and the one row of the `binary-casts` group that diverges. Spark's STRING is a
+        // BYTE string: `CAST(X'FF' AS STRING)` holds the raw FF, and casting it back hands the
+        // same byte over. A .NET string is UTF-16 and cannot hold an unpaired FF, so the decode
+        // substitutes U+FFFD before anything can cast it back, and we answer its UTF-8 instead.
+        //
+        // Two rows in the same group agree BY LUCK and are there to say so:
+        // `X'FF' = CAST(X'FF' AS STRING)` and `nullif(X'FF', CAST(X'FF' AS STRING))`. Spark
+        // compares FF with FF; we compare U+FFFD with U+FFFD; both routes say equal.
+        ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
+            "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
+
         // #298, found by the `nullif-equality` group. AreEqual -- which only `nullif` reaches --
         // compares a string operand against a number AS TEXT, where Spark casts the string to the
         // OTHER operand's type and, under ANSI, refuses one that will not cast. The comparison
@@ -161,12 +172,6 @@ public sealed class SparkEvaluationCorpusTests
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
-        // ANSI resolves a binary against a string TO binary, moving the string in as UTF-8. We
-        // refuse the pair, because `Cast` has no binary target and `Unify` has no binary branch,
-        // so there is no column to resolve it to. Declared rather than dropped from the corpus:
-        // the legacy dialect refuses this pair outright and we match it there, so the entry is
-        // what says the two dialects are not both agreeing for the same reason. #295.
-        ["coalesce(X'00', '2')"] = "#295: ANSI resolves binary; we have no cast to it",
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",
         ["1S"] = "parser refuses the smallint literal suffix; declared in SparkSqlParserTests",
@@ -254,6 +259,21 @@ public sealed class SparkEvaluationCorpusTests
             // those three fixed.
             ["nullif(' 1', 1)"] = "#298: nullif compares a string as text; ' 1' casts to 1",
             ["nullif('1.0', 1)"] = "#298: nullif compares a string as text; legacy truncates to 1",
+
+            // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
+            ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
+                "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
+
+            // #293, surfaced here for the first time by #295's binary support. A TYPED null still
+            // constrains the pair -- Spark refuses `coalesce(X'00', CAST(NULL AS STRING))` under
+            // this dialect, exactly as it refuses `coalesce(X'00', '2')`. We materialise every
+            // null literal as an all-null STRING column and cannot tell the typed one from the
+            // untyped placeholder #278 must drop, so we drop it and answer the binary.
+            //
+            // The ANSI section does not see it: there the pair resolves to binary anyway, so we
+            // reach the right answer by the wrong route and the comparison cannot tell.
+            ["coalesce(X'00', CAST(NULL AS STRING))"] =
+                "#293: a typed null string is indistinguishable from the untyped placeholder",
 
             // #299, and visible ONLY here. An integral compared with a FLOAT unifies to double
             // under ANSI -- because int->float is lossy and ANSI refuses to lose bits -- and to

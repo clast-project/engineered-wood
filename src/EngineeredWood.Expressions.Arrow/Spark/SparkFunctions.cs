@@ -312,6 +312,21 @@ internal static class SparkFunctions
             return strings.Build();
         }
 
+        // Order does not matter here, unlike everywhere else binary appears: these branches are
+        // selected by the unified TYPE, and BinaryType and StringType are disjoint. It is
+        // `ReadBytes` that has to know a StringArray is also a BinaryArray. #295.
+        if (type is BinaryType)
+        {
+            var bytes = new BinaryArray.Builder();
+            for (var i = 0; i < rowCount; i++)
+            {
+                var value = choice[i] < 0 ? null : SparkArrays.ReadBytes(sources[choice[i]], i);
+                if (value is null) bytes.AppendNull(); else bytes.Append(value.AsSpan());
+            }
+
+            return bytes.Build();
+        }
+
         if (type is BooleanType)
         {
             var booleans = new BooleanArray.Builder();
@@ -433,6 +448,14 @@ internal static class SparkFunctions
 
         StringArray a => string.CompareOrdinal(a.GetString(index), ((StringArray)right).GetString(index)),
 
+        // AFTER the string case, which is not optional: a StringArray IS a BinaryArray, and
+        // matching it here would order two strings by their UTF-8 bytes instead of by their
+        // ordinals. Only greatest/least reach this, and only over a binary/binary pair -- a
+        // binary against a STRING is refused by both dialects, unlike coalesce, which coerces it.
+        // #295.
+        BinaryArray a => SparkArrays.CompareBytes(
+            SparkArrays.ReadBytes(a, index)!, SparkArrays.ReadBytes(right, index)!),
+
         BooleanArray a => a.GetValue(index)!.Value.CompareTo(((BooleanArray)right).GetValue(index)!.Value),
 
         _ when SparkArrays.IsTemporal(left.Data.DataType) =>
@@ -485,6 +508,22 @@ internal static class SparkFunctions
 
         if (left is StringArray || right is StringArray)
             return ReadString(left, index) == ReadString(right, index);
+
+        // AFTER the string case, and the two really do answer differently. A binary against a
+        // BINARY compares BYTES: measured, `nullif(X'FF', X'FE')` is X'FF', though both bytes
+        // decode to the same U+FFFD and the string route above would have called them equal. A
+        // binary against a STRING keeps that string route, and that is Spark's answer too --
+        // measured, `nullif(X'FF', CAST(X'FF' AS STRING))` is NULL, because there it is the
+        // binary that is rendered as text (#262) rather than the string that is encoded. #295.
+        if (left is BinaryArray && right is BinaryArray)
+        {
+            var first = SparkArrays.ReadBytes(left, index);
+            var second = SparkArrays.ReadBytes(right, index);
+
+            return first is null || second is null
+                ? first is null && second is null
+                : SparkArrays.CompareBytes(first, second) == 0;
+        }
 
         if (left is BooleanArray a && right is BooleanArray b)
             return ReadBoolean(a, index) == ReadBoolean(b, index);

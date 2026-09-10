@@ -311,6 +311,18 @@ internal static class CorpusEvaluation
                     ? null
                     : $"expected {expected}, got '{a.GetString(row)}'";
 
+            // AFTER StringArray, which it derives from in Apache.Arrow -- putting it first would
+            // compare every string against a hex reading of its UTF-8. The fixture records binary
+            // as HEX rather than as Python's bytearray repr (#295), which is what makes a binary
+            // answer comparable at all; before that the two binary rows were excluded outright.
+            case BinaryArray a:
+            {
+                var got = BitConverter.ToString(a.GetBytes(row).ToArray()).Replace("-", string.Empty);
+                return string.Equals(expected.GetString(), got, StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : $"expected {expected}, got X'{got}'";
+            }
+
             case Decimal128Array a:
             {
                 // Numeric comparison, not textual: the fixture holds Python's rendering.
