@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 09:09:03.691514",
-      "2026-09-11 09:09:03.691514",
-      "2026-09-11 09:09:03.691514"
+      "2026-09-11 10:10:20.905291",
+      "2026-09-11 10:10:20.905291",
+      "2026-09-11 10:10:20.905291"
      ]
     }
    },
@@ -17937,6 +17937,146 @@
       false
      ]
     }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "9007199254740993 IN (9007199254740992, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(9007199254740993L IN (9007199254740992L, NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "9007199254740993 IN (9007199254740993, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(9007199254740993L IN (9007199254740993L, NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
    }
   ],
   "ansi-sensitive": [
@@ -28797,6 +28937,146 @@
        false,
        null,
        false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "9007199254740993 IN (9007199254740992, NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(9007199254740993L IN (9007199254740992L, NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "9007199254740993 IN (9007199254740993, NULL)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(9007199254740993L IN (9007199254740993L, NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
       ]
      }
     }

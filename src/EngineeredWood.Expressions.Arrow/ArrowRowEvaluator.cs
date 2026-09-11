@@ -234,11 +234,26 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         // values instead cannot build a decimal at all and reads a date as an instant.
         var operandResolved = OperandType(operandType, operand);
         var resolved = new IArrowType[members.Length];
+
+        // A BARE NULL MEMBER CONSTRAINS NOTHING and is left out of the resolution. Spark types it
+        // `void`, and `MemberType` has to call it a string because it has no value to read a type
+        // from — which would otherwise make `d IN (wide, NULL)` look like a set with a string in
+        // it and send it down the promotion rule. Measured, Spark answers TRUE for
+        // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)` — the same rounding
+        // match it gives without the NULL — where promoting the set answered null. #280.
+        // It is not cast either: a null is null at every type, and the members that are left are
+        // what the target has to hold.
+        var untypedNull = new bool[members.Length];
         var types = new List<IArrowType>(members.Length + 1) { operandResolved };
         for (var k = 0; k < members.Length; k++)
         {
+            untypedNull[k] = members[k].IsConstant
+                && !members[k].Constant.HasValue
+                && memberTypes[k] is null;
+
             resolved[k] = MemberType(members[k], memberTypes[k]);
-            types.Add(resolved[k]);
+            if (!untypedNull[k])
+                types.Add(resolved[k]);
         }
 
         var target = _coercion.SetComparisonTarget(types);
@@ -248,6 +263,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         operand = CastMember(operand, operandResolved, target, rowCount);
         for (var k = 0; k < members.Length; k++)
         {
+            if (untypedNull[k])
+                continue;
+
             // A constant is cast as a one-row array, not as one row per row of the batch.
             members[k] = members[k].IsConstant
                 ? new SetMember(CastMember(

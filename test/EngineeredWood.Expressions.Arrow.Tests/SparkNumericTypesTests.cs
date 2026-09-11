@@ -258,13 +258,18 @@ public sealed class SparkNumericTypesTests
     [Fact]
     public void EveryOperandFitsTheTypeItUnifiesTo()
     {
-        for (var lp = 1; lp <= 38; lp += 3)
+        var pairs = 0;
+
+        // EVERY (p,s) pair against every other, stepping by one. A stepped loop sampled the
+        // grid and skipped precision 38 entirely, which is exactly where the corpus lives --
+        // decimal(38,38) against decimal(38,0) is the pair the whole issue turns on.
+        for (var lp = 1; lp <= SparkNumericTypes.MaxPrecision; lp++)
         {
-            for (var ls = 0; ls <= lp; ls += 5)
+            for (var ls = 0; ls <= lp; ls++)
             {
-                for (var rp = 1; rp <= 38; rp += 3)
+                for (var rp = 1; rp <= SparkNumericTypes.MaxPrecision; rp++)
                 {
-                    for (var rs = 0; rs <= rp; rs += 5)
+                    for (var rs = 0; rs <= rp; rs++)
                     {
                         var common = (Decimal128Type)SparkNumericTypes.CommonType(
                             new Decimal128Type(lp, ls), new Decimal128Type(rp, rs));
@@ -288,9 +293,16 @@ public sealed class SparkNumericTypesTests
                         if (common.Scale < rs)
                             Assert.True(room > rp - rs, $"decimal({rp},{rs}) rounds to scale " +
                                 $"{common.Scale} with no room for a carry");
+
+                        pairs++;
                     }
                 }
             }
         }
+
+        // 779 (p,s) pairs on each side. Asserted so a loop that silently stopped covering the
+        // grid -- which is what the stepped version this replaced did -- fails rather than
+        // passes quietly.
+        Assert.Equal(779 * 779, pairs);
     }
 }

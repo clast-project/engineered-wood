@@ -570,16 +570,24 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             if (common is not Decimal128Type decimalCommon)
                 return null;
 
+            // EVERY member has to be one the exact-decimal path can actually move, not just the
+            // one that loses scale, because the caller casts them all. A decimal256 is the case
+            // that separates the two: `CommonType` reads its precision and scale happily and
+            // hands back a decimal128 common type, but `SparkWideDecimals` cannot read one, so
+            // returning a target here turns an answer into a throw. Measured before this guard:
+            // a decimal(38,38) column `IN` a decimal256(38,0) column threw where it used to
+            // answer. Bailing leaves the exact comparison, which is what the pair had before.
+            var anyRounds = false;
             foreach (var type in memberTypes)
             {
-                if (SparkWideDecimals.IsExact(type)
-                    && decimalCommon.Scale < SparkNumericTypes.AsDecimal(type).Scale)
-                {
-                    return decimalCommon;
-                }
+                if (!SparkWideDecimals.IsExact(type))
+                    return null;
+
+                if (decimalCommon.Scale < SparkNumericTypes.AsDecimal(type).Scale)
+                    anyRounds = true;
             }
 
-            return null;
+            return anyRounds ? decimalCommon : null;
         }
 
         if (_options.Ansi)

@@ -1503,6 +1503,23 @@ GROUPS = {
         "d5 < d4",
         "d2 = d4",
         "d5 IN (d4)",
+
+        # A BARE NULL IN THE LIST CONSTRAINS NOTHING. Spark types it `void`, so the set still
+        # resolves through the other members and still rounds -- the first row is TRUE, the same
+        # answer the list gives without the NULL. Worth pinning because a NULL member has no
+        # value to read a type from, and calling it a string instead would send an otherwise
+        # numeric set down the string-promotion rule and lose the match.
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL)",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (NULL)",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL)",
+        # The exact control: no rounding, so no match, and the NULL member makes it null rather
+        # than false -- ordinary three-valued IN.
+        "CAST(1.005 AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL)",
+        # ...and an integral set, which reaches none of this and must not start to. The pair
+        # differs only in whether the list holds the operand's exact value.
+        "9007199254740993 IN (9007199254740992, NULL)",
+        "9007199254740993 IN (9007199254740993, NULL)",
     ],
 
     "ansi-sensitive": [
