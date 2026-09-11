@@ -85,6 +85,10 @@ LEGACY_GROUPS = (
     # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
     # directions in one group, so one harvest would describe neither.
     "binary-casts",
+    # #285. The integral rows answer DIFFERENTLY under each dialect -- ANSI raises where legacy
+    # wraps -- while the decimal rows raise under both. Neither half is visible from one harvest,
+    # and the second is the surprising one.
+    "round-overflow",
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
     "conditional-string-coercion")
@@ -1317,6 +1321,61 @@ GROUPS = {
         # which is why the last row is NULL and the one above it is not.
         "nullif(X'00', X'01')", "nullif(X'00', X'00')", "nullif(X'FF', X'FE')",
         "nullif(X'00', '2')", "nullif(X'FF', CAST(X'FF' AS STRING))",
+    ],
+
+    # Rounding at the top of a type's range, which has nowhere to go. #285. Kept apart from
+    # `round-greatest-least` because the question is overflow rather than the rounding mode, and
+    # because the two dialects answer it DIFFERENTLY for an integral and IDENTICALLY for a decimal
+    # -- which is the pair of facts the group exists to pin.
+    "round-overflow": [
+        # Every integral width, both signs. ANSI raises; legacy WRAPS to the width, it does not
+        # null -- the shape #243 found for an integral cast.
+        "round(9223372036854775807, -1)", "round(CAST(-9223372036854775808 AS BIGINT), -1)",
+        "round(CAST(127 AS TINYINT), -1)", "round(CAST(-128 AS TINYINT), -1)",
+        "round(CAST(32767 AS SMALLINT), -1)", "round(CAST(2147483647 AS INT), -1)",
+        "round(CAST(-2147483648 AS INT), -1)",
+        # Just inside, so the refusal is about the boundary and not about the shape.
+        "round(9223372036854775806, -1)", "round(CAST(124 AS TINYINT), -1)",
+        "round(9223372036854775807, -18)",
+
+        # THE THREE `places` BANDS. At 19 the step is 10^19, which no long holds, so the only
+        # answers are 0 and +/-10^19; at 20 and beyond every value rounds to zero. The boundary
+        # between them is 5e18, which is half of 10^19 and does fit.
+        "round(4999999999999999999, -19)", "round(5000000000000000000, -19)",
+        "round(9223372036854775807, -19)", "round(9223372036854775807, -20)",
+        "round(123, -19)", "round(123, -3)",
+
+        # A non-negative scale on an integral has nothing to round and cannot overflow.
+        "round(9223372036854775807)", "round(9223372036854775807, 2)",
+
+        # A DECIMAL with a negative scale rounds to a multiple of a power of ten, ONCE. 14.6 is
+        # the row that says so: rounding to an integer first and to the multiple second would
+        # answer 20 by way of 15.
+        "round(CAST(14.6 AS DECIMAL(10,1)), -1)", "round(CAST(-14.6 AS DECIMAL(10,1)), -1)",
+        "round(CAST(15.0 AS DECIMAL(10,1)), -1)", "round(CAST(14.9 AS DECIMAL(10,1)), -1)",
+        "round(CAST(4.6 AS DECIMAL(10,1)), -1)",
+        "round(CAST(12.34 AS DECIMAL(10,2)), -1)", "round(CAST(12.34 AS DECIMAL(10,2)), -3)",
+        "round(CAST(15 AS DECIMAL(2,0)), -1)", "round(CAST(5 AS DECIMAL(1,0)), -1)",
+        # The carry that the +1 of precision exists for.
+        "round(CAST(99 AS DECIMAL(2,0)), -1)",
+        # ...and the row that says the type reserves max(p - s, places) integral digits rather
+        # than p - s: a decimal(2,0) at -20 resolves to decimal(21,0), and answers 0.
+        "round(CAST(99 AS DECIMAL(2,0)), -20)",
+
+        # A decimal overflow RAISES IN BOTH DIALECTS, unlike the integral one above it.
+        "round(99999999999999999999999999999999999999, -1)",
+        "round(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), -1)",
+
+        # Controls: a positive scale on a decimal, including the carry past the precision.
+        "round(CAST(9.99 AS DECIMAL(3,2)), 1)", "round(CAST(9.99 AS DECIMAL(3,2)), 0)",
+        "round(CAST(0.5 AS DECIMAL(2,1)), 0)",
+
+        # Floating point has no overflow to find -- it saturates to an infinity instead.
+        "round(CAST(1.7976931348623157E308 AS DOUBLE), -1)",
+        "round(CAST(3.4028235E38 AS FLOAT), -1)",
+
+        # Nulls stay null on both paths.
+        "round(CAST(NULL AS BIGINT), -1)", "round(CAST(NULL AS DECIMAL(10,2)), -1)",
     ],
 
     "ansi-sensitive": [
