@@ -199,6 +199,53 @@ internal static class SparkWideDecimals
     /// Compared at the wider of the two scales, so a <c>decimal(10,2)</c> holding 1.00 equals an
     /// <c>int</c> holding 1 — which is what Spark says, and what comparing renderings would not.
     /// </remarks>
+    /// <summary>
+    /// Rounds to a multiple of 10^<paramref name="places"/>, half away from zero, at scale 0.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>ONE rounding, not two</b>, and the difference is visible on ordinary values. Declaring
+    /// the operand's scale to be <c>Scale + places</c> is the same as dividing it by
+    /// 10^<paramref name="places"/>, so a single rescale to 0 rounds at the place that matters.
+    /// Rounding to an integer first and to the multiple second would answer 20 for
+    /// <c>round(14.6, -1)</c>, by way of 15; measured, Spark answers 10.
+    /// </para>
+    /// <para>
+    /// Null means the result does not fit <paramref name="target"/> — the caller decides what
+    /// that is, exactly as for <see cref="Cast"/>.
+    /// </para>
+    /// </remarks>
+    internal static Int128? RoundToPowerOfTen(Operand value, int places, Decimal128Type target)
+    {
+        // No Spark decimal reaches half of 10^39, so everything past 38 rounds to zero -- and
+        // saying so here is what keeps `round(x, -2000000000)` from forming that power at all.
+        if (places > SparkNumericTypes.MaxPrecision)
+            return Int128.Zero;
+
+        var type = AsDecimalType(target);
+
+        try
+        {
+            var quotient = ScaleHelper.Rescale256(
+                (Int256)value.Unscaled, value.Type.Scale + places, 0, Rounding);
+
+            if (quotient == Int256.Zero)
+                return Int128.Zero;
+
+            var factor = Int256.One;
+            for (var i = 0; i < places; i++) factor *= Ten;
+
+            var exact = quotient * factor;
+            return DecimalRange.IsInRange(exact, type) ? (Int128)exact : null;
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+    }
+
+    private static readonly Int256 Ten = (Int256)10;
+
     internal static bool AreEqual(Operand left, Operand right)
     {
         // Raising a scale multiplies and is exact, so the rounding mode never comes up here.

@@ -62,6 +62,22 @@ public sealed class SparkEvaluationException : Exception
             "and return NULL instead.");
 
     /// <summary>
+    /// The same condition where turning ANSI off would not help, so Spark does not suggest it.
+    /// </summary>
+    /// <remarks>
+    /// Spark spells the two sub-classes apart and the distinction is load-bearing rather than
+    /// cosmetic: <c>WITH_SUGGESTION</c> is the one whose message ends "set
+    /// <c>spark.sql.ansi.enabled</c> to false … and return NULL instead", which is only honest
+    /// where the legacy dialect really does return null. <c>round</c> over a decimal is the path
+    /// where it does not — measured, <c>round(99999999999999999999999999999999999999, -1)</c>
+    /// raises with ansi both on and off — so it reports this variant. #285.
+    /// </remarks>
+    internal static SparkEvaluationException NumericValueOutOfRangeWithoutSuggestion(
+        string value, Decimal128Type type) =>
+        new("NUMERIC_VALUE_OUT_OF_RANGE.WITHOUT_SUGGESTION",
+            $"{value} cannot be represented as Decimal({type.Precision}, {type.Scale}).");
+
+    /// <summary>
     /// A string carrying more integral digits than any Spark decimal has.
     /// </summary>
     /// <remarks>

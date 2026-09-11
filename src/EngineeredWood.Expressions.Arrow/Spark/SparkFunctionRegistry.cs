@@ -1659,6 +1659,14 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             return value;
 
         var factor = Math.Pow(10, scale);
+
+        // A scale below about -324 underflows the factor to zero, and dividing by it at the end
+        // would turn a rounded 0 into 0/0 = NaN -- a value out of nowhere, for an input that has
+        // a perfectly ordinary answer. Everything is nearer to zero than to the first multiple of
+        // a power of ten that large, so zero is that answer. #285.
+        if (factor == 0d)
+            return 0d;
+
         var scaled = value * factor;
 
         if (double.IsInfinity(scaled) || Math.Abs(scaled) >= 9007199254740992d)
@@ -1684,17 +1692,29 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
                 continue;
             }
 
-            var rounded = RoundToPowerOfTen(value, -scale);
+            var rounded = RoundToPowerOfTen(value, PlacesFor(scale, 20), out var exact);
 
-            if (!SparkArrays.FitsIn(rounded, type))
+            if (!exact || !SparkArrays.FitsIn(rounded, type))
             {
-                if (!_options.Ansi) continue;
-
                 // Measured: `round(a, -1)` over INT_MIN reports ARITHMETIC_OVERFLOW rather than
-                // CAST_OVERFLOW — rounding is arithmetic here, not a conversion.
-                throw SparkEvaluationException.Overflow(
-                    SparkArrays.NarrowerThanInt(type),
-                    $"rounding {value} to {scale} places overflows {SparkArrays.Describe(type)}");
+                // CAST_OVERFLOW — rounding is arithmetic here, not a conversion. And plain
+                // ARITHMETIC_OVERFLOW at EVERY width, including the narrow ones: unlike `a + b`,
+                // this does not report BINARY_ARITHMETIC_OVERFLOW for a TINYINT.
+                if (_options.Ansi)
+                {
+                    throw SparkEvaluationException.Overflow(
+                        narrowerThanInt: false,
+                        $"rounding {value} to {scale} places overflows {SparkArrays.Describe(type)}");
+                }
+
+                // THE LEGACY DIALECT WRAPS, it does not null -- which is the half of #285 the
+                // issue did not name and the shape #243 already found for an integral cast.
+                // Measured: `round(CAST(127 AS TINYINT), -1)` is -126 with ansi off, the byte
+                // wrap of 130, and `round(9223372036854775807, -1)` is -9223372036854775806.
+                // `rounded` already carries the low 64 bits, so the wrap is the same narrowing an
+                // overflowing cast takes.
+                values[i] = SparkArrays.Truncate(rounded, type);
+                continue;
             }
 
             values[i] = rounded;
@@ -1703,29 +1723,131 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return SparkArrays.BuildIntegral(values, type, rowCount);
     }
 
-    /// <summary>Rounds to a multiple of 10^places, half away from zero.</summary>
-    private static long RoundToPowerOfTen(long value, int places)
+    /// <summary>
+    /// How many places a scale rounds to, negated in 64 bits and clamped.
+    /// </summary>
+    /// <remarks>
+    /// <b><paramref name="scale"/> is an <see cref="int"/>, so <c>-scale</c> overflows back to a
+    /// NEGATIVE for <see cref="int.MinValue"/></b> — and everything downstream then reads as
+    /// nonsense: the integral loop runs zero times and returns the value unrounded, and the
+    /// decimal path builds a <c>Decimal128Type</c> with a negative precision. Negating in 64 bits
+    /// and clamping fixes both and changes no answer, because past <paramref name="ceiling"/>
+    /// every value already rounds to zero.
+    /// <para>
+    /// <b>There is no Spark behaviour to reproduce this far out</b>, only a crash to avoid.
+    /// Measured: <c>round(1, -2147483648)</c> is a bare <c>ArithmeticException: Underflow</c> with
+    /// no error class under the legacy dialect, and
+    /// <c>round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)</c> is one under both — uncaught JVM
+    /// exceptions rather than anything Spark defines. The scales that ARE defined still agree:
+    /// <c>round(1, -100)</c> is 0 and <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is a
+    /// decimal(38,0) holding 0.
+    /// </para>
+    /// </remarks>
+    private static int PlacesFor(int scale, int ceiling) =>
+        scale >= 0 ? 0 : (int)Math.Min(-(long)scale, ceiling);
+
+    /// <summary>
+    /// Rounds to a multiple of 10^<paramref name="places"/>, half away from zero, in 64 bits.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns the low 64 bits whether or not the exact answer fits them, and reports which
+    /// through <paramref name="exact"/>. Both halves are needed: ANSI raises on an overflow and
+    /// the legacy dialect WRAPS to the target's width, so a function that could only refuse would
+    /// leave the second dialect with nothing to return. #285.
+    /// </para>
+    /// <para>
+    /// <b>Rounding at the top of the range is where the overflow lives</b>, and it used to be
+    /// invisible for a BIGINT: <c>9223372036854775807</c> rounds to <c>...810</c>, the addition
+    /// wrapped silently, and the <c>FitsIn</c> check that follows sees only a <c>long</c> — which
+    /// always fits a BIGINT. The narrower widths were caught because their arithmetic still had
+    /// room in a <see cref="long"/>; only the widest one did not.
+    /// </para>
+    /// <para>
+    /// <b>The three <paramref name="places"/> bands are measured, not defensive.</b> At 19 the
+    /// step is 10^19, which no <see cref="long"/> holds, so the only answers are 0 and ±10^19 and
+    /// the second always overflows — but the TEST is exact, because half of 10^19 is 5e18 and
+    /// that does fit. Measured: <c>round(4999999999999999999, -19)</c> is 0 and
+    /// <c>round(5000000000000000000, -19)</c> is ARITHMETIC_OVERFLOW. At 20 and beyond, half the
+    /// step is past a long's ceiling altogether, so every value rounds to zero —
+    /// <c>round(9223372036854775807, -20)</c> is 0. The old code answered 0 for everything past
+    /// 18, which got the 19 band wrong in both dialects.
+    /// </para>
+    /// </remarks>
+    private static long RoundToPowerOfTen(long value, int places, out bool exact)
     {
-        if (places > 18)
+        exact = true;
+
+        // Half of 10^20 is 5e19, past long.MaxValue, so nothing reaches the first multiple.
+        if (places >= 20)
             return 0;
+
+        if (places == 19)
+        {
+            // Written as a bound rather than Math.Abs, which throws on long.MinValue — the very
+            // value this band has to get right.
+            if (value > -5_000_000_000_000_000_000L && value < 5_000_000_000_000_000_000L)
+                return 0;
+
+            exact = false;
+
+            // 10^19 modulo 2^64, which is what the wrap produces, and its negation for the other
+            // sign. Both fit a long once wrapped, so neither needs any more care than `unchecked`.
+            const long WrappedTenPow19 = unchecked((long)10_000_000_000_000_000_000UL);
+            return value < 0 ? unchecked(-WrappedTenPow19) : WrappedTenPow19;
+        }
 
         var step = 1L;
         for (var i = 0; i < places; i++) step *= 10;
 
+        // Neither of these can overflow: |remainder| < step, and truncated is between value and
+        // zero. The step AWAY from zero below is the only part that can.
         var remainder = value % step;
         var truncated = value - remainder;
 
         if (Math.Abs(remainder) * 2 < step)
             return truncated;
 
-        return truncated + (value < 0 ? -step : step);
+        var away = value < 0 ? -step : step;
+        var result = unchecked(truncated + away);
+
+        // Adding a positive step can only decrease the result by wrapping, and vice versa.
+        exact = value < 0 ? result < truncated : result > truncated;
+        return result;
     }
 
+    /// <summary>
+    /// <c>round</c> over a decimal, where a NEGATIVE scale rounds to a multiple of a power of ten.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A negative scale used to do nothing at all.</b> The result scale clamps to 0 either way,
+    /// so the old code rescaled to scale 0 and stopped — measured, <c>round(12.34, -1)</c> answered
+    /// 12 where Spark answers 10, and every negative scale answered the same as scale 0. #285.
+    /// </para>
+    /// <para>
+    /// <b>The integral digits the type reserves are <c>max(p - s, places)</c>, not <c>p - s</c>.</b>
+    /// Measured, and the row that says so is the extreme one: <c>round(CAST(99 AS DECIMAL(2,0)),
+    /// -20)</c> resolves to <c>decimal(21,0)</c> — Spark sizes the type for a multiple of 10^20
+    /// even though no <c>decimal(2,0)</c> can reach one, and the answer is 0. The ordinary rows
+    /// agree with the old formula because <c>p - s</c> is the larger term there.
+    /// </para>
+    /// <para>
+    /// <b>Both dialects RAISE on a decimal overflow here</b>, unlike the integral path beside it,
+    /// which raises under ANSI and wraps under legacy. Measured:
+    /// <c>round(99999999999999999999999999999999999999, -1)</c> is
+    /// NUMERIC_VALUE_OUT_OF_RANGE.WITHOUT_SUGGESTION with ansi both on and off — and the
+    /// <c>WITHOUT_SUGGESTION</c> half of that name is Spark saying so itself, since the other
+    /// variant is the one that tells you to turn ANSI off.
+    /// </para>
+    /// </remarks>
     private IArrowArray RoundDecimal(IArrowArray source, Decimal128Type type, int scale, int rowCount)
     {
+        var places = PlacesFor(scale, SparkNumericTypes.MaxPrecision + 1);
         var resultScale = Math.Max(Math.Min(type.Scale, scale), 0);
+        var integralDigits = Math.Max(type.Precision - type.Scale, places);
         var resultPrecision = Math.Min(
-            SparkNumericTypes.MaxPrecision, type.Precision - type.Scale + resultScale + 1);
+            SparkNumericTypes.MaxPrecision, integralDigits + resultScale + 1);
         var target = new Decimal128Type(resultPrecision, resultScale);
 
         var mantissas = new Int128?[rowCount];
@@ -1737,12 +1859,13 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
             // The same rescale every other exact path uses, so the rounding mode is the one
             // SparkWideDecimals pins rather than a second opinion about it.
-            var rounded = SparkWideDecimals.Cast(value, target);
+            var rounded = places == 0
+                ? SparkWideDecimals.Cast(value, target)
+                : SparkWideDecimals.RoundToPowerOfTen(value, places, target);
 
             if (rounded is null)
             {
-                if (!_options.Ansi) continue;
-                throw SparkEvaluationException.NumericValueOutOfRange(
+                throw SparkEvaluationException.NumericValueOutOfRangeWithoutSuggestion(
                     SparkWideDecimals.Render(value), target);
             }
 

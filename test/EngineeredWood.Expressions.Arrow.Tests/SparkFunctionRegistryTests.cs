@@ -647,7 +647,12 @@ public sealed class SparkFunctionRegistryTests
             "ARITHMETIC_OVERFLOW",
             Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "round(a, -1)", batch)).ErrorClass);
 
-        Assert.True(Assert.IsType<Int32Array>(Eval(Legacy, "round(a, -1)", batch)).IsNull(0));
+        // THE LEGACY HALF WAS ASSUMED, NOT MEASURED, and it was wrong: this asserted null,
+        // because "legacy yields null where ANSI raises" is true of so much else here. Measured
+        // for #285, the legacy dialect WRAPS — the same thing an overflowing integral cast does
+        // (#243) — so INT_MIN rounded to -2147483650 comes back as 2147483646.
+        Assert.Equal(
+            2147483646, Assert.IsType<Int32Array>(Eval(Legacy, "round(a, -1)", batch)).GetValue(0));
     }
 
     [Fact]
@@ -1658,6 +1663,212 @@ public sealed class SparkFunctionRegistryTests
 
         Assert.False(Eval(Ansi, "nullif(g, 2e29)", batch).IsNull(0));
         Assert.True(Eval(Ansi, "nullif(g, 1e29)", batch).IsNull(0));
+    }
+
+    // ── round at the top of a type's range (#285) ───────────────────────────────────────────
+
+    /// <summary>
+    /// Rounding away from zero past a type's maximum raises under ANSI and WRAPS under legacy.
+    /// </summary>
+    /// <remarks>
+    /// <b>The BIGINT rows are the ones that were invisible.</b> The overflow check that was here
+    /// compared the rounded value against the target's width, which catches a TINYINT, a SMALLINT
+    /// and an INT — their arithmetic still has room in the <see cref="long"/> it is done in — but
+    /// never a BIGINT, where the addition had already wrapped before the check could see it.
+    /// <para>
+    /// <b>Legacy wraps rather than nulling</b>, which is the half #285 did not name and the same
+    /// shape #243 found for an integral cast. Measured: <c>round(CAST(127 AS TINYINT), -1)</c> is
+    /// -126 with ansi off, the byte wrap of 130.
+    /// </para>
+    /// <para>
+    /// Plain <c>ARITHMETIC_OVERFLOW</c> at every width — unlike <c>a + b</c>, which reports
+    /// <c>BINARY_ARITHMETIC_OVERFLOW</c> for the narrow ones.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("round(9223372036854775807, -1)", -9223372036854775806L)]
+    [InlineData("round(9223372036854775806, -1)", -9223372036854775806L)]
+    [InlineData("round(CAST(-9223372036854775808 AS BIGINT), -1)", 9223372036854775806L)]
+    [InlineData("round(CAST(2147483647 AS INT), -1)", -2147483646L)]
+    [InlineData("round(CAST(-2147483648 AS INT), -1)", 2147483646L)]
+    [InlineData("round(CAST(32767 AS SMALLINT), -1)", -32766L)]
+    [InlineData("round(CAST(127 AS TINYINT), -1)", -126L)]
+    [InlineData("round(CAST(-128 AS TINYINT), -1)", 126L)]
+    public void RoundingPastATypesMaximumRaisesUnderAnsiAndWrapsUnderLegacy(string sql, long wrapped)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        var thrown = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, batch));
+        Assert.Equal("ARITHMETIC_OVERFLOW", thrown.ErrorClass);
+
+        Assert.Equal(wrapped, SparkArrays.ReadInt64(Eval(Legacy, sql, batch), 0));
+    }
+
+    [Theory]
+    // Inside the range, so nothing raises in either dialect.
+    [InlineData("round(CAST(124 AS TINYINT), -1)", 120L)]
+    [InlineData("round(9223372036854775807, -18)", 9000000000000000000L)]
+    [InlineData("round(123, -3)", 0L)]
+    // A non-negative scale on an integral has nothing to round.
+    [InlineData("round(9223372036854775807)", 9223372036854775807L)]
+    [InlineData("round(9223372036854775807, 2)", 9223372036854775807L)]
+    public void RoundingInsideTheRangeIsUnchanged(string sql, long expected)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Equal(expected, SparkArrays.ReadInt64(Eval(Ansi, sql, batch), 0));
+        Assert.Equal(expected, SparkArrays.ReadInt64(Eval(Legacy, sql, batch), 0));
+    }
+
+    /// <summary>
+    /// The three bands a negative scale falls into, where only the middle one is subtle.
+    /// </summary>
+    /// <remarks>
+    /// At 19 places the step is 10^19, which no <see cref="long"/> holds, so the only answers are
+    /// 0 and ±10^19 and the second always overflows — but the TEST is exact, because half of
+    /// 10^19 is 5e18 and that does fit. At 20 and beyond half the step is past a long's ceiling
+    /// altogether and every value rounds to zero. The old code answered 0 for everything past 18,
+    /// which got the middle band wrong in both dialects.
+    /// </remarks>
+    [Fact]
+    public void ANegativeScalePastEighteenPlacesHasThreeBands()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        // Below half of 10^19: zero, and no overflow.
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Ansi, "round(4999999999999999999, -19)", batch), 0));
+
+        // At half: rounds away to 10^19, which no BIGINT holds.
+        Assert.Equal(
+            "ARITHMETIC_OVERFLOW",
+            Assert.Throws<SparkEvaluationException>(
+                () => Eval(Ansi, "round(5000000000000000000, -19)", batch)).ErrorClass);
+
+        // ...and legacy hands back the low 64 bits of 10^19.
+        Assert.Equal(
+            -8446744073709551616L,
+            SparkArrays.ReadInt64(Eval(Legacy, "round(5000000000000000000, -19)", batch), 0));
+
+        // Past 19, half the step is out of reach and everything is zero.
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Ansi, "round(9223372036854775807, -20)", batch), 0));
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Ansi, "round(123, -19)", batch), 0));
+    }
+
+    /// <summary>
+    /// A negative scale on a DECIMAL rounds to a multiple of a power of ten, in one step.
+    /// </summary>
+    /// <remarks>
+    /// It used to do nothing at all: the result scale clamps to 0 either way, so the old code
+    /// rescaled to scale 0 and stopped, and every negative scale answered the same as scale 0.
+    /// <para>
+    /// <b>14.6 is the row that shows the rounding happens once.</b> Rounding to an integer first
+    /// and to the multiple second would answer 20, by way of 15; Spark answers 10.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("round(CAST(14.6 AS DECIMAL(10,1)), -1)", 10, 0, "10")]
+    [InlineData("round(CAST(-14.6 AS DECIMAL(10,1)), -1)", 10, 0, "-10")]
+    [InlineData("round(CAST(15.0 AS DECIMAL(10,1)), -1)", 10, 0, "20")]
+    [InlineData("round(CAST(14.9 AS DECIMAL(10,1)), -1)", 10, 0, "10")]
+    [InlineData("round(CAST(4.6 AS DECIMAL(10,1)), -1)", 10, 0, "0")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -1)", 9, 0, "10")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -3)", 9, 0, "0")]
+    [InlineData("round(CAST(15 AS DECIMAL(2,0)), -1)", 3, 0, "20")]
+    [InlineData("round(CAST(5 AS DECIMAL(1,0)), -1)", 2, 0, "10")]
+    // The carry the extra digit of precision exists for.
+    [InlineData("round(CAST(99 AS DECIMAL(2,0)), -1)", 3, 0, "100")]
+    // ...and the row that says the type reserves max(p - s, places) integral digits, not p - s.
+    [InlineData("round(CAST(99 AS DECIMAL(2,0)), -20)", 21, 0, "0")]
+    public void ANegativeScaleOnADecimalRoundsToAMultipleOfATenPower(
+        string sql, int precision, int scale, string expected)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Assert.IsType<Decimal128Array>(Eval(registry, sql, batch));
+            var type = (Decimal128Type)result.Data.DataType;
+
+            Assert.Equal((precision, scale), (type.Precision, type.Scale));
+            Assert.Equal(expected, SparkWideDecimals.Render(SparkWideDecimals.Read(result, 0)!.Value));
+        }
+    }
+
+    /// <summary>
+    /// An extreme scale rounds to zero rather than overflowing the arithmetic that reads it.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="scale"/> is an <c>int</c>, so <c>-scale</c> overflows back to a negative
+    /// for <c>int.MinValue</c>: the integral loop then ran zero times and returned the value
+    /// UNROUNDED, and the decimal path built a <c>Decimal128Type</c> with a negative precision.
+    /// <para>
+    /// <b>Spark does not survive this corner either</b> — measured, <c>round(1, -2147483648)</c>
+    /// is a bare <c>ArithmeticException: Underflow</c> with no error class, so there is no
+    /// behaviour to match, only a crash to avoid. The scales that ARE defined agree:
+    /// <c>round(1, -100)</c> is 0 and <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is 0.
+    /// </para>
+    /// <para>
+    /// The floating case is not an extreme at all. A scale below about -324 underflows
+    /// <c>Math.Pow</c>'s factor to zero, and the final division turned a rounded 0 into 0/0 —
+    /// measured, Spark answers 0.0 for <c>round(1.5, -400)</c>, and -400 is an ordinary number.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("round(1, -2147483648)")]
+    [InlineData("round(1, -2147483647)")]
+    [InlineData("round(1, -100)")]
+    [InlineData("round(9223372036854775807, -2147483648)")]
+    public void AnExtremeNegativeScaleRoundsToZero(string sql)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Ansi, sql, batch), 0));
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Legacy, sql, batch), 0));
+    }
+
+    [Theory]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -39)")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -2147483648)")]
+    public void AnExtremeNegativeScaleOnADecimalStaysAValidType(string sql)
+    {
+        var batch = Batch(("a", Ints(1)));
+        var result = Assert.IsType<Decimal128Array>(Eval(Ansi, sql, batch));
+        var type = (Decimal128Type)result.Data.DataType;
+
+        Assert.Equal((38, 0), (type.Precision, type.Scale));
+        Assert.Equal("0", SparkWideDecimals.Render(SparkWideDecimals.Read(result, 0)!.Value));
+    }
+
+    [Fact]
+    public void AScaleThatUnderflowsTheFactorRoundsToZeroRatherThanNaN()
+    {
+        var batch = Batch(("g", Doubles(1.5)));
+
+        Assert.Equal(0d, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, -400)", batch)).GetValue(0));
+        Assert.Equal(0d, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, -300)", batch)).GetValue(0));
+
+        // ...and a scale far past what a double can hold is still the value itself.
+        Assert.Equal(1.5, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, 400)", batch)).GetValue(0));
+    }
+
+    /// <summary>A decimal that will not fit raises under BOTH dialects, unlike the integral one.</summary>
+    /// <remarks>
+    /// The asymmetry is measured, not assumed, and Spark names it itself: the sub-class is
+    /// <c>WITHOUT_SUGGESTION</c>, where the variant used everywhere else is the one whose message
+    /// offers to turn ANSI off and return null instead.
+    /// </remarks>
+    [Fact]
+    public void ADecimalRoundThatOverflowsRaisesUnderBothDialects()
+    {
+        var batch = Batch(("a", Ints(1)));
+        const string Sql = "round(99999999999999999999999999999999999999, -1)";
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var thrown = Assert.Throws<SparkEvaluationException>(() => Eval(registry, Sql, batch));
+            Assert.Equal("NUMERIC_VALUE_OUT_OF_RANGE.WITHOUT_SUGGESTION", thrown.ErrorClass);
+        }
     }
 
     // ── CAST to and from BINARY, and the conditionals that needed it (#295) ─────────────────
