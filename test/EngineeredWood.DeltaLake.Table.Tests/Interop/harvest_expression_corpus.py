@@ -81,6 +81,10 @@ LEGACY_GROUPS = (
     # refuse under ANSI and answer under legacy, and #299's float rows, which answer differently
     # in each. Both were found by this group and neither is visible from one dialect.
     "nullif-equality",
+    # #295. The dialects disagree twice over: ANSI refuses the integral-to-binary CAST that legacy
+    # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
+    # directions in one group, so one harvest would describe neither.
+    "binary-casts",
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
     "conditional-string-coercion")
@@ -1255,6 +1259,66 @@ GROUPS = {
         "9007199254740993 = CAST(9007199254740992 AS DOUBLE)",
     ],
 
+    # Casts to and from BINARY, and the conditionals that need them. #295. Binary answers are
+    # recorded as HEX (see `_json_safe`); before that no binary answer was comparable at all,
+    # which is part of why this gap lived so long.
+    "binary-casts": [
+        # A string is a UTF-8 encode, in both dialects. The empty string is bytes, not null.
+        "CAST('a' AS BINARY)", "CAST('abc' AS BINARY)", "CAST('' AS BINARY)",
+        "CAST(CAST(NULL AS STRING) AS BINARY)",
+        "CAST(s AS BINARY)", "CAST(ns AS BINARY)",
+
+        # An INTEGRAL is the legacy dialect's alone: big-endian at the SOURCE type's width, so a
+        # tinyint is one byte and a bigint eight, and a negative is its two's complement. ANSI
+        # refuses the same cast, and try_cast refuses it under BOTH dialects.
+        "CAST(CAST(1 AS TINYINT) AS BINARY)", "CAST(CAST(1 AS SMALLINT) AS BINARY)",
+        "CAST(CAST(1 AS INT) AS BINARY)", "CAST(CAST(1 AS BIGINT) AS BINARY)",
+        "CAST(CAST(-2 AS SMALLINT) AS BINARY)", "CAST(9223372036854775807 AS BINARY)",
+        "TRY_CAST(CAST(1 AS INT) AS BINARY)", "TRY_CAST('a' AS BINARY)",
+
+        # Refused by both dialects, so the allowance above is not "anything numeric".
+        "CAST(CAST(1.5 AS DOUBLE) AS BINARY)", "CAST(CAST(1.5 AS FLOAT) AS BINARY)",
+        "CAST(d1 AS BINARY)", "CAST(true AS BINARY)",
+        "CAST(dt AS BINARY)", "CAST(ts AS BINARY)",
+
+        # Binary to binary is the identity; binary to STRING is a UTF-8 DECODE that REPLACES what
+        # is not valid, so the round trip is not the identity and both halves are here.
+        "CAST(X'00FF' AS BINARY)", "CAST(bin AS BINARY)",
+        "CAST(X'41' AS STRING)", "CAST(X'FF' AS STRING)",
+        "CAST(CAST('abc' AS BINARY) AS STRING)",
+        "CAST(CAST(X'FF' AS STRING) AS BINARY)",
+
+        # The conditional family, which is what #295 was filed for: ANSI resolves the pair to
+        # BINARY and moves the string into it as UTF-8, in EITHER operand order; the legacy
+        # dialect refuses the pair outright.
+        "coalesce(X'00', '2')", "coalesce('2', X'00')",
+        "coalesce(CAST(NULL AS BINARY), '2')", "coalesce(X'FF', '2')",
+        "coalesce(bin, '2')", "ifnull(X'00', '2')", "nvl(X'00', '2')",
+        "if(true, X'00', '2')", "if(false, X'00', '2')",
+        "CASE WHEN false THEN X'00' ELSE '2' END",
+        # A typed null still constrains the pair, which is #293's shape rather than this one's.
+        "coalesce(X'00', CAST(NULL AS STRING))",
+
+        # ...and a binary against a binary, which needed no string rule at all and was broken too.
+        "coalesce(X'00', X'01')", "coalesce(CAST(NULL AS BINARY), X'01')",
+        # Refused in both dialects, so binary does not absorb everything.
+        "coalesce(X'00', 1)", "coalesce(X'00', true)",
+
+        # greatest/least ORDER a binary pair -- unsigned, and a prefix sorts first. They refuse a
+        # binary against a string where coalesce coerces it, which is #278's split again.
+        "greatest(X'00', X'01')", "least(X'00', X'01')",
+        "greatest(X'00', X'FF')", "greatest(X'7F', X'80')",
+        "greatest(X'01', X'0100')", "least(X'01', X'0100')",
+        "greatest(X'00', '2')", "least(X'00', '2')",
+
+        # nullif takes the FIRST argument's type, so it answers binary in both dialects. Equality
+        # is by BYTES against another binary -- X'FF' and X'FE' decode to the same U+FFFD and are
+        # still unequal -- but against a STRING it is the binary that is rendered as text (#262),
+        # which is why the last row is NULL and the one above it is not.
+        "nullif(X'00', X'01')", "nullif(X'00', X'00')", "nullif(X'FF', X'FE')",
+        "nullif(X'00', '2')", "nullif(X'FF', CAST(X'FF' AS STRING))",
+    ],
+
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",
@@ -1300,6 +1364,9 @@ def _json_safe(value):
     stricter reader refuses -- System.Text.Json among them, so the fixture simply failed to load.
     They are legitimate Spark answers (`round(CAST('NaN' AS DOUBLE), 2)` is NaN), so they are
     recorded as the strings Java prints for them and the comparison reads them back.
+
+    Binary needs the same treatment and does not get it here: the driver has already converted it
+    to hex by the time these values arrive. See `_expr_value` in spark_driver.py for why. #295.
     """
     if isinstance(value, float):
         if value != value:

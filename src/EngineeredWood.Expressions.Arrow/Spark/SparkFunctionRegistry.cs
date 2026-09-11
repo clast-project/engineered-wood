@@ -700,6 +700,9 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         if (target is StringType)
             return CastToString(source, rowCount);
 
+        if (target is BinaryType)
+            return CastToBinary(source, rowCount, legacy);
+
         if (SparkNumericTypes.IsIntegral(target))
             return CastToIntegral(source, target, rowCount, raising, legacy);
 
@@ -1172,6 +1175,108 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return builder.Build();
     }
 
+    /// <summary>Casts a column to BINARY, which only two source families reach.</summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A string is a UTF-8 encode and a binary is the identity</b> — those two in both
+    /// dialects. Measured: <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, <c>CAST('' AS BINARY)</c> is
+    /// empty rather than null, and a null stays null. The reverse direction,
+    /// <c>CAST(bin AS STRING)</c>, already worked and is a UTF-8 DECODE that replaces what is not
+    /// valid, so <c>CAST(X'FF' AS STRING)</c> is U+FFFD — which means the round trip is not the
+    /// identity and the corpus carries both halves.
+    /// </para>
+    /// <para>
+    /// <b>An integral is the legacy dialect's ALONE, and this is the part #295 did not name.</b>
+    /// Measured on 4.0.3: with ansi off, <c>CAST(CAST(1 AS INT) AS BINARY)</c> is
+    /// <c>00000001</c> — big-endian, at the source type's own width, so a TINYINT gives one byte
+    /// and a BIGINT eight, and a negative value gives its two's complement (<c>CAST(-2 AS
+    /// SMALLINT)</c> is <c>FFFE</c>). With ANSI on the same cast is refused outright, as
+    /// <c>DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION</c>, whose whole content is "turn ANSI off".
+    /// </para>
+    /// <para>
+    /// <b>try_cast is refused too, under BOTH dialects</b>, which is why this keys on
+    /// <paramref name="legacy"/> rather than on <c>!raising</c>: measured,
+    /// <c>TRY_CAST(CAST(1 AS INT) AS BINARY)</c> is <c>CAST_WITHOUT_SUGGESTION</c> even with ansi
+    /// off, because try_cast type-checks as ANSI does. The three-state <c>raising</c>/
+    /// <paramref name="legacy"/> pair from #243 already distinguishes exactly those three callers.
+    /// </para>
+    /// <para>
+    /// Everything else — float, double, decimal, boolean, date, timestamp — is refused in both
+    /// dialects, and refused as a TYPE error rather than a per-row one, which is what Spark does
+    /// with it. Same treatment as <c>SparkNumericTypes</c>'s "no common type", and deliberately
+    /// not a <see cref="SparkEvaluationException"/>: nothing here depends on the row's value.
+    /// </para>
+    /// </remarks>
+    private static IArrowArray CastToBinary(IArrowArray source, int rowCount, bool legacy)
+    {
+        var type = source.Data.DataType;
+
+        if (SparkNumericTypes.IsIntegral(type))
+        {
+            if (!legacy)
+            {
+                throw new NotSupportedException(
+                    $"Spark refuses CAST({SparkArrays.Describe(type)} AS BINARY) unless " +
+                    "spark.sql.ansi.enabled is false, and try_cast refuses it either way");
+            }
+
+            return CastIntegralToBinary(source, type, rowCount);
+        }
+
+        // One check, not one per row -- and a StringArray satisfies it, because it derives from
+        // BinaryArray and its buffer already holds the UTF-8 this cast wants.
+        if (source is not BinaryArray bytes)
+        {
+            throw new NotSupportedException(
+                $"Spark has no cast from {SparkArrays.Describe(type)} to BINARY in either dialect");
+        }
+
+        var builder = new BinaryArray.Builder();
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (bytes.IsNull(i)) builder.AppendNull();
+            else builder.Append(bytes.GetBytes(i));
+        }
+
+        // The spans above point into `bytes`'s buffer; see doc/arrow-span-lifetime.md.
+        GC.KeepAlive(bytes);
+        return builder.Build();
+    }
+
+    /// <summary>An integral column as big-endian bytes at its own width, for the legacy dialect.</summary>
+    private static IArrowArray CastIntegralToBinary(IArrowArray source, IArrowType type, int rowCount)
+    {
+        // The WIDTH is the source type's, not the value's: 1 as a BIGINT is eight bytes and 1 as a
+        // TINYINT is one. Measured, and it is why this reads the declared type rather than
+        // shrinking to the significant bytes.
+        var width = type switch
+        {
+            Int8Type => 1,
+            Int16Type => 2,
+            Int32Type => 4,
+            _ => 8,
+        };
+
+        var builder = new BinaryArray.Builder();
+        var buffer = new byte[width];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkArrays.ReadInt64(source, i) is not { } value)
+            {
+                builder.AppendNull();
+                continue;
+            }
+
+            for (var b = 0; b < width; b++)
+                buffer[width - 1 - b] = unchecked((byte)(value >> (8 * b)));
+
+            builder.Append(buffer.AsSpan());
+        }
+
+        return builder.Build();
+    }
+
     private IArrowArray CastToBoolean(IArrowArray source, int rowCount, bool raising)
     {
         var builder = new BooleanArray.Builder();
@@ -1341,15 +1446,13 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         if (SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other))
             return DoubleType.Default;
 
-        if (other is BooleanType or TimestampType || SparkArrays.IsDateType(other))
+        // BINARY joins these as of #295, which built the cast and the Unify branch that were
+        // missing when #278 measured the rule and had to decline it. Measured: ANSI resolves
+        // `coalesce(X'00', '2')` to BINARY, moving the string into it as UTF-8, in either operand
+        // order -- `coalesce('2', X'00')` is binary too, holding 32.
+        if (other is BooleanType or BinaryType or TimestampType || SparkArrays.IsDateType(other))
             return other;
 
-        // BINARY IS MEASURED AND STILL DECLINED. ANSI resolves `coalesce(X'00', '2')` to binary,
-        // moving the string into it as UTF-8 -- but `Cast` has no binary target and `Unify` has no
-        // binary branch, so naming that type here would promise a column nothing can build and
-        // trade "no common type" for "cast to 'BINARY' is not implemented" one call later.
-        // Declining keeps the refusal this pair already had before #278 and keeps this function
-        // honest about what it can deliver. #295, and declared in the corpus so it cannot drift.
         return null;
     }
 

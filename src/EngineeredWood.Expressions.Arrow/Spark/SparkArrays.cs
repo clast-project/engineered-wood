@@ -572,6 +572,86 @@ internal static class SparkArrays
     public static decimal Rescale(decimal value, int scale) =>
         Math.Round(value, Math.Min(scale, 28), MidpointRounding.AwayFromZero);
 
+    /// <summary>The array as bytes, or a refusal naming the type that cannot be read as binary.</summary>
+    /// <remarks>
+    /// <b>A <see cref="StringArray"/> passes this check, and that is the point rather than an
+    /// accident.</b> Apache.Arrow's StringArray derives from <see cref="BinaryArray"/> and its
+    /// value buffer already holds the UTF-8 — which IS Spark's string-to-binary cast, measured:
+    /// <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, and <c>CAST('' AS BINARY)</c> is empty bytes
+    /// rather than null. So the derivation that has to be guarded against everywhere else in this
+    /// file — where it would take a string's bytes when its TEXT was wanted — is here exactly what
+    /// is wanted, and no ordering is needed at all. #295.
+    /// <para>
+    /// Every other source type is refused, and by the CALLER rather than here, because the two
+    /// dialects disagree about integrals.
+    /// </para>
+    /// </remarks>
+    private static BinaryArray AsBinary(IArrowArray array) =>
+        array as BinaryArray
+        ?? throw new NotSupportedException(
+            $"{Describe(array.Data.DataType)} cannot be read as binary");
+
+    /// <summary>Appends a cell's bytes to <paramref name="builder"/>, or a null.</summary>
+    /// <remarks>
+    /// Takes the builder rather than returning the bytes so that nothing is materialised: this
+    /// runs once per row, and returning a <c>byte[]</c> would allocate one per row and then copy
+    /// it into the builder a second time. The span never leaves this method, which is also what
+    /// keeps the <c>GC.KeepAlive</c> rule in <c>doc/arrow-span-lifetime.md</c> local and honest.
+    /// </remarks>
+    public static void AppendBytes(BinaryArray.Builder builder, IArrowArray array, int index)
+    {
+        var bytes = AsBinary(array);
+
+        if (bytes.IsNull(index))
+        {
+            builder.AppendNull();
+        }
+        else
+        {
+            builder.Append(bytes.GetBytes(index));
+        }
+
+        GC.KeepAlive(bytes);
+    }
+
+    /// <summary>
+    /// Orders one row of two binary columns the way Spark orders a binary column.
+    /// </summary>
+    /// <remarks>
+    /// <b>Unsigned, and measured rather than assumed</b>: <c>greatest(X'00', X'FF')</c> is
+    /// <c>FF</c> and <c>greatest(X'7F', X'80')</c> is <c>80</c>. A signed reading gets both
+    /// backwards, which is the mistake a port from Java invites — Java's <c>byte</c> is signed
+    /// where .NET's is not. A shorter array that is a prefix of a longer one sorts first:
+    /// <c>greatest(X'01', X'0100')</c> is <c>0100</c>.
+    /// <para>
+    /// Compares in place for the reason <see cref="AppendBytes"/> gives — this is a per-row call,
+    /// and materialising either side would allocate.
+    /// </para>
+    /// </remarks>
+    public static int CompareBytes(IArrowArray left, IArrowArray right, int index)
+    {
+        var first = AsBinary(left);
+        var second = AsBinary(right);
+
+        var result = CompareBytes(first.GetBytes(index), second.GetBytes(index));
+
+        GC.KeepAlive(first);
+        GC.KeepAlive(second);
+        return result;
+    }
+
+    private static int CompareBytes(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right)
+    {
+        var shared = Math.Min(left.Length, right.Length);
+        for (var i = 0; i < shared; i++)
+        {
+            if (left[i] != right[i])
+                return left[i] < right[i] ? -1 : 1;
+        }
+
+        return left.Length.CompareTo(right.Length);
+    }
+
     /// <summary>The Spark spelling of an Arrow type, for error messages.</summary>
     public static string Describe(IArrowType type) => type switch
     {
@@ -582,6 +662,7 @@ internal static class SparkArrays
         FloatType => "FLOAT",
         DoubleType => "DOUBLE",
         StringType => "STRING",
+        BinaryType => "BINARY",
         BooleanType => "BOOLEAN",
         Decimal128Type d => $"DECIMAL({d.Precision},{d.Scale})",
         Decimal256Type d => $"DECIMAL({d.Precision},{d.Scale})",
@@ -643,6 +724,7 @@ internal static class SparkArrays
             "FLOAT" or "REAL" => FloatType.Default,
             "DOUBLE" => DoubleType.Default,
             "STRING" => StringType.Default,
+            "BINARY" => BinaryType.Default,
             "BOOLEAN" or "BOOL" => BooleanType.Default,
             "DATE" => Date32Type.Default,
             // Microseconds in UTC, matching what the readers produce and the fixed timezone

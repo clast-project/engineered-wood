@@ -869,6 +869,24 @@ def _quote_name(name):
     return "`" + name.replace("`", "``") + "`"
 
 
+def _expr_value(value):
+    """One collected cell, with binary turned into hex so it survives as a VALUE.
+
+    `_emit` serialises with `default=str`, which renders a bytearray as PYTHON'S REPR --
+    `bytearray(b'\\xab\\xcd')`. That is a rendering of a Python object, not an encoding of the
+    value, so the .NET comparison could not read it back and the corpus simply EXCLUDED its two
+    binary rows: no binary answer was ever checked, which is part of why #295 lived as long as it
+    did. Hex is unambiguous, and the reader knows to take it as bytes because the array it is
+    comparing against is a BinaryArray.
+
+    Only this command converts. Every other driver command has its own result shape, and a
+    global change to `_emit` would quietly reformat all of them.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex().upper()
+    return value
+
+
 def cmd_expr_oracle(args):
     """Ask Spark what an expression MEANS, for differential-testing the EW parser and registry.
 
@@ -957,7 +975,7 @@ def cmd_expr_oracle(args):
         if data is not None:
             try:
                 entry["eval"] = {"ok": True,
-                                 "values": [r[0] for r in
+                                 "values": [_expr_value(r[0]) for r in
                                             data.selectExpr(f"({expr}) AS r").collect()]}
             except Exception as exc:
                 entry["eval"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
