@@ -91,7 +91,12 @@ LEGACY_GROUPS = (
     "round-overflow",
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
-    "conditional-string-coercion")
+    "conditional-string-coercion",
+    # #280. Measured identical under both dialects, all 24 rows -- the least common type is a
+    # coercion rule and the ANSI switch moves overflow behaviour, not coercion. Recorded rather
+    # than assumed, for the reason nullif-equality is: the registry has a legacy variant that
+    # shares this rule, and "it cannot differ" is a claim until a second harvest says so.
+    "decimal-common-type")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -1376,6 +1381,145 @@ GROUPS = {
 
         # Nulls stay null on both paths.
         "round(CAST(NULL AS BIGINT), -1)", "round(CAST(NULL AS DECIMAL(10,2)), -1)",
+    ],
+
+    "decimal-common-type": [
+        # Issue #280. Unification and arithmetic BOTH sacrifice scale when the natural precision
+        # passes 38, and they sacrifice it to different floors. Spark's least-common-type rule is
+        # `DecimalType.boundedPreferIntegralDigits`, whose floor is ZERO -- read out of the 4.0.3
+        # jar and pinned here -- while arithmetic's `adjustPrecisionScale` stops at 6. Sharing
+        # arithmetic's clamp with this half is the whole defect, and no row of the corpus reached
+        # the overflow branch before this group, which is why the fuzzer found it and the corpus
+        # did not.
+
+        # THE REPRO. decimal(4,3) unified with decimal(38,0) is naturally decimal(41,3); the
+        # answer is decimal(38,0), having given the scale up entirely rather than down to 3.
+        "greatest(1.005, 99999999999999999999999999999999999999)",
+        "least(1.005, 99999999999999999999999999999999999999)",
+        # Asked twice, typed and rendered, so a disagreement is attributable to the value rather
+        # than to how a decimal reaches the fixture. #291.
+        "CAST(greatest(1.005, 99999999999999999999999999999999999999) AS STRING)",
+        "CAST(least(1.005, 99999999999999999999999999999999999999) AS STRING)",
+
+        # THE HALF THE ISSUE DID NOT NAME. greatest and least were the visible symptom, but they
+        # merely share the rule; the conditionals unify through the same one. They also fail
+        # DIFFERENTLY, which is why recording them separately matters: greatest skips an argument
+        # that will not fit the common type and answers the other one, where coalesce has nothing
+        # to skip to and answers NULL -- a non-null input reaching a caller as a null.
+        "coalesce(1.005, 99999999999999999999999999999999999999)",
+        "coalesce(CAST(NULL AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+        "if(false, CAST(1.005 AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+        "CASE WHEN false THEN CAST(1.005 AS DECIMAL(4,3)) ELSE CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) END",
+
+        # UNIFYING ROUNDS, HALF AWAY FROM ZERO, AND THE COMPARISON HAPPENS AFTERWARDS. These are
+        # the rows that say greatest is not "return the larger argument": every argument is cast
+        # to the common type FIRST, so an answer can be a value neither argument held. 0.5 at
+        # scale 0 is 1, and 1 beats 0.
+        "greatest(CAST(0.5 AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))",
+        "least(CAST(0.4 AS DECIMAL(38,38)), CAST(1 AS DECIMAL(38,0)))",
+        # ...including against a negative operand, where an implementation that compared the
+        # unscaled integers without aligning first would answer the other one.
+        "greatest(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+        "least(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+
+        # THE CLAMP ACROSS ITS BOUNDARY, as types. Natural common type in brackets:
+        #   d1,d2 (12,4) and d1,d3 (40,10) -- one under the maximum, one just over it
+        #   d1,d5 (46,38) -> (38,30) and d3,d5 (66,38) -> (38,10): the scale survives in part
+        #   d2,d4 (42,4) -> (38,0) and d4,d5 (76,38) -> (38,0): it does not survive at all
+        # The last two are exactly the pairs arithmetic's floor of 6 would have kept 4 and 6
+        # digits of, leaving too few integer digits for d4 and turning it into a null.
+        "greatest(d1, d2)",
+        "greatest(d1, d3)",
+        "greatest(d1, d5)",
+        "greatest(d3, d5)",
+        "greatest(d2, d4)",
+        "greatest(d4, d5)",
+        "coalesce(d2, d4)",
+        "if(true, d4, d5)",
+
+        # An integral unifies as the decimal that holds it, so the same clamp applies to it.
+        "greatest(d5, b)",
+        "greatest(d5, a)",
+
+        # THE CONTROL THAT KEEPS THE TWO CLAMPS APART. Same operand types as `greatest(d2, d4)`
+        # above, and a different answer: unification gives the scale up to 0 where `+` keeps 4.
+        # If this row ever agrees with that one, the two rules have been collapsed into one.
+        "d2 + d4",
+        "d1 + d3",
+
+        # ── COMPARISON THROUGH THE SAME TYPE ──────────────────────────────────────────────
+        # A comparison resolves a least common type too, and casts BOTH operands to it before
+        # comparing -- so once that type gives up scale the comparison is made on ROUNDED
+        # values, and it stops agreeing with an exact one. Every operator, because they do not
+        # all diverge the same way: `=` and `>` both flip, `<` does not.
+        "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) <> CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) < CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) >= CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) <= CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) <=> CAST(1 AS DECIMAL(38,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), CAST(1 AS DECIMAL(38,0)))",
+        "CAST(1.005 AS DECIMAL(4,3)) BETWEEN CAST(1 AS DECIMAL(38,0)) AND CAST(2 AS DECIMAL(38,0))",
+
+        # Rounding half AWAY FROM ZERO, on both sides of zero, at the scale the pair resolves to.
+        "CAST(0.4 AS DECIMAL(38,38)) = CAST(0 AS DECIMAL(38,0))",
+        "CAST(0.4 AS DECIMAL(38,38)) > CAST(0 AS DECIMAL(38,0))",
+        "CAST(0.5 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+        "CAST(0.6 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+        "CAST(-0.5 AS DECIMAL(38,38)) = CAST(-1 AS DECIMAL(38,0))",
+
+        # THE CONTROLS. The same operand against a decimal(10,0), where the common type is
+        # decimal(11,3) and loses nothing: the answers go back to the exact ones. Without these
+        # a fix that rounded every decimal comparison would look correct.
+        "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(10,0))",
+        "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(10,0))",
+
+        # AN INTEGRAL'S WIDTH DECIDES THE ANSWER, which is the row that says an integral takes
+        # part in this rather than sitting outside it. Against 4E-32 the same `=` is FALSE for a
+        # tinyint (the pair resolves to decimal(38,35), which still holds the value), TRUE for an
+        # int (decimal(38,28)) and TRUE for a bigint (decimal(38,18)) -- the wider the integral,
+        # the more integer digits it reserves and the sooner the other operand rounds away.
+        "CAST(0 AS TINYINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+        "CAST(0 AS INT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+        "CAST(0 AS BIGINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+        "CAST(0 AS INT) > CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT))",
+        "greatest(CAST(0 AS INT), CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+        # ...and an int against a value that does NOT round away, so the width rule is pinned
+        # from both sides.
+        "CAST(0 AS INT) = CAST(0.4 AS DECIMAL(38,38))",
+
+        # FLOATING POINT IS NOT PART OF THIS. A decimal against a double is compared as a
+        # DOUBLE (#277), not through a common decimal, and these rows keep the new rule from
+        # intercepting that one.
+        "CAST(0.1 AS DECIMAL(38,38)) = CAST(0.1 AS DOUBLE)",
+        "CAST(1.005 AS DECIMAL(4,3)) = CAST(1.005 AS DOUBLE)",
+
+        # Column forms of the same question, so the rule is pinned over real columns and not
+        # only over folded literals.
+        "d5 = d4",
+        "d5 < d4",
+        "d2 = d4",
+        "d5 IN (d4)",
+
+        # A BARE NULL IN THE LIST CONSTRAINS NOTHING. Spark types it `void`, so the set still
+        # resolves through the other members and still rounds -- the first row is TRUE, the same
+        # answer the list gives without the NULL. Worth pinning because a NULL member has no
+        # value to read a type from, and calling it a string instead would send an otherwise
+        # numeric set down the string-promotion rule and lose the match.
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), NULL)",
+        "CAST(1.005 AS DECIMAL(4,3)) IN (NULL)",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT), NULL)",
+        # The exact control: no rounding, so no match, and the NULL member makes it null rather
+        # than false -- ordinary three-valued IN.
+        "CAST(1.005 AS DECIMAL(10,3)) IN (CAST(1 AS DECIMAL(10,0)), NULL)",
+        # ...and an integral set, which reaches none of this and must not start to. The pair
+        # differs only in whether the list holds the operand's exact value.
+        "9007199254740993 IN (9007199254740992, NULL)",
+        "9007199254740993 IN (9007199254740993, NULL)",
     ],
 
     "ansi-sensitive": [
