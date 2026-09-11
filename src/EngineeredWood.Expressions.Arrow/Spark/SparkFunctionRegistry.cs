@@ -1659,6 +1659,14 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             return value;
 
         var factor = Math.Pow(10, scale);
+
+        // A scale below about -324 underflows the factor to zero, and dividing by it at the end
+        // would turn a rounded 0 into 0/0 = NaN -- a value out of nowhere, for an input that has
+        // a perfectly ordinary answer. Everything is nearer to zero than to the first multiple of
+        // a power of ten that large, so zero is that answer. #285.
+        if (factor == 0d)
+            return 0d;
+
         var scaled = value * factor;
 
         if (double.IsInfinity(scaled) || Math.Abs(scaled) >= 9007199254740992d)
@@ -1684,7 +1692,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
                 continue;
             }
 
-            var rounded = RoundToPowerOfTen(value, -scale, out var exact);
+            var rounded = RoundToPowerOfTen(value, PlacesFor(scale, 20), out var exact);
 
             if (!exact || !SparkArrays.FitsIn(rounded, type))
             {
@@ -1714,6 +1722,29 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
         return SparkArrays.BuildIntegral(values, type, rowCount);
     }
+
+    /// <summary>
+    /// How many places a scale rounds to, negated in 64 bits and clamped.
+    /// </summary>
+    /// <remarks>
+    /// <b><paramref name="scale"/> is an <see cref="int"/>, so <c>-scale</c> overflows back to a
+    /// NEGATIVE for <see cref="int.MinValue"/></b> — and everything downstream then reads as
+    /// nonsense: the integral loop runs zero times and returns the value unrounded, and the
+    /// decimal path builds a <c>Decimal128Type</c> with a negative precision. Negating in 64 bits
+    /// and clamping fixes both and changes no answer, because past <paramref name="ceiling"/>
+    /// every value already rounds to zero.
+    /// <para>
+    /// <b>There is no Spark behaviour to reproduce this far out</b>, only a crash to avoid.
+    /// Measured: <c>round(1, -2147483648)</c> is a bare <c>ArithmeticException: Underflow</c> with
+    /// no error class under the legacy dialect, and
+    /// <c>round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)</c> is one under both — uncaught JVM
+    /// exceptions rather than anything Spark defines. The scales that ARE defined still agree:
+    /// <c>round(1, -100)</c> is 0 and <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is a
+    /// decimal(38,0) holding 0.
+    /// </para>
+    /// </remarks>
+    private static int PlacesFor(int scale, int ceiling) =>
+        scale >= 0 ? 0 : (int)Math.Min(-(long)scale, ceiling);
 
     /// <summary>
     /// Rounds to a multiple of 10^<paramref name="places"/>, half away from zero, in 64 bits.
@@ -1812,7 +1843,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     /// </remarks>
     private IArrowArray RoundDecimal(IArrowArray source, Decimal128Type type, int scale, int rowCount)
     {
-        var places = scale < 0 ? -scale : 0;
+        var places = PlacesFor(scale, SparkNumericTypes.MaxPrecision + 1);
         var resultScale = Math.Max(Math.Min(type.Scale, scale), 0);
         var integralDigits = Math.Max(type.Precision - type.Scale, places);
         var resultPrecision = Math.Min(

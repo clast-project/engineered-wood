@@ -1794,6 +1794,64 @@ public sealed class SparkFunctionRegistryTests
         }
     }
 
+    /// <summary>
+    /// An extreme scale rounds to zero rather than overflowing the arithmetic that reads it.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="scale"/> is an <c>int</c>, so <c>-scale</c> overflows back to a negative
+    /// for <c>int.MinValue</c>: the integral loop then ran zero times and returned the value
+    /// UNROUNDED, and the decimal path built a <c>Decimal128Type</c> with a negative precision.
+    /// <para>
+    /// <b>Spark does not survive this corner either</b> — measured, <c>round(1, -2147483648)</c>
+    /// is a bare <c>ArithmeticException: Underflow</c> with no error class, so there is no
+    /// behaviour to match, only a crash to avoid. The scales that ARE defined agree:
+    /// <c>round(1, -100)</c> is 0 and <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is 0.
+    /// </para>
+    /// <para>
+    /// The floating case is not an extreme at all. A scale below about -324 underflows
+    /// <c>Math.Pow</c>'s factor to zero, and the final division turned a rounded 0 into 0/0 —
+    /// measured, Spark answers 0.0 for <c>round(1.5, -400)</c>, and -400 is an ordinary number.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("round(1, -2147483648)")]
+    [InlineData("round(1, -2147483647)")]
+    [InlineData("round(1, -100)")]
+    [InlineData("round(9223372036854775807, -2147483648)")]
+    public void AnExtremeNegativeScaleRoundsToZero(string sql)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Ansi, sql, batch), 0));
+        Assert.Equal(0L, SparkArrays.ReadInt64(Eval(Legacy, sql, batch), 0));
+    }
+
+    [Theory]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -39)")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)")]
+    [InlineData("round(CAST(12.34 AS DECIMAL(10,2)), -2147483648)")]
+    public void AnExtremeNegativeScaleOnADecimalStaysAValidType(string sql)
+    {
+        var batch = Batch(("a", Ints(1)));
+        var result = Assert.IsType<Decimal128Array>(Eval(Ansi, sql, batch));
+        var type = (Decimal128Type)result.Data.DataType;
+
+        Assert.Equal((38, 0), (type.Precision, type.Scale));
+        Assert.Equal("0", SparkWideDecimals.Render(SparkWideDecimals.Read(result, 0)!.Value));
+    }
+
+    [Fact]
+    public void AScaleThatUnderflowsTheFactorRoundsToZeroRatherThanNaN()
+    {
+        var batch = Batch(("g", Doubles(1.5)));
+
+        Assert.Equal(0d, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, -400)", batch)).GetValue(0));
+        Assert.Equal(0d, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, -300)", batch)).GetValue(0));
+
+        // ...and a scale far past what a double can hold is still the value itself.
+        Assert.Equal(1.5, Assert.IsType<DoubleArray>(Eval(Ansi, "round(g, 400)", batch)).GetValue(0));
+    }
+
     /// <summary>A decimal that will not fit raises under BOTH dialects, unlike the integral one.</summary>
     /// <remarks>
     /// The asymmetry is measured, not assumed, and Spark names it itself: the sub-class is
