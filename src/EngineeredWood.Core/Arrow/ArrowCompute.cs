@@ -164,6 +164,112 @@ public static class ArrowCompute
 #endif
 
     /// <summary>
+    /// Places <paramref name="values"/> — one per entry of <paramref name="targetRows"/>, in order — into an
+    /// array of <paramref name="length"/> rows, leaving every row no entry names NULL. The inverse of
+    /// <see cref="Take(IArrowArray, ReadOnlySpan{int})"/>: <c>Scatter(Take(a, rows), rows, a.Length)</c> is
+    /// <paramref name="values"/> back where it came from, with everything else blanked.
+    ///
+    /// <para>Written for evaluating an expression over only the rows that need it: the rows are gathered, the
+    /// expression runs over the short array, and the answers are placed back where the caller expects to find
+    /// them. A row nothing was computed for is NULL rather than an arbitrary value, so a caller that reads one
+    /// by mistake gets SQL's answer for "not known" instead of another row's answer.</para>
+    /// </summary>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="values"/> is of a type whose nulls are not carried by a top-level validity bitmap —
+    /// run-end encoding and unions delegate theirs elsewhere, so there is nothing here to blank.
+    /// </exception>
+    public static IArrowArray Scatter(IArrowArray values, ReadOnlySpan<int> targetRows, int length)
+    {
+        if (values is null)
+            throw new ArgumentNullException(nameof(values));
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), length, "length cannot be negative");
+        if (targetRows.Length != values.Length)
+        {
+            throw new ArgumentException(
+                $"targetRows names {targetRows.Length} row(s) for {values.Length} value(s)",
+                nameof(targetRows));
+        }
+
+        // Extension arrays scatter through their STORAGE and are re-wrapped, for the same reason Take
+        // gathers them that way: the annotation has to survive, and the storage is what carries the rows.
+        if (values is ExtensionArray extension)
+        {
+            return ((ExtensionType)extension.Data.DataType).CreateArray(
+                Scatter(extension.Storage, targetRows, length));
+        }
+
+        // Nothing to place, so every row is null — and the type still has to be reproduced exactly, which is
+        // the whole reason this does not just hand back an untyped empty.
+        if (targetRows.Length == 0)
+            return MakeNullArray(values.Data.DataType, length);
+
+        // Gather first, then blank the rows no entry named. Take has no null index, so every output row must
+        // name SOME source row; the unnamed ones borrow row 0 and are nulled out below. Their value slots are
+        // never read through the returned array — the validity bitmap says so — but they hold a copy of a real
+        // row rather than uninitialized memory.
+        var sources = new int[length];
+        var placed = new bool[length];
+        for (int i = 0; i < targetRows.Length; i++)
+        {
+            int row = targetRows[i];
+            if ((uint)row >= (uint)length)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(targetRows), row, $"row is outside a {length}-row array");
+            }
+
+            sources[row] = i;
+            placed[row] = true;
+        }
+
+        var gathered = Take(values, sources);
+
+        // A null array is all-null by construction, so the blanking below has nothing to do and no bitmap to
+        // do it with.
+        if (gathered is NullArray)
+            return gathered;
+
+        var data = gathered.Data;
+        if (data.Buffers.Length == 0)
+        {
+            throw new NotSupportedException(
+                $"ArrowCompute cannot scatter a column of type {data.DataType.TypeId}: "
+                + "its nulls are not carried by a validity bitmap.");
+        }
+
+        // Take builds at offset 0 with its own freshly written buffers, so the bitmap can be rebuilt from
+        // logical row numbers with no offset arithmetic.
+        var validity = new byte[BitmapBytes(length)];
+        var nullCount = 0;
+        for (int row = 0; row < length; row++)
+        {
+            if (placed[row] && !gathered.IsNull(row))
+                validity[row >> 3] |= (byte)(1 << (row & 7));
+            else
+                nullCount++;
+        }
+
+        var buffers = new ArrowBuffer[data.Buffers.Length];
+        for (int i = 1; i < buffers.Length; i++)
+            buffers[i] = data.Buffers[i];
+        buffers[0] = new ArrowBuffer(validity);
+
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            data.DataType, length, nullCount, offset: 0, buffers, data.Children, data.Dictionary));
+    }
+
+    /// <summary>
+    /// <see cref="Scatter(IArrowArray, ReadOnlySpan{int}, int)"/> for callers holding a <see cref="List{T}"/>.
+    /// </summary>
+    public static IArrowArray Scatter(IArrowArray values, List<int> targetRows, int length) =>
+#if NET6_0_OR_GREATER
+        Scatter(values, CollectionsMarshal.AsSpan(targetRows), length);
+#else
+        Scatter(values, targetRows.ToArray(), length);
+#endif
+
+    /// <summary>
     /// Builds an all-NULL array of <paramref name="type"/> and <paramref name="length"/> — every row null,
     /// with the type reproduced exactly, including the parameters a typed builder for a narrower type would
     /// discard (timestamp unit and timezone, decimal precision and scale, list and struct child types).
