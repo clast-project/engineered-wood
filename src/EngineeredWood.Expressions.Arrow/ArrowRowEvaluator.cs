@@ -4,6 +4,7 @@
 using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using ArrowCompute = EngineeredWood.Arrow.ArrowCompute;
 
 namespace EngineeredWood.Expressions.Arrow;
 
@@ -30,10 +31,17 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <summary>The registry's comparison rules, when it has any. See <see cref="CoerceOperands"/>.</summary>
     private readonly IComparisonCoercion? _coercion;
 
+    /// <summary>
+    /// The registry's short-circuiting functions, when it has any. See
+    /// <see cref="IShortCircuitingFunctions"/>.
+    /// </summary>
+    private readonly IShortCircuitingFunctions? _shortCircuiting;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
         _coercion = functions as IComparisonCoercion;
+        _shortCircuiting = functions as IShortCircuitingFunctions;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -42,8 +50,17 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         return ToBooleanArray(result, batch.Length);
     }
 
-    public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch) =>
-        EvalExpressionAsArray(expression, batch);
+    public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch)
+    {
+        var result = EvalExpressionAsArray(expression, batch);
+
+        // A literal is built at least one row long even over an empty batch -- see
+        // <see cref="ConstantArray"/> for why -- so trim it back here. The invariant a caller is
+        // owed is that the answer has the batch's length; the extra row is an internal device.
+        return result.Length == batch.Length
+            ? result
+            : ArrowArrayFactory.Slice(result, 0, batch.Length);
+    }
 
     public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch, IArrowType targetType)
     {
@@ -70,47 +87,106 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         };
     }
 
+    /// <summary>
+    /// SQL three-valued AND, evaluating each operand only over the rows the ones before it left
+    /// undecided.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Short-circuiting per ROW, because Spark's is.</b> Spark's <c>And</c> returns false
+    /// without touching its right operand as soon as the left is false, so an error on a row the
+    /// left already decided never happens. Measured on 4.0.1 over <c>z = [0, 1, 2]</c>:
+    /// <c>z &lt;&gt; 0 AND 1/z &gt; 0</c> answers <c>[false, true, true]</c>, where evaluating
+    /// both operands whole raises DIVIDE_BY_ZERO and loses the other two rows with it. #306.
+    /// </para>
+    /// <para>
+    /// <b>NULL does not short-circuit.</b> The skip is keyed on false, not on "decided": measured,
+    /// <c>n &gt; 0 AND 1/z &gt; 0</c> over an all-null <c>n</c> DOES raise on the row where
+    /// <c>z</c> is zero, while the <c>z &lt;&gt; 0</c> form above does not. So a row whose answer
+    /// so far is null stays live and the next operand is evaluated for it.
+    /// </para>
+    /// <para>
+    /// Every operand is evaluated even once no row is live, over an empty selection. That reads no
+    /// value and so cannot raise, and it keeps an operand that cannot be evaluated at all -- an
+    /// unresolvable column, a pair of types with no comparison -- raising rather than being
+    /// quietly skipped.
+    /// </para>
+    /// </remarks>
     private bool?[] EvalAnd(AndPredicate and, RecordBatch batch)
     {
         var result = new bool?[batch.Length];
         for (int i = 0; i < result.Length; i++) result[i] = true;
 
+        // The rows whose answer is not yet false, which are exactly the rows Spark would still be
+        // evaluating operands for.
+        var live = new bool[batch.Length];
+        for (int i = 0; i < live.Length; i++) live[i] = true;
+
         foreach (var child in and.Children)
         {
-            var childResult = EvalPredicate(child, batch);
+            var childResult = EvalPredicateOver(child, batch, live);
             for (int i = 0; i < result.Length; i++)
             {
-                // SQL three-valued AND:
-                //   any child false → false
-                //   any child null and no false → null
-                //   all true → true
-                if (result[i] == false || childResult[i] == false)
+                if (!live[i])
+                    continue;
+
+                if (childResult[i] == false)
+                {
                     result[i] = false;
-                else if (result[i] is null || childResult[i] is null)
+                    live[i] = false;
+                }
+                else if (childResult[i] is null)
+                {
+                    // No false yet and an unknown: the answer is unknown, but a LATER operand can
+                    // still turn it false, so the row stays live.
                     result[i] = null;
-                // else both true, keep true
+                }
+
+                // else true, which leaves the accumulated answer -- true or null -- as it was.
             }
         }
+
         return result;
     }
 
+    /// <summary>
+    /// SQL three-valued OR, the mirror of <see cref="EvalAnd"/>: an operand is evaluated only over
+    /// the rows no earlier one made true.
+    /// </summary>
+    /// <remarks>
+    /// Measured the same way, and the shape a CHECK constraint that has to tolerate a zero or a
+    /// null is actually written in: <c>z = 0 OR 1/z &gt; 0</c> answers <c>[true, true, true]</c>
+    /// over <c>z = [0, 1, 2]</c>. NULL does not short-circuit here either -- the skip is keyed on
+    /// true, and <c>n &gt; 0 OR 1/z &gt; 0</c> raises.
+    /// </remarks>
     private bool?[] EvalOr(OrPredicate or, RecordBatch batch)
     {
         var result = new bool?[batch.Length];
         for (int i = 0; i < result.Length; i++) result[i] = false;
 
+        var live = new bool[batch.Length];
+        for (int i = 0; i < live.Length; i++) live[i] = true;
+
         foreach (var child in or.Children)
         {
-            var childResult = EvalPredicate(child, batch);
+            var childResult = EvalPredicateOver(child, batch, live);
             for (int i = 0; i < result.Length; i++)
             {
-                if (result[i] == true || childResult[i] == true)
+                if (!live[i])
+                    continue;
+
+                if (childResult[i] == true)
+                {
                     result[i] = true;
-                else if (result[i] is null || childResult[i] is null)
+                    live[i] = false;
+                }
+                else if (childResult[i] is null)
+                {
                     result[i] = null;
-                // else both false, keep false
+                }
             }
         }
+
         return result;
     }
 
@@ -761,6 +837,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 $"No function registered for '{call.Name}'. " +
                 "Provide an IFunctionRegistry to ArrowRowEvaluator.");
 
+        // A short-circuiting function is handed its arguments UNEVALUATED, because which of them
+        // to evaluate -- and over which rows -- is part of what the function means. Everything
+        // else is evaluated first and invoked with the answers, as it always was.
+        if (_shortCircuiting is not null && _shortCircuiting.ShortCircuits(call.Name))
+            return _shortCircuiting.Invoke(call.Name, new CallArguments(this, call, batch), batch.Length);
+
         var arguments = new IArrowArray[call.Arguments.Count];
         for (int i = 0; i < call.Arguments.Count; i++)
             arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
@@ -768,9 +850,268 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         return _functions.Invoke(call.Name, arguments, batch.Length);
     }
 
+    // -- Evaluating over a selection of rows --
+
+    /// <summary>The empty row selection, which types an expression without evaluating one.</summary>
+    private static readonly int[] NoRows = new int[0];
+
+    /// <summary>
+    /// Evaluates <paramref name="expression"/> over the rows <paramref name="rows"/> selects, and
+    /// returns an array of the batch's full length whose other rows are NULL.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The three cases are deliberately distinct rather than one general path, because two of them
+    /// are the common ones and cost nothing. A selection covering every row -- a first operand, or
+    /// a batch that takes the same branch throughout -- is evaluated against the batch itself with
+    /// nothing copied. An empty one evaluates over no rows at all, which reads no value and so
+    /// cannot raise, and exists to answer what type the expression WOULD have produced: Spark
+    /// types a conditional from every branch, including one nothing selected, and refuses one
+    /// whose branches share no type however few rows reach it.
+    /// </para>
+    /// <para>
+    /// Only a genuinely mixed batch gathers. The columns are gathered, not the answers: the
+    /// expression is then evaluated over a short batch exactly as it would be over a whole one,
+    /// so nothing has to know it is running over a selection -- which is what makes a nested
+    /// conditional come out right, since it short-circuits again over the rows it was given.
+    /// </para>
+    /// <para>
+    /// <b>Gathering, not masking.</b> Nulling the unselected rows of the input columns and
+    /// evaluating whole would be cheaper and is WRONG: null-propagation is not universal, and the
+    /// counter-example is the family being fixed. In <c>coalesce(a, coalesce(z, 1/0))</c> a nulled
+    /// <c>z</c> makes the inner conditional choose <c>1/0</c> on exactly the rows the outer one
+    /// had already decided, so the masking reintroduces the error it was meant to avoid.
+    /// </para>
+    /// </remarks>
+    private IArrowArray EvaluateOver(Expression expression, RecordBatch batch, ReadOnlySpan<bool> rows)
+    {
+        var selected = Selected(rows);
+
+        if (selected == batch.Length)
+            return EvalExpressionAsArray(expression, batch);
+
+        if (selected == 0)
+        {
+            var probe = EvalExpressionAsArray(expression, Restrict(expression, batch, NoRows));
+            return ArrowCompute.MakeNullArray(probe.Data.DataType, batch.Length);
+        }
+
+        var indices = Indices(rows, selected);
+        var computed = EvalExpressionAsArray(expression, Restrict(expression, batch, indices));
+        return ArrowCompute.Scatter(computed, indices, batch.Length);
+    }
+
+    /// <summary>
+    /// <see cref="EvaluateOver"/> for a predicate: the rows outside the selection come back null,
+    /// which is the value three-valued logic already has for "not known".
+    /// </summary>
+    private bool?[] EvalPredicateOver(Predicate predicate, RecordBatch batch, bool[] rows)
+    {
+        var selected = Selected(rows);
+        if (selected == batch.Length)
+            return EvalPredicate(predicate, batch);
+
+        var result = new bool?[batch.Length];
+
+        if (selected == 0)
+        {
+            // Evaluated and discarded, for the reason EvaluateOver gives: over no rows it cannot
+            // raise on a value, and an operand that cannot be evaluated at all still says so.
+            EvalPredicate(predicate, Restrict(predicate, batch, NoRows));
+            return result;
+        }
+
+        var indices = Indices(rows, selected);
+        var partial = EvalPredicate(predicate, Restrict(predicate, batch, indices));
+        for (var i = 0; i < indices.Length; i++)
+            result[indices[i]] = partial[i];
+
+        return result;
+    }
+
+    private static int Selected(ReadOnlySpan<bool> rows)
+    {
+        var selected = 0;
+        for (var row = 0; row < rows.Length; row++)
+        {
+            if (rows[row]) selected++;
+        }
+
+        return selected;
+    }
+
+    private static int[] Indices(ReadOnlySpan<bool> rows, int selected)
+    {
+        var indices = new int[selected];
+        var next = 0;
+        for (var row = 0; row < rows.Length; row++)
+        {
+            if (rows[row]) indices[next++] = row;
+        }
+
+        return indices;
+    }
+
+    /// <summary>
+    /// A batch holding only <paramref name="rows"/>, and only the columns
+    /// <paramref name="expression"/> names.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only the named columns, for two reasons. It is the cheaper half of the work on a wide
+    /// batch, and it keeps a column the expression never mentions from deciding whether the
+    /// expression can be evaluated at all -- a type <c>ArrowCompute.Take</c> declines to
+    /// gather would otherwise fail a branch that does not read it.
+    /// </para>
+    /// <para>
+    /// <b>Every column matching a name is kept, not the first.</b> <see cref="GetColumn"/>
+    /// resolves case-insensitively and refuses an ambiguous match, and dropping the second of a
+    /// colliding pair here would turn that refusal into an answer -- the wrong one, and only on
+    /// the batches that happened to take this path.
+    /// </para>
+    /// </remarks>
+    private static RecordBatch Restrict(Expression expression, RecordBatch batch, int[] rows)
+    {
+        var names = new List<string>();
+        CollectReferences(expression, names);
+
+        var fields = batch.Schema.FieldsList;
+        var schema = new Schema.Builder();
+        var columns = new List<IArrowArray>();
+
+        for (var i = 0; i < fields.Count; i++)
+        {
+            if (!Names(names, fields[i].Name))
+                continue;
+
+            schema.Field(fields[i]);
+            columns.Add(ArrowCompute.Take(batch.Column(i), rows));
+        }
+
+        return new RecordBatch(schema.Build(), columns, rows.Length);
+    }
+
+    private static bool Names(List<string> names, string field)
+    {
+        foreach (var name in names)
+        {
+            if (string.Equals(name, field, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Collects every column name <paramref name="expression"/> reads, duplicates and all.</summary>
+    /// <remarks>
+    /// Exhaustive on purpose, with no catch-all arm. A node kind that went unlisted would be read
+    /// as naming no columns, and the batch built for it would then be missing a column it reads --
+    /// so the default throws, and a new node kind fails loudly here rather than somewhere further
+    /// down that cannot explain itself.
+    /// </remarks>
+    private static void CollectReferences(Expression expression, List<string> names)
+    {
+        switch (expression)
+        {
+            case UnboundReference u:
+                names.Add(u.Name);
+                break;
+
+            case BoundReference b:
+                names.Add(b.Name);
+                break;
+
+            case LiteralExpression:
+            case TruePredicate:
+            case FalsePredicate:
+                break;
+
+            case FunctionCall fc:
+                foreach (var argument in fc.Arguments) CollectReferences(argument, names);
+                break;
+
+            case AndPredicate and:
+                foreach (var child in and.Children) CollectReferences(child, names);
+                break;
+
+            case OrPredicate or:
+                foreach (var child in or.Children) CollectReferences(child, names);
+                break;
+
+            case NotPredicate not:
+                CollectReferences(not.Child, names);
+                break;
+
+            case ComparisonPredicate cmp:
+                CollectReferences(cmp.Left, names);
+                CollectReferences(cmp.Right, names);
+                break;
+
+            case UnaryPredicate unary:
+                CollectReferences(unary.Operand, names);
+                break;
+
+            case SetPredicate set:
+                CollectReferences(set.Operand, names);
+                foreach (var value in set.Values) CollectReferences(value, names);
+                break;
+
+            default:
+                throw new NotSupportedException(
+                    $"Cannot find the columns read by {expression.GetType().Name}");
+        }
+    }
+
+    /// <summary>
+    /// One call's arguments, evaluated on demand. See <see cref="IConditionalArguments"/>.
+    /// </summary>
+    private sealed class CallArguments : IConditionalArguments
+    {
+        private readonly ArrowRowEvaluator _evaluator;
+        private readonly FunctionCall _call;
+        private readonly RecordBatch _batch;
+
+        public CallArguments(ArrowRowEvaluator evaluator, FunctionCall call, RecordBatch batch)
+        {
+            _evaluator = evaluator;
+            _call = call;
+            _batch = batch;
+        }
+
+        public int Count => _call.Arguments.Count;
+
+        /// <remarks>
+        /// Read off the TREE, which is the whole point of asking here rather than of the evaluated
+        /// array: a bare <c>NULL</c> is a null literal, and <c>CAST(NULL AS INT)</c> -- a call,
+        /// carrying a type that Spark does let constrain the result -- is not, however identical
+        /// the two look once they are columns.
+        /// </remarks>
+        public bool IsNullLiteral(int index) =>
+            _call.Arguments[index] is LiteralExpression literal && literal.Value.IsNull;
+
+        public IArrowArray Evaluate(int index, ReadOnlySpan<bool> rows) =>
+            _evaluator.EvaluateOver(_call.Arguments[index], _batch, rows);
+    }
+
     /// <summary>Builds a constant array of <paramref name="value"/>, repeated.</summary>
+    /// <remarks>
+    /// <b>At least one row long, even over an empty batch.</b> A literal does not vary by row, and
+    /// the registry reads a SCALAR argument out of row 0 -- a cast's target type, the scale
+    /// <c>round</c> was asked for -- so over no rows there would be nothing to read: measured,
+    /// <c>CAST('x' AS DOUBLE)</c> failed with "cast expects its target type as a string literal"
+    /// rather than answering DOUBLE, and <c>1 + 1</c> with "arithmetic is not defined for utf8",
+    /// because a zero-length literal cannot be typed from its values either.
+    /// <para>
+    /// That matters because evaluating over zero rows is how <see cref="EvaluateOver"/> learns the
+    /// type of a branch no row selected. The extra row is internal: it is never read, since every
+    /// function is bounded by the row count rather than by its arguments' lengths, and
+    /// <see cref="EvaluateExpression(Expression, RecordBatch)"/> trims it off at the boundary.
+    /// </para>
+    /// </remarks>
     private static IArrowArray ConstantArray(LiteralValue value, int length)
     {
+        length = Math.Max(length, 1);
+
         // A decimal literal's type comes from the value, matching Spark: `1.5` is decimal(2,1),
         // `.5` is decimal(1,1) and `1.` is decimal(1,0).
         if (!value.IsNull && value.Type == LiteralValue.Kind.Decimal)

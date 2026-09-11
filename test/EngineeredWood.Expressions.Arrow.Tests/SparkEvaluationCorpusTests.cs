@@ -264,16 +264,11 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
-            // #293, surfaced here for the first time by #295's binary support. A TYPED null still
-            // constrains the pair -- Spark refuses `coalesce(X'00', CAST(NULL AS STRING))` under
-            // this dialect, exactly as it refuses `coalesce(X'00', '2')`. We materialise every
-            // null literal as an all-null STRING column and cannot tell the typed one from the
-            // untyped placeholder #278 must drop, so we drop it and answer the binary.
-            //
-            // The ANSI section does not see it: there the pair resolves to binary anyway, so we
-            // reach the right answer by the wrong route and the comparison cannot tell.
-            ["coalesce(X'00', CAST(NULL AS STRING))"] =
-                "#293: a typed null string is indistinguishable from the untyped placeholder",
+            // `coalesce(X'00', CAST(NULL AS STRING))` used to sit here as #293: a typed null string
+            // was indistinguishable from the untyped placeholder, so we dropped it and answered
+            // the binary where Spark refuses the pair. #279 replaced the content test with a
+            // structural one -- the conditional family asks the EXPRESSION which branch is a bare
+            // NULL -- and a typed null stopped being one.
 
             // #299, and visible ONLY here. An integral compared with a FLOAT unifies to double
             // under ANSI -- because int->float is lossy and ANSI refuses to lose bits -- and to
