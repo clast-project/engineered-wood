@@ -303,10 +303,27 @@ jobs:
       # upload reads back longer than it went in. Working around that meant disabling checksum
       # calculation and validation on the client, which switched off the very thing being
       # tested. MinIO handles the framing, so the tests now exercise checksums for real.
+      #
+      # FETCHED FROM THE GITHUB RELEASE, not from dl.min.io, which stopped serving it on
+      # 2026-09-11. MinIO archived the open-source server and the download host now answers 410
+      # Gone to every community release and every hotfix build for them -- so this is not a pin
+      # that expired and bumping the version would not have helped. The SAME release tag still
+      # carries the binary as a release asset, so the pin below is the one this job has always
+      # used, reached by a different route.
+      #
+      # The shasum is published beside the asset and is checked here, which the old `curl | chmod`
+      # did not do: a release asset can be replaced in a way a CDN path could not, and a silently
+      # different emulator is exactly the shape of failure #79 exists to prevent.
+      #
+      # The upstream project is archived, so this is now a frozen artifact rather than something
+      # that will see updates. That is tolerable for an oracle -- it is pinned by tag anyway -- but
+      # it does mean the S3 emulator will eventually want replacing rather than upgrading.
       - name: Install MinIO (S3 emulator)
         run: |
+          release=RELEASE.2025-09-07T16-13-09Z
           curl -fsSL -o /usr/local/bin/minio \
-            https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+            "https://github.com/minio/minio/releases/download/$release/minio.linux-amd64.$release"
+          echo "c7772193f524192439ce12ebd942cf7e9335ebf9  /usr/local/bin/minio" | sha1sum -c -
           chmod +x /usr/local/bin/minio
 
       - name: Start emulators
