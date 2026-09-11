@@ -247,6 +247,33 @@ public sealed class ShortCircuitEvaluationTests
     }
 
     /// <summary>
+    /// A branch whose result type depends on an argument's VALUE is still typed, even though no
+    /// row selects it.
+    /// </summary>
+    /// <remarks>
+    /// <c>round</c>'s scale decides the result's precision and scale and is read out of row 0, so
+    /// this branch cannot be typed over zero rows the way every other one can — the scale comes
+    /// back as an empty array and `round` throws instead of answering. A literal scale hides it,
+    /// because a literal is built one row long on purpose; <c>1 + 1</c> is not a literal by the
+    /// time the registry sees it. Measured: Spark types this <c>decimal(12,2)</c>.
+    /// </remarks>
+    [Fact]
+    public void ABranchTypedFromAnArgumentsValueIsStillTyped()
+    {
+        var decimals = new Decimal128Array.Builder(new Decimal128Type(10, 2));
+        decimals.Append(1.25m).Append(2.25m);
+
+        var batch = Batch(("a", Ints(1, 2)), ("d1", decimals.Build()));
+
+        foreach (var sql in new[] { "coalesce(a, round(d1, 1 + 1))", "if(1 = 1, a, round(d1, 1 + 1))" })
+        {
+            var type = Assert.IsType<Decimal128Type>(Eval(sql, batch).Data.DataType);
+            Assert.Equal(12, type.Precision);
+            Assert.Equal(2, type.Scale);
+        }
+    }
+
+    /// <summary>
     /// AND stops at a FALSE and OR at a TRUE, per row — and neither stops at a null.
     /// </summary>
     /// <remarks>

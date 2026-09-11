@@ -887,14 +887,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         var selected = Selected(rows);
 
+        // Tested BEFORE the full-selection case, which it would otherwise be swallowed by over an
+        // empty batch -- where both are true and the answer has to be the empty one, or a literal
+        // would hand a caller the one-row array ConstantArray builds internally.
+        if (selected == 0)
+            return ArrowCompute.MakeNullArray(TypeOver(expression, batch), batch.Length);
+
+        // Every row wants it, which is the ordinary case for a first operand and for a batch that
+        // takes the same branch throughout. Nothing is copied and nothing is rebuilt.
         if (selected == batch.Length)
             return EvalExpressionAsArray(expression, batch);
-
-        if (selected == 0)
-        {
-            var probe = EvalExpressionAsArray(expression, Restrict(expression, batch, NoRows));
-            return ArrowCompute.MakeNullArray(probe.Data.DataType, batch.Length);
-        }
 
         var indices = Indices(rows, selected);
         var computed = EvalExpressionAsArray(expression, Restrict(expression, batch, indices));
@@ -908,25 +910,73 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private bool?[] EvalPredicateOver(Predicate predicate, RecordBatch batch, bool[] rows)
     {
         var selected = Selected(rows);
+
+        if (selected == 0)
+        {
+            // Evaluated and discarded, for the reason TypeOver gives: over no rows it cannot raise
+            // on a value, and an operand that cannot be evaluated at all still says so.
+            TypeOver(predicate, batch);
+            return new bool?[batch.Length];
+        }
+
         if (selected == batch.Length)
             return EvalPredicate(predicate, batch);
 
         var result = new bool?[batch.Length];
-
-        if (selected == 0)
-        {
-            // Evaluated and discarded, for the reason EvaluateOver gives: over no rows it cannot
-            // raise on a value, and an operand that cannot be evaluated at all still says so.
-            EvalPredicate(predicate, Restrict(predicate, batch, NoRows));
-            return result;
-        }
-
         var indices = Indices(rows, selected);
         var partial = EvalPredicate(predicate, Restrict(predicate, batch, indices));
         for (var i = 0; i < indices.Length; i++)
             result[indices[i]] = partial[i];
 
         return result;
+    }
+
+    /// <summary>
+    /// The type <paramref name="expression"/> produces, for a selection no row is in.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Over no rows nothing can be READ, so an error in a branch nobody selected cannot happen --
+    /// which is the whole point -- and what comes back still carries the type Spark would have
+    /// typed the conditional from.
+    /// </para>
+    /// <para>
+    /// <b>With rows, if it has to be.</b> A few functions take a SCALAR argument whose value
+    /// decides the result type, and read it out of row 0: <c>round</c>'s scale is the one that
+    /// bites, since the scale may itself be computed. A literal survives an empty batch --
+    /// <see cref="ConstantArray"/> keeps one row for exactly this reason -- but
+    /// <c>round(f, 1 + 1)</c> hands <c>round</c> a zero-length array to read a scale from, and it
+    /// throws rather than answering DOUBLE. So the empty evaluation is a QUESTION: when it cannot
+    /// be answered without rows, it is asked again with them.
+    /// </para>
+    /// <para>
+    /// Trying the empty one first is what keeps this correct rather than merely working. The
+    /// retry evaluates a branch no row selected, which is the thing that raises, so it must stay
+    /// the fallback and never the first attempt. And it never makes an outcome worse: without it
+    /// the first failure propagated, and with it the second does -- so the only expressions that
+    /// still fail are ones that failed before, with a different message.
+    /// </para>
+    /// <para>
+    /// The residual is an expression that needs BOTH -- a value-dependent result type and a
+    /// branch that raises over real rows, as in <c>round(CAST('x' AS DOUBLE), 1 + 1)</c> inside a
+    /// branch nothing reaches. Answering that needs the type inferred rather than evaluated, which
+    /// is a different design.
+    /// </para>
+    /// </remarks>
+    private IArrowType TypeOver(Expression expression, RecordBatch batch)
+    {
+        try
+        {
+            return EvalExpressionAsArray(expression, Restrict(expression, batch, NoRows))
+                .Data.DataType;
+        }
+        catch (Exception)
+        {
+            // Deliberately broad: the question is whether an ANSWER came back, and the ways of
+            // failing to answer it are the registry's business rather than this method's. Nothing
+            // is swallowed -- a retry that fails throws in place of what was caught.
+            return EvalExpressionAsArray(expression, batch).Data.DataType;
+        }
     }
 
     private static int Selected(ReadOnlySpan<bool> rows)

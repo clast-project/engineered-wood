@@ -1570,11 +1570,27 @@ GROUPS = {
         "a IS NULL AND CAST(t AS INT) > 0",
         "NOT (a IS NULL AND CAST(t AS INT) > 0)",
 
-        # NULL does not short-circuit: AND skips only where the left is FALSE and OR only where it
-        # is TRUE, so these raise where the two above answer. The pair is what tells a correct row
-        # mask from one that treats "not known" as "decided".
+        # The same two with the guard inverted, so the left operand is FALSE (for OR) or TRUE (for
+        # AND) on the zero-divisor row and the right one IS evaluated there. These raise, and they
+        # are what stops "skip the right operand" from being read as "skip it whenever the left
+        # decided something".
         "b <> 0 OR a / b > 1",
         "b = 0 AND a / b > 1",
+
+        # NULL DOES NOT SHORT-CIRCUIT, which is the subtle half of the rule: AND skips only where
+        # the left is FALSE and OR only where it is TRUE, so an UNKNOWN left keeps the right
+        # operand live. Each of these pairs differs only in whether the null row reaches the right
+        # operand, and the right operand raises on any row that evaluates it -- so the raising one
+        # is raising BECAUSE of the null, and the answering one proves the guard is what saved it.
+        #
+        # `a` is 1 / NULL / INT_MIN, so `a >= -2147483648` is TRUE, NULL, TRUE and
+        # `a < -2147483648` is FALSE, NULL, FALSE: the null row is the only one left undecided by
+        # the guard, on a schema whose null row nulls EVERY column and so cannot raise by
+        # arithmetic. That is why the right operand is a cast of a literal rather than a division.
+        "a >= -2147483648 OR CAST('x' AS INT) > 0",
+        "a IS NULL OR a >= -2147483648 OR CAST('x' AS INT) > 0",
+        "a < -2147483648 AND CAST('x' AS INT) > 0",
+        "a IS NOT NULL AND a < -2147483648 AND CAST('x' AS INT) > 0",
 
         # Reached, and still raising. The other direction.
         "coalesce(a, CAST('0x10' AS DOUBLE))",
@@ -1587,6 +1603,13 @@ GROUPS = {
         "nullif(a, CAST('0x10' AS DOUBLE))",
         "greatest(a, CAST('0x10' AS DOUBLE))",
         "least(1, CAST('0x10' AS DOUBLE))",
+
+        # A branch nothing selects whose result type depends on an argument's VALUE. `round`'s
+        # scale decides the result's precision and scale, and it is read out of row 0 -- so typing
+        # this branch cannot be done over zero rows the way every other branch can, and a literal
+        # scale would have hidden it. Regression guard for the fallback in `TypeOver`.
+        "coalesce(a, round(d1, 1 + 1))",
+        "if(1 = 1, a, round(d1, 1 + 1))",
 
         # An unreached branch still TYPES the result, and still has to type-check. This is the
         # constraint that stops "do not evaluate it" from meaning "do not look at it": dropping the

@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 14:13:48.586616",
-      "2026-09-11 14:13:48.586616",
-      "2026-09-11 14:13:48.586616"
+      "2026-09-11 15:44:12.426473",
+      "2026-09-11 15:44:12.426473",
+      "2026-09-11 15:44:12.426473"
      ]
     }
    },
@@ -18433,6 +18433,78 @@
     }
    },
    {
+    "expression": "a >= -2147483648 OR CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "((a >= -2147483648) OR (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 22) ==\n(a >= -2147483648 OR CAST('x' AS INT) > 0) AS r\n                     ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "a IS NULL OR a >= -2147483648 OR CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "(((a IS NULL) OR (a >= -2147483648)) OR (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "a < -2147483648 AND CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((a < -2147483648) AND (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 22) ==\n(a < -2147483648 AND CAST('x' AS INT) > 0) AS r\n                     ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "a IS NOT NULL AND a < -2147483648 AND CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "(((a IS NOT NULL) AND (a < -2147483648)) AND (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
     "expression": "coalesce(a, CAST('0x10' AS DOUBLE))",
     "parse": {
      "ok": true,
@@ -18526,6 +18598,46 @@
     "eval": {
      "ok": false,
      "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 11) ==\n(least(1, CAST('0x10' AS DOUBLE))) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "coalesce(a, round(d1, 1 + 1))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, round(d1, (1 + 1)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, round(d1, 1 + 1))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, round(d1, (1 + 1)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
     }
    },
    {
@@ -18657,11 +18769,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#0 else bin#17 AS r#3789]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#0 else bin#17 AS r#3813]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#3790]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#3814]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
     }
    }
   ],

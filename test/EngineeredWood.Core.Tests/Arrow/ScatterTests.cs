@@ -170,6 +170,27 @@ public class ScatterTests
         Assert.Throws<ArgumentException>(() => ArrowCompute.Scatter(builder.Build(), TwoRows, 4));
     }
 
+    /// <summary>
+    /// A repeated target row is refused rather than resolved by last-write.
+    /// </summary>
+    /// <remarks>
+    /// It would otherwise discard the value placed there first, silently — and this is only
+    /// Take's inverse while the rows are distinct, since Take allows duplicates and a row read
+    /// twice has no inverse.
+    /// </remarks>
+    [Fact]
+    public void ARepeatedRow_IsRefused()
+    {
+        var builder = new Int32Array.Builder();
+        builder.Append(10).Append(20);
+
+        var error = Assert.Throws<ArgumentException>(
+            () => ArrowCompute.Scatter(builder.Build(), RepeatedRow, 3));
+        Assert.Contains("more than once", error.Message);
+    }
+
+    private static readonly int[] RepeatedRow = [1, 1];
+
     [Fact]
     public void ARowOutsideTheArray_IsRefused()
     {

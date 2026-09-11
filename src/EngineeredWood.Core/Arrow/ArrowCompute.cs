@@ -174,6 +174,14 @@ public static class ArrowCompute
     /// them. A row nothing was computed for is NULL rather than an arbitrary value, so a caller that reads one
     /// by mistake gets SQL's answer for "not known" instead of another row's answer.</para>
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="targetRows"/> names a row more than once, which would discard a value, or does not
+    /// have one entry per value.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="targetRows"/> names a row more than once, which would discard a value, or does not
+    /// have one entry per value.
+    /// </exception>
     /// <exception cref="NotSupportedException">
     /// <paramref name="values"/> is of a type whose nulls are not carried by a top-level validity bitmap —
     /// run-end encoding and unions delegate theirs elsewhere, so there is nothing here to blank.
@@ -217,6 +225,26 @@ public static class ArrowCompute
             {
                 throw new ArgumentOutOfRangeException(
                     nameof(targetRows), row, $"row is outside a {length}-row array");
+            }
+
+            // A repeated target would overwrite the value already placed there and lose it
+            // silently -- and this is Take's inverse only while the rows are distinct, since Take
+            // allows duplicates and there is no inverse of a row read twice. Refuse rather than
+            // pick one.
+            if (placed[row])
+            {
+                throw new ArgumentException(
+                    $"targetRows names row {row} more than once", nameof(targetRows));
+            }
+
+            // A repeated target would overwrite the value already placed there and lose it
+            // silently -- and this is Take's inverse only while the rows are distinct, since Take
+            // allows duplicates and there is no inverse of a row read twice. Refuse rather than
+            // pick one.
+            if (placed[row])
+            {
+                throw new ArgumentException(
+                    $"targetRows names row {row} more than once", nameof(targetRows));
             }
 
             sources[row] = i;
