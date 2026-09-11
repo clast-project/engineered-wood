@@ -212,15 +212,22 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         bool anyString = IsString(operandType, operand);
         bool anyOther = !anyString && (operandType is not null || FirstKind(operand) is not null);
+        bool anyDecimal = MightRound(operandType, operand);
 
         for (var k = 0; k < members.Length; k++)
         {
             if (IsMemberString(members[k], memberTypes[k])) anyString = true;
             else if (MemberIsTyped(members[k], memberTypes[k])) anyOther = true;
+
+            if (MemberMightRound(members[k], memberTypes[k])) anyDecimal = true;
         }
 
-        if (!anyString || !anyOther)
-            return;   // one kind throughout: nothing to resolve
+        // A string mixed with anything else takes the promotion rule; a set with no string at
+        // all takes it only when a decimal is present, because that is the one case where the
+        // type the set resolves through can round a member away. #280. Everything else is one
+        // kind throughout, or exact, and is compared as it stands.
+        if (anyString ? !anyOther : !anyDecimal)
+            return;
 
         // Resolved once and reused, because the type decides two things: which target the set
         // takes, and how each member is rebuilt as an Arrow array. Inferring the second from
@@ -248,6 +255,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 : new SetMember(CastMember(members[k].PerRow, resolved[k], target, rowCount));
         }
     }
+
+    /// <summary>Whether a set member carries a scale the set's common type could round away.</summary>
+    private static bool MemberMightRound(in SetMember member, IArrowType? declared) =>
+        member.IsConstant
+            ? member.Constant?.Type
+                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal
+            : MightRound(declared, member.PerRow);
 
     /// <summary>Whether a set member is a string, from its declared type or its value.</summary>
     private static bool IsMemberString(in SetMember member, IArrowType? declared) =>
@@ -357,11 +371,20 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         if (_coercion is null)
             return;
 
-        // Every measured rule has a string on exactly one side, so this one cheap test decides
-        // whether to resolve types at all -- and typing an operand can allocate.
+        // One cheap test picks the rule: the string rules below need a string on exactly one
+        // side, and the numeric one needs a string on neither. Typing an operand can allocate,
+        // so neither path resolves a type until it knows it is the path being taken.
         bool leftIsString = IsString(leftType, left);
-        if (leftIsString == IsString(rightType, right))
-            return;   // two strings, or neither: nothing to coerce
+        bool rightIsString = IsString(rightType, right);
+
+        if (leftIsString && rightIsString)
+            return;   // two strings: compared as text, nothing to coerce
+
+        if (!leftIsString && !rightIsString)
+        {
+            CoerceExactNumerics(leftType, rightType, ref left, ref right);
+            return;
+        }
 
         var strings = leftIsString ? left : right;
         var other = leftIsString ? right : left;
@@ -398,6 +421,76 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         if (leftIsString == castTheString) left = values;
         else right = values;
     }
+
+    /// <summary>
+    /// Rounds two exact numeric operands to the type they compare through, where that type gives
+    /// up scale.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #280, and the one comparison rule where BOTH operands can move — which is why it does not
+    /// reuse the "at most one side moves" shape above. Spark compares a decimal against a
+    /// decimal by casting each to their least common type, and that type gives up scale once the
+    /// natural precision passes 38, so the comparison is made on rounded values. Measured,
+    /// <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c> is TRUE.
+    /// </para>
+    /// <para>
+    /// The registry answers null for both operands in every ordinary case — the common type
+    /// keeps their scales, and rounding to it would change no answer — so a comparison between a
+    /// column and a literal of its own type resolves two types and casts nothing. The types
+    /// still have to be resolved to ask, which is the cost this path adds and the reason the
+    /// string tests above it are kind tests rather than type tests.
+    /// </para>
+    /// </remarks>
+    private void CoerceExactNumerics(
+        IArrowType? leftType, IArrowType? rightType,
+        ref LiteralValue?[] left, ref LiteralValue?[] right)
+    {
+        // A bare NULL literal types as string here and is excluded by the caller; anything else
+        // untyped in every row cannot round differently either, since it has no value to round.
+        if (!MightRound(leftType, left) && !MightRound(rightType, right))
+            return;
+
+        var resolvedLeft = OperandType(leftType, left);
+        var resolvedRight = OperandType(rightType, right);
+
+        var leftTarget = _coercion!.ComparisonTarget(resolvedLeft, resolvedRight);
+        var rightTarget = _coercion.ComparisonTarget(resolvedRight, resolvedLeft);
+        if (leftTarget is null && rightTarget is null)
+            return;
+
+        // The null mask the string path applies is deliberately absent, because this cast cannot
+        // fail and so has no refusal for a null on the other side to suppress. The common type
+        // leaves max(p1 - s1, p2 - s2) integer digits, and an operand that ROUNDS always has
+        // strictly fewer than that: rounding needs its scale to be the wider one, and if its
+        // integer digits were also the widest, the natural precision would come to its own
+        // precision and never pass 38 -- so nothing would be clamped and nothing would round.
+        // The spare digit is what absorbs a carry, which is the case that would otherwise
+        // overflow: decimal(38,2) at 36 nines rounds to 10^36 against a decimal(38,0).
+        int rowCount = left.Length;
+        if (leftTarget is not null)
+            left = Rounded(left, resolvedLeft, leftTarget, rowCount);
+        if (rightTarget is not null)
+            right = Rounded(right, resolvedRight, rightTarget, rowCount);
+    }
+
+    /// <summary>Whether an operand carries a scale that a common type could round away.</summary>
+    /// <remarks>
+    /// Only a decimal does. Asked before any type is resolved, from the declared type when there
+    /// is one and from the first populated value otherwise, so an integer-and-string-free
+    /// comparison of two <c>int</c> columns costs two field reads.
+    /// </remarks>
+    private static bool MightRound(IArrowType? declared, LiteralValue?[] values) =>
+        declared is not null
+            ? declared is Decimal128Type or Decimal256Type
+            : FirstKind(values) is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal;
+
+    private LiteralValue?[] Rounded(
+        LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
+        ArrowToLiteralValues(
+            _coercion!.CastForComparison(
+                MaterializeAsArray(values, rowCount, type), target, rowCount),
+            rowCount);
 
     /// <summary>
     /// Evaluates a comparison operand, keeping the Arrow type when the operand declares one.

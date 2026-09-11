@@ -460,6 +460,9 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     ///     both sides became text — cast the other way, U+FFFD's three UTF-8 bytes are not
     ///     <c>FF</c>. Both dialects agree, and so do <c>'A' = bin</c> (true against
     ///     <c>X'41'</c>) and <c>'B' &gt; bin</c>.</item>
+    ///   <item>An EXACT NUMERIC against another — a decimal, or an integral read as one — is
+    ///     compared through their least common type, and <b>both</b> operands can move.
+    ///     <see cref="LossyDecimalTarget"/>; #280.</item>
     /// </list>
     /// A pair with no rule gets null from both operands and is compared as it stands.
     /// </remarks>
@@ -474,7 +477,54 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             return StringComparisonTarget(other);
 
         // Checked after the string case: a string operand is never the one that moves here.
-        return operand is BinaryType && other is StringType ? StringType.Default : null;
+        if (operand is BinaryType && other is StringType)
+            return StringType.Default;
+
+        return LossyDecimalTarget(operand, other);
+    }
+
+    /// <summary>
+    /// The least common type an exact numeric must be rounded to before comparison, or null when
+    /// comparing the values as they stand gives the same answer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #280. Spark casts both operands of a comparison to their least common type and compares
+    /// the results, so once that type gives up scale — see
+    /// <see cref="SparkNumericTypes.ClampPreferringIntegralDigits"/> — the comparison is made on
+    /// ROUNDED values. Measured, <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c>
+    /// is TRUE, and <c>&gt;</c> over the same pair is FALSE: the common type is decimal(38,0)
+    /// and 1.005 rounds to 1 before either question is asked.
+    /// </para>
+    /// <para>
+    /// <b>An integral counts, and its WIDTH decides the answer.</b> An integral unifies as the
+    /// decimal that holds it, so it widens the common type's integer part and squeezes the
+    /// scale. Measured against <c>CAST(4E-32 AS DECIMAL(38,38))</c>, <c>= 0</c> is TRUE for an
+    /// <c>int</c> (common decimal(38,28), the value rounds away) and TRUE for a <c>bigint</c>
+    /// (decimal(38,18)) but FALSE for a <c>tinyint</c> (decimal(38,35), which still holds it).
+    /// Three answers from one comparison is why this cannot be special-cased to decimal pairs.
+    /// </para>
+    /// <para>
+    /// Null whenever the common type keeps at least this operand's scale, which is the ordinary
+    /// case: casting to a scale that loses nothing cannot change an ordering, and skipping it
+    /// keeps a per-row cast out of the comparison path that predicate pushdown runs.
+    /// </para>
+    /// </remarks>
+    private static IArrowType? LossyDecimalTarget(IArrowType operand, IArrowType other)
+    {
+        // Floating point is not exact and does not unify as a decimal -- a decimal against a
+        // double is compared as a double, which is a rule this must not intercept. #277.
+        if (!SparkWideDecimals.IsExact(operand) || !SparkWideDecimals.IsExact(other))
+            return null;
+
+        // Two integrals share a scale of zero and can never round, so there is nothing to do.
+        if (!SparkNumericTypes.IsDecimal(operand) && !SparkNumericTypes.IsDecimal(other))
+            return null;
+
+        if (SparkNumericTypes.CommonType(operand, other) is not Decimal128Type common)
+            return null;
+
+        return common.Scale < SparkNumericTypes.AsDecimal(operand).Scale ? common : null;
     }
 
     /// <inheritdoc />
@@ -506,8 +556,31 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
             throw new ArgumentNullException(nameof(memberTypes));
 
         var common = CommonTypeOfNonStrings(memberTypes, out bool anyString);
-        if (!anyString || common is null)
-            return null;   // no string to promote, all strings already, or no common type
+        if (common is null)
+            return null;   // all strings already, or no common type
+
+        if (!anyString)
+        {
+            // #280. No string to promote, but a set of exact numerics still resolves through one
+            // type, and that type can give up scale. Measured,
+            // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))` is TRUE -- the same
+            // rounding a comparison against that operand does, which is what makes IN and `=`
+            // agree here even though they disagree over a string. Null unless some member
+            // actually loses scale, so an ordinary set is still compared as it stands.
+            if (common is not Decimal128Type decimalCommon)
+                return null;
+
+            foreach (var type in memberTypes)
+            {
+                if (SparkWideDecimals.IsExact(type)
+                    && decimalCommon.Scale < SparkNumericTypes.AsDecimal(type).Scale)
+                {
+                    return decimalCommon;
+                }
+            }
+
+            return null;
+        }
 
         if (_options.Ansi)
         {

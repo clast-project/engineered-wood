@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 06:13:23.855429",
-      "2026-09-11 06:13:23.855429",
-      "2026-09-11 06:13:23.855429"
+      "2026-09-11 09:09:03.691514",
+      "2026-09-11 09:09:03.691514",
+      "2026-09-11 09:09:03.691514"
      ]
     }
    },
@@ -16857,6 +16857,1088 @@
     }
    }
   ],
+  "decimal-common-type": [
+   {
+    "expression": "greatest(1.005, 99999999999999999999999999999999999999)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(1.005BD, 99999999999999999999999999999999999999BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "least(1.005, 99999999999999999999999999999999999999)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(1.005BD, 99999999999999999999999999999999999999BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(greatest(1.005, 99999999999999999999999999999999999999) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(greatest(1.005BD, 99999999999999999999999999999999999999BD) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(least(1.005, 99999999999999999999999999999999999999) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(least(1.005BD, 99999999999999999999999999999999999999BD) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(1.005, 99999999999999999999999999999999999999)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(1.005BD, 99999999999999999999999999999999999999BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(CAST(NULL AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(CAST(NULL AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "if(false, CAST(1.005 AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(false, CAST(1.005BD AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN false THEN CAST(1.005 AS DECIMAL(4,3)) ELSE CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN false THEN CAST(1.005BD AS DECIMAL(4,3)) ELSE CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)) END"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999",
+      "99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(CAST(0.5 AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(CAST(0.5BD AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "least(CAST(0.4 AS DECIMAL(38,38)), CAST(1 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(CAST(0.4BD AS DECIMAL(38,38)), CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      "0",
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(CAST(-99999999999999999999999999999999999999BD AS DECIMAL(38,0)), CAST(0.5BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "1",
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "least(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(CAST(-99999999999999999999999999999999999999BD AS DECIMAL(38,0)), CAST(0.5BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-99999999999999999999999999999999999999",
+      "-99999999999999999999999999999999999999",
+      "-99999999999999999999999999999999999999"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d1, d2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d1, d2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.3400",
+      null,
+      "0.0000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d1, d3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d1, d3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,10)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.3400000000",
+      null,
+      "0E-10"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d1, d5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d1, d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,30)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.340000000000000000000000000000",
+      null,
+      "0.500000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d3, d5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d3, d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,10)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9.9900000000",
+      null,
+      "0.5000000000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d2, d4)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d2, d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d4, d5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d4, d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(d2, d4)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(d2, d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "if(true, d4, d5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(true, d4, d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000000",
+      null,
+      "-1000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d5, b)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d5, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,18)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.000000000000000000",
+      null,
+      "0.500000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d5, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d5, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,28)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.0000000000000000000000000000",
+      null,
+      "0.5000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d2 + d4",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d2 + d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,4)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000000000000000000000000001.2345",
+      null,
+      "-1000000000000000000000000000000.0000"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + d3",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + d3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,9)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "22.330000000",
+      null,
+      "0E-9"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) <> CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) < CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) < CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) >= CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThanOrEqual",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) >= CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) <= CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "LessThanOrEqual",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) <= CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) <=> CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) <=> CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0))))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), CAST(1 AS DECIMAL(38,0)))",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), CAST(1 AS DECIMAL(38,0))))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) BETWEEN CAST(1 AS DECIMAL(38,0)) AND CAST(2 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "between(CAST(1.005BD AS DECIMAL(4,3)), CAST(1 AS DECIMAL(38,0)), CAST(2 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.4 AS DECIMAL(38,38)) = CAST(0 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.4BD AS DECIMAL(38,38)) = CAST(0 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.4 AS DECIMAL(38,38)) > CAST(0 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST(0.4BD AS DECIMAL(38,38)) > CAST(0 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.5 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.5BD AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.6 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.6BD AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-0.5 AS DECIMAL(38,38)) = CAST(-1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(-0.5BD AS DECIMAL(38,38)) = CAST(-1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(10,0))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(10,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(10,0))",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(10,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS TINYINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0 AS TINYINT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS INT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0 AS INT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS BIGINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0 AS BIGINT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS INT) > CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST(0 AS INT) > CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (CAST(0 AS INT)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "greatest(CAST(0 AS INT), CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(CAST(0 AS INT), CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,28)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0E-28",
+      "0E-28",
+      "0E-28"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS INT) = CAST(0.4 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0 AS INT) = CAST(0.4BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.1 AS DECIMAL(38,38)) = CAST(0.1 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.1BD AS DECIMAL(38,38)) = CAST(0.1BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1.005 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1.005BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "d5 = d4",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d5 = d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "d5 < d4",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(d5 < d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "d2 = d4",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d2 = d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "d5 IN (d4)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(d5 IN (d4))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -26634,6 +27716,1088 @@
      "eval": {
       "ok": false,
       "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#1917]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+     }
+    }
+   ],
+   "decimal-common-type": [
+    {
+     "expression": "greatest(1.005, 99999999999999999999999999999999999999)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(1.005BD, 99999999999999999999999999999999999999BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "least(1.005, 99999999999999999999999999999999999999)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "least(1.005BD, 99999999999999999999999999999999999999BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       "1",
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(greatest(1.005, 99999999999999999999999999999999999999) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(greatest(1.005BD, 99999999999999999999999999999999999999BD) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(least(1.005, 99999999999999999999999999999999999999) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(least(1.005BD, 99999999999999999999999999999999999999BD) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       "1",
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(1.005, 99999999999999999999999999999999999999)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(1.005BD, 99999999999999999999999999999999999999BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       "1",
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(CAST(NULL AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(CAST(NULL AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "if(false, CAST(1.005 AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if(false, CAST(1.005BD AS DECIMAL(4,3)), CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN false THEN CAST(1.005 AS DECIMAL(4,3)) ELSE CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) END",
+     "parse": {
+      "ok": true,
+      "node": "CaseWhen",
+      "sql": "CASE WHEN false THEN CAST(1.005BD AS DECIMAL(4,3)) ELSE CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)) END"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999",
+       "99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(CAST(0.5 AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(CAST(0.5BD AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       "1",
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "least(CAST(0.4 AS DECIMAL(38,38)), CAST(1 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "least(CAST(0.4BD AS DECIMAL(38,38)), CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0",
+       "0",
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(CAST(-99999999999999999999999999999999999999BD AS DECIMAL(38,0)), CAST(0.5BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       "1",
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "least(CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)), CAST(0.5 AS DECIMAL(38,38)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "least(CAST(-99999999999999999999999999999999999999BD AS DECIMAL(38,0)), CAST(0.5BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-99999999999999999999999999999999999999",
+       "-99999999999999999999999999999999999999",
+       "-99999999999999999999999999999999999999"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d1, d2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d1, d2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.3400",
+       null,
+       "0.0000"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d1, d3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d1, d3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,10)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.3400000000",
+       null,
+       "0E-10"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d1, d5)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d1, d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,30)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.340000000000000000000000000000",
+       null,
+       "0.500000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d3, d5)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d3, d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,10)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "9.9900000000",
+       null,
+       "0.5000000000"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d2, d4)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d2, d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       null,
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d4, d5)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d4, d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       null,
+       "1"
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(d2, d4)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(d2, d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1",
+       null,
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "if(true, d4, d5)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if(true, d4, d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000000",
+       null,
+       "-1000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d5, b)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d5, b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,18)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.000000000000000000",
+       null,
+       "0.500000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d5, a)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d5, a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,28)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.0000000000000000000000000000",
+       null,
+       "0.5000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d2 + d4",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d2 + d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000000000000000000000000001.2345",
+       null,
+       "-1000000000000000000000000000000.0000"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + d3",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + d3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,9)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "22.330000000",
+       null,
+       "0E-9"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) <> CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) < CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) < CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) >= CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThanOrEqual",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) >= CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) <= CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "LessThanOrEqual",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) <= CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) <=> CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) <=> CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0))))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), CAST(1 AS DECIMAL(38,0)))",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) IN (CAST(2 AS DECIMAL(38,0)), CAST(1 AS DECIMAL(38,0))))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) BETWEEN CAST(1 AS DECIMAL(38,0)) AND CAST(2 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "between(CAST(1.005BD AS DECIMAL(4,3)), CAST(1 AS DECIMAL(38,0)), CAST(2 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.4 AS DECIMAL(38,38)) = CAST(0 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.4BD AS DECIMAL(38,38)) = CAST(0 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.4 AS DECIMAL(38,38)) > CAST(0 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST(0.4BD AS DECIMAL(38,38)) > CAST(0 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.5 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.5BD AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.6 AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.6BD AS DECIMAL(38,38)) = CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-0.5 AS DECIMAL(38,38)) = CAST(-1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(-0.5BD AS DECIMAL(38,38)) = CAST(-1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(10,0))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(10,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(10,0))",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) > CAST(1 AS DECIMAL(10,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS TINYINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0 AS TINYINT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS INT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0 AS INT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS BIGINT) = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0 AS BIGINT) = CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS INT) > CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST(0 AS INT) > CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (CAST(0 AS INT))",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (CAST(0 AS INT)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "greatest(CAST(0 AS INT), CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(CAST(0 AS INT), CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,28)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-28",
+       "0E-28",
+       "0E-28"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS INT) = CAST(0.4 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0 AS INT) = CAST(0.4BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.1 AS DECIMAL(38,38)) = CAST(0.1 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.1BD AS DECIMAL(38,38)) = CAST(0.1BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.005 AS DECIMAL(4,3)) = CAST(1.005 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(1.005BD AS DECIMAL(4,3)) = CAST(1.005BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "d5 = d4",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d5 = d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "d5 < d4",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(d5 < d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "d2 = d4",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d2 = d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "d5 IN (d4)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(d5 IN (d4))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
      }
     }
    ]

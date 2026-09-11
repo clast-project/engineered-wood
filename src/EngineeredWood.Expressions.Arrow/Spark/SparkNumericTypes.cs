@@ -87,6 +87,18 @@ internal static class SparkNumericTypes
     /// <em>result</em>. Measured, <c>coalesce(decimal(10,2), int)</c> is <c>decimal(12,2)</c>
     /// while <c>decimal(10,2) + int</c> is <c>decimal(13,2)</c> — the extra digit addition needs
     /// for a carry is not needed here.
+    /// <para>
+    /// They also differ once the natural precision overflows, which is what #280 was: the two
+    /// sacrifice scale to different floors. See <see cref="ClampPreferringIntegralDigits"/>,
+    /// which is the clamp this half takes.
+    /// </para>
+    /// <para>
+    /// <b>Greatest and least unify here too</b>, not only the conditionals in the summary. They
+    /// are the callers where a lossy common type is visible as a wrong VALUE rather than a wrong
+    /// type: both cast every argument to this type first and then compare, so measured,
+    /// <c>greatest(0.5BD, CAST(0 AS DECIMAL(38,0)))</c> is 1 — a value neither argument held,
+    /// because unifying rounded 0.5 up at scale 0 before the comparison ever ran.
+    /// </para>
     /// </remarks>
     public static IArrowType CommonType(IArrowType left, IArrowType right)
     {
@@ -111,7 +123,10 @@ internal static class SparkNumericTypes
             var (lp, ls) = AsDecimal(left);
             var (rp, rs) = AsDecimal(right);
             var scale = Math.Max(ls, rs);
-            return Clamp(Math.Max(lp - ls, rp - rs) + scale, scale);
+
+            // ClampPreferringIntegralDigits, NOT `Clamp`. Unification and arithmetic sacrifice
+            // scale to different floors, and using arithmetic's here is #280.
+            return ClampPreferringIntegralDigits(Math.Max(lp - ls, rp - rs) + scale, scale);
         }
 
         if (IsIntegral(left) && IsIntegral(right))
@@ -230,5 +245,49 @@ internal static class SparkNumericTypes
         var adjustedScale = Math.Max(MaxPrecision - integerDigits, minimumScale);
 
         return new Decimal128Type(MaxPrecision, adjustedScale);
+    }
+
+    /// <summary>
+    /// Brings a computed precision and scale within Spark's maximum for a LEAST COMMON TYPE,
+    /// which gives up scale further than <see cref="Clamp"/> will.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's <c>DecimalType.boundedPreferIntegralDigits</c>, reached from
+    /// <c>DecimalPrecisionTypeCoercion.widerDecimalType</c>. It is the same shape as
+    /// <see cref="Clamp"/> — integer digits are kept and the scale absorbs the overflow — with
+    /// one difference that is the whole of #280: <b>the floor is zero, not
+    /// <see cref="MinimumAdjustedScale"/></b>. So decimal(4,3) unified with decimal(38,0), whose
+    /// natural common type is decimal(41,3), is decimal(38,<b>0</b>) and not decimal(38,3).
+    /// </para>
+    /// <para>
+    /// The floor is what makes the difference load-bearing rather than cosmetic. Reserving six
+    /// fractional digits leaves only 32 integer digits, and the decimal(38,0) operand does not
+    /// fit in 32 — so unifying it yields no value at all, and every caller then reads that as a
+    /// null. Measured, <c>greatest(1.005, 99999999999999999999999999999999999999)</c> answered
+    /// 1.005, because the larger operand had become a null that <c>greatest</c> skips, and
+    /// <c>coalesce</c> over the same pair answered NULL outright.
+    /// </para>
+    /// <para>
+    /// With the floor at zero the scale gives up exactly as much as it must and no operand can
+    /// ever fail to fit: the adjusted scale leaves <c>max(p1 - s1, p2 - s2)</c> integer digits,
+    /// which is by construction what the wider operand needs. That invariant is the reason the
+    /// method Spark names is the one to copy rather than to approximate.
+    /// </para>
+    /// <para>
+    /// Arithmetic keeps <see cref="Clamp"/>, and the two really are different functions rather
+    /// than one that drifted: measured under the same session, decimal(6,4) unified with
+    /// decimal(38,0) is decimal(38,0) while decimal(6,4) <c>+</c> decimal(38,0) is
+    /// decimal(38,4). Spark 4.0 changed the unification half and left arithmetic alone —
+    /// <c>spark.sql.legacy.decimal.retainFractionDigitsOnTruncate</c>, default false, restores
+    /// the pre-4.0 answer, and EngineeredWood targets the default.
+    /// </para>
+    /// </remarks>
+    public static Decimal128Type ClampPreferringIntegralDigits(int precision, int scale)
+    {
+        if (precision <= MaxPrecision)
+            return new Decimal128Type(Math.Max(precision, 1), scale);
+
+        return new Decimal128Type(MaxPrecision, Math.Max(scale - (precision - MaxPrecision), 0));
     }
 }

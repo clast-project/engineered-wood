@@ -162,4 +162,135 @@ public sealed class SparkNumericTypesTests
         Assert.Equal("decimal(38,9)", SparkName(SparkNumericTypes.Clamp(39, 10)));
         Assert.Equal("decimal(20,4)", SparkName(SparkNumericTypes.Clamp(20, 4)));
     }
+
+    /// <summary>
+    /// The unification clamp against Spark's own resolved types, for every column pair the
+    /// <c>decimal-common-type</c> group asks about.
+    /// </summary>
+    /// <remarks>
+    /// #280. The arithmetic test above walks the <c>coercion</c> group and reaches
+    /// <see cref="SparkNumericTypes.ArithmeticResult"/>; nothing walked the other rule, so a
+    /// clamp shared between the two looked right for as long as no pair overflowed. Restricted
+    /// to the column forms on purpose — a reference resolves through the harvested schema, so
+    /// the operand types are Spark's own rather than this test's reading of a CAST.
+    /// </remarks>
+    [Fact]
+    public void UnificationPromotionMatchesSpark()
+    {
+        var checked_ = 0;
+        var mismatches = new List<string>();
+
+        foreach (var entry in Corpus.RootElement.GetProperty("groups")
+                     .GetProperty("decimal-common-type").EnumerateArray())
+        {
+            var sql = entry.GetProperty("expression").GetString()!;
+            var recorded = entry.GetProperty("type");
+            if (!recorded.GetProperty("ok").GetBoolean())
+                continue;
+
+            if (SparkSqlParser.ParseExpression(sql) is not FunctionCall
+                {
+                    Name: "greatest" or "least" or "coalesce",
+                    Arguments.Count: 2,
+                } call)
+            {
+                continue;
+            }
+
+            if (TypeOfReference(call.Arguments[0]) is not { } left
+                || TypeOfReference(call.Arguments[1]) is not { } right)
+            {
+                continue;
+            }
+
+            checked_++;
+            var expected = recorded.GetProperty("type").GetString();
+            var ours = SparkNumericTypes.CommonType(left, right);
+            if (SparkName(ours) != expected)
+                mismatches.Add($"{sql}: spark says {expected}, we say {SparkName(ours)}");
+        }
+
+        Assert.Empty(mismatches);
+
+        // The same vacuity guard the arithmetic test carries: a filter that excluded everything
+        // would leave this passing while checking nothing.
+        Assert.True(checked_ >= 8, $"only {checked_} unification expressions were checked");
+    }
+
+    private static IArrowType? TypeOfReference(Expression expression) =>
+        expression is UnboundReference reference && Schema.TryGetValue(reference.Name, out var type)
+            ? type
+            : null;
+
+    [Fact]
+    public void TheUnificationClampGivesUpScaleAllTheWayToZero()
+    {
+        // #280, and the one place the two clamps visibly part company. Arithmetic keeps the
+        // lesser of the scale and 6; unification has no floor at all, because stopping short
+        // leaves too few integer digits for the wider operand and it then fails to convert.
+        // decimal(41,3) is what decimal(4,3) and decimal(38,0) come to naturally.
+        Assert.Equal("decimal(38,0)", SparkName(SparkNumericTypes.ClampPreferringIntegralDigits(41, 3)));
+        Assert.Equal("decimal(38,3)", SparkName(SparkNumericTypes.Clamp(41, 3)));
+
+        // The floor bites hardest where the scale is wide: decimal(38,0) with decimal(38,38)
+        // comes to decimal(76,38), and arithmetic's rule keeps 6 fractional digits that leave
+        // only 32 integer ones -- two too few for the decimal(38,0) operand.
+        Assert.Equal("decimal(38,0)", SparkName(SparkNumericTypes.ClampPreferringIntegralDigits(76, 38)));
+        Assert.Equal("decimal(38,6)", SparkName(SparkNumericTypes.Clamp(76, 38)));
+
+        // Where the overflow is small enough, the scale survives in part and both agree.
+        Assert.Equal("decimal(38,30)", SparkName(SparkNumericTypes.ClampPreferringIntegralDigits(46, 38)));
+        Assert.Equal("decimal(38,30)", SparkName(SparkNumericTypes.Clamp(46, 38)));
+
+        // Under the maximum nothing is given up at all.
+        Assert.Equal("decimal(12,4)", SparkName(SparkNumericTypes.ClampPreferringIntegralDigits(12, 4)));
+    }
+
+    /// <summary>
+    /// The invariant that makes the unification clamp safe: every operand still fits.
+    /// </summary>
+    /// <remarks>
+    /// The adjusted scale leaves exactly <c>max(p1 - s1, p2 - s2)</c> integer digits, which is by
+    /// construction what the wider operand needs — so unifying can round a value but can never
+    /// fail to represent one. Arithmetic's floor breaks that, and a decimal that will not fit its
+    /// own common type is what #280 saw as a vanished operand.
+    /// </remarks>
+    [Fact]
+    public void EveryOperandFitsTheTypeItUnifiesTo()
+    {
+        for (var lp = 1; lp <= 38; lp += 3)
+        {
+            for (var ls = 0; ls <= lp; ls += 5)
+            {
+                for (var rp = 1; rp <= 38; rp += 3)
+                {
+                    for (var rs = 0; rs <= rp; rs += 5)
+                    {
+                        var common = (Decimal128Type)SparkNumericTypes.CommonType(
+                            new Decimal128Type(lp, ls), new Decimal128Type(rp, rs));
+
+                        var room = common.Precision - common.Scale;
+                        Assert.True(room >= lp - ls && room >= rp - rs,
+                            $"decimal({lp},{ls}) and decimal({rp},{rs}) unify to " +
+                            $"decimal({common.Precision},{common.Scale}), which holds only " +
+                            $"{room} integer digits");
+
+                        // And an operand that ROUNDS has a spare integer digit beyond that, to
+                        // absorb a carry: 36 nines at decimal(38,2) becomes 10^36. Rounding
+                        // needs the wider scale, and an operand with both the wider scale and
+                        // the widest integer part brings the natural precision out at its own
+                        // precision, which never passes 38 -- so it is never clamped. The
+                        // comparison path in ArrowRowEvaluator casts without a null mask on the
+                        // strength of this, so it is asserted rather than reasoned about.
+                        if (common.Scale < ls)
+                            Assert.True(room > lp - ls, $"decimal({lp},{ls}) rounds to scale " +
+                                $"{common.Scale} with no room for a carry");
+                        if (common.Scale < rs)
+                            Assert.True(room > rp - rs, $"decimal({rp},{rs}) rounds to scale " +
+                                $"{common.Scale} with no room for a carry");
+                    }
+                }
+            }
+        }
+    }
 }
