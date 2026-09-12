@@ -66,7 +66,7 @@ public sealed class SparkFunctionRegistry
         "like" or "ilike" or "rlike" => true,
         "year" or "month" or "day" or "dayofmonth" or "hour" or "minute" or "second" => true,
         "date_format" => true,
-        "coalesce" or "nvl" or "ifnull" or "nullif" or "if" or "case" => true,
+        "coalesce" or "nvl" or "ifnull" or "nullif" or "nvl2" or "if" or "case" => true,
         "round" or "greatest" or "least" => true,
         _ => false,
     };
@@ -162,6 +162,10 @@ public sealed class SparkFunctionRegistry
                 Expect(name, args, 3);
                 return If(new EagerArguments(args, rowCount), rowCount);
 
+            case "nvl2":
+                Expect(name, args, 3);
+                return Nvl2(new EagerArguments(args, rowCount), rowCount);
+
             case "case":
                 return Case(new EagerArguments(args, rowCount), rowCount);
 
@@ -183,7 +187,7 @@ public sealed class SparkFunctionRegistry
     /// </remarks>
     public bool ShortCircuits(string name) => name switch
     {
-        "coalesce" or "nvl" or "ifnull" or "if" or "case" => true,
+        "coalesce" or "nvl" or "ifnull" or "nvl2" or "if" or "case" => true,
         _ => false,
     };
 
@@ -200,6 +204,10 @@ public sealed class SparkFunctionRegistry
             case "if":
                 Expect(name, arguments.Count, 3);
                 return If(arguments, rowCount);
+
+            case "nvl2":
+                Expect(name, arguments.Count, 3);
+                return Nvl2(arguments, rowCount);
 
             case "case":
                 return Case(arguments, rowCount);
@@ -2212,6 +2220,59 @@ public sealed class SparkFunctionRegistry
         }
 
         var branches = new[] { args.Evaluate(1, thenRows), args.Evaluate(2, elseRows) };
+        var nullLiterals = new[] { args.IsNullLiteral(1), args.IsNullLiteral(2) };
+
+        return UnifyBranches(branches, nullLiterals, choice, rowCount);
+    }
+
+    /// <summary>
+    /// <c>nvl2(x, a, b)</c> — <c>a</c> where <c>x</c> is not null, <c>b</c> where it is.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>if(x IS NOT NULL, a, b)</c>, and not merely by analogy: Spark rewrites it to exactly
+    /// that before resolution, and says so when the rewrite fails —
+    /// <c>nvl2(a, a, bin)</c> is refused as <c>Cannot resolve "(IF((a IS NOT NULL), a, bin))"</c>.
+    /// So it belongs in the short-circuiting family and unifies through <see cref="UnifyBranches"/>
+    /// like every other member; #308.
+    /// </para>
+    /// <para>
+    /// Two things separate it from <see cref="If"/>, both measured on 4.0.3. The first argument is
+    /// read for NULLNESS rather than for truth, so it is not required to be boolean and is not
+    /// required to be scalar either — <c>nvl2(bin, 1, 2)</c>, <c>nvl2(ts, 1, 2)</c> and
+    /// <c>nvl2(nested, a, 0)</c> all answer. And it takes no part in the result type:
+    /// <c>nvl2(s, a, a)</c> is an <c>int</c>, not a string.
+    /// </para>
+    /// <para>
+    /// The laziness is the whole point of the issue, and it runs in both directions.
+    /// <c>nvl2(s, 0, CAST(s AS INT))</c> answers <c>[0, null, 0]</c> over the corpus batch, where
+    /// the two rows that would raise never reach the cast; <c>nvl2(a, a, 1/0)</c> raises, because
+    /// the null row does reach it.
+    /// </para>
+    /// </remarks>
+    private IArrowArray Nvl2(IConditionalArguments args, int rowCount)
+    {
+        var everyRow = new bool[rowCount];
+        for (var row = 0; row < rowCount; row++) everyRow[row] = true;
+
+        // Over every row, and always: the first argument is what decides, so there is nothing to
+        // skip. Measured, `nvl2(CAST(t AS INT), 1, 2)` raises under ANSI even though neither
+        // branch is in any doubt.
+        var subject = args.Evaluate(0, everyRow);
+
+        var presentRows = new bool[rowCount];
+        var absentRows = new bool[rowCount];
+        var choice = new int[rowCount];
+
+        for (var row = 0; row < rowCount; row++)
+        {
+            var present = !SparkFunctions.IsNull(subject, row);
+            presentRows[row] = present;
+            absentRows[row] = !present;
+            choice[row] = present ? 0 : 1;
+        }
+
+        var branches = new[] { args.Evaluate(1, presentRows), args.Evaluate(2, absentRows) };
         var nullLiterals = new[] { args.IsNullLiteral(1), args.IsNullLiteral(2) };
 
         return UnifyBranches(branches, nullLiterals, choice, rowCount);

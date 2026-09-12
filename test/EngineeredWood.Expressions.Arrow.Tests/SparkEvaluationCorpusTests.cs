@@ -190,6 +190,9 @@ public sealed class SparkEvaluationCorpusTests
         ["size(nested.arr)"] = "struct columns are not modelled",
         ["element_at(nested.m, 'k')"] = "struct columns are not modelled",
         ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
+        // #308. Spark reads the first argument of `nvl2` for nullness alone, so a struct is a
+        // perfectly good subject there; the harness still cannot build the column to ask.
+        ["nvl2(nested, a, 0)"] = "struct columns are not modelled",
 
         // ── NOT IMPLEMENTED: raw string literals, where no escape applies. ───────────────────
         // Spark reads R'...' and r'...' and even lets them join the adjacent-literal run, so
