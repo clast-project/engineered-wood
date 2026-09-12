@@ -49,9 +49,36 @@ internal static class SparkNumericTypes
     public const int MinimumAdjustedScale = 6;
 
     /// <summary>The result type of <paramref name="op"/> over the two operand types.</summary>
+    /// <remarks>
+    /// <b>A <c>void</c> operand takes the other one's type</b>, which is Spark's rule for a bare
+    /// <c>NULL</c> and is why the result is not itself void: measured on 4.0.3, <c>a + NULL</c>
+    /// is an <c>int</c>, <c>b + NULL</c> a <c>bigint</c> and <c>d1 + NULL</c> a
+    /// <c>decimal(11,2)</c> — which is decimal(10,2) against ITSELF, the extra digit addition
+    /// reserves for a carry, rather than against anything the NULL contributed.
+    /// <para>
+    /// <b>Two voids are a DOUBLE, not a void.</b> Measured, <c>NULL + NULL</c> is a double and so
+    /// is <c>-NULL</c>. Spark has no arithmetic over <c>void</c> at all, so it defaults the
+    /// operands rather than propagating the type — the one place in this file where an untyped
+    /// null does NOT simply step aside.
+    /// </para>
+    /// <para>
+    /// Until #293 a bare NULL arrived here as a STRING and every one of these threw
+    /// "arithmetic is not defined for utf8". That is the defect this rule closes; it is not a
+    /// refinement of an answer that was nearly right.
+    /// </para>
+    /// </remarks>
     /// <exception cref="NotSupportedException">Either operand is not a supported numeric type.</exception>
     public static IArrowType ArithmeticResult(string op, IArrowType left, IArrowType right)
     {
+        if (left is NullType || right is NullType)
+        {
+            if (left is NullType && right is NullType)
+                return DoubleType.Default;
+
+            var typed = left is NullType ? right : left;
+            return ArithmeticResult(op, typed, typed);
+        }
+
         // Decimal is contagious over the INTEGRAL types only: an int is read as the decimal that
         // holds it exactly and the decimal rules below apply. Against a float or a double it is
         // the other way round -- see the remarks on FLOATING POINT WINS -- so this asks for a
@@ -73,10 +100,17 @@ internal static class SparkNumericTypes
     }
 
     /// <summary>The result type of unary minus, which never changes the operand's type.</summary>
+    /// <remarks>
+    /// The one exception is <c>void</c>, which has no arithmetic of its own: measured,
+    /// <c>-NULL</c> is a <c>double</c>, the same default two void operands take in
+    /// <see cref="ArithmeticResult"/>. #293.
+    /// </remarks>
     public static IArrowType NegateResult(IArrowType operand) =>
-        IsNumeric(operand)
-            ? operand
-            : throw new NotSupportedException($"unary minus is not defined for {operand.Name}");
+        operand is NullType
+            ? DoubleType.Default
+            : IsNumeric(operand)
+                ? operand
+                : throw new NotSupportedException($"unary minus is not defined for {operand.Name}");
 
     /// <summary>
     /// The type two branches of a conditional unify to — <c>coalesce</c>, <c>if</c>, <c>CASE</c>.
@@ -102,6 +136,15 @@ internal static class SparkNumericTypes
     /// </remarks>
     public static IArrowType CommonType(IArrowType left, IArrowType right)
     {
+        // `void` constrains nothing, so the other side IS the common type -- and two voids stay
+        // void, which is what Spark answers for `greatest(NULL, NULL)`. Unlike arithmetic, which
+        // defaults a lone void to double, unification simply steps aside. #293.
+        if (left is NullType)
+            return right;
+
+        if (right is NullType)
+            return left;
+
         if (left.GetType() == right.GetType() && !IsDecimal(left))
             return left;
 

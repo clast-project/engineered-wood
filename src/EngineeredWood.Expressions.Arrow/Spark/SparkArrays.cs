@@ -161,6 +161,10 @@ internal static class SparkArrays
 
     public static long? ReadInt64(IArrowArray array, int index) => array switch
     {
+        // A bare NULL literal, which Spark types `void`. It is null at every row by construction
+        // and every reader here answers so rather than refusing: the alternative -- a type that
+        // reads as nothing -- is what #293 was, where the placeholder was spelled as a string.
+        NullArray => null,
         Int8Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int32Array a => a.IsNull(index) ? null : a.GetValue(index),
@@ -171,6 +175,7 @@ internal static class SparkArrays
 
     public static double? ReadDouble(IArrowArray array, int index) => array switch
     {
+        NullArray => null,
         Int8Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int32Array a => a.IsNull(index) ? null : a.GetValue(index),
@@ -219,6 +224,7 @@ internal static class SparkArrays
 
     public static decimal? ReadDecimal(IArrowArray array, int index) => array switch
     {
+        NullArray => null,
         Int8Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int32Array a => a.IsNull(index) ? null : a.GetValue(index),
@@ -314,6 +320,11 @@ internal static class SparkArrays
     /// <summary>Reads a value for casting, keeping strings as strings.</summary>
     public static CastInput? ReadForCast(IArrowArray array, int index)
     {
+        // FIRST, because a `void` column has no value at any row and every later branch would
+        // have to answer the same thing. #293.
+        if (array is NullArray)
+            return null;
+
         if (IsTemporal(array.Data.DataType))
         {
             var instant = ReadInstant(array, index);
@@ -600,6 +611,14 @@ internal static class SparkArrays
     /// </remarks>
     public static void AppendBytes(BinaryArray.Builder builder, IArrowArray array, int index)
     {
+        // A `void` branch carries no bytes at any row, and is reachable here whenever the OTHER
+        // branch made the unified type binary -- `if(c, X'00', NULL)`. #293.
+        if (array is NullArray)
+        {
+            builder.AppendNull();
+            return;
+        }
+
         var bytes = AsBinary(array);
 
         if (bytes.IsNull(index))
@@ -666,6 +685,10 @@ internal static class SparkArrays
         BooleanType => "BOOLEAN",
         Decimal128Type d => $"DECIMAL({d.Precision},{d.Scale})",
         Decimal256Type d => $"DECIMAL({d.Precision},{d.Scale})",
+
+        // Spark's name for the type of a bare NULL. Arrow calls it `null`, which would read as
+        // "no type at all" in an error message rather than as the type it is. #293.
+        NullType => "VOID",
         _ => type.Name.ToUpperInvariant(),
     };
 

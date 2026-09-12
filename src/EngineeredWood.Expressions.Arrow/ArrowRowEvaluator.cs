@@ -1162,9 +1162,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         length = Math.Max(length, 1);
 
+        if (value.IsNull)
+            return NullLiteralArray(length);
+
         // A decimal literal's type comes from the value, matching Spark: `1.5` is decimal(2,1),
         // `.5` is decimal(1,1) and `1.` is decimal(1,0).
-        if (!value.IsNull && value.Type == LiteralValue.Kind.Decimal)
+        if (value.Type == LiteralValue.Kind.Decimal)
         {
             var (precision, scale) = DecimalTypeOf(value.AsDecimal);
             return MaterializeAsArray(
@@ -1174,7 +1177,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         // ...and the same for one too wide for System.Decimal, which the parser now reads (#173).
         // Without this the literal parses and then cannot be turned into a column, which is the
         // same seam one method further along: `d4 + <38 digits>` failed here rather than there.
-        if (!value.IsNull && value.Type == LiteralValue.Kind.HighPrecisionDecimal)
+        if (value.Type == LiteralValue.Kind.HighPrecisionDecimal)
         {
             var (unscaled, wideScale) = value.AsHighPrecisionDecimal;
             return MaterializeAsArray(
@@ -1182,8 +1185,27 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 new Decimal128Type(DecimalPrecisionOf(unscaled, wideScale), wideScale));
         }
 
-        return MaterializeAsArray(Repeat(value.IsNull ? null : (LiteralValue?)value, length), length);
+        return MaterializeAsArray(Repeat(value, length), length);
     }
+
+    /// <summary>The column a bare <c>NULL</c> literal becomes.</summary>
+    /// <remarks>
+    /// <b>Arrow's <see cref="NullType"/>, which is Spark's <c>void</c>.</b> Until #293 this was an
+    /// all-null <see cref="StringArray"/>, and the type was a lie that nothing downstream could
+    /// see through: a real string column holding nothing in this batch was the same array, so
+    /// <c>greatest(a, s)</c> answered an int over such a batch where Spark refuses, and the
+    /// conditional family needed the expression tree to tell the two apart at all. Worse, the lie
+    /// was not only a typing one — every arithmetic operator refused a bare NULL outright, since
+    /// <c>a + NULL</c> arrived as <c>int + utf8</c>: measured, "arithmetic is not defined for
+    /// utf8" where Spark answers an <c>int</c> null.
+    /// <para>
+    /// The blast radius is real and is paid for in the readers rather than at each call site:
+    /// <c>SparkArrays</c> and <c>SparkFunctions</c> read a void cell as null, and
+    /// <c>SparkNumericTypes</c> gives the type rules. A function that reads its arguments
+    /// through those needs no case of its own.
+    /// </para>
+    /// </remarks>
+    private static IArrowArray NullLiteralArray(int length) => new NullArray(length);
 
     /// <summary>
     /// The precision Spark gives a decimal literal, from its unscaled value and scale.
@@ -1316,6 +1338,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         var result = new LiteralValue?[length];
         switch (array)
         {
+            // A `void` column -- a bare NULL literal, or a conditional every branch of which was
+            // one. Every row is null, which is what the freshly-allocated array already holds.
+            // #293.
+            case NullArray:
+                break;
             case BooleanArray a:
                 for (int i = 0; i < length; i++)
                     result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetValue(i)!.Value);
@@ -1429,7 +1456,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             if (values[i].HasValue) { kind = values[i]!.Value.Type; break; }
         }
 
-        if (kind is null) return BuildAllNullStrings(length);
+        // Nothing to infer a type from. That is a bare NULL by any other name, so it takes the
+        // same `void` column one does rather than a string one. #293.
+        if (kind is null) return NullLiteralArray(length);
 
         switch (kind.Value)
         {
@@ -1621,13 +1650,6 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 #endif
         _ => throw new NotSupportedException($"Cannot materialize {v.Type} as a date/timestamp."),
     };
-
-    private static IArrowArray BuildAllNullStrings(int length)
-    {
-        var b = new StringArray.Builder();
-        for (int i = 0; i < length; i++) b.AppendNull();
-        return b.Build();
-    }
 
     private static BooleanArray ToBooleanArray(bool?[] values, int length)
     {
