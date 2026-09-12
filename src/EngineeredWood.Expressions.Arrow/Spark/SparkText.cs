@@ -40,8 +40,15 @@ internal static class SparkText
     /// knows which it wants.
     /// </para>
     /// <para>
-    /// <b>The string casts that still call <see cref="string.Trim()"/> have the gap this exists
-    /// to close</b>, and each needs its own measured rows before it moves: #316.
+    /// <b>Every string CAST reads its text through here</b>, which is #316: the numeric parses
+    /// share it through <see cref="SparkArrays.CastInput"/>, and the integral, decimal, temporal
+    /// and boolean rules each reach it from there.
+    /// <para>
+    /// <b>The <c>trim</c>/<c>ltrim</c>/<c>rtrim</c> FUNCTIONS do not, and must not.</b> Spark's
+    /// one-argument <c>trim</c> is a THIRD rule: it removes the space and nothing else, so
+    /// measured, <c>trim('\tx\t')</c> comes back unchanged where the cast rule would strip both
+    /// tabs. Three rules, and the wrong one is wrong in a different direction each time.
+    /// </para>
     /// </para>
     /// </remarks>
     public static (int Start, int End) TrimBounds(ReadOnlySpan<char> text)
@@ -60,5 +67,16 @@ internal static class SparkText
     {
         var (start, end) = TrimBounds(text);
         return text.Slice(start, end - start);
+    }
+
+    /// <summary>The same, for a caller that needs a string because .NET's parse takes one.</summary>
+    /// <remarks>
+    /// Returns <paramref name="text"/> itself when there is nothing to trim, which
+    /// <see cref="string.Trim()"/> also does. This runs once per row of every string cast.
+    /// </remarks>
+    public static string Trim(string text)
+    {
+        var (start, end) = TrimBounds(text.AsSpan());
+        return start == 0 && end == text.Length ? text : text.Substring(start, end - start);
     }
 }
