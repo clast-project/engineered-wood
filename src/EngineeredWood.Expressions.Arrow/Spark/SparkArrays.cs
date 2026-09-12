@@ -87,9 +87,15 @@ internal static class SparkArrays
             _index = 0;
             FromString = true;
 
-            // Trimmed once and shared. Both parses want the same text, and `Trim` allocates
+            // Trimmed once and shared. Both parses want the same text, and trimming allocates
             // whenever there is anything to trim -- twice per row, for a padded cell.
-            var trimmed = text.Trim();
+            //
+            // SPARK'S TRIM, NOT .NET'S, and the two sets cross rather than nest -- see
+            // SparkText.TrimBounds. Nothing downstream can undo the choice: .NET's number parser
+            // skips only 0x20 and 0x09-0x0D on its own, all of which this has already removed, so
+            // what it sees is exactly what Spark's parse would. The TEMPORAL parses are the
+            // exception and handle it themselves. #316.
+            var trimmed = SparkText.Trim(text);
             IsNumeric = double.TryParse(
                 trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
             AsDouble = IsNumeric ? asDouble : 0d;
@@ -441,7 +447,7 @@ internal static class SparkArrays
     public static bool TryReadTypeSuffixed(string text, out double value)
     {
         value = 0d;
-        var trimmed = text.Trim();
+        var trimmed = SparkText.Trim(text);
         if (trimmed.Length < 2)
             return false;
 

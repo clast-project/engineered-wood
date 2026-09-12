@@ -94,6 +94,11 @@ LEGACY_GROUPS = (
     # a row the ANSI switch moves. Recording one dialect would describe the accept-set and leave
     # the whole boundary around it unmeasured.
     "string-to-boolean",
+    # #316. The trim itself is dialect-independent -- both dialects trim the same set -- and what
+    # a string it does NOT rescue then does is not: ANSI raises CAST_INVALID_INPUT where legacy
+    # answers NULL. Since the whole point of the group is which strings survive the trim, the
+    # refusals ARE the measurement, and one harvest would record only half of each of them.
+    "string-trim",
     # #295. The dialects disagree twice over: ANSI refuses the integral-to-binary CAST that legacy
     # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
     # directions in one group, so one harvest would describe neither.
@@ -1448,6 +1453,105 @@ GROUPS = {
         "nullif('t', true)", "nullif('no', bl)", "nullif('on', true)",
         "if('yes' = bl, 1, 0)", "coalesce(CAST('y' AS BOOLEAN), false)",
         "bl = 't'", "NOT (bl = 'n')",
+    ],
+
+    # WHICH whitespace a string cast trims. #316, found by the `string-to-boolean` group above,
+    # which asked the question for one target and got an answer that belongs to all of them.
+    #
+    # Spark trims with `UTF8String.trimAll`: leading and trailing BYTES of 0x20 or below. .NET's
+    # `string.Trim` removes UNICODE whitespace. NEITHER SET CONTAINS THE OTHER, so the rows below
+    # come in two halves that fail in OPPOSITE directions, and a group carrying only one half
+    # would read as "we are too strict" or "too lenient" instead of "we are using the wrong set".
+    #
+    # Every character is written as a python escape and reaches Spark as one real character; none
+    # of them is a SQL escape sequence, so what these rows measure is the trim rather than the
+    # tokenizer.
+    #
+    # The tail of the group is a THIRD rule and is here because it is the same question: Spark's
+    # `trim`/`ltrim`/`rtrim` FUNCTIONS remove the space alone. Three rules for one word, and each
+    # of the other two is the wrong answer in a different direction.
+    "string-trim": [
+        # --- SPARK TRIMS IT AND .NET DOES NOT. `char.IsWhiteSpace` is false below 0x09, and for
+        # 0x0E through 0x1F, so a `Trim` leaves these in place and the parse then refuses a string
+        # Spark reads.
+        "CAST('1' AS INT)", "CAST('1' AS INT)", "CAST('1' AS INT)",
+        "CAST('1' AS INT)", "CAST('1' AS INT)", "CAST('1' AS INT)",
+        "CAST('1' AS BIGINT)", "CAST('1' AS SMALLINT)", "CAST('1' AS TINYINT)",
+        "CAST('1.5' AS DOUBLE)", "CAST('1.5' AS FLOAT)",
+        "CAST('1.5' AS DECIMAL(10,2))",
+        "CAST('2026-08-11' AS DATE)", "CAST('2026-08-11' AS DATE)",
+        "CAST(CAST('2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)",
+        "CAST('true' AS BOOLEAN)",
+        "'1' = 1",
+
+        # --- .NET TRIMS IT AND SPARK DOES NOT. This is the half that answers WRONGLY rather than
+        # loudly: a `Trim` removes the character and the parse then succeeds, so a CHECK
+        # constraint admits a row Spark rejects.
+        "CAST(' 1' AS INT)", "CAST('1 ' AS INT)", "CAST(' 1 ' AS INT)",
+        "CAST(' 1' AS BIGINT)", "CAST(' 1' AS SMALLINT)", "CAST(' 1' AS TINYINT)",
+        "CAST(' 1.5' AS DOUBLE)", "CAST(' 1.5' AS FLOAT)",
+        "CAST(' 1.5' AS DECIMAL(10,2))",
+        # THE TEMPORAL TARGETS ARE THE ONES THAT NEED MORE THAN A TRIM. `DateTimeOffset.TryParse`
+        # skips `char.IsWhiteSpace` ITSELF, at either end, so removing the `Trim` above them does
+        # not reach these rows -- measured in .NET, it reads U+00A0 + '2026-08-11' as the date.
+        #
+        # The TIMESTAMP rows are wrapped in a cast to STRING, and only for a reason about the
+        # fixture: PySpark localises a timestamp to the DRIVER's zone on collect, so a bare
+        # timestamp answer records the harvest machine rather than the session's UTC and has to
+        # be excluded from the comparison. Spark's own rendering crosses as text in the pinned
+        # zone. The refusing rows refuse either way; wrapping all of them keeps the block one
+        # shape.
+        "CAST(' 2026-08-11' AS DATE)", "CAST('2026-08-11 ' AS DATE)",
+        "CAST(CAST(' 2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 ' AS TIMESTAMP) AS STRING)",
+        # ...and two more of the same kind, so the rule is "Unicode whitespace above 0x20" rather
+        # than "the no-break space".
+        "CAST('　1' AS INT)", "CAST(' 1' AS INT)", "CAST(' 1' AS INT)",
+        # Whitespace to .NET and a VALUE to Spark, with nothing else in it.
+        "CAST(' ' AS INT)", "CAST(' ' AS DOUBLE)",
+        # The comparison coercion, which is where this costs a wrong answer rather than a
+        # different error class: since #180 a string against a number is cast, not compared as
+        # text. `nullif` reaches the same cast through #298.
+        "' 1' = 1", "' 1' > 0", "nullif(' 1', 1)",
+        "' 2026-08-11' = dt",
+
+        # --- TRIMMED BY BOTH, which is what says the fix did not simply stop trimming. The whole
+        # 0x09-0x0D run plus the space, at both ends.
+        "CAST(' 1 ' AS INT)", "CAST('\t1\n' AS INT)", "CAST('\r\n1' AS BIGINT)",
+        "CAST('1' AS INT)", "CAST('1' AS INT)",
+        "CAST('  1.5  ' AS DOUBLE)", "CAST(' 1.5 ' AS DECIMAL(10,2))",
+        "CAST(' 2026-08-11 ' AS DATE)",
+        "CAST(CAST('  2026-08-11 12:30:00  ' AS TIMESTAMP) AS STRING)",
+        "' 1 ' = 1",
+        # Whitespace ALONE under both rules, and the empty string it trims down to.
+        "CAST('  ' AS INT)", "CAST('\t' AS INT)", "CAST('' AS INT)",
+
+        # --- INTERIOR whitespace is trimmed by neither rule, so a fix that stripped instead of
+        # trimming would show up here.
+        "CAST('1 2' AS INT)", "CAST('1 2' AS INT)", "CAST('12' AS INT)",
+        "CAST('2026-08 -11' AS DATE)",
+
+        # --- The parses that sit BESIDE the shared one and have to take the same trim: Java's
+        # trailing type suffix on a floating literal (#258), and a sign, which must still be the
+        # first thing the parse sees once the trim is done.
+        "CAST(' 1d ' AS DOUBLE)", "CAST('1d' AS DOUBLE)", "CAST(' 1d' AS DOUBLE)",
+        "CAST(' -1' AS INT)", "CAST('-1' AS INT)", "CAST(' -1' AS INT)",
+        "CAST('- 1' AS INT)",
+
+        # --- THE TRIM FUNCTIONS ARE A THIRD RULE, which is the question the issue raised and this
+        # is the answer: `trim(str)` removes the SPACE and nothing else. Not the cast rule above,
+        # and not .NET's. Bracketed with `concat` so a surviving tab or space is visible in the
+        # recorded answer rather than being something the reader has to take on trust.
+        "concat('[', trim('  x  '), ']')",
+        "concat('[', trim('\tx\t'), ']')",
+        "concat('[', trim('\nx\n'), ']')",
+        "concat('[', trim('x'), ']')",
+        "concat('[', trim(' x '), ']')",
+        "concat('[', trim('\t x \t'), ']')",
+        "concat('[', ltrim('  x'), ']')", "concat('[', ltrim('\tx'), ']')",
+        "concat('[', rtrim('x  '), ']')", "concat('[', rtrim('x\t'), ']')",
+        # ...and LIKE trims NOTHING, under any of the three, so a padded string is not the bare one.
+        "'  x  ' LIKE 'x'", "'\tx' LIKE '%x'",
     ],
 
     # Casts to and from BINARY, and the conditionals that need them. #295. Binary answers are

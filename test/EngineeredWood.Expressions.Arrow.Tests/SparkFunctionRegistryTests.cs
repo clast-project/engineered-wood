@@ -2483,4 +2483,184 @@ public sealed class SparkFunctionRegistryTests
         Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "bl = 'on'", batch));
         Assert.True(Eval(Legacy, "bl = 'on'", batch).IsNull(0));
     }
+
+    // ── Which whitespace a string cast trims: Spark's set, not .NET's (#316) ─────
+
+    /// <summary>
+    /// The trim set, stated as the rule rather than per target: at or below 0x20 goes, above it
+    /// stays.
+    /// </summary>
+    /// <remarks>
+    /// Both directions matter, and this is the cheapest place to see them side by side.
+    /// <c>char.IsWhiteSpace</c> is FALSE for U+0000-U+0008 and U+000E-U+001F, all of which Spark
+    /// trims, and TRUE for U+00A0, U+2007, U+2028 and U+3000, none of which it does. So a
+    /// <see cref="string.Trim()"/> is not a loose version of this rule; it is a different one.
+    /// </remarks>
+    [Theory]
+    // Trimmed by Spark. The second column is what `char.IsWhiteSpace` says, so a row where it is
+    // false is one a `Trim` would have left in place.
+    [InlineData('\u0000', false)]
+    [InlineData('\u0001', false)]
+    [InlineData('\u0008', false)]
+    [InlineData('\u0009', true)]
+    [InlineData('\u000A', true)]
+    [InlineData('\u000B', true)]
+    [InlineData('\u000C', true)]
+    [InlineData('\u000D', true)]
+    [InlineData('\u000E', false)]
+    [InlineData('\u001F', false)]
+    [InlineData(' ', true)]
+    public void SparkTrimsEveryCharacterAtOrBelowTheSpace(char c, bool dotNetAgrees)
+    {
+        Assert.Equal("1", SparkText.Trim(c + "1" + c));
+        Assert.Equal(dotNetAgrees, char.IsWhiteSpace(c));
+    }
+
+    [Theory]
+    // NOT trimmed by Spark, and every one of them IS .NET whitespace -- so a `Trim` would have
+    // removed it and let the parse succeed on a string Spark refuses.
+    [InlineData('\u0085')]
+    [InlineData('\u00A0')]
+    [InlineData('\u2007')]
+    [InlineData('\u2028')]
+    [InlineData('\u3000')]
+    public void SparkTrimsNothingAboveTheSpaceThoughDotNetDoes(char c)
+    {
+        Assert.Equal(c + "1" + c, SparkText.Trim(c + "1" + c));
+        Assert.True(char.IsWhiteSpace(c), "the point of the row is that .NET disagrees");
+    }
+
+    /// <summary>
+    /// Every string cast takes the set, and each is wrong in BOTH directions without it.
+    /// </summary>
+    /// <remarks>
+    /// One test per direction would have passed on half the targets: the numeric parses share
+    /// <see cref="SparkArrays.CastInput"/>'s trim, the integral one adds its own scan, the decimal
+    /// one has a reader of its own, and the temporal ones needed more than a trim. The targets are
+    /// listed rather than sampled because that is four code paths, not one.
+    /// </remarks>
+    [Theory]
+    [InlineData("CAST(s AS INT)")]
+    [InlineData("CAST(s AS BIGINT)")]
+    [InlineData("CAST(s AS SMALLINT)")]
+    [InlineData("CAST(s AS TINYINT)")]
+    [InlineData("CAST(s AS DOUBLE)")]
+    [InlineData("CAST(s AS FLOAT)")]
+    [InlineData("CAST(s AS DECIMAL(10,2))")]
+    public void EveryNumericCastTakesSparksTrimAndNotDotNets(string sql)
+    {
+        // Spark trims U+001F, so the value is there to be read.
+        Assert.False(Eval(Ansi, sql, Batch(("s", Strings("\u001F1")))).IsNull(0));
+        Assert.False(Eval(Ansi, sql, Batch(("s", Strings("1\u001F")))).IsNull(0));
+
+        // Spark does not trim U+00A0, so the value is malformed: ANSI raises and legacy nulls.
+        var nbsp = Batch(("s", Strings("\u00A01")));
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, nbsp));
+        Assert.True(Eval(Legacy, sql, nbsp).IsNull(0));
+
+        // ...and the ordinary padding both rules trim still works, which is what says the fix
+        // changed the SET rather than stopping.
+        Assert.False(Eval(Ansi, sql, Batch(("s", Strings(" \t1\n ")))).IsNull(0));
+    }
+
+    /// <summary>
+    /// The temporal targets, where trimming right is NOT enough on its own.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DateTimeOffset.TryParse(string, IFormatProvider, System.Globalization.DateTimeStyles, out DateTimeOffset)"/>
+    /// skips <see cref="char.IsWhiteSpace(char)"/> itself, at either end, so a U+00A0 the trim
+    /// deliberately left in place would have been swallowed by the parser instead and the cast
+    /// would have answered anyway. <c>TemporalText</c> is the guard, and these are the rows that
+    /// fail without it while every numeric row above still passes.
+    /// </remarks>
+    [Theory]
+    [InlineData("CAST(s AS DATE)", "2026-08-11")]
+    [InlineData("CAST(s AS TIMESTAMP)", "2026-08-11 12:30:00")]
+    public void ATemporalCastRefusesWhitespaceSparkKeepsEvenThoughDotNetWouldSkipIt(
+        string sql, string text)
+    {
+        foreach (var padded in new[] { "\u00A0" + text, text + "\u00A0" })
+        {
+            var batch = Batch(("s", Strings(padded)));
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, batch));
+            Assert.True(Eval(Legacy, sql, batch).IsNull(0));
+
+            // The proof that the guard is doing the work rather than the trim: .NET's own parser
+            // reads this string quite happily.
+            Assert.True(DateTimeOffset.TryParse(
+                padded, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out _));
+        }
+
+        // Trimmed by both rules, and by Spark alone, are both still read.
+        Assert.False(Eval(Ansi, sql, Batch(("s", Strings("  " + text + "  ")))).IsNull(0));
+        Assert.False(Eval(Ansi, sql, Batch(("s", Strings("\u001F" + text)))).IsNull(0));
+    }
+
+    /// <summary>
+    /// The comparison coercion takes it too, which is where the wrong set cost a wrong ANSWER.
+    /// </summary>
+    /// <remarks>
+    /// A cast that reads too much is a loud error somewhere; a comparison that reads too much is
+    /// a CHECK constraint quietly admitting a row Spark rejects. Since #180 a string against a
+    /// number is cast rather than compared as text, so it arrives here.
+    /// </remarks>
+    [Fact]
+    public void TheComparisonCoercionTakesTheSameTrim()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.True(Assert.IsType<BooleanArray>(Eval(Ansi, "'\u001F1' = a", batch)).GetValue(0));
+        Assert.True(Assert.IsType<BooleanArray>(Eval(Ansi, "' 1 ' = a", batch)).GetValue(0));
+
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "'\u00A01' = a", batch));
+        Assert.True(Eval(Legacy, "'\u00A01' = a", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// Interior whitespace is trimmed by none of the rules, so the fix trims rather than strips.
+    /// </summary>
+    [Theory]
+    [InlineData("1 2")]
+    [InlineData("1\u00A02")]
+    [InlineData("1\u001F2")]
+    public void InteriorWhitespaceIsNotTrimmedByAnything(string text)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS INT)", batch));
+        Assert.True(Eval(Legacy, "CAST(s AS INT)", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// <c>trim</c>/<c>ltrim</c>/<c>rtrim</c> are a THIRD rule: the space, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// Measured on 4.0.3, and the least guessable of the three. The cast rule removes every byte
+    /// at or below 0x20 and .NET's removes Unicode whitespace; Spark's one-argument <c>trim</c>
+    /// removes U+0020 alone, so a tab survives it. Using either of the other two here is wrong in
+    /// a different direction again, which is why they are asserted side by side.
+    /// </remarks>
+    [Theory]
+    [InlineData("trim(s)", "  x  ", "x")]
+    [InlineData("trim(s)", "\tx\t", "\tx\t")]
+    [InlineData("trim(s)", "\nx\n", "\nx\n")]
+    [InlineData("trim(s)", "\u001Fx\u001F", "\u001Fx\u001F")]
+    [InlineData("trim(s)", "\u00A0x\u00A0", "\u00A0x\u00A0")]
+    // A space OUTSIDE a tab still goes, and the tab then stops the trim -- so it is a per-character
+    // rule and not "give up if the edge is not a space".
+    [InlineData("trim(s)", "\t x \t", "\t x \t")]
+    [InlineData("trim(s)", " \tx\t ", "\tx\t")]
+    [InlineData("ltrim(s)", "  x  ", "x  ")]
+    [InlineData("ltrim(s)", "\tx", "\tx")]
+    [InlineData("rtrim(s)", "  x  ", "  x")]
+    [InlineData("rtrim(s)", "x\t", "x\t")]
+    public void TheTrimFunctionsRemoveTheSpaceAndNothingElse(string sql, string text, string expected)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(expected,
+            Assert.IsType<StringArray>(Eval(Ansi, sql, batch)).GetString(0));
+        Assert.Equal(expected,
+            Assert.IsType<StringArray>(Eval(Legacy, sql, batch)).GetString(0));
+    }
 }
