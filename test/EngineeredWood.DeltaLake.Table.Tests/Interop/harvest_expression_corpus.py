@@ -72,6 +72,10 @@ LEGACY_CONF = dict(CONF, **{"spark.sql.ansi.enabled": "false"})
 LEGACY_GROUPS = (
     "wide-decimal", "ansi-sensitive", "string-to-decimal", "integral-cast-overflow",
     "double-to-decimal", "string-coercion", "numeric-text",
+    # #293. `void` ought to be dialect-independent -- it carries no value to overflow and no text
+    # to parse -- but #278 measured the conditional family coercing in OPPOSITE directions per
+    # dialect, so "ought to" is not a measurement. Asked twice to find out.
+    "null-literal",
     # #283. The decimal answers are the same in both dialects; the OTHER targets are what differ,
     # raising CAST_INVALID_INPUT under ANSI and answering NULL without it, and recording only half
     # of that would leave the legacy registry's version of the rule unmeasured.
@@ -1671,6 +1675,61 @@ GROUPS = {
         # Strictly three arguments -- WRONG_NUM_ARGS, not a silent default.
         "nvl2(a, a)",
         "nvl2(a, a, 0, 0)",
+    ],
+
+    # #293. A bare NULL is `void` in Spark, and EngineeredWood used to materialise one as an
+    # all-null STRING column -- so the type was a lie, and one that nothing downstream could see
+    # through. Two consequences, and only the second was the one the issue was filed for.
+    #
+    # ARITHMETIC SIMPLY REFUSED. `a + NULL` arrived as `int + utf8` and threw "arithmetic is not
+    # defined for utf8", for every operator and every numeric type. Nothing in the corpus asked,
+    # which is why it went unnoticed for as long as it did -- so the operators are enumerated here
+    # rather than sampled.
+    #
+    # AND A TYPE DEPENDED ON THE BATCH. A real string column holding nothing in this batch is the
+    # same array as the placeholder, so `greatest` dropped it and answered where Spark refuses.
+    # That half cannot be asked here -- this corpus is ONE batch, and every string column in it
+    # holds values -- so the rows below pin the REFUSAL and a unit test carries the empty batch.
+    # The corpus's job here is the rule; the test's job is that the rule does not move.
+    "null-literal": [
+        # What `void` is, on its own.
+        "NULL",
+        "CAST(NULL AS INT)", "CAST(NULL AS BINARY)", "CAST(NULL AS DATE)",
+        "CAST(NULL AS DECIMAL(10,2))", "CAST(NULL AS BOOLEAN)", "CAST(NULL AS STRING)",
+
+        # Arithmetic: the void operand takes the OTHER one's type. Every operator, because it was
+        # every operator that threw.
+        "a + NULL", "NULL + a", "a - NULL", "a * NULL", "a / NULL", "a % NULL",
+        # ...and every numeric width, since the answer is the other operand's own type and not a
+        # default. `d1 + NULL` is the shape that says so loudest: decimal(11,2) is decimal(10,2)
+        # against ITSELF, the digit addition reserves for a carry.
+        "b + NULL", "sh + NULL", "f + NULL", "g + NULL", "d1 + NULL", "d3 + NULL",
+        # TWO voids have no other operand to take, and Spark does not answer void.
+        "NULL + NULL", "NULL - NULL", "NULL * NULL", "NULL / NULL",
+        "-NULL", "NULL / 2", "1 + NULL",
+
+        # Where the result IS void, because nothing else constrained it.
+        "coalesce(NULL, NULL)", "if(true, NULL, NULL)", "nvl2(a, NULL, NULL)",
+        "CASE WHEN true THEN NULL ELSE NULL END", "nullif(NULL, a)",
+        # A void that is not a LITERAL null -- the fold has to keep stepping aside for it.
+        "coalesce(coalesce(NULL, NULL), a)", "greatest(coalesce(NULL, NULL), a)",
+        "coalesce(NULL, NULL) + a",
+
+        # Where it is not: one typed branch settles the whole conditional.
+        "coalesce(a, NULL)", "if(true, a, NULL)", "greatest(a, NULL)", "least(a, NULL)",
+        "greatest(d1, NULL)", "greatest(NULL, 'x')", "nullif(a, NULL)",
+        "coalesce(a, greatest(a, NULL))",
+
+        # greatest/least REFUSE a string against a number, which is the rule the content test
+        # used to break: over a batch where `s` held nothing it answered instead. Both orders,
+        # because the refusal is not about which side is written first.
+        "greatest(a, s)", "least(a, s)", "greatest(s, a)",
+
+        # The functions that read a void argument. None of these was wrong -- a string
+        # placeholder reads as null too -- but each is a reader that now has to say so itself.
+        "length(NULL)", "upper(NULL)", "concat('x', NULL)", "substring(NULL, 1, 2)",
+        "round(NULL)", "round(NULL, 2)", "year(NULL)", "date_format(NULL, 'y')",
+        "NULL || 'x'", "NULL LIKE 'a'", "s LIKE NULL",
     ],
 
     "ansi-sensitive": [

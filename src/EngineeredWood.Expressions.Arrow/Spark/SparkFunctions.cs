@@ -300,6 +300,11 @@ internal static class SparkFunctions
     public static IArrowArray Unify(
         IArrowType type, IReadOnlyList<IArrowArray> sources, int[] choice, int rowCount)
     {
+        // Every branch was `void`, so there is no value to pick and no type to build one at:
+        // Spark types `coalesce(NULL, NULL)` and `if(c, NULL, NULL)` as void too. #293.
+        if (type is NullType)
+            return new NullArray(rowCount);
+
         if (type is StringType)
         {
             var strings = new StringArray.Builder();
@@ -398,6 +403,10 @@ internal static class SparkFunctions
     /// <summary>Whether a cell is null, for the conditional functions.</summary>
     public static bool IsNull(IArrowArray array, int index) => array switch
     {
+        // A `void` column is null at every row. Named rather than left to the numeric fallback,
+        // which reached the same answer by catching the NotSupportedException ReadDouble raises --
+        // an exception per row on a path a conditional walks for every branch. #293.
+        NullArray => true,
         StringArray a => a.IsNull(index),
         BooleanArray a => a.IsNull(index),
         _ => SparkArrays.IsTemporal(array.Data.DataType)
@@ -565,6 +574,9 @@ internal static class SparkFunctions
 
     public static string? ReadString(IArrowArray array, int index)
     {
+        if (array is NullArray)
+            return null;
+
         if (array is StringArray strings)
             return strings.IsNull(index) ? null : strings.GetString(index);
 
@@ -573,7 +585,12 @@ internal static class SparkFunctions
     }
 
     private static bool? ReadBoolean(IArrowArray array, int index) =>
-        array is BooleanArray booleans
-            ? booleans.IsNull(index) ? null : booleans.GetValue(index)
-            : throw new NotSupportedException($"{array.Data.DataType.Name} is not boolean");
+        array switch
+        {
+            // Reachable wherever the OTHER branch made the unified type boolean, as in
+            // `if(c, bl, NULL)`. #293.
+            NullArray => null,
+            BooleanArray booleans => booleans.IsNull(index) ? null : booleans.GetValue(index),
+            _ => throw new NotSupportedException($"{array.Data.DataType.Name} is not boolean"),
+        };
 }

@@ -117,15 +117,23 @@ public interface IConditionalArguments
     /// <para>
     /// Spark types one as <c>void</c>, which constrains nothing: <c>coalesce(a, NULL)</c> is an
     /// <c>int</c>. A conditional therefore has to leave such a branch out of its type fold, and
-    /// this is how it tells one apart — <b>structurally, from the expression</b>, rather than by
-    /// noticing that a branch came back all null.
+    /// this is how it tells one apart — <b>structurally</b>, rather than by noticing that a branch
+    /// came back all null.
     /// </para>
     /// <para>
     /// The difference is not academic. Under short-circuiting a branch no row selects is all null
     /// BY CONSTRUCTION, so a content test would swallow every unreached branch and retype the
     /// result: a zero-row <c>coalesce(a, s)</c> would come back <c>int</c> where Spark says
-    /// <c>bigint</c>. It was already wrong for a string column that merely held nothing in this
+    /// <c>bigint</c>. It was also wrong for a string column that merely held nothing in this
     /// batch, which is #293.
+    /// </para>
+    /// <para>
+    /// <b>An implementation may answer from the expression or from the type</b>, and both are in
+    /// use: an evaluator-driven call reads the tree, where a bare <c>NULL</c> is a literal and
+    /// <c>CAST(NULL AS INT)</c> — which carries a type Spark DOES let constrain the result — is
+    /// not; an eager one reads the column, which since #293 is a <c>void</c> column for a bare
+    /// NULL and the cast's own type for a cast. They agree because the materialisation makes them
+    /// agree, not because either is a fallback for the other.
     /// </para>
     /// </remarks>
     bool IsNullLiteral(int index);

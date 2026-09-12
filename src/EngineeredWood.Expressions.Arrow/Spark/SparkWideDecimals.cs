@@ -80,6 +80,10 @@ internal static class SparkWideDecimals
     /// </remarks>
     internal static Operand? Read(IArrowArray array, int index) => array switch
     {
+        // A bare NULL, typed `void`: no value at any row, and reachable wherever the other
+        // operand made the result a decimal -- `d1 + NULL`, `if(c, d1, NULL)`. #293.
+        NullArray => null,
+
         // The precisions are the ones SparkNumericTypes.AsDecimal assigns, so an operand carries
         // the same type here that the result-type rules gave it.
         Int8Array a => a.IsNull(index) ? null : new Operand(FromInt64(a.GetValue(index)!.Value), 3, 0),

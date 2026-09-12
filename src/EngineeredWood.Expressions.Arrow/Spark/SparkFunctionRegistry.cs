@@ -4,6 +4,7 @@
 using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 
 namespace EngineeredWood.Expressions.Arrow.Spark;
 
@@ -145,7 +146,7 @@ public sealed class SparkFunctionRegistry
                 return SparkFunctions.DateFormat(args, rowCount);
 
             case "coalesce" or "nvl" or "ifnull":
-                return Coalesce(new EagerArguments(args, rowCount), rowCount);
+                return Coalesce(new EagerArguments(args), rowCount);
 
             case "greatest" or "least":
                 return Extreme(name, args, rowCount);
@@ -160,14 +161,14 @@ public sealed class SparkFunctionRegistry
 
             case "if":
                 Expect(name, args, 3);
-                return If(new EagerArguments(args, rowCount), rowCount);
+                return If(new EagerArguments(args), rowCount);
 
             case "nvl2":
                 Expect(name, args, 3);
-                return Nvl2(new EagerArguments(args, rowCount), rowCount);
+                return Nvl2(new EagerArguments(args), rowCount);
 
             case "case":
-                return Case(new EagerArguments(args, rowCount), rowCount);
+                return Case(new EagerArguments(args), rowCount);
 
             default:
                 throw new NotSupportedException(
@@ -223,27 +224,21 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// One implementation of the conditional family serves both entry points, rather than two that
-    /// have to be kept saying the same thing. What the eager path cannot supply is the structural
-    /// answer to <see cref="IsNullLiteral"/> -- there is no expression left to look at, only a
-    /// column -- so it falls back to the content test #293 describes, under which a string column
-    /// that happens to hold nothing in this batch is a bare <c>NULL</c>. Ignoring the row selection
-    /// is safe for the same reason the arrays are usable at all: every one of these algorithms
-    /// reads a branch only at the rows that selected it.
+    /// have to be kept saying the same thing. There is no expression left to look at here, only a
+    /// column -- and that is enough now that a bare <c>NULL</c> arrives as a <c>void</c> column
+    /// rather than as an all-null string one, because the answer travels WITH the array. #293.
+    /// Ignoring the row selection is safe for the same reason the arrays are usable at all: every
+    /// one of these algorithms reads a branch only at the rows that selected it.
     /// </remarks>
     private sealed class EagerArguments : IConditionalArguments
     {
         private readonly IReadOnlyList<IArrowArray> _args;
-        private readonly int _rowCount;
 
-        public EagerArguments(IReadOnlyList<IArrowArray> args, int rowCount)
-        {
-            _args = args;
-            _rowCount = rowCount;
-        }
+        public EagerArguments(IReadOnlyList<IArrowArray> args) => _args = args;
 
         public int Count => _args.Count;
 
-        public bool IsNullLiteral(int index) => IsNullLiteralPlaceholder(_args[index], _rowCount);
+        public bool IsNullLiteral(int index) => _args[index].Data.DataType is NullType;
 
         public IArrowArray Evaluate(int index, ReadOnlySpan<bool> rows) => _args[index];
     }
@@ -859,6 +854,14 @@ public sealed class SparkFunctionRegistry
     /// </remarks>
     private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
+        // A `void` source is null at every row, so it is null at the target too -- whatever the
+        // target is, and in either dialect, since there is no value to be malformed. Answered here
+        // rather than in each CastToX because it is the same answer for all of them, and because
+        // two of those refuse a source they do not recognise: measured, `CAST(NULL AS BINARY)` is
+        // a binary null in Spark where CastToBinary would have said VOID cannot become one. #293.
+        if (source.Data.DataType is NullType)
+            return ArrowCompute.MakeNullArray(target, rowCount);
+
         if (target is Decimal128Type decimalTarget)
             return CastToDecimal(source, decimalTarget, rowCount, raising);
 
@@ -1501,13 +1504,15 @@ public sealed class SparkFunctionRegistry
     /// A bare <c>NULL</c> is <c>void</c> in Spark and constrains nothing, so
     /// <c>coalesce(a, NULL)</c> is an <c>int</c>, and such a branch is left out of the fold.
     /// <para>
-    /// <b>Which branch that is comes from the EXPRESSION</b>, through
+    /// <b>Which branch that is comes from the TYPE</b>, through
     /// <see cref="IConditionalArguments.IsNullLiteral"/>, rather than from noticing that a branch
     /// came back all null. It has to: a branch no row selected is all null by construction once
     /// the family stopped evaluating every branch, so a content test would swallow every unreached
     /// branch and retype the result -- measured, a zero-row <c>coalesce(a, s)</c> would come back
-    /// <c>int</c> where Spark says <c>bigint</c>. That test was already wrong for a string column
+    /// <c>int</c> where Spark says <c>bigint</c>. That test was also wrong for a string column
     /// that merely held nothing in this batch, which is #293; #279 is what made it unworkable.
+    /// Both are gone now that a bare NULL is materialised as a <c>void</c> column, and the
+    /// two entry points answer the same way rather than the eager one guessing.
     /// </para>
     /// <para>
     /// <b>A typed null is not one.</b> It carries its type and still constrains the result:
@@ -1524,47 +1529,32 @@ public sealed class SparkFunctionRegistry
 
         for (var i = 0; i < branches.Count; i++)
         {
-            if (nullLiterals[i])
+            if (nullLiterals[i] || branches[i].Data.DataType is NullType)
                 continue;
 
             var candidate = branches[i].Data.DataType;
             type = type is null ? candidate : UnifyBranchTypes(type, candidate);
         }
 
-        return type ?? StringType.Default;
-    }
-
-    /// <summary>Whether a branch is the all-null string column a bare <c>NULL</c> arrives as.</summary>
-    /// <remarks>
-    /// <b>The fallback for <see cref="EagerArguments"/>, which has no expression to ask.</b> An
-    /// evaluator-driven call answers structurally instead — see
-    /// <see cref="ConditionalType"/> — because under short-circuiting this test cannot tell an
-    /// unreached branch from a bare NULL. #293.
-    /// <para>
-    /// Asks Arrow for the null count rather than reading every row: this runs once per branch on
-    /// every conditional evaluation, and a column already knows how many nulls it holds. The scan
-    /// remains for the case where the array's length does not match the rows being evaluated,
-    /// where the count says nothing about the range in question.
-    /// </para>
-    /// <para>
-    /// Keyed on the logical <see cref="StringType"/> rather than on <c>is StringArray</c>, so any
-    /// other array class carrying the same type is treated the same way.
-    /// </para>
-    /// </remarks>
-    private static bool IsNullLiteralPlaceholder(IArrowArray branch, int rowCount)
-    {
-        if (branch.Data.DataType is not StringType)
-            return false;
-
-        return branch.Length == rowCount
-            ? branch.NullCount == rowCount
-            : AllNull(branch, rowCount);
+        // Every branch was a bare NULL, so there is no type to unify to. Spark says `void` --
+        // measured, `coalesce(NULL, NULL)` and `CASE WHEN true THEN NULL ELSE NULL END` are both
+        // void -- where this used to say `string` because that is what the placeholder was. #293.
+        return type ?? NullType.Default;
     }
 
     private IArrowType UnifyBranchTypes(IArrowType left, IArrowType right)
     {
         if (left is StringType && right is StringType)
             return StringType.Default;
+
+        // A `void` branch that reached here rather than being skipped -- a nested conditional
+        // whose every branch was a bare NULL, so the answer is void without being a LITERAL null.
+        // It still constrains nothing. #293.
+        if (left is NullType)
+            return right;
+
+        if (right is NullType)
+            return left;
 
         if (left is StringType || right is StringType)
         {
@@ -1688,7 +1678,7 @@ public sealed class SparkFunctionRegistry
                 : SparkNumericTypes.CommonType(type, branch.Data.DataType);
         }
 
-        return type ?? StringType.Default;
+        return type ?? NullType.Default;
     }
 
     /// <summary>
@@ -1739,23 +1729,14 @@ public sealed class SparkFunctionRegistry
         if (SparkNumericTypes.IsIntegral(source.Data.DataType))
             return RoundIntegral(source, scale, rowCount);
 
-        // `round(NULL, 2)` resolves to a double in Spark, and an all-null literal reaches here as
-        // the placeholder column the evaluator builds when it has no type to infer.
-        if (AllNull(source, rowCount))
+        // `round(NULL, 2)` resolves to a double in Spark, and a bare NULL reaches here as the
+        // `void` column the evaluator materialises one as. This used to test the CONTENT instead,
+        // and was dead code: the placeholder was spelled as a string, so the string branch above
+        // cast it to a double and nothing ever reached here. #293.
+        if (source.Data.DataType is NullType)
             return NullDoubles(rowCount);
 
         throw new NotSupportedException($"round over {source.Data.DataType.Name} is not supported");
-    }
-
-    private static bool AllNull(IArrowArray source, int rowCount)
-    {
-        for (var i = 0; i < rowCount; i++)
-        {
-            if (!SparkFunctions.IsNull(source, i))
-                return false;
-        }
-
-        return true;
     }
 
     private static IArrowArray NullDoubles(int rowCount)
@@ -2071,37 +2052,27 @@ public sealed class SparkFunctionRegistry
         // Converted to the common type FIRST, so the comparison below is between two values of
         // one type rather than across a promotion. `greatest(d1, a)` is a decimal(12,2) in Spark,
         // and comparing the decimal against the raw int would be a different question.
-        // A bare NULL is typed `void` in Spark and constrains nothing: measured,
-        // `greatest(a, NULL)` is an INT holding a, not an error about a common type. The
-        // evaluator materialises a null literal as an all-null placeholder column, so that is
-        // how `void` arrives here, and it is left out of the unification rather than unified
-        // with. If every argument is one, there is no type to find and the answer is null —
-        // which is what Spark says for `greatest(NULL, NULL)`.
-        // An argument that is null in every row is DROPPED rather than unified with. A bare NULL
-        // is typed `void` in Spark and constrains nothing — measured, `greatest(a, NULL)` is an
-        // INT holding a, where unifying int with the all-null placeholder column the evaluator
-        // materialises a null literal as would be an error about int and string. Dropping it
-        // changes no answer, because a row that is null can never be the greatest or the least.
-        // Over NO rows the test is vacuous -- every argument is all-null because none of them has
-        // a row to be anything else -- so it decides nothing and drops everything. That range is
-        // reachable now that a conditional evaluates a branch nobody selected over zero rows to
-        // learn its type: dropping every argument there typed `coalesce(a, greatest(a, d1))` as an
-        // int where Spark says decimal(12,2). Keeping them all types it correctly.
         //
-        // What stays wrong there is a bare NULL, which over no rows cannot be told from a real
-        // column and so constrains the type it should not: `greatest(a, NULL)` inside a branch no
-        // row reaches refuses instead of answering `a`. That is the half of #293 this does not
-        // close -- `Extreme` is eager, so it never sees the expression the conditional family now
-        // asks.
-        var typed = rowCount == 0
-            ? args.ToList()
-            : args.Where(a => !AllNull(a, rowCount)).ToList();
+        // A `void` argument is DROPPED rather than unified with. A bare NULL constrains nothing
+        // in Spark — measured, `greatest(a, NULL)` is an INT holding a — and dropping it changes
+        // no VALUE either, because a row that is null can never be the greatest or the least.
+        //
+        // THE TEST IS THE TYPE, NOT THE CONTENT, and that is #293. This used to drop any argument
+        // that held no value in this batch, which got two things wrong at once and in opposite
+        // directions. A real string column with no populated row was dropped, so `greatest(a, s)`
+        // ANSWERED an int over such a batch where Spark refuses it outright
+        // (DATATYPE_MISMATCH.DATA_DIFF_TYPES) — an answer that depended on what the batch
+        // happened to hold. And over NO rows the test was vacuous, since nothing can be anything
+        // else there, so it had to be suppressed entirely: a bare NULL then constrained the type
+        // it should not, and `greatest(a, NULL)` inside a branch no row reaches REFUSED instead
+        // of answering `a`. A void column is void at every row count, so both cases fall out.
+        var typed = args.Where(a => a.Data.DataType is not NullType).ToList();
 
-        // Every argument was one, so there is no type to find and no value to pick. Spark types
-        // `greatest(NULL, NULL)` as void and answers null, which is what the placeholder already
-        // is.
+        // Every argument was void, so there is no type to find and no value to pick. Spark types
+        // `greatest(NULL, NULL)` as void and answers null. Built at the row count rather than
+        // handed back as args[0], which a literal makes one row long even over an empty batch.
         if (typed.Count == 0)
-            return args[0];
+            return new NullArray(rowCount);
 
         var type = UnifiedType(typed);
         var here = new int[rowCount];
