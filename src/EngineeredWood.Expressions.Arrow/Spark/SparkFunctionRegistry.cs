@@ -848,9 +848,16 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Three states, not two: <c>raising</c> is ANSI's cast, <c>legacy</c> is the non-ANSI
-    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force. Only
-    /// <see cref="CastToIntegral"/> tells the last two apart — every other target nulls under both
-    /// — so <paramref name="legacy"/> reaches only that one.
+    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force.
+    /// <para>
+    /// Most targets null under both of the last two and take <paramref name="raising"/> alone.
+    /// Three read <paramref name="legacy"/>, and each reads it for a different reason:
+    /// <see cref="CastToIntegral"/>, because the legacy dialect WRAPS an overflow where
+    /// try_cast nulls it; <see cref="CastToBinary"/> and <see cref="CastToBoolean"/>, because
+    /// each has a SOURCE the legacy dialect alone accepts — an integral and a temporal
+    /// respectively — and try_cast type-checks as ANSI does, so both must refuse it with ansi
+    /// off as well. That is the whole reason the pair is three states rather than a bool.
+    /// </para>
     /// </remarks>
     private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
@@ -878,7 +885,7 @@ public sealed class SparkFunctionRegistry
             return CastToFloatingPoint(source, target, rowCount, raising);
 
         if (target is BooleanType)
-            return CastToBoolean(source, rowCount, raising);
+            return CastToBoolean(source, rowCount, raising, legacy);
 
         if (SparkArrays.IsDateType(target))
             return CastToDate(source, rowCount, raising);
@@ -1445,8 +1452,74 @@ public sealed class SparkFunctionRegistry
         return builder.Build();
     }
 
-    private IArrowArray CastToBoolean(IArrowArray source, int rowCount, bool raising)
+    /// <summary>Casts to a boolean, which reads a string as a WORD and not as a number.</summary>
+    /// <remarks>
+    /// The whole source matrix, because #314 was as much about which sources reach the
+    /// conversion as about what it reads:
+    /// <list type="bullet">
+    /// <item><description>
+    /// A NUMBER is true when it is not zero. A BOOLEAN source arrives here as one, because
+    /// <see cref="SparkArrays.ReadForCast"/> renders it as 1 or 0, so the identity cast falls
+    /// out of the same branch rather than needing one of its own.
+    /// </description></item>
+    /// <item><description>
+    /// A STRING must be a word in <see cref="BooleanVocabulary"/>, and is refused otherwise.
+    /// </description></item>
+    /// <item><description>
+    /// A TEMPORAL answers under the <paramref name="legacy"/> dialect ALONE, and the two
+    /// temporals answer differently: a DATE is null at every row and a TIMESTAMP is its
+    /// instant against the epoch. See the branch below.
+    /// </description></item>
+    /// <item><description>
+    /// A BINARY is refused in both dialects, and so is anything else.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// <b>A numeric-looking STRING is not a number here.</b> Measured, <c>CAST(2 AS BOOLEAN)</c>
+    /// is true while <c>CAST('2' AS BOOLEAN)</c> is refused, so the string must not reach the
+    /// numeric branch — <see cref="SparkArrays.CastInput.FromString"/> is what keeps it out,
+    /// the same distinction that makes <c>CAST('12.5' AS INT)</c> refuse where
+    /// <c>CAST(12.5 AS INT)</c> truncates. <c>'1'</c> and <c>'0'</c> agree either way by luck:
+    /// they are in the vocabulary as text. This half is the one that answered WRONGLY rather than
+    /// loudly, which is what a numeric-looking string in a CHECK constraint would have hit.
+    /// </para>
+    /// <para>
+    /// <b>The two refusals are TYPE errors, for the whole column rather than per row</b>, which
+    /// is what Spark makes of them and the treatment <see cref="CastToBinary"/> gives its own.
+    /// The binary one is the load-bearing half: a binary RENDERS as text, so reading that
+    /// rendering as a word would make <c>CAST(X'74727565' AS BOOLEAN)</c> — the bytes of
+    /// "true" — answer true, where Spark refuses it at analysis.
+    /// </para>
+    /// </remarks>
+    private IArrowArray CastToBoolean(IArrowArray source, int rowCount, bool raising, bool legacy)
     {
+        var type = source.Data.DataType;
+
+        // Asked of the TYPE. A StringArray derives from BinaryArray, which is the ordering hazard
+        // ReadForCast has to step around, but StringType does not derive from BinaryType.
+        if (type is BinaryType)
+        {
+            throw new NotSupportedException(
+                "Spark has no cast from BINARY to BOOLEAN in either dialect; its rendering is "
+                + "not read as a word");
+        }
+
+        if (SparkArrays.IsTemporal(type))
+        {
+            if (!legacy)
+            {
+                throw new NotSupportedException(
+                    $"Spark refuses CAST({SparkArrays.Describe(type)} AS BOOLEAN) unless "
+                    + "spark.sql.ansi.enabled is false, and try_cast refuses it either way");
+            }
+
+            // Measured with ansi off: a DATE is null at EVERY row -- Hive's answer, which Spark
+            // kept and commented as Hive's -- and a TIMESTAMP is its instant against the epoch.
+            return SparkArrays.IsDateType(type)
+                ? ArrowCompute.MakeNullArray(BooleanType.Default, rowCount)
+                : TimestampToBoolean(source, rowCount);
+        }
+
         var builder = new BooleanArray.Builder();
 
         for (var i = 0; i < rowCount; i++)
@@ -1459,16 +1532,16 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            if (value.Value.IsNumeric)
+            if (value.Value is { IsNumeric: true, FromString: false })
             {
                 builder.Append(value.Value.AsDouble != 0d);
                 continue;
             }
 
-            var text = value.Value.Text.Trim();
-            if (bool.TryParse(text, out var parsed))
+            if (value.Value.FromString
+                && BooleanVocabulary(value.Value.Text.AsSpan()) is { } word)
             {
-                builder.Append(parsed);
+                builder.Append(word);
                 continue;
             }
 
@@ -1477,6 +1550,64 @@ public sealed class SparkFunctionRegistry
         }
 
         return builder.Build();
+    }
+
+    /// <summary>A timestamp as a boolean: true unless it IS the epoch.</summary>
+    /// <remarks>
+    /// Against the instant rather than against <see cref="SparkArrays.CastInput.AsDouble"/>,
+    /// which is whole epoch SECONDS. Spark tests the microseconds, so 1970-01-01 00:00:00.5 is
+    /// true where truncated seconds would call it false.
+    /// </remarks>
+    private static IArrowArray TimestampToBoolean(IArrowArray source, int rowCount)
+    {
+        var builder = new BooleanArray.Builder();
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            var instant = SparkArrays.ReadInstant(source, i);
+            if (instant is null)
+                builder.AppendNull();
+            else
+                builder.Append(instant.Value != Epoch);
+        }
+
+        return builder.Build();
+    }
+
+    private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    /// <summary>
+    /// The boolean Spark reads out of a string, or null when the text is not one of its words.
+    /// </summary>
+    /// <remarks>
+    /// <b>Spark accepts a SET of words where <c>bool.TryParse</c> knows two.</b> Measured in both
+    /// dialects: <c>t</c>, <c>true</c>, <c>y</c>, <c>yes</c> and <c>1</c> are true; <c>f</c>,
+    /// <c>false</c>, <c>n</c>, <c>no</c> and <c>0</c> are false; case does not matter, and
+    /// leading and trailing whitespace is trimmed — SPARK'S whitespace, which is
+    /// <see cref="SparkText.TrimBounds"/> and not <see cref="string.Trim()"/>. Everything else is
+    /// <c>CAST_INVALID_INPUT</c> under ANSI and null without it, and <c>try_cast</c> follows the
+    /// same set, which is why the vocabulary lives in the conversion rather than in a dialect
+    /// branch above it. #314.
+    /// <para>
+    /// The refusals carry as much of the rule as the acceptances: <c>on</c> and <c>off</c> are a
+    /// vocabulary other systems have and Spark does not, and a PREFIX of an accepted word is not
+    /// accepted — <c>tr</c> and <c>ye</c> are refused.
+    /// </para>
+    /// </remarks>
+    private static bool? BooleanVocabulary(ReadOnlySpan<char> text)
+    {
+        var word = SparkText.Trim(text);
+
+        if (Is(word, "t") || Is(word, "true") || Is(word, "y") || Is(word, "yes") || Is(word, "1"))
+            return true;
+
+        if (Is(word, "f") || Is(word, "false") || Is(word, "n") || Is(word, "no") || Is(word, "0"))
+            return false;
+
+        return null;
+
+        static bool Is(ReadOnlySpan<char> word, string accepted) =>
+            word.Equals(accepted.AsSpan(), StringComparison.OrdinalIgnoreCase);
     }
 
     // ── Conditionals ───────────────────────────────────────────────────────────────────────

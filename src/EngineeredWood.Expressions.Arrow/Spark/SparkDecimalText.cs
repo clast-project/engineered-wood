@@ -179,7 +179,7 @@ internal static class SparkDecimalText
         negative = false;
         exponent = 0;
 
-        var (start, end) = TrimAscii(text);
+        var (start, end) = SparkText.TrimBounds(text.AsSpan());
         var i = start;
 
         if (i < end && (text[i] == '+' || text[i] == '-'))
@@ -287,27 +287,6 @@ internal static class SparkDecimalText
         }
 
         return new string(joined, 0, length);
-    }
-
-    /// <summary>
-    /// The bounds of <paramref name="text"/> with ASCII whitespace and control characters removed
-    /// from both ends.
-    /// </summary>
-    /// <remarks>
-    /// Spark trims with <c>UTF8String.trimAll</c>, which removes characters at or below the space,
-    /// and nothing else. <c>string.Trim()</c> would also remove Unicode whitespace such as a
-    /// non-breaking space, which Spark refuses — so trimming the way .NET does would accept a
-    /// string Spark rejects.
-    /// </remarks>
-    private static (int Start, int End) TrimAscii(string text)
-    {
-        var start = 0;
-        var end = text.Length;
-
-        while (start < end && text[start] <= ' ') start++;
-        while (end > start && text[end - 1] <= ' ') end--;
-
-        return (start, end);
     }
 
     /// <summary>

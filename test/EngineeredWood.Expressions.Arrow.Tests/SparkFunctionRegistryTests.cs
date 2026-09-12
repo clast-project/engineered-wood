@@ -66,6 +66,13 @@ public sealed class SparkFunctionRegistryTests
         return b.Build();
     }
 
+    private static IArrowArray Booleans(params bool?[] values)
+    {
+        var b = new BooleanArray.Builder();
+        foreach (var v in values) { if (v is { } x) b.Append(x); else b.AppendNull(); }
+        return b.Build();
+    }
+
     private static IArrowArray Decimals(int precision, int scale, params decimal[] values)
     {
         var b = new Decimal128Array.Builder(new Decimal128Type(precision, scale));
@@ -2252,5 +2259,228 @@ public sealed class SparkFunctionRegistryTests
         // nullif takes the FIRST argument's type, so this one answers binary in BOTH dialects
         // even though `coalesce` over the same pair is refused under legacy.
         Assert.Equal("00", Hex(Eval(Legacy, "nullif(X'00', '2')", batch)));
+    }
+
+    // ── String-to-boolean: a vocabulary, not `bool.TryParse` (#314) ──────────────
+
+    /// <summary>
+    /// The accept-set, over a COLUMN rather than over literals.
+    /// </summary>
+    /// <remarks>
+    /// The corpus asks these as literals, where a constant fold could answer them one at a time.
+    /// Here they arrive as one string column, which is the shape a CHECK constraint over a real
+    /// batch has, and every row has to find its own word.
+    /// </remarks>
+    [Fact]
+    public void AStringIsReadAsOneOfSparksBooleanWords()
+    {
+        var batch = Batch(("s", Strings(
+            "t", "true", "y", "yes", "1", "T", "TRUE", "Yes",
+            "f", "false", "n", "no", "0", "F", "FALSE", "No", null)));
+
+        var result = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(s AS BOOLEAN)", batch));
+
+        for (var i = 0; i < 8; i++)
+            Assert.True(result.GetValue(i), $"row {i} should be true");
+        for (var i = 8; i < 16; i++)
+            Assert.False(result.GetValue(i), $"row {i} should be false");
+        Assert.True(result.IsNull(16));
+    }
+
+    /// <summary>
+    /// A word OUTSIDE the set raises under ANSI and nulls under the legacy dialect, and a prefix
+    /// of an accepted word is outside it.
+    /// </summary>
+    /// <remarks>
+    /// <c>on</c>/<c>off</c> are the vocabulary the accept-set is most often confused with, and
+    /// <c>tr</c>/<c>ye</c> are what says the match is on the whole word.
+    /// </remarks>
+    [Theory]
+    [InlineData("on")]
+    [InlineData("off")]
+    [InlineData("tr")]
+    [InlineData("ye")]
+    [InlineData("truex")]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void AWordOutsideTheSetRaisesUnderAnsiAndNullsUnderLegacy(string text)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS BOOLEAN)", batch));
+        Assert.True(Eval(Legacy, "CAST(s AS BOOLEAN)", batch).IsNull(0));
+
+        // try_cast nulls under BOTH dialects, and takes the same set rather than a wider one.
+        Assert.True(Eval(Ansi, "TRY_CAST(s AS BOOLEAN)", batch).IsNull(0));
+        Assert.True(Eval(Legacy, "TRY_CAST(s AS BOOLEAN)", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// A numeric-looking STRING is not a number here, and that is the half that answered wrongly
+    /// rather than loudly.
+    /// </summary>
+    /// <remarks>
+    /// Measured: <c>CAST(2 AS BOOLEAN)</c> is true while <c>CAST('2' AS BOOLEAN)</c> is refused.
+    /// The string used to reach the numeric branch and come back true, so a constraint reading
+    /// <c>CAST(flag AS BOOLEAN)</c> over a column holding <c>'2'</c> admitted rows Spark rejects.
+    /// <c>'1'</c> and <c>'0'</c> agree by luck: they are in the vocabulary as text.
+    /// </remarks>
+    [Fact]
+    public void ANumericStringIsRefusedWhereTheNumberIsAccepted()
+    {
+        foreach (var text in new[] { "2", "-1", "1.0", "0.0", "1e0", "+1" })
+        {
+            var batch = Batch(("s", Strings(text)));
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS BOOLEAN)", batch));
+            Assert.True(Eval(Legacy, "CAST(s AS BOOLEAN)", batch).IsNull(0));
+        }
+
+        // The NUMBERS those strings look like, taking the branch the strings must not: anything
+        // non-zero is true, a negative and a NaN included, and -0.0 is false.
+        var numbers = Batch(("a", Ints(2, -1, 0)), ("g", Doubles(double.NaN, -0.0, 1.5)));
+        var ints = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(a AS BOOLEAN)", numbers));
+        Assert.True(ints.GetValue(0));
+        Assert.True(ints.GetValue(1));
+        Assert.False(ints.GetValue(2));
+
+        var doubles = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(g AS BOOLEAN)", numbers));
+        Assert.True(doubles.GetValue(0));
+        Assert.False(doubles.GetValue(1));
+        Assert.True(doubles.GetValue(2));
+
+        // ...and the two spellings that agree either way.
+        var lucky = Batch(("s", Strings("1", "0")));
+        var both = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(s AS BOOLEAN)", lucky));
+        Assert.True(both.GetValue(0));
+        Assert.False(both.GetValue(1));
+    }
+
+    /// <summary>
+    /// The whitespace trimmed is SPARK'S set, which is neither a subset nor a superset of the one
+    /// <see cref="string.Trim()"/> removes.
+    /// </summary>
+    /// <remarks>
+    /// Measured on 4.0.3, in both dialects, and it splits BOTH ways — which is why a
+    /// <c>Trim</c> here is wrong twice over rather than merely lenient. U+001F is not .NET
+    /// whitespace and Spark trims it; U+00A0 is .NET whitespace and Spark does not. Spark's
+    /// <c>UTF8String.trimAll</c> removes bytes of 0x20 or below, and every char above 0x7F
+    /// encodes as bytes of 0x80 or above, so testing the char against 0x20 is the same test.
+    /// </remarks>
+    [Fact]
+    public void TheTrimIsSparksWhitespaceAndNotDotNets()
+    {
+        // Trimmed by both: space, tab, newline, carriage return.
+        var ordinary = Batch(("s", Strings(
+            " t ", "  true  ", "\ttrue", "true\n", "\r\ntrue")));
+        var trimmed = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(s AS BOOLEAN)", ordinary));
+        for (var i = 0; i < 5; i++)
+            Assert.True(trimmed.GetValue(i), $"row {i} should trim to a word");
+
+        // Trimmed by Spark and NOT by .NET: char.IsWhiteSpace('\u001F') is false, so a Trim
+        // would leave the control character in place and refuse the word.
+        var control = Batch(("s", Strings("\u001Ftrue", "\u0000t", "\u0001no")));
+        var stripped = Assert.IsType<BooleanArray>(Eval(Ansi, "CAST(s AS BOOLEAN)", control));
+        Assert.True(stripped.GetValue(0));
+        Assert.True(stripped.GetValue(1));
+        Assert.False(stripped.GetValue(2));
+
+        // Trimmed by .NET and NOT by Spark: U+00A0 is Unicode whitespace but is not a byte
+        // Spark's trim looks at, so this is refused rather than read as "true".
+        var nbsp = Batch(("s", Strings("\u00A0true")));
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS BOOLEAN)", nbsp));
+        Assert.True(Eval(Legacy, "CAST(s AS BOOLEAN)", nbsp).IsNull(0));
+    }
+
+    /// <summary>
+    /// A BINARY has no cast to boolean in either dialect, even though it renders as text.
+    /// </summary>
+    /// <remarks>
+    /// The bytes of "true" are the case that matters: reading a binary's rendering as a word
+    /// would make <c>CAST(X'74727565' AS BOOLEAN)</c> answer true, where Spark refuses it at
+    /// analysis. A TYPE error rather than a per-row one, as <c>CastToBinary</c>'s own refusals
+    /// are, because nothing about it depends on the row.
+    /// </remarks>
+    [Fact]
+    public void ABinaryHasNoCastToBooleanInEitherDialect()
+    {
+        var batch = BinaryBatch(new byte[] { 0x74, 0x72, 0x75, 0x65 });
+
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(bin AS BOOLEAN)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Legacy, "CAST(bin AS BOOLEAN)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "TRY_CAST(bin AS BOOLEAN)", batch));
+    }
+
+    /// <summary>
+    /// A temporal source is the LEGACY dialect's alone, and the two temporals answer differently.
+    /// </summary>
+    /// <remarks>
+    /// Measured on 4.0.3. With ansi off a DATE is null at every row — Hive's answer, which
+    /// Spark kept — and a TIMESTAMP is its instant against the epoch. With ANSI on both
+    /// are refused as <c>CAST_WITH_CONF_SUGGESTION</c>, and try_cast refuses them under either
+    /// dialect, which is why the refusal keys on the dialect rather than on whether it may raise.
+    /// <para>
+    /// The INSTANT is compared, not the epoch seconds the cast input carries: measured,
+    /// <c>CAST(TIMESTAMP'1970-01-01 00:00:00.5' AS BOOLEAN)</c> is true, where truncated seconds
+    /// would have called it false.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ATemporalCastsToBooleanOnlyUnderTheLegacyDialect()
+    {
+        var epoch = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var batch = Batch(
+            ("ts", Timestamps(Straddling, epoch, epoch.AddMilliseconds(500), epoch.AddSeconds(-1))),
+            ("dt", Dates(Straddling, epoch, epoch, epoch)));
+
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(ts AS BOOLEAN)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(dt AS BOOLEAN)", batch));
+        Assert.Throws<NotSupportedException>(() => Eval(Legacy, "TRY_CAST(ts AS BOOLEAN)", batch));
+
+        var timestamps = Assert.IsType<BooleanArray>(Eval(Legacy, "CAST(ts AS BOOLEAN)", batch));
+        Assert.True(timestamps.GetValue(0));
+        Assert.False(timestamps.GetValue(1));
+        // Half a second past the epoch. Spark tests microseconds, so this is true.
+        Assert.True(timestamps.GetValue(2));
+        Assert.True(timestamps.GetValue(3));
+
+        var dates = Assert.IsType<BooleanArray>(Eval(Legacy, "CAST(dt AS BOOLEAN)", batch));
+        for (var i = 0; i < 4; i++)
+            Assert.True(dates.IsNull(i), $"row {i} should be null");
+    }
+
+    /// <summary>
+    /// The vocabulary is reached without a CAST being written, which is the shape that costs
+    /// something.
+    /// </summary>
+    /// <remarks>
+    /// Since #298 a string against a boolean operand is cast to boolean by the comparison
+    /// coercion, so a Spark-written CHECK constraint reading <c>flag = 't'</c> goes through this
+    /// conversion — and refused every row before the fix. The corpus pins the same pairs;
+    /// these are here because the reach, and not the written cast, is what a constraint hits.
+    /// </remarks>
+    [Fact]
+    public void AStringComparedWithABooleanTakesTheSameVocabulary()
+    {
+        var batch = Batch(("bl", Booleans(true, false, null)));
+
+        var t = Assert.IsType<BooleanArray>(Eval(Ansi, "bl = 't'", batch));
+        Assert.True(t.GetValue(0));
+        Assert.False(t.GetValue(1));
+        Assert.True(t.IsNull(2));
+
+        var n = Assert.IsType<BooleanArray>(Eval(Ansi, "'no' = bl", batch));
+        Assert.False(n.GetValue(0));
+        Assert.True(n.GetValue(1));
+
+        // nullif rewrites to `if(a = b, NULL, a)`, so it reaches the cast the same way and keeps
+        // the FIRST operand's type: the answer is the original text, not the boolean.
+        var kept = Assert.IsType<StringArray>(Eval(Ansi, "nullif('y', bl)", batch));
+        Assert.True(kept.IsNull(0));
+        Assert.Equal("y", kept.GetString(1));
+
+        // ...and a word outside the set refuses the comparison under ANSI rather than answering
+        // false, which is the ordinary raise-or-null split and not a rule of its own.
+        Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "bl = 'on'", batch));
+        Assert.True(Eval(Legacy, "bl = 'on'", batch).IsNull(0));
     }
 }
