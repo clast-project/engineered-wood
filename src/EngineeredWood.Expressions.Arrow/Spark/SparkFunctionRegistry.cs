@@ -2148,8 +2148,32 @@ public sealed class SparkFunctionRegistry
     /// <summary>
     /// <c>nullif(a, b)</c> — null when the two are equal, otherwise the first.
     /// </summary>
-    private static IArrowArray NullIf(IReadOnlyList<IArrowArray> args, int rowCount)
+    /// <remarks>
+    /// <para>
+    /// <b>The comparison is <c>=</c>, not a private notion of equality.</b> Spark rewrites
+    /// <c>nullif(a, b)</c> to <c>if(a = b, NULL, a)</c>, so the pair takes the ordinary
+    /// comparison coercion — and the trailing <c>a</c> is the UNCAST operand, which is why the
+    /// answer is built from <paramref name="args"/> rather than from what was compared. Measured:
+    /// <c>nullif(' 2', 1)</c> is the string <c>' 2'</c>, not the 2 it was compared through, and
+    /// <c>nullif(dt, '2026-08-11')</c> is a <c>date</c>.
+    /// </para>
+    /// <para>
+    /// Until #298 this compared a string operand AS TEXT, which is neither dialect's rule: it
+    /// answered <c>' 1'</c> for <c>nullif(' 1', 1)</c> where both dialects answer NULL, since
+    /// <c>' 1'</c> casts to the int 1 and only the rendering differs. Twenty-four corpus rows
+    /// moved — the string rows the issue named, and the temporal, boolean and #280 decimal rows
+    /// it did not, all of which the one coercion call answers.
+    /// </para>
+    /// <para>
+    /// Compared in the operands' own terms once coerced, never as rendered text: a decimal(10,2)
+    /// holding 1.00 and an int holding 1 render differently but are equal, and Spark agrees —
+    /// <c>nullif(CAST(1.00 AS DECIMAL(10,2)), 1)</c> is null.
+    /// </para>
+    /// </remarks>
+    private IArrowArray NullIf(IReadOnlyList<IArrowArray> args, int rowCount)
     {
+        var (left, right) = CoerceForEquality(args[0], args[1], rowCount);
+
         var choice = new int[rowCount];
         for (var row = 0; row < rowCount; row++)
         {
@@ -2159,16 +2183,119 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            // Compared in the operands' own terms, not as rendered text. A decimal(10,2)
-            // holding 1.00 and an int holding 1 render differently but are equal, and Spark
-            // agrees: nullif(CAST(1.00 AS DECIMAL(10,2)), 1) is null.
-            choice[row] = !SparkFunctions.IsNull(args[1], row)
-                && SparkFunctions.AreEqual(args[0], args[1], row)
+            // A null on EITHER side of the comparison makes it null, which is not true, so the
+            // first operand comes back. The left one can be null here without `args[0]` being
+            // null: under the legacy dialect a string the cast refuses becomes null, and
+            // measured, `nullif('abc', 1)` is then `'abc'`.
+            choice[row] = !SparkFunctions.IsNull(left, row)
+                && !SparkFunctions.IsNull(right, row)
+                && SparkFunctions.AreEqual(left, right, row)
                 ? -1
                 : 0;
         }
 
         return SparkFunctions.Unify(args[0].Data.DataType, args, choice, rowCount);
+    }
+
+    /// <summary>
+    /// Casts whichever operands of an equality have to move before the two can be compared.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The same two questions <c>ArrowRowEvaluator.CoerceOperands</c> asks of the comparison
+    /// operators, asked here because <c>nullif</c> reaches equality by a different road and so
+    /// never got the rule. Both operands are offered a target and at most one comes back with
+    /// one, except in #280's case — an exact numeric against another — where the least common
+    /// type can round BOTH.
+    /// </para>
+    /// <para>
+    /// What each target is belongs to <see cref="ComparisonTarget"/>, and the three rules it
+    /// carries all reach here: a string moves to the other operand's type, a BINARY against a
+    /// string is the pair where the binary moves and is rendered as text, and two exact numerics
+    /// round to their least common type. Measured, all three: <c>nullif('1.0', 1)</c> refuses
+    /// under ANSI and is NULL under legacy, <c>nullif(X'41', 'A')</c> is NULL, and
+    /// <c>nullif(CAST(1.005 AS DECIMAL(4,3)), CAST(1 AS DECIMAL(38,0)))</c> is NULL.
+    /// </para>
+    /// <para>
+    /// A <c>void</c> operand is left alone: it has no type to resolve a target through, and it
+    /// compares as null whatever sits opposite it. #293.
+    /// </para>
+    /// </remarks>
+    private (IArrowArray Left, IArrowArray Right) CoerceForEquality(
+        IArrowArray left, IArrowArray right, int rowCount)
+    {
+        var leftType = left.Data.DataType;
+        var rightType = right.Data.DataType;
+
+        if (leftType is NullType || rightType is NullType)
+            return (left, right);
+
+        var leftTarget = ComparisonTarget(leftType, rightType);
+        var rightTarget = ComparisonTarget(rightType, leftType);
+
+        // Each operand is cast against the ORIGINAL other one, not against a coerced one: the
+        // mask below reads only which rows the other side populates, and a cast cannot move a
+        // null into or out of a row.
+        return (
+            leftTarget is null ? left : CastForEquality(left, right, leftTarget, rowCount),
+            rightTarget is null ? right : CastForEquality(right, left, rightTarget, rowCount));
+    }
+
+    /// <summary>Casts one operand of an equality, over the rows the other one populates.</summary>
+    /// <remarks>
+    /// <b>A row whose other operand is null is not cast.</b> Spark's relational operators
+    /// evaluate nothing once an operand is null, so a malformed string sitting opposite one is
+    /// never read and never refused. Measured under ANSI: <c>nullif('abc', CAST(NULL AS INT))</c>
+    /// is <c>'abc'</c> and <c>'abc' = CAST(NULL AS INT)</c> is null, while
+    /// <c>'abc' &lt;=&gt; CAST(NULL AS INT)</c> — which has no such short-circuit — raises
+    /// <c>CAST_INVALID_INPUT</c>. Without the mask a batch mixing one such row with an ordinary
+    /// one would refuse a comparison Spark answers.
+    /// </remarks>
+    private IArrowArray CastForEquality(
+        IArrowArray moving, IArrowArray staying, IArrowType target, int rowCount) =>
+        Cast(
+            NulledWhereOtherIsNull(moving, staying, rowCount),
+            target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+
+    /// <summary>
+    /// <paramref name="moving"/> with its string cells blanked wherever the other operand is null,
+    /// or <paramref name="moving"/> itself when no row needs it.
+    /// </summary>
+    /// <remarks>
+    /// <b>Scanned before it is rebuilt, which is the point of splitting this out.</b> The
+    /// overwhelmingly common batch has no null opposite the string at all, and there the answer is
+    /// the operand as it stands — rebuilding it would allocate a builder and a fresh
+    /// <see cref="string"/> per row to reproduce what was already there. The scan reads null bits
+    /// and allocates nothing. The comparison evaluator's own <c>NulledWhere</c> takes the same
+    /// shape for the same reason.
+    /// <para>
+    /// Only a STRING is masked, because only a string cast can refuse. The numeric rounding #280
+    /// asks for cannot fail, so it has no refusal for a null opposite it to suppress.
+    /// </para>
+    /// </remarks>
+    private static IArrowArray NulledWhereOtherIsNull(
+        IArrowArray moving, IArrowArray staying, int rowCount)
+    {
+        if (moving is not StringArray strings)
+            return moving;
+
+        var needed = false;
+        for (var row = 0; row < rowCount && !needed; row++)
+            needed = !strings.IsNull(row) && SparkFunctions.IsNull(staying, row);
+
+        if (!needed)
+            return moving;
+
+        var masked = new StringArray.Builder();
+        for (var row = 0; row < rowCount; row++)
+        {
+            if (strings.IsNull(row) || SparkFunctions.IsNull(staying, row))
+                masked.AppendNull();
+            else
+                masked.Append(strings.GetString(row)!);
+        }
+
+        return masked.Build();
     }
 
     private IArrowArray If(IConditionalArguments args, int rowCount)

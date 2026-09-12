@@ -127,20 +127,18 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
             "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
-        // #298, found by the `nullif-equality` group. AreEqual -- which only `nullif` reaches --
-        // compares a string operand against a number AS TEXT, where Spark casts the string to the
-        // OTHER operand's type and, under ANSI, refuses one that will not cast. The comparison
-        // operators already coerce correctly (#260/#262/#263); this is the one call site that
-        // never got the rule.
+        // #314, found by the `nullif-coercion` group added for #298. Spark's string-to-boolean
+        // cast accepts a VOCABULARY -- t/true/y/yes/1 and f/false/n/no/0, case-insensitively and
+        // trimmed -- where `CastToBoolean` uses .NET's `bool.TryParse`, which knows two words.
+        // It is wrong in both directions: it also ACCEPTS '2' and '-1', which Spark refuses,
+        // because a numeric-looking string reaches the numeric branch that `CastInput.FromString`
+        // exists to keep it out of.
         //
-        // `nullif(' 1', 1)` is the row that shows it is not merely an error-class difference: we
-        // return ' 1' where Spark returns NULL, because ' 1' casts to the INT 1 and only the text
-        // differs. `nullif('1', 1)` agrees by luck and is in the corpus beside it to say so.
-        ["nullif(' 1', 1)"] = "#298: nullif compares a string as text; ' 1' casts to 1",
-        ["nullif('1.0', 1)"] = "#298: nullif compares a string as text",
-        ["nullif('1e0', 1)"] = "#298: nullif compares a string as text",
-        ["nullif('abc', 1)"] = "#298: nullif compares a string as text",
-        ["nullif('x', 1e308)"] = "#298: nullif compares a string as text",
+        // Only this row is declared, though the defect spans `CAST(... AS BOOLEAN)` generally:
+        // the accept-set is measured in #314 and the corpus group that pins it belongs with the
+        // fix, not here. `nullif('true', true)` and `nullif('TRUE', bl)` sit in the same group
+        // and PASS, which is what says the coercion is right and the cast under it is not.
+        ["nullif('t', true)"] = "#314: our string-to-boolean cast refuses 't', which Spark accepts",
 
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
@@ -257,11 +255,11 @@ public sealed class SparkEvaluationCorpusTests
             // the fix; the ANSI side would not have moved either way.
             ["'" + Backslash + "u0663' + 1"] =
                 "#296: arithmetic has no string coercion; we throw",
-            // #298, the two rows of it this dialect can see. The other three refuse under ANSI
-            // and ANSWER here, agreeing with us -- so a one-dialect corpus would have called
-            // those three fixed.
-            ["nullif(' 1', 1)"] = "#298: nullif compares a string as text; ' 1' casts to 1",
-            ["nullif('1.0', 1)"] = "#298: nullif compares a string as text; legacy truncates to 1",
+            // #314, and this dialect sees the OTHER half of it. Under ANSI our cast refuses 't'
+            // and Spark's accepts it; here neither refuses, so the difference is a value --
+            // Spark's NULL against our 't'. Same defect, and only the two harvests together say
+            // that it is not merely an error class.
+            ["nullif('t', true)"] = "#314: our string-to-boolean cast refuses 't', which Spark accepts",
 
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =

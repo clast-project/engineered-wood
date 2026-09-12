@@ -1665,6 +1665,176 @@ public sealed class SparkFunctionRegistryTests
         Assert.True(Eval(Ansi, "nullif(g, 1e29)", batch).IsNull(0));
     }
 
+    // ── nullif takes the ordinary comparison coercion (#298) ───────────────────────
+
+    /// <summary>
+    /// A string operand is CAST to the other operand's type, not compared as text.
+    /// </summary>
+    /// <remarks>
+    /// Spark rewrites <c>nullif(a, b)</c> to <c>if(a = b, NULL, a)</c>, so the pair takes the
+    /// #180/#259 rule. Every value below casts to the other operand while differing from it as
+    /// text, so a text comparison answers the string where both dialects answer NULL — a wrong
+    /// VALUE, not merely a different error class, which is what made this worth fixing rather
+    /// than declaring.
+    /// </remarks>
+    [Theory]
+    [InlineData("nullif(' 1', a)")]
+    [InlineData("nullif('01', a)")]
+    [InlineData("nullif('+1', a)")]
+    [InlineData("nullif('1 ', a)")]
+    [InlineData("nullif(a, ' 1')")]
+    [InlineData("nullif(a, '01')")]
+    public void NullIfCastsAStringOperandRatherThanComparingItAsText(string sql)
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.True(Eval(Ansi, sql, batch).IsNull(0));
+        Assert.True(Eval(Legacy, sql, batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// The answer is the UNCOERCED first operand, at its own type.
+    /// </summary>
+    /// <remarks>
+    /// The trailing <c>a</c> of <c>if(a = b, NULL, a)</c> is not the operand the comparison cast,
+    /// so the coercion must not leak into the result. Two things could have leaked and both are
+    /// asserted: the TEXT, since <c>' 2'</c> compared as the number 2 could have come back as
+    /// "2", and the TYPE, since a date compared against a string could have come back as one.
+    /// </remarks>
+    [Fact]
+    public void NullIfAnswersFromTheUncoercedFirstOperand()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        var text = Assert.IsType<StringArray>(Eval(Ansi, "nullif(' 2', a)", batch));
+        Assert.Equal(" 2", text.GetString(0));
+
+        // The other order, where the result is the NUMBER and the string is what moved.
+        var number = Assert.IsType<Int32Array>(Eval(Ansi, "nullif(a, ' 2')", batch));
+        Assert.Equal(1, number.GetValue(0));
+
+        // A date against a string: the string moves to the date, and the answer stays a date.
+        var dates = Batch(("d", Eval(Ansi, "CAST('2026-08-11' AS DATE)", batch)));
+        Assert.True(Eval(Ansi, "nullif(d, '2026-08-11')", dates).IsNull(0));
+        Assert.IsType<Date32Array>(Eval(Ansi, "nullif(d, '1970-01-01')", dates));
+    }
+
+    /// <summary>
+    /// A string opposite a NULL is never cast, and so is never refused.
+    /// </summary>
+    /// <remarks>
+    /// <b>The mask, and the row that needs it cannot be written as a single-row corpus
+    /// expression.</b> Spark's relational operators evaluate nothing once an operand is null, so
+    /// a malformed string sitting opposite one is never read. Casting the column whole would
+    /// refuse the whole BATCH — including the ordinary row beside it, which Spark answers.
+    /// <para>
+    /// Measured under ANSI: <c>nullif('abc', CAST(NULL AS INT))</c> is <c>'abc'</c> and
+    /// <c>'abc' = CAST(NULL AS INT)</c> is null, while <c>'abc' &lt;=&gt; CAST(NULL AS INT)</c>,
+    /// which has no such short-circuit, raises CAST_INVALID_INPUT.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void NullIfDoesNotCastAStringOppositeANull()
+    {
+        // Row 0 is ordinary and equal; row 1 pairs a string no cast accepts with a null, which is
+        // exactly the row Spark never reads.
+        var batch = Batch(("s", Strings("1", "abc")), ("a", Ints(1, null)));
+
+        var ansi = Eval(Ansi, "nullif(s, a)", batch);
+        Assert.True(ansi.IsNull(0));
+        Assert.Equal("abc", Assert.IsType<StringArray>(ansi).GetString(1));
+
+        // ...and the batch still refuses when the malformed string really is opposite a value.
+        var read = Batch(("s", Strings("abc")), ("a", Ints(1)));
+        var ex = Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "nullif(s, a)", read));
+        Assert.Equal("CAST_INVALID_INPUT", ex.ErrorClass);
+    }
+
+    /// <summary>
+    /// Under the legacy dialect a string the cast refuses becomes null, so the comparison is null
+    /// and the first operand comes back.
+    /// </summary>
+    /// <remarks>
+    /// The left operand of the comparison can be null here without <c>args[0]</c> being null,
+    /// which is why the row test asks about the COERCED operands and not the original ones.
+    /// Measured: <c>nullif('abc', 1)</c> is <c>'abc'</c> under legacy and CAST_INVALID_INPUT
+    /// under ANSI, and <c>nullif('1.0', 1)</c> splits the other way — legacy truncates to 1 and
+    /// answers NULL where a text comparison answered <c>'1.0'</c>, which is neither dialect's.
+    /// </remarks>
+    [Fact]
+    public void ALegacyStringThatWillNotCastLeavesTheFirstOperand()
+    {
+        var batch = Batch(("a", Ints(1)));
+
+        Assert.Equal("abc", Assert.IsType<StringArray>(Eval(Legacy, "nullif('abc', a)", batch)).GetString(0));
+        Assert.True(Eval(Legacy, "nullif('1.0', a)", batch).IsNull(0));
+    }
+
+    /// <summary>
+    /// Two STRING operands are still compared as text, which is the pair that rule is right for.
+    /// </summary>
+    /// <remarks>
+    /// The branch the fix had to leave alone. <c>nullif('1.0', '1')</c> is <c>'1.0'</c> in both
+    /// dialects: neither operand moves, so nothing casts <c>'1.0'</c> to a number and the two
+    /// texts simply differ. A BINARY against a string is the neighbouring case where the BINARY
+    /// moves and is rendered as text (#259/#295), so it lands on the same branch from the other
+    /// side — measured, <c>nullif(X'41', 'A')</c> is NULL.
+    /// </remarks>
+    [Fact]
+    public void TwoStringOperandsAreStillComparedAsText()
+    {
+        var batch = Batch(("s", Strings("1.0")), ("t", Strings("1")));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.Equal("1.0", Assert.IsType<StringArray>(Eval(registry, "nullif(s, t)", batch)).GetString(0));
+            Assert.True(Eval(registry, "nullif(s, '1.0')", batch).IsNull(0));
+            Assert.True(Eval(registry, "nullif(X'41', 'A')", batch).IsNull(0));
+        }
+    }
+
+    /// <summary>
+    /// Two exact numerics round to their least common type before being compared (#280).
+    /// </summary>
+    /// <remarks>
+    /// The other half of what one <c>ComparisonTarget</c> call answers, and the half #298 did not
+    /// name. #280 measured every comparison operator over this pair without a <c>nullif</c> among
+    /// them, so the site kept an exact comparison where Spark rounds: measured,
+    /// <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c> is TRUE, and the
+    /// <c>nullif</c> spelling of it is NULL.
+    /// <para>
+    /// <b>An integral counts and its WIDTH decides the answer</b>, because it unifies as the
+    /// decimal that holds it: against a decimal(38,38) the common scale is 35 for a tinyint and
+    /// 18 for a bigint, so 4E-32 survives the first and rounds away under the second.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TwoExactNumericsRoundToTheirLeastCommonTypeBeforeComparison()
+    {
+        var batch = Batch(("d", Decimals(4, 3, 1.005m)), ("w", Decimals(38, 0, 1m)));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.True(Eval(registry, "nullif(d, w)", batch).IsNull(0));
+            Assert.True(Eval(registry, "nullif(w, d)", batch).IsNull(0));
+
+            // ...and the result keeps the first operand's own type AND its unrounded value. The
+            // type alone would not say so: the comparison rounds 1.005 to 1, and 1 is a
+            // Decimal128Array too, so only the value catches the rounded operand leaking out.
+            var kept = Assert.IsType<Decimal128Array>(
+                Eval(registry, "nullif(d, CAST(2 AS DECIMAL(38,0)))", batch));
+            Assert.Equal(1.005m, kept.GetValue(0));
+        }
+
+        // Written as a CAST rather than as a column, because System.Decimal's scale stops at 28:
+        // `0.00000000000000000000000000000004m` is a literal ZERO, and building the operand that
+        // way asserted nothing while passing for the wrong reason.
+        Assert.False(
+            Eval(Ansi, "nullif(CAST(4E-32 AS DECIMAL(38,38)), CAST(0 AS TINYINT))", batch).IsNull(0));
+        Assert.True(
+            Eval(Ansi, "nullif(CAST(4E-32 AS DECIMAL(38,38)), CAST(0 AS BIGINT))", batch).IsNull(0));
+    }
+
     // ── round at the top of a type's range (#285) ───────────────────────────────────────────
 
     /// <summary>

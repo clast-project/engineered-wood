@@ -85,6 +85,10 @@ LEGACY_GROUPS = (
     # refuse under ANSI and answer under legacy, and #299's float rows, which answer differently
     # in each. Both were found by this group and neither is visible from one dialect.
     "nullif-equality",
+    # #298. The string rows answer in BOTH dialects and answer DIFFERENTLY -- ANSI refuses a
+    # string that will not cast, legacy reads it as null, and the widening picks a different
+    # target again. One harvest would record half a rule.
+    "nullif-coercion",
     # #295. The dialects disagree twice over: ANSI refuses the integral-to-binary CAST that legacy
     # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
     # directions in one group, so one harvest would describe neither.
@@ -1253,10 +1257,8 @@ GROUPS = {
         "CAST(0.0 AS DOUBLE) = CAST(-0.0 AS DOUBLE)",
         "greatest(1, 1e308)", "coalesce(1, 1e308)",
 
-        # A STRING operand, where the coercion is a different rule again and we compare as text.
-        # #298. 'nullif(...1.0..., 1)' is the discriminator: as text it is neither answer.
-        "nullif('1', 1)", "nullif('1.0', 1)", "nullif('1e0', 1)", "nullif(' 1', 1)",
-        "nullif('abc', 1)", "nullif('x', 1e308)", "nullif('1.0', '1')",
+        # A STRING operand is a rule of its own and has a group of its own -- see
+        # `nullif-coercion` below, which this group's first harvest is what found. #298.
 
         # An integral against a FLOAT, where the two dialects pick DIFFERENT common types and we
         # answer ANSI's under both. #299. 16777217 is the first integer a float cannot hold.
@@ -1270,6 +1272,97 @@ GROUPS = {
         # ...and the same shape against a DOUBLE, which does NOT split: both dialects unify to
         # double, so this row is what says #299 is about float specifically.
         "9007199254740993 = CAST(9007199254740992 AS DOUBLE)",
+    ],
+
+    # A STRING operand of `nullif`, which is the ordinary comparison coercion and was a TEXT
+    # comparison instead. #298, found by `nullif-equality` above.
+    #
+    # Spark rewrites `nullif(a, b)` to `if(a = b, NULL, a)`, so the pair takes the `=` rule
+    # (#180/#259): the string is cast to the OTHER operand's type, and under ANSI one that will
+    # not cast refuses the comparison. The trailing `a` is the UNCAST operand, so the result keeps
+    # the first operand's type and its original text -- which is why the rows below ask both what
+    # matches and what the answer is when it does not.
+    #
+    # This is the one call site that never got the rule, so the `=` controls at the end are not
+    # decoration: they are the same pairs through the path that already coerces, and a row where
+    # the two disagree means the two sites have drifted apart again.
+    "nullif-coercion": [
+        # THE DISCRIMINATORS. Each of these casts to the other operand's value while differing
+        # from it as text, so a text comparison answers the first operand where Spark answers
+        # NULL -- a wrong VALUE, not merely a different error class.
+        "nullif(' 1', 1)", "nullif('01', 1)", "nullif('+1', 1)", "nullif('1 ', 1)",
+        "nullif('1.0', 1)", "nullif('1e0', 1)",
+
+        # ...and the other way round. Which side is the string decides nothing about which one
+        # moves, but it decides the RESULT, so both orders are asked.
+        "nullif(1, ' 1')", "nullif(1, '01')", "nullif(1, '1.0')",
+
+        # A string that casts and does NOT match: the answer has to be the original text, not the
+        # value the comparison went through.
+        "nullif(' 2', 1)", "nullif('1.5', 1)", "nullif('0.10', 0.1)",
+
+        # Agrees BY LUCK, and is here to say so: '1' and the rendering of 1 are the same string,
+        # so the text route and the cast route happen to meet.
+        "nullif('1', 1)",
+
+        # A string no numeric cast accepts. ANSI refuses the comparison; legacy reads it as NULL,
+        # which is not equal, so the first operand comes back.
+        "nullif('abc', 1)", "nullif('x', 1e308)", "nullif('', 1)", "nullif(s, a)",
+
+        # BOTH operands strings, which is the one pair a text comparison IS right for. The fix
+        # must leave these alone.
+        "nullif('1.0', '1')", "nullif('abc', 'abc')", "nullif(s, t)", "nullif(ns, s)",
+
+        # THE WIDENING, which is #180's half of the rule and splits the dialects: ANSI casts the
+        # string to bigint or double, legacy to the operand's OWN type, where it can overflow or
+        # round away.
+        "nullif('32768', CAST(32767 AS SMALLINT))",
+        "nullif('0.1', CAST(0.1 AS FLOAT))",
+        "nullif('1000000000000000000000000000001', d4)",
+        "nullif(fs, a)", "nullif(ns, a)", "nullif(ns, f)",
+
+        # The kinds that take no widening in either dialect -- the string is cast straight to the
+        # other operand's type.
+        "nullif('true', true)", "nullif('TRUE', bl)", "nullif('t', true)",
+        "nullif('2026-08-11', dt)", "nullif(dt, '2026-08-11')",
+        "nullif('2026-08-11 12:30:00', ts)", "nullif('2026-08-11', ts)",
+
+        # A BINARY against a string is the pair where the BINARY moves and is rendered as text
+        # (#259/#295), so the existing text route is right for it and must survive.
+        "nullif(X'41', 'A')", "nullif('A', X'41')", "nullif(bin, s)",
+
+        # THE NULL MASK. A relational operator evaluates nothing once an operand is null, so a
+        # string that would not cast is never read -- and never refused -- opposite one.
+        # Without this a batch mixing such a row with an ordinary one would refuse where Spark
+        # answers. `<=>` has no such short-circuit and is asked beside it to show the difference.
+        "nullif('abc', CAST(NULL AS INT))",
+        "nullif(CAST(NULL AS STRING), 1)",
+        "'abc' = CAST(NULL AS INT)",
+        "'abc' <=> CAST(NULL AS INT)",
+
+        # THE OTHER HALF OF THE SAME CALL. `=` casts BOTH operands to their least common type,
+        # and once that type gives up scale the comparison is made on ROUNDED values (#280).
+        # `nullif` reaches the rule through the same question the string rows do, so asking only
+        # about strings would leave half of what the coercion returns unmeasured -- and #280
+        # measured every other operator over these pairs without a `nullif` among them.
+        "nullif(CAST(1.005 AS DECIMAL(4,3)), CAST(1 AS DECIMAL(38,0)))",
+        "nullif(CAST(1 AS DECIMAL(38,0)), CAST(1.005 AS DECIMAL(4,3)))",
+        "nullif(CAST(0.4 AS DECIMAL(38,38)), CAST(0 AS DECIMAL(38,0)))",
+        # An INTEGRAL counts and its WIDTH decides the answer, because it unifies as the decimal
+        # that holds it: against decimal(38,38) the common scale is 35, 28 and 18 for a tinyint,
+        # an int and a bigint, and 4E-32 survives only the first.
+        "nullif(CAST(4E-32 AS DECIMAL(38,38)), CAST(0 AS TINYINT))",
+        "nullif(CAST(4E-32 AS DECIMAL(38,38)), CAST(0 AS INT))",
+        "nullif(CAST(4E-32 AS DECIMAL(38,38)), CAST(0 AS BIGINT))",
+        # ...and the controls for those, through the operator that already rounds.
+        "CAST(4E-32 AS DECIMAL(38,38)) = CAST(0 AS TINYINT)",
+        "CAST(4E-32 AS DECIMAL(38,38)) = CAST(0 AS INT)",
+        "CAST(4E-32 AS DECIMAL(38,38)) = CAST(0 AS BIGINT)",
+
+        # CONTROLS: the same pairs through `=`, which already coerces. These are what say the two
+        # call sites agree rather than each holding an opinion.
+        "' 1' = 1", "'1.0' = 1", "'1e0' = 1", "'abc' = 1", "'32768' = CAST(32767 AS SMALLINT)",
+        "'0.1' = CAST(0.1 AS FLOAT)", "X'41' = 'A'", "'true' = true", "'2026-08-11' = dt",
     ],
 
     # Casts to and from BINARY, and the conditionals that need them. #295. Binary answers are
