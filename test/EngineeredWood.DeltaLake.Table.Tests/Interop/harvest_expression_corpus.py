@@ -89,6 +89,11 @@ LEGACY_GROUPS = (
     # string that will not cast, legacy reads it as null, and the widening picks a different
     # target again. One harvest would record half a rule.
     "nullif-coercion",
+    # #314. The vocabulary itself is dialect-independent, but what a word OUTSIDE it does is not:
+    # ANSI raises CAST_INVALID_INPUT where legacy answers NULL, and every refusal in the group is
+    # a row the ANSI switch moves. Recording one dialect would describe the accept-set and leave
+    # the whole boundary around it unmeasured.
+    "string-to-boolean",
     # #295. The dialects disagree twice over: ANSI refuses the integral-to-binary CAST that legacy
     # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
     # directions in one group, so one harvest would describe neither.
@@ -1363,6 +1368,86 @@ GROUPS = {
         # call sites agree rather than each holding an opinion.
         "' 1' = 1", "'1.0' = 1", "'1e0' = 1", "'abc' = 1", "'32768' = CAST(32767 AS SMALLINT)",
         "'0.1' = CAST(0.1 AS FLOAT)", "X'41' = 'A'", "'true' = true", "'2026-08-11' = dt",
+    ],
+
+    # `CAST(<string> AS BOOLEAN)`, where Spark reads a WORD out of a vocabulary and we read one
+    # of `bool.TryParse`'s two -- and where a numeric-looking STRING must not be read as a number
+    # at all. #314, found by the `nullif-coercion` group above.
+    #
+    # The group is deliberately wider than the string cast it is named for. Two of its sections
+    # are the CONTROLS that make the string rows mean something: the numbers, which take the
+    # branch a numeric string must not reach, and the comparison forms, which reach this cast
+    # without a CAST being written -- since #298 a string against a boolean operand is coerced,
+    # so `bl = 't'` in a CHECK constraint is a string-to-boolean cast under another name.
+    "string-to-boolean": [
+        # THE ACCEPT-SET, in each case. `t`/`y`/`yes` and `f`/`n`/`no` are the eight words
+        # `bool.TryParse` never knew; `true`/`false` are the two it did.
+        "CAST('true' AS BOOLEAN)", "CAST('TRUE' AS BOOLEAN)", "CAST('True' AS BOOLEAN)",
+        "CAST('t' AS BOOLEAN)", "CAST('T' AS BOOLEAN)",
+        "CAST('y' AS BOOLEAN)", "CAST('Y' AS BOOLEAN)",
+        "CAST('yes' AS BOOLEAN)", "CAST('YES' AS BOOLEAN)", "CAST('Yes' AS BOOLEAN)",
+        "CAST('1' AS BOOLEAN)",
+        "CAST('false' AS BOOLEAN)", "CAST('FALSE' AS BOOLEAN)", "CAST('False' AS BOOLEAN)",
+        "CAST('f' AS BOOLEAN)", "CAST('F' AS BOOLEAN)",
+        "CAST('n' AS BOOLEAN)", "CAST('N' AS BOOLEAN)",
+        "CAST('no' AS BOOLEAN)", "CAST('NO' AS BOOLEAN)",
+        "CAST('0' AS BOOLEAN)",
+
+        # TRIMMED -- and WHICH whitespace is a question of its own, because the two runtimes do
+        # not agree on what whitespace is. The tab and the newline below are REAL characters in
+        # the SQL text, not SQL escape sequences, so what these rows measure is the trim and not
+        # the tokenizer.
+        "CAST(' t ' AS BOOLEAN)", "CAST('  true  ' AS BOOLEAN)",
+        "CAST('\ttrue' AS BOOLEAN)", "CAST('true\n' AS BOOLEAN)",
+        # ...and the BOUNDARY between the two rules: a NO-BREAK SPACE. .NET's `string.Trim`
+        # removes it, because it is Unicode whitespace; Spark's `trimAll` removes bytes <= 0x20
+        # and leaves it. If the two trims differ anywhere they differ here.
+        "CAST('\u00a0true' AS BOOLEAN)",
+        # Whitespace ALONE, which trims down to the empty string, and the empty string itself.
+        "CAST(' ' AS BOOLEAN)", "CAST('' AS BOOLEAN)",
+
+        # REFUSED, and each refusal carries as much of the rule as an acceptance does: `on`/`off`
+        # are a vocabulary other systems have and this one does not, and a PREFIX of an accepted
+        # word is not accepted.
+        "CAST('on' AS BOOLEAN)", "CAST('off' AS BOOLEAN)",
+        "CAST('tr' AS BOOLEAN)", "CAST('ye' AS BOOLEAN)", "CAST('truex' AS BOOLEAN)",
+        "CAST('yeah' AS BOOLEAN)", "CAST('t t' AS BOOLEAN)",
+
+        # THE OTHER DIRECTION, and the half that answers wrongly rather than loudly: a
+        # numeric-looking STRING is refused where the NUMBER is accepted. `'1'` and `'0'` above
+        # agree by luck -- they are in the vocabulary as text, not as numbers.
+        "CAST('2' AS BOOLEAN)", "CAST('-1' AS BOOLEAN)", "CAST('0.0' AS BOOLEAN)",
+        "CAST('1.0' AS BOOLEAN)", "CAST('1e0' AS BOOLEAN)", "CAST('+1' AS BOOLEAN)",
+        "CAST(ns AS BOOLEAN)", "CAST(fs AS BOOLEAN)", "CAST(s AS BOOLEAN)",
+
+        # ...and the NUMBERS themselves, which is the branch those strings must not reach. Any
+        # non-zero is true, including a negative and a NaN.
+        "CAST(0 AS BOOLEAN)", "CAST(1 AS BOOLEAN)", "CAST(2 AS BOOLEAN)", "CAST(-1 AS BOOLEAN)",
+        "CAST(a AS BOOLEAN)", "CAST(b AS BOOLEAN)", "CAST(g AS BOOLEAN)", "CAST(d1 AS BOOLEAN)",
+        "CAST(CAST(-0.0 AS DOUBLE) AS BOOLEAN)", "CAST(CAST('NaN' AS DOUBLE) AS BOOLEAN)",
+        "CAST(bl AS BOOLEAN)", "CAST(true AS BOOLEAN)",
+
+        # The sources that are NEITHER a number nor a string. A binary RENDERS as text and must
+        # not be read as one -- `X'74727565'` is the bytes of "true" -- and a temporal has no
+        # boolean in it at all.
+        "CAST(X'74727565' AS BOOLEAN)", "CAST(bin AS BOOLEAN)",
+        "CAST(dt AS BOOLEAN)", "CAST(ts AS BOOLEAN)",
+        # A null carries no text to be malformed, in either direction.
+        "CAST(CAST(NULL AS STRING) AS BOOLEAN)", "CAST(NULL AS BOOLEAN)",
+
+        # TRY_CAST follows the SAME set. That is what says the vocabulary belongs to the
+        # conversion and not to a dialect branch above it -- otherwise `try_cast`, which nulls
+        # under both dialects, could have had a set of its own.
+        "TRY_CAST('t' AS BOOLEAN)", "TRY_CAST('yes' AS BOOLEAN)", "TRY_CAST('2' AS BOOLEAN)",
+        "TRY_CAST('tr' AS BOOLEAN)", "TRY_CAST(s AS BOOLEAN)", "TRY_CAST(X'74727565' AS BOOLEAN)",
+
+        # THE REACH, which is why this is not only a CAST defect. Since #298 a string against a
+        # boolean operand is cast to boolean, so the vocabulary decides these too -- and the last
+        # two are the shape a Spark-written CHECK constraint actually has.
+        "'t' = true", "'y' = bl", "'no' = false", "'on' = true", "'2' = true",
+        "nullif('t', true)", "nullif('no', bl)", "nullif('on', true)",
+        "if('yes' = bl, 1, 0)", "coalesce(CAST('y' AS BOOLEAN), false)",
+        "bl = 't'", "NOT (bl = 'n')",
     ],
 
     # Casts to and from BINARY, and the conditionals that need them. #295. Binary answers are

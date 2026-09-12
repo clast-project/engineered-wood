@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 20:41:20.802628",
-      "2026-09-11 20:41:20.802628",
-      "2026-09-11 20:41:20.802628"
+      "2026-09-12 04:23:57.417686",
+      "2026-09-12 04:23:57.417686",
+      "2026-09-12 04:23:57.417686"
      ]
     }
    },
@@ -16135,6 +16135,1504 @@
     }
    }
   ],
+  "string-to-boolean": [
+   {
+    "expression": "CAST('true' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('true' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('TRUE' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('TRUE' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('True' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('True' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('t' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('t' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('T' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('T' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('y' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('y' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('Y' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('Y' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('yes' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('yes' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('YES' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('YES' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('Yes' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('Yes' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('1' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('false' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('false' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('FALSE' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('FALSE' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('False' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('False' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('f' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('f' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('F' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('F' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('n' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('n' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('N' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('N' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('no' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('no' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('NO' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('NO' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST('0' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('0' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(' t ' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(' t ' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('  true  ' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('  true  ' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('\ttrue' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('\ttrue' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('true\n' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('true\n' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(' true' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(' true' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value ' true' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(' true' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(' ' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(' ' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value ' ' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(' ' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('on' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('on' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'on' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('on' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('off' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('off' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'off' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('off' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('tr' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('tr' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'tr' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('tr' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('ye' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('ye' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'ye' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('ye' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('truex' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('truex' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'truex' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('truex' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('yeah' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('yeah' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'yeah' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('yeah' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('t t' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('t t' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 't t' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('t t' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('2' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('2' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '2' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('2' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('-1' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('-1' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '-1' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('-1' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('0.0' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('0.0' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '0.0' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('0.0' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1.0' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1.0' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '1.0' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1.0' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('1e0' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('1e0' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '1e0' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('1e0' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('+1' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('+1' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '+1' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('+1' AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(ns AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(ns AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(fs AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(fs AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(fs AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(s AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(s AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(s AS BOOLEAN)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(0 AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(0 AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1 AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(1 AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(2 AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(2 AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-1 AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-1 AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(a AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(a AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(b AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(b AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(g AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(g AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(d1 AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(d1 AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-0.0 AS DOUBLE) AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.0BD AS DOUBLE) AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('NaN' AS DOUBLE) AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('NaN' AS DOUBLE) AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(bl AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(bl AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(true AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(true AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(X'74727565' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(X'74727565' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(0x74727565 as boolean) AS r#3531]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(0x74727565 as boolean) AS r#3532]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+    }
+   },
+   {
+    "expression": "CAST(bin AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(bin AS BOOLEAN)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(bin AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(bin#17 as boolean) AS r#3533]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(bin AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(bin#36 as boolean) AS r#3534]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as f"
+    }
+   },
+   {
+    "expression": "CAST(dt AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(dt AS BOOLEAN)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(dt AS BOOLEAN)\" due to data type mismatch: cannot cast \"DATE\" to \"BOOLEAN\" with ANSI mode on.\nIf you have to cast \"DATE\" to \"BOOLEAN\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#15 as boolean) AS r#3535]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(dt AS BOOLEAN)\" due to data type mismatch: cannot cast \"DATE\" to \"BOOLEAN\" with ANSI mode on.\nIf you have to cast \"DATE\" to \"BOOLEAN\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#34 as boolean) AS r#3536]\n+- Union false, false\n   :- Union false, false\n   :  :-"
+    }
+   },
+   {
+    "expression": "CAST(ts AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(ts AS BOOLEAN)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(ts AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BOOLEAN\" with ANSI mode on.\nIf you have to cast \"TIMESTAMP\" to \"BOOLEAN\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#14 as boolean) AS r#3537]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(ts AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BOOLEAN\" with ANSI mode on.\nIf you have to cast \"TIMESTAMP\" to \"BOOLEAN\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#33 as boolean) AS r#3538]\n+- Union false, false\n   :- Union false, fals"
+    }
+   },
+   {
+    "expression": "CAST(CAST(NULL AS STRING) AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(NULL AS STRING) AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST(NULL AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(NULL AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('t' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('t' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('yes' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('yes' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('2' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('2' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST('tr' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('tr' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST(s AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(s AS BOOLEAN)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "TRY_CAST(X'74727565' AS BOOLEAN)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(X'74727565' AS BOOLEAN)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(0x74727565 as boolean) AS r#3567]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(0x74727565 as boolean) AS r#3568]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
+    }
+   },
+   {
+    "expression": "'t' = true",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('t' = true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "'y' = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('y' = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'no' = false",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('no' = false)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "'on' = true",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('on' = true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'on' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('on' = true) AS r\n ^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'2' = true",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "('2' = true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value '2' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('2' = true) AS r\n ^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nullif('t', true)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('t', true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif('no', bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('no', bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "no",
+      "no",
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif('on', true)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif('on', true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'on' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nullif('on', true)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "if('yes' = bl, 1, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(('yes' = bl), 1, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      0,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(CAST('y' AS BOOLEAN), false)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(CAST('y' AS BOOLEAN), false)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "bl = 't'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(bl = 't')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "NOT (bl = 'n')",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (bl = 'n'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   }
+  ],
   "binary-casts": [
    {
     "expression": "CAST('a' AS BINARY)",
@@ -16265,11 +17763,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS TINYINT) AS BINARY)\" due to data type mismatch: cannot cast \"TINYINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"TINYINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as tinyint) as binary) AS r#3331]\n+- LogicalRDD [a#0, b#1L"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS TINYINT) AS BINARY)\" due to data type mismatch: cannot cast \"TINYINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"TINYINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as tinyint) as binary) AS r#3637]\n+- LogicalRDD [a#0, b#1L"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS TINYINT) AS BINARY)\" due to data type mismatch: cannot cast \"TINYINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"TINYINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as tinyint) as binary) AS r#3332]\n+- Union false, false\n  "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS TINYINT) AS BINARY)\" due to data type mismatch: cannot cast \"TINYINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"TINYINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as tinyint) as binary) AS r#3638]\n+- Union false, false\n  "
     }
    },
    {
@@ -16281,11 +17779,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as smallint) as binary) AS r#3333]\n+- LogicalRDD [a#0, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as smallint) as binary) AS r#3639]\n+- LogicalRDD [a#0, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as smallint) as binary) AS r#3334]\n+- Union false, fals"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as smallint) as binary) AS r#3640]\n+- Union false, fals"
     }
    },
    {
@@ -16297,11 +17795,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"INT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as int) as binary) AS r#3335]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"INT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as int) as binary) AS r#3641]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"INT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as int) as binary) AS r#3336]\n+- Union false, false\n   :- Union false,"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"INT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as int) as binary) AS r#3642]\n+- Union false, false\n   :- Union false,"
     }
    },
    {
@@ -16313,11 +17811,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS BIGINT) AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as bigint) as binary) AS r#3337]\n+- LogicalRDD [a#0, b#1L, sh"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS BIGINT) AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as bigint) as binary) AS r#3643]\n+- LogicalRDD [a#0, b#1L, sh"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS BIGINT) AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as bigint) as binary) AS r#3338]\n+- Union false, false\n   :- "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(1 AS BIGINT) AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1 as bigint) as binary) AS r#3644]\n+- Union false, false\n   :- "
     }
    },
    {
@@ -16329,11 +17827,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(-2 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(-2 as smallint) as binary) AS r#3339]\n+- LogicalRDD [a#0"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(-2 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(-2 as smallint) as binary) AS r#3645]\n+- LogicalRDD [a#0"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(-2 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(-2 as smallint) as binary) AS r#3340]\n+- Union false, fa"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(CAST(-2 AS SMALLINT) AS BINARY)\" due to data type mismatch: cannot cast \"SMALLINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"SMALLINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(-2 as smallint) as binary) AS r#3646]\n+- Union false, fa"
     }
    },
    {
@@ -16345,11 +17843,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(9223372036854775807 AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(9223372036854775807 as binary) AS r#3341]\n+- LogicalRDD [a#0, b#1L"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(9223372036854775807 AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(9223372036854775807 as binary) AS r#3647]\n+- LogicalRDD [a#0, b#1L"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(9223372036854775807 AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(9223372036854775807 as binary) AS r#3342]\n+- Union false, false\n  "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION] Cannot resolve \"CAST(9223372036854775807 AS BINARY)\" due to data type mismatch: cannot cast \"BIGINT\" to \"BINARY\" with ANSI mode on.\nIf you have to cast \"BIGINT\" to \"BINARY\", you can set \"spark.sql.ansi.enabled\" as 'false'. SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(9223372036854775807 as binary) AS r#3648]\n+- Union false, false\n  "
     }
    },
    {
@@ -16361,11 +17859,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#3343]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], f"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#3649]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], f"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#3344]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#3650]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS"
     }
    },
    {
@@ -16397,11 +17895,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#3349]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#3655]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#3350]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#3656]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
     }
    },
    {
@@ -16413,11 +17911,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#3351]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#3657]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#3352]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#3658]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) "
     }
    },
    {
@@ -16429,11 +17927,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#5 as binary) AS r#3353]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#5 as binary) AS r#3659]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#24 as binary) AS r#3354]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#24 as binary) AS r#3660]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
     }
    },
    {
@@ -16445,11 +17943,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#3355]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#3661]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#3356]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as floa"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#3662]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as floa"
     }
    },
    {
@@ -16461,11 +17959,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#15 as binary) AS r#3357]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#15 as binary) AS r#3663]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#34 as binary) AS r#3358]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as float) A"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#34 as binary) AS r#3664]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as float) A"
     }
    },
    {
@@ -16477,11 +17975,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#14 as binary) AS r#3359]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#14 as binary) AS r#3665]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#33 as binary) AS r#3360]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as flo"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#33 as binary) AS r#3666]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as flo"
     }
    },
    {
@@ -16873,11 +18371,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#3433]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#3739]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#3434]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#3740]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
     }
    },
    {
@@ -16889,11 +18387,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#3435]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#3741]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#3436]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#3742]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
     }
    },
    {
@@ -17025,11 +18523,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#3461]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#3767]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#3462]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#3768]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
     }
    },
    {
@@ -17041,11 +18539,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#3463]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#3769]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#3464]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#3770]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
     }
    },
    {
@@ -19775,11 +21273,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#0 else bin#17 AS r#4017]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#0 else bin#17 AS r#4323]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#4018]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#4324]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
     }
    },
    {
@@ -20179,11 +21677,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#0, a#0, bin#17) AS r#4099]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#0, a#0, bin#17) AS r#4405]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#19, a#19, bin#36) AS r#4100]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#19, a#19, bin#36) AS r#4406]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
     }
    },
    {
@@ -21069,11 +22567,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, s)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#0, s#10) AS r#4253]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18]"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, s)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#0, s#10) AS r#4555]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18]"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, s)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#19, s#29) AS r#4254]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, s)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#19, s#29) AS r#4556]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint"
     }
    },
    {
@@ -21085,11 +22583,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(a, s)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(a#0, s#10) AS r#4255]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(a, s)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(a#0, s#10) AS r#4557]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(a, s)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(a#19, s#29) AS r#4256]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#2"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(a, s)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(a#19, s#29) AS r#4558]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#2"
     }
    },
    {
@@ -21101,11 +22599,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(s, a)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"STRING\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(s#10, a#0) AS r#4257]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18]"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(s, a)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"STRING\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(s#10, a#0) AS r#4559]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18]"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(s, a)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"STRING\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(s#29, a#19) AS r#4258]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(s, a)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"STRING\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(s#29, a#19) AS r#4560]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint"
     }
    },
    {
@@ -30847,6 +32345,1596 @@
      }
     }
    ],
+   "string-to-boolean": [
+    {
+     "expression": "CAST('true' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('true' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('TRUE' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('TRUE' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('True' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('True' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('t' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('t' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('T' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('T' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('y' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('y' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('Y' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('Y' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('yes' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('yes' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('YES' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('YES' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('Yes' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('Yes' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('false' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('false' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('FALSE' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('FALSE' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('False' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('False' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('f' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('f' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('F' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('F' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('n' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('n' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('N' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('N' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('no' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('no' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('NO' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('NO' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST('0' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('0' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(' t ' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(' t ' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('  true  ' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('  true  ' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('\ttrue' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('\ttrue' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('true\n' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('true\n' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(' true' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(' true' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(' ' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(' ' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('on' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('on' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('off' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('off' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('tr' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('tr' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('ye' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('ye' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('truex' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('truex' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('yeah' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('yeah' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('t t' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('t t' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('2' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('2' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('-1' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('-1' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('0.0' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('0.0' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1.0' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1.0' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('1e0' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('1e0' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('+1' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('+1' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(ns AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(ns AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(fs AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(fs AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(s AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(s AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(0 AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1 AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(1 AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(2 AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(2 AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-1 AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-1 AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(a AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(a AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(b AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(b AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(g AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(g AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d1 AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(d1 AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-0.0 AS DOUBLE) AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(0.0BD AS DOUBLE) AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('NaN' AS DOUBLE) AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('NaN' AS DOUBLE) AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(bl AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(bl AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(true AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(true AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(X'74727565' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(X'74727565' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(0x74727565 as boolean) AS r#2114]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(0x74727565 as boolean) AS r#2115]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+     }
+    },
+    {
+     "expression": "CAST(bin AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(bin AS BOOLEAN)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(bin AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(bin#17 as boolean) AS r#2116]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(bin AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(bin#36 as boolean) AS r#2117]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as f"
+     }
+    },
+    {
+     "expression": "CAST(dt AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(dt AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(ts AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(ts AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(NULL AS STRING) AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(NULL AS STRING) AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(NULL AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(NULL AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('t' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('t' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('yes' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('yes' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('2' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('2' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST('tr' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('tr' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(s AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(s AS BOOLEAN)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "TRY_CAST(X'74727565' AS BOOLEAN)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(X'74727565' AS BOOLEAN)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(0x74727565 as boolean) AS r#2150]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(X'74727565' AS BOOLEAN)\" due to data type mismatch: cannot cast \"BINARY\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(0x74727565 as boolean) AS r#2151]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
+     }
+    },
+    {
+     "expression": "'t' = true",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('t' = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'y' = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('y' = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'no' = false",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('no' = false)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'on' = true",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('on' = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'2' = true",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "('2' = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('t', true)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('t', true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('no', bl)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('no', bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "no",
+       "no",
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif('on', true)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif('on', true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "on",
+       "on",
+       "on"
+      ]
+     }
+    },
+    {
+     "expression": "if('yes' = bl, 1, 0)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if(('yes' = bl), 1, 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       0,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(CAST('y' AS BOOLEAN), false)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(CAST('y' AS BOOLEAN), false)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "bl = 't'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(bl = 't')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "NOT (bl = 'n')",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (bl = 'n'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    }
+   ],
    "binary-casts": [
     {
      "expression": "CAST('a' AS BINARY)",
@@ -31097,11 +34185,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#1938]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], f"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#2244]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], f"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#1939]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(CAST(1 AS INT) AS BINARY)\" due to data type mismatch: cannot cast \"INT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(cast(1 as int) as binary) AS r#2245]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS"
      }
     },
     {
@@ -31133,11 +34221,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#1944]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#2250]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#1945]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS DOUBLE) AS BINARY)\" due to data type mismatch: cannot cast \"DOUBLE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as double) as binary) AS r#2251]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
      }
     },
     {
@@ -31149,11 +34237,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#1946]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#2252]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#1947]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(CAST(1.5 AS FLOAT) AS BINARY)\" due to data type mismatch: cannot cast \"FLOAT\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(cast(1.5 as float) as binary) AS r#2253]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) "
      }
     },
     {
@@ -31165,11 +34253,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#5 as binary) AS r#1948]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#5 as binary) AS r#2254]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#24 as binary) AS r#1949]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(d1 AS BINARY)\" due to data type mismatch: cannot cast \"DECIMAL(10,2)\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(d1#24 as binary) AS r#2255]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
      }
     },
     {
@@ -31181,11 +34269,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#1950]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#2256]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#1951]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as floa"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(true AS BINARY)\" due to data type mismatch: cannot cast \"BOOLEAN\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(true as binary) AS r#2257]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as floa"
      }
     },
     {
@@ -31197,11 +34285,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#15 as binary) AS r#1952]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#15 as binary) AS r#2258]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#34 as binary) AS r#1953]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as float) A"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(dt AS BINARY)\" due to data type mismatch: cannot cast \"DATE\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(dt#34 as binary) AS r#2259]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as float) A"
      }
     },
     {
@@ -31213,11 +34301,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#14 as binary) AS r#1954]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#14 as binary) AS r#2260]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#33 as binary) AS r#1955]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as flo"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ts AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ts#33 as binary) AS r#2261]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as flo"
      }
     },
     {
@@ -31349,11 +34437,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1980]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#2286]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1981]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#2287]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -31365,11 +34453,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(2, X'00')\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"STRING\" or \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(2, 0x00) AS r#1982]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(2, X'00')\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"STRING\" or \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(2, 0x00) AS r#2288]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(2, X'00')\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"STRING\" or \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(2, 0x00) AS r#1983]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(2, X'00')\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"STRING\" or \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(2, 0x00) AS r#2289]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -31381,11 +34469,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(CAST(NULL AS BINARY), 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(cast(null as binary), 2) AS r#1984]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, t"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(CAST(NULL AS BINARY), 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(cast(null as binary), 2) AS r#2290]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, t"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(CAST(NULL AS BINARY), 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(cast(null as binary), 2) AS r#1985]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(CAST(NULL AS BINARY), 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(cast(null as binary), 2) AS r#2291]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as"
      }
     },
     {
@@ -31397,11 +34485,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'FF', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0xFF, 2) AS r#1986]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'FF', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0xFF, 2) AS r#2292]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'FF', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0xFF, 2) AS r#1987]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'FF', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0xFF, 2) AS r#2293]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -31413,11 +34501,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(bin, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(bin#17, 2) AS r#1988]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(bin, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(bin#17, 2) AS r#2294]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(bin, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(bin#36, 2) AS r#1989]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(bin, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(bin#36, 2) AS r#2295]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -31429,11 +34517,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [ifnull(0x00, 2) AS r#1990]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [ifnull(0x00, 2) AS r#2296]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [ifnull(0x00, 2) AS r#1991]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [ifnull(0x00, 2) AS r#2297]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
      }
     },
     {
@@ -31445,11 +34533,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl(0x00, 2) AS r#1992]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl(0x00, 2) AS r#2298]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl(0x00, 2) AS r#1993]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl(0x00, 2) AS r#2299]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
      }
     },
     {
@@ -31461,11 +34549,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(true, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (true) 0x00 else 2 AS r#1994]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(true, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (true) 0x00 else 2 AS r#2300]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(true, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (true) 0x00 else 2 AS r#1995]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(true, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (true) 0x00 else 2 AS r#2301]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
      }
     },
     {
@@ -31477,11 +34565,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(false, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (false) 0x00 else 2 AS r#1996]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(false, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (false) 0x00 else 2 AS r#2302]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(false, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (false) 0x00 else 2 AS r#1997]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(false, X'00', 2))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (false) 0x00 else 2 AS r#2303]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -31493,11 +34581,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"CASE WHEN false THEN X'00' ELSE 2 END\" due to data type mismatch: Input to `casewhen` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [CASE WHEN false THEN 0x00 ELSE 2 END AS r#1998]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"CASE WHEN false THEN X'00' ELSE 2 END\" due to data type mismatch: Input to `casewhen` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [CASE WHEN false THEN 0x00 ELSE 2 END AS r#2304]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"CASE WHEN false THEN X'00' ELSE 2 END\" due to data type mismatch: Input to `casewhen` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [CASE WHEN false THEN 0x00 ELSE 2 END AS r#1999]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast("
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"CASE WHEN false THEN X'00' ELSE 2 END\" due to data type mismatch: Input to `casewhen` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [CASE WHEN false THEN 0x00 ELSE 2 END AS r#2305]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast("
      }
     },
     {
@@ -31509,11 +34597,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', CAST(NULL AS STRING))\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, cast(null as string)) AS r#2000]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, f"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', CAST(NULL AS STRING))\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, cast(null as string)) AS r#2306]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, f"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', CAST(NULL AS STRING))\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, cast(null as string)) AS r#2001]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cas"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', CAST(NULL AS STRING))\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, cast(null as string)) AS r#2307]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cas"
      }
     },
     {
@@ -31565,11 +34653,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#2010]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#2316]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#2011]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 1)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 1) AS r#2317]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
      }
     },
     {
@@ -31581,11 +34669,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#2012]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#2318]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#2013]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', true)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, true) AS r#2319]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
      }
     },
     {
@@ -31717,11 +34805,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#2038]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#2344]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#2039]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(X'00', 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(0x00, 2) AS r#2345]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smal"
      }
     },
     {
@@ -31733,11 +34821,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#2040]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#2346]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], fa"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#2041]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(X'00', 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"BINARY\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(0x00, 2) AS r#2347]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS "
      }
     },
     {
@@ -33025,11 +36113,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#2298]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#2604]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#2299]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(true, 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BOOLEAN\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(true, 2) AS r#2605]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -33061,11 +36149,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1980]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#2286]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nes"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#1981]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(X'00', 2)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"BINARY\" or \"STRING\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(0x00, 2) AS r#2287]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sm"
      }
     },
     {
@@ -33237,11 +36325,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#2332]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#2638]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#2333]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(cast(1 as int), 2) AS r#2639]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L"
      }
     },
     {
@@ -33253,11 +36341,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#2334]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#2640]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#2335]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#2641]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
      }
     }
    ],
