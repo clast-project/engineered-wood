@@ -1522,6 +1522,112 @@ GROUPS = {
         "9007199254740993 IN (9007199254740993, NULL)",
     ],
 
+    # Issue #279, and #306 beside it. Spark evaluates a conditional's branch only over the rows
+    # that select it, and the two halves of AND/OR only over the rows the other half left
+    # undecided -- so a cast that would fail, an overflow or a division by zero in a branch no row
+    # reaches never happens. Under ANSI that is the difference between a write succeeding and
+    # failing, and every row of a table is on the wrong side of it.
+    #
+    # WHY BOTH DIRECTIONS ARE HERE. Half these rows ask whether an unreached error is skipped, and
+    # half ask whether a REACHED one still raises. Only the first half fails today, but a corpus
+    # carrying only that half would be satisfied by an implementation that evaluated nothing at
+    # all, which is a worse bug in the more dangerous direction. The `nullif`/`greatest`/`least`
+    # rows are there for the same reason from the other side: they are measured EAGER, so they pin
+    # the boundary of the family rather than assuming it.
+    #
+    # WHY THE CONDITIONS LOOK ROUNDABOUT. The all-null row means a plain `coalesce(a, ...)` selects
+    # its second branch on row 2, so an expression whose bad branch is genuinely unreached on every
+    # row has to be written around a column that is not null there. `s IS NOT NULL` and
+    # `b = 0 OR ...` are doing that work, and they are also the shapes a real CHECK constraint is
+    # written in.
+    "short-circuit": [
+        # The issue's repro, and the same shape through each spelling of the family. The condition
+        # is a literal in these, so Spark could answer them by folding rather than by skipping --
+        # which is exactly why the column-driven rows below exist. We fold nothing, so they are a
+        # real test for us either way.
+        "nvl(1, CAST('0x10' AS DOUBLE))",
+        "coalesce(1, 1/0)",
+        "ifnull(1, CAST('0x10' AS DOUBLE))",
+        "if(true, 1, CAST('0x10' AS DOUBLE))",
+        "CASE WHEN true THEN 1 ELSE CAST('0x10' AS DOUBLE) END",
+        # An unreached CONDITION, not an unreached value: the second WHEN is never asked.
+        "CASE WHEN true THEN 1 WHEN CAST('0x10' AS DOUBLE) > 0 THEN 2 END",
+
+        # Column-driven, so no rewrite can decide them ahead of time: whether the branch is
+        # evaluated is a property of the ROW. These are the rows that prove the behaviour is
+        # per-row laziness rather than constant folding.
+        "if(s IS NOT NULL, 0, CAST(s AS INT))",
+        "CASE WHEN s IS NOT NULL THEN 0 ELSE CAST(s AS INT) END",
+        "coalesce(a, CAST(t AS INT))",
+        "coalesce(a, b, CAST(t AS INT))",
+        "if(a IS NOT NULL, a, if(b IS NOT NULL, b, CAST(t AS INT)))",
+
+        # AND / OR, which #279 does not mention and which carry the same defect. The first two are
+        # the ordinary shape of a CHECK constraint that has to tolerate a zero divisor.
+        "b = 0 OR a / b > 1",
+        "b <> 0 AND a / b > 1",
+        "a IS NOT NULL OR CAST(t AS INT) > 0",
+        "a IS NULL AND CAST(t AS INT) > 0",
+        "NOT (a IS NULL AND CAST(t AS INT) > 0)",
+
+        # The same two with the guard inverted, so the left operand is FALSE (for OR) or TRUE (for
+        # AND) on the zero-divisor row and the right one IS evaluated there. These raise, and they
+        # are what stops "skip the right operand" from being read as "skip it whenever the left
+        # decided something".
+        "b <> 0 OR a / b > 1",
+        "b = 0 AND a / b > 1",
+
+        # NULL DOES NOT SHORT-CIRCUIT, which is the subtle half of the rule: AND skips only where
+        # the left is FALSE and OR only where it is TRUE, so an UNKNOWN left keeps the right
+        # operand live. Each of these pairs differs only in whether the null row reaches the right
+        # operand, and the right operand raises on any row that evaluates it -- so the raising one
+        # is raising BECAUSE of the null, and the answering one proves the guard is what saved it.
+        #
+        # `a` is 1 / NULL / INT_MIN, so `a >= -2147483648` is TRUE, NULL, TRUE and
+        # `a < -2147483648` is FALSE, NULL, FALSE: the null row is the only one left undecided by
+        # the guard, on a schema whose null row nulls EVERY column and so cannot raise by
+        # arithmetic. That is why the right operand is a cast of a literal rather than a division.
+        "a >= -2147483648 OR CAST('x' AS INT) > 0",
+        "a IS NULL OR a >= -2147483648 OR CAST('x' AS INT) > 0",
+        "a < -2147483648 AND CAST('x' AS INT) > 0",
+        "a IS NOT NULL AND a < -2147483648 AND CAST('x' AS INT) > 0",
+
+        # Reached, and still raising. The other direction.
+        "coalesce(a, CAST('0x10' AS DOUBLE))",
+        "if(a IS NULL, CAST('0x10' AS DOUBLE), 0)",
+        "CASE WHEN a IS NULL THEN CAST('0x10' AS DOUBLE) ELSE 0 END",
+
+        # Eager in Spark, all three -- they raise over the same batch the conditional rows above
+        # answer over. They have no branch to skip either, each needing every argument before it can
+        # decide anything, so these pin the BOUNDARY of the family rather than assuming it.
+        "nullif(a, CAST('0x10' AS DOUBLE))",
+        "greatest(a, CAST('0x10' AS DOUBLE))",
+        "least(1, CAST('0x10' AS DOUBLE))",
+
+        # A branch nothing selects whose result type depends on an argument's VALUE. `round`'s
+        # scale decides the result's precision and scale, and it is read out of row 0 -- so typing
+        # this branch cannot be done over zero rows the way every other branch can, and a literal
+        # scale would have hidden it. Regression guard for the fallback in `TypeOver`.
+        "coalesce(a, round(d1, 1 + 1))",
+        "if(1 = 1, a, round(d1, 1 + 1))",
+
+        # An unreached branch still TYPES the result, and still has to type-check. This is the
+        # constraint that stops "do not evaluate it" from meaning "do not look at it": dropping the
+        # unreached branch would make the first of these a float rather than a double, which is a
+        # different VALUE and not merely a different label.
+        "if(1 = 1, f, 'abc')",
+        "if(1 = 1, a, 'abc')",
+        "coalesce(ns, 'abc')",
+        # ...and a bare NULL still does not, being `void`. The pair below is the discriminator: a
+        # TYPED null constrains the result and an untyped one does not, however alike the two look
+        # once they are columns. #293.
+        "if(1 = 1, a, NULL)",
+        "if(1 = 1, a, CAST(NULL AS STRING))",
+        "coalesce(a, NULL)",
+        # A pair with no common type is refused however few rows reach it.
+        "if(1 = 1, a, bin)",
+    ],
+
     "ansi-sensitive": [
         "a / 0", "a % 0", "CAST(s AS INT)", "a + 2147483647",
         "CAST(g AS INT)", "CAST('abc' AS DATE)", "nested.arr[99]",

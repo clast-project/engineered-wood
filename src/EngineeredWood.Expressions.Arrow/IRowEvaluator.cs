@@ -61,6 +61,95 @@ public interface IFunctionRegistry
 }
 
 /// <summary>
+/// A function registry whose functions do not all evaluate every argument.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast, so a registry that does not implement it is
+/// invoked exactly as before. It exists because <b>which</b> arguments a call evaluates is the
+/// function's own business and the evaluator has no way to guess it: Spark's conditional family
+/// evaluates a branch only over the rows that select it, so a cast that would fail, an overflow
+/// or a division by zero in a branch no row reaches never happens at all. Measured on 4.0.1,
+/// <c>coalesce(a, CAST(s AS DOUBLE))</c> answers over a batch where <c>a</c> has no nulls and
+/// raises over one where it has one — the same expression, decided per ROW. #279.
+/// </para>
+/// <para>
+/// <b>A branch no row selects is still evaluated, over no rows at all.</b> That is not a
+/// wasted call: Spark types a conditional from every branch, reached or not —
+/// <c>coalesce(f, 'x')</c> is a <c>double</c> even where the string is never chosen, and
+/// <c>if(a &gt; 0, a, bin)</c> is refused outright — and an evaluation over an empty row
+/// selection produces the branch's type without reading a value that could raise.
+/// </para>
+/// </remarks>
+public interface IShortCircuitingFunctions
+{
+    /// <summary>
+    /// Whether <paramref name="name"/> decides for itself which of its arguments to evaluate,
+    /// and over which rows.
+    /// </summary>
+    /// <remarks>
+    /// A name this answers false for — which is most of them, <c>nullif</c>, <c>greatest</c> and
+    /// <c>least</c> included, all three measured eager in Spark — goes through
+    /// <see cref="IFunctionRegistry.Invoke"/> with every argument already evaluated.
+    /// </remarks>
+    bool ShortCircuits(string name);
+
+    /// <summary>
+    /// Invokes a short-circuiting function. Arguments are evaluated through
+    /// <paramref name="arguments"/> rather than supplied, so the implementation chooses what to
+    /// evaluate and over which rows.
+    /// </summary>
+    IArrowArray Invoke(string name, IConditionalArguments arguments, int rowCount);
+}
+
+/// <summary>
+/// The arguments of a short-circuiting call, each evaluated only over the rows asked for.
+/// </summary>
+public interface IConditionalArguments
+{
+    /// <summary>How many arguments the call was written with.</summary>
+    int Count { get; }
+
+    /// <summary>
+    /// Whether argument <paramref name="index"/> is a bare <c>NULL</c> literal.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark types one as <c>void</c>, which constrains nothing: <c>coalesce(a, NULL)</c> is an
+    /// <c>int</c>. A conditional therefore has to leave such a branch out of its type fold, and
+    /// this is how it tells one apart — <b>structurally, from the expression</b>, rather than by
+    /// noticing that a branch came back all null.
+    /// </para>
+    /// <para>
+    /// The difference is not academic. Under short-circuiting a branch no row selects is all null
+    /// BY CONSTRUCTION, so a content test would swallow every unreached branch and retype the
+    /// result: a zero-row <c>coalesce(a, s)</c> would come back <c>int</c> where Spark says
+    /// <c>bigint</c>. It was already wrong for a string column that merely held nothing in this
+    /// batch, which is #293.
+    /// </para>
+    /// </remarks>
+    bool IsNullLiteral(int index);
+
+    /// <summary>
+    /// Evaluates argument <paramref name="index"/> over the rows <paramref name="rows"/> selects,
+    /// and returns an array of the call's full row count whose other rows are NULL.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Full length, so the caller indexes it by row number like any other argument. NULL
+    /// elsewhere, so a row the caller did not ask for reads as "not known" rather than as another
+    /// row's answer.
+    /// </para>
+    /// <para>
+    /// An empty selection evaluates nothing and yields an all-null array of the type the argument
+    /// WOULD have produced — which is the answer a conditional needs for a branch nothing reached.
+    /// A full selection is passed straight through with no copying.
+    /// </para>
+    /// </remarks>
+    IArrowArray Evaluate(int index, ReadOnlySpan<bool> rows);
+}
+
+/// <summary>
 /// A function registry that also knows which operand a comparison casts, and to what.
 /// </summary>
 /// <remarks>

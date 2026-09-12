@@ -29,7 +29,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// Each refuses by name rather than silently producing nothing.
 /// </para>
 /// </remarks>
-public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoercion
+public sealed class SparkFunctionRegistry
+    : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -144,7 +145,7 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
                 return SparkFunctions.DateFormat(args, rowCount);
 
             case "coalesce" or "nvl" or "ifnull":
-                return Coalesce(args, rowCount);
+                return Coalesce(new EagerArguments(args, rowCount), rowCount);
 
             case "greatest" or "least":
                 return Extreme(name, args, rowCount);
@@ -159,15 +160,90 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
             case "if":
                 Expect(name, args, 3);
-                return If(args, rowCount);
+                return If(new EagerArguments(args, rowCount), rowCount);
 
             case "case":
-                return Case(args, rowCount);
+                return Case(new EagerArguments(args, rowCount), rowCount);
 
             default:
                 throw new NotSupportedException(
                     $"'{name}' is not implemented by SparkFunctionRegistry.");
         }
+    }
+
+    /// <summary>
+    /// The conditional family, and only it.
+    /// </summary>
+    /// <remarks>
+    /// <c>nullif</c>, <c>greatest</c> and <c>least</c> are measured raising over the very batches
+    /// where <c>coalesce</c> and <c>if</c> answer -- and they have no branch to skip in the first
+    /// place, since each needs every argument before it can decide anything. The
+    /// <c>short-circuit</c> corpus group carries all three, so the boundary of the family is
+    /// pinned rather than assumed.
+    /// </remarks>
+    public bool ShortCircuits(string name) => name switch
+    {
+        "coalesce" or "nvl" or "ifnull" or "if" or "case" => true,
+        _ => false,
+    };
+
+    public IArrowArray Invoke(string name, IConditionalArguments arguments, int rowCount)
+    {
+        if (arguments is null)
+            throw new ArgumentNullException(nameof(arguments));
+
+        switch (name)
+        {
+            case "coalesce" or "nvl" or "ifnull":
+                return Coalesce(arguments, rowCount);
+
+            case "if":
+                Expect(name, arguments.Count, 3);
+                return If(arguments, rowCount);
+
+            case "case":
+                return Case(arguments, rowCount);
+
+            default:
+                throw new NotSupportedException($"'{name}' does not evaluate its own arguments.");
+        }
+    }
+
+    /// <summary>
+    /// The arguments of a conditional invoked through <see cref="IFunctionRegistry"/>, where they
+    /// arrive already evaluated.
+    /// </summary>
+    /// <remarks>
+    /// One implementation of the conditional family serves both entry points, rather than two that
+    /// have to be kept saying the same thing. What the eager path cannot supply is the structural
+    /// answer to <see cref="IsNullLiteral"/> -- there is no expression left to look at, only a
+    /// column -- so it falls back to the content test #293 describes, under which a string column
+    /// that happens to hold nothing in this batch is a bare <c>NULL</c>. Ignoring the row selection
+    /// is safe for the same reason the arrays are usable at all: every one of these algorithms
+    /// reads a branch only at the rows that selected it.
+    /// </remarks>
+    private sealed class EagerArguments : IConditionalArguments
+    {
+        private readonly IReadOnlyList<IArrowArray> _args;
+        private readonly int _rowCount;
+
+        public EagerArguments(IReadOnlyList<IArrowArray> args, int rowCount)
+        {
+            _args = args;
+            _rowCount = rowCount;
+        }
+
+        public int Count => _args.Count;
+
+        public bool IsNullLiteral(int index) => IsNullLiteralPlaceholder(_args[index], _rowCount);
+
+        public IArrowArray Evaluate(int index, ReadOnlySpan<bool> rows) => _args[index];
+    }
+
+    private static void Expect(string name, int count, int arity)
+    {
+        if (count != arity)
+            throw new ArgumentException($"'{name}' takes {arity} argument(s), got {count}");
     }
 
     private static void Expect(string name, IReadOnlyList<IArrowArray> args, int arity)
@@ -1405,9 +1481,9 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     /// <see cref="UnifiedType"/> and its refusal. #278.
     /// </remarks>
     private IArrowArray UnifyBranches(
-        IReadOnlyList<IArrowArray> branches, int[] choice, int rowCount)
+        IReadOnlyList<IArrowArray> branches, bool[] nullLiterals, int[] choice, int rowCount)
     {
-        var type = ConditionalType(branches, rowCount);
+        var type = ConditionalType(branches, nullLiterals);
         return SparkFunctions.Unify(
             type, CoerceBranches(type, branches, choice, rowCount), choice, rowCount);
     }
@@ -1415,34 +1491,35 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     /// <summary>The type a conditional's branches unify to, string coercion included.</summary>
     /// <remarks>
     /// A bare <c>NULL</c> is <c>void</c> in Spark and constrains nothing, so
-    /// <c>coalesce(a, NULL)</c> is an <c>int</c>. The evaluator has no void type and materialises
-    /// such a literal as an all-null STRING column, so that shape is what gets left out of the
-    /// fold — and left out on BOTH counts, being all-null and being a string.
+    /// <c>coalesce(a, NULL)</c> is an <c>int</c>, and such a branch is left out of the fold.
     /// <para>
-    /// <b>Only that shape.</b> A typed null still carries its type and still constrains the
-    /// result: measured, <c>coalesce(CAST(NULL AS INT), '2')</c> is a <c>bigint</c> in Spark, not
-    /// the string that dropping the all-null int would give, and
-    /// <c>coalesce(CAST(NULL AS INT), CAST(NULL AS STRING), '7')</c> is a bigint too. Dropping
-    /// every all-null branch — which is what <c>greatest</c>/<c>least</c> do — got the first of
-    /// those wrong, and the corpus caught it.
+    /// <b>Which branch that is comes from the EXPRESSION</b>, through
+    /// <see cref="IConditionalArguments.IsNullLiteral"/>, rather than from noticing that a branch
+    /// came back all null. It has to: a branch no row selected is all null by construction once
+    /// the family stopped evaluating every branch, so a content test would swallow every unreached
+    /// branch and retype the result -- measured, a zero-row <c>coalesce(a, s)</c> would come back
+    /// <c>int</c> where Spark says <c>bigint</c>. That test was already wrong for a string column
+    /// that merely held nothing in this batch, which is #293; #279 is what made it unworkable.
     /// </para>
     /// <para>
-    /// What remains is narrow and batch-dependent: a real string COLUMN that happens to hold
-    /// nothing but nulls in this batch is indistinguishable from the placeholder and is dropped
-    /// with it. Removing that needs the evaluator to stop spelling a null literal as a string,
-    /// which is a change of its own.
+    /// <b>A typed null is not one.</b> It carries its type and still constrains the result:
+    /// measured, <c>coalesce(CAST(NULL AS INT), '2')</c> is a <c>bigint</c> in Spark, not the
+    /// string that dropping the all-null int would give, and
+    /// <c>coalesce(CAST(NULL AS INT), CAST(NULL AS STRING), '7')</c> is a bigint too. Asking the
+    /// expression gets this right by construction, where the content test got it right only
+    /// because the placeholder happened to be spelled as a string.
     /// </para>
     /// </remarks>
-    private IArrowType ConditionalType(IReadOnlyList<IArrowArray> branches, int rowCount)
+    private IArrowType ConditionalType(IReadOnlyList<IArrowArray> branches, bool[] nullLiterals)
     {
         IArrowType? type = null;
 
-        foreach (var branch in branches)
+        for (var i = 0; i < branches.Count; i++)
         {
-            if (IsNullLiteralPlaceholder(branch, rowCount))
+            if (nullLiterals[i])
                 continue;
 
-            var candidate = branch.Data.DataType;
+            var candidate = branches[i].Data.DataType;
             type = type is null ? candidate : UnifyBranchTypes(type, candidate);
         }
 
@@ -1451,10 +1528,16 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
 
     /// <summary>Whether a branch is the all-null string column a bare <c>NULL</c> arrives as.</summary>
     /// <remarks>
+    /// <b>The fallback for <see cref="EagerArguments"/>, which has no expression to ask.</b> An
+    /// evaluator-driven call answers structurally instead — see
+    /// <see cref="ConditionalType"/> — because under short-circuiting this test cannot tell an
+    /// unreached branch from a bare NULL. #293.
+    /// <para>
     /// Asks Arrow for the null count rather than reading every row: this runs once per branch on
     /// every conditional evaluation, and a column already knows how many nulls it holds. The scan
     /// remains for the case where the array's length does not match the rows being evaluated,
     /// where the count says nothing about the range in question.
+    /// </para>
     /// <para>
     /// Keyed on the logical <see cref="StringType"/> rather than on <c>is StringArray</c>, so any
     /// other array class carrying the same type is treated the same way.
@@ -1991,7 +2074,20 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         // INT holding a, where unifying int with the all-null placeholder column the evaluator
         // materialises a null literal as would be an error about int and string. Dropping it
         // changes no answer, because a row that is null can never be the greatest or the least.
-        var typed = args.Where(a => !AllNull(a, rowCount)).ToList();
+        // Over NO rows the test is vacuous -- every argument is all-null because none of them has
+        // a row to be anything else -- so it decides nothing and drops everything. That range is
+        // reachable now that a conditional evaluates a branch nobody selected over zero rows to
+        // learn its type: dropping every argument there typed `coalesce(a, greatest(a, d1))` as an
+        // int where Spark says decimal(12,2). Keeping them all types it correctly.
+        //
+        // What stays wrong there is a bare NULL, which over no rows cannot be told from a real
+        // column and so constrains the type it should not: `greatest(a, NULL)` inside a branch no
+        // row reaches refuses instead of answering `a`. That is the half of #293 this does not
+        // close -- `Extreme` is eager, so it never sees the expression the conditional family now
+        // asks.
+        var typed = rowCount == 0
+            ? args.ToList()
+            : args.Where(a => !AllNull(a, rowCount)).ToList();
 
         // Every argument was one, so there is no type to find and no value to pick. Spark types
         // `greatest(NULL, NULL)` as void and answers null, which is what the placeholder already
@@ -2028,26 +2124,46 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return SparkFunctions.Unify(type, unified, choice, rowCount);
     }
 
-    private IArrowArray Coalesce(IReadOnlyList<IArrowArray> args, int rowCount)
+    /// <summary>
+    /// <c>coalesce</c>/<c>nvl</c>/<c>ifnull</c> -- the first argument that is not null, per row.
+    /// </summary>
+    /// <remarks>
+    /// Written as a sweep per ARGUMENT rather than per row, which is what lets an argument be
+    /// evaluated once over exactly the rows still looking for a value. Spark evaluates them in the
+    /// same order and stops at the same place, one row at a time; measured,
+    /// <c>coalesce(a, z, CAST(s AS DOUBLE))</c> answers where <c>z</c> covers every row <c>a</c>
+    /// left null, and raises where it does not.
+    /// </remarks>
+    private IArrowArray Coalesce(IConditionalArguments args, int rowCount)
     {
         if (args.Count == 0)
             throw new ArgumentException("coalesce needs at least one argument", nameof(args));
 
+        var remaining = new bool[rowCount];
+        for (var row = 0; row < rowCount; row++) remaining[row] = true;
+
         var choice = new int[rowCount];
-        for (var row = 0; row < rowCount; row++)
+        for (var row = 0; row < rowCount; row++) choice[row] = -1;
+
+        var branches = new IArrowArray[args.Count];
+        var nullLiterals = new bool[args.Count];
+
+        for (var i = 0; i < args.Count; i++)
         {
-            choice[row] = -1;
-            for (var i = 0; i < args.Count; i++)
+            branches[i] = args.Evaluate(i, remaining);
+            nullLiterals[i] = args.IsNullLiteral(i);
+
+            for (var row = 0; row < rowCount; row++)
             {
-                if (SparkFunctions.IsNull(args[i], row))
+                if (!remaining[row] || SparkFunctions.IsNull(branches[i], row))
                     continue;
 
                 choice[row] = i;
-                break;
+                remaining[row] = false;
             }
         }
 
-        return UnifyBranches(args, choice, rowCount);
+        return UnifyBranches(branches, nullLiterals, choice, rowCount);
     }
 
     /// <summary>
@@ -2076,15 +2192,29 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
         return SparkFunctions.Unify(args[0].Data.DataType, args, choice, rowCount);
     }
 
-    private IArrowArray If(IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray If(IConditionalArguments args, int rowCount)
     {
-        var branches = new[] { args[1], args[2] };
+        var everyRow = new bool[rowCount];
+        for (var row = 0; row < rowCount; row++) everyRow[row] = true;
+
+        var condition = args.Evaluate(0, everyRow);
+
+        var thenRows = new bool[rowCount];
+        var elseRows = new bool[rowCount];
         var choice = new int[rowCount];
 
         for (var row = 0; row < rowCount; row++)
-            choice[row] = IsTrue(args[0], row) ? 0 : 1;
+        {
+            var taken = IsTrue(condition, row);
+            thenRows[row] = taken;
+            elseRows[row] = !taken;
+            choice[row] = taken ? 0 : 1;
+        }
 
-        return UnifyBranches(branches, choice, rowCount);
+        var branches = new[] { args.Evaluate(1, thenRows), args.Evaluate(2, elseRows) };
+        var nullLiterals = new[] { args.IsNullLiteral(1), args.IsNullLiteral(2) };
+
+        return UnifyBranches(branches, nullLiterals, choice, rowCount);
     }
 
     /// <summary>
@@ -2095,35 +2225,69 @@ public sealed class SparkFunctionRegistry : IFunctionRegistry, IComparisonCoerci
     /// A CASE with no ELSE and no matching branch is null — measured,
     /// <c>CASE WHEN a &gt; 0 THEN 1 END</c> gives null where the condition fails.
     /// </remarks>
-    private IArrowArray Case(IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray Case(IConditionalArguments args, int rowCount)
     {
         if (args.Count < 2)
             throw new ArgumentException("case needs at least one when/then pair", nameof(args));
 
         var hasElse = args.Count % 2 == 1;
-        var values = new List<IArrowArray>();
-        for (var i = 1; i < args.Count; i += 2)
-            values.Add(args[i]);
+        var pairs = args.Count / 2;
+        var branchCount = pairs + (hasElse ? 1 : 0);
 
-        if (hasElse)
-            values.Add(args[args.Count - 1]);
+        // The rows no WHEN has claimed yet. A later condition is evaluated only over these, which
+        // is Spark's own order: measured, the second WHEN of
+        // `CASE WHEN a > 0 THEN a WHEN CAST(s AS INT) > 0 THEN 2 ELSE 3 END` never runs on a batch
+        // whose rows all satisfy the first, and does run -- and raises -- on one where a row
+        // falls through.
+        var remaining = new bool[rowCount];
+        for (var row = 0; row < rowCount; row++) remaining[row] = true;
 
         var choice = new int[rowCount];
-        for (var row = 0; row < rowCount; row++)
-        {
-            choice[row] = hasElse ? values.Count - 1 : -1;
+        for (var row = 0; row < rowCount; row++) choice[row] = -1;
 
-            for (var branch = 0; branch * 2 + 1 < args.Count; branch++)
+        var taken = new bool[branchCount][];
+        for (var branch = 0; branch < branchCount; branch++) taken[branch] = new bool[rowCount];
+
+        for (var pair = 0; pair < pairs; pair++)
+        {
+            var condition = args.Evaluate(pair * 2, remaining);
+            for (var row = 0; row < rowCount; row++)
             {
-                if (!IsTrue(args[branch * 2], row))
+                // Asked of every row, decided or not, so that a condition of the wrong type is
+                // refused rather than skipped past on a batch that never needed it.
+                var matched = IsTrue(condition, row);
+                if (!remaining[row] || !matched)
                     continue;
 
-                choice[row] = branch;
-                break;
+                choice[row] = pair;
+                taken[pair][row] = true;
+                remaining[row] = false;
             }
         }
 
-        return UnifyBranches(values, choice, rowCount);
+        if (hasElse)
+        {
+            for (var row = 0; row < rowCount; row++)
+            {
+                if (!remaining[row])
+                    continue;
+
+                choice[row] = branchCount - 1;
+                taken[branchCount - 1][row] = true;
+            }
+        }
+
+        var branches = new IArrowArray[branchCount];
+        var nullLiterals = new bool[branchCount];
+        for (var branch = 0; branch < branchCount; branch++)
+        {
+            // The value of pair `branch` is the odd argument beside it; the ELSE is the last one.
+            var index = branch < pairs ? branch * 2 + 1 : args.Count - 1;
+            branches[branch] = args.Evaluate(index, taken[branch]);
+            nullLiterals[branch] = args.IsNullLiteral(index);
+        }
+
+        return UnifyBranches(branches, nullLiterals, choice, rowCount);
     }
 
     /// <summary>A condition is taken only when it is true — null is not.</summary>

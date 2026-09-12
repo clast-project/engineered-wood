@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 10:10:20.905291",
-      "2026-09-11 10:10:20.905291",
-      "2026-09-11 10:10:20.905291"
+      "2026-09-11 15:44:12.426473",
+      "2026-09-11 15:44:12.426473",
+      "2026-09-11 15:44:12.426473"
      ]
     }
    },
@@ -18076,6 +18076,704 @@
       true,
       true
      ]
+    }
+   }
+  ],
+  "short-circuit": [
+   {
+    "expression": "nvl(1, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl(1, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(1, 1/0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(1, (1 / 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "ifnull(1, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "ifnull(1, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "if(true, 1, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(true, 1, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN true THEN 1 ELSE CAST('0x10' AS DOUBLE) END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN true THEN 1 ELSE CAST('0x10' AS DOUBLE) END"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN true THEN 1 WHEN CAST('0x10' AS DOUBLE) > 0 THEN 2 END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN true THEN 1 WHEN (CAST('0x10' AS DOUBLE) > 0) THEN 2 END"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "if(s IS NOT NULL, 0, CAST(s AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((s IS NOT NULL), 0, CAST(s AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN s IS NOT NULL THEN 0 ELSE CAST(s AS INT) END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN (s IS NOT NULL) THEN 0 ELSE CAST(s AS INT) END"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, CAST(t AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, CAST(t AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, b, CAST(t AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, b, CAST(t AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "if(a IS NOT NULL, a, if(b IS NOT NULL, b, CAST(t AS INT)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((a IS NOT NULL), a, if((b IS NOT NULL), b, CAST(t AS INT)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "b = 0 OR a / b > 1",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "((b = 0) OR ((a / b) > 1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "b <> 0 AND a / b > 1",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((NOT (b = 0)) AND ((a / b) > 1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "a IS NOT NULL OR CAST(t AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "((a IS NOT NULL) OR (CAST(t AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "a IS NULL AND CAST(t AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((a IS NULL) AND (CAST(t AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "NOT (a IS NULL AND CAST(t AS INT) > 0)",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT ((a IS NULL) AND (CAST(t AS INT) > 0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "b <> 0 OR a / b > 1",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "((NOT (b = 0)) OR ((a / b) > 1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 12) ==\n(b <> 0 OR a / b > 1) AS r\n           ^^^^^\n"
+    }
+   },
+   {
+    "expression": "b = 0 AND a / b > 1",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((b = 0) AND ((a / b) > 1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 12) ==\n(b = 0 AND a / b > 1) AS r\n           ^^^^^\n"
+    }
+   },
+   {
+    "expression": "a >= -2147483648 OR CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "((a >= -2147483648) OR (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 22) ==\n(a >= -2147483648 OR CAST('x' AS INT) > 0) AS r\n                     ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "a IS NULL OR a >= -2147483648 OR CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "Or",
+     "sql": "(((a IS NULL) OR (a >= -2147483648)) OR (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "a < -2147483648 AND CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((a < -2147483648) AND (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 22) ==\n(a < -2147483648 AND CAST('x' AS INT) > 0) AS r\n                     ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "a IS NOT NULL AND a < -2147483648 AND CAST('x' AS INT) > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "(((a IS NOT NULL) AND (a < -2147483648)) AND (CAST('x' AS INT) > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 14) ==\n(coalesce(a, CAST('0x10' AS DOUBLE))) AS r\n             ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "if(a IS NULL, CAST('0x10' AS DOUBLE), 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((a IS NULL), CAST('0x10' AS DOUBLE), 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 16) ==\n(if(a IS NULL, CAST('0x10' AS DOUBLE), 0)) AS r\n               ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CASE WHEN a IS NULL THEN CAST('0x10' AS DOUBLE) ELSE 0 END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN (a IS NULL) THEN CAST('0x10' AS DOUBLE) ELSE 0 END"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 27) ==\n(CASE WHEN a IS NULL THEN CAST('0x10' AS DOUBLE) ELSE 0 END) AS r\n                    "
+    }
+   },
+   {
+    "expression": "nullif(a, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(a, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 12) ==\n(nullif(a, CAST('0x10' AS DOUBLE))) AS r\n           ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "greatest(a, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 14) ==\n(greatest(a, CAST('0x10' AS DOUBLE))) AS r\n             ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "least(1, CAST('0x10' AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(1, CAST('0x10' AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '0x10' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 11) ==\n(least(1, CAST('0x10' AS DOUBLE))) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "coalesce(a, round(d1, 1 + 1))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, round(d1, (1 + 1)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, round(d1, 1 + 1))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, round(d1, (1 + 1)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, f, 'abc')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), f, 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, 'abc')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(ns, 'abc')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(ns, 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1",
+      "abc",
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, CAST(NULL AS STRING))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, CAST(NULL AS STRING))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "if(1 = 1, a, bin)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((1 = 1), a, bin)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#0 else bin#17 AS r#3813]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#3814]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
     }
    }
   ],
