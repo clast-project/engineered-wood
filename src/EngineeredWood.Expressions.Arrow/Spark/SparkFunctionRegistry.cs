@@ -146,7 +146,7 @@ public sealed class SparkFunctionRegistry
                 return SparkFunctions.DateFormat(args, rowCount);
 
             case "coalesce" or "nvl" or "ifnull":
-                return Coalesce(new EagerArguments(args, rowCount), rowCount);
+                return Coalesce(new EagerArguments(args), rowCount);
 
             case "greatest" or "least":
                 return Extreme(name, args, rowCount);
@@ -161,14 +161,14 @@ public sealed class SparkFunctionRegistry
 
             case "if":
                 Expect(name, args, 3);
-                return If(new EagerArguments(args, rowCount), rowCount);
+                return If(new EagerArguments(args), rowCount);
 
             case "nvl2":
                 Expect(name, args, 3);
-                return Nvl2(new EagerArguments(args, rowCount), rowCount);
+                return Nvl2(new EagerArguments(args), rowCount);
 
             case "case":
-                return Case(new EagerArguments(args, rowCount), rowCount);
+                return Case(new EagerArguments(args), rowCount);
 
             default:
                 throw new NotSupportedException(
@@ -233,13 +233,8 @@ public sealed class SparkFunctionRegistry
     private sealed class EagerArguments : IConditionalArguments
     {
         private readonly IReadOnlyList<IArrowArray> _args;
-        private readonly int _rowCount;
 
-        public EagerArguments(IReadOnlyList<IArrowArray> args, int rowCount)
-        {
-            _args = args;
-            _rowCount = rowCount;
-        }
+        public EagerArguments(IReadOnlyList<IArrowArray> args) => _args = args;
 
         public int Count => _args.Count;
 

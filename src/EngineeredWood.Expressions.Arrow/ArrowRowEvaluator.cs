@@ -1532,9 +1532,24 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         }
     }
 
-    // Materialize against a caller-supplied Arrow type. The decimal / temporal cases need metadata a bare
-    // LiteralValue cannot carry (precision/scale/width, unit/timezone, date-vs-timestamp); every other type
-    // is inferrable, so it falls through to the type-inferring overload.
+    /// <summary>
+    /// Materializes against a caller-supplied Arrow type, which the answer always carries.
+    /// </summary>
+    /// <remarks>
+    /// The decimal and temporal cases need metadata a bare <see cref="LiteralValue"/> cannot
+    /// carry — precision/scale/width, unit/timezone, date-vs-timestamp — and every other type is
+    /// inferrable from a value, so those fall through to the type-inferring overload.
+    /// <para>
+    /// <b>Except when there is no value to infer from.</b> An expression that is null in every
+    /// row tells the inferring overload nothing, and it answered with whatever it uses for "no
+    /// type" — a string column before #293 and a <c>void</c> one after — so a generated
+    /// <c>INT</c> column defined as <c>NULL</c> came back <c>utf8</c>. That breaks this
+    /// overload's whole contract: its callers are <c>DeltaGeneratedColumns</c> and the Lance
+    /// writer, which put the array straight into a batch whose schema declares
+    /// <paramref name="targetType"/>. A null is null at every type, so the target simply decides
+    /// which one it is.
+    /// </para>
+    /// </remarks>
     private static IArrowArray MaterializeAsArray(LiteralValue?[] values, int length, IArrowType targetType) =>
         targetType switch
         {
@@ -1545,6 +1560,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             TimestampType tt => BuildTimestampArray(values, length, tt),
             Date32Type => BuildDate32Array(values, length),
             Date64Type => BuildDate64Array(values, length),
+            _ when FirstKind(values) is null => ArrowCompute.MakeNullArray(targetType, length),
             _ => MaterializeAsArray(values, length),
         };
 

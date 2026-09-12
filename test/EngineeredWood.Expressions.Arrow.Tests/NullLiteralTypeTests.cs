@@ -263,6 +263,63 @@ public sealed class NullLiteralTypeTests
                 SparkSqlParser.ParseExpression("round('abc', 2)"), batch));
     }
 
+    /// <summary>
+    /// The target-type overload answers at the TARGET's type, even with nothing to infer from.
+    /// </summary>
+    /// <remarks>
+    /// <b>This one predates #293 and is fixed alongside it, because #293 made it one case worse.</b>
+    /// <c>EvaluateExpression(expression, batch, targetType)</c> falls through to the type-inferring
+    /// overload for every target but decimal and temporal — and an expression null in every row
+    /// gives that overload nothing to infer from, so it answered with whatever it uses for "no
+    /// type": a <c>utf8</c> column before, a <c>void</c> one after. Measured on `main`, a generated
+    /// <c>INT</c> column defined as <c>NULL</c> came back <c>utf8</c>; the string target was the
+    /// only one that happened to agree, and #293 took that away too.
+    /// <para>
+    /// It matters because this overload's two callers — <c>DeltaGeneratedColumns.Compute</c> and
+    /// the Lance writer — put the array straight into a batch whose schema declares the target, so
+    /// the array and the schema disagreed. Nothing caught it: every test that computes a generated
+    /// column gives it an expression that produces values.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("NULL", "int")]
+    [InlineData("NULL", "string")]
+    [InlineData("NULL", "boolean")]
+    [InlineData("NULL", "binary")]
+    [InlineData("NULL", "double")]
+    [InlineData("NULL", "bigint")]
+    [InlineData("NULL", "date")]
+    [InlineData("NULL", "decimal(10,2)")]
+    [InlineData("coalesce(NULL, NULL)", "int")]
+    [InlineData("CAST(NULL AS INT)", "bigint")]
+    // ...and a column that holds nothing, which is the same question asked of real data.
+    [InlineData("s", "int")]
+    public void AnAllNullExpressionMaterializesAtTheTargetType(string sql, string target)
+    {
+        var wanted = TargetType(target);
+
+        var result = new ArrowRowEvaluator(new SparkFunctionRegistry()).EvaluateExpression(
+            SparkSqlParser.ParseExpression(sql), EmptyStringColumn(), wanted);
+
+        Assert.Equal(SparkName(wanted), SparkName(result.Data.DataType));
+        Assert.Equal(2, result.Length);
+        for (var row = 0; row < result.Length; row++)
+            Assert.True(result.IsNull(row));
+    }
+
+    private static IArrowType TargetType(string spark) => spark switch
+    {
+        "int" => Int32Type.Default,
+        "bigint" => Int64Type.Default,
+        "double" => DoubleType.Default,
+        "string" => StringType.Default,
+        "boolean" => BooleanType.Default,
+        "binary" => BinaryType.Default,
+        "date" => Date32Type.Default,
+        "decimal(10,2)" => new Decimal128Type(10, 2),
+        _ => throw new ArgumentOutOfRangeException(nameof(spark), spark, "not a target this test builds"),
+    };
+
     /// <summary>An Arrow type spelled the way Spark's <c>dataType.simpleString</c> spells it.</summary>
     private static string SparkName(IArrowType type) => type switch
     {
