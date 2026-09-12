@@ -335,11 +335,106 @@ public sealed class ShortCircuitEvaluationTests
         Assert.Equal(3, result.GetValue(2));
     }
 
+    /// <summary>
+    /// <c>nvl2</c> gathers both ways at once — the subject decides, and every row goes to one
+    /// branch or the other.
+    /// </summary>
+    /// <remarks>
+    /// The corpus reaches this with its three-row batch, but only ever with the null row alone on
+    /// one side. Here the selection is interleaved, and BOTH branches are unevaluable on the rows
+    /// they do not own: the then-branch would refuse 'bad' on rows 1 and 3, the else-branch would
+    /// refuse 'worse' on rows 0 and 2. An implementation that evaluated either branch whole raises
+    /// instead of answering, whichever one it got wrong.
+    /// </remarks>
+    [Fact]
+    public void Nvl2EvaluatesEachBranchOverOnlyTheRowsTheSubjectSendsIt()
+    {
+        var batch = Batch(
+            ("a", Ints(10, null, 30, null)),
+            ("present", Strings("1", "bad", "3", "bad")),
+            ("absent", Strings("worse", "2", "worse", "4")));
+
+        var result = (Int32Array)Eval("nvl2(a, CAST(present AS INT), CAST(absent AS INT))", batch);
+
+        Assert.Equal(1, result.GetValue(0));
+        Assert.Equal(2, result.GetValue(1));
+        Assert.Equal(3, result.GetValue(2));
+        Assert.Equal(4, result.GetValue(3));
+    }
+
+    /// <summary>
+    /// The subject is read for NULLNESS, so a type no branch could be is still a valid one to ask
+    /// about.
+    /// </summary>
+    /// <remarks>
+    /// This is where <c>nvl2</c> parts company with <c>if</c>, whose condition Spark requires to
+    /// be boolean. Measured on 4.0.3, <c>nvl2(bin, 1, 2)</c> answers — so a binary subject must
+    /// not travel the same path that refuses a non-boolean condition.
+    /// </remarks>
+    [Fact]
+    public void Nvl2ReadsASubjectThatIsNotABooleanAtAll()
+    {
+        var binary = new BinaryArray.Builder();
+        binary.Append(new byte[] { 0x00 }).AppendNull().Append(new byte[] { 0x01 });
+
+        var batch = Batch(("a", Ints(1, 2, 3)), ("bin", binary.Build()));
+
+        var result = (Int32Array)Eval("nvl2(bin, 1, 2)", batch);
+
+        Assert.Equal(1, result.GetValue(0));
+        Assert.Equal(2, result.GetValue(1));
+        Assert.Equal(1, result.GetValue(2));
+    }
+
+    /// <summary>
+    /// The subject is evaluated over every row, whatever the branches want, because it is what
+    /// decides them.
+    /// </summary>
+    /// <remarks>
+    /// Measured: <c>nvl2(CAST(t AS INT), 1, 2)</c> raises under ANSI even though both branches are
+    /// constants no cast could trouble. The corpus pins that from a batch whose bad value sits on
+    /// row 0; here it sits on the last row, so an implementation that stopped at the first
+    /// decidable row would still be caught.
+    /// </remarks>
+    [Fact]
+    public void Nvl2StillEvaluatesASubjectNoBranchNeeds()
+    {
+        var batch = Batch(("s", Strings("1", null, "bad")));
+
+        Assert.Throws<SparkEvaluationException>(() => Eval("nvl2(CAST(s AS INT), 1, 2)", batch));
+    }
+
+    /// <summary>
+    /// Invoking <c>nvl2</c> eagerly, with the arguments already columns, chooses and unifies the
+    /// same way.
+    /// </summary>
+    [Fact]
+    public void TheEagerRegistryEntryPointHandlesNvl2()
+    {
+        var args = new[] { Ints(1, null, 3), Ints(7, 7, 7), Ints(9, 9, 9) };
+
+        var result = (Int32Array)Ansi.Invoke("nvl2", args, 3);
+
+        Assert.Equal(7, result.GetValue(0));
+        Assert.Equal(9, result.GetValue(1));
+        Assert.Equal(7, result.GetValue(2));
+    }
+
+    /// <summary>Three arguments, exactly — Spark answers WRONG_NUM_ARGS to anything else.</summary>
+    [Fact]
+    public void Nvl2TakesThreeArguments()
+    {
+        var batch = Batch(("a", Ints(1, 2, 3)));
+
+        Assert.Throws<ArgumentException>(() => Eval("nvl2(a, a)", batch));
+        Assert.Throws<ArgumentException>(() => Eval("nvl2(a, a, 0, 0)", batch));
+    }
+
     /// <summary>Only the conditional family evaluates its own arguments.</summary>
     [Fact]
     public void TheShortCircuitingFamilyIsTheConditionalOne()
     {
-        foreach (var name in new[] { "coalesce", "nvl", "ifnull", "if", "case" })
+        foreach (var name in new[] { "coalesce", "nvl", "ifnull", "nvl2", "if", "case" })
             Assert.True(Ansi.ShortCircuits(name), name);
 
         // Measured eager in Spark, all of them.

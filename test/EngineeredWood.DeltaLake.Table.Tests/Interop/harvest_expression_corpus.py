@@ -1626,6 +1626,51 @@ GROUPS = {
         "coalesce(a, NULL)",
         # A pair with no common type is refused however few rows reach it.
         "if(1 = 1, a, bin)",
+
+        # nvl2, #308, which was not registered at all. It is `if(x IS NOT NULL, a, b)` and Spark
+        # says so itself -- the refusal below reports `Cannot resolve "(IF((a IS NOT NULL), a,
+        # bin))"`, naming a rewrite the expression never mentioned -- so these rows ask whether it
+        # behaves like the `if` rows above rather than assuming it inherits them.
+        "nvl2(a, a, 0)",
+        # Lazy in the ELSE, column-driven: rows 0 and 2 hold 'abc' and '', which the cast refuses
+        # under ANSI, and neither reaches it.
+        "nvl2(s, 0, CAST(s AS INT))",
+        "nvl2(a, a, CAST(s AS INT))",
+        # Lazy in the THEN, which the shape above cannot reach: the first argument decides both
+        # branches, so a row that skips `a` is a row that took `b`. A first argument no row finds
+        # present is what leaves the then-branch unevaluated on every row -- and it still TYPES the
+        # result, which is why this answers `0.0` as a double rather than an int.
+        "nvl2(NULL, CAST('0x10' AS DOUBLE), 0)",
+        # Reached, and still raising, in each branch and in the subject. The subject is the
+        # interesting one: it is evaluated on every row whatever the branches say, because it is
+        # what decides them.
+        "nvl2(a, CAST(s AS INT), 0)",
+        "nvl2(a, a, 1/0)",
+        "nvl2(CAST(t AS INT), 1, 2)",
+        # The subject is read for NULLNESS, not for truth, so unlike `if` it needs no boolean --
+        # and needs no scalar either.
+        "nvl2(s, a, a)",
+        "nvl2(bl, a, a)",
+        "nvl2(bin, 1, 2)",
+        "nvl2(ts, 1, 2)",
+        "nvl2(nested, a, 0)",
+        # ...and it takes no part in the result type. Both of these are `int`, not `string`.
+        "nvl2(ns, a, 0)",
+        # The branches unify exactly as `if`'s do, bare NULL dropped from the fold and all.
+        "nvl2(a, a, b)",
+        "nvl2(a, a, NULL)",
+        "nvl2(a, NULL, 'abc')",
+        "nvl2(a, a, d1)",
+        "nvl2(a, f, a)",
+        "nvl2(a, ns, 0)",
+        # A branch nothing selects whose type is read out of a VALUE -- the `TypeOver` fallback,
+        # the same guard the `coalesce(a, round(d1, 1 + 1))` row above is.
+        "nvl2(a, a, round(d1, 1 + 1))",
+        # Refused: no common type, and the message is where the rewrite to `if` is visible.
+        "nvl2(a, a, bin)",
+        # Strictly three arguments -- WRONG_NUM_ARGS, not a silent default.
+        "nvl2(a, a)",
+        "nvl2(a, a, 0, 0)",
     ],
 
     "ansi-sensitive": [

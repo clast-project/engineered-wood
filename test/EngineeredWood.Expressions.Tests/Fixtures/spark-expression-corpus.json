@@ -2257,9 +2257,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11",
-      "2026-09-11",
-      "2026-09-11"
+      "2026-09-12",
+      "2026-09-12",
+      "2026-09-12"
      ]
     }
    },
@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-11 15:44:12.426473",
-      "2026-09-11 15:44:12.426473",
-      "2026-09-11 15:44:12.426473"
+      "2026-09-11 17:37:10.551816",
+      "2026-09-11 17:37:10.551816",
+      "2026-09-11 17:37:10.551816"
      ]
     }
    },
@@ -18774,6 +18774,442 @@
     "eval": {
      "ok": false,
      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((1 = 1), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if ((1 = 1)) a#19 else bin#36 AS r#3814]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 a"
+    }
+   },
+   {
+    "expression": "nvl2(a, a, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      0,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(s, 0, CAST(s AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(s, 0, CAST(s AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, CAST(s AS INT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, CAST(s AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(NULL, CAST('0x10' AS DOUBLE), 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(NULL, CAST('0x10' AS DOUBLE), 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, CAST(s AS INT), 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, CAST(s AS INT), 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 10) ==\n(nvl2(a, CAST(s AS INT), 0)) AS r\n         ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nvl2(a, a, 1/0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, (1 / 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 13) ==\n(nvl2(a, a, 1/0)) AS r\n            ^^^\n"
+    }
+   },
+   {
+    "expression": "nvl2(CAST(t AS INT), 1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(CAST(t AS INT), 1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 7) ==\n(nvl2(CAST(t AS INT), 1, 2)) AS r\n      ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "nvl2(s, a, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(s, a, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(bl, a, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(bl, a, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(bin, 1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(bin, 1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(ts, 1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(ts, 1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      2,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(nested, a, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(nested, a, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      0,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(ns, a, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(ns, a, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      0,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, b)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, NULL, 'abc')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, NULL, 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      "abc",
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, d1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, f, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, f, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, ns, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, ns, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      0,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, round(d1, 1 + 1))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, round(d1, (1 + 1)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1.00",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, a, bin)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, bin)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#0, a#0, bin#17) AS r#3895]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF((a IS NOT NULL), a, bin))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BINARY\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [nvl2(a#19, a#19, bin#36) AS r#3896]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast("
+    }
+   },
+   {
+    "expression": "nvl2(a, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `nvl2` requires 3 parameters but the actual number is 2. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605; line 1 pos 1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `nvl2` requires 3 parameters but the actual number is 2. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605; line 1 pos 1"
+    }
+   },
+   {
+    "expression": "nvl2(a, a, 0, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, a, 0, 0)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `nvl2` requires 3 parameters but the actual number is 4. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605; line 1 pos 1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [WRONG_NUM_ARGS.WITHOUT_SUGGESTION] The `nvl2` requires 3 parameters but the actual number is 4. Please, refer to 'https://spark.apache.org/docs/latest/sql-ref-functions.html' for a fix. SQLSTATE: 42605; line 1 pos 1"
     }
    }
   ],
