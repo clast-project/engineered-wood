@@ -848,9 +848,16 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Three states, not two: <c>raising</c> is ANSI's cast, <c>legacy</c> is the non-ANSI
-    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force. Only
-    /// <see cref="CastToIntegral"/> tells the last two apart — every other target nulls under both
-    /// — so <paramref name="legacy"/> reaches only that one.
+    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force.
+    /// <para>
+    /// Most targets null under both of the last two and take <paramref name="raising"/> alone.
+    /// Three read <paramref name="legacy"/>, and each reads it for a different reason:
+    /// <see cref="CastToIntegral"/>, because the legacy dialect WRAPS an overflow where
+    /// try_cast nulls it; <see cref="CastToBinary"/> and <see cref="CastToBoolean"/>, because
+    /// each has a SOURCE the legacy dialect alone accepts — an integral and a temporal
+    /// respectively — and try_cast type-checks as ANSI does, so both must refuse it with ansi
+    /// off as well. That is the whole reason the pair is three states rather than a bool.
+    /// </para>
     /// </remarks>
     private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
@@ -1447,8 +1454,26 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Casts to a boolean, which reads a string as a WORD and not as a number.</summary>
     /// <remarks>
-    /// Two sources answer a boolean and no others: a NUMBER, which is true when it is not zero,
-    /// and a STRING, which must be in <see cref="BooleanVocabulary"/>. #314.
+    /// The whole source matrix, because #314 was as much about which sources reach the
+    /// conversion as about what it reads:
+    /// <list type="bullet">
+    /// <item><description>
+    /// A NUMBER is true when it is not zero. A BOOLEAN source arrives here as one, because
+    /// <see cref="SparkArrays.ReadForCast"/> renders it as 1 or 0, so the identity cast falls
+    /// out of the same branch rather than needing one of its own.
+    /// </description></item>
+    /// <item><description>
+    /// A STRING must be a word in <see cref="BooleanVocabulary"/>, and is refused otherwise.
+    /// </description></item>
+    /// <item><description>
+    /// A TEMPORAL answers under the <paramref name="legacy"/> dialect ALONE, and the two
+    /// temporals answer differently: a DATE is null at every row and a TIMESTAMP is its
+    /// instant against the epoch. See the branch below.
+    /// </description></item>
+    /// <item><description>
+    /// A BINARY is refused in both dialects, and so is anything else.
+    /// </description></item>
+    /// </list>
     /// <para>
     /// <b>A numeric-looking STRING is not a number here.</b> Measured, <c>CAST(2 AS BOOLEAN)</c>
     /// is true while <c>CAST('2' AS BOOLEAN)</c> is refused, so the string must not reach the
@@ -1459,11 +1484,11 @@ public sealed class SparkFunctionRegistry
     /// loudly, which is what a numeric-looking string in a CHECK constraint would have hit.
     /// </para>
     /// <para>
-    /// <b>The rest are TYPE errors, refused for the whole column rather than per row</b>, which
-    /// is what Spark does with them and the same treatment <see cref="CastToBinary"/> gives its
-    /// own. A BINARY renders as text and must not be read as one — <c>X'74727565'</c> is the
-    /// bytes of "true", and Spark refuses it in both dialects — and a temporal source is the
-    /// <paramref name="legacy"/> dialect's alone, refused under ANSI and by try_cast either way.
+    /// <b>The two refusals are TYPE errors, for the whole column rather than per row</b>, which
+    /// is what Spark makes of them and the treatment <see cref="CastToBinary"/> gives its own.
+    /// The binary one is the load-bearing half: a binary RENDERS as text, so reading that
+    /// rendering as a word would make <c>CAST(X'74727565' AS BOOLEAN)</c> — the bytes of
+    /// "true" — answer true, where Spark refuses it at analysis.
     /// </para>
     /// </remarks>
     private IArrowArray CastToBoolean(IArrowArray source, int rowCount, bool raising, bool legacy)
