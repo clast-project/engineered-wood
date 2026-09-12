@@ -2250,30 +2250,52 @@ public sealed class SparkFunctionRegistry
     /// <c>'abc' &lt;=&gt; CAST(NULL AS INT)</c> — which has no such short-circuit — raises
     /// <c>CAST_INVALID_INPUT</c>. Without the mask a batch mixing one such row with an ordinary
     /// one would refuse a comparison Spark answers.
-    /// <para>
-    /// Only a STRING is masked, because only a string cast can refuse. The numeric rounding #280
-    /// asks for cannot fail, so it has no refusal for a null opposite it to suppress and pays
-    /// nothing to copy the operand.
-    /// </para>
     /// </remarks>
     private IArrowArray CastForEquality(
-        IArrowArray moving, IArrowArray staying, IArrowType target, int rowCount)
-    {
-        if (moving is StringArray strings)
-        {
-            var masked = new StringArray.Builder();
-            for (var row = 0; row < rowCount; row++)
-            {
-                if (strings.IsNull(row) || SparkFunctions.IsNull(staying, row))
-                    masked.AppendNull();
-                else
-                    masked.Append(strings.GetString(row)!);
-            }
+        IArrowArray moving, IArrowArray staying, IArrowType target, int rowCount) =>
+        Cast(
+            NulledWhereOtherIsNull(moving, staying, rowCount),
+            target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
 
-            moving = masked.Build();
+    /// <summary>
+    /// <paramref name="moving"/> with its string cells blanked wherever the other operand is null,
+    /// or <paramref name="moving"/> itself when no row needs it.
+    /// </summary>
+    /// <remarks>
+    /// <b>Scanned before it is rebuilt, which is the point of splitting this out.</b> The
+    /// overwhelmingly common batch has no null opposite the string at all, and there the answer is
+    /// the operand as it stands — rebuilding it would allocate a builder and a fresh
+    /// <see cref="string"/> per row to reproduce what was already there. The scan reads null bits
+    /// and allocates nothing. The comparison evaluator's own <c>NulledWhere</c> takes the same
+    /// shape for the same reason.
+    /// <para>
+    /// Only a STRING is masked, because only a string cast can refuse. The numeric rounding #280
+    /// asks for cannot fail, so it has no refusal for a null opposite it to suppress.
+    /// </para>
+    /// </remarks>
+    private static IArrowArray NulledWhereOtherIsNull(
+        IArrowArray moving, IArrowArray staying, int rowCount)
+    {
+        if (moving is not StringArray strings)
+            return moving;
+
+        var needed = false;
+        for (var row = 0; row < rowCount && !needed; row++)
+            needed = !strings.IsNull(row) && SparkFunctions.IsNull(staying, row);
+
+        if (!needed)
+            return moving;
+
+        var masked = new StringArray.Builder();
+        for (var row = 0; row < rowCount; row++)
+        {
+            if (strings.IsNull(row) || SparkFunctions.IsNull(staying, row))
+                masked.AppendNull();
+            else
+                masked.Append(strings.GetString(row)!);
         }
 
-        return Cast(moving, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
+        return masked.Build();
     }
 
     private IArrowArray If(IConditionalArguments args, int rowCount)

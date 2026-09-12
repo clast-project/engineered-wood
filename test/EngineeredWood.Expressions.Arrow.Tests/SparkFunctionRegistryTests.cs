@@ -1818,8 +1818,12 @@ public sealed class SparkFunctionRegistryTests
             Assert.True(Eval(registry, "nullif(d, w)", batch).IsNull(0));
             Assert.True(Eval(registry, "nullif(w, d)", batch).IsNull(0));
 
-            // ...and the result keeps the first operand's own type, unrounded.
-            Assert.IsType<Decimal128Array>(Eval(registry, "nullif(d, CAST(2 AS DECIMAL(38,0)))", batch));
+            // ...and the result keeps the first operand's own type AND its unrounded value. The
+            // type alone would not say so: the comparison rounds 1.005 to 1, and 1 is a
+            // Decimal128Array too, so only the value catches the rounded operand leaking out.
+            var kept = Assert.IsType<Decimal128Array>(
+                Eval(registry, "nullif(d, CAST(2 AS DECIMAL(38,0)))", batch));
+            Assert.Equal(1.005m, kept.GetValue(0));
         }
 
         // Written as a CAST rather than as a column, because System.Decimal's scale stops at 28:
