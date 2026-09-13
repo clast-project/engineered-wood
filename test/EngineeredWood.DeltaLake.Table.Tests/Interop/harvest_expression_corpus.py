@@ -1550,8 +1550,12 @@ GROUPS = {
         "concat('[', trim('\t x \t'), ']')",
         "concat('[', ltrim('  x'), ']')", "concat('[', ltrim('\tx'), ']')",
         "concat('[', rtrim('x  '), ']')", "concat('[', rtrim('x\t'), ']')",
-        # ...and LIKE trims NOTHING, under any of the three, so a padded string is not the bare one.
-        "'  x  ' LIKE 'x'", "'\tx' LIKE '%x'",
+        # ...and LIKE trims NOTHING, under any of the three, so a padded string is not the bare
+        # one. The `'x'` patterns are what make these DISTINGUISHING -- they are false, and an
+        # accidental trim anywhere in the path would turn them true. The `'%x'` row is the control
+        # beside the tab one saying the tab is still there to be matched; on its own it would be
+        # true either way and would pin nothing.
+        "'  x  ' LIKE 'x'", "'\tx' LIKE 'x'", "'\tx' LIKE '%x'",
     ],
 
     # Casts to and from BINARY, and the conditionals that need them. #295. Binary answers are

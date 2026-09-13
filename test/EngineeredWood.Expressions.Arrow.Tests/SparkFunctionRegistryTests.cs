@@ -2530,14 +2530,17 @@ public sealed class SparkFunctionRegistryTests
         Assert.True(char.IsWhiteSpace(c), "the point of the row is that .NET disagrees");
     }
 
-    /// <summary>
-    /// Every string cast takes the set, and each is wrong in BOTH directions without it.
-    /// </summary>
+    /// <summary>Every numeric cast takes the set, whichever parse it reaches it through.</summary>
     /// <remarks>
-    /// One test per direction would have passed on half the targets: the numeric parses share
-    /// <see cref="SparkArrays.CastInput"/>'s trim, the integral one adds its own scan, the decimal
-    /// one has a reader of its own, and the temporal ones needed more than a trim. The targets are
-    /// listed rather than sampled because that is four code paths, not one.
+    /// The targets are listed rather than sampled because they are not one code path: the shared
+    /// parse in <see cref="SparkArrays.CastInput"/>, the integral scan in
+    /// <c>SparkIntegralCasts.Classify</c> on top of it, and <c>SparkDecimalText</c>'s own reader.
+    /// <para>
+    /// <b>DECIMAL is the one that already agreed</b>, and it is here as a control rather than as
+    /// coverage of a changed path: its reader has used <see cref="SparkText.TrimBounds"/> since
+    /// before #314, so none of its rows was among the 39 the corpus group found. What it pins is
+    /// that unifying the sites did not move the one target that was right.
+    /// </para>
     /// </remarks>
     [Theory]
     [InlineData("CAST(s AS INT)")]

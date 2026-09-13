@@ -118,17 +118,21 @@ public sealed class SparkFunctionRegistry
             // every byte at or below 0x20 (SparkText.TrimBounds), and not .NET's `string.Trim`,
             // which is Unicode whitespace. Measured on 4.0.3: `trim('\tx\t')` is unchanged, and so
             // are the newline and no-break-space forms, while `trim('  x  ')` is "x". #316.
+            //
+            // Through SparkText and not `t.Trim(' ')`: `string.Trim(char)` does not exist on
+            // netstandard2.0, so that call binds to `Trim(params char[])` there and allocates a
+            // one-element array per row -- MapString runs the lambda for every row.
             case "trim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.Trim(' '));
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimSpaces);
 
             case "ltrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimStart(' '));
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimLeadingSpaces);
 
             case "rtrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimEnd(' '));
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimTrailingSpaces);
 
             case "substring" or "substr":
                 if (args.Count is not (2 or 3))
@@ -916,8 +920,14 @@ public sealed class SparkFunctionRegistry
     /// <para>
     /// So a Spark-trimmed string whose first or last character is still .NET whitespace is
     /// precisely the string the two disagree about, and it is refused here rather than left for
-    /// the parser to swallow. Interior whitespace is not this rule: no parser skips that, and
-    /// <c>'2026-08 -11'</c> is refused by both. #316.
+    /// the parser to swallow. #316.
+    /// </para>
+    /// <para>
+    /// <b>INTERIOR whitespace is a different defect and this guard does not touch it.</b>
+    /// <c>DateTimeOffset.TryParse</c> reads <c>'2026-08 -11'</c> as a date where Spark refuses
+    /// it, and it still does under this guard, because the space is not at an edge for the trim
+    /// or for this test to see. That is the grammar difference in #318 rather than a trim, and
+    /// the corpus row for it is declared against that issue.
     /// </para>
     /// </remarks>
     private static string? TemporalText(string source)
