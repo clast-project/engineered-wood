@@ -106,6 +106,13 @@ DECIMAL_LITERALS = [
 # digit, a separator. #174, #258.
 NUMERIC_TEXT = [
     "''", "' '", "'  '", "'12'", "'  12  '", "'\\t12\\n'",
+    # WHITESPACE THE TWO RUNTIMES DISAGREE ABOUT, which is #316 and which this list could not
+    # reach before it: every whitespace character above was one BOTH Spark and .NET trim, so a
+    # generated corpus of 600 expressions contained no character in the disagreement band at all
+    # and the fuzzer could not have found the defect. Spark trims bytes <= 0x20; .NET trims
+    # Unicode whitespace; neither set contains the other, and these two are the halves.
+    "'\u001f12'", "'12\u001f'",   # U+001F: Spark trims it, .NET does not
+    "'\u00a012'", "'12\u00a0'",   # U+00A0: .NET trims it, Spark does not
     "'1e'", "'e1'", "'1e+'", "'1e400'", "'1e-400'",
     "'0x10'", "'0b101'", "'1_000'", "'1,000'",
     "'+1'", "'-0'", "'-'", "'+'", "'.'", "'0.'", "'.5'", "'12.'",
@@ -129,6 +136,9 @@ NUMERIC_TEXT = [
 # General strings, for the string functions and the LIKE family.
 STRING_LITERALS = [
     "''", "'abc'", "'ABC'", "'AbC'", "'  abc  '", "'a'", "'%'", "'_'",
+    # The same two, for the trim FUNCTIONS -- a third rule again, and one a padded-with-spaces
+    # literal cannot tell from the other two: Spark's `trim(str)` removes the space alone. #316.
+    "'\tabc\t'", "'\u00a0abc\u00a0'",
     "'é'", "'\U0001F600'",   # a 2-byte char and a surrogate pair: length() counts UTF-16 units
     "'a%c'", "'\\\\'", "'x'",
 ]

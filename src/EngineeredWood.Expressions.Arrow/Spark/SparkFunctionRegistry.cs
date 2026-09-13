@@ -113,17 +113,26 @@ public sealed class SparkFunctionRegistry
                 Expect(name, args, 1);
                 return SparkFunctions.MapString(args[0], rowCount, t => t.ToLowerInvariant());
 
+            // A THIRD whitespace rule, and the one the name makes hardest to guess: Spark's
+            // one-argument `trim` removes the SPACE and nothing else. Not the CAST rule, which is
+            // every byte at or below 0x20 (SparkText.TrimBounds), and not .NET's `string.Trim`,
+            // which is Unicode whitespace. Measured on 4.0.3: `trim('\tx\t')` is unchanged, and so
+            // are the newline and no-break-space forms, while `trim('  x  ')` is "x". #316.
+            //
+            // Through SparkText and not `t.Trim(' ')`: `string.Trim(char)` does not exist on
+            // netstandard2.0, so that call binds to `Trim(params char[])` there and allocates a
+            // one-element array per row -- MapString runs the lambda for every row.
             case "trim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.Trim());
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimSpaces);
 
             case "ltrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimStart());
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimLeadingSpaces);
 
             case "rtrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.TrimEnd());
+                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimTrailingSpaces);
 
             case "substring" or "substr":
                 if (args.Count is not (2 or 3))
@@ -898,6 +907,40 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>
+    /// The text a temporal parse should see, or null when .NET's parser would see less of it.
+    /// </summary>
+    /// <remarks>
+    /// <b>The one place trimming Spark's way is not enough.</b> Everywhere else the parse under
+    /// <see cref="SparkText.TrimBounds"/> skips no more whitespace than the trim already removed:
+    /// .NET's number parser recognises 0x20 and 0x09-0x0D, which are all at or below 0x20.
+    /// <see cref="DateTimeOffset.TryParse(string, IFormatProvider, DateTimeStyles, out DateTimeOffset)"/>
+    /// is the exception — it skips <see cref="char.IsWhiteSpace(char)"/> ITSELF, at either end, so
+    /// measured in .NET it reads U+00A0 followed by <c>2026-08-11</c> as that date and hands back
+    /// a value Spark refuses. Trimming less would not have reached it.
+    /// <para>
+    /// So a Spark-trimmed string whose first or last character is still .NET whitespace is
+    /// precisely the string the two disagree about, and it is refused here rather than left for
+    /// the parser to swallow. #316.
+    /// </para>
+    /// <para>
+    /// <b>INTERIOR whitespace is a different defect and this guard does not touch it.</b>
+    /// <c>DateTimeOffset.TryParse</c> reads <c>'2026-08 -11'</c> as a date where Spark refuses
+    /// it, and it still does under this guard, because the space is not at an edge for the trim
+    /// or for this test to see. That is the grammar difference in #318 rather than a trim, and
+    /// the corpus row for it is declared against that issue.
+    /// </para>
+    /// </remarks>
+    private static string? TemporalText(string source)
+    {
+        var text = SparkText.Trim(source);
+
+        return text.Length > 0
+            && (char.IsWhiteSpace(text[0]) || char.IsWhiteSpace(text[text.Length - 1]))
+            ? null
+            : text;
+    }
+
+    /// <summary>
     /// Casts to a calendar date, taking the date the instant falls on in the resolved timezone.
     /// </summary>
     /// <remarks>
@@ -924,7 +967,8 @@ public sealed class SparkFunctionRegistry
             }
 
             if (value.Value.FromString
-                && DateTimeOffset.TryParse(value.Value.Text.Trim(), Invariant,
+                && TemporalText(value.Value.Text) is { } text
+                && DateTimeOffset.TryParse(text, Invariant,
                     DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
             {
                 instants[i] = parsed;
@@ -956,7 +1000,8 @@ public sealed class SparkFunctionRegistry
 
             if (value.Value.FromString)
             {
-                if (DateTimeOffset.TryParse(value.Value.Text.Trim(), Invariant,
+                if (TemporalText(value.Value.Text) is { } text
+                    && DateTimeOffset.TryParse(text, Invariant,
                         DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
                 {
                     instants[i] = parsed;

@@ -116,6 +116,17 @@ public sealed class SparkEvaluationCorpusTests
         ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
         ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
+        // #318, and the one row of the `string-trim` group that diverges -- which is not about
+        // trimming at all. It sits in that group as the control saying #316 trimmed rather than
+        // stripped, and interior whitespace is what it carries; what it FOUND is that
+        // `CastToDate` parses with `DateTimeOffset.TryParse` where Spark has a grammar of its
+        // own. Measured, we also read `2026/08/11`, `08/11/2026` and `Aug 11, 2026` as dates
+        // Spark refuses, and refuse `CAST('2026' AS DATE)`, which Spark reads as 2026-01-01.
+        // Only this row is declared because only this row is in the corpus; the rest are in the
+        // issue, and belong with the fix.
+        ["CAST('2026-08 -11' AS DATE)"] =
+            "#318: our temporal parse is DateTimeOffset.TryParse, which skips the interior space",
+
         // #301, and the one row of the `binary-casts` group that diverges. Spark's STRING is a
         // BYTE string: `CAST(X'FF' AS STRING)` holds the raw FF, and casting it back hands the
         // same byte over. A .NET string is UTF-16 and cannot hold an unpaired FF, so the decode
@@ -242,6 +253,12 @@ public sealed class SparkEvaluationCorpusTests
             // the fix; the ANSI side would not have moved either way.
             ["'" + Backslash + "u0663' + 1"] =
                 "#296: arithmetic has no string coercion; we throw",
+            // #318, as in the ANSI list. Both dialects see it, and they see it differently:
+            // under ANSI Spark refuses and we answer, here Spark answers NULL and we answer a
+            // date -- the ordinary raise-or-null split around one wrong acceptance.
+            ["CAST('2026-08 -11' AS DATE)"] =
+                "#318: our temporal parse is DateTimeOffset.TryParse, which skips the interior space",
+
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",

@@ -100,11 +100,12 @@ internal static class SparkIntegralCasts
     public static TextForm Classify(string text)
     {
         // Read between indices rather than over a trimmed copy: this runs once per row of a
-        // string-to-integral cast, and `Trim` allocates whenever there is anything to trim.
-        var index = 0;
-        var end = text.Length;
-        while (index < end && char.IsWhiteSpace(text[index])) index++;
-        while (end > index && char.IsWhiteSpace(text[end - 1])) end--;
+        // string-to-integral cast, and trimming allocates whenever there is anything to trim.
+        // Which is also why SparkText hands back bounds rather than a span.
+        //
+        // `char.IsWhiteSpace` was the wrong set here, the same way it was everywhere else: it
+        // keeps U+001F, which Spark trims, and removes U+00A0, which Spark does not. #316.
+        var (index, end) = SparkText.TrimBounds(text.AsSpan());
 
         if (index < end && (text[index] == '+' || text[index] == '-'))
             index++;

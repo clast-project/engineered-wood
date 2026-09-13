@@ -87,9 +87,26 @@ internal static class SparkArrays
             _index = 0;
             FromString = true;
 
-            // Trimmed once and shared. Both parses want the same text, and `Trim` allocates
-            // whenever there is anything to trim -- twice per row, for a padded cell.
-            var trimmed = text.Trim();
+            // Trimmed once and shared: both parses want the same text, and this runs for every
+            // row of every cast and comparison over a string column.
+            //
+            // SPARK'S TRIM, NOT .NET'S, and the two sets cross rather than nest -- see
+            // SparkText.TrimBounds. Nothing downstream can undo the choice: .NET's number parser
+            // skips only 0x20 and 0x09-0x0D on its own, all of which this has already removed, so
+            // what it sees is exactly what Spark's parse would. The TEMPORAL parses are the
+            // exception and handle it themselves. #316.
+            //
+            // A SPAN where the runtime has span parses, which is net8.0 and net10.0; only the
+            // netstandard2.0 build takes the string, and only that build allocates for a PADDED
+            // cell -- an unpadded one hands back the original instance either way. The two
+            // TryParse calls below are the same source on both sides: `trimmed` is a string there
+            // and a ReadOnlySpan<char> here, and each binds to its own overload. Same trap as
+            // TryReadTypeSuffixed and DecodeUtf8 below.
+#if NETSTANDARD2_0
+            var trimmed = SparkText.Trim(text);
+#else
+            var trimmed = SparkText.Trim(text.AsSpan());
+#endif
             IsNumeric = double.TryParse(
                 trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
             AsDouble = IsNumeric ? asDouble : 0d;
@@ -441,7 +458,7 @@ internal static class SparkArrays
     public static bool TryReadTypeSuffixed(string text, out double value)
     {
         value = 0d;
-        var trimmed = text.Trim();
+        var trimmed = SparkText.Trim(text);
         if (trimmed.Length < 2)
             return false;
 
