@@ -224,3 +224,45 @@ public interface IComparisonCoercion
     /// </remarks>
     IArrowArray CastForComparison(IArrowArray operand, IArrowType target, int rowCount);
 }
+
+/// <summary>
+/// A function registry that knows which of its functions can never produce a null.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast, so a registry that does not implement it
+/// leaves <c>IS NULL</c> / <c>IS NOT NULL</c> evaluating their operand exactly as before.
+/// </para>
+/// <para>
+/// It exists because Spark DISCARDS the operand of <c>IS NULL</c> / <c>IS NOT NULL</c> when the
+/// operand is provably non-nullable, so an error inside it never happens. Measured on 4.0.3 under
+/// ANSI, <c>CASE WHEN (CAST('abc' AS INT) &gt; 1) THEN 1 ELSE 2 END IS NULL</c> answers
+/// <c>false</c> while the same CASE without the <c>IS NULL</c> raises CAST_INVALID_INPUT, and
+/// <c>(2147483647 + 1) IS NULL</c> answers <c>false</c> where the same sum compared against zero
+/// raises ARITHMETIC_OVERFLOW. That is Spark's <c>NullPropagation</c>, and it fires on the whole
+/// predicate before a row is read rather than per row, so it is not the laziness of #279/#306.
+/// #319.
+/// </para>
+/// <para>
+/// <b>An ALLOW-LIST, and the default must be "nullable".</b> The judgement only ever makes a
+/// difference when it says a function can never be null, and saying so wrongly turns
+/// <c>x IS NOT NULL</c> into a constant <c>true</c> — which, inside a Delta CHECK constraint,
+/// admits a row Spark rejects. Under-claiming costs nothing but the fold. So a name this does not
+/// recognise, and every name added to a registry later, must answer false until it has been
+/// measured.
+/// </para>
+/// </remarks>
+public interface INullabilityRules
+{
+    /// <summary>
+    /// Whether a call to <paramref name="name"/> can never produce a null, given which of its
+    /// arguments can never produce one.
+    /// </summary>
+    /// <remarks>
+    /// Asked with the arguments' own answers rather than the argument expressions, because the
+    /// rules that exist are all positional: <c>coalesce</c> is never null if ANY argument is,
+    /// <c>if</c> and <c>nvl2</c> if their two RESULT arguments are (the first argument's
+    /// nullability does not reach the answer), and arithmetic if all of them are.
+    /// </remarks>
+    bool NeverNull(string name, ReadOnlySpan<bool> argumentsNeverNull);
+}

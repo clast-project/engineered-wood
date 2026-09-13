@@ -31,7 +31,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </para>
 /// </remarks>
 public sealed class SparkFunctionRegistry
-    : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions
+    : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -200,6 +200,113 @@ public sealed class SparkFunctionRegistry
         "coalesce" or "nvl" or "ifnull" or "nvl2" or "if" or "case" => true,
         _ => false,
     };
+
+    /// <summary>
+    /// Which functions can never produce a null, and on which of their arguments that depends.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's <c>Expression.nullable</c> for the names this registry answers for, measured
+    /// against 4.0.3 by asking Spark for the schema of <c>SELECT (expr) AS r</c>. It is read only
+    /// by <see cref="ArrowRowEvaluator"/>'s <c>IS NULL</c> / <c>IS NOT NULL</c> fold, and an
+    /// over-claim there yields a wrong answer, so this is an ALLOW-LIST: a name missing from the
+    /// switch is nullable, and a name added to <see cref="IsRegistered"/> later stays nullable
+    /// until someone measures it and adds it here.
+    /// </para>
+    /// <para>
+    /// <b>Every rule here is STRUCTURAL — it reads only which arguments can be null, never their
+    /// types.</b> That is not a simplification, it is the boundary: Spark's nullability is
+    /// structural for the conditional family and type-dependent everywhere else, and a
+    /// type-dependent rule cannot be answered from this seam at all.
+    /// </para>
+    /// <para>
+    /// <b>ARITHMETIC IS THE ONE THAT LOOKS STRUCTURAL AND IS NOT</b>, and it is deliberately
+    /// absent. Integral arithmetic is non-nullable in both dialects, so <c>2147483647 + 1</c> is
+    /// non-nullable and Spark answers <c>(2147483647 + 1) IS NULL</c> without adding. DECIMAL
+    /// arithmetic is not: its nullability follows the PROMOTED precision, and measured under ANSI
+    /// <c>CAST(1 AS DECIMAL(10,2)) + CAST(1 AS DECIMAL(10,2))</c> is NULLABLE (the sum wants
+    /// decimal(11,2)) while <c>CAST(1 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))</c> is not.
+    /// Both are two non-null literals added together, so no rule phrased in terms of the
+    /// arguments' nullability can separate them. Claiming non-nullable for the first would fold
+    /// <c>x IS NOT NULL</c> to a constant true over an expression that really can be null, which
+    /// is the direction a CHECK constraint must not fail in — so arithmetic stays evaluated, and
+    /// the corpus's <c>null-propagation</c> group declares what that costs.
+    /// </para>
+    /// <para>
+    /// <b>What else is absent.</b> A <c>cast</c> is nullable — measured, <c>CAST(s AS INT)</c> is
+    /// nullable even under ANSI over a NOT NULL column, because <c>Cast.forceNullable</c> is a
+    /// property of the type PAIR. <c>try_cast</c>, <c>nullif</c>, <c>round</c>, <c>/</c> and
+    /// <c>%</c> are nullable in Spark whatever their arguments (<c>1 / 0</c> and
+    /// <c>round(1.5, 0)</c> both are). The string and date functions propagate their arguments'
+    /// nullability, but nothing needs them: an argument of theirs is only ever non-nullable when
+    /// it is a literal, and a literal cannot raise, so folding them would suppress no error.
+    /// </para>
+    /// </remarks>
+    public bool NeverNull(string name, ReadOnlySpan<bool> argumentsNeverNull)
+    {
+        switch (name)
+        {
+            // Never null as soon as ONE argument is. Measured for all five: `coalesce(a, 1)` and
+            // `greatest(a, 1)` are non-nullable over a nullable `a`, while
+            // `coalesce(a, CAST(NULL AS INT))` and `greatest(a, CAST(NULL AS INT))` are not.
+            case "coalesce" or "nvl" or "ifnull" or "greatest" or "least":
+                return Any(argumentsNeverNull);
+
+            // The two RESULT arguments decide it, and the first one does not reach the answer at
+            // all: measured, `nvl2(NULL, 1, 2)` is non-nullable and `nvl2(1, a, 2)` is nullable.
+            // `if` is the same shape -- and note it has no `CASE`-style true-condition rule:
+            // `if(true, 1, NULL)` is NULLABLE where `CASE WHEN true THEN 1 ELSE NULL END` is not.
+            case "if" or "nvl2":
+                return argumentsNeverNull.Length == 3
+                    && argumentsNeverNull[1]
+                    && argumentsNeverNull[2];
+
+            case "case":
+                return CaseNeverNull(argumentsNeverNull);
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// <c>case</c>'s arguments are <c>cond, value, cond, value, …</c> with an optional trailing
+    /// ELSE, so an odd count is the one that has an ELSE.
+    /// </summary>
+    /// <remarks>
+    /// Every result has to be non-nullable, ELSE included, and a CASE with no ELSE is nullable
+    /// because a row matching no branch yields null. Deliberately WEAKER than Spark, which stops
+    /// at the first literally-true condition and ignores everything after it —
+    /// <c>CASE WHEN true THEN 1 ELSE CAST(NULL AS INT) END</c> is non-nullable there and nullable
+    /// here. Reproducing that rule would suppress no error that is not already suppressed: a
+    /// literal condition makes every later branch unreachable, and #307 evaluates an unreachable
+    /// branch over no rows, so `CASE WHEN true THEN 1 ELSE CAST('abc' AS INT) END IS NULL`
+    /// already answers.
+    /// </remarks>
+    private static bool CaseNeverNull(ReadOnlySpan<bool> argumentsNeverNull)
+    {
+        if (argumentsNeverNull.Length % 2 == 0)
+            return false;
+
+        for (var i = 1; i < argumentsNeverNull.Length - 1; i += 2)
+        {
+            if (!argumentsNeverNull[i])
+                return false;
+        }
+
+        return argumentsNeverNull[argumentsNeverNull.Length - 1];
+    }
+
+    private static bool Any(ReadOnlySpan<bool> flags)
+    {
+        for (var i = 0; i < flags.Length; i++)
+        {
+            if (flags[i])
+                return true;
+        }
+
+        return false;
+    }
 
     public IArrowArray Invoke(string name, IConditionalArguments arguments, int rowCount)
     {

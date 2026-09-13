@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-13 13:43:49.492886",
-      "2026-09-13 13:43:49.492886",
-      "2026-09-13 13:43:49.492886"
+      "2026-09-13 15:48:03.309664",
+      "2026-09-13 15:48:03.309664",
+      "2026-09-13 15:48:03.309664"
      ]
     }
    },
@@ -24221,6 +24221,756 @@
     }
    }
   ],
+  "null-propagation": [
+   {
+    "expression": "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN (CAST(s AS INT) > 1) THEN 1 ELSE 2 END IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(CASE WHEN (CAST(s AS INT) > 1) THEN 1 ELSE 2 END IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "if(CAST('abc' AS INT) > 1, 1, 2) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(if((CAST('abc' AS INT) > 1), 1, 2) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(CAST(s AS INT), 0) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(coalesce(CAST(s AS INT), 0) IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(1, CAST('abc' AS INT)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(coalesce(1, CAST('abc' AS INT)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "nvl(CAST(s AS INT), 0) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(nvl(CAST(s AS INT), 0) IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "ifnull(CAST(s AS INT), 0) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(ifnull(CAST(s AS INT), 0) IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(CAST(s AS INT), 1, 2) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(nvl2(CAST(s AS INT), 1, 2) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "greatest(CAST(s AS INT), 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(greatest(CAST(s AS INT), 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "least(CAST(s AS INT), 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(least(CAST(s AS INT), 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "(2147483647 + 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((2147483647 + 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "(99999999999999999999999999999999999999 + 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((99999999999999999999999999999999999999BD + 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION]  100000000000000000000000000000000000000 cannot be represented as Decimal(38, 0). If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error, and return NULL instead. SQLSTATE: 22003\n== SQL (line 1, position 3) ==\n((99999999999999999999999999999999999999 + 1) IS NULL) AS r\n  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "(CAST(s AS INT) IS NULL) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((CAST(s AS INT) IS NULL) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "(CAST(s AS INT) <=> 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((CAST(s AS INT) <=> 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "NOT (coalesce(CAST(s AS INT), 0) IS NULL)",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (coalesce(CAST(s AS INT), 0) IS NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "(coalesce(CAST(s AS INT), 0) IS NOT NULL) AND a > 0",
+    "parse": {
+     "ok": true,
+     "node": "And",
+     "sql": "((coalesce(CAST(s AS INT), 0) IS NOT NULL) AND (a > 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "1 IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(1 IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'x' IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "('x' IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "true IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(true IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(s AS INT) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(CAST(s AS INT) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(s AS INT) IS NULL) AS r\n ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('abc' AS INT) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(CAST('abc' AS INT) IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('abc' AS INT) IS NOT NULL) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "try_cast(s AS INT) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(TRY_CAST(s AS INT) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(s AS INT), 0) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(nullif(CAST(s AS INT), 0) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 9) ==\n(nullif(CAST(s AS INT), 0) IS NULL) AS r\n        ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "(1 / 0) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((1 / 0) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 3) ==\n((1 / 0) IS NULL) AS r\n  ^^^^^\n"
+    }
+   },
+   {
+    "expression": "(1 % 0) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((1 % 0) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 3) ==\n((1 % 0) IS NULL) AS r\n  ^^^^^\n"
+    }
+   },
+   {
+    "expression": "round(CAST(s AS DOUBLE), 0) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(round(CAST(s AS DOUBLE), 0) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 8) ==\n(round(CAST(s AS DOUBLE), 0) IS NULL) AS r\n       ^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 13) ==\n(CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL) AS r\n            ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS INT) END IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS INT) END IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 13) ==\n(CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS I...\n            ^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "if(CAST('abc' AS INT) > 1, 1, CAST(NULL AS INT)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(if((CAST('abc' AS INT) > 1), 1, CAST(NULL AS INT)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 5) ==\n(if(CAST('abc' AS INT) > 1, 1, CAST(NULL AS INT)) IS N...\n    ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 11) ==\n(greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL) AS...\n          ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "(CAST(s AS INT) = 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((CAST(s AS INT) = 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 3) ==\n((CAST(s AS INT) = 1) IS NULL) AS r\n  ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 19) ==\n(concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL) AS r\n                  ^^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "a IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(a IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      true,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "s IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(s IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      false,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(NULL AS INT) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(CAST(NULL AS INT) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "NULL IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(NULL IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "(a + 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((a + 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      true,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, 0) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(coalesce(a, 0) IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN a > 0 THEN 1 ELSE 2 END IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(CASE WHEN (a > 0) THEN 1 ELSE 2 END IS NOT NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   }
+  ],
   "ansi-sensitive": [
    {
     "expression": "a / 0",
@@ -39262,6 +40012,808 @@
      "eval": {
       "ok": false,
       "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"least(CAST(1 AS INT), 2)\" due to data type mismatch: Input to `least` should all be the same type, but it's [\"INT\", \"STRING\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [least(cast(1 as int), 2) AS r#2945]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 "
+     }
+    }
+   ],
+   "null-propagation": [
+    {
+     "expression": "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN (CAST(s AS INT) > 1) THEN 1 ELSE 2 END IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(CASE WHEN (CAST(s AS INT) > 1) THEN 1 ELSE 2 END IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "if(CAST('abc' AS INT) > 1, 1, 2) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(if((CAST('abc' AS INT) > 1), 1, 2) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(CAST(s AS INT), 0) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(coalesce(CAST(s AS INT), 0) IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(1, CAST('abc' AS INT)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(coalesce(1, CAST('abc' AS INT)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "nvl(CAST(s AS INT), 0) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(nvl(CAST(s AS INT), 0) IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "ifnull(CAST(s AS INT), 0) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(ifnull(CAST(s AS INT), 0) IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "nvl2(CAST(s AS INT), 1, 2) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(nvl2(CAST(s AS INT), 1, 2) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "greatest(CAST(s AS INT), 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(greatest(CAST(s AS INT), 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "least(CAST(s AS INT), 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(least(CAST(s AS INT), 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "(2147483647 + 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((2147483647 + 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "(99999999999999999999999999999999999999 + 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((99999999999999999999999999999999999999BD + 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((CAST(99999999999999999999999999999999999999BD AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(CAST(s AS INT) IS NULL) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((CAST(s AS INT) IS NULL) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "(CAST(s AS INT) <=> 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((CAST(s AS INT) <=> 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "NOT (coalesce(CAST(s AS INT), 0) IS NULL)",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (coalesce(CAST(s AS INT), 0) IS NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(coalesce(CAST(s AS INT), 0) IS NOT NULL) AND a > 0",
+     "parse": {
+      "ok": true,
+      "node": "And",
+      "sql": "((coalesce(CAST(s AS INT), 0) IS NOT NULL) AND (a > 0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "1 IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(1 IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "'x' IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "('x' IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "true IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(true IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(s AS INT) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(CAST(s AS INT) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('abc' AS INT) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(CAST('abc' AS INT) IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "try_cast(s AS INT) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(TRY_CAST(s AS INT) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(s AS INT), 0) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(nullif(CAST(s AS INT), 0) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(1 / 0) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((1 / 0) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(1 % 0) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((1 % 0) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "round(CAST(s AS DOUBLE), 0) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(round(CAST(s AS DOUBLE), 0) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS INT) END IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS INT) END IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "if(CAST('abc' AS INT) > 1, 1, CAST(NULL AS INT)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(if((CAST('abc' AS INT) > 1), 1, CAST(NULL AS INT)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(CAST(s AS INT) = 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((CAST(s AS INT) = 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "a IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(a IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "s IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(s IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       false,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(NULL AS INT) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(CAST(NULL AS INT) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "NULL IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(NULL IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(a + 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((a + 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(a, 0) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(coalesce(a, 0) IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN a > 0 THEN 1 ELSE 2 END IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(CASE WHEN (a > 0) THEN 1 ELSE 2 END IS NOT NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
      }
     }
    ],
