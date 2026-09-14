@@ -2575,6 +2575,75 @@ GROUPS = {
         "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)",
     ],
 
+    # THE RANGE OF A NUMERIC LITERAL, which Spark checks in its PARSER. #287. A group of parse
+    # questions rather than evaluation ones: `1e400` never reaches a row, and the whole point is
+    # that it never reaches one here either.
+    #
+    # THE BOUND IS COMPARED AGAINST THE LITERAL EXACTLY, and that is the part an implementation
+    # gets wrong by reading the parsed value instead of the text -- `1.79769313486231575e308`
+    # rounds to Double.MaxValue and is still refused. The bound itself is the SHORTEST repr of
+    # the type's maximum, which is why the ordinary spelling of the largest float,
+    # `3.4028235e38F`, is over it.
+    #
+    # AND ONLY FROM ABOVE. #287 reports `1e-400` as the same gap at the other end; measured, it
+    # is not one -- Spark compares against [-MaxValue, MaxValue] and an underflow sits well
+    # inside that. The underflow rows are here to record that, and `-1e-400` is here because it
+    # is a NEGATIVE ZERO literal, which is #282 and not this.
+    "numeric-literal-range": [
+        # --- THE ISSUE AS FILED, in the three spellings of a double literal.
+        "1e400", "CAST(1e400 AS DOUBLE)", "1e400D", "-1e400",
+        # ...and in the places a literal can sit, since the refusal is the parser's and so cannot
+        # depend on context.
+        "CAST(1e400 AS STRING)", "1e400 + 1", "g + 1e400",
+
+        # --- THE DOUBLE BOUNDARY, one step either side. 1.7976931348623157e308 is the largest
+        # accepted; the next four are all refused, and the first two of them ROUND to it.
+        "1.7976931348623157e308",
+        "1.79769313486231575e308",
+        "1.7976931348623158e308",
+        "1.7976931348623159e308",
+        "1.8e308",
+        "1e308", "1e309",
+        # ...and the same value with the point moved, which says the check is on the value and
+        # not on the spelling.
+        "17976931348623157e292",
+
+        # --- THE FLOAT BOUNDARY, which is NOT where Java prints float.MaxValue. Spark states the
+        # bound as a widened double, 3.4028234663852886E38, so the familiar 3.4028235e38 is over
+        # it by a hair and refused.
+        "3.4028234663852886e38F",
+        "3.4028234663852887e38F",
+        "3.4028235e38F",
+        "3.4e38F", "3.5e38F", "1e38F", "1e39F", "1e400F",
+
+        # --- UNDERFLOW IS NOT A RANGE ERROR. Every one of these answers, and the last is a
+        # negative zero -- Spark folds the sign into the literal, so it is a Literal there and a
+        # `negative` call here. #282.
+        "1e-400", "CAST(1e-400 AS DOUBLE)", "1e-400D", "1e-325", "1e-324", "1e-323",
+        "4.9e-324", "4e-324", "1e-45F", "1e-46F", "-1e-400",
+
+        # --- A ZERO MANTISSA IS IN RANGE AT EVERY EXPONENT, which is what stops a check written
+        # on the exponent alone.
+        "0e400", "0e-400", "0.0e400", "000e400",
+
+        # --- AN EXPONENT THE SCALE CANNOT CARRY is refused ahead of the range comparison, and
+        # `0e2147483648` is the row that proves the order: its mantissa is zero, so only a check
+        # that runs FIRST can refuse it. `1e-2147483648` refuses although the exponent fits an
+        # int, because it is the negation that overflows.
+        "1e2147483647", "1e2147483648", "1e99999999999", "1e-99999999999",
+        "1e-2147483648", "1e-2147483649", "0e2147483648",
+
+        # --- A DECIMAL LITERAL IS BOUNDED BY ITS PRECISION INSTEAD, a different error class and
+        # a different rule: 39 digits is too many however small the value. Recorded beside the
+        # others so the two are not confused -- #173 already implements this one.
+        "1e400BD", "1e38BD", "1e37BD",
+
+        # --- AND AN INTEGRAL LITERAL HAS NO UPPER BOUND AT ALL, because Spark's ladder does not
+        # stop at bigint: past it the literal becomes a DECIMAL. The control that says "out of
+        # range for the type" is a floating-point rule and not a numeric-literal rule. #173.
+        "9223372036854775808", "-9223372036854775809",
+    ],
+
     "malformed": [
         # Genuine parse errors, recorded so our error paths can be checked against Spark's.
         "a +", "((a)", "a > > 0", "",

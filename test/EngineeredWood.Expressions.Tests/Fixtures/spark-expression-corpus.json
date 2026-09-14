@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-14 07:10:08.951587",
-      "2026-09-14 07:10:08.951587",
-      "2026-09-14 07:10:08.951587"
+      "2026-09-14 09:32:53.314560",
+      "2026-09-14 09:32:53.314560",
+      "2026-09-14 09:32:53.314560"
      ]
     }
    },
@@ -29769,6 +29769,878 @@
       "Infinity",
       "Infinity",
       "Infinity"
+     ]
+    }
+   }
+  ],
+  "numeric-literal-range": [
+   {
+    "expression": "1e400",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e400\n^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400) AS r\n ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(1e400 AS DOUBLE)",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 6) ==\nCAST(1e400 AS DOUBLE)\n     ^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 7) ==\n(CAST(1e400 AS DOUBLE)) AS r\n      ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 7) ==\n(CAST(1e400 AS DOUBLE)) AS r\n      ^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e400D",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e400D\n^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400D) AS r\n ^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400D) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-1e400",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n-1e400\n^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1e400) AS r\n ^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1e400) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(1e400 AS STRING)",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 6) ==\nCAST(1e400 AS STRING)\n     ^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 7) ==\n(CAST(1e400 AS STRING)) AS r\n      ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 7) ==\n(CAST(1e400 AS STRING)) AS r\n      ^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e400 + 1",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e400 + 1\n^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400 + 1) AS r\n ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400 + 1) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "g + 1e400",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 5) ==\ng + 1e400\n    ^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 6) ==\n(g + 1e400) AS r\n     ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 6) ==\n(g + 1e400) AS r\n     ^^^^^\n"
+    }
+   },
+   {
+    "expression": "1.7976931348623157e308",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.7976931348623157E308D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.7976931348623157e+308,
+      1.7976931348623157e+308,
+      1.7976931348623157e+308
+     ]
+    }
+   },
+   {
+    "expression": "1.79769313486231575e308",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1.79769313486231575e308\n^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1.7976931348623158e308",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623158e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1.7976931348623158e308\n^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623158e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.7976931348623158e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623158e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.7976931348623158e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1.7976931348623159e308",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623159e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1.7976931348623159e308\n^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623159e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.7976931348623159e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.7976931348623159e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.7976931348623159e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1.8e308",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.8e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1.8e308\n^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.8e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.8e308) AS r\n ^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1.8e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1.8e308) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e308",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.0E308D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+308,
+      1e+308,
+      1e+308
+     ]
+    }
+   },
+   {
+    "expression": "1e309",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e309 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e309\n^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e309 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e309) AS r\n ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e309 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e309) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "17976931348623157e292",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.7976931348623157E308D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.7976931348623157e+308,
+      1.7976931348623157e+308,
+      1.7976931348623157e+308
+     ]
+    }
+   },
+   {
+    "expression": "3.4028234663852886e38F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('3.4028235E38' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.4028234663852886e+38,
+      3.4028234663852886e+38,
+      3.4028234663852886e+38
+     ]
+    }
+   },
+   {
+    "expression": "3.4028234663852887e38F",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028234663852887e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n3.4028234663852887e38F\n^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028234663852887e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.4028234663852887e38F) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028234663852887e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.4028234663852887e38F) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "3.4028235e38F",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028235e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n3.4028235e38F\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028235e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.4028235e38F) AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.4028235e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.4028235e38F) AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "3.4e38F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('3.4E38' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.3999999521443642e+38,
+      3.3999999521443642e+38,
+      3.3999999521443642e+38
+     ]
+    }
+   },
+   {
+    "expression": "3.5e38F",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.5e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n3.5e38F\n^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.5e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.5e38F) AS r\n ^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 3.5e38 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(3.5e38F) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e38F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('1.0E38' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      9.999999680285692e+37,
+      9.999999680285692e+37,
+      9.999999680285692e+37
+     ]
+    }
+   },
+   {
+    "expression": "1e39F",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e39 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e39F\n^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e39 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e39F) AS r\n ^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e39 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e39F) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e400F",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e400F\n^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400F) AS r\n ^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e400 is outside the valid range for float with minimum value of -3.4028234663852886E+38 and maximum value of 3.4028234663852886E+38. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400F) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e-400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1e-400 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(0.0D AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "1e-400D",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "1e-325",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "1e-324",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "1e-323",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "1.0E-323D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e-323,
+      1e-323,
+      1e-323
+     ]
+    }
+   },
+   {
+    "expression": "4.9e-324",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "4.9E-324D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      5e-324,
+      5e-324,
+      5e-324
+     ]
+    }
+   },
+   {
+    "expression": "4e-324",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "4.9E-324D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      5e-324,
+      5e-324,
+      5e-324
+     ]
+    }
+   },
+   {
+    "expression": "1e-45F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('1.4E-45' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.401298464324817e-45,
+      1.401298464324817e-45,
+      1.401298464324817e-45
+     ]
+    }
+   },
+   {
+    "expression": "1e-46F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('0.0' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "-1e-400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "0e400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "0e-400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "0.0e400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "000e400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "1e2147483647",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e2147483647 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e2147483647\n^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e2147483647 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e2147483647) AS r\n ^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal 1e2147483647 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e2147483647) AS r\n ^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e2147483648",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 1) ==\n1e2147483648\n^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(1e2147483648) AS r\n ^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(1e2147483648) AS r\n ^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e99999999999",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 1) ==\n1e99999999999\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 2) ==\n(1e99999999999) AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 2) ==\n(1e99999999999) AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e-99999999999",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 1) ==\n1e-99999999999\n^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 2) ==\n(1e-99999999999) AS r\n ^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nToo many nonzero exponent digits..\n== SQL (line 1, position 2) ==\n(1e-99999999999) AS r\n ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e-2147483648",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nScale out of range..\n== SQL (line 1, position 1) ==\n1e-2147483648\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nScale out of range..\n== SQL (line 1, position 2) ==\n(1e-2147483648) AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nScale out of range..\n== SQL (line 1, position 2) ==\n(1e-2147483648) AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e-2147483649",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 1) ==\n1e-2147483649\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(1e-2147483649) AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(1e-2147483649) AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "0e2147483648",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 1) ==\n0e2147483648\n^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(0e2147483648) AS r\n ^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \nExponent overflow..\n== SQL (line 1, position 2) ==\n(0e2147483648) AS r\n ^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e400BD",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 401 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e400BD\n^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 401 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400BD) AS r\n ^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 401 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e400BD) AS r\n ^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e38BD",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n1e38BD\n^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e38BD) AS r\n ^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION] Decimal precision 39 exceeds max precision 38. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1e38BD) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1e37BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "10000000000000000000000000000000000000BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10000000000000000000000000000000000000",
+      "10000000000000000000000000000000000000",
+      "10000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "9223372036854775808",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "9223372036854775808BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(19,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9223372036854775808",
+      "9223372036854775808",
+      "9223372036854775808"
+     ]
+    }
+   },
+   {
+    "expression": "-9223372036854775809",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-9223372036854775809BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(19,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-9223372036854775809",
+      "-9223372036854775809",
+      "-9223372036854775809"
      ]
     }
    }

@@ -472,15 +472,159 @@ internal static class SparkLiteral
         return new decimal(low, mid, high, unscaled.Sign < 0, (byte)scale);
     }
 
-    private static double ParseDouble(string text, string sql, int position) =>
-        double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+    private static double ParseDouble(string text, string sql, int position)
+    {
+        RefuseOutOfRange(text, MaxDoubleDigits, MaxDoubleExponent, "a double", sql, position);
+
+        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? value
             : throw Overflow(text, "a double", sql, position);
+    }
 
-    private static float ParseFloat(string text, string sql, int position) =>
-        float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+    private static float ParseFloat(string text, string sql, int position)
+    {
+        RefuseOutOfRange(text, MaxFloatDigits, MaxFloatExponent, "a float", sql, position);
+
+        return float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? value
             : throw Overflow(text, "a float", sql, position);
+    }
+
+    // -- THE RANGE OF A FLOATING-POINT LITERAL ----------------------------------------------
+
+    /// <summary>
+    /// The largest magnitude a <c>double</c> literal may spell, as <c>0.&lt;digits&gt; x 10^exp</c>.
+    /// </summary>
+    /// <remarks>
+    /// Spark states the bound as <c>1.7976931348623157E+308</c> in its own error text, which is
+    /// <see cref="double.MaxValue"/> written in its shortest round-tripping form rather than the
+    /// exact 309-digit integer that value really is. Taking the same spelling is what makes the
+    /// boundary agree, because the comparison is against the literal EXACTLY: measured,
+    /// <c>1.79769313486231575e308</c> is refused although it rounds to
+    /// <see cref="double.MaxValue"/>. #287.
+    /// </remarks>
+    private const string MaxDoubleDigits = "17976931348623157";
+
+    private const int MaxDoubleExponent = 309;
+
+    /// <summary>The same bound for a <c>float</c>, which Spark states as a widened double.</summary>
+    /// <remarks>
+    /// <c>3.4028234663852886E+38</c>, not the <c>3.4028235E38</c> that Java prints for
+    /// <see cref="float.MaxValue"/> -- so <c>3.4028235e38F</c>, the ordinary spelling of the
+    /// largest float, is REFUSED while <c>3.4028234663852886e38F</c> is accepted. Measured, and
+    /// it is the row that says the bound is not "whatever survives the cast to float".
+    /// </remarks>
+    private const string MaxFloatDigits = "34028234663852886";
+
+    private const int MaxFloatExponent = 39;
+
+    /// <summary>
+    /// Refuses a floating-point literal whose exact value lies outside the type range, the way
+    /// Spark PARSER does.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #287. <c>1e400</c> is <c>INVALID_NUMERIC_LITERAL_RANGE</c> in Spark, refused before any
+    /// data is touched; we produced an infinity. The check is on the literal exact decimal TEXT
+    /// rather than on what the parse produces, which is the half that is easy to miss:
+    /// <c>3.4028234663852887e38F</c> and <c>1.79769313486231575e308</c> both round to a finite
+    /// value and are both refused.
+    /// </para>
+    /// <para>
+    /// <b>Only the magnitude is bounded, and only from above.</b> The issue reports
+    /// <c>1e-400</c> as the same gap at the other end and it is not one: Spark compares against
+    /// <c>[-MaxValue, MaxValue]</c>, and a value that underflows sits well inside that. Measured,
+    /// <c>1e-400</c> is <c>0.0D</c>, <c>1e-325</c> is <c>0.0D</c>, and <c>-1e-400</c> is
+    /// <c>-0.0D</c> -- Spark folds the sign into the literal there, which is why that row belongs
+    /// to #282 rather than here.
+    /// </para>
+    /// <para>
+    /// A zero mantissa is in range at every exponent: <c>0e400</c> is <c>0.0D</c>. An exponent
+    /// that Java BigDecimal cannot carry as a scale is refused ahead of the comparison, which is
+    /// why <c>0e2147483648</c> refuses where <c>0e400</c> does not -- and why the lower bound is
+    /// <c>-int.MaxValue</c> rather than <c>int.MinValue</c>, since it is the NEGATION that
+    /// overflows there and <c>1e-2147483648</c> is measured refusing.
+    /// </para>
+    /// </remarks>
+    private static void RefuseOutOfRange(
+        string text, string boundDigits, int boundExponent, string what, string sql, int position)
+    {
+        var (digits, exponent) = Normalize(text, what, sql, position);
+
+        if (digits.Length == 0)
+            return;
+
+        if (exponent > boundExponent
+            || (exponent == boundExponent && IsGreater(digits, boundDigits)))
+        {
+            throw Overflow(text, what, sql, position);
+        }
+    }
+
+    /// <summary>
+    /// Significant digits and the base-10 exponent of the point: the value is
+    /// <c>0.&lt;digits&gt; x 10^exponent</c>, and a zero has no digits at all.
+    /// </summary>
+    /// <remarks>
+    /// The exponent is a <see cref="long"/>, and that is not decoration. <c>1e2147483647</c> is a
+    /// legal token whose normalised exponent is 2147483648, so accumulating it in an
+    /// <see cref="int"/> would wrap to <see cref="int.MinValue"/> and read the largest literal
+    /// expressible as the smallest -- accepting exactly what this exists to refuse.
+    /// </remarks>
+    private static (string Digits, long Exponent) Normalize(
+        string text, string what, string sql, int position)
+    {
+        long exponent = 0;
+        var e = text.IndexOf('E');
+        if (e < 0) e = text.IndexOf('e');
+
+        if (e >= 0)
+        {
+            if (!long.TryParse(
+                    text.Substring(e + 1), NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out exponent)
+                || exponent > int.MaxValue
+                || exponent < -int.MaxValue)
+            {
+                throw Overflow(text, what, sql, position);
+            }
+
+            text = text.Substring(0, e);
+        }
+
+        var dot = text.IndexOf('.');
+        if (dot >= 0)
+        {
+            exponent -= text.Length - dot - 1;
+            text = text.Remove(dot, 1);
+        }
+
+        var digits = text.TrimStart('0');
+        exponent += digits.Length;
+
+        return (digits.TrimEnd('0'), exponent);
+    }
+
+    /// <summary>Whether one normalised digit string is greater than another, padding with zeros.</summary>
+    /// <remarks>
+    /// Both sides have had their leading and trailing zeros removed, so neither starts with one
+    /// and a longer string is the greater once the shared prefix matches.
+    /// </remarks>
+    private static bool IsGreater(string digits, string bound)
+    {
+        var length = Math.Max(digits.Length, bound.Length);
+
+        for (var i = 0; i < length; i++)
+        {
+            var left = i < digits.Length ? digits[i] : '0';
+            var right = i < bound.Length ? bound[i] : '0';
+
+            if (left != right)
+                return left > right;
+        }
+
+        return false;
+    }
 
     private static SparkSqlParseException Overflow(string text, string what, string sql, int position) =>
         new($"'{text}' is out of range for {what}", sql, position);
