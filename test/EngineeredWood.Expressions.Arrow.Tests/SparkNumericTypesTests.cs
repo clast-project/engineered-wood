@@ -153,6 +153,95 @@ public sealed class SparkNumericTypesTests
             SparkNumericTypes.ArithmeticResult("+", Int32Type.Default, new Decimal128Type(10, 2))));
     }
 
+    /// <summary>
+    /// The narrowest decimal an integral literal is read as, which is a PRECISION of its value.
+    /// </summary>
+    /// <remarks>
+    /// #281. Spark's <c>DecimalType.fromLiteral</c> goes through
+    /// <c>BigDecimal(v).precision()</c>, and two of these rows are the ones a digit count written
+    /// from intuition gets wrong: zero has ONE digit rather than none — a decimal(0,0) is not a
+    /// type — and a sign is not a digit, so -2 is as narrow as 2.
+    /// </remarks>
+    [Theory]
+    [InlineData(0L, "decimal(1,0)")]
+    [InlineData(2L, "decimal(1,0)")]
+    [InlineData(-2L, "decimal(1,0)")]
+    [InlineData(100L, "decimal(3,0)")]
+    [InlineData(1000000000L, "decimal(10,0)")]
+    [InlineData(2147483647L, "decimal(10,0)")]
+    [InlineData(-2147483648L, "decimal(10,0)")]
+    [InlineData(9223372036854775807L, "decimal(19,0)")]
+    // long.MinValue, whose magnitude Math.Abs cannot take. Written out rather than referenced
+    // because an InlineData argument must be a constant expression.
+    [InlineData(-9223372036854775808L, "decimal(19,0)")]
+    public void AnIntegralLiteralIsReadAsTheNarrowestDecimalHoldingIt(long value, string expected)
+    {
+        Assert.Equal(expected, SparkName(SparkNumericTypes.LiteralDecimal(value)));
+    }
+
+    /// <summary>
+    /// The same arithmetic, with the literal's width as the only difference — which is the whole
+    /// of #281.
+    /// </summary>
+    /// <remarks>
+    /// Both answers are Spark's, measured on 4.0.3 one expression apart: <c>d1 + a</c> is
+    /// decimal(13,2) and <c>d1 + 2</c> is decimal(11,2). The rules below are unchanged by the
+    /// fix; only which type the literal arrives as changed, which is why the fix is a cast at the
+    /// operand rather than a case inside the promotion rules.
+    /// </remarks>
+    [Fact]
+    public void NarrowingTheLiteralIsWhatMovesTheResultScale()
+    {
+        var d1 = new Decimal128Type(10, 2);
+
+        Assert.Equal("decimal(13,2)", SparkName(
+            SparkNumericTypes.ArithmeticResult("+", d1, Int32Type.Default)));
+        Assert.Equal("decimal(11,2)", SparkName(
+            SparkNumericTypes.ArithmeticResult("+", d1, SparkNumericTypes.LiteralDecimal(2))));
+
+        // The issue's own repro: 1.5BD is decimal(2,1), and the divisor's width reaches the
+        // scale through `max(6, s1 + p2 + 1)` -- so ten integer digits become a scale of 12.
+        var literal = new Decimal128Type(2, 1);
+        Assert.Equal("decimal(13,12)", SparkName(
+            SparkNumericTypes.ArithmeticResult("/", literal, Int32Type.Default)));
+        Assert.Equal("decimal(7,6)", SparkName(
+            SparkNumericTypes.ArithmeticResult("/", literal, SparkNumericTypes.LiteralDecimal(2))));
+    }
+
+    /// <summary>
+    /// Which call sites take the rule, as the registry answers it.
+    /// </summary>
+    /// <remarks>
+    /// Every row is a measurement, and the two that look wrong are the ones worth having: a
+    /// <c>nullif</c> literal is narrowed in its SECOND argument only, and unification — where
+    /// <c>greatest(d1, 2)</c> is decimal(12,2), the int-width answer — takes no rule at all. A
+    /// fix applied one call too widely would pass every test in the issue and break those.
+    /// </remarks>
+    [Fact]
+    public void OnlyABinaryOperatorNarrowsItsLiteral()
+    {
+        var registry = new SparkFunctionRegistry();
+        var d5 = new Decimal128Type(38, 38);
+
+        foreach (var op in new[] { "+", "-", "*", "/", "%" })
+        {
+            Assert.Equal("decimal(1,0)", SparkName(registry.LiteralArgumentType(op, 0, 0, d5)!));
+            Assert.Equal("decimal(1,0)", SparkName(registry.LiteralArgumentType(op, 1, 0, d5)!));
+        }
+
+        Assert.Null(registry.LiteralArgumentType("nullif", 0, 0, d5));
+        Assert.Equal("decimal(1,0)", SparkName(registry.LiteralArgumentType("nullif", 1, 0, d5)!));
+
+        foreach (var name in new[] { "greatest", "least", "coalesce", "nvl", "if", "case", "round" })
+            Assert.Null(registry.LiteralArgumentType(name, 1, 0, d5));
+
+        // A comparison takes it in either position, and only against a decimal: the guard is
+        // Spark's own, so `a = 2` stays an integral comparison and `g = 2` a floating one.
+        Assert.Equal("decimal(1,0)", SparkName(registry.LiteralComparisonType(0, d5)!));
+        Assert.Null(registry.LiteralComparisonType(0, Int32Type.Default));
+        Assert.Null(registry.LiteralComparisonType(0, DoubleType.Default));
+    }
+
     [Fact]
     public void ClampingGivesUpScaleRatherThanIntegerDigits()
     {

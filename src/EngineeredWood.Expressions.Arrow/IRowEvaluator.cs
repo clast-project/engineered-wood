@@ -226,6 +226,59 @@ public interface IComparisonCoercion
 }
 
 /// <summary>
+/// A function registry that reads an integral LITERAL against a decimal as a narrower decimal
+/// than its type implies.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast: a registry that does not implement it types
+/// every literal from its own kind, exactly as before.
+/// </para>
+/// <para>
+/// It exists because Spark reads a literal <c>2</c> met with a decimal as <c>decimal(1,0)</c>
+/// rather than as the <c>decimal(10,0)</c> an <c>int</c> occupies, and those nine integer digits
+/// are nine the result keeps as scale: measured on 4.0.3, <c>1.5BD / 2</c> is
+/// <c>decimal(7,6)</c> and <c>d1 + 2</c> over a decimal(10,2) is <c>decimal(11,2)</c>. #281.
+/// </para>
+/// <para>
+/// <b>The evaluator cannot own this rule, because where it applies is dialect knowledge and it
+/// is narrow.</b> Spark inserts the cast at a binary operator and nowhere else, so arithmetic
+/// and comparison take it while <c>greatest</c>, <c>coalesce</c> and an <c>IN</c> list do not —
+/// measured one expression apart, <c>CAST(4E-32 AS DECIMAL(38,38)) = 0</c> is FALSE and the same
+/// value <c>IN (0)</c> is TRUE. Asking the registry per SITE is what keeps that boundary in the
+/// place Spark puts it.
+/// </para>
+/// </remarks>
+public interface ILiteralPrecisionRules
+{
+    /// <summary>
+    /// The type an integral literal takes as argument <paramref name="argumentIndex"/> of
+    /// <paramref name="function"/>, against an argument of <paramref name="other"/>; null to
+    /// leave the literal as it is.
+    /// </summary>
+    /// <remarks>
+    /// Asked per ARGUMENT POSITION, because one measured rule needs it: <c>nullif</c> takes the
+    /// rule on its second argument and not on its first. From the optimized plans,
+    /// <c>nullif(d5, 0)</c> compares at decimal(38,37) — the literal narrowed — while
+    /// <c>nullif(0, d5)</c> compares at decimal(38,28), the pair's common type with the literal
+    /// read as an <c>int</c>. The two therefore answer differently over the same values.
+    /// </remarks>
+    IArrowType? LiteralArgumentType(string function, int argumentIndex, long value, IArrowType other);
+
+    /// <summary>
+    /// The type an integral literal operand of a comparison takes against an operand of
+    /// <paramref name="other"/>; null to leave it as it is.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="LiteralArgumentType"/> because a comparison is not a call: it
+    /// resolves both operands' types to pick the one they compare through — see
+    /// <see cref="IComparisonCoercion.ComparisonTarget"/> — rather than invoking a function over
+    /// them. Every comparison operator takes the rule, in both operand orders.
+    /// </remarks>
+    IArrowType? LiteralComparisonType(long value, IArrowType other);
+}
+
+/// <summary>
 /// A function registry that knows which of its functions can never produce a null.
 /// </summary>
 /// <remarks>

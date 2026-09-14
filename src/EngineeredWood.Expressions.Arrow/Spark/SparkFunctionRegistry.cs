@@ -31,7 +31,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </para>
 /// </remarks>
 public sealed class SparkFunctionRegistry
-    : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules
+    : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
+      ILiteralPrecisionRules
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -639,6 +640,64 @@ public sealed class SparkFunctionRegistry
         var values = new long?[rowCount];
         for (var i = 0; i < rowCount; i++) values[i] = 0L;
         return SparkArrays.BuildIntegral(values, type, rowCount);
+    }
+
+    // ── LITERAL PRECISION ──────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// #281. Arithmetic takes the rule on either operand; <c>nullif</c> takes it on its SECOND
+    /// argument only, and nothing else takes it at all. Every one of those three answers was
+    /// measured off Spark 4.0.3's own plans rather than reasoned about, and the middle one is the
+    /// surprise: the optimized plan for <c>nullif(d5, 0)</c> is
+    /// <c>if (cast(d5 as decimal(38,37)) = cast(cast(0 as decimal(1,0)) as decimal(38,37)))
+    /// null else d5</c> — the literal narrowed — while <c>nullif(0, d5)</c> is
+    /// <c>if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0</c>, where the
+    /// literal instead took the pair's common type. So the two disagree over the same values:
+    /// against <c>CAST(4E-32 AS DECIMAL(38,38))</c> the first answers the value and the second
+    /// answers NULL.
+    /// </para>
+    /// <para>
+    /// <b>The absences are measured too, and they are the reason this is asked per name.</b>
+    /// <c>greatest</c>, <c>least</c>, <c>coalesce</c>, <c>nvl</c>, <c>if</c> and <c>CASE</c> all
+    /// resolve <c>(d1, 2)</c> to decimal(12,2), the answer the int WIDTH gives, where the rule
+    /// would say decimal(10,2); and <c>round</c>'s second argument is a scale it needs as an
+    /// integer. A name absent from this switch gets no rule, which is the safe default in the
+    /// same sense <see cref="NeverNull"/>'s allow-list is.
+    /// </para>
+    /// </remarks>
+    public IArrowType? LiteralArgumentType(
+        string function, int argumentIndex, long value, IArrowType other)
+    {
+        if (other is null)
+            throw new ArgumentNullException(nameof(other));
+
+        // The first argument position Spark offers the rule to, or -1 for a name that never
+        // takes it.
+        var first = function switch
+        {
+            "+" or "-" or "*" or "/" or "%" => 0,
+            "nullif" => 1,
+            _ => -1,
+        };
+
+        return first < 0 || argumentIndex < first ? null : LiteralComparisonType(value, other);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The rule proper, and it is one line: a literal met with a DECIMAL is read as the narrowest
+    /// decimal that holds its value. The guard is Spark's own — the cast is inserted only where
+    /// the other operand is a decimal, so <c>a = 2</c> stays an integral comparison and
+    /// <c>g = 2</c> a floating one.
+    /// </remarks>
+    public IArrowType? LiteralComparisonType(long value, IArrowType other)
+    {
+        if (other is null)
+            throw new ArgumentNullException(nameof(other));
+
+        return SparkNumericTypes.IsDecimal(other) ? SparkNumericTypes.LiteralDecimal(value) : null;
     }
 
     // ── COMPARISON COERCION ────────────────────────────────────────────────────────────────

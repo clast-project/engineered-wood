@@ -120,7 +120,14 @@ LEGACY_GROUPS = (
     # coercion rule and the ANSI switch moves overflow behaviour, not coercion. Recorded rather
     # than assumed, for the reason nullif-equality is: the registry has a legacy variant that
     # shares this rule, and "it cannot differ" is a claim until a second harvest says so.
-    "decimal-common-type")
+    "decimal-common-type",
+    # #281. The TYPES are identical under both dialects, all 56 rows -- `literalPickMinimumPrecision`
+    # is a coercion rule, and the ANSI switch moves overflow and cast behaviour rather than
+    # coercion. Measured rather than assumed, and the second harvest earned its place anyway: two
+    # rows do differ, `2 / d2` and `2 % d2`, which raise DIVIDE_BY_ZERO on the boundary row under
+    # ANSI and answer null without it. One harvest would have recorded the rule with no evidence
+    # that the dialect leaves it alone, which is the whole reason decimal-common-type is here too.
+    "decimal-literal-precision")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -2155,6 +2162,128 @@ GROUPS = {
         "count(a)", "sum(a) > 0", "a > (SELECT 1)",
         "*", "a IN (SELECT 1)", "rank() OVER (ORDER BY a)",
     ],
+    # ------------------------------------------------------------------------------------
+    # Issue #281, found by fuzz_expressions.py: Spark reads an integral LITERAL met with a
+    # decimal as the narrowest decimal holding its VALUE, not as the one holding its TYPE.
+    # `DecimalType.fromLiteral` via `DecimalPrecisionTypeCoercion.nondecimalAndDecimal`, under
+    # `spark.sql.decimalOperations.literalPickMinimumPrecision` (default true). The analyzed plan
+    # for `d1 + 2` is `(d1 + cast(2 as decimal(1,0)))`, and those nine integer digits an int
+    # column would have reserved are nine the result keeps as SCALE.
+    #
+    # The group's job is the BOUNDARY as much as the rule. Spark inserts the cast at a binary
+    # operator and nowhere else, so the controls -- a column, a CAST, a folded-looking sum,
+    # unification, an IN list -- are not decoration: reproducing the rule one call too widely is
+    # as wrong as not reproducing it, and only the pairs here say where the line falls.
+    "decimal-literal-precision": [
+        # THE TWO REPROS from the issue. Both agree numerically and disagree in scale, which is
+        # what makes them a rendering and a downstream-cast defect rather than a value one.
+        "1.5BD / 2",
+        "1.0000000000000000000000000000000000001 + 1",
+        "CAST(1.5BD / 2 AS STRING)",
+        "CAST(1.0000000000000000000000000000000000001 + 1 AS STRING)",
+
+        # EVERY OPERATOR, both operand orders. `%` is the one that can answer a NARROWER type
+        # than either operand -- decimal(3,2) here, against the decimal(10,2) the int width
+        # gives -- and `/` the one where the literal's width reaches the scale twice over.
+        "d1 + 2",
+        "2 + d1",
+        "d1 - 2",
+        "2 - d1",
+        "d1 * 2",
+        "2 * d1",
+        "d1 / 2",
+        "2 / d2",
+        "d1 % 2",
+        "2 % d2",
+
+        # THE VALUE DECIDES, not the type: a ten-digit literal reserves exactly the ten digits an
+        # int column would, so this row is the control where narrowing changes nothing, and the
+        # 19-digit one is the control where it is a bigint's width that is not taken.
+        "d1 + 1000000000",
+        "d1 + 9999999999999999999",
+        "d1 + 0",
+
+        # A NEGATED LITERAL IS A LITERAL. Spark folds the sign at parse time; a precision never
+        # counts one, so these must answer exactly as the positive rows do.
+        "d1 + -2",
+        "d1 + -2147483648",
+
+        # AT THE CLAMP, where the digits the rule saves are the difference between an answer with
+        # 36 fractional digits and one with 27. d5 is all scale, so every integer digit an
+        # operand reserves comes straight off the result.
+        "d5 + 2",
+        "d5 - 1",
+        "d5 * 100",
+        "d5 + 1000000",
+        "CAST(d5 + 2 AS STRING)",
+
+        # THE CONTROLS THAT SAY "LITERAL". Same shapes, none of them a literal to Spark: a
+        # column, a CAST of a literal, and a sum of two literals -- which is NOT folded before
+        # coercion runs, so it keeps the int width. A rule that fired on any of these would make
+        # `d1 + a` and `d1 + 2` the same type, and they are not.
+        "d1 + a",
+        "d1 + b",
+        "d1 + CAST(2 AS INT)",
+        "d1 + (2 + 2)",
+        "d1 + 2 + a",
+
+        # WHAT DOES NOT TAKE THE RULE. Unification resolves `(d1, 2)` through the int width in
+        # every one of these -- decimal(12,2), where the rule would say decimal(10,2) -- so they
+        # are the rows that keep this from leaking into #280's least-common-type clamp.
+        "greatest(d1, 2)",
+        "least(d1, 2)",
+        "coalesce(d1, 2)",
+        "nvl(d1, 2)",
+        "if(bl, d1, 2)",
+        "CASE WHEN bl THEN d1 ELSE 2 END",
+        # ...and `round`, whose second argument is a scale it needs as an integer.
+        "round(d1 + 2, 1)",
+        "round(1.5BD / 2, 2)",
+        # A negation carries the operand's type through, so it shows the inner rule and adds no
+        # rule of its own.
+        "-(1.5BD / 2)",
+
+        # -- COMPARISON TAKES IT, AND AN IN LIST DOES NOT --------------------------------
+        # One expression apart, and opposite answers. Against 4E-32 the comparison resolves
+        # through decimal(38,37) -- the literal narrowed to decimal(1,0) -- and the value
+        # survives, so `= 0` is FALSE; the IN list resolves through decimal(38,28), where it
+        # rounds away, so `IN (0)` is TRUE. Both orders and every operator, since a rule applied
+        # to one of them would be visible in no other row.
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0",
+        "0 = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <> 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) > 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) < 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) >= 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <= 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <=> 0",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0)",
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0, 1)",
+        # The same comparison with the literal spelled as a CAST, which is the int-width answer
+        # and the row that makes the pair above attributable to the literal rather than to the
+        # value.
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = CAST(0 AS INT)",
+        # A decimal literal reaches none of this: it is already a decimal and is typed from its
+        # own digits either way.
+        "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0.0BD",
+
+        # NULLIF IS ASYMMETRIC, which no other row in the corpus would show. Its second argument
+        # takes the rule and its first does not: from the optimized plans, `nullif(d5, 0)` is
+        # `if (cast(d5 as decimal(38,37)) = cast(cast(0 as decimal(1,0)) as decimal(38,37)))
+        # null else d5` while `nullif(0, d5)` is `if (cast(0 as decimal(38,28)) = cast(d5 as
+        # decimal(38,28))) null else 0`. So these two answer DIFFERENTLY over the same values --
+        # the first keeps 4E-32 and the second is NULL -- and neither is a typo.
+        "nullif(CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)), 0)",
+        "nullif(0, CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+        "nullif(d1, 2)",
+        "nullif(2, d1)",
+
+        # FLOATING POINT IS NOT PART OF THIS, for the reason #277 gives: a decimal mixed with a
+        # double is a DOUBLE, so there is no decimal for a literal to be narrowed against.
+        "g + 2",
+        "CAST(0.1 AS DOUBLE) = 0",
+    ],
+
     "malformed": [
         # Genuine parse errors, recorded so our error paths can be checked against Spark's.
         "a +", "((a)", "a > > 0", "",
