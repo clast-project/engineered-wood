@@ -37,11 +37,15 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     private readonly IShortCircuitingFunctions? _shortCircuiting;
 
+    /// <summary>The registry's nullability rules, when it has any. See <see cref="NeverNull"/>.</summary>
+    private readonly INullabilityRules? _nullability;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
         _coercion = functions as IComparisonCoercion;
         _shortCircuiting = functions as IShortCircuitingFunctions;
+        _nullability = functions as INullabilityRules;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -694,6 +698,28 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalUnary(UnaryPredicate unary, RecordBatch batch)
     {
+        // AN OPERAND THAT CAN NEVER BE NULL IS NOT EVALUATED, so an error inside it never happens.
+        // Spark discards it at analysis -- `NullPropagation` rewrites the whole predicate to a
+        // constant -- and measured on 4.0.3 under ANSI that is the difference between
+        // `CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL`, which answers false, and
+        // the same CASE on its own, which raises CAST_INVALID_INPUT. #319.
+        //
+        // Not the per-row laziness of #279/#306: this fires before a row is read, and it fires on
+        // an operand every row of which WOULD be evaluated. The two are independent, and the
+        // conditional family needs both -- laziness already answers
+        // `coalesce(1, CAST('abc' AS INT)) IS NULL` by reaching the second argument over no rows,
+        // while nothing about laziness reaches `(2147483647 + 1) IS NULL`.
+        if ((unary.Op is UnaryOperator.IsNull or UnaryOperator.IsNotNull)
+            && NeverNull(unary.Operand))
+        {
+            // Typed and discarded, exactly as an unreached branch is. Spark ANALYSES the operand
+            // before the optimizer ever folds it, so `if(a > 0, a, bin) IS NOT NULL` is still
+            // refused for having no common type; over no rows this reads no value and so cannot
+            // raise on one.
+            TypeOver(unary.Operand, batch);
+            return Constant(unary.Op == UnaryOperator.IsNotNull, batch.Length);
+        }
+
         var operand = EvalExpression(unary.Operand, batch);
         var result = new bool?[batch.Length];
 
@@ -710,6 +736,120 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             };
         }
         return result;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expression"/> can never produce a null, whatever the data.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's <c>Expression.nullable</c>, for the subset that can be answered without types.
+    /// Only <see cref="EvalUnary"/> asks, and only so that it can skip an operand Spark skips;
+    /// the judgement is never allowed to change a VALUE.
+    /// </para>
+    /// <para>
+    /// <b>A COLUMN REFERENCE IS ALWAYS NULLABLE HERE, even one whose field says otherwise.</b>
+    /// Spark reads nullability from the TABLE's schema, and the only schema this can see is the
+    /// batch the caller happened to build — <c>DeltaConstraintEnforcer</c> is handed the caller's
+    /// rows, not the snapshot's. A batch declaring a field non-nullable that the table declares
+    /// nullable would make <c>x IS NOT NULL</c> a constant <c>true</c> and admit a row Spark
+    /// rejects, which is the one direction a constraint validator must not fail in. Refusing to
+    /// read the flag at all removes that direction rather than guarding it, and what it costs is
+    /// only that <c>(a + b) IS NOT NULL</c> over two NOT NULL columns keeps raising where Spark
+    /// answers — the divergence #319 already had, in the safe direction.
+    /// </para>
+    /// <para>
+    /// <b>Everything unrecognised is nullable.</b> Under-claiming costs a fold; over-claiming
+    /// yields a wrong answer. So this is an allow-list of shapes measured against Spark 4.0.3,
+    /// and a shape not on it — <c>IS NAN</c>, a cast, <c>nullif</c>, <c>round</c>, a division,
+    /// <c>IN</c>, and every comparison but <c>&lt;=&gt;</c> — answers false whether or not it
+    /// could be null.
+    /// </para>
+    /// <para>
+    /// <b>The rule is STRUCTURAL: it never reads a type, so any shape whose nullability depends
+    /// on one is off the list.</b> That is the boundary the arithmetic and comparison families
+    /// are outside of — both look positional and are not, because an implicit cast appears
+    /// between operands this cannot see the types of.
+    /// </para>
+    /// </remarks>
+    private bool NeverNull(Expression expression)
+    {
+        switch (expression)
+        {
+            case LiteralExpression literal:
+                return !literal.Value.IsNull;
+
+            case TruePredicate or FalsePredicate:
+                return true;
+
+            // Measured: `CAST(s AS INT) IS NULL` is itself non-nullable, so a doubled
+            // `IS NULL` folds where the inner one alone raises. IS NAN is deliberately absent --
+            // Spark answers false for a null operand where we answer null, and settling that
+            // difference is not this change's job.
+            case UnaryPredicate unary:
+                return unary.Op is UnaryOperator.IsNull or UnaryOperator.IsNotNull;
+
+            case NotPredicate not:
+                return NeverNull(not.Child);
+
+            case AndPredicate and:
+                return AllNeverNull(and.Children);
+
+            case OrPredicate or:
+                return AllNeverNull(or.Children);
+
+            // ONLY `<=>`, and the rest of the comparison family is deliberately absent for the
+            // same reason arithmetic is. A comparison that needs COERCION inserts a cast, and a
+            // cast is nullable: measured in BOTH dialects, `1 = 1` and `'a' = 'b'` are
+            // non-nullable while `'abc' = 1` and `'abc' > 1` are NULLABLE, because the string is
+            // cast to the number's type first. Two non-null literals compared in every case, so
+            // no rule phrased in terms of the operands' nullability can separate them -- this has
+            // no types, and asking `IComparisonCoercion` for one needs the Arrow types the
+            // operands have not been evaluated into yet. `IN` is worse still: `'abc' IN (1)` is
+            // nullable under ANSI and NON-nullable under legacy.
+            //
+            // Nothing is lost by leaving them out. A comparison folds only when both operands are
+            // non-nullable, and an operand that could RAISE is a cast or an arithmetic node,
+            // which is nullable anyway -- so the shapes this gives up (`(1 = 1) IS NULL`) are
+            // exactly the ones that evaluate to the same answer without the fold.
+            //
+            // `<=>` stays because its non-nullability is STRUCTURAL: it answers for a null pair,
+            // coercion or not. Measured, `'abc' <=> 1` is non-nullable and
+            // `('abc' <=> 1) IS NULL` is false in both dialects, where the `=` spelling of the
+            // same comparison raises under ANSI.
+            case ComparisonPredicate comparison:
+                return comparison.Op == ComparisonOperator.NullSafeEqual;
+
+            case FunctionCall call:
+                return NeverNullCall(call);
+
+            // A column reference, and anything else this does not recognise.
+            default:
+                return false;
+        }
+    }
+
+    private bool AllNeverNull(IReadOnlyList<Expression> expressions)
+    {
+        for (var i = 0; i < expressions.Count; i++)
+        {
+            if (!NeverNull(expressions[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool NeverNullCall(FunctionCall call)
+    {
+        if (_nullability is null)
+            return false;
+
+        var arguments = new bool[call.Arguments.Count];
+        for (var i = 0; i < arguments.Length; i++)
+            arguments[i] = NeverNull(call.Arguments[i]);
+
+        return _nullability.NeverNull(call.Name, arguments);
     }
 
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)

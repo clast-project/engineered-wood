@@ -116,6 +116,49 @@ public sealed class SparkEvaluationCorpusTests
         ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
         ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
+        // #319, and the two rows of the `null-propagation` group that diverge. Spark discards the
+        // operand of IS NULL / IS NOT NULL when the operand can never be null, so an error inside
+        // it never happens; we reproduce that for the shapes whose nullability is STRUCTURAL --
+        // the conditional family, the predicates, a literal -- and deliberately not for
+        // arithmetic, which is the one shape that looks structural and is not.
+        //
+        // WHY NOT ARITHMETIC. Integral arithmetic is non-nullable, so the first row folds in
+        // Spark and raises here. Decimal arithmetic follows the PROMOTED precision instead:
+        // measured under ANSI, `CAST(1 AS DECIMAL(10,2)) + CAST(1 AS DECIMAL(10,2))` is NULLABLE
+        // (the sum wants decimal(11,2)) while `CAST(1 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))`
+        // is not -- two non-null literals added together in both cases, so no rule phrased in
+        // terms of the arguments' nullability can tell them apart. The group carries a third row,
+        // `(99999999999999999999999999999999999999 + 1) IS NULL`, which AGREES: Spark calls that
+        // sum nullable and raises, and it is exactly what an implementation that folded
+        // arithmetic would answer false for -- a constant `IS NOT NULL` over an expression that
+        // really can be null, which in a CHECK constraint admits a row Spark rejects.
+        //
+        // So this is fail-CLOSED on purpose: we refuse a write Spark accepts, rather than risk
+        // accepting one Spark refuses. Reversing it needs the result TYPE of an arithmetic node,
+        // which the nullability seam does not carry.
+        // #319, the third row of that group, and a different kind of gap: not a nullability
+        // judgement but the TYPE CHECK the fold does in place of Spark's analysis. `TypeOver`
+        // types an operand by evaluating it over NO rows, and retries WITH rows when that cannot
+        // answer -- which `round` cannot, because its scale decides the result type and is read
+        // out of row 0. The retry then reads the malformed cast the fold existed to avoid.
+        //
+        // Not worth trading away: dropping the retry only changes which error is raised (the
+        // scale read fails instead), and folding through a failed type check would swallow the
+        // analysis errors the group's `if(1, 1, 2)` rows exist to keep. This is the residual
+        // `TypeOver` already names for itself -- an expression needing BOTH a value-dependent
+        // result type and a branch that raises -- and answering it needs the type INFERRED rather
+        // than evaluated, which is a different design.
+        ["coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL"] =
+            "#319: TypeOver retries with rows for a value-dependent result type, and the retry "
+            + "reads the operand the fold would have skipped",
+
+        ["(2147483647 + 1) IS NULL"] =
+            "#319: integral arithmetic is non-nullable to Spark and folds; we evaluate and raise",
+        ["(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) "
+            + "+ CAST(1 AS DECIMAL(38,0))) IS NULL"] =
+            "#319: decimal arithmetic nullability follows the promoted precision, which the rule "
+            + "cannot see, so we evaluate and raise",
+
         // #318, and the one row of the `string-trim` group that diverges -- which is not about
         // trimming at all. It sits in that group as the control saying #316 trimmed rather than
         // stripped, and interior whitespace is what it carries; what it FOUND is that

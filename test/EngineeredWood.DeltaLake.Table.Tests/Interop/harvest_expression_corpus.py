@@ -110,6 +110,12 @@ LEGACY_GROUPS = (
     # #278. Not merely ansi-SENSITIVE: the two dialects coerce in opposite directions, so the
     # legacy answers are a different rule rather than a different failure mode.
     "conditional-string-coercion",
+    # #319. The nullability rule itself ought to be dialect-independent -- it is a structural
+    # property of the tree, not a failure mode -- but most of the group's rows are casts and
+    # divisions that RAISE under ANSI and answer NULL without it, so what the fold has to step
+    # aside for is completely different in the two dialects. Recorded rather than assumed, for
+    # the reason decimal-common-type is: the registry has a legacy variant that shares this rule.
+    "null-propagation",
     # #280. Measured identical under both dialects, all 24 rows -- the least common type is a
     # coercion rule and the ANSI switch moves overflow behaviour, not coercion. Recorded rather
     # than assumed, for the reason nullif-equality is: the registry has a legacy variant that
@@ -2016,6 +2022,122 @@ GROUPS = {
         "length(NULL)", "upper(NULL)", "concat('x', NULL)", "substring(NULL, 1, 2)",
         "round(NULL)", "round(NULL, 2)", "year(NULL)", "date_format(NULL, 'y')",
         "NULL || 'x'", "NULL LIKE 'a'", "s LIKE NULL",
+    ],
+
+    # #319. Spark DISCARDS the operand of IS NULL / IS NOT NULL when the operand is provably
+    # non-nullable, so an error inside it never happens. That is `NullPropagation`, and it is NOT
+    # the per-row laziness of the `short-circuit` group: it fires before a row is read, and it
+    # fires on an operand every row of which would otherwise be evaluated.
+    #
+    # THE GROUP CARRIES BOTH DIRECTIONS, for the reason `short-circuit` does. Half the rows ask
+    # whether the fold happens; the other half ask whether an operand Spark calls NULLABLE is
+    # still evaluated and still raises. A group carrying only the first half is satisfied by an
+    # implementation that folds everything -- which answers `x IS NOT NULL` true for a genuine
+    # null and admits a row Spark rejects, the one direction a CHECK constraint must not fail in.
+    #
+    # EVERY ROW IS LITERAL-DRIVEN OR COLUMN-NULLABLE, because a non-nullable COLUMN cannot be
+    # expressed here at all: `cmd_expression_corpus` builds its frame with `createDataFrame([],
+    # ddl)` and its rows from `SELECT CAST(...)`, so every column of this schema is nullable. The
+    # half of the rule that reads a column's declared nullability is out of reach of this fixture
+    # by construction, and is declared in SparkEvaluationCorpusTests instead.
+    "null-propagation": [
+        # The fold, once per shape that reaches it. Each operand contains a cast that raises, and
+        # each wrapper is what makes the operand non-nullable.
+        "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL",
+        "CASE WHEN (CAST(s AS INT) > 1) THEN 1 ELSE 2 END IS NOT NULL",
+        "if(CAST('abc' AS INT) > 1, 1, 2) IS NULL",
+        "coalesce(CAST(s AS INT), 0) IS NOT NULL",
+        "coalesce(1, CAST('abc' AS INT)) IS NULL",
+        "nvl(CAST(s AS INT), 0) IS NOT NULL",
+        "ifnull(CAST(s AS INT), 0) IS NOT NULL",
+        "nvl2(CAST(s AS INT), 1, 2) IS NULL",
+        "greatest(CAST(s AS INT), 1) IS NULL",
+        "least(CAST(s AS INT), 1) IS NULL",
+
+        # ARITHMETIC, WHICH WE DELIBERATELY DO NOT FOLD -- three rows that between them say why.
+        # Integral arithmetic is non-nullable, so Spark answers the first without adding. DECIMAL
+        # arithmetic follows the PROMOTED precision instead: the second is two non-null literals
+        # whose sum Spark calls NULLABLE (it evaluates, and raises at plan time), and the third is
+        # the same sum through casts, whose sum Spark calls non-nullable. No rule phrased in terms
+        # of the arguments' nullability can separate the last two, so arithmetic is off the
+        # allow-list and the first and third are declared differences. The middle one AGREES, and
+        # is the control: it is what an implementation that folded arithmetic would get wrong in
+        # the dangerous direction.
+        "(2147483647 + 1) IS NULL",
+        "(99999999999999999999999999999999999999 + 1) IS NULL",
+        "(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))) IS NULL",
+
+        # Predicates are never null themselves, so a doubled IS NULL folds where the inner one
+        # alone raises -- and `<=>` answers for a null pair, which makes it non-nullable whatever
+        # its operands are.
+        "(CAST(s AS INT) IS NULL) IS NULL",
+        "(CAST(s AS INT) <=> 1) IS NULL",
+
+        # COMPARISONS, WHICH WE DELIBERATELY DO NOT FOLD EITHER -- the same trap as arithmetic,
+        # found by the review of PR #321 after the first version DID fold them. A comparison that
+        # needs coercion inserts a CAST, and a cast is nullable: `1 = 1` and `'a' = 'b'` are
+        # non-nullable while `'abc' = 1` and `'abc' > 1` are NULLABLE in BOTH dialects. Two
+        # non-null literals compared in every case, so the operands' nullability cannot separate
+        # them. The legacy answers are what make this urgent rather than tidy: `('abc' = 1) IS
+        # NULL` is TRUE there, so folding it to false is a WRONG VALUE, not a suppressed error.
+        "('abc' = 1) IS NULL",
+        "('abc' > 1) IS NULL",
+        "(1 = 1) IS NULL",
+        "('a' = 'b') IS NULL",
+        # ...and the over-claim travels through the connectives, so AND carries a row of its own.
+        "(true AND 'abc' = 1) IS NULL",
+        # `IN` is worse: nullable under ANSI and NON-nullable under legacy, for the same set.
+        "('abc' IN (1)) IS NULL",
+        "('abc' IN ('x')) IS NULL",
+        # `<=>` is the one comparison that DOES fold, because its non-nullability is structural
+        # rather than a property of the coercion. Same operands as the `=` row above, opposite
+        # answer -- which is what says the rule is about the OPERATOR and not about the literals.
+        "('abc' <=> 1) IS NULL",
+
+        # A non-boolean CONDITION, which Spark refuses at ANALYSIS under both dialects. The fold
+        # must not answer for it, which means the condition's type has to be checked over no rows
+        # -- the first version of this change checked it per row and so never checked it at all
+        # once the fold skipped the evaluation.
+        "if(1, 1, 2) IS NOT NULL",
+        "CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL",
+
+        # A folded operand whose result TYPE depends on an argument's VALUE. `round`'s scale is
+        # read from row 0, so typing this over zero rows fails and `TypeOver` retries WITH rows --
+        # which reads the malformed cast the fold existed to avoid. Declared; the residual is the
+        # one `TypeOver` names for itself.
+        "coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL",
+        # NOT and AND over a folded operand, so the structural half of the rule is exercised
+        # through something the fold actually reaches. The second is the shape a real constraint
+        # takes: a conjunct Spark discards beside one that still decides the row.
+        "NOT (coalesce(CAST(s AS INT), 0) IS NULL)",
+        "(coalesce(CAST(s AS INT), 0) IS NOT NULL) AND a > 0",
+        "1 IS NULL", "'x' IS NOT NULL", "true IS NOT NULL",
+
+        # ── The other direction: Spark calls these NULLABLE, evaluates, and raises. ──
+        # A cast is nullable whatever its source -- `Cast.forceNullable` is a property of the type
+        # pair, not of ANSI -- which is why the whole cast family stays evaluated.
+        "CAST(s AS INT) IS NULL",
+        "CAST('abc' AS INT) IS NOT NULL",
+        "try_cast(s AS INT) IS NULL",
+        # Nullable whatever their arguments.
+        "nullif(CAST(s AS INT), 0) IS NULL",
+        "(1 / 0) IS NULL",
+        "(1 % 0) IS NULL",
+        "round(CAST(s AS DOUBLE), 0) IS NULL",
+        # A CASE with no ELSE is null for a row matching no branch.
+        "CASE WHEN (CAST(s AS INT) > 1) THEN 1 END IS NULL",
+        # One nullable result is enough to make the whole conditional nullable.
+        "CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE CAST(NULL AS INT) END IS NULL",
+        "if(CAST('abc' AS INT) > 1, 1, CAST(NULL AS INT)) IS NULL",
+        "greatest(CAST(s AS INT), CAST(NULL AS INT)) IS NULL",
+        # A comparison is nullable when either operand is; a string function when its argument is.
+        "(CAST(s AS INT) = 1) IS NULL",
+        "concat('a', CAST(CAST(s AS INT) AS STRING)) IS NULL",
+
+        # ── The value half: an operand that really can be null still answers per row. ──
+        "a IS NULL", "s IS NOT NULL", "CAST(NULL AS INT) IS NULL", "NULL IS NULL",
+        "(a + 1) IS NULL", "coalesce(a, 0) IS NOT NULL",
+        "CASE WHEN a > 0 THEN 1 ELSE 2 END IS NOT NULL",
     ],
 
     "ansi-sensitive": [
