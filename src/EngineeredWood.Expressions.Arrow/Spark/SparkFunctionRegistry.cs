@@ -2195,11 +2195,26 @@ public sealed class SparkFunctionRegistry
     /// for another: <c>round(-(0.0D), 1)</c> agreed before only because the negation had already
     /// lost the sign.
     /// </para>
+    /// <para>
+    /// <b>A zero is answered before any scaling</b>, which is what makes that rule hold at a
+    /// scale whose power of ten is not a double. Above about 308 the factor overflows to an
+    /// infinity, and <c>0 * infinity</c> is NaN -- so a zero came back NaN, which is the same
+    /// value-out-of-nowhere the underflow guard below exists to prevent, at the other end of the
+    /// same range and for a positive zero as much as a negative one. Measured: Spark answers 0.0
+    /// for every scale an <c>Int</c> can hold. Raised in review of #282; it was wrong before it
+    /// too, and #285 measured only the underflow end.
+    /// </para>
     /// </remarks>
     private static double RoundHalfUp(double value, int scale)
     {
         if (double.IsNaN(value) || double.IsInfinity(value))
             return value;
+
+        // BEFORE the scaling, not after it: a zero has no fraction to lose at any scale, and
+        // reaching the multiply at all is what turns it into a NaN. Both zeros answer the
+        // positive one, which is the BigDecimal rule the remarks above describe.
+        if (value == 0d)
+            return 0d;
 
         var factor = Math.Pow(10, scale);
 

@@ -149,6 +149,53 @@ public sealed class NegativeZeroTests
     public void RoundingToZeroProducesAPositiveZero(string sql) =>
         Assert.True(IsPositiveZero(Eval(sql)));
 
+    /// <summary>
+    /// A zero rounds to a positive zero at EVERY scale, including the ones whose power of ten is
+    /// not a double.
+    /// </summary>
+    /// <remarks>
+    /// Raised in review of #282. Above about 308 the scaling factor overflows to infinity, and
+    /// `0 * infinity` is NaN -- so a zero came back NaN, a value out of nowhere for an input with
+    /// a perfectly ordinary answer. That is the same failure #285 fixed at the OTHER end, where a
+    /// scale below -324 underflows the factor to zero; only that end had been measured, and this
+    /// one was wrong before #282 as well, for a positive zero as much as a negative one. Spark
+    /// answers 0.0 at every scale an Int can hold.
+    /// </remarks>
+    [Theory]
+    [InlineData("round(CAST(0.0 AS DOUBLE), 400)")]
+    [InlineData("round(negative(CAST(0.0 AS DOUBLE)), 400)")]
+    [InlineData("round(g - g, 400)")]
+    [InlineData("round(negative(g - g), 400)")]
+    [InlineData("round(CAST(0.0 AS FLOAT), 400)")]
+    // The boundary: 10^308 is a double and 10^309 is not.
+    [InlineData("round(CAST(0.0 AS DOUBLE), 308)")]
+    [InlineData("round(CAST(0.0 AS DOUBLE), 309)")]
+    [InlineData("round(negative(CAST(0.0 AS DOUBLE)), 309)")]
+    // ...and the other end, which #285 covered for a value and not for a zero.
+    [InlineData("round(CAST(0.0 AS DOUBLE), -400)")]
+    [InlineData("round(negative(CAST(0.0 AS DOUBLE)), -400)")]
+    public void RoundingAZeroAtAnyScaleProducesAPositiveZero(string sql) =>
+        Assert.True(IsPositiveZero(Eval(sql)));
+
+    /// <summary>The control: a NON-zero value at the same scales is untouched.</summary>
+    /// <remarks>
+    /// These are what say the short-circuit is about the zero rather than about the scale. The
+    /// scaled value overflows to an infinity for them, which the range guard already caught --
+    /// only a zero reached the NaN, because only `0 * infinity` is one.
+    /// </remarks>
+    [Theory]
+    [InlineData("round(CAST(-1.5 AS DOUBLE), 400)", -1.5d)]
+    [InlineData("round(g, 400)", 2.5d)]
+    [InlineData("round(CAST(2.5 AS DOUBLE), 309)", 2.5d)]
+    // A huge NEGATIVE scale rounds a value away to zero, and to the positive one. #285.
+    [InlineData("round(CAST(-1.5 AS DOUBLE), -400)", 0d)]
+    public void RoundingAValueAtAnExtremeScaleIsUntouched(string sql, double expected)
+    {
+        var actual = Eval(sql);
+        Assert.Equal(expected, actual);
+        Assert.False(double.IsNaN(actual));
+    }
+
     /// <summary>A rounded value that does not land on zero keeps its sign.</summary>
     [Theory]
     [InlineData("round(CAST(-1.5 AS DOUBLE))", -2d)]

@@ -2503,6 +2503,36 @@ GROUPS = {
         "CAST(round(CAST(-0.5 AS DOUBLE)) AS STRING)",
         "CAST(round(CAST(-0.4 AS DOUBLE), 3) AS STRING)",
 
+        # --- AND AT A SCALE WHOSE POWER OF TEN IS NOT A DOUBLE, which is where that rule was
+        # easiest to implement only halfway. Raised in review of #282: above about 308 the
+        # scaling factor overflows to an infinity and `0 * infinity` is NaN, so a zero answered
+        # NaN -- a value out of nowhere, and the same failure #285 fixed at the other end of the
+        # range without anyone measuring this one. Both zeros and both widths, because it was
+        # wrong for the POSITIVE zero too and so is not a negative-zero regression at all.
+        "CAST(round(CAST(0.0 AS DOUBLE), 400) AS STRING)",
+        "CAST(round(negative(CAST(0.0 AS DOUBLE)), 400) AS STRING)",
+        "CAST(round(g - g, 400) AS STRING)",
+        "CAST(round(negative(g - g), 400) AS STRING)",
+        "CAST(round(CAST(0.0 AS FLOAT), 400) AS STRING)",
+        # ...on both sides of the boundary, 10^308 being a double and 10^309 not.
+        "CAST(round(CAST(0.0 AS DOUBLE), 308) AS STRING)",
+        "CAST(round(CAST(0.0 AS DOUBLE), 309) AS STRING)",
+        "CAST(round(negative(CAST(0.0 AS DOUBLE)), 309) AS STRING)",
+        # ...and the other end, where the factor underflows instead. #285 measured it for a
+        # value; these are the zeros it did not ask about.
+        "CAST(round(CAST(0.0 AS DOUBLE), -400) AS STRING)",
+        "CAST(round(negative(CAST(0.0 AS DOUBLE)), -400) AS STRING)",
+        # ...with the controls that say the short-circuit is about the ZERO and not the scale: a
+        # non-zero value at the same scales is untouched, because the range guard already caught
+        # its overflow. Only `0 * infinity` was ever a NaN.
+        "CAST(round(CAST(-1.5 AS DOUBLE), 400) AS STRING)",
+        "CAST(round(g, 400) AS STRING)",
+        "CAST(round(CAST(2.5 AS DOUBLE), 309) AS STRING)",
+        "CAST(round(CAST(-1.5 AS DOUBLE), -400) AS STRING)",
+        # ...and the non-finite values, which pass through ahead of all of it.
+        "CAST(round(CAST('NaN' AS DOUBLE), 400) AS STRING)",
+        "CAST(round(CAST('Infinity' AS DOUBLE), 400) AS STRING)",
+
         # --- NOTHING SURVIVES A CAST OUT of the double, the widest decimal included, so a fix
         # that made the negation right must not start rendering "-0.00". The double-to-decimal
         # cast is the one to watch: #244 made it go through the value's RENDERING, which is now
