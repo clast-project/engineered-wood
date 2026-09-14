@@ -231,18 +231,34 @@ internal static class SparkFunctions
     }
 
     /// <summary>
-    /// <c>date_format(temporal, pattern)</c>, over the subset of Java patterns that mean the same
-    /// thing in .NET.
+    /// <c>date_format(temporal, pattern)</c>, rendered from Java's pattern language by
+    /// <see cref="SparkDatePattern"/>.
     /// </summary>
     /// <remarks>
-    /// The two pattern languages overlap for the fields Delta expressions actually use —
-    /// <c>y M d H m s</c> — but diverge elsewhere, so an unrecognised letter is refused rather
-    /// than passed through to be silently reinterpreted. <c>yyyy</c> is the common case and means
-    /// the same in both.
+    /// The pattern is compiled here rather than handed to .NET's formatter; see
+    /// <see cref="SparkDatePattern"/> for the four ways that pass-through answered differently
+    /// from Spark. #284.
+    /// <para>
+    /// A NULL ROW IS ANSWERED WITHOUT LOOKING AT THE PATTERN, which is measured rather than
+    /// assumed — the obvious reading, that Spark resolves the pattern at analysis and so refuses
+    /// an invalid one whatever the values are, is wrong for the case that matters. Measured on
+    /// 4.0.3: <c>date_format(NULL, 'ddd')</c> and <c>date_format(CAST(NULL AS TIMESTAMP),
+    /// 'ddd')</c> both answer NULL, because a null-literal argument folds the whole expression
+    /// away before the formatter is ever built, while <c>date_format(ts, 'ddd')</c> over a column
+    /// refuses. The residual, unmeasured because the corpus has no all-null timestamp column:
+    /// Spark would refuse a bad pattern over a column whose every row is null, where this
+    /// answers nulls.
+    /// </para>
+    /// <para>
+    /// The compiled pattern is cached across the batch because the pattern is an ARRAY here —
+    /// nothing stops it varying per row, and almost nothing ever does.
+    /// </para>
     /// </remarks>
     public static IArrowArray DateFormat(IReadOnlyList<IArrowArray> args, int rowCount)
     {
         var builder = new StringArray.Builder();
+        string? compiledFor = null;
+        SparkDatePattern? compiled = null;
 
         for (var i = 0; i < rowCount; i++)
         {
@@ -255,40 +271,17 @@ internal static class SparkFunctions
                 continue;
             }
 
+            if (!string.Equals(compiledFor, pattern, StringComparison.Ordinal))
+            {
+                compiled = SparkDatePattern.Compile(pattern);
+                compiledFor = pattern;
+            }
+
             var local = TimeZoneInfo.ConvertTime(instant.Value, SparkDialectOptions.TimeZone);
-            builder.Append(local.ToString(TranslatePattern(pattern), Invariant));
+            builder.Append(compiled!.Format(local));
         }
 
         return builder.Build();
-    }
-
-    private static string TranslatePattern(string javaPattern)
-    {
-        // A single-quoted section is a literal in both dialects, so its letters carry no meaning
-        // and must not be validated. Rejecting them would refuse `yyyy-MM-dd\'T\'HH:mm:ss`, which
-        // is the ordinary way to write an ISO 8601 timestamp.
-        var inLiteral = false;
-
-        foreach (var c in javaPattern)
-        {
-            if (c == '\'')
-            {
-                inLiteral = !inLiteral;
-                continue;
-            }
-
-            if (inLiteral || !char.IsLetter(c))
-                continue;
-
-            if (c is not ('y' or 'M' or 'd' or 'H' or 'm' or 's'))
-            {
-                throw new NotSupportedException(
-                    $"date_format pattern letter '{c}' is not supported; " +
-                    "only y, M, d, H, m and s are known to mean the same in both dialects");
-            }
-        }
-
-        return javaPattern;
     }
 
     // ── Conditionals ───────────────────────────────────────────────────────────────────────

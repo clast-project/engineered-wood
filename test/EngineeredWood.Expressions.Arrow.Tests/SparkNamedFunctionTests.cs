@@ -200,6 +200,150 @@ public sealed class SparkNamedFunctionTests
         Assert.Contains("'D'", ex.Message, StringComparison.Ordinal);
     }
 
+    // ── date_format, where .NET's format language is NOT Java's. #284. ─────────────────────
+    //
+    // Every answer below was measured on Spark 4.0.3 / JDK 17 with the session zone pinned to
+    // UTC, over 2026-08-11 12:30:45 and 0999-01-02 03:04:05.
+
+    private static RecordBatch Moment() =>
+        Batch(("ts", Timestamps(new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero))));
+
+    [Fact]
+    public void AnEmptyPatternFormatsNoFieldsRatherThanAWholeTimestamp()
+    {
+        // The issue as filed. .NET reads an empty format string as a request for the general
+        // format, so this answered `08/11/2026 12:30:45 +00:00` -- a whole timestamp where Spark
+        // formats nothing at all.
+        Assert.Equal("", Str("date_format(ts, '')", Moment()));
+    }
+
+    [Fact]
+    public void AOneCharacterPatternIsAFieldAndNotADotNetStandardFormat()
+    {
+        // THE TRAP: .NET reads a format string of exactly one character as a STANDARD specifier,
+        // so the shortest spelling of every field was the one spelling that could not mean it --
+        // `d` was the short date `08/11/2026`, `s` the sortable `2026-08-11T12:30:45`, `M` was
+        // `August 11`, and `H` is no standard specifier at all and threw FormatException.
+        var batch = Moment();
+
+        Assert.Equal("2026", Str("date_format(ts, 'y')", batch));
+        Assert.Equal("8", Str("date_format(ts, 'M')", batch));
+        Assert.Equal("11", Str("date_format(ts, 'd')", batch));
+        Assert.Equal("12", Str("date_format(ts, 'H')", batch));
+        Assert.Equal("30", Str("date_format(ts, 'm')", batch));
+        Assert.Equal("45", Str("date_format(ts, 's')", batch));
+    }
+
+    [Fact]
+    public void TheYearHasThreeRulesAndOnlyOneOfThemIsPadToTheCount()
+    {
+        // Year 999 is the boundary that tells them apart: below 1000 the count-1 year and the
+        // padded ones stop agreeing, and `yyy` pads to three where `yyyy` pads to four. This is
+        // the divergence no .NET pattern could have covered -- `y` has no .NET spelling, since
+        // .NET's own `y` is the last two digits.
+        var batch = Batch(("ts", Timestamps(new DateTimeOffset(999, 1, 2, 3, 4, 5, TimeSpan.Zero))));
+
+        Assert.Equal("999", Str("date_format(ts, 'y')", batch));
+        Assert.Equal("99", Str("date_format(ts, 'yy')", batch));
+        Assert.Equal("999", Str("date_format(ts, 'yyy')", batch));
+        Assert.Equal("0999", Str("date_format(ts, 'yyyy')", batch));
+        Assert.Equal("00999", Str("date_format(ts, 'yyyyy')", batch));
+
+        Assert.Equal("0999-01-02 03:04:05",
+            Str("date_format(ts, 'yyyy-MM-dd HH:mm:ss')", batch));
+    }
+
+    [Fact]
+    public void AMonthNameIsEnglishBecauseSparkFormatsWithLocaleUs()
+    {
+        var batch = Moment();
+
+        Assert.Equal("Aug", Str("date_format(ts, 'MMM')", batch));
+        Assert.Equal("August", Str("date_format(ts, 'MMMM')", batch));
+    }
+
+    [Fact]
+    public void ARunTooLongForItsLetterIsRefusedTheWaySparkRefusesIt()
+    {
+        // Java would widen the field to the count -- `ddd` a three-digit day -- but Spark raises
+        // SparkUpgradeException.DATETIME_PATTERN_RECOGNITION for every one of these, because the
+        // meaning changed when it moved to java.time in 3.0. Answering here would be answering
+        // where Spark refuses, which is the worse half of the same defect.
+        var batch = Moment();
+
+        foreach (var pattern in new[] { "ddd", "dddd", "HHH", "mmm", "sss", "MMMMM" })
+        {
+            Assert.Throws<NotSupportedException>(
+                () => Eval($"date_format(ts, '{pattern}')", batch));
+        }
+    }
+
+    [Fact]
+    public void TheCharactersDotNetReadsAsConstructsAreLiteralsToJava()
+    {
+        // `\` is .NET's escape, `%` its single-custom-specifier prefix and `"` its other literal
+        // delimiter. Java has none of the three, so each is output as itself -- and a pattern
+        // ending in a lone backslash, which .NET refuses outright, is just a backslash.
+        var batch = Moment();
+
+        Assert.Equal(@"\11", Str(@"date_format(ts, '\\d')", batch));
+        Assert.Equal("%11", Str("date_format(ts, '%d')", batch));
+        Assert.Equal(@"""26""", Str(@"date_format(ts, '""yy""')", batch));
+        Assert.Equal(@"\", Str(@"date_format(ts, '\\')", batch));
+        Assert.Equal(@"\\", Str(@"date_format(ts, '\\\\')", batch));
+    }
+
+    [Fact]
+    public void AQuotedSectionIsALiteralAndAnEmptyOneIsAnApostrophe()
+    {
+        // Java's two special cases, both reachable from SQL and neither what a reader would
+        // guess: an EMPTY quoted section is a literal apostrophe rather than nothing, and a
+        // doubled quote inside a section is one apostrophe rather than two section boundaries.
+        var batch = Moment();
+
+        Assert.Equal("2026T12", Str(@"date_format(ts, 'yyyy\'T\'HH')", batch));
+        Assert.Equal("yyyy", Str(@"date_format(ts, '\'yyyy\'')", batch));
+        Assert.Equal("'", Str(@"date_format(ts, '\'\'')", batch));
+    }
+
+    [Fact]
+    public void APatternEndingInsideAQuotedSectionIsRefused()
+    {
+        var ex = Assert.Throws<NotSupportedException>(
+            () => Eval(@"date_format(ts, 'yyyy\'')", Moment()));
+        Assert.Contains("incomplete string literal", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheStructuralCharactersJavaReservesAreRefused()
+    {
+        // Spark refuses `#`, `{`, `}` and a closing `]`. It ACCEPTS `[ ]` as an optional section
+        // -- `[yyyy]` answers 2026 -- but an optional section is a parse-side construct with no
+        // counterpart when formatting, so it is refused with the rest rather than guessed at.
+        var batch = Moment();
+
+        foreach (var pattern in new[] { "#", "{", "}", "[yyyy]", "yyyy]" })
+        {
+            Assert.Throws<NotSupportedException>(
+                () => Eval($"date_format(ts, '{pattern}')", batch));
+        }
+    }
+
+    [Fact]
+    public void ANullTimestampIsAnsweredWithoutLookingAtThePattern()
+    {
+        // NOT what the obvious reading gives. Spark resolves a datetime pattern at analysis, so
+        // "an invalid pattern refuses whatever the values are" is the rule one would write down
+        // -- and it is wrong for the case that reaches here: measured on 4.0.3, a null-literal
+        // argument folds the whole expression away before the formatter is ever built, so
+        // `date_format(NULL, 'ddd')` is NULL while `date_format(ts, 'ddd')` over a column
+        // refuses. Both rows are in the `date-format` corpus group.
+        var batch = Moment();
+
+        Assert.Null(Str("date_format(CAST(NULL AS TIMESTAMP), 'ddd')", batch));
+        Assert.Throws<NotSupportedException>(() => Eval("date_format(ts, 'ddd')", batch));
+    }
+
     // ── Conditionals ───────────────────────────────────────────────────────────────────────
 
     [Fact]

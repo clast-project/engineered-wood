@@ -2284,6 +2284,115 @@ GROUPS = {
         "CAST(0.1 AS DOUBLE) = 0",
     ],
 
+    # `date_format`'s pattern language, which is JAVA'S and not .NET's. #284.
+    #
+    # NOT IN LEGACY_GROUPS. Every answer here is a formatting rule and every refusal is a pattern
+    # check, and the ANSI switch moves neither -- what governs a datetime pattern in Spark is
+    # `spark.sql.legacy.timeParserPolicy`, which this corpus does not touch. Asking twice would
+    # double the group for the same answers.
+    #
+    # THE POINT OF THE GROUP is that the two languages agree over a narrow middle and nowhere
+    # else, so the rows are chosen to sit on both sides of every edge: a run of two or more of
+    # `y M d H m s` with punctuation between them agrees, and the empty pattern, a pattern of one
+    # character, a lone `y`, and every character .NET reads as a construct do not.
+    "date-format": [
+        # --- THE ISSUE AS FILED. .NET reads an EMPTY format string as a request for the general
+        # format, so this answered a whole timestamp -- `08/11/2026 12:30:00 +00:00` -- where
+        # Spark formats no fields at all. Asked bracketed as well, so the recorded answer says
+        # "empty string" rather than leaving a reader to wonder whether the row is missing.
+        "date_format(ts, '')",
+        "concat('[', date_format(ts, ''), ']')",
+        "date_format(dt, '')",
+
+        # --- A PATTERN OF EXACTLY ONE CHARACTER, which .NET reads as a STANDARD specifier rather
+        # than a custom one. So the shortest spelling of each field was the one spelling that
+        # could not mean the field: `d` was the short date, `s` the sortable timestamp, `M` the
+        # month-and-day, and `H` is no standard specifier at all and threw FormatException out of
+        # the evaluator.
+        "date_format(ts, 'y')", "date_format(ts, 'M')", "date_format(ts, 'd')",
+        "date_format(ts, 'H')", "date_format(ts, 'm')", "date_format(ts, 's')",
+        "date_format(dt, 'y')", "date_format(dt, 'M')", "date_format(dt, 'd')",
+
+        # --- TWO OF THE SAME LETTER, which is the width the two languages DO agree on. These are
+        # the control: a fix that stopped using .NET's formatter has to leave them alone.
+        "date_format(ts, 'yy')", "date_format(ts, 'MM')", "date_format(ts, 'dd')",
+        "date_format(ts, 'HH')", "date_format(ts, 'mm')", "date_format(ts, 'ss')",
+        "date_format(ts, 'yyyy-MM-dd')", "date_format(ts, 'HH:mm:ss')",
+        "date_format(ts, 'MM/dd/yyyy')", "date_format(ts, 'yyyyMMdd')",
+        "date_format(dt, 'yyyy-MM-dd')",
+
+        # --- THE YEAR HAS THREE RULES, and only one of them is "pad to the count": count 1 is the
+        # year in its own width, count 2 is the last two digits, count 3 or more pads. Above 999
+        # the first and the last agree and the rule is invisible, so the boundary is asked as a
+        # LITERAL -- the `ts` column cannot carry two years at once, and this is the year that
+        # tells `y` (999) from `yyy` (999) from `yyyy` (0999). It is also the divergence no
+        # translation into .NET's language could have closed: .NET's `y` is the last two digits
+        # and it has no spelling for "as many digits as the year needs".
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'y')",
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yy')",
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyy')",
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyy')",
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyyy')",
+        "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyy-MM-dd HH:mm:ss')",
+        "date_format(ts, 'yyy')", "date_format(ts, 'yyyy')", "date_format(ts, 'yyyyy')",
+
+        # --- MONTH NAMES. Spark formats with Locale.US, so these are English on every machine --
+        # which is why the implementation reads them off InvariantCulture rather than the
+        # process's. One past the last name, Spark REFUSES rather than narrowing.
+        "date_format(ts, 'MMM')", "date_format(ts, 'MMMM')", "date_format(ts, 'MMMMM')",
+
+        # --- A RUN TOO LONG FOR ITS LETTER. Java would widen the field to the count, so `ddd`
+        # would be a three-digit day -- but Spark raises DATETIME_PATTERN_RECOGNITION for all of
+        # these, because the meaning changed when it moved to java.time in 3.0. Answering where
+        # Spark refuses is the worse half of the same defect, so they are asked here.
+        "date_format(ts, 'ddd')", "date_format(ts, 'dddd')",
+        "date_format(ts, 'HHH')", "date_format(ts, 'mmm')", "date_format(ts, 'sss')",
+
+        # --- THE CHARACTERS .NET READS AS CONSTRUCTS AND JAVA OUTPUTS AS THEMSELVES: the escape,
+        # the single-custom-specifier prefix, and the other literal delimiter. A lone trailing
+        # backslash, which .NET refuses outright, is just a backslash.
+        r"date_format(ts, '\\d')",
+        "date_format(ts, '%d')",
+        """date_format(ts, '"yy"')""",
+        r"date_format(ts, '\\')",
+        r"date_format(ts, '\\\\')",
+        # ...and the punctuation that agrees, which says the fix did not start escaping
+        # everything. `/` and `:` are .NET's culture-dependent date and time separators, so they
+        # only agree because the formatter was invariant.
+        "date_format(ts, '-')", "date_format(ts, ' ')", "date_format(ts, '..')",
+
+        # --- JAVA'S OWN LITERAL, which is the single-quoted section, with both of its special
+        # cases: an EMPTY section is a literal apostrophe rather than nothing, and a doubled quote
+        # inside a section is one apostrophe rather than two section boundaries. A pattern ending
+        # inside a section is refused, by Java and here alike.
+        r"date_format(ts, 'yyyy\'T\'HH')",
+        r"date_format(ts, '\'yyyy\'')",
+        r"date_format(ts, '\'\'')",
+        r"date_format(ts, 'yyyy\'')",
+
+        # --- THE STRUCTURAL CHARACTERS. Java reserves `#`, `{` and `}` and throws on them; `[` and
+        # `]` open and close an OPTIONAL SECTION, which Spark accepts when formatting and this does
+        # not implement. Both halves are asked so the boundary is recorded rather than assumed.
+        "date_format(ts, '#')", "date_format(ts, '{')", "date_format(ts, '}')",
+        "date_format(ts, ']')", "date_format(ts, 'yyyy]')", "date_format(ts, '[yyyy]')",
+
+        # --- PATTERN LETTERS SPARK SUPPORTS AND THIS DOES NOT, which is a gap #284 does not close
+        # and does not widen. Recorded because an unimplemented letter and an INVALID one look the
+        # same from here -- both refuse -- and only the corpus says which is which: `D E a h S G q
+        # L Z z X` all answer in Spark, while `n` and `V` refuse there too.
+        "date_format(ts, 'D')", "date_format(ts, 'E')", "date_format(ts, 'a')",
+        "date_format(ts, 'h')", "date_format(ts, 'S')", "date_format(ts, 'G')",
+        "date_format(ts, 'q')", "date_format(ts, 'LLL')", "date_format(ts, 'Z')",
+        "date_format(ts, 'z')", "date_format(ts, 'X')",
+        "date_format(ts, 'n')", "date_format(ts, 'V')",
+
+        # --- THE PATTERN IS CHECKED WHATEVER THE VALUE IS. Spark resolves it at analysis, so a
+        # pattern it rejects rejects the expression over an all-null column too. Checking it after
+        # the null test would answer null here and refuse only once a value showed up.
+        "date_format(NULL, 'ddd')", "date_format(NULL, 'yyyy')",
+        "date_format(CAST(NULL AS TIMESTAMP), 'ddd')",
+    ],
+
     "malformed": [
         # Genuine parse errors, recorded so our error paths can be checked against Spark's.
         "a +", "((a)", "a > > 0", "",
