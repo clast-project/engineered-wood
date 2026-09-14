@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-14 05:38:34.297020",
-      "2026-09-14 05:38:34.297020",
-      "2026-09-14 05:38:34.297020"
+      "2026-09-14 06:00:18.516548",
+      "2026-09-14 06:00:18.516548",
+      "2026-09-14 06:00:18.516548"
      ]
     }
    },
@@ -27544,6 +27544,198 @@
     "eval": {
      "ok": false,
      "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: uuuu'"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[']",
+      null,
+      "[']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: '''"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[']",
+      null,
+      "[']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: '''''"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "['']",
+      null,
+      "['']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[''']",
+      null,
+      "[''']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, 'yyyy\\'\\'MM'), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, 'yyyy\\'\\'MM'), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[2026'08]",
+      null,
+      "[1970'01]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'yyyy'), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'yyyy'), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "['2026]",
+      null,
+      "['1970]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'It\\'\\'s\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'It\\'\\'s\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[It's]",
+      null,
+      "[It's]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'a\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'a\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[a']",
+      null,
+      "[a']"
+     ]
     }
    },
    {

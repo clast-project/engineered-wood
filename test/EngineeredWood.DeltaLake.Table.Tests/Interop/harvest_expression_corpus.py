@@ -2370,6 +2370,23 @@ GROUPS = {
         r"date_format(ts, '\'\'')",
         r"date_format(ts, 'yyyy\'')",
 
+        # ...and THE SCAN IS GREEDY, which is the part a reader gets wrong. A run of apostrophes
+        # is ONE section, not a chain of `''` pairs, so four of them render one apostrophe rather
+        # than two -- 2n render n-1, and an odd count ends inside the section and refuses. Asked
+        # because the other reading is plausible enough to have been raised in review of #284,
+        # and bracketed by `concat` so the recorded answer distinguishes one apostrophe from two.
+        # The rows with fields around the run are what say the section ends where the scan says.
+        r"""concat('[', date_format(ts, '\'\''), ']')""",
+        r"""concat('[', date_format(ts, '\'\'\''), ']')""",
+        r"""concat('[', date_format(ts, '\'\'\'\''), ']')""",
+        r"""concat('[', date_format(ts, '\'\'\'\'\''), ']')""",
+        r"""concat('[', date_format(ts, '\'\'\'\'\'\''), ']')""",
+        r"""concat('[', date_format(ts, '\'\'\'\'\'\'\'\''), ']')""",
+        r"""concat('[', date_format(ts, 'yyyy\'\'MM'), ']')""",
+        r"""concat('[', date_format(ts, '\'\'yyyy'), ']')""",
+        r"""concat('[', date_format(ts, '\'It\'\'s\''), ']')""",
+        r"""concat('[', date_format(ts, '\'a\'\'\''), ']')""",
+
         # --- THE STRUCTURAL CHARACTERS. Java reserves `#`, `{` and `}` and throws on them; `[` and
         # `]` open and close an OPTIONAL SECTION, which Spark accepts when formatting and this does
         # not implement. Both halves are asked so the boundary is recorded rather than assumed.

@@ -315,6 +315,71 @@ public sealed class SparkNamedFunctionTests
     }
 
     [Fact]
+    public void ARunOfApostrophesIsOneSectionAndNotAChainOfEmptyOnes()
+    {
+        // THE SCAN IS GREEDY, and the whole run is one section rather than a chain of `''` pairs.
+        // Reading it the other way gives a plausible and wrong answer -- four apostrophes would
+        // be two empty sections and so two apostrophes -- so the counts are MEASURED, on 4.0.3,
+        // and 2n apostrophes render n-1: two give one, four give one, six give two, eight give
+        // three. An ODD count ends inside the section and refuses.
+        var batch = Moment();
+
+        Assert.Equal("'", Str(@"date_format(ts, '\'\'')", batch));
+        Assert.Equal("'", Str(@"date_format(ts, '\'\'\'\'')", batch));
+        Assert.Equal("''", Str(@"date_format(ts, '\'\'\'\'\'\'')", batch));
+        Assert.Equal("'''", Str(@"date_format(ts, '\'\'\'\'\'\'\'\'')", batch));
+
+        Assert.Throws<NotSupportedException>(
+            () => Eval(@"date_format(ts, '\'\'\'')", batch));
+        Assert.Throws<NotSupportedException>(
+            () => Eval(@"date_format(ts, '\'\'\'\'\'')", batch));
+
+        // ...and the same run with fields around it, which is what says the section ends where
+        // the scan says it does rather than swallowing the rest of the pattern.
+        Assert.Equal("2026'08", Str(@"date_format(ts, 'yyyy\'\'MM')", batch));
+        Assert.Equal("'2026", Str(@"date_format(ts, '\'\'yyyy')", batch));
+        Assert.Equal("It's", Str(@"date_format(ts, '\'It\'\'s\'')", batch));
+        Assert.Equal("a'", Str(@"date_format(ts, '\'a\'\'\'')", batch));
+    }
+
+    [Fact]
+    public void ThePatternIsReadPerRowAndNotOncePerBatch()
+    {
+        // The pattern argument is an ARRAY, so nothing stops it varying per row -- a column, or a
+        // CASE over one, reaches here as easily as a literal does. The compiled pattern is cached
+        // across the batch because almost nothing ever does vary, and a cache that never
+        // invalidated would format every row with the first row's pattern and say nothing.
+        var batch = Batch(
+            ("ts", Timestamps(
+                new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero),
+                new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero),
+                new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero))),
+            ("p", Strings("yyyy", "MM", "yyyy")));
+
+        var result = (StringArray)Eval("date_format(ts, p)", batch);
+
+        Assert.Equal("2026", result.GetString(0));
+        Assert.Equal("08", result.GetString(1));
+        // Back to the first pattern, which is what says the cache re-compiles rather than merely
+        // remembering the most recent answer.
+        Assert.Equal("2026", result.GetString(2));
+    }
+
+    [Fact]
+    public void AnInvalidPatternRefusesOnTheRowThatCarriesIt()
+    {
+        // The row before it formats fine, so this is the per-row read again from the other side:
+        // a pattern column is checked where it is used, not once for the batch.
+        var batch = Batch(
+            ("ts", Timestamps(
+                new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero),
+                new DateTimeOffset(2026, 8, 11, 12, 30, 45, TimeSpan.Zero))),
+            ("p", Strings("yyyy", "ddd")));
+
+        Assert.Throws<NotSupportedException>(() => Eval("date_format(ts, p)", batch));
+    }
+
+    [Fact]
     public void TheStructuralCharactersJavaReservesAreRefused()
     {
         // Spark refuses `#`, `{`, `}` and a closing `]`. It ACCEPTS `[ ]` as an optional section

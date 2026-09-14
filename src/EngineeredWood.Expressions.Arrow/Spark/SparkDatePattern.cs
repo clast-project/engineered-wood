@@ -299,13 +299,34 @@ internal sealed class SparkDatePattern
         }
     }
 
+    /// <summary>
+    /// Appends <paramref name="value"/> zero-padded to <paramref name="width"/>.
+    /// </summary>
+    /// <remarks>
+    /// The digits go straight into the builder rather than through
+    /// <see cref="int.ToString(IFormatProvider)"/>: <see cref="Format"/> runs once per row and
+    /// this is called once per numeric field, so <c>yyyy-MM-dd HH:mm:ss</c> would otherwise
+    /// allocate six transient strings for every value formatted. Every value that reaches here is
+    /// a field of a <see cref="DateTimeOffset"/> — a year of at most four digits, or a month, day
+    /// or clock field of at most two — so there is no sign to carry and the buffer cannot fill.
+    /// </remarks>
     private static void AppendPadded(StringBuilder text, int value, int width)
     {
-        var digits = value.ToString(CultureInfo.InvariantCulture);
-        for (var i = digits.Length; i < width; i++)
+        Span<char> digits = stackalloc char[10];
+        var length = 0;
+
+        do
+        {
+            digits[length++] = (char)('0' + (value % 10));
+            value /= 10;
+        }
+        while (value > 0);
+
+        for (var i = length; i < width; i++)
             text.Append('0');
 
-        text.Append(digits);
+        for (var i = length - 1; i >= 0; i--)
+            text.Append(digits[i]);
     }
 
     private readonly struct Token
