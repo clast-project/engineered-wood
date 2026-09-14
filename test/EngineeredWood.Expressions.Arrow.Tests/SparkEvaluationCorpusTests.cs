@@ -390,7 +390,8 @@ public sealed class SparkEvaluationCorpusTests
     /// shape this issue is about.
     /// </para>
     /// <para>
-    /// Asked of the EVALUATOR rather than of the rules, so it measures the type a caller actually
+    /// Asked of the EVALUATOR — and of BOTH registries, the legacy half in the theory below — so
+    /// it measures the type a caller actually
     /// receives: a Delta generated column is written at the type the array carries, and a
     /// decimal(13,12) where Spark writes a decimal(7,6) is a different column however equal the
     /// values look. Scoped to the decimal groups, whose types we model completely; a name this
@@ -408,16 +409,44 @@ public sealed class SparkEvaluationCorpusTests
     [InlineData("decimal-literal-precision")]
     [InlineData("decimal-common-type")]
     [InlineData("coercion")]
-    public void TheTypeWeProduceIsTheTypeSparkResolved(string group)
+    public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
+        AssertTypesMatchSpark(
+            Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
+
+    /// <summary>
+    /// The same question of the LEGACY registry, against the corpus harvested with ANSI off.
+    /// </summary>
+    /// <remarks>
+    /// Both groups were harvested twice in order to record that their types are
+    /// dialect-independent, and a claim the tests do not check is not recorded — the ANSI theory
+    /// above would pass unchanged if the legacy registry started resolving a different decimal,
+    /// since the two evaluation gates either side of it compare VALUES, which carry no scale.
+    /// The `coercion` group is absent here because it is not in the harvest's `LEGACY_GROUPS`,
+    /// so there is no second section for it to check.
+    /// </remarks>
+    [Theory]
+    [InlineData("decimal-literal-precision")]
+    [InlineData("decimal-common-type")]
+    public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
+        AssertTypesMatchSpark(
+            Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
+            LegacyExcluded, LegacyKnownDifferences);
+
+    private static void AssertTypesMatchSpark(
+        JsonElement groups, string group, SparkFunctionRegistry registry,
+        Dictionary<string, string> excluded, Dictionary<string, string> knownDifferences)
     {
         var batch = CorpusEvaluation.BuildBatch(RootSchema, RootRows).Slice(0, 0);
         var differing = new List<string>();
         var compared = 0;
 
-        foreach (var entry in Corpus.RootElement.GetProperty("groups").GetProperty(group).EnumerateArray())
+        foreach (var entry in groups.GetProperty(group).EnumerateArray())
         {
             var expression = entry.GetProperty("expression").GetString()!;
-            if (Excluded.ContainsKey(expression) || KnownDifferences.ContainsKey(expression))
+            // The dialect's OWN declared lists, not the ANSI ones: a row this dialect answers
+            // differently is declared in its own table, and reading the other dialect's would
+            // both skip rows that are fine here and compare rows that are known not to be.
+            if (excluded.ContainsKey(expression) || knownDifferences.ContainsKey(expression))
                 continue;
 
             var recorded = entry.GetProperty("type");
@@ -428,7 +457,7 @@ public sealed class SparkEvaluationCorpusTests
 
             try
             {
-                var actual = new ArrowRowEvaluator(Ansi)
+                var actual = new ArrowRowEvaluator(registry)
                     .EvaluateExpression(SparkSqlParser.ParseExpression(expression), batch);
                 var ours = SparkTypeName(actual.Data.DataType);
                 var theirs = recorded.GetProperty("type").GetString();

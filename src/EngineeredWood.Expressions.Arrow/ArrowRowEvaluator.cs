@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -607,13 +608,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </remarks>
     private IArrowType? MinimumPrecision(Expression operand, IArrowType other)
     {
-        if (_literalPrecision is null)
+        if (_literalPrecision is null || IntegralLiteral(operand) is not long value)
             return null;
 
-        var literal = IntegralLiteral(operand);
-        return literal is null
-            ? null
-            : _literalPrecision.LiteralComparisonType(IntegralValue(literal.Value), other);
+        return _literalPrecision.LiteralComparisonType(value, other);
     }
 
     /// <summary>Whether an operand carries a scale that a common type could round away.</summary>
@@ -1080,33 +1078,66 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         // integral literal is not one, so no call can narrow both.
         for (var i = 0; i < 2; i++)
         {
-            var literal = IntegralLiteral(call.Arguments[i]);
-            if (literal is null)
+            if (IntegralLiteral(call.Arguments[i]) is not long value)
                 continue;
 
-            var target = _literalPrecision.LiteralArgumentType(
-                call.Name, i, IntegralValue(literal.Value), arguments[1 - i].Data.DataType);
-
-            if (target is null)
+            if (_literalPrecision.LiteralArgumentType(
+                    call.Name, i, value, arguments[1 - i].Data.DataType) is not Decimal128Type target)
                 continue;
 
-            // The literal's ARRAY is rebuilt rather than the type declared over it, because the
-            // registry reads its arguments' types off the arrays it is handed. Rebuilt at the
-            // array's own length, not the batch's: a literal evaluated over no rows carries the
-            // extra row ConstantArray adds so that a type survives an empty selection.
-            var length = arguments[i].Length;
-            arguments[i] = MaterializeAsArray(
-                ArrowToLiteralValues(arguments[i], length), length, target);
+            // Built from the VALUE rather than by reading the array back: the array the literal
+            // already materialised into holds the same constant in every row, so converting it to
+            // `LiteralValue?[]` and re-materialising would put an O(batch) scan and a temporary
+            // array of the batch's length on every arithmetic call carrying a literal. The
+            // replacement is at the array's own length, not the batch's, because a literal
+            // evaluated over no rows carries the extra row ConstantArray adds so that a type
+            // survives an empty selection.
+            arguments[i] = ConstantDecimalArray(value, target, arguments[i].Length);
         }
     }
 
-    /// <summary>The value of an integral literal, whichever width it was parsed at.</summary>
-    private static long IntegralValue(LiteralValue literal) =>
-        literal.Type == LiteralValue.Kind.Int32 ? literal.AsInt32 : literal.AsInt64;
+    /// <summary>A decimal column holding one integral value in every row.</summary>
+    /// <remarks>
+    /// The general <see cref="BuildDecimalArray"/> reaches <see cref="BigInteger"/> per row to
+    /// rescale a value that may differ each time. Neither applies here: the value is constant and
+    /// its scale is zero, so the unscaled value IS the value, and the sixteen bytes it occupies
+    /// are laid out once and copied. Nothing is allocated per row.
+    /// </remarks>
+    private static IArrowArray ConstantDecimalArray(long value, Decimal128Type type, int length)
+    {
+        const int ByteWidth = 16;
+
+        var bytes = new byte[length * ByteWidth];
+
+        // Zero rows is a real case, not a degenerate one: it is how a branch nothing selected
+        // gets its TYPE, so the answer is an empty column of the target type and there is no
+        // first row to lay out.
+        if (length > 0)
+        {
+            var first = bytes.AsSpan(0, ByteWidth);
+
+            // Two's complement over the full width, so a negative value sign-extends through the
+            // upper eight bytes rather than reading as a very large positive one.
+            if (value < 0)
+                first.Fill(0xFF);
+
+            BinaryPrimitives.WriteInt64LittleEndian(first, value);
+
+            for (var row = 1; row < length; row++)
+                first.CopyTo(bytes.AsSpan(row * ByteWidth, ByteWidth));
+        }
+
+        var validity = new ArrowBuffer.BitmapBuilder(length);
+        for (var row = 0; row < length; row++)
+            validity.Append(true);
+
+        return new Decimal128Array(new ArrayData(
+            type, length, 0, 0, [validity.Build(), new ArrowBuffer(bytes)]));
+    }
 
     /// <summary>
-    /// The integral literal an operand IS, for Spark's minimum-precision rule, or null when it is
-    /// anything else.
+    /// The value of the integral literal an operand IS, for Spark's minimum-precision rule, or
+    /// null when it is anything else.
     /// </summary>
     /// <remarks>
     /// <b>A negated literal is one.</b> Spark's parser folds the sign into the literal, so
@@ -1116,20 +1147,42 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// decimal(11,2), the same as <c>d1 + 2</c>. Exactly one level, because Spark folds exactly
     /// one: <c>- -2</c> is a UnaryMinus over a literal there too, and takes no cast.
     /// <para>
+    /// The sign is applied to the value returned, because the caller builds the operand's column
+    /// from it rather than from the array the negation produced.
+    /// <see cref="long.MinValue"/> cannot arrive under a negation — its magnitude is one past
+    /// <see cref="long.MaxValue"/>, so <c>SparkLiteral</c> reads that token as a DECIMAL literal,
+    /// which is not integral and never reaches here — and the guard says so rather than trusting
+    /// it, since an expression tree built in code is not bound by the parser's ladder.
+    /// </para>
+    /// <para>
     /// This is also why the depth of #303 does not reach here. That issue is about a negative
     /// literal at a type's minimum being an <c>int</c> to Spark and a <c>bigint</c> to us; both
     /// spell <c>-2147483648</c> with ten digits, so both give <c>decimal(10,0)</c>.
     /// </para>
     /// </remarks>
-    private static LiteralValue? IntegralLiteral(Expression expression)
+    private static long? IntegralLiteral(Expression expression)
     {
+        var negated = false;
         if (expression is FunctionCall { Name: "negative", Arguments.Count: 1 } negate)
+        {
+            negated = true;
             expression = negate.Arguments[0];
+        }
 
-        return expression is LiteralExpression literal
-            && literal.Value.Type is LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64
-                ? (LiteralValue?)literal.Value
-                : null;
+        if (expression is not LiteralExpression literal
+            || literal.Value.Type is not (LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64))
+        {
+            return null;
+        }
+
+        var value = literal.Value.Type == LiteralValue.Kind.Int32
+            ? literal.Value.AsInt32
+            : literal.Value.AsInt64;
+
+        if (!negated)
+            return value;
+
+        return value == long.MinValue ? null : -value;
     }
 
     // -- Evaluating over a selection of rows --
