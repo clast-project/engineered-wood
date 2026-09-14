@@ -345,12 +345,12 @@ internal static class CorpusEvaluation
             case DoubleArray a:
                 return SameDouble(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
-                    : $"expected {expected}, got {a.GetValue(row)}";
+                    : $"expected {expected}, got {ShowDouble(a.GetValue(row)!.Value)}";
 
             case FloatArray a:
                 return SameDouble(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
-                    : $"expected {expected}, got {a.GetValue(row)}";
+                    : $"expected {expected}, got {ShowDouble(a.GetValue(row)!.Value)}";
 
             case Int64Array a:
                 return expected.GetInt64() == a.GetValue(row)!.Value
@@ -389,8 +389,9 @@ internal static class CorpusEvaluation
     /// does by default, and it made the whole fixture unreadable here — the failure was the
     /// corpus not loading at all rather than one comparison going wrong.
     /// </remarks>
-    public static double ExpectedDouble(JsonElement expected) =>
-        expected.ValueKind == JsonValueKind.String
+    public static double ExpectedDouble(JsonElement expected)
+    {
+        var value = expected.ValueKind == JsonValueKind.String
             ? expected.GetString() switch
             {
                 "NaN" => double.NaN,
@@ -399,6 +400,31 @@ internal static class CorpusEvaluation
                 var other => double.Parse(other!, Invariant),
             }
             : expected.GetDouble();
+
+        // THE SIGN OF A RECORDED ZERO COMES OFF THE TEXT, because .NET Framework's number parser
+        // drops it -- and the netstandard2.0 build of System.Text.Json this test loads under
+        // net472 reads a JSON number through that parser. Without this, the fixture's -0.0 became
+        // +0.0 on that target ALONE, and the two rows of `negative-zero` that compare a bare
+        // double failed there while their `CAST(... AS STRING)` twins passed: the expectation was
+        // wrong, not the answer. The same trap #282 fixes in SparkArrays, on the other side of
+        // the comparison.
+        var text = expected.ValueKind == JsonValueKind.String
+            ? expected.GetString()
+            : expected.GetRawText();
+
+        return value == 0d && text is { Length: > 0 } && text[0] == '-' ? -0d : value;
+    }
+
+    /// <summary>A double with the sign of a zero shown, which neither runtime's ToString does.</summary>
+    /// <remarks>
+    /// .NET Framework prints -0.0 as "0" and .NET Core prints it as "-0", so a failure message
+    /// built from ToString said "expected -0.0, got 0" on one target for an answer that was
+    /// actually right. A message about a signed zero has to spell the sign itself.
+    /// </remarks>
+    private static string ShowDouble(double value) =>
+        value == 0d && BitConverter.DoubleToInt64Bits(value) < 0
+            ? "-0"
+            : value.ToString("R", Invariant);
 
     /// <summary>
     /// Whether a recorded floating-point answer and ours are the SAME double. No tolerance.
@@ -418,12 +444,18 @@ internal static class CorpusEvaluation
     /// </remarks>
     public static bool SameDouble(double expected, double actual)
     {
-        // double.Equals rather than ==, because it settles NaN against NaN as equal — which is
-        // the answer a value oracle wants — and distinguishes nothing else that matters here.
-        // Everything the old tolerance had to special-case (an infinity making the tolerance
-        // infinite, so that our overflow to infinity compared equal to Spark's finite answer)
-        // stops existing once there is no tolerance to compute.
-        return expected.Equals(actual);
+        // Every NaN is one NaN. Spark's answer arrives as the text "NaN" and carries no payload,
+        // and a NaN that has been through unary minus has its sign bit set — so comparing NaN
+        // by its bits would report a difference where both sides render "NaN" and Spark makes no
+        // distinction either.
+        if (double.IsNaN(expected))
+            return double.IsNaN(actual);
+
+        // BY THE BITS, not by ==, which holds -0.0 equal to 0.0 and so could not see #282 at all:
+        // the whole corpus agreed on the VALUE of `-(0.0D)` while we answered the wrong zero, and
+        // only the `CAST(... AS STRING)` channel noticed. A value oracle that cannot distinguish
+        // two values Spark renders differently is not measuring the value.
+        return BitConverter.DoubleToInt64Bits(expected) == BitConverter.DoubleToInt64Bits(actual);
     }
 
     public static string Show(IArrowArray array, int row) => array switch

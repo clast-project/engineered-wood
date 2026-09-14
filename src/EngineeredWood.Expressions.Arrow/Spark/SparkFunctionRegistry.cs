@@ -595,6 +595,32 @@ public sealed class SparkFunctionRegistry
     /// <summary>An operand as Spark would print it, for an overflow message.</summary>
     private static string Show(SparkWideDecimals.Operand operand) => SparkWideDecimals.Render(operand);
 
+    /// <summary>Unary minus.</summary>
+    /// <remarks>
+    /// <b>Floating point negates in place; everything else subtracts from zero.</b> The two agree
+    /// at every value except zero, where IEEE 754 has two of them and subtraction cannot reach
+    /// the negative one: <c>0.0 - 0.0</c> is <c>+0.0</c> under round-to-nearest, so routing a
+    /// double through subtraction answered <c>0.0</c> where Spark answers <c>-0.0</c>. Measured
+    /// on 4.0.3, with the control in the corpus beside it — <c>-(0.0D)</c> renders <c>-0.0</c>
+    /// and <c>0.0D - 0.0D</c> renders <c>0.0</c>, so the two spellings really are different
+    /// questions rather than one written twice. #282.
+    /// <para>
+    /// The sign of a zero is invisible to a value comparison — <c>-0.0 == 0.0</c> holds in .NET
+    /// as it does in Spark, and <see cref="SparkFunctions.CompareAt"/> deliberately agrees — so
+    /// only the RENDERING channel can see this at all. It matters wherever the answer is printed
+    /// or kept as a sort key.
+    /// </para>
+    /// <para>
+    /// An integral operand keeps the subtraction, and that is load-bearing rather than merely
+    /// inherited: it is what makes <c>-(-2147483648)</c> raise instead of wrapping back to
+    /// itself, since the range check on the subtraction catches a result the operand's own width
+    /// cannot hold. A decimal keeps it for the same reason, and has no negative zero to lose.
+    /// </para>
+    /// <para>
+    /// It is also cheaper, which is not why it changed: the floating-point path no longer builds
+    /// a column of zeros to subtract from, and reads one value per row instead of two.
+    /// </para>
+    /// </remarks>
     private IArrowArray Negate(IArrowArray operand, int rowCount)
     {
         var type = SparkNumericTypes.NegateResult(operand.Data.DataType);
@@ -602,17 +628,43 @@ public sealed class SparkFunctionRegistry
         return type switch
         {
             Decimal128Type d => DecimalArithmetic("-", ZeroLike(d, rowCount), operand, d, rowCount),
-            DoubleType => DoubleArithmetic("-", ZeroLike(DoubleType.Default, rowCount), operand, rowCount),
-            FloatType => FloatArithmetic("-", ZeroLike(FloatType.Default, rowCount), operand, rowCount),
+            DoubleType => NegateFloating(operand, isFloat: false, rowCount),
+            FloatType => NegateFloating(operand, isFloat: true, rowCount),
             _ => IntegralArithmetic("-", ZeroLike(type, rowCount), operand, type, rowCount),
         };
     }
 
+    /// <summary>Unary minus over a float or a double, which is a flip of the sign bit.</summary>
+    /// <remarks>
+    /// A <c>void</c> operand arrives here as a double — <c>-NULL</c> is a double in Spark, #293 —
+    /// and <see cref="SparkArrays.ReadDouble"/> reads a <see cref="NullArray"/> as null, so it
+    /// falls out as a column of nulls without a case of its own.
+    /// </remarks>
+    private static IArrowArray NegateFloating(IArrowArray operand, bool isFloat, int rowCount)
+    {
+        var doubles = isFloat ? null : new DoubleArray.Builder();
+        var floats = isFloat ? new FloatArray.Builder() : null;
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (SparkArrays.ReadDouble(operand, i) is not { } value)
+            {
+                doubles?.AppendNull();
+                floats?.AppendNull();
+                continue;
+            }
+
+            doubles?.Append(-value);
+            floats?.Append(-(float)value);
+        }
+
+        return (IArrowArray?)doubles?.Build() ?? floats!.Build();
+    }
+
     /// <summary>An all-zero array of <paramref name="type"/>, so negation reuses subtraction.</summary>
     /// <remarks>
-    /// Subtracting from zero rather than negating in place is what makes
-    /// <c>-(-2147483648)</c> raise instead of wrapping back to itself, since the range check on
-    /// the subtraction catches a result the operand's own width cannot hold.
+    /// Integral and decimal only; see <see cref="Negate"/> for why floating point does not come
+    /// here.
     /// </remarks>
     private static IArrowArray ZeroLike(IArrowType type, int rowCount)
     {
@@ -621,20 +673,6 @@ public sealed class SparkFunctionRegistry
             var decimals = new Decimal128Array.Builder(d);
             for (var i = 0; i < rowCount; i++) decimals.Append(0m);
             return decimals.Build();
-        }
-
-        if (type is DoubleType)
-        {
-            var doubles = new DoubleArray.Builder();
-            for (var i = 0; i < rowCount; i++) doubles.Append(0d);
-            return doubles.Build();
-        }
-
-        if (type is FloatType)
-        {
-            var floats = new FloatArray.Builder();
-            for (var i = 0; i < rowCount; i++) floats.Append(0f);
-            return floats.Build();
         }
 
         var values = new long?[rowCount];
@@ -2147,6 +2185,16 @@ public sealed class SparkFunctionRegistry
     /// NaN and the infinities pass through — measured, <c>round(NaN, 2)</c> is NaN — and so does
     /// a value scaled past 2^53, where a double has no fractional part left to round. That is
     /// what keeps <c>round(g, 20)</c> equal to <c>g</c> rather than turning it into an infinity.
+    /// <para>
+    /// <b>A zero result is always a POSITIVE zero</b>, which is the half of #282 that runs the
+    /// other way. Spark rounds a double through <c>BigDecimal</c>, which has no negative zero at
+    /// all, so every answer that lands on zero comes back <c>+0.0</c> however the input was
+    /// signed: measured on 4.0.3, <c>round(-0.4D)</c>, <c>round(-0.04D, 1)</c> and
+    /// <c>round(-(0.0D), 1)</c> all render <c>0.0</c>, where IEEE rounding keeps the sign and
+    /// would render <c>-0.0</c>. Fixing unary minus without this would have TRADED one divergence
+    /// for another: <c>round(-(0.0D), 1)</c> agreed before only because the negation had already
+    /// lost the sign.
+    /// </para>
     /// </remarks>
     private static double RoundHalfUp(double value, int scale)
     {
@@ -2167,7 +2215,11 @@ public sealed class SparkFunctionRegistry
         if (double.IsInfinity(scaled) || Math.Abs(scaled) >= 9007199254740992d)
             return value;
 
-        return Math.Round(scaled, MidpointRounding.AwayFromZero) / factor;
+        var rounded = Math.Round(scaled, MidpointRounding.AwayFromZero) / factor;
+
+        // `+ 0d` rather than a branch on the sign bit, because IEEE addition is what DEFINES the
+        // sign of a zero sum: -0.0 + 0.0 is +0.0 under round-to-nearest, and +0.0 + 0.0 is +0.0.
+        return rounded == 0d ? rounded + 0d : rounded;
     }
 
     private IArrowArray RoundIntegral(IArrowArray source, int scale, int rowCount)

@@ -127,7 +127,14 @@ LEGACY_GROUPS = (
     # rows do differ, `2 / d2` and `2 % d2`, which raise DIVIDE_BY_ZERO on the boundary row under
     # ANSI and answer null without it. One harvest would have recorded the rule with no evidence
     # that the dialect leaves it alone, which is the whole reason decimal-common-type is here too.
-    "decimal-literal-precision")
+    "decimal-literal-precision",
+    # #282. The sign of a zero ought to be dialect-independent -- negation, rounding and the
+    # number parse are computations, and the ANSI switch moves overflow and cast BEHAVIOUR rather
+    # than arithmetic -- but the group is half made of casts, and #258, #314 and #316 each found a
+    # cast whose answer the switch does move. Asked twice to find out whether this is another, for
+    # the reason decimal-common-type is asked twice: the registry has a legacy variant that shares
+    # every one of these code paths.
+    "negative-zero")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -2408,6 +2415,134 @@ GROUPS = {
         # the null test would answer null here and refuse only once a value showed up.
         "date_format(NULL, 'ddd')", "date_format(NULL, 'yyyy')",
         "date_format(CAST(NULL AS TIMESTAMP), 'ddd')",
+    ],
+
+    # IEEE 754 HAS TWO ZEROS AND SPARK CAN TELL THEM APART. #282. The group exists because the
+    # sign of a zero is invisible to every comparison in SQL and in .NET alike -- `-0.0 = 0.0` is
+    # true in both -- so the only channel that can see it is the RENDERING, and every row here
+    # that carries a double is therefore asked through `CAST(... AS STRING)`. That is also why
+    # the defect survived a corpus which already evaluated `-(g)`: the value matched.
+    #
+    # THREE RULES, and they do not point the same way, which is why they are gathered together.
+    # Unary minus MAKES a negative zero where subtracting from zero cannot. `round` DESTROYS one,
+    # because Spark rounds a double through BigDecimal and a BigDecimal has no signed zero. And
+    # every cast OUT of a double -- to a decimal, to an integral, to a boolean -- drops it too. A
+    # fix that reads only the first rule trades one divergence for another.
+    "negative-zero": [
+        # --- THE ISSUE AS FILED, in both channels and in every spelling of unary minus. The
+        # first row is the one a value comparison cannot see; the second is the one that caught it.
+        "negative(CAST(0.0 AS DOUBLE))",
+        "CAST(negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+        "-CAST(0.0 AS DOUBLE)",
+        "CAST(-CAST(0.0 AS DOUBLE) AS STRING)",
+        "CAST(-0.0D AS STRING)",
+        "CAST(negative(CAST(0.0 AS FLOAT)) AS STRING)",
+        # ...and over a zero the OPTIMIZER cannot fold away, so the rule is about evaluation
+        # rather than about constant folding.
+        "CAST(negative(g - g) AS STRING)",
+        "CAST(negative(f - f) AS STRING)",
+
+        # --- THE CONTROL, and the reason this is a defect rather than a preference: `0.0 - x` and
+        # `-x` are the same value at every double except this one. Under round-to-nearest
+        # `0.0 - 0.0` is a POSITIVE zero, so an implementation that reuses subtraction for
+        # negation cannot reach the answer above however it is written.
+        "CAST(CAST(0.0 AS DOUBLE) - CAST(0.0 AS DOUBLE) AS STRING)",
+        "CAST(0.0D AS STRING)",
+        "CAST(negative(negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+        "CAST(negative(CAST(0.0 AS DOUBLE)) + CAST(0.0 AS DOUBLE) AS STRING)",
+        "CAST(negative(CAST(0.0 AS DOUBLE)) + negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+        "CAST(CAST(0.0 AS DOUBLE) * CAST(-1.0 AS DOUBLE) AS STRING)",
+
+        # --- FROM TEXT, which is the second producer, and the one that differs per RUNTIME rather
+        # than per implementation: .NET Framework's number parser answers a positive zero for
+        # "-0.0" where .NET Core and Java answer the negative one. The sign has to be read off the
+        # TEXT, and `-1e-400` is the proof -- it underflows to a zero whose sign appears nowhere
+        # in the digits.
+        "CAST(CAST('-0.0' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-0' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-.0' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-0E5' AS DOUBLE) AS STRING)",
+        "CAST(CAST('  -0.0  ' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-0.0' AS FLOAT) AS STRING)",
+        "CAST(CAST('-1e-400' AS DOUBLE) AS STRING)",
+        # ...including through the Java type suffix #258 is about, which is a SECOND parse and
+        # needs the same rule.
+        "CAST(CAST('-0.0d' AS DOUBLE) AS STRING)",
+        "CAST(CAST('-0.0f' AS FLOAT) AS STRING)",
+        # ...and the two forms that must NOT produce one.
+        "CAST(CAST('+0.0' AS DOUBLE) AS STRING)",
+        "CAST(CAST('1e-400' AS DOUBLE) AS STRING)",
+
+        # --- A NEGATIVE ZERO LITERAL IS NOT ONE. `-0.0` is a decimal in Spark, and a decimal has
+        # no signed zero, so the sign is gone before the cast to double ever runs. Only the `D`
+        # suffix above spells a negative zero as a literal.
+        "CAST(-0.0 AS STRING)",
+        "CAST(-0.0BD AS STRING)",
+        "CAST(CAST(-0.0 AS DOUBLE) AS STRING)",
+        "CAST(negative(CAST(0.0 AS DECIMAL(10,2))) AS STRING)",
+        "CAST(negative(CAST(0 AS INT)) AS STRING)",
+
+        # --- ROUND DESTROYS IT, which is the rule that runs the other way. Spark rounds a double
+        # through BigDecimal, so any answer landing on zero comes back positive however the input
+        # was signed -- where IEEE rounding keeps the sign and would answer -0.0.
+        "CAST(round(CAST(-0.4 AS DOUBLE)) AS STRING)",
+        "CAST(round(CAST(-0.04 AS DOUBLE), 1) AS STRING)",
+        "CAST(round(CAST(-0.0001 AS DOUBLE), 2) AS STRING)",
+        "CAST(round(CAST(-0.4 AS DOUBLE), -1) AS STRING)",
+        "CAST(round(CAST(-0.4 AS FLOAT)) AS STRING)",
+        # ...and over a negative zero itself, at three scales. These are the rows that say the two
+        # rules have to be fixed TOGETHER: each of them agreed before #282 only because unary
+        # minus had already lost the sign, so closing that half alone would have opened these.
+        "CAST(round(negative(CAST(0.0 AS DOUBLE)), 0) AS STRING)",
+        "CAST(round(negative(CAST(0.0 AS DOUBLE)), 1) AS STRING)",
+        "CAST(round(negative(CAST(0.0 AS FLOAT)), 2) AS STRING)",
+        "CAST(round(negative(g - g), 2) AS STRING)",
+        # ...while a rounded value that does NOT land on zero keeps its sign, which is what says
+        # the rule is about the zero and not about rounding a negative.
+        "CAST(round(CAST(-1.5 AS DOUBLE)) AS STRING)",
+        "CAST(round(CAST(-0.5 AS DOUBLE)) AS STRING)",
+        "CAST(round(CAST(-0.4 AS DOUBLE), 3) AS STRING)",
+
+        # --- NOTHING SURVIVES A CAST OUT of the double, the widest decimal included, so a fix
+        # that made the negation right must not start rendering "-0.00". The double-to-decimal
+        # cast is the one to watch: #244 made it go through the value's RENDERING, which is now
+        # the one place the sign is written down.
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(10,2)) AS STRING)",
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)",
+        "CAST(CAST(negative(CAST(0.0 AS FLOAT)) AS DECIMAL(10,2)) AS STRING)",
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BIGINT) AS STRING)",
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS SMALLINT) AS STRING)",
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BOOLEAN) AS STRING)",
+        "CAST(CAST('-0.0' AS DECIMAL(10,2)) AS STRING)",
+        "CAST(CAST('-0' AS DECIMAL(10,2)) AS STRING)",
+        # ...but it does survive a cast to the OTHER float width, which is a sign-bit copy.
+        "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS FLOAT) AS STRING)",
+
+        # --- INVISIBLE TO EVERY COMPARISON, which is why only the rendering channel above can
+        # measure any of this. Equality, ordering, the null-safe form and IN all hold the two
+        # zeros equal, and so does the equality `nullif` is defined by.
+        "negative(CAST(0.0 AS DOUBLE)) = CAST(0.0 AS DOUBLE)",
+        "negative(CAST(0.0 AS DOUBLE)) < CAST(0.0 AS DOUBLE)",
+        "negative(CAST(0.0 AS DOUBLE)) <=> CAST(0.0 AS DOUBLE)",
+        "negative(CAST(0.0 AS DOUBLE)) IN (CAST(0.0 AS DOUBLE))",
+        "CAST(nullif(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+        # ...so `greatest` and `least` cannot choose between them by value, and both keep whichever
+        # argument came FIRST. Asked in both orders, because one order alone would look like a
+        # rule about the sign.
+        "CAST(greatest(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+        "CAST(least(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+        "CAST(greatest(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+        "CAST(least(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+        # ...while a conditional carries out whichever branch it took, per row.
+        "CAST(if(bl, negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+        "CAST(coalesce(negative(CAST(0.0 AS DOUBLE)), CAST(1.0 AS DOUBLE)) AS STRING)",
+
+        # --- THE NON-FINITE NEIGHBOURS, because a sign-bit flip reaches them too and only two of
+        # the three show it: Java prints a negated NaN as "NaN", so the sign bit unary minus
+        # really does set there is written down nowhere.
+        "CAST(negative(CAST('NaN' AS DOUBLE)) AS STRING)",
+        "CAST(negative(CAST('Infinity' AS DOUBLE)) AS STRING)",
+        "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)",
     ],
 
     "malformed": [

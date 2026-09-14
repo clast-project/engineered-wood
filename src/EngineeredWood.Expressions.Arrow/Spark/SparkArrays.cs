@@ -109,7 +109,9 @@ internal static class SparkArrays
 #endif
             IsNumeric = double.TryParse(
                 trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
-            AsDouble = IsNumeric ? asDouble : 0d;
+            AsDouble = IsNumeric
+                ? WithSignOfZero(asDouble, trimmed.Length > 0 && trimmed[0] == '-')
+                : 0d;
             Exact = IsNumeric
                 && decimal.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
                 ? parsed
@@ -473,13 +475,43 @@ internal static class SparkArrays
         // Read without the suffix, and without copying the text to drop it. The span overload
         // lands on net8.0 and net10.0; netstandard2.0 has only the string one.
 #if NETSTANDARD2_0
-        return double.TryParse(
+        var parsed = double.TryParse(
             trimmed.Substring(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
 #else
-        return double.TryParse(
+        var parsed = double.TryParse(
             trimmed.AsSpan(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
 #endif
+
+        if (parsed)
+            value = WithSignOfZero(value, trimmed[0] == '-');
+
+        return parsed;
     }
+
+    /// <summary>
+    /// A parsed value with the sign its TEXT carried, which only a zero can have lost.
+    /// </summary>
+    /// <remarks>
+    /// <b>.NET Framework's number parser returns a POSITIVE zero for <c>"-0.0"</c></b>, where
+    /// .NET Core and Java both return the negative one. Measured: the netstandard2.0 build of
+    /// this library renders <c>CAST('-0.0' AS DOUBLE)</c> as <c>0.0</c> under net472 and as
+    /// <c>-0.0</c> under net10.0, against Spark's <c>-0.0</c> — so without this the answer
+    /// depended on which RUNTIME loaded the library, which is the same thing
+    /// <see cref="SparkFloatText.ShortestRoundTrip(double)"/> refuses for the digits. #282.
+    /// <para>
+    /// Applied to every parse rather than only the netstandard2.0 one, because it is a no-op
+    /// wherever the parser already got it right: a leading <c>-</c> on text that reads as zero
+    /// means a negative zero on every runtime, and no other value can reach the branch. Reading
+    /// the SIGN off the text rather than off the parse is also the only thing available —
+    /// <c>-1e-400</c> underflows to a zero whose sign is not in the digits anywhere.
+    /// </para>
+    /// </remarks>
+    private static double WithSignOfZero(double value, bool negative) =>
+        // `-0d` is a compile-time flip of the sign BIT, which is the value wanted. Not `0d - 0d`,
+        // which is a POSITIVE zero under round-to-nearest -- the same trap #282 fixes in
+        // SparkFunctionRegistry.Negate. NegativeZeroTests asserts the constant really is negative,
+        // since a reader cannot tell the two apart by looking.
+        value == 0d && negative ? -0d : value;
 
     /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
     /// <remarks>

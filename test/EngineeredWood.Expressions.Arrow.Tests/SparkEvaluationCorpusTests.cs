@@ -336,6 +336,19 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
+            // #325, found by the `negative-zero` group and nothing to do with the sign: the
+            // VALUE is an ordinary zero and the two dialects render it differently. A decimal
+            // casts to string through `toPlainString` under ANSI and through Java's
+            // `BigDecimal.toString` without it, which goes scientific once the adjusted exponent
+            // drops below -6 -- so decimal(38,37) zero is `0E-37` here and
+            // `0.0000000000000000000000000000000000000` in the ANSI section. We render plainly in
+            // both.
+            //
+            // ONLY THIS DIALECT SEES IT, like #296 above: the ANSI section passes on the same
+            // expression, so deleting this entry is what will prove #325 fixed.
+            ["CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)"] =
+                "#325: legacy renders a small decimal in scientific notation; we render plainly",
+
             // `coalesce(X'00', CAST(NULL AS STRING))` used to sit here as #293: a typed null string
             // was indistinguishable from the untyped placeholder, so we dropped it and answered
             // the binary where Spark refuses the pair. #279 replaced the content test with a
