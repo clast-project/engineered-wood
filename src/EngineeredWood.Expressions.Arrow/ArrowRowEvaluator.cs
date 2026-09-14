@@ -761,8 +761,15 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <para>
     /// <b>Everything unrecognised is nullable.</b> Under-claiming costs a fold; over-claiming
     /// yields a wrong answer. So this is an allow-list of shapes measured against Spark 4.0.3,
-    /// and a shape not on it — <c>IS NAN</c>, a cast, <c>nullif</c>, <c>round</c>, a division —
-    /// answers false whether or not it could be null.
+    /// and a shape not on it — <c>IS NAN</c>, a cast, <c>nullif</c>, <c>round</c>, a division,
+    /// <c>IN</c>, and every comparison but <c>&lt;=&gt;</c> — answers false whether or not it
+    /// could be null.
+    /// </para>
+    /// <para>
+    /// <b>The rule is STRUCTURAL: it never reads a type, so any shape whose nullability depends
+    /// on one is off the list.</b> That is the boundary the arithmetic and comparison families
+    /// are outside of — both look positional and are not, because an implicit cast appears
+    /// between operands this cannot see the types of.
     /// </para>
     /// </remarks>
     private bool NeverNull(Expression expression)
@@ -791,15 +798,27 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             case OrPredicate or:
                 return AllNeverNull(or.Children);
 
-            // `<=>` is the one comparison that answers for a null pair, so it is never null
-            // whatever its operands are: measured, `1 <=> a` over a nullable column is
-            // non-nullable where `a = 1` is not.
+            // ONLY `<=>`, and the rest of the comparison family is deliberately absent for the
+            // same reason arithmetic is. A comparison that needs COERCION inserts a cast, and a
+            // cast is nullable: measured in BOTH dialects, `1 = 1` and `'a' = 'b'` are
+            // non-nullable while `'abc' = 1` and `'abc' > 1` are NULLABLE, because the string is
+            // cast to the number's type first. Two non-null literals compared in every case, so
+            // no rule phrased in terms of the operands' nullability can separate them -- this has
+            // no types, and asking `IComparisonCoercion` for one needs the Arrow types the
+            // operands have not been evaluated into yet. `IN` is worse still: `'abc' IN (1)` is
+            // nullable under ANSI and NON-nullable under legacy.
+            //
+            // Nothing is lost by leaving them out. A comparison folds only when both operands are
+            // non-nullable, and an operand that could RAISE is a cast or an arithmetic node,
+            // which is nullable anyway -- so the shapes this gives up (`(1 = 1) IS NULL`) are
+            // exactly the ones that evaluate to the same answer without the fold.
+            //
+            // `<=>` stays because its non-nullability is STRUCTURAL: it answers for a null pair,
+            // coercion or not. Measured, `'abc' <=> 1` is non-nullable and
+            // `('abc' <=> 1) IS NULL` is false in both dialects, where the `=` spelling of the
+            // same comparison raises under ANSI.
             case ComparisonPredicate comparison:
-                return comparison.Op == ComparisonOperator.NullSafeEqual
-                    || (NeverNull(comparison.Left) && NeverNull(comparison.Right));
-
-            case SetPredicate set:
-                return NeverNull(set.Operand) && AllNeverNull(set.Values);
+                return comparison.Op == ComparisonOperator.NullSafeEqual;
 
             case FunctionCall call:
                 return NeverNullCall(call);

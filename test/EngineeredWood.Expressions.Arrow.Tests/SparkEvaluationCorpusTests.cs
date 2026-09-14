@@ -136,6 +136,22 @@ public sealed class SparkEvaluationCorpusTests
         // So this is fail-CLOSED on purpose: we refuse a write Spark accepts, rather than risk
         // accepting one Spark refuses. Reversing it needs the result TYPE of an arithmetic node,
         // which the nullability seam does not carry.
+        // #319, the third row of that group, and a different kind of gap: not a nullability
+        // judgement but the TYPE CHECK the fold does in place of Spark's analysis. `TypeOver`
+        // types an operand by evaluating it over NO rows, and retries WITH rows when that cannot
+        // answer -- which `round` cannot, because its scale decides the result type and is read
+        // out of row 0. The retry then reads the malformed cast the fold existed to avoid.
+        //
+        // Not worth trading away: dropping the retry only changes which error is raised (the
+        // scale read fails instead), and folding through a failed type check would swallow the
+        // analysis errors the group's `if(1, 1, 2)` rows exist to keep. This is the residual
+        // `TypeOver` already names for itself -- an expression needing BOTH a value-dependent
+        // result type and a branch that raises -- and answering it needs the type INFERRED rather
+        // than evaluated, which is a different design.
+        ["coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL"] =
+            "#319: TypeOver retries with rows for a value-dependent result type, and the retry "
+            + "reads the operand the fold would have skipped",
+
         ["(2147483647 + 1) IS NULL"] =
             "#319: integral arithmetic is non-nullable to Spark and folds; we evaluate and raise",
         ["(CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)) "

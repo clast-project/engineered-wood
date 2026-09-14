@@ -2072,6 +2072,40 @@ GROUPS = {
         # its operands are.
         "(CAST(s AS INT) IS NULL) IS NULL",
         "(CAST(s AS INT) <=> 1) IS NULL",
+
+        # COMPARISONS, WHICH WE DELIBERATELY DO NOT FOLD EITHER -- the same trap as arithmetic,
+        # found by the review of PR #321 after the first version DID fold them. A comparison that
+        # needs coercion inserts a CAST, and a cast is nullable: `1 = 1` and `'a' = 'b'` are
+        # non-nullable while `'abc' = 1` and `'abc' > 1` are NULLABLE in BOTH dialects. Two
+        # non-null literals compared in every case, so the operands' nullability cannot separate
+        # them. The legacy answers are what make this urgent rather than tidy: `('abc' = 1) IS
+        # NULL` is TRUE there, so folding it to false is a WRONG VALUE, not a suppressed error.
+        "('abc' = 1) IS NULL",
+        "('abc' > 1) IS NULL",
+        "(1 = 1) IS NULL",
+        "('a' = 'b') IS NULL",
+        # ...and the over-claim travels through the connectives, so AND carries a row of its own.
+        "(true AND 'abc' = 1) IS NULL",
+        # `IN` is worse: nullable under ANSI and NON-nullable under legacy, for the same set.
+        "('abc' IN (1)) IS NULL",
+        "('abc' IN ('x')) IS NULL",
+        # `<=>` is the one comparison that DOES fold, because its non-nullability is structural
+        # rather than a property of the coercion. Same operands as the `=` row above, opposite
+        # answer -- which is what says the rule is about the OPERATOR and not about the literals.
+        "('abc' <=> 1) IS NULL",
+
+        # A non-boolean CONDITION, which Spark refuses at ANALYSIS under both dialects. The fold
+        # must not answer for it, which means the condition's type has to be checked over no rows
+        # -- the first version of this change checked it per row and so never checked it at all
+        # once the fold skipped the evaluation.
+        "if(1, 1, 2) IS NOT NULL",
+        "CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL",
+
+        # A folded operand whose result TYPE depends on an argument's VALUE. `round`'s scale is
+        # read from row 0, so typing this over zero rows fails and `TypeOver` retries WITH rows --
+        # which reads the malformed cast the fold existed to avoid. Declared; the residual is the
+        # one `TypeOver` names for itself.
+        "coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL",
         # NOT and AND over a folded operand, so the structural half of the rule is exercised
         # through something the fold actually reaches. The second is the shape a real constraint
         # takes: a conjunct Spark discards beside one that still decides the row.

@@ -2257,9 +2257,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-13",
-      "2026-09-13",
-      "2026-09-13"
+      "2026-09-14",
+      "2026-09-14",
+      "2026-09-14"
      ]
     }
    },
@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-13 15:48:03.309664",
-      "2026-09-13 15:48:03.309664",
-      "2026-09-13 15:48:03.309664"
+      "2026-09-13 17:54:21.502944",
+      "2026-09-13 17:54:21.502944",
+      "2026-09-13 17:54:21.502944"
      ]
     }
    },
@@ -24519,6 +24519,202 @@
     }
    },
    {
+    "expression": "('abc' = 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('abc' = 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 3) ==\n(('abc' = 1) IS NULL) AS r\n  ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "('abc' > 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('abc' > 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 3) ==\n(('abc' > 1) IS NULL) AS r\n  ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "(1 = 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((1 = 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "('a' = 'b') IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('a' = 'b') IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "(true AND 'abc' = 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "((true AND ('abc' = 1)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 12) ==\n((true AND 'abc' = 1) IS NULL) AS r\n           ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "('abc' IN (1)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('abc' IN (1)) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 9) ==\n(('abc' IN (1)) IS NULL) AS r\n        ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "('abc' IN ('x')) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('abc' IN ('x')) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "('abc' <=> 1) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(('abc' <=> 1) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "if(1, 1, 2) IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(if(1, 1, 2) IS NOT NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(IF(1, 1, 2))\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(if (1) 1 else 2) AS r#4997]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bi"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(IF(1, 1, 2))\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(if (1) 1 else 2) AS r#4998]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cas"
+    }
+   },
+   {
+    "expression": "CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNotNull",
+     "sql": "(CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"CASE WHEN 1 THEN 1 ELSE 2 END\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(CASE WHEN 1 THEN 1 ELSE 2 END) AS r#4999]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"CASE WHEN 1 THEN 1 ELSE 2 END\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(CASE WHEN 1 THEN 1 ELSE 2 END) AS r#5000]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, ca"
+    }
+   },
+   {
+    "expression": "coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(coalesce(1, round(CAST('abc' AS DOUBLE), (1 + 1))) IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
     "expression": "NOT (coalesce(CAST(s AS INT), 0) IS NULL)",
     "parse": {
      "ok": true,
@@ -40302,6 +40498,218 @@
       "ok": true,
       "node": "IsNull",
       "sql": "((CAST(s AS INT) <=> 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "('abc' = 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('abc' = 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "('abc' > 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('abc' > 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "(1 = 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((1 = 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "('a' = 'b') IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('a' = 'b') IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "(true AND 'abc' = 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "((true AND ('abc' = 1)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "('abc' IN (1)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('abc' IN (1)) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "('abc' IN ('x')) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('abc' IN ('x')) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "('abc' <=> 1) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(('abc' <=> 1) IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "if(1, 1, 2) IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(if(1, 1, 2) IS NOT NULL)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(IF(1, 1, 2))\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(if (1) 1 else 2) AS r#3038]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bi"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(IF(1, 1, 2))\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(if (1) 1 else 2) AS r#3039]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cas"
+     }
+    },
+    {
+     "expression": "CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNotNull",
+      "sql": "(CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"CASE WHEN 1 THEN 1 ELSE 2 END\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(CASE WHEN 1 THEN 1 ELSE 2 END) AS r#3040]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, "
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"CASE WHEN 1 THEN 1 ELSE 2 END\" due to data type mismatch: The first parameter requires the \"BOOLEAN\" type, however \"1\" has the type \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [isnotnull(CASE WHEN 1 THEN 1 ELSE 2 END) AS r#3041]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, ca"
+     }
+    },
+    {
+     "expression": "coalesce(1, round(CAST('abc' AS DOUBLE), 1 + 1)) IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(coalesce(1, round(CAST('abc' AS DOUBLE), (1 + 1))) IS NULL)"
      },
      "type": {
       "ok": true,

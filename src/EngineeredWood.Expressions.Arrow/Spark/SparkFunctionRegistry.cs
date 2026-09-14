@@ -2586,7 +2586,7 @@ public sealed class SparkFunctionRegistry
         var everyRow = new bool[rowCount];
         for (var row = 0; row < rowCount; row++) everyRow[row] = true;
 
-        var condition = args.Evaluate(0, everyRow);
+        var condition = RequireBooleanCondition(args.Evaluate(0, everyRow));
 
         var thenRows = new bool[rowCount];
         var elseRows = new bool[rowCount];
@@ -2692,11 +2692,9 @@ public sealed class SparkFunctionRegistry
 
         for (var pair = 0; pair < pairs; pair++)
         {
-            var condition = args.Evaluate(pair * 2, remaining);
+            var condition = RequireBooleanCondition(args.Evaluate(pair * 2, remaining));
             for (var row = 0; row < rowCount; row++)
             {
-                // Asked of every row, decided or not, so that a condition of the wrong type is
-                // refused rather than skipped past on a batch that never needed it.
                 var matched = IsTrue(condition, row);
                 if (!remaining[row] || !matched)
                     continue;
@@ -2732,14 +2730,25 @@ public sealed class SparkFunctionRegistry
         return UnifyBranches(branches, nullLiterals, choice, rowCount);
     }
 
-    /// <summary>A condition is taken only when it is true — null is not.</summary>
+    /// <summary>
+    /// Refuses a condition that is not boolean, BEFORE any row of it is read.
+    /// </summary>
     /// <remarks>
+    /// <para>
     /// A non-boolean condition fails rather than being read as false. Spark rejects one outright
-    /// (<c>if(int_col, …)</c> is a DATATYPE_MISMATCH analysis error), and treating it as false
-    /// here would silently take the ELSE branch on every row — a wrong answer that looks like a
-    /// deliberate one.
+    /// — <c>if(1, 1, 2)</c> is a DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE analysis error, measured
+    /// under both dialects — and treating it as false here would silently take the ELSE branch on
+    /// every row, a wrong answer that looks like a deliberate one.
+    /// </para>
+    /// <para>
+    /// <b>Checked once, on the ARRAY, rather than per row.</b> The check is on the type and the
+    /// type does not vary by row, and asking it per row meant it was never asked at all over an
+    /// empty selection — which is how a conditional is typed when nothing reaches it (#307) and
+    /// how the operand of a folded <c>IS NULL</c> is typed (#319). Both made
+    /// <c>if(1, 1, 2)</c> answer where Spark refuses.
+    /// </para>
     /// </remarks>
-    private static bool IsTrue(IArrowArray condition, int row)
+    private static BooleanArray RequireBooleanCondition(IArrowArray condition)
     {
         if (condition is not BooleanArray booleans)
         {
@@ -2747,6 +2756,10 @@ public sealed class SparkFunctionRegistry
                 $"a condition must be boolean, not {SparkArrays.Describe(condition.Data.DataType)}");
         }
 
-        return !booleans.IsNull(row) && booleans.GetValue(row)!.Value;
+        return booleans;
     }
+
+    /// <summary>A condition is taken only when it is true — null is not.</summary>
+    private static bool IsTrue(BooleanArray condition, int row) =>
+        !condition.IsNull(row) && condition.GetValue(row)!.Value;
 }

@@ -45,13 +45,6 @@ public sealed class NullPropagationTests
         return builder.Build();
     }
 
-    private static IArrowArray Binaries(params byte[][] values)
-    {
-        var builder = new BinaryArray.Builder();
-        foreach (var value in values) builder.Append(value);
-        return builder.Build();
-    }
-
     private static RecordBatch Batch(bool nullable, params (string Name, IArrowArray Array)[] columns)
     {
         var schema = new Schema.Builder();
@@ -157,12 +150,38 @@ public sealed class NullPropagationTests
     /// analysis. "Do not evaluate it" must not become "do not look at it", which is the same rule
     /// #307 needed for an unreached branch.
     /// </remarks>
-    [Fact]
-    public void AFoldedOperandIsStillTypeChecked()
+    [Theory]
+    // Both results are non-null literals, so `NeverNull` says true and the fold IS taken -- which
+    // is what makes this a test of the folded path. `X'00'` against an int has no common type.
+    [InlineData("if(a > 0, 1, X'00') IS NOT NULL")]
+    [InlineData("CASE WHEN a > 0 THEN 1 ELSE X'00' END IS NOT NULL")]
+    // A non-boolean CONDITION, which Spark refuses at analysis under both dialects
+    // (DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE). The type check has to reach it over no rows,
+    // which is why the guard is on the condition ARRAY and not inside the per-row loop.
+    [InlineData("if(1, 1, 2) IS NOT NULL")]
+    [InlineData("CASE WHEN 1 THEN 1 ELSE 2 END IS NOT NULL")]
+    public void AFoldedOperandIsStillTypeChecked(string sql)
     {
-        var batch = Batch(true, ("a", Ints(1)), ("bin", Binaries(new byte[] { 0 })));
+        var batch = Batch(true, ("a", Ints(1)));
 
-        Assert.ThrowsAny<Exception>(() => Eval("if(a > 0, a, bin) IS NOT NULL", batch));
+        Assert.ThrowsAny<Exception>(() => Eval(sql, batch));
+    }
+
+    /// <summary>
+    /// The fold is taken for these, so the refusals above are refusals of the FOLDED path.
+    /// </summary>
+    /// <remarks>
+    /// Without this the theory above would pass just as well if the fold never fired and ordinary
+    /// evaluation raised instead — which is exactly how its first version was wrong.
+    /// </remarks>
+    [Fact]
+    public void TheTypeCheckedShapesReallyDoFold()
+    {
+        var batch = Batch(true, ("a", Ints(1)));
+
+        Assert.True(Eval("if(a > 0, 1, CAST(s AS INT)) IS NOT NULL",
+            Batch(true, ("a", Ints(1)), ("s", Strings("abc")))).GetValue(0));
+        Assert.True(Eval("CASE WHEN a > 0 THEN 1 ELSE 2 END IS NOT NULL", batch).GetValue(0));
     }
 
     /// <summary>
@@ -212,8 +231,12 @@ public sealed class NullPropagationTests
         Assert.Throws<SparkEvaluationException>(
             () => Eval("coalesce(CAST(s AS INT), 0) IS NOT NULL", batch, bare));
 
+        // Statically non-nullable operands, so these fail if structural folding is removed --
+        // `s = 'abc'` would NOT, because `s` is a nullable column and the comparison is evaluated
+        // either way.
         Assert.False(Eval("1 IS NULL", batch, bare).GetValue(0));
-        Assert.False(Eval("(s = 'abc') IS NULL", batch, bare).GetValue(0));
+        Assert.True(Eval("(1 IS NULL) IS NOT NULL", batch, bare).GetValue(0));
+        Assert.False(Eval("(CAST(s AS INT) <=> 1) IS NULL", batch, bare).GetValue(0));
     }
 
     /// <summary>A registry with the functions but none of the optional seams past invocation.</summary>

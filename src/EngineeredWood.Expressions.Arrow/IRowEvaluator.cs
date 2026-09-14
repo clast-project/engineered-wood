@@ -230,8 +230,11 @@ public interface IComparisonCoercion
 /// </summary>
 /// <remarks>
 /// <para>
-/// Optional, and asked for with an <c>as</c> cast, so a registry that does not implement it
-/// leaves <c>IS NULL</c> / <c>IS NOT NULL</c> evaluating their operand exactly as before.
+/// Optional, and asked for with an <c>as</c> cast. It supplies the FUNCTION-CALL half of the
+/// judgement only: a registry that does not implement it makes every call nullable, so nothing
+/// containing one is folded, while the shapes <see cref="ArrowRowEvaluator"/> judges for itself —
+/// a non-null literal, a nested <c>IS NULL</c>, <c>&lt;=&gt;</c>, and the connectives over them —
+/// still fold.
 /// </para>
 /// <para>
 /// It exists because Spark DISCARDS the operand of <c>IS NULL</c> / <c>IS NOT NULL</c> when the
@@ -259,10 +262,23 @@ public interface INullabilityRules
     /// arguments can never produce one.
     /// </summary>
     /// <remarks>
-    /// Asked with the arguments' own answers rather than the argument expressions, because the
-    /// rules that exist are all positional: <c>coalesce</c> is never null if ANY argument is,
-    /// <c>if</c> and <c>nvl2</c> if their two RESULT arguments are (the first argument's
-    /// nullability does not reach the answer), and arithmetic if all of them are.
+    /// <para>
+    /// Asked with the arguments' own answers rather than the argument expressions, because every
+    /// rule an implementation may state here has to be POSITIONAL: <c>coalesce</c> is never null
+    /// if ANY argument is, <c>if</c> and <c>nvl2</c> if their two RESULT arguments are (the first
+    /// argument's nullability does not reach the answer), <c>case</c> if every result and a
+    /// present ELSE are.
+    /// </para>
+    /// <para>
+    /// <b>A function whose nullability depends on its argument TYPES must answer false</b>, and
+    /// that is not a corner case — it is why arithmetic is absent from
+    /// <c>SparkFunctionRegistry</c>'s own list. Measured under ANSI,
+    /// <c>CAST(1 AS DECIMAL(10,2)) + CAST(1 AS DECIMAL(10,2))</c> is NULLABLE (its sum wants
+    /// decimal(11,2)) while <c>CAST(1 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))</c> is not,
+    /// and both are two non-null literals added together. An implementation that answered true
+    /// for arithmetic because "all arguments are non-null" would fold
+    /// <c>(d + d) IS NOT NULL</c> to a constant and suppress a real overflow.
+    /// </para>
     /// </remarks>
     bool NeverNull(string name, ReadOnlySpan<bool> argumentsNeverNull);
 }
