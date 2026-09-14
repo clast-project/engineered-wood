@@ -40,12 +40,19 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <summary>The registry's nullability rules, when it has any. See <see cref="NeverNull"/>.</summary>
     private readonly INullabilityRules? _nullability;
 
+    /// <summary>
+    /// The registry's rule for narrowing an integral literal met with a decimal, when it has one.
+    /// See <see cref="PickMinimumPrecision"/>.
+    /// </summary>
+    private readonly ILiteralPrecisionRules? _literalPrecision;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
         _coercion = functions as IComparisonCoercion;
         _shortCircuiting = functions as IShortCircuitingFunctions;
         _nullability = functions as INullabilityRules;
+        _literalPrecision = functions as ILiteralPrecisionRules;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -480,7 +487,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         if (!leftIsString && !rightIsString)
         {
-            CoerceExactNumerics(leftType, rightType, ref left, ref right);
+            CoerceExactNumerics(cmp, leftType, rightType, ref left, ref right);
             return;
         }
 
@@ -541,16 +548,33 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </para>
     /// </remarks>
     private void CoerceExactNumerics(
+        ComparisonPredicate cmp,
         IArrowType? leftType, IArrowType? rightType,
         ref LiteralValue?[] left, ref LiteralValue?[] right)
     {
         // A bare NULL literal types as string here and is excluded by the caller; anything else
         // untyped in every row cannot round differently either, since it has no value to round.
+        // A decimal on one side is what the minimum-precision rule below needs too, so nothing
+        // it applies to is skipped here.
         if (!MightRound(leftType, left) && !MightRound(rightType, right))
             return;
 
         var resolvedLeft = OperandType(leftType, left);
         var resolvedRight = OperandType(rightType, right);
+
+        // #281. An integral LITERAL against a decimal is read as the narrowest decimal holding
+        // its value, not as the one holding its type, and only the resolved TYPE moves: the
+        // literal's own values never round -- a scale-0 operand cannot -- so the common type
+        // this changes is what the other operand rounds to. Measured, that is the difference
+        // between `CAST(4E-32 AS DECIMAL(38,38)) = 0`, which compares at decimal(38,37) and is
+        // FALSE, and `= CAST(0 AS INT)`, which compares at decimal(38,28) and is TRUE. See
+        // PickMinimumPrecision for where the same rule reaches arithmetic, and for the calls
+        // that deliberately do not take it -- an IN list among them, measured one expression
+        // away: `CAST(4E-32 AS DECIMAL(38,38)) IN (0)` is TRUE.
+        var minimumLeft = MinimumPrecision(cmp.Left, resolvedRight);
+        var minimumRight = MinimumPrecision(cmp.Right, resolvedLeft);
+        resolvedLeft = minimumLeft ?? resolvedLeft;
+        resolvedRight = minimumRight ?? resolvedRight;
 
         var leftTarget = _coercion!.ComparisonTarget(resolvedLeft, resolvedRight);
         var rightTarget = _coercion.ComparisonTarget(resolvedRight, resolvedLeft);
@@ -570,6 +594,26 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             left = Rounded(left, resolvedLeft, leftTarget, rowCount);
         if (rightTarget is not null)
             right = Rounded(right, resolvedRight, rightTarget, rowCount);
+    }
+
+    /// <summary>
+    /// The decimal an integral literal compares as, or null when the rule does not apply.
+    /// </summary>
+    /// <remarks>
+    /// Guarded on the OTHER operand being a decimal, which is Spark's own guard: the cast is
+    /// inserted only where the literal meets one, so <c>a = 2</c> stays an integral comparison.
+    /// Asked of each side in turn — <c>1.5BD = 2</c> and <c>2 = 1.5BD</c> both resolve through
+    /// decimal(2,1) — and at most one side can answer, since the other must already be a decimal.
+    /// </remarks>
+    private IArrowType? MinimumPrecision(Expression operand, IArrowType other)
+    {
+        if (_literalPrecision is null)
+            return null;
+
+        var literal = IntegralLiteral(operand);
+        return literal is null
+            ? null
+            : _literalPrecision.LiteralComparisonType(IntegralValue(literal.Value), other);
     }
 
     /// <summary>Whether an operand carries a scale that a common type could round away.</summary>
@@ -987,7 +1031,105 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         for (int i = 0; i < call.Arguments.Count; i++)
             arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
 
+        PickMinimumPrecision(call, arguments);
+
         return _functions.Invoke(call.Name, arguments, batch.Length);
+    }
+
+    /// <summary>
+    /// Reads an integral literal that meets a decimal as the narrowest decimal holding it, which
+    /// is the cast Spark's analyzer inserts at a binary operator.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #281, and the whole of it: the rule is a CAST on one operand, so reproducing it as one
+    /// leaves every type and value rule downstream untouched.
+    /// <c>SparkNumericTypes.ArithmeticResult</c> then answers Spark's
+    /// <c>decimal(7,6)</c> for <c>1.5BD / 2</c> from the rules it already had, rather than
+    /// growing a literal case of its own. Spark's analyzed plan for <c>d1 + 2</c> is literally
+    /// <c>(d1 + cast(2 as decimal(1,0)))</c>.
+    /// </para>
+    /// <para>
+    /// <b>Which calls take it is measured, and it is fewer than the name suggests.</b>
+    /// Arithmetic does. <c>nullif</c> takes it on its SECOND argument ONLY — asymmetric, and
+    /// measured from the optimized plans rather than guessed:
+    /// <c>nullif(d5, 0)</c> becomes <c>if (cast(d5 as decimal(38,37)) = cast(cast(0 as
+    /// decimal(1,0)) as decimal(38,37))) null else d5</c>, while <c>nullif(0, d5)</c> becomes
+    /// <c>if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0</c>, where the
+    /// literal took the pair's common type instead. So the two answer DIFFERENTLY over the same
+    /// values: against <c>CAST(4E-32 AS DECIMAL(38,38))</c>, the first keeps the value and the
+    /// second is NULL.
+    /// </para>
+    /// <para>
+    /// <c>greatest</c>, <c>least</c>, <c>coalesce</c>, <c>if</c>, <c>CASE</c> and <c>round</c>
+    /// do NOT take it — they are not binary operators, and <c>round</c>'s second argument is an
+    /// integer it needs as one. The comparison operators do, and reach it through
+    /// <see cref="CoerceExactNumerics"/> rather than here, since a comparison resolves its
+    /// operands' types rather than evaluating a function over them.
+    /// </para>
+    /// </remarks>
+    private void PickMinimumPrecision(FunctionCall call, IArrowArray[] arguments)
+    {
+        // Two arguments, because the rule is Spark's for a BINARY operator. A registry with no
+        // rule leaves every literal as it was.
+        if (_literalPrecision is null || arguments.Length != 2)
+            return;
+
+        // The two positions are independent even though the second reads an argument the first
+        // may have rebuilt: an argument is only rebuilt when the OTHER one is a decimal, and an
+        // integral literal is not one, so no call can narrow both.
+        for (var i = 0; i < 2; i++)
+        {
+            var literal = IntegralLiteral(call.Arguments[i]);
+            if (literal is null)
+                continue;
+
+            var target = _literalPrecision.LiteralArgumentType(
+                call.Name, i, IntegralValue(literal.Value), arguments[1 - i].Data.DataType);
+
+            if (target is null)
+                continue;
+
+            // The literal's ARRAY is rebuilt rather than the type declared over it, because the
+            // registry reads its arguments' types off the arrays it is handed. Rebuilt at the
+            // array's own length, not the batch's: a literal evaluated over no rows carries the
+            // extra row ConstantArray adds so that a type survives an empty selection.
+            var length = arguments[i].Length;
+            arguments[i] = MaterializeAsArray(
+                ArrowToLiteralValues(arguments[i], length), length, target);
+        }
+    }
+
+    /// <summary>The value of an integral literal, whichever width it was parsed at.</summary>
+    private static long IntegralValue(LiteralValue literal) =>
+        literal.Type == LiteralValue.Kind.Int32 ? literal.AsInt32 : literal.AsInt64;
+
+    /// <summary>
+    /// The integral literal an operand IS, for Spark's minimum-precision rule, or null when it is
+    /// anything else.
+    /// </summary>
+    /// <remarks>
+    /// <b>A negated literal is one.</b> Spark's parser folds the sign into the literal, so
+    /// <c>-2</c> is a <c>Literal</c> there and a <c>negative</c> call here — and the rule reads a
+    /// PRECISION, which a sign never changes, so unwrapping one level answers the same
+    /// <c>decimal(1,0)</c> Spark's folded literal gets. Measured: <c>d1 + -2</c> is
+    /// decimal(11,2), the same as <c>d1 + 2</c>. Exactly one level, because Spark folds exactly
+    /// one: <c>- -2</c> is a UnaryMinus over a literal there too, and takes no cast.
+    /// <para>
+    /// This is also why the depth of #303 does not reach here. That issue is about a negative
+    /// literal at a type's minimum being an <c>int</c> to Spark and a <c>bigint</c> to us; both
+    /// spell <c>-2147483648</c> with ten digits, so both give <c>decimal(10,0)</c>.
+    /// </para>
+    /// </remarks>
+    private static LiteralValue? IntegralLiteral(Expression expression)
+    {
+        if (expression is FunctionCall { Name: "negative", Arguments.Count: 1 } negate)
+            expression = negate.Arguments[0];
+
+        return expression is LiteralExpression literal
+            && literal.Value.Type is LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64
+                ? (LiteralValue?)literal.Value
+                : null;
     }
 
     // -- Evaluating over a selection of rows --

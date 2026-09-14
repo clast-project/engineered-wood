@@ -376,6 +376,96 @@ public sealed class SparkEvaluationCorpusTests
                 .Contains(e)));
     }
 
+    /// <summary>
+    /// The Arrow type we PRODUCE for a group's expressions, against the type Spark RESOLVED.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #281, and the gap that let it live: a decimal's SCALE is not visible in an evaluation
+    /// comparison. <see cref="CorpusEvaluation.Compare"/> reads a recorded decimal back as a
+    /// number, because the fixture holds Python's rendering rather than Spark's, so
+    /// <c>0.750000</c> and <c>0.750000000000</c> compare equal and a wrong result type passes.
+    /// The corpus's <c>type</c> answers were checked only by <c>SparkNumericTypesTests</c>, which
+    /// walks the rules directly and skips every expression involving a literal — exactly the
+    /// shape this issue is about.
+    /// </para>
+    /// <para>
+    /// Asked of the EVALUATOR rather than of the rules, so it measures the type a caller actually
+    /// receives: a Delta generated column is written at the type the array carries, and a
+    /// decimal(13,12) where Spark writes a decimal(7,6) is a different column however equal the
+    /// values look. Scoped to the decimal groups, whose types we model completely; a name this
+    /// cannot spell is a failure rather than a skip, so the scope cannot quietly widen.
+    /// </para>
+    /// <para>
+    /// <b>Over NO ROWS, which is the condition Spark's own answer was harvested under</b> — the
+    /// corpus resolves <c>type</c> against an empty frame. It is not a convenience: the corpus
+    /// carries a boundary row of zeros, so <c>2 / d2</c> and <c>a + sh</c> RAISE over the full
+    /// batch while resolving perfectly well, and reading their type from an evaluation would
+    /// mean skipping exactly the rows a division or an overflow makes interesting.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("decimal-literal-precision")]
+    [InlineData("decimal-common-type")]
+    [InlineData("coercion")]
+    public void TheTypeWeProduceIsTheTypeSparkResolved(string group)
+    {
+        var batch = CorpusEvaluation.BuildBatch(RootSchema, RootRows).Slice(0, 0);
+        var differing = new List<string>();
+        var compared = 0;
+
+        foreach (var entry in Corpus.RootElement.GetProperty("groups").GetProperty(group).EnumerateArray())
+        {
+            var expression = entry.GetProperty("expression").GetString()!;
+            if (Excluded.ContainsKey(expression) || KnownDifferences.ContainsKey(expression))
+                continue;
+
+            var recorded = entry.GetProperty("type");
+            if (!recorded.GetProperty("ok").GetBoolean())
+                continue;   // Spark refused to resolve it; the eval test owns that half
+
+            compared++;
+
+            try
+            {
+                var actual = new ArrowRowEvaluator(Ansi)
+                    .EvaluateExpression(SparkSqlParser.ParseExpression(expression), batch);
+                var ours = SparkTypeName(actual.Data.DataType);
+                var theirs = recorded.GetProperty("type").GetString();
+                if (ours != theirs)
+                    differing.Add($"{expression}: spark {theirs}, we {ours}");
+            }
+            catch (Exception ex)
+            {
+                differing.Add($"{expression}: we threw {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        Assert.Empty(differing);
+        Assert.True(compared > 10, $"only {compared} expressions in '{group}' were compared");
+    }
+
+    /// <summary>An Arrow type spelled the way the corpus spells a Spark one.</summary>
+    /// <remarks>
+    /// Throws rather than falling back on <see cref="IArrowType.Name"/>, so a type this does not
+    /// know cannot pass as a mismatch-free comparison of two strings neither of which is Spark's.
+    /// </remarks>
+    private static string SparkTypeName(IArrowType type) => type switch
+    {
+        Decimal128Type d => $"decimal({d.Precision},{d.Scale})",
+        Decimal256Type d => $"decimal({d.Precision},{d.Scale})",
+        Int8Type => "tinyint",
+        Int16Type => "smallint",
+        Int32Type => "int",
+        Int64Type => "bigint",
+        FloatType => "float",
+        DoubleType => "double",
+        BooleanType => "boolean",
+        StringType => "string",
+        NullType => "void",
+        _ => throw new NotSupportedException($"no Spark spelling for {type.Name}"),
+    };
+
     [Fact]
     public void EveryCorpusExpressionEvaluatesToSparksAnswer()
     {

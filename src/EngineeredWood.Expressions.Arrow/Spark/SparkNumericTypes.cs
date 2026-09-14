@@ -178,6 +178,67 @@ internal static class SparkNumericTypes
         throw new NotSupportedException($"no common type for {left.Name} and {right.Name}");
     }
 
+    /// <summary>
+    /// The decimal type Spark reads an integral LITERAL as when it meets a decimal: the narrowest
+    /// one that holds the value, rather than the one that holds its type.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's <c>DecimalType.fromLiteral</c>, reached from
+    /// <c>DecimalPrecisionTypeCoercion.nondecimalAndDecimal</c> under
+    /// <c>spark.sql.decimalOperations.literalPickMinimumPrecision</c> (default true). A literal
+    /// <c>2</c> is a <c>decimal(1,0)</c> where an <c>int</c> COLUMN is
+    /// <see cref="AsDecimal"/>'s <c>decimal(10,0)</c>, and the nine integer digits that saves are
+    /// nine the result's scale keeps: measured, <c>1.5BD / 2</c> is <c>decimal(7,6)</c> and
+    /// <c>d1 + 2</c> over a decimal(10,2) is <c>decimal(11,2)</c>, against the decimal(13,12) and
+    /// decimal(13,2) the column rule gives. #281.
+    /// </para>
+    /// <para>
+    /// <b>Where it applies is narrow and was measured rather than assumed.</b> Spark inserts the
+    /// cast at a BINARY OPERATOR — arithmetic and comparison — and nowhere else. Unification does
+    /// not take it (<c>greatest(d1, 2)</c> and <c>coalesce(d1, 2)</c> are both decimal(12,2), the
+    /// int-width answer), and neither does an <c>IN</c> list: measured,
+    /// <c>CAST(4E-32 AS DECIMAL(38,38)) = 0</c> is FALSE while the same value
+    /// <c>IN (0)</c> is TRUE, one expression apart. So this is deliberately not reached from
+    /// <see cref="CommonType"/>.
+    /// </para>
+    /// <para>
+    /// The sign never changes the answer — <c>fromBigDecimal</c> reads a precision, and -100 and
+    /// 100 both have three digits — which is what lets the caller treat Spark's folded negative
+    /// literal and our <c>negative(2)</c> call as the same thing.
+    /// </para>
+    /// <para>
+    /// <b>A tinyint literal is the exception, and it is unreachable here.</b>
+    /// <c>fromLiteral</c> has cases for Short, Int and Long only, so a Byte falls through to
+    /// <c>forType</c> and keeps the full decimal(3,0): measured, <c>d5 + 2Y</c> is
+    /// decimal(38,34) where <c>d5 + 2S</c> is decimal(38,36). <c>SparkLiteral</c> refuses the
+    /// <c>Y</c> and <c>S</c> suffixes outright — <c>LiteralValue</c> has no 8- or 16-bit kind —
+    /// so no literal that reaches this can be either.
+    /// </para>
+    /// </remarks>
+    public static Decimal128Type LiteralDecimal(long value) =>
+        new(DigitCount(value), 0);
+
+    /// <summary>The decimal digits in a value, which is its precision as Spark counts one.</summary>
+    /// <remarks>
+    /// Zero has one digit, not none: <c>BigDecimal(0).precision()</c> is 1, and a decimal(0,0)
+    /// is not a type. Counted by division rather than through <see cref="Math.Abs(long)"/>, which
+    /// throws on <see cref="long.MinValue"/> — a literal that can reach here, since
+    /// <c>-9223372036854775808</c> parses as one.
+    /// </remarks>
+    private static int DigitCount(long value)
+    {
+        var digits = 0;
+        do
+        {
+            digits++;
+            value /= 10;
+        }
+        while (value != 0);
+
+        return digits;
+    }
+
     public static bool IsDecimal(IArrowType type) => type is Decimal128Type or Decimal256Type;
 
     public static bool IsFloatingPoint(IArrowType type) => type is FloatType or DoubleType;

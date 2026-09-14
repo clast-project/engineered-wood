@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-13 17:54:21.502944",
-      "2026-09-13 17:54:21.502944",
-      "2026-09-13 17:54:21.502944"
+      "2026-09-13 19:22:03.649392",
+      "2026-09-13 19:22:03.649392",
+      "2026-09-13 19:22:03.649392"
      ]
     }
    },
@@ -25419,6 +25419,1120 @@
     }
    }
   ],
+  "decimal-literal-precision": [
+   {
+    "expression": "1.5BD / 2",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(1.5BD / 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(7,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.750000",
+      "0.750000",
+      "0.750000"
+     ]
+    }
+   },
+   {
+    "expression": "1.0000000000000000000000000000000000001 + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(1.0000000000000000000000000000000000001BD + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,36)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.000000000000000000000000000000000000",
+      "2.000000000000000000000000000000000000",
+      "2.000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.5BD / 2 AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((1.5BD / 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.750000",
+      "0.750000",
+      "0.750000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(1.0000000000000000000000000000000000001 + 1 AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((1.0000000000000000000000000000000000001BD + 1) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.000000000000000000000000000000000000",
+      "2.000000000000000000000000000000000000",
+      "2.000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + 2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "14.34",
+      null,
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "2 + d1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(2 + d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "14.34",
+      null,
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 - 2",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(d1 - 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.34",
+      null,
+      "-2.00"
+     ]
+    }
+   },
+   {
+    "expression": "2 - d1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(2 - d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-10.34",
+      null,
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 * 2",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d1 * 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "24.68",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "2 * d1",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(2 * d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "24.68",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 / 2",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(d1 / 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(14,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "6.170000",
+      null,
+      "0.000000"
+     ]
+    }
+   },
+   {
+    "expression": "2 / d2",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(2 / d2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,7)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 2) ==\n(2 / d2) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "d1 % 2",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(d1 % 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(3,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "2 % d2",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(2 % d2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(5,4)"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 2) ==\n(2 % d2) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "d1 + 1000000000",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + 1000000000)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000012.34",
+      null,
+      "1000000000.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + 9999999999999999999",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + 9999999999999999999BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(22,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10000000000000000011.34",
+      null,
+      "9999999999999999999.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + 0",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + -2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + -2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.34",
+      null,
+      "-2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + -2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-2147483635.66",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "d5 + 2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d5 + 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,36)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.100000000000000000000000000000000000",
+      null,
+      "2.500000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d5 - 1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(d5 - 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,36)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.900000000000000000000000000000000000",
+      null,
+      "-0.500000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d5 * 100",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(d5 * 100)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,34)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.0000000000000000000000000000000000",
+      null,
+      "50.0000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d5 + 1000000",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d5 + 1000000)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,30)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1000000.100000000000000000000000000000",
+      null,
+      "1000000.500000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(d5 + 2 AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((d5 + 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.100000000000000000000000000000000000",
+      null,
+      "2.500000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "13.34",
+      null,
+      "-2147483648.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + b",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(23,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "22.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + CAST(2 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + CAST(2 AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "14.34",
+      null,
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + (2 + 2)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + (2 + 2))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "16.34",
+      null,
+      "4.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + 2 + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "((d1 + 2) + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "15.34",
+      null,
+      "-2147483646.00"
+     ]
+    }
+   },
+   {
+    "expression": "greatest(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      "2.00",
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "least(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "least(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.00",
+      "2.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      "2.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "nvl(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      "2.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "if(bl, d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(bl, d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      "2.00",
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "CASE WHEN bl THEN d1 ELSE 2 END",
+    "parse": {
+     "ok": true,
+     "node": "CaseWhen",
+     "sql": "CASE WHEN bl THEN d1 ELSE 2 END"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(12,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      "2.00",
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "round(d1 + 2, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round((d1 + 2), 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "14.3",
+      null,
+      "2.0"
+     ]
+    }
+   },
+   {
+    "expression": "round(1.5BD / 2, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round((1.5BD / 2), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(4,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.75",
+      "0.75",
+      "0.75"
+     ]
+    }
+   },
+   {
+    "expression": "-(1.5BD / 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- (1.5BD / 2))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(7,6)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.750000",
+      "-0.750000",
+      "-0.750000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "0 = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(0 = CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <> 0",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (CAST(4E-32BD AS DECIMAL(38,38)) = 0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) > 0",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) > 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) < 0",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) < 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) >= 0",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThanOrEqual",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) >= 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <= 0",
+    "parse": {
+     "ok": true,
+     "node": "LessThanOrEqual",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) <= 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <=> 0",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) <=> 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (0))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0, 1)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (0, 1))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = CAST(0 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = CAST(0 AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0.0BD",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = 0.0BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "nullif(CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)), 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(CAST(4E-32BD AS DECIMAL(38,38)), 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "4.000000E-32",
+      "4.000000E-32",
+      "4.000000E-32"
+     ]
+    }
+   },
+   {
+    "expression": "nullif(0, CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(0, CAST(4E-32BD AS DECIMAL(38,38)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "nullif(d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(10,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "nullif(2, d1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(2, d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "g + 2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(g + 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      4.5,
+      null,
+      2.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.1 AS DOUBLE) = 0",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(0.1BD AS DOUBLE) = 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -42443,6 +43557,1128 @@
        true,
        true,
        true
+      ]
+     }
+    }
+   ],
+   "decimal-literal-precision": [
+    {
+     "expression": "1.5BD / 2",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(1.5BD / 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(7,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.750000",
+       "0.750000",
+       "0.750000"
+      ]
+     }
+    },
+    {
+     "expression": "1.0000000000000000000000000000000000001 + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(1.0000000000000000000000000000000000001BD + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,36)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.000000000000000000000000000000000000",
+       "2.000000000000000000000000000000000000",
+       "2.000000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.5BD / 2 AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((1.5BD / 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.750000",
+       "0.750000",
+       "0.750000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(1.0000000000000000000000000000000000001 + 1 AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((1.0000000000000000000000000000000000001BD + 1) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.000000000000000000000000000000000000",
+       "2.000000000000000000000000000000000000",
+       "2.000000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + 2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "14.34",
+       null,
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "2 + d1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(2 + d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "14.34",
+       null,
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 - 2",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(d1 - 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.34",
+       null,
+       "-2.00"
+      ]
+     }
+    },
+    {
+     "expression": "2 - d1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(2 - d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-10.34",
+       null,
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 * 2",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d1 * 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "24.68",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "2 * d1",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(2 * d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "24.68",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 / 2",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(d1 / 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(14,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "6.170000",
+       null,
+       "0.000000"
+      ]
+     }
+    },
+    {
+     "expression": "2 / d2",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(2 / d2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,7)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.6200891",
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "d1 % 2",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(d1 % 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(3,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.34",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "2 % d2",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(2 % d2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(5,4)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.7655",
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "d1 + 1000000000",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + 1000000000)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000012.34",
+       null,
+       "1000000000.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + 9999999999999999999",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + 9999999999999999999BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(22,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10000000000000000011.34",
+       null,
+       "9999999999999999999.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + 0",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + -2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + -2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.34",
+       null,
+       "-2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + -2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-2147483635.66",
+       null,
+       "-2147483648.00"
+      ]
+     }
+    },
+    {
+     "expression": "d5 + 2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d5 + 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,36)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.100000000000000000000000000000000000",
+       null,
+       "2.500000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d5 - 1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(d5 - 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,36)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.900000000000000000000000000000000000",
+       null,
+       "-0.500000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d5 * 100",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(d5 * 100)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,34)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.0000000000000000000000000000000000",
+       null,
+       "50.0000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d5 + 1000000",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d5 + 1000000)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,30)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1000000.100000000000000000000000000000",
+       null,
+       "1000000.500000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(d5 + 2 AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((d5 + 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.100000000000000000000000000000000000",
+       null,
+       "2.500000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "13.34",
+       null,
+       "-2147483648.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + b",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(23,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "22.34",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + CAST(2 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + CAST(2 AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "14.34",
+       null,
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + (2 + 2)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + (2 + 2))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "16.34",
+       null,
+       "4.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + 2 + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "((d1 + 2) + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "15.34",
+       null,
+       "-2147483646.00"
+      ]
+     }
+    },
+    {
+     "expression": "greatest(d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       "2.00",
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "least(d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "least(d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.00",
+       "2.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       "2.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "nvl(d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nvl(d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       "2.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "if(bl, d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if(bl, d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       "2.00",
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "CASE WHEN bl THEN d1 ELSE 2 END",
+     "parse": {
+      "ok": true,
+      "node": "CaseWhen",
+      "sql": "CASE WHEN bl THEN d1 ELSE 2 END"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(12,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       "2.00",
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "round(d1 + 2, 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "round((d1 + 2), 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "14.3",
+       null,
+       "2.0"
+      ]
+     }
+    },
+    {
+     "expression": "round(1.5BD / 2, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "round((1.5BD / 2), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(4,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.75",
+       "0.75",
+       "0.75"
+      ]
+     }
+    },
+    {
+     "expression": "-(1.5BD / 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- (1.5BD / 2))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(7,6)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.750000",
+       "-0.750000",
+       "-0.750000"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "0 = CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38))",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(0 = CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <> 0",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (CAST(4E-32BD AS DECIMAL(38,38)) = 0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) > 0",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) > 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) < 0",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) < 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) >= 0",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThanOrEqual",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) >= 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <= 0",
+     "parse": {
+      "ok": true,
+      "node": "LessThanOrEqual",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) <= 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) <=> 0",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) <=> 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (0))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) IN (0, 1)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) IN (0, 1))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = CAST(0 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = CAST(0 AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)) = 0.0BD",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(4E-32BD AS DECIMAL(38,38)) = 0.0BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "nullif(CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)), 0)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(CAST(4E-32BD AS DECIMAL(38,38)), 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,38)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "4.000000E-32",
+       "4.000000E-32",
+       "4.000000E-32"
+      ]
+     }
+    },
+    {
+     "expression": "nullif(0, CAST(0.00000000000000000000000000000004 AS DECIMAL(38,38)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(0, CAST(4E-32BD AS DECIMAL(38,38)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "nullif(d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(10,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "nullif(2, d1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(2, d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "g + 2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(g + 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       4.5,
+       null,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.1 AS DOUBLE) = 0",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(0.1BD AS DOUBLE) = 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
       ]
      }
     }

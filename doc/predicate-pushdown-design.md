@@ -1053,6 +1053,56 @@ than a coercion, and EngineeredWood has no analysis phase to put it in — see
 #261 for why reproducing it at evaluation time is a decision rather than a
 gap.
 
+#### An integral literal is narrower than its type
+
+Added 2026-09-13, closing #281. Spark reads a literal `2` met with a decimal as
+`decimal(1,0)` — the narrowest decimal that holds the **value** — rather than as
+the `decimal(10,0)` an `int` occupies. Those nine integer digits it does not
+reserve are nine the result keeps as SCALE, so the rule is visible in the
+result type of nearly every decimal expression written against a literal:
+
+| expression | Spark | the int-width answer |
+|---|---|---|
+| `1.5BD / 2` | `decimal(7,6)` | `decimal(13,12)` |
+| `d1 + 2` | `decimal(11,2)` | `decimal(13,2)` |
+| `d1 % 2` | `decimal(3,2)` | `decimal(10,2)` |
+| `d5 + 2` | `decimal(38,36)` | `decimal(38,27)` |
+
+`DecimalType.fromLiteral` via `DecimalPrecisionTypeCoercion.nondecimalAndDecimal`,
+under `spark.sql.decimalOperations.literalPickMinimumPrecision` (default true).
+It is a **precision of the value**, so the sign never enters it — `-2` is
+`decimal(1,0)` like `2` — and a `0` is `decimal(1,0)` rather than a type with no
+digits at all.
+
+**Where it applies is narrow, and the boundary is the part worth writing down.**
+Spark inserts the cast at a binary operator and nowhere else:
+
+- **Arithmetic and comparison take it**, in either operand order.
+- **Unification does not.** `greatest(d1, 2)`, `least`, `coalesce`, `nvl`, `if`
+  and `CASE` all resolve through the int width, `decimal(12,2)`.
+- **An `IN` list does not**, which is measurable one expression apart:
+  `CAST(4E-32 AS DECIMAL(38,38)) = 0` is **false** — the pair compares at
+  `decimal(38,37)`, where the value survives — while the same value `IN (0)` is
+  **true**, the list resolving through `decimal(38,28)` where it rounds away.
+- **`nullif` takes it on its second argument only.** From the optimized plans,
+  `nullif(d5, 0)` is `if (cast(d5 as decimal(38,37)) = cast(cast(0 as
+  decimal(1,0)) as decimal(38,37))) null else d5`, while `nullif(0, d5)` is
+  `if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0`. So
+  the two answer differently over the same values.
+
+The rule reaches EngineeredWood as the cast it is: `ArrowRowEvaluator` rebuilds
+an integral literal argument as a decimal array before the registry sees it, and
+resolves a comparison operand's type the same way, so `SparkNumericTypes` needed
+no literal case and every promotion and clamp rule downstream is untouched.
+Which sites take it is the registry's answer, through `ILiteralPrecisionRules` —
+the fourth optional interface a registry may implement, asked for with an `as`
+cast like the other three — because the boundary above is dialect knowledge and
+reproducing it one call too widely is as wrong as not reproducing it at all.
+
+A negated literal is one: Spark's parser folds the sign into the `Literal` where
+our parser produces `negative(2)`, and since a precision never counts a sign,
+unwrapping exactly one level gives the same answer.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic
