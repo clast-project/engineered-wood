@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-14 06:00:18.516548",
-      "2026-09-14 06:00:18.516548",
-      "2026-09-14 06:00:18.516548"
+      "2026-09-14 07:10:08.951587",
+      "2026-09-14 07:10:08.951587",
+      "2026-09-14 07:10:08.951587"
      ]
     }
    },
@@ -28151,6 +28151,1628 @@
     }
    }
   ],
+  "negative-zero": [
+   {
+    "expression": "negative(CAST(0.0 AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "negative(CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "-CAST(0.0 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-CAST(0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((- CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-0.0D AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-0.0D AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0.0 AS FLOAT)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST(0.0BD AS FLOAT)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(g - g) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative((g - g)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      null,
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(f - f) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative((f - f)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      null,
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.0 AS DOUBLE) - CAST(0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((CAST(0.0BD AS DOUBLE) - CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0.0D AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(0.0D AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) + CAST(0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((negative(CAST(0.0BD AS DOUBLE)) + CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) + negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((negative(CAST(0.0BD AS DOUBLE)) + negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(0.0 AS DOUBLE) * CAST(-1.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST((CAST(0.0BD AS DOUBLE) * CAST(-1.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0.0' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-.0' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-.0' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0E5' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0E5' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('  -0.0  ' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('  -0.0  ' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0.0' AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0' AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-1e-400' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-1e-400' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0.0d' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0d' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0.0f' AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0f' AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('+0.0' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('+0.0' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('1e-400' AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('1e-400' AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-0.0 AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(0.0BD AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-0.0BD AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(0.0BD AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(-0.0 AS DOUBLE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(0.0BD AS DOUBLE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0.0 AS DECIMAL(10,2))) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST(0.0BD AS DECIMAL(10,2))) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00",
+      "0.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST(0 AS INT)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST(0 AS INT)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      "0",
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.4 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.4BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.04 AS DOUBLE), 1) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.04BD AS DOUBLE), 1) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.0001 AS DOUBLE), 2) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.0001BD AS DOUBLE), 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.4 AS DOUBLE), -1) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.4BD AS DOUBLE), -1) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.4 AS FLOAT)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.4BD AS FLOAT)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 0) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 0) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 1) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 1) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS FLOAT)), 2) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS FLOAT)), 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(g - g), 2) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative((g - g)), 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-1.5 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-1.5BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-2.0",
+      "-2.0",
+      "-2.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.5 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.5BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.0",
+      "-1.0",
+      "-1.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-0.4 AS DOUBLE), 3) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-0.4BD AS DOUBLE), 3) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.4",
+      "-0.4",
+      "-0.4"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(0.0 AS DOUBLE), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(g - g, 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round((g - g), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(g - g), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative((g - g)), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(0.0 AS FLOAT), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(0.0BD AS FLOAT), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(0.0 AS DOUBLE), 308) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 308) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(0.0 AS DOUBLE), 309) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 309) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 309) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 309) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(0.0 AS DOUBLE), -400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(0.0BD AS DOUBLE), -400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), -400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), -400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-1.5 AS DOUBLE), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-1.5BD AS DOUBLE), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(g, 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(g, 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.5",
+      null,
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(2.5 AS DOUBLE), 309) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(2.5BD AS DOUBLE), 309) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2.5",
+      "2.5",
+      "2.5"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST(-1.5 AS DOUBLE), -400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST(-1.5BD AS DOUBLE), -400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST('NaN' AS DOUBLE), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST('NaN' AS DOUBLE), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(round(CAST('Infinity' AS DOUBLE), 400) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(round(CAST('Infinity' AS DOUBLE), 400) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Infinity",
+      "Infinity",
+      "Infinity"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(10,2)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS DECIMAL(10,2)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00",
+      "0.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0000000000000000000000000000000000000",
+      "0.0000000000000000000000000000000000000",
+      "0.0000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS FLOAT)) AS DECIMAL(10,2)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS FLOAT)) AS DECIMAL(10,2)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00",
+      "0.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BIGINT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS BIGINT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      "0",
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS SMALLINT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS SMALLINT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      "0",
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BOOLEAN) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS BOOLEAN) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "false",
+      "false",
+      "false"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0.0' AS DECIMAL(10,2)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0' AS DECIMAL(10,2)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00",
+      "0.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('-0' AS DECIMAL(10,2)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0' AS DECIMAL(10,2)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00",
+      "0.00",
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS FLOAT) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "negative(CAST(0.0 AS DOUBLE)) = CAST(0.0 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(negative(CAST(0.0BD AS DOUBLE)) = CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "negative(CAST(0.0 AS DOUBLE)) < CAST(0.0 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(negative(CAST(0.0BD AS DOUBLE)) < CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "negative(CAST(0.0 AS DOUBLE)) <=> CAST(0.0 AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(negative(CAST(0.0BD AS DOUBLE)) <=> CAST(0.0BD AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "negative(CAST(0.0 AS DOUBLE)) IN (CAST(0.0 AS DOUBLE))",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(negative(CAST(0.0BD AS DOUBLE)) IN (CAST(0.0BD AS DOUBLE)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(nullif(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(nullif(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST(greatest(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(greatest(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(least(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(least(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(greatest(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(greatest(CAST(0.0BD AS DOUBLE), negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(least(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(least(CAST(0.0BD AS DOUBLE), negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(if(bl, negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(if(bl, negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(coalesce(negative(CAST(0.0 AS DOUBLE)), CAST(1.0 AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(coalesce(negative(CAST(0.0BD AS DOUBLE)), CAST(1.0BD AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST('NaN' AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST('NaN' AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "NaN",
+      "NaN",
+      "NaN"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST('Infinity' AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST('Infinity' AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-Infinity",
+      "-Infinity",
+      "-Infinity"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Infinity",
+      "Infinity",
+      "Infinity"
+     ]
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -46297,6 +47919,1628 @@
        false,
        false,
        false
+      ]
+     }
+    }
+   ],
+   "negative-zero": [
+    {
+     "expression": "negative(CAST(0.0 AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "negative(CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "-CAST(0.0 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-CAST(0.0 AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((- CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-0.0D AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-0.0D AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0.0 AS FLOAT)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST(0.0BD AS FLOAT)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(g - g) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative((g - g)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       null,
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(f - f) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative((f - f)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       null,
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(0.0 AS DOUBLE) - CAST(0.0 AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((CAST(0.0BD AS DOUBLE) - CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0.0D AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(0.0D AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) + CAST(0.0 AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((negative(CAST(0.0BD AS DOUBLE)) + CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0.0 AS DOUBLE)) + negative(CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((negative(CAST(0.0BD AS DOUBLE)) + negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(0.0 AS DOUBLE) * CAST(-1.0 AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST((CAST(0.0BD AS DOUBLE) * CAST(-1.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0.0' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-.0' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-.0' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0E5' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0E5' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('  -0.0  ' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('  -0.0  ' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0.0' AS FLOAT) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0' AS FLOAT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-1e-400' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-1e-400' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0.0d' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0d' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0.0f' AS FLOAT) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0f' AS FLOAT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('+0.0' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('+0.0' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('1e-400' AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('1e-400' AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-0.0 AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(0.0BD AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-0.0BD AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(0.0BD AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(-0.0 AS DOUBLE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(0.0BD AS DOUBLE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0.0 AS DECIMAL(10,2))) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST(0.0BD AS DECIMAL(10,2))) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.00",
+       "0.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST(0 AS INT)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST(0 AS INT)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0",
+       "0",
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.4 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.4BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.04 AS DOUBLE), 1) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.04BD AS DOUBLE), 1) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.0001 AS DOUBLE), 2) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.0001BD AS DOUBLE), 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.4 AS DOUBLE), -1) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.4BD AS DOUBLE), -1) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.4 AS FLOAT)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.4BD AS FLOAT)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 0) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 0) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 1) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 1) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS FLOAT)), 2) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS FLOAT)), 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(g - g), 2) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative((g - g)), 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       null,
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-1.5 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-1.5BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-2.0",
+       "-2.0",
+       "-2.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.5 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.5BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.0",
+       "-1.0",
+       "-1.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-0.4 AS DOUBLE), 3) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-0.4BD AS DOUBLE), 3) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.4",
+       "-0.4",
+       "-0.4"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(0.0 AS DOUBLE), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(g - g, 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round((g - g), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       null,
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(g - g), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative((g - g)), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       null,
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(0.0 AS FLOAT), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(0.0BD AS FLOAT), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(0.0 AS DOUBLE), 308) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 308) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(0.0 AS DOUBLE), 309) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(0.0BD AS DOUBLE), 309) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), 309) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), 309) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(0.0 AS DOUBLE), -400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(0.0BD AS DOUBLE), -400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(negative(CAST(0.0 AS DOUBLE)), -400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(negative(CAST(0.0BD AS DOUBLE)), -400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-1.5 AS DOUBLE), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-1.5BD AS DOUBLE), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.5",
+       "-1.5",
+       "-1.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(g, 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(g, 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.5",
+       null,
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(2.5 AS DOUBLE), 309) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(2.5BD AS DOUBLE), 309) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2.5",
+       "2.5",
+       "2.5"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST(-1.5 AS DOUBLE), -400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST(-1.5BD AS DOUBLE), -400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST('NaN' AS DOUBLE), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST('NaN' AS DOUBLE), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "NaN",
+       "NaN",
+       "NaN"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(round(CAST('Infinity' AS DOUBLE), 400) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(round(CAST('Infinity' AS DOUBLE), 400) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "Infinity",
+       "Infinity",
+       "Infinity"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(10,2)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS DECIMAL(10,2)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.00",
+       "0.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS DECIMAL(38,37)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-37",
+       "0E-37",
+       "0E-37"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS FLOAT)) AS DECIMAL(10,2)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS FLOAT)) AS DECIMAL(10,2)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.00",
+       "0.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BIGINT) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS BIGINT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0",
+       "0",
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS SMALLINT) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS SMALLINT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0",
+       "0",
+       "0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS BOOLEAN) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS BOOLEAN) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "false",
+       "false",
+       "false"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0.0' AS DECIMAL(10,2)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0' AS DECIMAL(10,2)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.00",
+       "0.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('-0' AS DECIMAL(10,2)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0' AS DECIMAL(10,2)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.00",
+       "0.00",
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST(negative(CAST(0.0 AS DOUBLE)) AS FLOAT) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST(negative(CAST(0.0BD AS DOUBLE)) AS FLOAT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "negative(CAST(0.0 AS DOUBLE)) = CAST(0.0 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(negative(CAST(0.0BD AS DOUBLE)) = CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "negative(CAST(0.0 AS DOUBLE)) < CAST(0.0 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(negative(CAST(0.0BD AS DOUBLE)) < CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "negative(CAST(0.0 AS DOUBLE)) <=> CAST(0.0 AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(negative(CAST(0.0BD AS DOUBLE)) <=> CAST(0.0BD AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "negative(CAST(0.0 AS DOUBLE)) IN (CAST(0.0 AS DOUBLE))",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(negative(CAST(0.0BD AS DOUBLE)) IN (CAST(0.0BD AS DOUBLE)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(nullif(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(nullif(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(greatest(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(greatest(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(least(negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(least(negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(greatest(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(greatest(CAST(0.0BD AS DOUBLE), negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(least(CAST(0.0 AS DOUBLE), negative(CAST(0.0 AS DOUBLE))) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(least(CAST(0.0BD AS DOUBLE), negative(CAST(0.0BD AS DOUBLE))) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(if(bl, negative(CAST(0.0 AS DOUBLE)), CAST(0.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(if(bl, negative(CAST(0.0BD AS DOUBLE)), CAST(0.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(coalesce(negative(CAST(0.0 AS DOUBLE)), CAST(1.0 AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(coalesce(negative(CAST(0.0BD AS DOUBLE)), CAST(1.0BD AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST('NaN' AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST('NaN' AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "NaN",
+       "NaN",
+       "NaN"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST('Infinity' AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST('Infinity' AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-Infinity",
+       "-Infinity",
+       "-Infinity"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(negative(CAST('-Infinity' AS DOUBLE)) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "Infinity",
+       "Infinity",
+       "Infinity"
       ]
      }
     }
