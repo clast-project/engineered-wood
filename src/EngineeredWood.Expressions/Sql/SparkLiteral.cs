@@ -416,7 +416,7 @@ internal static class SparkLiteral
             if (!int.TryParse(
                     text.Substring(e + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out exponent))
             {
-                throw Overflow(text, "a decimal", sql, position);
+                throw ExponentOverflow(text, sql, position);
             }
 
             text = text.Substring(0, e);
@@ -586,7 +586,7 @@ internal static class SparkLiteral
                 || exponent > int.MaxValue
                 || exponent < -int.MaxValue)
             {
-                throw Overflow(text, what, sql, position);
+                throw ExponentOverflow(text, sql, position);
             }
 
             text = text.Substring(0, e);
@@ -628,4 +628,29 @@ internal static class SparkLiteral
 
     private static SparkSqlParseException Overflow(string text, string what, string sql, int position) =>
         new($"'{text}' is out of range for {what}", sql, position);
+
+    /// <summary>
+    /// An exponent no decimal scale can carry, which is a different refusal from a value out of
+    /// range.
+    /// </summary>
+    /// <remarks>
+    /// Its own reason because the range one would be FALSE here, and visibly so: the literal that
+    /// reaches this most clearly is <c>0e2147483648</c>, which is numerically zero and in the
+    /// range of every type there is. It is refused for the spelling of its exponent alone. Raised
+    /// in review of #287.
+    /// <para>
+    /// The distinction is the oracle's too. Spark answers an out-of-range literal with
+    /// <c>INVALID_NUMERIC_LITERAL_RANGE</c>, naming the min and max it compared against, and
+    /// answers these with a plain <c>ParseException</c> out of <c>BigDecimal</c> instead --
+    /// measured on 4.0.3 for <c>1e2147483648</c>, <c>1e99999999999</c>, <c>1e-99999999999</c>,
+    /// <c>1e-2147483648</c> and <c>0e2147483648</c>. A caller quoting the reason into a refused
+    /// write should be able to tell a value that is too big from one nothing can spell.
+    /// </para>
+    /// <para>
+    /// Reached from the decimal path as well, where the wording was wrong in the same way and for
+    /// the same inputs -- <c>0e2147483648BD</c> is not out of range for a decimal either.
+    /// </para>
+    /// </remarks>
+    private static SparkSqlParseException ExponentOverflow(string text, string sql, int position) =>
+        new($"'{text}' has an exponent no decimal scale can carry", sql, position);
 }

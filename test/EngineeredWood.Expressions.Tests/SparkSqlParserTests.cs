@@ -720,12 +720,38 @@ public sealed class SparkSqlParserTests
     [InlineData("1e-2147483648")]
     [InlineData("1e-2147483649")]
     [InlineData("0e2147483648")]
-    // ...while the largest exponent that DOES fit is refused by the range check instead, and
-    // reaching it at all is what needs the normalisation to count in a long: 1e2147483647
-    // normalises to an exponent of 2147483648, which an int cannot hold.
-    [InlineData("1e2147483647")]
-    public void AnExponentTooWideForAScaleIsRefused(string sql) =>
-        Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+    // The decimal path has the same guard, and had the same wrong wording before it was split.
+    [InlineData("0e2147483648BD")]
+    [InlineData("1e99999999999BD")]
+    public void AnExponentTooWideForAScaleIsRefused(string sql)
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+
+        // NOT the range reason, which would be FALSE for `0e2147483648`: that literal is
+        // numerically zero and in the range of every type there is. Raised in review of #287,
+        // and it is a distinction Spark draws too -- INVALID_NUMERIC_LITERAL_RANGE names the
+        // min and max it compared against, while these come back as a plain ParseException.
+        Assert.Contains("exponent", thrown.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("out of range", thrown.Reason, StringComparison.Ordinal);
+        Assert.Equal(sql, thrown.Expression);
+    }
+
+    /// <summary>
+    /// The largest exponent that DOES fit is refused by the RANGE check, with the range reason.
+    /// </summary>
+    /// <remarks>
+    /// The pair of tests is what says the two refusals are told apart rather than merged. It is
+    /// also the row that needs the normalisation to count in a long: `1e2147483647` normalises to
+    /// an exponent of 2147483648, which an int cannot hold.
+    /// </remarks>
+    [Fact]
+    public void TheLargestExponentThatFitsIsRefusedForItsValueInstead()
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse("1e2147483647"));
+
+        Assert.Contains("out of range", thrown.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("exponent", thrown.Reason, StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// The neighbouring rules, which are NOT this one and must not have moved.
