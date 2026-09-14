@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-13 19:22:03.649392",
-      "2026-09-13 19:22:03.649392",
-      "2026-09-13 19:22:03.649392"
+      "2026-09-14 06:00:18.516548",
+      "2026-09-14 06:00:18.516548",
+      "2026-09-14 06:00:18.516548"
      ]
     }
    },
@@ -26529,6 +26529,1624 @@
       false,
       false,
       false
+     ]
+    }
+   }
+  ],
+  "date-format": [
+   {
+    "expression": "date_format(ts, '')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, ''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, ''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[]",
+      null,
+      "[]"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(dt, '')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(dt, '')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'y')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'y')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026",
+      null,
+      "1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'M')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'M')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "8",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "11",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'H')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'H')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'm')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'm')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "30",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 's')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 's')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(dt, 'y')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(dt, 'y')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026",
+      null,
+      "1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(dt, 'M')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(dt, 'M')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "8",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(dt, 'd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(dt, 'd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "11",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "26",
+      null,
+      "70"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'MM')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'MM')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "08",
+      null,
+      "01"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'dd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'dd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "11",
+      null,
+      "01"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'HH')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'HH')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12",
+      null,
+      "00"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'mm')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'mm')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "30",
+      null,
+      "00"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'ss')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'ss')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "00",
+      null,
+      "00"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyy-MM-dd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyy-MM-dd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      null,
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'HH:mm:ss')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'HH:mm:ss')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12:30:00",
+      null,
+      "00:00:00"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'MM/dd/yyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'MM/dd/yyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "08/11/2026",
+      null,
+      "01/01/1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyyMMdd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyyMMdd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "20260811",
+      null,
+      "19700101"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(dt, 'yyyy-MM-dd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(dt, 'yyyy-MM-dd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      null,
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'y')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'y')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "999",
+      "999",
+      "999"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'yy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "99",
+      "99",
+      "99"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'yyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "999",
+      "999",
+      "999"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'yyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0999",
+      "0999",
+      "0999"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'yyyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "00999",
+      "00999",
+      "00999"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(TIMESTAMP'0999-01-02 03:04:05', 'yyyy-MM-dd HH:mm:ss')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(TIMESTAMP '0999-01-02 03:04:05', 'yyyy-MM-dd HH:mm:ss')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0999-01-02 03:04:05",
+      "0999-01-02 03:04:05",
+      "0999-01-02 03:04:05"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026",
+      null,
+      "1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026",
+      null,
+      "1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "02026",
+      null,
+      "01970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'MMM')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'MMM')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Aug",
+      null,
+      "Jan"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'MMMM')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'MMMM')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "August",
+      null,
+      "January"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'MMMMM')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'MMMMM')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'MMMMM' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark."
+    }
+   },
+   {
+    "expression": "date_format(ts, 'ddd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'ddd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'ddd' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.ap"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'dddd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'dddd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'dddd' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.a"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'HHH')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'HHH')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'HHH' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.ap"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'mmm')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'mmm')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'mmm' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.ap"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'sss')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'sss')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'sss' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.ap"
+    }
+   },
+   {
+    "expression": "date_format(ts, '\\\\d')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\\\\d')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "\\11",
+      null,
+      "\\1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '%d')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '%d')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "%11",
+      null,
+      "%1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '\"yy\"')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\"yy\"')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "\"26\"",
+      null,
+      "\"70\""
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '\\\\')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\\\\')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "\\",
+      null,
+      "\\"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '\\\\\\\\')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\\\\\\\\')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "\\\\",
+      null,
+      "\\\\"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '-')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '-')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-",
+      null,
+      "-"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, ' ')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, ' ')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      " ",
+      null,
+      " "
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '..')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '..')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "..",
+      null,
+      ".."
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyy\\'T\\'HH')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyy\\'T\\'HH')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026T12",
+      null,
+      "1970T00"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '\\'yyyy\\'')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\\'yyyy\\'')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "yyyy",
+      null,
+      "yyyy"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '\\'\\'')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '\\'\\'')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "'",
+      null,
+      "'"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyy\\'')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyy\\'')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: uuuu'"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[']",
+      null,
+      "[']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: '''"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[']",
+      null,
+      "[']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern ends with an incomplete string literal: '''''"
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "['']",
+      null,
+      "['']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'\\'\\'\\'\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[''']",
+      null,
+      "[''']"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, 'yyyy\\'\\'MM'), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, 'yyyy\\'\\'MM'), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[2026'08]",
+      null,
+      "[1970'01]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'\\'yyyy'), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'\\'yyyy'), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "['2026]",
+      null,
+      "['1970]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'It\\'\\'s\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'It\\'\\'s\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[It's]",
+      null,
+      "[It's]"
+     ]
+    }
+   },
+   {
+    "expression": "concat('[', date_format(ts, '\\'a\\'\\'\\''), ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('[', date_format(ts, '\\'a\\'\\'\\''), ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "[a']",
+      null,
+      "[a']"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, '#')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '#')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize '#' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.apac"
+    }
+   },
+   {
+    "expression": "date_format(ts, '{')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '{')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize '{' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.apac"
+    }
+   },
+   {
+    "expression": "date_format(ts, '}')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '}')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize '}' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.apac"
+    }
+   },
+   {
+    "expression": "date_format(ts, ']')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, ']')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize ']' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark.apac"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'yyyy]')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'yyyy]')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkUpgradeException: [INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION] You may get a different result due to the upgrading to Spark >= 3.0:\nFail to recognize 'yyyy]' pattern in the DateTimeFormatter.\n1) You can set \"spark.sql.legacy.timeParserPolicy\" to \"LEGACY\" to restore the behavior before Spark 3.0.\n2) You can form a valid datetime pattern with the guide from 'https://spark."
+    }
+   },
+   {
+    "expression": "date_format(ts, '[yyyy]')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, '[yyyy]')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026",
+      null,
+      "1970"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'D')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'D')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "223",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'E')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'E')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Tue",
+      null,
+      "Thu"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'a')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'a')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "PM",
+      null,
+      "AM"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'h')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'h')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12",
+      null,
+      "12"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'S')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'S')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0",
+      null,
+      "0"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'G')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'G')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "AD",
+      null,
+      "AD"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'q')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'q')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "3",
+      null,
+      "1"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'LLL')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'LLL')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Aug",
+      null,
+      "Jan"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'Z')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'Z')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "+0000",
+      null,
+      "+0000"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'z')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'z')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "UTC",
+      null,
+      "UTC"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'X')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'X')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Z",
+      null,
+      "Z"
+     ]
+    }
+   },
+   {
+    "expression": "date_format(ts, 'n')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'n')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: [INVALID_DATETIME_PATTERN.ILLEGAL_CHARACTER] Unrecognized datetime pattern: n. Illegal pattern character found in datetime pattern: n. Please provide legal character. SQLSTATE: 22007"
+    }
+   },
+   {
+    "expression": "date_format(ts, 'V')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(ts, 'V')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "IllegalArgumentException: Pattern letter count must be 2: V"
+    }
+   },
+   {
+    "expression": "date_format(NULL, 'ddd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(NULL, 'ddd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "date_format(NULL, 'yyyy')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(NULL, 'yyyy')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "date_format(CAST(NULL AS TIMESTAMP), 'ddd')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "date_format(CAST(NULL AS TIMESTAMP), 'ddd')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
      ]
     }
    }

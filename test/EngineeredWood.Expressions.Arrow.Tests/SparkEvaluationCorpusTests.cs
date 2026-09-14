@@ -210,6 +210,36 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS STRING)"] =
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
+        // ── NOT IMPLEMENTED: the `date_format` pattern letters beyond y M d H m s. ────────────
+        // #284 made the pattern language Java's rather than .NET's, which is what lets these be
+        // DECLARED at all: before it, an unimplemented letter and one whose two languages
+        // disagree were the same refusal. Every row below is one Spark answers and we refuse, so
+        // the list is exactly the shape of the gap -- and its neighbours in the group, `n` and
+        // `V`, are rows Spark refuses TOO, which is what says the boundary is the implementation
+        // and not the corpus.
+        //
+        // Adding one is a day's arithmetic each and none of them is needed by a Delta CHECK or
+        // generation expression, which is the scope the registry serves. They stay declared
+        // until something asks.
+        ["date_format(ts, 'D')"] = "day-of-year is not implemented",
+        ["date_format(ts, 'E')"] = "day-of-week name is not implemented",
+        ["date_format(ts, 'a')"] = "am/pm is not implemented",
+        ["date_format(ts, 'h')"] = "the 12-hour clock is not implemented",
+        ["date_format(ts, 'S')"] = "fraction-of-second is not implemented",
+        ["date_format(ts, 'G')"] = "era is not implemented",
+        ["date_format(ts, 'q')"] = "quarter is not implemented",
+        ["date_format(ts, 'LLL')"] = "the standalone month is not implemented",
+        ["date_format(ts, 'Z')"] = "zone offset is not implemented",
+        ["date_format(ts, 'z')"] = "zone name is not implemented",
+        ["date_format(ts, 'X')"] = "ISO zone offset is not implemented",
+
+        // Spark accepts `[ ]` when FORMATTING -- an optional section whose fields are all present
+        // simply outputs, so `[yyyy]` is 2026 -- but the construct is a parse-side one and
+        // implementing it for the format side alone would put its boundary somewhere arbitrary.
+        // Refused with Java's reserved `#`, `{` and `}`, which are in the group beside it and
+        // which Spark refuses too.
+        ["date_format(ts, '[yyyy]')"] = "#284: an optional section is not implemented",
+
         // ── NOT IMPLEMENTED: no function or materialisation for these yet. ────────────────────
         ["INTERVAL 1 DAY"] = "parser refuses INTERVAL literals; declared in SparkSqlParserTests",
         ["1Y"] = "parser refuses the tinyint literal suffix; declared in SparkSqlParserTests",

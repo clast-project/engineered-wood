@@ -296,7 +296,27 @@ def t_datepart(rng, depth=0):
 
 
 def t_date_format(rng, depth=0):
-    fmt = _pick(rng, ["'yyyy-MM-dd'", "'yyyy'", "'HH:mm:ss'", "'MM/dd/yyyy'", "''"])
+    # THE PATTERN IS THE PAYLOAD. `date_format` takes Java's pattern language, and the five
+    # formats this template started with were all runs of two or more letters with punctuation
+    # between them -- which is exactly the middle where Java's language and .NET's agree, so the
+    # template could not express #284 even though `''` was already in the list. The empty pattern
+    # only diverges because .NET reads it as a request for the GENERAL format, and that needed a
+    # non-null timestamp to show; the single-letter patterns below are the same defect with a
+    # value attached, since .NET reads a one-character format string as a STANDARD specifier.
+    fmt = _pick(rng, [
+        # The middle that agrees, which is what makes a divergence elsewhere attributable.
+        "'yyyy-MM-dd'", "'yyyy'", "'HH:mm:ss'", "'MM/dd/yyyy'",
+        # The empty pattern, and one character, which is where the two languages part.
+        "''", "'y'", "'M'", "'d'", "'H'", "'m'", "'s'",
+        # Widths either side of the ones Spark allows, and the month names.
+        "'yy'", "'yyy'", "'yyyyy'", "'MMM'", "'MMMM'", "'MMMMM'", "'ddd'", "'sss'",
+        # Every character .NET reads as a construct and Java outputs as itself: the escape, the
+        # single-specifier prefix, the other literal delimiter -- plus Java's own literal, whose
+        # empty form is an apostrophe rather than nothing.
+        r"'\\d'", "'%d'", """'"yy"'""", r"'\\'", r"'yyyy\'T\'HH'", r"'\'\''",
+        # ...and the structural characters, where the right answer is that both sides refuse.
+        "'#'", "'[yyyy]'", "'yyyy]'",
+    ])
     return f"date_format({_pick(rng, DATE_COLUMNS)}, {fmt})"
 
 
