@@ -1103,6 +1103,52 @@ A negated literal is one: Spark's parser folds the sign into the `Literal` where
 our parser produces `negative(2)`, and since a precision never counts a sign,
 unwrapping exactly one level gives the same answer.
 
+#### What arithmetic does with a string operand
+
+Added 2026-09-14, closing #296. The other half of the comparison rule above, and
+it was never measured: `SparkNumericTypes.ArithmeticResult` had no string branch
+at all, so every string operand of `+ - * / %` or of unary minus threw.
+
+Spark casts the string here too, and the two dialects choose differently again:
+
+- **The legacy dialect reads it as a `DOUBLE`, always** — whatever the other
+  operand is. That is where arithmetic parts company with comparison, which casts
+  to the other operand's own type in this dialect.
+- **ANSI reads it as the other operand's FAMILY**: `BIGINT` against any integral
+  width, `DOUBLE` against a float, a double or a decimal.
+- **Unary minus is a `DOUBLE` in both**, even against the integral shape where
+  binary `+` is a bigint.
+
+The target decides which strings are **accepted**, not only what type comes back,
+because ANSI's integral target inherits the integral text rule above:
+
+| expression | ANSI | legacy |
+|---|---|---|
+| `'1' + 1` | 2, `bigint` | 2.0, `double` |
+| `'1.5' + 1` | `CAST_INVALID_INPUT` | 2.5 |
+| `'1e3' + 1` | `CAST_INVALID_INPUT` | 1001.0 |
+| `'abc' + 1` | `CAST_INVALID_INPUT` | null |
+| `'0.1' + CAST(0 AS FLOAT)` | the double 0.1 | the double 0.1 |
+| `'1' + '2'` | `BINARY_OP_WRONG_TYPE` | 3.0 |
+| `'1' + NULL` | `BINARY_OP_WRONG_TYPE` | null |
+| `-'1e3'` | -1000.0 | -1000.0 |
+
+**`/` takes the same target as every other operator**, which is the row a table of
+result types cannot show: a division's result is a double whatever the operands
+are, and the string is still read as a bigint first. So under ANSI `'1.5' / 3`
+raises while `'1.5' / g` answers 0.6 — one expression apart.
+
+**A bare `NULL` refuses under ANSI exactly as a second string does**, and it is
+the absence of a TYPE rather than the nullness: `'1' + CAST(NULL AS INT)` is a
+perfectly good bigint null beside it. Boolean, date, timestamp and binary refuse
+in both dialects.
+
+The rule lives on `SparkFunctionRegistry` beside the comparison one, and routes
+to the same `Cast` that `CAST(…)` reaches — so a string arithmetic accepts is
+exactly a string the explicit cast accepts, and one it refuses is a raise under
+ANSI and a null without it. Pinned by the corpus's `arithmetic-string-coercion`
+group, harvested under both confs.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic
