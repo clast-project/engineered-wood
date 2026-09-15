@@ -210,6 +210,18 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(3.333333333333333E17 AS DOUBLE) AS STRING)"] =
             "#244: JDK 17 prints 17 digits where the shortest form needs 16",
 
+        // The same band, reached from the other end by #288's subnormals -- and these two are
+        // not about digit COUNT at all. `1e-323` is the double two steps above the smallest
+        // there is, and both 1.0E-323 and 9.9E-324 are two digits long and read back as it; JDK
+        // 19 picks the closer one and JDK 17 does not. Verified on JDK 21 directly, which prints
+        // 9.9E-324, and over all 8,388,607 subnormal floats and 22,000 subnormal doubles: these
+        // are the ONLY rows of the `subnormal-floats` group that move, and the other 20 agree
+        // exactly, which is what says the divergence is the JVM's.
+        ["CAST(CAST(1e-323 AS DOUBLE) AS STRING)"] =
+            "#288: JDK 17 prints 1.0E-323 where JDK 19+ prints the closer 9.9E-324",
+        ["CAST(CAST(-1e-323 AS DOUBLE) AS STRING)"] =
+            "#288: JDK 17 prints -1.0E-323 where JDK 19+ prints the closer -9.9E-324",
+
         // ── NOT IMPLEMENTED: the `date_format` pattern letters beyond y M d H m s. ────────────
         // #284 made the pattern language Java's rather than .NET's, which is what lets these be
         // DECLARED at all: before it, an unimplemented letter and one whose two languages
