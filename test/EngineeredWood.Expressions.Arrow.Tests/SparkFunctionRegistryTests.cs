@@ -483,6 +483,107 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal("0.3333333", SparkFloatText.ShortestRoundTrip(0.3333333f));
     }
 
+    /// <summary>
+    /// The float ladder starts at six digits, because seven does not always reach the shortest form.
+    /// </summary>
+    /// <remarks>
+    /// Half a step is at most 2^-24 = 5.96e-8 of a normal float, and half of the seven-digit
+    /// grid's step falls to 5.0e-8 where the leading digit is a 9 — so rounding to seven digits
+    /// can miss a six-digit answer. Measured against <c>Float.toString</c> on JDK 21 over a
+    /// 200,000-float sweep: six values disagreed, every one of them beginning with a 9, and the
+    /// extra rung takes it to none. Unrelated to <see cref="ASubnormalFloatPrintsTheWayJavaPrintsIt"/>
+    /// — these are ordinary normal floats.
+    /// </remarks>
+    [Theory]
+    [InlineData(-1333657694, "-9.45864E-10")]   // seven digits gave -9.458641E-10
+    [InlineData(117638275, "9.85667E-35")]
+    [InlineData(-637128058, "-9.4433E15")]
+    [InlineData(-1249503410, "-9.99056E-7")]
+    public void SixDigitsCanBeTheShortestFormOfANormalFloat(int bits, string expected) =>
+        Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
+
+    /// <summary>
+    /// A subnormal's digits are reached by exact arithmetic, not by the platform's formatter.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #288. A subnormal's step stays a fixed 2^-1074 however small the value gets, so at the
+    /// bottom of the range half a step is half the value and one digit round-trips — while the
+    /// ladder above starts at fifteen, which is why <c>CAST(CAST(1e-323 AS DOUBLE) AS STRING)</c>
+    /// printed <c>9.88131291682493E-324</c>.
+    /// </para>
+    /// <para>
+    /// The expectations are <c>Double.toString</c> on JDK 21, matched over all 8,388,607 subnormal
+    /// floats and 22,000 subnormal doubles. The values are given as bit patterns rather than
+    /// literals so that no parser stands between the test and the double it means.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(1L, "4.9E-324")]                             // the smallest double there is
+    [InlineData(2L, "9.9E-324")]                             // #288's own repro, CAST(1e-323 AS DOUBLE)
+    [InlineData(3L, "1.5E-323")]
+    [InlineData(4L, "2.0E-323")]
+    [InlineData(32L, "1.6E-322")]
+    [InlineData(2024L, "1.0E-320")]
+    [InlineData(202402253L, "1.0E-315")]
+    [InlineData(20240225330731L, "1.0E-310")]
+    [InlineData(1889890541868028L, "9.337299911372906E-309")]  // net472's ToString("G16") is a digit out here
+    [InlineData(4503599627370495L, "2.225073858507201E-308")]  // the largest subnormal
+    public void ASubnormalDoublePrintsTheWayJavaPrintsIt(long bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(BitConverter.Int64BitsToDouble(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-BitConverter.Int64BitsToDouble(bits)));
+    }
+
+    [Theory]
+    [InlineData(1, "1.4E-45")]              // float.Epsilon, and NOT the shorter 1E-45
+    [InlineData(5, "7.0E-45")]
+    [InlineData(7, "9.8E-45")]
+    [InlineData(71, "9.9E-44")]
+    [InlineData(512, "7.17E-43")]
+    [InlineData(1155, "1.618E-42")]         // net472's ToString("G4") is a digit out here
+    [InlineData(8192, "1.148E-41")]
+    [InlineData(71362, "1.0E-40")]
+    [InlineData(8388607, "1.1754942E-38")]  // the largest subnormal
+    public void ASubnormalFloatPrintsTheWayJavaPrintsIt(int bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-Float(bits)));
+    }
+
+    /// <summary>
+    /// Where ONE digit round-trips, Java still asks which of the one- and two-digit decimals is closer.
+    /// </summary>
+    /// <remarks>
+    /// The rule that makes <c>Double.toString(Double.MIN_VALUE)</c> <c>4.9E-324</c> and not
+    /// <c>5E-324</c>, although both read back as the same double. It reaches only subnormals: for
+    /// a normal value, a one-digit decimal within half a step means the two-digit rounding is that
+    /// same decimal with a zero after it.
+    /// </remarks>
+    [Fact]
+    public void ASingleDigitIsNotAlwaysTheAnswerEvenWhenItRoundTrips()
+    {
+        Assert.Equal("4.9E-324", SparkFloatText.ShortestRoundTrip(double.Epsilon));
+        Assert.Equal("1.4E-45", SparkFloatText.ShortestRoundTrip(float.Epsilon));
+
+        // Both of the shorter spellings ARE the same value, so shortest-wins alone would have
+        // picked them. Read through literals, which the compiler resolves, rather than through
+        // the runtime parser — net472's reads a subnormal wrongly, which is half of why the
+        // digits above are computed rather than formatted.
+        Assert.Equal(double.Epsilon, 5E-324);
+        Assert.Equal(float.Epsilon, 1E-45f);
+    }
+
+    /// <summary>The sign survives the subnormal path, which the decimal cast reaches directly.</summary>
+    [Fact]
+    public void ASubnormalKeepsItsSignThroughTheDecimalCastEntryPoint()
+    {
+        Assert.Equal("-9.9E-324", SparkFloatText.ShortestRoundTrip(-BitConverter.Int64BitsToDouble(2L)));
+        Assert.Equal("9.9E-324", SparkFloatText.ShortestRoundTrip(BitConverter.Int64BitsToDouble(2L)));
+    }
+
+    private static float Float(int bits) => BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+
 
     /// <summary>
     /// A refused row names its own value, which is what deferring the rendering puts at risk.

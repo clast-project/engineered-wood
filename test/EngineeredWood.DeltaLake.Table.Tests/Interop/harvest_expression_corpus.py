@@ -929,6 +929,57 @@ GROUPS = {
         # And through concat, which casts implicitly and is how a constraint usually meets one.
         "concat(s, g)",
     ],
+    "subnormal-floats": [
+        # Issue #288. Below 2.2250738585072014e-308 a double stops carrying 53 bits: the step
+        # between neighbours stays a fixed 2^-1074 however small the value gets, so at the bottom
+        # of the range half a step is half the value itself and ONE digit round-trips. The
+        # G15/G16/G17 ladder that #248 built starts at fifteen because fifteen is where a NORMAL
+        # double's shortest form can first appear -- so it printed 9.88131291682493E-324 where
+        # Spark prints two digits, and the whole subnormal range was rendering long.
+        #
+        # What this group is FOR is the exact digits, so every expression below reaches a
+        # different part of the range: the smallest double there is, the ones just above it where
+        # one and two digits compete, the middle where the answer is short for a different reason,
+        # and the top where seventeen digits are genuinely needed.
+
+        # The bottom of the range, where the step is a large fraction of the value.
+        "CAST(CAST(4.9e-324 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-323 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1.5e-323 AS DOUBLE) AS STRING)",
+        "CAST(CAST(2e-323 AS DOUBLE) AS STRING)",
+        "CAST(CAST(-1e-323 AS DOUBLE) AS STRING)",
+
+        # The middle, where a short answer comes from the value being near a round decimal rather
+        # than from the step being coarse.
+        "CAST(CAST(1e-320 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-315 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-310 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1.23456789e-310 AS DOUBLE) AS STRING)",
+
+        # The top, one value below the smallest normal double, where sixteen digits are needed --
+        # and a value whose sixteenth digit .NET Framework's own formatter gets wrong.
+        "CAST(CAST(2.2250738585072011e-308 AS DOUBLE) AS STRING)",
+        "CAST(CAST(9.337299911372906e-309 AS DOUBLE) AS STRING)",
+
+        # A FLOAT is subnormal below 1.17549435e-38 and asks the same question at its own width.
+        "CAST(CAST(1.4e-45 AS FLOAT) AS STRING)",
+        "CAST(CAST(7e-45 AS FLOAT) AS STRING)",
+        "CAST(CAST(1e-44 AS FLOAT) AS STRING)",
+        "CAST(CAST(1.618e-42 AS FLOAT) AS STRING)",
+        "CAST(CAST(1e-40 AS FLOAT) AS STRING)",
+        "CAST(CAST(1.1754942e-38 AS FLOAT) AS STRING)",
+
+        # Reached by arithmetic rather than written down, so at least one answer is not a constant
+        # fold -- and so the underflow itself is measured rather than assumed.
+        "CAST(g * CAST(1e-323 AS DOUBLE) AS STRING)",
+        "CAST(CAST(1e-300 AS DOUBLE) * CAST(1e-20 AS DOUBLE) AS STRING)",
+        "CAST(CAST(4.9e-324 AS DOUBLE) / 2 AS STRING)",
+
+        # And the other consumer of the same digits: Spark reaches a decimal from a double through
+        # Double.toString, so whatever this group settles the DECIMAL cast inherits.
+        "CAST(CAST(1e-323 AS DOUBLE) AS DECIMAL(38,38))",
+        "CAST(CAST(1e-310 AS DOUBLE) AS DECIMAL(10,2))",
+    ],
     "wide-decimal-literals": [
         # Issue #173. SparkLiteral.ParseDecimal goes through decimal.TryParse, so a literal wider
         # than System.Decimal fails to parse — while a decimal(38,0) COLUMN evaluates fine across

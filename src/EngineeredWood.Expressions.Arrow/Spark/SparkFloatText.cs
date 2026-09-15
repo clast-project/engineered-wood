@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Globalization;
+using System.Numerics;
 using System.Text;
 
 namespace EngineeredWood.Expressions.Arrow.Spark;
@@ -45,9 +46,26 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// The corpus records <c>java_version</c> beside <c>conf</c>, and the two rows that land in the
 /// band are declared differences.
 /// </para>
+/// <para>
+/// <b>A subnormal is a different question and gets its own answer.</b> Every rule above is about
+/// where the point goes; <see cref="Subnormal"/> is about which digits there are at all, and it
+/// reaches them without the platform's formatter or its parser. #288.
+/// </para>
 /// </remarks>
 internal static class SparkFloatText
 {
+    /// <summary>The smallest positive normal double, below which a double loses significant bits.</summary>
+    private const double DoubleMinNormal = 2.2250738585072014E-308;
+
+    /// <summary>The smallest positive normal float.</summary>
+    private const float FloatMinNormal = 1.17549435E-38f;
+
+    /// <summary>The exponent every subnormal double is written at: <c>double.Epsilon</c> is 2^-1074.</summary>
+    private const int DoubleMinExponent = -1074;
+
+    /// <summary>The exponent every subnormal float is written at: <c>float.Epsilon</c> is 2^-149.</summary>
+    private const int FloatMinExponent = -149;
+
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
     /// <summary>Java's rendering of a double.</summary>
@@ -89,6 +107,10 @@ internal static class SparkFloatText
     /// </remarks>
     internal static string ShortestRoundTrip(double value)
     {
+        var magnitude = Math.Abs(value);
+        if (magnitude > 0 && magnitude < DoubleMinNormal)
+            return Sign(value) + Subnormal((long)(magnitude / double.Epsilon), DoubleMinExponent, 17);
+
         // Unrolled onto constant format strings rather than built per iteration: this runs for
         // every row of every cast, and there are only ever three rungs.
         if (RoundTrips(value, "G15", out var fifteen))
@@ -104,6 +126,20 @@ internal static class SparkFloatText
     /// <summary>The shortest decimal text that round-trips a float, which needs at most nine digits.</summary>
     internal static string ShortestRoundTrip(float value)
     {
+        var magnitude = Math.Abs(value);
+        if (magnitude > 0 && magnitude < FloatMinNormal)
+            return Sign(value) + Subnormal((long)((double)magnitude / float.Epsilon), FloatMinExponent, 9);
+
+        // Six, not seven. Half a step is at most 2^-24 of a normal float, and half of the
+        // seven-digit grid's step is as little as 0.05e-6 = 5.0e-8 where the leading digit is a 9
+        // -- SMALLER than 2^-24 = 5.96e-8, so rounding to seven digits does not always land on a
+        // six-digit shortest form. Measured: it prints 9.458641E-10 where Java prints 9.45864E-10,
+        // and the six mismatches in a 200,000-float sweep all began with a 9. The same arithmetic
+        // is what makes fifteen right for a double: half of its sixteen-digit step can be 5.0e-17
+        // against a half-step of 2^-53 = 1.11e-16, and half of the fifteen-digit step cannot.
+        if (RoundTrips(value, "G6", out var six))
+            return six;
+
         if (RoundTrips(value, "G7", out var seven))
             return seven;
 
@@ -124,6 +160,173 @@ internal static class SparkFloatText
         text = value.ToString(format, Invariant);
         return float.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value;
     }
+
+    /// <summary>
+    /// The shortest decimal text that reads back as the subnormal <c>mantissa × 2^minExponent</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ladder above starts at fifteen digits because that is where a NORMAL double's shortest
+    /// form can first appear: half a step is at most 2^-53 of the value, so rounding to fifteen
+    /// digits lands on the shortest form whenever the shortest form is that short or shorter. A
+    /// subnormal breaks the premise. Its step is a fixed 2^-1074 no matter how small the value
+    /// gets, so at the bottom of the range half a step is half the value itself and ONE digit
+    /// round-trips — which is why we printed <c>9.88131291682493E-324</c> where Spark prints two
+    /// digits. #288.
+    /// </para>
+    /// <para>
+    /// <b>Neither the platform's formatter nor its parser can be asked here.</b> Both are wrong
+    /// about subnormals on .NET Framework and right on .NET Core, which is the one thing a cast
+    /// may not depend on. Measured: <c>double.Parse("2.12E-322")</c> returns the wrong double
+    /// there, so a round-trip test answers falsely, and <c>ToString("G16")</c> of the double just
+    /// below the smallest normal one is a digit out, so the digits it hands over are not the
+    /// value's. So the digits come from exact integer arithmetic instead: a subnormal is
+    /// <c>mantissa × 2^minExponent</c>, which is <c>(mantissa × 5^-minExponent) × 10^minExponent</c>,
+    /// and the significant digits are simply the digits of that integer product.
+    /// </para>
+    /// <para>
+    /// Checked against <c>Float.toString</c> on JDK 21 over all 8,388,607 subnormal floats and
+    /// <c>Double.toString</c> over 22,000 subnormal doubles: identical on every one, on net10.0
+    /// and on net472 alike.
+    /// </para>
+    /// </remarks>
+    private static string Subnormal(long mantissa, int minExponent, int maxDigits)
+    {
+        var exact = (BigInteger.Pow(5, -minExponent) * mantissa).ToString(Invariant);
+
+        // The product is the digit string of `0.<exact> × 10^pointAt`, with no leading zero to
+        // discard: BigInteger does not write one.
+        var pointAt = exact.Length + minExponent;
+
+        for (var length = 1; length < maxDigits; length++)
+        {
+            var candidate = Round(exact, pointAt, length);
+            if (!ReadsBackAs(candidate, mantissa, minExponent))
+                continue;
+
+            // Java's one exception to shortest-wins, and the reason Double.toString(4.9E-324) is
+            // not `5E-324`: where a single digit suffices, the answer is the closer of the best
+            // one- and two-digit decimals rather than the one-digit one. Measured -- it is the
+            // difference between `9.9E-324` and `1.0E-323` for the double just above the
+            // smallest, and both of those round-trip.
+            if (length == 1)
+            {
+                var pair = Round(exact, pointAt, 2);
+                if (ReadsBackAs(pair, mantissa, minExponent))
+                    return Scientific(pair);
+            }
+
+            return Scientific(candidate);
+        }
+
+        // Seventeen digits always identify a double and nine always identify a float, subnormal
+        // or not, so the last rung needs no test.
+        return Scientific(Round(exact, pointAt, maxDigits));
+    }
+
+    /// <summary>
+    /// Whether the decimal <paramref name="candidate"/> reads back as <c>mantissa × 2^minExponent</c>.
+    /// </summary>
+    /// <remarks>
+    /// The candidate is <c>c × 10^-s</c> and reads back as the value when it sits within half a
+    /// step of it — half a step being <c>2^(minExponent-1)</c>, the same for every subnormal:
+    /// <code>
+    ///     |c × 10^-s − mantissa × 2^minExponent| ≤ 2^(minExponent-1)
+    /// </code>
+    /// Multiplying through by <c>2^(1-minExponent) × 5^s</c> leaves nothing but integers:
+    /// <code>
+    ///     |c × 2^(1-minExponent-s) − 2 × mantissa × 5^s| ≤ 5^s
+    /// </code>
+    /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
+    /// sends a decimal landing exactly between two doubles.
+    /// </remarks>
+    private static bool ReadsBackAs((string Digits, int PointAt) candidate, long mantissa, int minExponent)
+    {
+        var scale = candidate.Digits.Length - candidate.PointAt;
+        var shift = 1 - minExponent;
+        if (scale <= 0 || scale > shift)
+            return false;
+
+        var half = BigInteger.Pow(5, scale);
+        var c = BigInteger.Parse(candidate.Digits, NumberStyles.Integer, Invariant);
+        var distance = BigInteger.Abs((c << (shift - scale)) - (2 * mantissa * half));
+
+        return distance < half || (distance == half && mantissa % 2 == 0);
+    }
+
+    /// <summary>
+    /// Rounds the exact digit string to <paramref name="length"/> significant digits, half to even.
+    /// </summary>
+    /// <returns>The digits with trailing zeros dropped, and the exponent of <c>0.&lt;digits&gt;</c>.</returns>
+    private static (string Digits, int PointAt) Round(string exact, int pointAt, int length)
+    {
+        if (exact.Length > length)
+        {
+            var head = exact.Substring(0, length);
+
+            if (RoundsUp(exact, length))
+            {
+                head = Increment(head);
+
+                // 99 -> 100: one digit too many, and the point has moved.
+                if (head.Length > length)
+                {
+                    head = head.Substring(0, length);
+                    pointAt++;
+                }
+            }
+
+            exact = head;
+        }
+
+        // A trailing zero is not a significant digit, and Java counts the length of a decimal
+        // without one: 1.0E-310 is one digit long, not two.
+        return (exact.TrimEnd('0'), pointAt);
+    }
+
+    private static bool RoundsUp(string exact, int length)
+    {
+        var next = exact[length];
+        if (next != '5')
+            return next > '5';
+
+        for (var i = length + 1; i < exact.Length; i++)
+            if (exact[i] != '0')
+                return true;
+
+        // An exact tie, which a terminating expansion like this one can genuinely reach.
+        return (exact[length - 1] - '0') % 2 == 1;
+    }
+
+    private static string Increment(string digits)
+    {
+        var carried = digits.ToCharArray();
+
+        for (var i = carried.Length - 1; i >= 0; i--)
+        {
+            if (carried[i] != '9')
+            {
+                carried[i]++;
+                return new string(carried);
+            }
+
+            carried[i] = '0';
+        }
+
+        return "1" + new string(carried);
+    }
+
+    /// <summary>Writes the digits in the shape a "G" format would, for <see cref="Split"/> to read.</summary>
+    private static string Scientific((string Digits, int PointAt) value)
+    {
+        var exponent = (value.PointAt - 1).ToString(Invariant);
+
+        return value.Digits.Length == 1
+            ? value.Digits + "E" + exponent
+            : value.Digits.Substring(0, 1) + "." + value.Digits.Substring(1) + "E" + exponent;
+    }
+
+    private static string Sign(double value) => value < 0 ? "-" : string.Empty;
 
     /// <summary>
     /// Whether the value carries a negative sign, including negative zero.
