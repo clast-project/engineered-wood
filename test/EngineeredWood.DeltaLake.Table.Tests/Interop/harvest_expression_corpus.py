@@ -99,6 +99,12 @@ LEGACY_GROUPS = (
     # answers NULL. Since the whole point of the group is which strings survive the trim, the
     # refusals ARE the measurement, and one harvest would record only half of each of them.
     "string-trim",
+    # #318. The grammar is dialect-independent and the group is mostly REFUSALS, which are not:
+    # ANSI raises CAST_INVALID_INPUT where legacy answers NULL. Since what the group measures is
+    # which strings are dates at all, the refusals ARE the measurement, and one harvest would
+    # record only half of each of them -- the same argument as `string-trim` above, which is the
+    # group this one was spun off from.
+    "temporal-text",
     # #295. The dialects disagree twice over: ANSI refuses the integral-to-binary CAST that legacy
     # allows, and legacy refuses the binary/string CONDITIONAL that ANSI resolves. Opposite
     # directions in one group, so one harvest would describe neither.
@@ -2766,6 +2772,186 @@ GROUPS = {
 
         # The pairs with no rule in EITHER dialect, so the refusal is not ANSI's alone.
         "'1' + bl", "'1' + ts", "'1' + X'41'", "'1' + dt", "dt + '1'",
+    ],
+
+    # The DATE and TIMESTAMP text grammars, which are Spark's OWN and not any general parser's.
+    # #318, found by the group above: its one interior-whitespace row failed, and not because of
+    # trimming. `CastToDate` and `CastToTimestamp` read their text with `DateTimeOffset.TryParse`,
+    # which accepts a whole culture's worth of formats Spark refuses and refuses two forms Spark
+    # accepts -- so the cast was wrong in both directions, exactly as the trim had been.
+    #
+    # TIMESTAMP answers are wrapped in `CAST(... AS STRING)` for the reason the trim group's are:
+    # PySpark localises a timestamp to the DRIVER's zone on collect, so a bare one would record the
+    # harvest machine rather than the pinned UTC. Wrapping also puts Spark's own RENDERING in the
+    # fixture, which is a second thing worth pinning -- the sub-second was dropped on the way OUT
+    # here, and from outside a corpus row cannot tell that apart from a defect in the parse.
+    "temporal-text": [
+        # --- A DATE IS NOT THE WHOLE STRING. The parse stops at the first space or `T` and throws
+        # away everything after it -- but only once BOTH separators have been seen, which is the
+        # half that makes it a rule rather than "anything may follow a date". The last four rows
+        # are the ones that pin the second half.
+        "CAST('2026-08-11 extra' AS DATE)", "CAST('2026-08-11Textra' AS DATE)",
+        "CAST('2026-08-11T' AS DATE)", "CAST('2026-08-11 12:30:00' AS DATE)",
+        "CAST('2026-08-11T12:30:00' AS DATE)", "CAST('2026-08-11 12:30 PM' AS DATE)",
+        "CAST('2026-08-1 1' AS DATE)",
+        "CAST('2026 extra' AS DATE)", "CAST('2026-08 extra' AS DATE)",
+        "CAST('2026-08T' AS DATE)", "CAST('2026T' AS DATE)",
+
+        # --- EVERY SEGMENT BELOW THE LAST ONE WRITTEN DEFAULTS, so a bare year is a whole date.
+        "CAST('2026' AS DATE)", "CAST('2026 ' AS DATE)", "CAST('2026-08' AS DATE)",
+        "CAST('2026-8-1' AS DATE)", "CAST('2026-8' AS DATE)",
+        "CAST('+2026-08-11' AS DATE)", "CAST('+2026' AS DATE)", "CAST('0001-01-01' AS DATE)",
+
+        # --- THE DIGIT COUNTS ARE THE GRAMMAR: four to seven for a year, one or two for a month
+        # or a day. So the compact ISO spelling is not a date at all, and neither is a two-digit
+        # year -- which is worth having written down, because a reader will assume both work.
+        "CAST('20260811' AS DATE)", "CAST('202-01-01' AS DATE)", "CAST('26-01-01' AS DATE)",
+        "CAST('2026-013-11' AS DATE)", "CAST('2026-08-011' AS DATE)", "CAST('2026-008' AS DATE)",
+        "CAST('12345678-01-01' AS DATE)",
+
+        # --- WHAT .NET READ AND SPARK REFUSES. Every one of these was a date here before #318,
+        # and the first two are the dangerous ones: read under InvariantCulture they answer a
+        # DIFFERENT DAY from the one whoever wrote `dd/MM/yyyy` meant. Silently answering a date
+        # nobody meant is worse than refusing.
+        "CAST('08/11/2026' AS DATE)", "CAST('2026/08/11' AS DATE)",
+        "CAST('11 Aug 2026' AS DATE)", "CAST('Aug 11, 2026' AS DATE)",
+        "CAST('2026.08.11' AS DATE)", "CAST('2026-08 -11' AS DATE)",
+        "CAST('2026- 08-11' AS DATE)", "CAST('2026-08-11Z' AS DATE)",
+        "CAST('2026-08-11+02:00' AS DATE)",
+
+        # --- Refused by both, so the accepting half above is not "anything with digits in it".
+        # The last row is the one #283 makes worth asking: a DECIMAL cast reads BMP digits, and
+        # a date does not, because this grammar tests BYTES against '0'-'9'.
+        "CAST('' AS DATE)", "CAST('2026-' AS DATE)", "CAST('2026-08-' AS DATE)",
+        "CAST('-' AS DATE)", "CAST('T' AS DATE)", "CAST('T2026' AS DATE)",
+        "CAST('2026-08-11-12' AS DATE)", "CAST('2026-02-30' AS DATE)",
+        "CAST('2026-00-01' AS DATE)", "CAST('2026-01-00' AS DATE)",
+        "CAST('١٤٤٧-01-01' AS DATE)",
+
+        # --- THE TIMESTAMP GRAMMAR IS THE DATE ONE PLUS A TIME, and the time's segments default
+        # the same way: an hour alone is a time.
+        "CAST(CAST('2026' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11T12' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 2:3:4' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)",
+        # ...and `T` alone does NOT end a timestamp's date, where it ends a DATE's. One character
+        # of difference between the two grammars, and nothing but a row says so.
+        "CAST(CAST('2026-08-11T' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('12' AS TIMESTAMP) AS STRING)",
+        # The year is SIX digits here and SEVEN for a DATE. Spark's own asymmetry, not a slip.
+        "CAST(CAST('1234567-01-01 00:00:00' AS TIMESTAMP) AS STRING)",
+
+        # --- THE SUB-SECOND, which is a defect on the way out as well as in. Past six digits the
+        # rest are DROPPED rather than refused, and the rendering strips trailing zeros -- so the
+        # number of digits that comes back is a property of the value, not a fixed width.
+        "CAST(CAST('2026-08-11 12:30:00.1' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.12' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.123456' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.1234567' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.1234567890123' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.000000' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.100000' AS TIMESTAMP) AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00.010000' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00.123400' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00.000001' AS STRING)",
+
+        # --- TRAILING TEXT IS A TIMEZONE HERE, not junk to ignore: everything from the first
+        # character that cannot continue the time is handed to Java's zone parser, and a name that
+        # parser rejects fails the whole cast. That single rule is why the first block reads and
+        # the second is refused, and it is the sharpest difference from the DATE grammar above.
+        "CAST(CAST('2026-08-11 12:30:00Z' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00-08:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+02' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+0200' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+02:00:00' AS TIMESTAMP) AS STRING)",
+        # Two spellings Java alone would refuse: Spark rewrites a single-digit hour or minute
+        # field before handing the text over, because ZoneOffset reads a field's width from the
+        # string's LENGTH.
+        "CAST(CAST('2026-08-11 12:30:00+2:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+02:0' AS TIMESTAMP) AS STRING)",
+        # ...and BOTH rewrites reach a PREFIXED zone, which is a property of where the patterns
+        # anchor rather than something either one says. The hour rewrite replaces its first match
+        # anywhere in the text; the minute one matches FIVE characters against the end, so its
+        # sign sits five back from the end whether or not `UTC` precedes it. Rows rather than an
+        # argument, because reading the regexes suggests otherwise and a reviewer did.
+        "CAST(CAST('2026-08-11 12:30:00UTC+02:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC+2:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00GMT+2:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UT+02:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC-02:0' AS TIMESTAMP) AS STRING)",
+        # One rewrite each, and no more: a seconds field spelled short is refused, because
+        # neither pattern is about it.
+        "CAST(CAST('2026-08-11 12:30:00UTC+02:00:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+2:0:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 +02:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UT' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00GMT+02:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC-08' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.UTC' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00.123456+02:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+18:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00-18:00' AS TIMESTAMP) AS STRING)",
+        # ...and the refusals that come from the same rule.
+        "CAST(CAST('2026-08-11 12:30:00 extra' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 PM' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 +02:00 junk' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00 1:2' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+19:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+' AS TIMESTAMP) AS STRING)",
+        # Only the CAPITAL Z, which is Java's rule and not a courtesy.
+        "CAST(CAST('2026-08-11 12:30:00z' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12 UTC' AS TIMESTAMP) AS STRING)",
+
+        # --- Malformed times, refused by both. The double space is the one worth reading: ONE
+        # space separates the date from the time and a second one starts a zone name.
+        "CAST(CAST('2026-08-11  12:30:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 :30:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 25:00:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:60:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:61' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026/08/11 12:30:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08 -11 12:30:00' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('' AS TIMESTAMP) AS STRING)",
+
+        # --- A TIME ALONE IS TODAY, in both engines, so the rows are written to compare the part
+        # that is not the clock. A leading `T` means the same thing -- and Spark tests it at index
+        # 0 of the UNTRIMMED string, so one leading space refuses what is otherwise the same text.
+        "CAST(CAST('12:30:00' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00'",
+        "CAST(CAST('12:30' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00'",
+        "CAST(CAST('12:30:00.5' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00.5'",
+        "CAST(CAST('12:30:00+02:00' AS TIMESTAMP) AS STRING) LIKE '% 10:30:00'",
+        "CAST(CAST('T12' AS TIMESTAMP) AS STRING) LIKE '% 12:00:00'",
+        "CAST(CAST(' T12:30:00' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00'",
+        "CAST(CAST('+12:30:00' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00'",
+        "CAST(CAST(':30:00' AS TIMESTAMP) AS STRING) LIKE '%:30:00'",
+        "CAST(CAST('12:30:00:00' AS TIMESTAMP) AS STRING) LIKE '% 12:30:00'",
+
+        # --- A YEAR OUTSIDE DateTimeOffset'S RANGE, which is where EngineeredWood is narrower
+        # than Spark rather than different from it. Declared as known differences against the
+        # issue that would widen it; see SparkTemporalText's remarks for why widening is a change
+        # to how an instant travels through the cast rather than to this grammar.
+        "CAST(CAST('-2026-08-11' AS DATE) AS STRING)",
+        "CAST(CAST('123456-01-01' AS DATE) AS STRING)",
+        "CAST(CAST('-2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)",
+        # ...and a REGION timezone, which is the other place it is narrower: resolving one needs a
+        # tz database, and .NET's is not the same on every target framework.
+        "CAST(CAST('2026-08-11 12:30:00America/Los_Angeles' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00EST' AS TIMESTAMP) AS STRING)",
+
+        # --- The coercion, which is where the grammar costs a wrong ANSWER rather than a wrong
+        # error class: a string compared against a temporal column is CAST, so every row above is
+        # reachable from a CHECK constraint that never writes the word CAST.
+        "dt = '2026-08-11'", "dt = '2026-08-11 extra'", "dt = '08/11/2026'",
+        "ts = '2026-08-11 12:30:00'", "ts = '2026-08-11 12:30:00 extra'",
     ],
 
     "malformed": [

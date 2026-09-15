@@ -159,16 +159,33 @@ public sealed class SparkEvaluationCorpusTests
             "#319: decimal arithmetic nullability follows the promoted precision, which the rule "
             + "cannot see, so we evaluate and raise",
 
-        // #318, and the one row of the `string-trim` group that diverges -- which is not about
-        // trimming at all. It sits in that group as the control saying #316 trimmed rather than
-        // stripped, and interior whitespace is what it carries; what it FOUND is that
-        // `CastToDate` parses with `DateTimeOffset.TryParse` where Spark has a grammar of its
-        // own. Measured, we also read `2026/08/11`, `08/11/2026` and `Aug 11, 2026` as dates
-        // Spark refuses, and refuse `CAST('2026' AS DATE)`, which Spark reads as 2026-01-01.
-        // Only this row is declared because only this row is in the corpus; the rest are in the
-        // issue, and belong with the fix.
-        ["CAST('2026-08 -11' AS DATE)"] =
-            "#318: our temporal parse is DateTimeOffset.TryParse, which skips the interior space",
+        // ── NARROWER THAN SPARK, not different from it. The `temporal-text` group's five, all
+        // from #318's fix, and each is a REFUSAL where Spark answers rather than a wrong value.
+        //
+        // The first three are DateTimeOffset's range. An instant travels through the cast as one
+        // — `SparkArrays.ReadForCast` hands one over and `BuildDate32` takes one back — so the
+        // years it cannot hold are years this cast cannot answer, whatever the grammar reads.
+        // Spark's own bound is Java's: seven digits for a date, six for a timestamp, and a
+        // leading `-` on either. Widening means carrying days-from-epoch through the cast
+        // instead, which is a change to that shape rather than to the grammar.
+        ["CAST(CAST('-2026-08-11' AS DATE) AS STRING)"] =
+            "#318: a year before 1 is outside DateTimeOffset, which is what the cast carries",
+        ["CAST(CAST('123456-01-01' AS DATE) AS STRING)"] =
+            "#318: a year past 9999 is outside DateTimeOffset, which is what the cast carries",
+        ["CAST(CAST('-2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)"] =
+            "#318: a year before 1 is outside DateTimeOffset, which is what the cast carries",
+
+        // ...and the last two are the tz database. Resolving a REGION id needs one, and .NET's
+        // is not the same on every target framework — `FindSystemTimeZoneById` reads an IANA id
+        // on .NET 6 and later and throws on .NET Framework, where the id has a Windows spelling.
+        // A cast that answered on net10.0 and refused on net472 would make one CHECK constraint
+        // accept a row on one host and reject it on another, so both refuse. Every
+        // SELF-DESCRIBING zone is read: `Z`, an offset in any of Java's spellings, and the
+        // `UTC`/`GMT`/`UT` prefixes, which is how a timestamp normally carries its zone.
+        ["CAST(CAST('2026-08-11 12:30:00America/Los_Angeles' AS TIMESTAMP) AS STRING)"] =
+            "#318: a region timezone needs a tz database our target frameworks do not share",
+        ["CAST(CAST('2026-08-11 12:30:00EST' AS TIMESTAMP) AS STRING)"] =
+            "#318: a short-id timezone resolves through the same database",
 
         // #301, and the one row of the `binary-casts` group that diverges. Spark's STRING is a
         // BYTE string: `CAST(X'FF' AS STRING)` holds the raw FF, and casting it back hands the
@@ -332,11 +349,19 @@ public sealed class SparkEvaluationCorpusTests
             // THIS list, since the ANSI section passed throughout on a right answer for a wrong
             // reason (Spark refuses the string as a BIGINT, and any throw reads as agreement).
 
-            // #318, as in the ANSI list. Both dialects see it, and they see it differently:
-            // under ANSI Spark refuses and we answer, here Spark answers NULL and we answer a
-            // date -- the ordinary raise-or-null split around one wrong acceptance.
-            ["CAST('2026-08 -11' AS DATE)"] =
-                "#318: our temporal parse is DateTimeOffset.TryParse, which skips the interior space",
+            // #318's five, as in the ANSI list and for the same two reasons. What differs is
+            // only the shape of our refusal: this dialect answers NULL where the other raises,
+            // so a row Spark answers reads as a null here rather than as an exception.
+            ["CAST(CAST('-2026-08-11' AS DATE) AS STRING)"] =
+                "#318: a year before 1 is outside DateTimeOffset, which is what the cast carries",
+            ["CAST(CAST('123456-01-01' AS DATE) AS STRING)"] =
+                "#318: a year past 9999 is outside DateTimeOffset, which is what the cast carries",
+            ["CAST(CAST('-2026-08-11 12:30:00' AS TIMESTAMP) AS STRING)"] =
+                "#318: a year before 1 is outside DateTimeOffset, which is what the cast carries",
+            ["CAST(CAST('2026-08-11 12:30:00America/Los_Angeles' AS TIMESTAMP) AS STRING)"] =
+                "#318: a region timezone needs a tz database our target frameworks do not share",
+            ["CAST(CAST('2026-08-11 12:30:00EST' AS TIMESTAMP) AS STRING)"] =
+                "#318: a short-id timezone resolves through the same database",
 
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =

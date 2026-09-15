@@ -1160,6 +1160,70 @@ exactly a string the explicit cast accepts, and one it refuses is a raise under
 ANSI and a null without it. Pinned by the corpus's `arithmetic-string-coercion`
 group, harvested under both confs.
 
+#### A date is not what a date parser reads
+
+Added 2026-09-15, closing #318. `CAST(s AS DATE)` and `CAST(s AS TIMESTAMP)`
+read their text with `DateTimeOffset.TryParse` under `InvariantCulture`, and
+Spark has a grammar of its own — so the cast was wrong in **both** directions,
+the way the trim in #316 had been. Measured on Spark 4.0.3 / JDK 17.0.20 under
+the pinned UTC session zone:
+
+| text | Spark | before #318 |
+|---|---|---|
+| `CAST('08/11/2026' AS DATE)` | refused | **2026-08-11** |
+| `CAST('2026/08/11' AS DATE)` | refused | **2026-08-11** |
+| `CAST('Aug 11, 2026' AS DATE)` | refused | **2026-08-11** |
+| `CAST('2026-08 -11' AS DATE)` | refused | **2026-08-11** |
+| `CAST('2026' AS DATE)` | 2026-01-01 | **refused** |
+| `CAST('2026-08-11 extra' AS DATE)` | 2026-08-11 | **refused** |
+
+The first row is the dangerous one. `08/11/2026` read under `InvariantCulture`
+is `MM/dd/yyyy`, so the answer is a **different day** from the one a writer of
+`dd/MM/yyyy` meant — a wrong value in a generated column rather than a loud
+refusal.
+
+`SparkTemporalText` is the grammar, ported from Spark's `stringToDate` and
+`parseTimestampString` and checked against measurements rather than against the
+reading of them. Three rules in it are worth knowing before touching the file:
+
+- **Every segment below the last one written defaults**, so `'2026'` is a whole
+  date and `'2026-08-11 12'` is a whole timestamp. The digit COUNTS are the
+  grammar: a year is four to seven digits for a DATE and four to **six** for a
+  TIMESTAMP — Spark's own asymmetry — and a month, day, hour, minute or second
+  is one or two. `'20260811'` is not a date.
+- **A DATE stops at the first space or `T` and discards the rest**, but only once
+  both separators have been seen. That single clause is why
+  `'2026-08-11 12:30:00'` and `'2026-08-11 extra'` are dates while
+  `'2026 extra'` is not.
+- **A TIMESTAMP reads that trailing text as a TIMEZONE instead**, which is the
+  sharpest difference between the two. `'…12:30:00 UTC'` and `'…12:30:00+02:00'`
+  are timestamps and `'…12:30:00 extra'` is refused, both for the same reason.
+
+Two places EngineeredWood is **narrower** than Spark rather than different, each
+declared as a known difference in the corpus:
+
+- **Years outside 1–9999.** An instant travels through the cast as a
+  `DateTimeOffset`, so a negative year or a seven-digit one is refused where
+  Spark answers. Widening means carrying days-from-epoch through
+  `SparkArrays.ReadForCast` instead, which is a change to that shape rather than
+  to the grammar.
+- **Region timezones.** `Z`, every spelling of an offset Java takes, and the
+  `UTC`/`GMT`/`UT` prefixes are all read; `America/Los_Angeles` and the short
+  ids are not. Resolving one needs a tz database, and
+  `TimeZoneInfo.FindSystemTimeZoneById` reads an IANA id on .NET 6 and later and
+  throws on .NET Framework — a cast that answered on net10.0 and refused on
+  net472 would make one CHECK constraint accept a row on one host and reject it
+  on another, which is worse than refusing on both.
+
+The same issue carried a defect on the way **out**: `CAST(ts AS STRING)` dropped
+the sub-second entirely, because `RenderInstant`'s format string stopped at the
+seconds. Spark prints the fraction and strips its trailing zeros, so `.100000`
+is `.1`, `.010000` is `.01` and `.000000` is nothing at all. From outside, a
+corpus row cannot tell a rendering defect from a parse defect — which is why the
+`temporal-text` group asks its timestamp questions as
+`CAST(CAST(… AS TIMESTAMP) AS STRING)` and the renderer has a unit test of its
+own over a timestamp COLUMN, the path the corpus cannot reach.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic

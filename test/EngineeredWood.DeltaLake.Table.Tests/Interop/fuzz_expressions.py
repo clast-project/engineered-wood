@@ -143,6 +143,26 @@ STRING_LITERALS = [
     "'a%c'", "'\\\\'", "'x'",
 ]
 
+# Strings shaped like a DATE or a TIMESTAMP. #318, and the same lesson #316 taught: `CAST_TYPES`
+# has carried DATE and TIMESTAMP from the start, but every string a template could cast to one was
+# `'abc'` or a number, so a 600-expression corpus contained NOTHING a temporal grammar could
+# disagree about and the whole target was fuzzed at zero. Before trusting a run, check the leaves
+# can reach the rule.
+#
+# Chosen so both directions are reachable. `'2026'` and `'2026-08-11 extra'` are dates to Spark
+# and were refused by .NET's parser; the four after them are the reverse, read by .NET and refused
+# by Spark. `'2026-08'` is the CONTROL between the two -- both read it, and .NET only by luck,
+# since it reads a year-month and not a bare year. The rest sit on the edges of the grammar, where
+# the date parse discards what follows a separator and the timestamp parse reads it as a timezone,
+# which is the pair that makes one string two answers.
+TEMPORAL_TEXT = [
+    "'2026'", "'2026-08-11 extra'", "'2026-08'",
+    "'08/11/2026'", "'2026/08/11'", "'Aug 11, 2026'", "'2026-08 -11'",
+    "'2026-08-11'", "'2026-08-11 12:30:00'", "'2026-08-11T12:30:00Z'",
+    "'2026-08-11 12:30:00.1234567'", "'2026-08-11 12:30:00+02:00'",
+    "'2026-08-11 12:30:00 UTC'", "'12:30:00'", "'2026-02-30'", "'20260811'",
+]
+
 LIKE_PATTERNS = ["'a%'", "'%c'", "'%b%'", "'a_c'", "'abc'", "'%'", "'_'", "''", "'\\\\%'"]
 RLIKE_PATTERNS = ["'^a'", "'c$'", "'a.c'", "'[a-c]+'", "'.*'", "'a{2,}'"]
 
@@ -161,7 +181,7 @@ DATE_COLUMNS = ["dt", "ts"]
 BOOL_COLUMNS = ["bl"]
 
 NUM_LEAVES = INT_LITERALS + FLOAT_LITERALS + DECIMAL_LITERALS + NUM_COLUMNS
-STR_LEAVES = STRING_LITERALS + NUMERIC_TEXT + STR_COLUMNS
+STR_LEAVES = STRING_LITERALS + NUMERIC_TEXT + TEMPORAL_TEXT + STR_COLUMNS
 ANY_LEAVES = NUM_LEAVES + STR_LEAVES + BOOL_COLUMNS + ["NULL", "true", "false"]
 
 # How often a slot grows a subtree instead of taking a leaf, and how deep that can go. Low on
@@ -291,7 +311,11 @@ def t_logical(rng, depth=0):
 
 def t_datepart(rng, depth=0):
     fn = _pick(rng, ["year", "month", "day", "dayofmonth", "hour", "minute", "second"])
-    operand = _pick(rng, DATE_COLUMNS + ["CAST(" + _pick(rng, NUMERIC_TEXT) + " AS DATE)"])
+    # The cast operand is drawn from the temporal strings as well as the numeric ones: a numeric
+    # text is refused by the DATE grammar every time, so on its own it only ever fuzzes the
+    # refusal path and `year(...)` never sees a date it had to parse. #318.
+    operand = _pick(rng, DATE_COLUMNS + [
+        "CAST(" + _pick(rng, NUMERIC_TEXT + TEMPORAL_TEXT) + " AS DATE)"])
     return f"{fn}({operand})"
 
 
