@@ -1557,21 +1557,45 @@ public sealed class SparkFunctionRegistry
     /// <para>
     /// Above 28 integer digits every <see cref="decimal"/> fits by construction — the type tops
     /// out near 7.9e28 — and the bound itself would have no <see cref="decimal"/> form to compare
-    /// against, so it is answered without building one.
+    /// against, so it is answered without reaching for one.
+    /// </para>
+    /// <para>
+    /// The bound is read from <see cref="PowersOfTen"/> rather than multiplied up, because this
+    /// runs once per non-null row while the target it depends on is fixed for the whole cast:
+    /// building it in place cost up to 28 decimal multiplications a row to reach the same answer
+    /// every time.
     /// </para>
     /// </remarks>
     private static bool FitsPrecision(decimal value, Decimal128Type target)
     {
         var integerDigits = target.Precision - target.Scale;
 
-        if (integerDigits >= 29)
+        if (integerDigits >= PowersOfTen.Length)
             return true;
 
-        var limit = 1m;
-        for (var i = 0; i < integerDigits; i++)
-            limit *= 10m;
+        // A scale wider than the precision is not a type Spark or Arrow will hand over, but the
+        // floor keeps a malformed one out of the indexer -- and 10^0 is the right answer for it
+        // anyway, since such a type has no room for a whole number at all.
+        var limit = PowersOfTen[Math.Max(integerDigits, 0)];
 
         return value > -limit && value < limit;
+    }
+
+    /// <summary>
+    /// 10^0 through 10^28 — every power of ten a <see cref="decimal"/> can hold, the type topping
+    /// out near 7.9e28.
+    /// </summary>
+    private static readonly decimal[] PowersOfTen = BuildPowersOfTen();
+
+    private static decimal[] BuildPowersOfTen()
+    {
+        var powers = new decimal[29];
+        powers[0] = 1m;
+
+        for (var i = 1; i < powers.Length; i++)
+            powers[i] = powers[i - 1] * 10m;
+
+        return powers;
     }
 
     /// <summary>
