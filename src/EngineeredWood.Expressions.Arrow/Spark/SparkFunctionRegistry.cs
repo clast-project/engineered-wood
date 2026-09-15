@@ -50,6 +50,15 @@ public sealed class SparkFunctionRegistry
 
     private const decimal MaxEpochSecond = 253402300799m;
 
+    /// <summary>The resolution Spark's TIMESTAMP carries, and the one a numeric cast lands on.</summary>
+    private const decimal MicrosecondsPerSecond = 1_000_000m;
+
+    /// <summary>
+    /// <c>TimeSpan.TicksPerMicrosecond</c>, spelled out because it is .NET 7 and this library
+    /// still builds for netstandard2.0 — where a <c>cref</c> to it does not resolve either.
+    /// </summary>
+    private const long TicksPerMicrosecond = 10L;
+
     private readonly SparkDialectOptions _options;
 
     public SparkFunctionRegistry(SparkDialectOptions? options = null)
@@ -1188,6 +1197,16 @@ public sealed class SparkFunctionRegistry
 
     private IArrowArray CastToTimestamp(IArrowArray source, int rowCount, bool raising)
     {
+        // A BOOLEAN IS NOT A NUMBER OF SECONDS, and it is the one source family that is not.
+        // Spark hands the flag's 1 straight to the microsecond field, so `CAST(true AS TIMESTAMP)`
+        // is the epoch plus ONE MICROSECOND -- measured on 4.0.1 with ansi off, which is the only
+        // dialect that allows the cast at all. Every integral source beside it really is seconds
+        // (`CAST(CAST(10 AS BIGINT) AS TIMESTAMP)` is 00:00:10 in both engines), so the two cannot
+        // share the numeric branch below. Answered off the column's TYPE rather than per row,
+        // because that is what it is a property of. #330.
+        if (source is BooleanArray booleans)
+            return SparkArrays.BuildTimestamp(BooleanInstants(booleans, rowCount), rowCount);
+
         var instants = new DateTimeOffset?[rowCount];
 
         for (var i = 0; i < rowCount; i++)
@@ -1228,7 +1247,7 @@ public sealed class SparkFunctionRegistry
                     throw SparkEvaluationException.CastOverflow(value.Value.Text, "TIMESTAMP");
                 }
 
-                instants[i] = DateTimeOffset.FromUnixTimeSeconds((long)decimal.Truncate(seconds));
+                instants[i] = FromEpochMicroseconds(Microseconds(seconds));
                 continue;
             }
 
@@ -1238,6 +1257,55 @@ public sealed class SparkFunctionRegistry
 
         return SparkArrays.BuildTimestamp(instants, rowCount);
     }
+
+    /// <summary>One instant per row of a boolean column, reading each flag as microseconds.</summary>
+    /// <remarks>See <see cref="CastToTimestamp"/> for why a boolean is not seconds.</remarks>
+    private static DateTimeOffset?[] BooleanInstants(BooleanArray booleans, int rowCount)
+    {
+        var instants = new DateTimeOffset?[rowCount];
+
+        for (var i = 0; i < rowCount; i++)
+        {
+            if (booleans.IsNull(i))
+                continue;
+
+            instants[i] = FromEpochMicroseconds(booleans.GetValue(i)!.Value ? 1L : 0L);
+        }
+
+        return instants;
+    }
+
+    /// <summary>
+    /// Epoch seconds as whole microseconds, truncated rather than rounded.
+    /// </summary>
+    /// <remarks>
+    /// <b>Spark keeps the fraction, and it keeps it TOWARD ZERO.</b> Measured on 4.0.1, both
+    /// dialects: <c>CAST(CAST(1.9999999 AS DOUBLE) AS TIMESTAMP)</c> is <c>00:00:01.999999</c> and
+    /// not <c>00:00:02</c>, and <c>CAST(CAST(0.0000005 AS DOUBLE) AS TIMESTAMP)</c> is the epoch —
+    /// so sub-microsecond is dropped and nothing rounds up into the next tick. The negative side
+    /// is what makes the direction observable rather than cosmetic:
+    /// <c>CAST(CAST(-2.5 AS DOUBLE) AS TIMESTAMP)</c> is <c>23:59:57.5</c>, where truncating the
+    /// SECONDS (as this did before #329) landed on <c>23:59:58</c> — past the true instant rather
+    /// than short of it.
+    /// <para>
+    /// The multiplication cannot overflow: the caller has already bounded the value by
+    /// <see cref="MaxEpochSecond"/>, so the product stays under 2.6e17 and well inside both
+    /// <see cref="decimal"/> and <see cref="long"/>.
+    /// </para>
+    /// </remarks>
+    private static long Microseconds(decimal seconds) =>
+        (long)decimal.Truncate(seconds * MicrosecondsPerSecond);
+
+    /// <summary>The instant a whole number of epoch microseconds denotes.</summary>
+    /// <remarks>
+    /// Reached by ticks off <see cref="Epoch"/> rather than through
+    /// <see cref="DateTimeOffset.FromUnixTimeSeconds"/>, because no epoch factory takes
+    /// microseconds on any of this library's target frameworks.
+    /// <see cref="DateTimeOffset.AddTicks"/> takes a negative count, so a pre-epoch instant needs
+    /// no separate branch.
+    /// </remarks>
+    private static DateTimeOffset FromEpochMicroseconds(long microseconds) =>
+        Epoch.AddTicks(microseconds * TicksPerMicrosecond);
 
     /// <summary>Casts a column to an integral type.</summary>
     /// <remarks>
