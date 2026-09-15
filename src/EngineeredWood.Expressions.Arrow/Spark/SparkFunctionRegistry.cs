@@ -979,10 +979,21 @@ public sealed class SparkFunctionRegistry
     /// members and there is no common type here, where an equality coerces a PAIR. See
     /// <see cref="SetComparisonTarget"/>, which is asked separately and answers separately.
     /// </para>
+    /// <para>
+    /// <b>A <see cref="Decimal256Type"/> is declined</b>, the same line
+    /// <see cref="ArithmeticStringTarget"/> draws and for the same two reasons. Nothing measured
+    /// says what this means: Spark's decimal stops at precision 38 and cannot name the type at
+    /// all — it reaches us only because Parquet's decimal runs wider, so
+    /// <c>ArrowSchemaConverter</c> builds one. And <see cref="Cast"/> cannot produce one, so a
+    /// target returned here would turn a comparison that answers null into a
+    /// <c>NotSupportedException</c>. Returning a target a caller cannot cast to is the failure
+    /// <c>Decimal256ComparisonTests</c> was written for on #305; this is the same shape reached
+    /// through a boolean.
+    /// </para>
     /// </remarks>
     private IArrowType? BooleanEqualityTarget(ComparisonOperator op, IArrowType other)
     {
-        if (_options.Ansi || !SparkNumericTypes.IsNumeric(other))
+        if (_options.Ansi || other is Decimal256Type || !SparkNumericTypes.IsNumeric(other))
             return null;
 
         return op is ComparisonOperator.Equal
