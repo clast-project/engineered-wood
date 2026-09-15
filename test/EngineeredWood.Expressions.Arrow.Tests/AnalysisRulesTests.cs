@@ -88,6 +88,17 @@ public sealed class AnalysisRulesTests
         return builder.Build();
     }
 
+    private static IArrowArray Strings(params string?[] values)
+    {
+        var builder = new StringArray.Builder();
+        foreach (var value in values)
+        {
+            if (value is null) builder.AppendNull(); else builder.Append(value);
+        }
+
+        return builder.Build();
+    }
+
     private static RecordBatch Batch(params (string Name, IArrowArray Array)[] columns)
     {
         var schema = new Schema.Builder();
@@ -232,6 +243,72 @@ public sealed class AnalysisRulesTests
 
         Assert.Equal(new bool?[] { null, null, null }, Rows(Eval("a = NULL", registry)));
         Assert.Empty(registry.Asked);
+    }
+
+    /// <summary>
+    /// A pair of literals is refused over an empty batch, where neither operand has a value to
+    /// read a type from.
+    /// </summary>
+    /// <remarks>
+    /// The companion to <see cref="ARefusalNeedsNoRows"/>, which uses columns and so reads both
+    /// types from the schema. A literal carries its type in the TREE, and reading it from a value
+    /// instead leaves an expression made only of literals unanalysed exactly when there is no
+    /// data — which is the case a definition-time pass consists of.
+    /// </remarks>
+    [Theory]
+    [InlineData("1 = TRUE")]
+    [InlineData("1 IN (TRUE)")]
+    public void ALiteralPairIsRefusedOverAnEmptyBatch(string sql)
+    {
+        Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(sql, RefusingIntAgainstBoolean(), Batch(("a", Ints()))));
+    }
+
+    /// <summary>
+    /// An operand that RAISES does not mask the refusal: the types are read without reading a
+    /// value, so the analysis answer is reached first.
+    /// </summary>
+    /// <remarks>
+    /// The soundness property the whole seam exists for, and #286's own complaint about the cast
+    /// path: an answer that depends on whether a value happened to raise first is an analysis
+    /// decision made by the data. Spark analyses the tree before any of it runs, and reports the
+    /// type refusal for both of these.
+    /// </remarks>
+    [Theory]
+    [InlineData("CAST(s AS INT) = bl")]
+    [InlineData("a IN (bl, CAST(s AS INT))")]
+    public void AValueFailureDoesNotMaskTheRefusal(string sql)
+    {
+        var batch = Batch(
+            ("a", Ints(1, 2)),
+            ("bl", Booleans(true, false)),
+            ("s", Strings("abc", "def")));
+
+        Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(sql, RefusingIntAgainstBoolean(), batch));
+    }
+
+    /// <summary>
+    /// A refusal reached by a zero-row type probe is not retried over the batch, where a value
+    /// would raise in its place.
+    /// </summary>
+    /// <remarks>
+    /// <c>TypeOver</c> answers "what type would this have produced" by evaluating over no rows and
+    /// falling back to the whole batch when that cannot answer. The fallback is right for a
+    /// registry that cannot type something over an empty selection, and wrong for an analysis
+    /// refusal: the refusal is the answer, it will not change over more rows, and retrying turns
+    /// it into whatever the first value raises. Measured here as CAST_INVALID_INPUT displacing
+    /// the type refusal.
+    /// </remarks>
+    [Fact]
+    public void AZeroRowProbeKeepsItsRefusal()
+    {
+        var batch = Batch(
+            ("bl", Booleans(true, false)),
+            ("s", Strings("abc", "def")));
+
+        Assert.Throws<ExpressionAnalysisException>(
+            () => Eval("false AND CAST(s AS INT) = bl", RefusingIntAgainstBoolean(), batch));
     }
 
     /// <summary>The rules are asked once per comparison, not once per row.</summary>

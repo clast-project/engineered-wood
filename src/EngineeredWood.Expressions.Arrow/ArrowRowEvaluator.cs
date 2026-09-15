@@ -219,9 +219,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalComparison(ComparisonPredicate cmp, RecordBatch batch)
     {
+        // ASKED BEFORE EITHER OPERAND IS EVALUATED, so that an operand which raises cannot
+        // decide the analysis. `CAST(s AS INT) = bl` over a row holding 'abc' would otherwise
+        // report CAST_INVALID_INPUT and never reach the refusal -- an analysis answer chosen by
+        // the data, which is the defect this seam exists to remove.
+        bool asked = CheckComparableFromTree(cmp, batch);
+
         var (left, leftType) = EvalOperand(cmp.Left, batch);
         var (right, rightType) = EvalOperand(cmp.Right, batch);
-        CheckComparable(cmp.Op, leftType, left, rightType, right);
+        if (!asked)
+            CheckComparable(cmp.Op, leftType, left, rightType, right);
         CoerceOperands(cmp, leftType, rightType, ref left, ref right);
         var result = new bool?[batch.Length];
 
@@ -278,16 +285,148 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// Refuses a comparison the registry's analyzer refuses, before the row loop can answer it.
+    /// Asks about a comparison whose operand types can both be read without evaluating either
+    /// operand, and reports whether it asked.
     /// </summary>
     /// <remarks>
     /// <para>
+    /// <b>This is the site that makes a refusal independent of the data</b>, and the reason
+    /// <see cref="CheckComparable"/> below it is a fallback rather than the rule. An analysis
+    /// refusal is a property of two types: it cannot become an acceptance over different rows,
+    /// and it must not be displaced by an operand that happens to raise first. Reading both types
+    /// before either operand runs is what delivers that, and it is the ordering Spark itself has —
+    /// the analyzer refuses before the plan executes at all.
+    /// </para>
+    /// <para>
+    /// False when the types could not both be read, which leaves the question to the fallback. A
+    /// bare <c>NULL</c> operand answers false here and is not asked about there either; see
+    /// <see cref="AnalysisType"/> for what can be read and what cannot.
+    /// </para>
+    /// </remarks>
+    private bool CheckComparableFromTree(ComparisonPredicate cmp, RecordBatch batch)
+    {
+        if (_analysis is null)
+            return false;
+
+        var left = AnalysisType(cmp.Left, batch);
+        var right = AnalysisType(cmp.Right, batch);
+        if (left is null || right is null)
+            return false;
+
+        Refuse(_analysis.CheckComparison(cmp.Op, left, right));
+        return true;
+    }
+
+    /// <summary>
+    /// Asks about every member of a set test whose type and the operand's can both be read
+    /// without evaluating either, and reports which members it asked about.
+    /// </summary>
+    /// <remarks>
+    /// Null when nothing could be asked — an operand with no readable type — so that the fallback
+    /// asks about every member rather than none.
+    /// </remarks>
+    private bool[]? CheckSetFromTree(SetPredicate set, RecordBatch batch)
+    {
+        if (_analysis is null)
+            return null;
+
+        var operandType = AnalysisType(set.Operand, batch);
+        if (operandType is null)
+            return null;
+
+        var asked = new bool[set.Values.Count];
+        for (var k = 0; k < set.Values.Count; k++)
+        {
+            var memberType = AnalysisType(set.Values[k], batch);
+            if (memberType is null)
+                continue;
+
+            asked[k] = true;
+            Refuse(_analysis.CheckComparison(ComparisonOperator.Equal, operandType, memberType));
+        }
+
+        return asked;
+    }
+
+    /// <summary>
+    /// The type an expression produces, read WITHOUT reading any of its values, or null when that
+    /// cannot be done.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three tiers, cheapest first. A reference takes its type from the batch's SCHEMA, which is
+    /// where a column's type lives whether or not the batch has rows. A literal takes its own,
+    /// which lives in the TREE — reading it from a value instead leaves an expression made only of
+    /// literals unanalysed exactly when there is no data, which is the case a definition-time pass
+    /// consists of. Anything else is evaluated over NO ROWS, the device <see cref="TypeOver"/>
+    /// already uses: over an empty selection a cast reads no value, so it produces its type
+    /// without being able to raise on one.
+    /// </para>
+    /// <para>
+    /// <b>The probe does not retry over the batch</b>, which is the difference from
+    /// <see cref="TypeOver"/>. This asks a question it is allowed not to answer: a registry that
+    /// cannot type something over an empty selection leaves the comparison to the fallback, which
+    /// is where it would have been without the probe at all. Retrying over rows to answer it
+    /// would read the values this exists not to read.
+    /// </para>
+    /// <para>
+    /// A bare <c>NULL</c> literal answers null rather than a type, because Spark types one
+    /// <c>void</c> and compares it with anything. See <see cref="CheckComparable"/> for the
+    /// related trap on the value side.
+    /// </para>
+    /// </remarks>
+    private IArrowType? AnalysisType(Expression expression, RecordBatch batch)
+    {
+        switch (expression)
+        {
+            case UnboundReference u:
+                return GetColumn(batch, u.Name).Data.DataType;
+
+            case BoundReference b:
+                return GetColumn(batch, b.Name).Data.DataType;
+
+            case LiteralExpression literal:
+                return literal.Value.IsNull
+                    ? null
+                    : ConstantArray(literal.Value, 1).Data.DataType;
+        }
+
+        try
+        {
+            return EvalExpressionAsArray(expression, Restrict(expression, batch, NoRows))
+                .Data.DataType;
+        }
+        catch (ExpressionAnalysisException)
+        {
+            // A refusal from further down the tree is an ANSWER, not a failure to produce one.
+            // Swallowing it here would hide a refused sub-expression behind the fallback, and the
+            // values it refuses would be read after all.
+            throw;
+        }
+        catch (Exception)
+        {
+            // Deliberately broad, as in TypeOver: the ways of failing to produce a type over no
+            // rows are the registry's business. Unlike TypeOver this does not retry — see the
+            // remarks.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Refuses a comparison the registry's analyzer refuses, where the operand types could only be
+    /// read from the values.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The fallback behind <see cref="CheckComparableFromTree"/>, reached only where that could
+    /// not read a type without evaluating — a registry whose function cannot be typed over an
+    /// empty selection. It is kept because a question asked late is better than one not asked,
+    /// and it carries the weakness of being asked late: an operand that raises during evaluation
+    /// reports its own failure and this is never reached.
+    /// </para>
+    /// <para>
     /// Nothing at all without a registry that implements <see cref="IAnalysisRules"/>, which is
-    /// every caller that supplies no registry. With one, the cost is resolving both operand types
-    /// where <see cref="CoerceOperands"/> would have resolved neither: a comparison between a
-    /// column and a literal of its own type resolves two types to be told there is nothing wrong
-    /// with it. That is the price of asking a question about TYPES at a site whose other work is
-    /// on values, and it is why the answer is asked for once per comparison rather than per row.
+    /// every caller that supplies no registry.
     /// </para>
     /// <para>
     /// <b>An operand whose type cannot be read is not asked about</b>, rather than being given
@@ -327,7 +466,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </remarks>
     private void CheckSetMembers(
         IArrowType? operandType, LiteralValue?[] operand,
-        SetMember[] members, IArrowType?[] memberTypes)
+        SetMember[] members, IArrowType?[] memberTypes, bool[]? askedFromTree)
     {
         if (_analysis is null)
             return;
@@ -338,6 +477,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         for (var k = 0; k < members.Length; k++)
         {
+            if (askedFromTree is not null && askedFromTree[k])
+                continue;
+
             var memberType = memberTypes[k]
                 ?? (members[k].IsConstant
                     ? members[k].Constant is { } constant
@@ -1006,6 +1148,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)
     {
+        // Before any member is evaluated, for the reason EvalComparison gives: a member that
+        // raises must not displace the refusal of a member whose TYPE is already wrong.
+        var askedFromTree = CheckSetFromTree(set, batch);
+
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 
         // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
@@ -1028,7 +1174,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             memberTypes[k] = type;
         }
 
-        CheckSetMembers(operandType, operand, members, memberTypes);
+        CheckSetMembers(operandType, operand, members, memberTypes, askedFromTree);
         CoerceSet(ref operand, operandType, members, memberTypes, batch.Length);
 
         var result = new bool?[batch.Length];
@@ -1415,6 +1561,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         {
             return EvalExpressionAsArray(expression, Restrict(expression, batch, NoRows))
                 .Data.DataType;
+        }
+        catch (ExpressionAnalysisException)
+        {
+            // AN ANALYSIS REFUSAL IS THE ANSWER, so it is not retried. The retry below exists for
+            // a registry that could not type something over no rows, and a refusal is not that:
+            // it is a property of the operand types, it answers the same over any number of rows,
+            // and retrying replaces it with whatever the first value raises. Measured while
+            // building this, `false AND CAST(s AS INT) = bl` over a row holding 'abc' reported
+            // CAST_INVALID_INPUT in place of the type refusal the probe had already reached.
+            throw;
         }
         catch (Exception)
         {
