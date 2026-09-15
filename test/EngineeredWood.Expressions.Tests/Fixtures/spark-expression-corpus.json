@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-15 05:10:26.101875",
-      "2026-09-15 05:10:26.101875",
-      "2026-09-15 05:10:26.101875"
+      "2026-09-15 06:34:07.727771",
+      "2026-09-15 06:34:07.727771",
+      "2026-09-15 06:34:07.727771"
      ]
     }
    },
@@ -35051,6 +35051,744 @@
     }
    }
   ],
+  "boolean-equality": [
+   {
+    "expression": "a = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(a = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 = bl#16) AS r#7072]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 = bl#35) AS r#7073]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "a <> bl",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (a = bl))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [NOT (a#0 = bl#16) AS r#7074]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [NOT (a#19 = bl#35) AS r#7075]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "a <=> bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(a <=> bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 <=> bl#16) AS r#7076]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 <=> bl#35) AS r#7077]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "bl = a",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(bl = a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#16 = a#0) AS r#7078]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#35 = a#19) AS r#7079]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "bl <> a",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (bl = a))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [NOT (bl#16 = a#0) AS r#7080]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [NOT (bl#35 = a#19) AS r#7081]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "sh = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(sh = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(sh = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"SMALLINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(sh#2 = bl#16) AS r#7082]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(sh = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"SMALLINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(sh#21 = bl#35) AS r#7083]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20"
+    }
+   },
+   {
+    "expression": "sh <=> bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(sh <=> bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(sh <=> bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"SMALLINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(sh#2 <=> bl#16) AS r#7084]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(sh <=> bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"SMALLINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(sh#21 <=> bl#35) AS r#7085]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS "
+    }
+   },
+   {
+    "expression": "b = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(b = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(b#1L = bl#16) AS r#7086]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(b#20L = bl#35) AS r#7087]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "f = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(f = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(f = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"FLOAT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(f#3 = bl#16) AS r#7088]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bi"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(f = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"FLOAT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(f#22 = bl#35) AS r#7089]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, ca"
+    }
+   },
+   {
+    "expression": "g = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(g = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(g = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(g#4 = bl#16) AS r#7090]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, b"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(g = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(g#23 = bl#35) AS r#7091]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, c"
+    }
+   },
+   {
+    "expression": "d1 = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d1 = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d1 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(10,2)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d1#5 = bl#16) AS r#7092]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d1 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(10,2)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d1#24 = bl#35) AS r#7093]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS"
+    }
+   },
+   {
+    "expression": "d3 = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d3 = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d3 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(38,10)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d3#7 = bl#16) AS r#7094]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d3 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(38,10)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d3#26 = bl#35) AS r#7095]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) A"
+    }
+   },
+   {
+    "expression": "d5 = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(d5 = bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d5 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(38,38)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d5#9 = bl#16) AS r#7096]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d5 = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(38,38)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(d5#28 = bl#35) AS r#7097]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) A"
+    }
+   },
+   {
+    "expression": "a < bl",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(a < bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a < bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 < bl#16) AS r#7098]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a < bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 < bl#35) AS r#7099]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "a > bl",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(a > bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a > bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 > bl#16) AS r#7100]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a > bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 > bl#35) AS r#7101]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "a <= bl",
+    "parse": {
+     "ok": true,
+     "node": "LessThanOrEqual",
+     "sql": "(a <= bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <= bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 <= bl#16) AS r#7102]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bi"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <= bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 <= bl#35) AS r#7103]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, ca"
+    }
+   },
+   {
+    "expression": "bl > a",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(bl > a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl > a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#16 > a#0) AS r#7104]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl > a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#35 > a#19) AS r#7105]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "a IS TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(a <=> true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(a#0 <=> true) AS r#7106]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(a#19 <=> true) AS r#7107]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L,"
+    }
+   },
+   {
+    "expression": "a IS NOT TRUE",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (a <=> true))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (a#0 <=> true) AS r#7108]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (a#19 <=> true) AS r#7109]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#"
+    }
+   },
+   {
+    "expression": "a IS FALSE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(a <=> false)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(a#0 <=> false) AS r#7110]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(a#19 <=> false) AS r#7111]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20"
+    }
+   },
+   {
+    "expression": "a IS NOT FALSE",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (a <=> false))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (a#0 <=> false) AS r#7112]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (a#19 <=> false) AS r#7113]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS "
+    }
+   },
+   {
+    "expression": "b IS TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(b <=> true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(b#1L <=> true) AS r#7114]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(b#20L <=> true) AS r#7115]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#"
+    }
+   },
+   {
+    "expression": "b IS NOT FALSE",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (b <=> false))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (b#1L <=> false) AS r#7116]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(b <=> false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BIGINT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [NOT (b#20L <=> false) AS r#7117]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint)"
+    }
+   },
+   {
+    "expression": "g IS TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(g <=> true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(g <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(g#4 <=> true) AS r#7118]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(g <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 3;\n'Project [(g#23 <=> true) AS r#7119]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#2"
+    }
+   },
+   {
+    "expression": "d1 IS TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(d1 <=> true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d1 <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(10,2)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 4;\n'Project [(d1#5 <=> true) AS r#7120]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, d"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(d1 <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DECIMAL(10,2)\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 4;\n'Project [(d1#24 <=> true) AS r#7121]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigin"
+    }
+   },
+   {
+    "expression": "1 = TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(1 = true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 = true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 = true) AS r#7122]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 = true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 = true) AS r#7123]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2"
+    }
+   },
+   {
+    "expression": "0 = FALSE",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(0 = false)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(0 = false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(0 = false) AS r#7124]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(0 = false)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(0 = false) AS r#7125]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+    }
+   },
+   {
+    "expression": "2 = TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(2 = true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(2 = true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(2 = true) AS r#7126]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(2 = true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(2 = true) AS r#7127]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2"
+    }
+   },
+   {
+    "expression": "TRUE = 1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(true = 1)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(true = 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(true = 1) AS r#7128]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(true = 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(true = 1) AS r#7129]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2"
+    }
+   },
+   {
+    "expression": "1 <=> TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(1 <=> true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 <=> true) AS r#7130]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, b"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 <=> true)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 <=> true) AS r#7131]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, ca"
+    }
+   },
+   {
+    "expression": "nullif(a, bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(a, bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(commonexpressionref() = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nullif(a#0, bl#16) AS r#7132]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(commonexpressionref() = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nullif(a#19, bl#35) AS r#7133]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 "
+    }
+   },
+   {
+    "expression": "nullif(bl, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nullif(bl, a)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(commonexpressionref() = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nullif(bl#16, a#0) AS r#7134]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, t"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(commonexpressionref() = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [nullif(bl#35, a#19) AS r#7135]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 a"
+    }
+   },
+   {
+    "expression": "a IN (bl)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(a IN (bl))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#2745]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#2746]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+    }
+   },
+   {
+    "expression": "bl IN (a)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(bl IN (a))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(bl IN (a))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [bl#16 IN (a#0) AS r#7136]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(bl IN (a))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [bl#35 IN (a#19) AS r#7137]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+    }
+   },
+   {
+    "expression": "a IN (bl, 1)",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(a IN (bl, 1))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl, 1))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16,1) AS r#7138]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl, 1))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35,1) AS r#7139]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint)"
+    }
+   },
+   {
+    "expression": "coalesce(a, bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(a, bl)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"INT\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(a#0, bl#16) AS r#7140]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(a, bl)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"INT\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(a#19, bl#35) AS r#7141]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sma"
+    }
+   },
+   {
+    "expression": "greatest(a, bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "greatest(a, bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, bl)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#0, bl#16) AS r#7142]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, bl)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#19, bl#35) AS r#7143]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
+    }
+   },
+   {
+    "expression": "if(bl, a, bl)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if(bl, a, bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(bl, a, bl))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (bl#16) a#0 else bl#16 AS r#7144]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(bl, a, bl))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (bl#35) a#19 else bl#35 AS r#7145]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smalli"
+    }
+   },
+   {
+    "expression": "bl = TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(bl = true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "bl <=> TRUE",
+    "parse": {
+     "ok": true,
+     "node": "EqualNullSafe",
+     "sql": "(bl <=> true)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "a = 1",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(a = 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "NOT (a = bl)",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (a = bl))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 6;\n'Project [NOT (a#0 = bl#16) AS r#7158]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a = bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 6;\n'Project [NOT (a#19 = bl#35) AS r#7159]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "NOT (bl = a)",
+    "parse": {
+     "ok": true,
+     "node": "Not",
+     "sql": "(NOT (bl = a))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 6;\n'Project [NOT (bl#16 = a#0) AS r#7160]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl = a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 6;\n'Project [NOT (bl#35 = a#19) AS r#7161]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, "
+    }
+   },
+   {
+    "expression": "s = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(s = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": false,
+     "error": "SparkRuntimeException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BOOLEAN\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s = bl) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns = bl",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ns = bl)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -59164,6 +59902,868 @@
      "eval": {
       "ok": false,
       "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#34, cast(1 as double)) AS r#4790]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS"
+     }
+    }
+   ],
+   "boolean-equality": [
+    {
+     "expression": "a = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(a = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a <> bl",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (a = bl))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "a <=> bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(a <=> bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "bl = a",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(bl = a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "bl <> a",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (bl = a))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "sh = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(sh = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "sh <=> bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(sh <=> bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "b = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(b = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "f = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(f = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "g = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(g = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "d1 = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d1 = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "d3 = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d3 = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "d5 = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(d5 = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a < bl",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(a < bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a < bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 < bl#16) AS r#4843]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a < bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 < bl#35) AS r#4844]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+     }
+    },
+    {
+     "expression": "a > bl",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(a > bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a > bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 > bl#16) AS r#4845]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a > bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 > bl#35) AS r#4846]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+     }
+    },
+    {
+     "expression": "a <= bl",
+     "parse": {
+      "ok": true,
+      "node": "LessThanOrEqual",
+      "sql": "(a <= bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <= bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#0 <= bl#16) AS r#4847]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bi"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(a <= bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"INT\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(a#19 <= bl#35) AS r#4848]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, ca"
+     }
+    },
+    {
+     "expression": "bl > a",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(bl > a)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl > a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#16 > a#0) AS r#4849]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(bl > a)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"BOOLEAN\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(bl#35 > a#19) AS r#4850]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast"
+     }
+    },
+    {
+     "expression": "a IS TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(a <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a IS NOT TRUE",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (a <=> true))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "a IS FALSE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(a <=> false)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a IS NOT FALSE",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (a <=> false))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "b IS TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(b <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "b IS NOT FALSE",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (b <=> false))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "g IS TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(g <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "d1 IS TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(d1 <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "1 = TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(1 = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "0 = FALSE",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(0 = false)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "2 = TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(2 = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "TRUE = 1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(true = 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "1 <=> TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(1 <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "nullif(a, bl)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(a, bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "nullif(bl, a)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nullif(bl, a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a IN (bl)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(a IN (bl))"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16) AS r#1022]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35) AS r#1023]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+     }
+    },
+    {
+     "expression": "bl IN (a)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(bl IN (a))"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(bl IN (a))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [bl#16 IN (a#0) AS r#4911]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(bl IN (a))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 4;\n'Project [bl#35 IN (a#19) AS r#4912]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, c"
+     }
+    },
+    {
+     "expression": "a IN (bl, 1)",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(a IN (bl, 1))"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl, 1))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#0 IN (bl#16,1) AS r#4913]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18],"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(a IN (bl, 1))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"INT\", \"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 3;\n'Project [a#19 IN (bl#35,1) AS r#4914]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint)"
+     }
+    },
+    {
+     "expression": "coalesce(a, bl)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(a, bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(a, bl)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"INT\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(a#0, bl#16) AS r#4915]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, neste"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"coalesce(a, bl)\" due to data type mismatch: Input to `coalesce` should all be the same type, but it's (\"INT\" or \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [coalesce(a#19, bl#35) AS r#4916]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as sma"
+     }
+    },
+    {
+     "expression": "greatest(a, bl)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "greatest(a, bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, bl)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#0, bl#16) AS r#4917]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"greatest(a, bl)\" due to data type mismatch: Input to `greatest` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [greatest(a#19, bl#35) AS r#4918]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as small"
+     }
+    },
+    {
+     "expression": "if(bl, a, bl)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if(bl, a, bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(bl, a, bl))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (bl#16) a#0 else bl#16 AS r#4919]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(IF(bl, a, bl))\" due to data type mismatch: Input to `if` should all be the same type, but it's [\"INT\", \"BOOLEAN\"]. SQLSTATE: 42K09; line 1 pos 1;\n'Project [if (bl#35) a#19 else bl#35 AS r#4920]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smalli"
+     }
+    },
+    {
+     "expression": "bl = TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(bl = true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "bl <=> TRUE",
+     "parse": {
+      "ok": true,
+      "node": "EqualNullSafe",
+      "sql": "(bl <=> true)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "a = 1",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(a = 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "NOT (a = bl)",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (a = bl))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "NOT (bl = a)",
+     "parse": {
+      "ok": true,
+      "node": "Not",
+      "sql": "(NOT (bl = a))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "s = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(s = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns = bl",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ns = bl)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
      }
     }
    ]

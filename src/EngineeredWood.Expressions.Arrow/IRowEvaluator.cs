@@ -189,11 +189,22 @@ public interface IComparisonCoercion
     /// value of <paramref name="other"/>, or null when this operand needs no cast.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Null is an answer, not a failure: it is what both operands of an ordinary comparison get,
     /// and what a pair with no rule at all gets. A caller asks about each operand in turn and
     /// casts at most the one that comes back with a target.
+    /// </para>
+    /// <para>
+    /// <b>Asked with the OPERATOR, because one measured rule is equality's alone.</b> Under the
+    /// legacy dialect Spark casts a BOOLEAN operand to the numeric it is compared against and
+    /// compares them as numbers — its <c>BooleanEquality</c> coercion — for <c>=</c>, <c>&lt;&gt;</c>
+    /// and <c>&lt;=&gt;</c> only. Measured on 4.0.3, <c>a = bl</c> answers while <c>a &lt; bl</c> is
+    /// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c> in BOTH dialects, so an implementation that
+    /// could not see the operator would have to answer the same for both and would invent a rule
+    /// Spark does not have. #333.
+    /// </para>
     /// </remarks>
-    IArrowType? ComparisonTarget(IArrowType operand, IArrowType other);
+    IArrowType? ComparisonTarget(ComparisonOperator op, IArrowType operand, IArrowType other);
 
     /// <summary>
     /// The one type every member of a set membership test must be cast to, or null when the set

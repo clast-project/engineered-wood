@@ -88,4 +88,75 @@ public sealed class Decimal256ComparisonTests
         Assert.Null(registry.SetComparisonTarget(
             new IArrowType[] { new Decimal128Type(38, 38), new Decimal256Type(38, 0) }));
     }
+
+    /// <summary>
+    /// The same guard reached through a BOOLEAN, which #333 added a second route to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The legacy dialect casts a boolean operand of an equality to the numeric opposite it, and
+    /// a decimal256 is a numeric — so without a guard the rule hands back a target
+    /// <see cref="SparkFunctionRegistry"/>'s own cast cannot produce, and
+    /// <c>bl = wide256</c> throws <c>NotSupportedException: cast to DECIMAL(38,0) is not
+    /// implemented</c> where it used to answer null. Measured before the guard was added; caught
+    /// by the Copilot reviewer on #345, which is the second time this exact shape has been caught
+    /// that way.
+    /// </para>
+    /// <para>
+    /// Null is the right answer rather than a poor one: Spark's decimal stops at precision 38 and
+    /// cannot name this type, so there is no rule to reproduce, and declining leaves the operands
+    /// compared as they stand — which for a boolean against a decimal is no comparison at all.
+    /// ORDERING already answered null and still does, since it never takes the rule.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("bl = wide256")]
+    [InlineData("wide256 = bl")]
+    [InlineData("bl <=> wide256")]
+    [InlineData("bl <> wide256")]
+    [InlineData("wide256 < bl")]
+    public void ABooleanAgainstADecimal256AnswersNullRatherThanThrowing(string expression)
+    {
+        var legacy = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false });
+
+        var actual = new ArrowRowEvaluator(legacy)
+            .EvaluateExpression(SparkSqlParser.ParseExpression(expression), BooleanWideBatch());
+
+        // `<=>` never answers null -- it is the one operator with no unknown -- so it answers
+        // false for a pair with no comparison between them, exactly as it did before #333.
+        var values = Assert.IsType<BooleanArray>(actual);
+        Assert.Equal(expression.Contains("<=>") ? false : (bool?)null, values.GetValue(0));
+    }
+
+    /// <summary>The registry declines directly, which is where this guard lives too.</summary>
+    [Fact]
+    public void TheBooleanEqualityTargetDeclinesADecimal256()
+    {
+        var legacy = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false });
+
+        // A decimal128 of the same precision and scale IS a target...
+        Assert.NotNull(legacy.ComparisonTarget(
+            ComparisonOperator.Equal, BooleanType.Default, new Decimal128Type(38, 0)));
+
+        // ...and the same type held as a decimal256 is not.
+        Assert.Null(legacy.ComparisonTarget(
+            ComparisonOperator.Equal, BooleanType.Default, new Decimal256Type(38, 0)));
+    }
+
+    /// <summary>A decimal256 beside a boolean, for the comparisons above.</summary>
+    private static RecordBatch BooleanWideBatch()
+    {
+        var wide = new Decimal256Type(38, 0);
+        var wideValues = new Decimal256Array.Builder(wide);
+        wideValues.Append(1m);
+
+        var flags = new BooleanArray.Builder();
+        flags.Append(true);
+
+        var schema = new Schema(
+            new[] { new Field("wide256", wide, true), new Field("bl", BooleanType.Default, true) },
+            null);
+        return new RecordBatch(
+            schema, new IArrowArray[] { wideValues.Build(), flags.Build() }, 1);
+    }
 }
