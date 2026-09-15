@@ -24,10 +24,13 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// parser decision or a per-call parameter.
 /// </para>
 /// <para>
-/// <b>Not yet implemented:</b> temporal casts (<c>CAST(ts AS DATE)</c> and friends), which need
-/// the timezone policy settled first, and the named functions — <c>substring</c>,
-/// <c>date_format</c>, <c>year</c>, <c>concat</c>, <c>coalesce</c>, <c>case</c>, <c>like</c>.
-/// Each refuses by name rather than silently producing nothing.
+/// This paragraph listed temporal casts and the named functions — <c>substring</c>,
+/// <c>date_format</c>, <c>year</c>, <c>concat</c>, <c>coalesce</c>, <c>case</c>, <c>like</c> — as
+/// not yet implemented. All of them are, and the corpus covers each; the timezone policy the
+/// temporal casts were waiting on is settled in <see cref="SparkDialectOptions.TimeZone"/>. What
+/// survives from it is the rule that outlasted the list: <b>a function this registry does not
+/// implement refuses BY NAME</b> rather than silently producing nothing, so a gap is a message
+/// naming the function and never a wrong answer.
 /// </para>
 /// </remarks>
 public sealed class SparkFunctionRegistry

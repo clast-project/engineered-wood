@@ -2861,9 +2861,9 @@ GROUPS = {
         "CAST(TIMESTAMP'2026-08-11 12:30:00.000001' AS STRING)",
 
         # --- TRAILING TEXT IS A TIMEZONE HERE, not junk to ignore: everything from the first
-        # character that cannot continue the time is handed to Java's zone parser, and a name it
-        # refuses refuses the whole cast. That single rule is why the first block reads and the
-        # second is refused, and it is the sharpest difference from the DATE grammar above.
+        # character that cannot continue the time is handed to Java's zone parser, and a name that
+        # parser rejects fails the whole cast. That single rule is why the first block reads and
+        # the second is refused, and it is the sharpest difference from the DATE grammar above.
         "CAST(CAST('2026-08-11 12:30:00Z' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00-08:00' AS TIMESTAMP) AS STRING)",
@@ -2875,6 +2875,20 @@ GROUPS = {
         # string's LENGTH.
         "CAST(CAST('2026-08-11 12:30:00+2:00' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00+02:0' AS TIMESTAMP) AS STRING)",
+        # ...and BOTH rewrites reach a PREFIXED zone, which is a property of where the patterns
+        # anchor rather than something either one says. The hour rewrite replaces its first match
+        # anywhere in the text; the minute one matches FIVE characters against the end, so its
+        # sign sits five back from the end whether or not `UTC` precedes it. Rows rather than an
+        # argument, because reading the regexes suggests otherwise and a reviewer did.
+        "CAST(CAST('2026-08-11 12:30:00UTC+02:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC+2:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00GMT+2:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UT+02:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00UTC-02:0' AS TIMESTAMP) AS STRING)",
+        # One rewrite each, and no more: a seconds field spelled short is refused, because
+        # neither pattern is about it.
+        "CAST(CAST('2026-08-11 12:30:00UTC+02:00:0' AS TIMESTAMP) AS STRING)",
+        "CAST(CAST('2026-08-11 12:30:00+2:0:0' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00 +02:00' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00UTC' AS TIMESTAMP) AS STRING)",
         "CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP) AS STRING)",

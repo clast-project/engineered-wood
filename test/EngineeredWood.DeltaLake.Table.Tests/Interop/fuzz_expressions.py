@@ -149,12 +149,14 @@ STRING_LITERALS = [
 # disagree about and the whole target was fuzzed at zero. Before trusting a run, check the leaves
 # can reach the rule.
 #
-# Chosen so both directions are reachable: the first three are read by Spark and were refused by
-# .NET's parser, the next four are the reverse, and the rest sit on the edges of the grammar --
-# where the date parse discards what follows a separator and the timestamp parse reads it as a
-# timezone, which is the pair that makes one string two answers.
+# Chosen so both directions are reachable. `'2026'` and `'2026-08-11 extra'` are dates to Spark
+# and were refused by .NET's parser; the four after them are the reverse, read by .NET and refused
+# by Spark. `'2026-08'` is the CONTROL between the two -- both read it, and .NET only by luck,
+# since it reads a year-month and not a bare year. The rest sit on the edges of the grammar, where
+# the date parse discards what follows a separator and the timestamp parse reads it as a timezone,
+# which is the pair that makes one string two answers.
 TEMPORAL_TEXT = [
-    "'2026'", "'2026-08'", "'2026-08-11 extra'",
+    "'2026'", "'2026-08-11 extra'", "'2026-08'",
     "'08/11/2026'", "'2026/08/11'", "'Aug 11, 2026'", "'2026-08 -11'",
     "'2026-08-11'", "'2026-08-11 12:30:00'", "'2026-08-11T12:30:00Z'",
     "'2026-08-11 12:30:00.1234567'", "'2026-08-11 12:30:00+02:00'",

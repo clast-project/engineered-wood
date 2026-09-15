@@ -1610,7 +1610,7 @@ public sealed class SparkFunctionRegistryTests
     // Below a microsecond there is nothing to print: Spark's timestamp has no such digit, so a
     // tick that fine is truncated rather than rounded into the one above it.
     [InlineData(9, "2026-08-11 03:00:00")]
-    public void ATimestampsSubSecondIsRenderedWithoutItsTrailingZeros(int ticks, string expected)
+    public void TheSubSecondOfATimestampIsRenderedWithoutItsTrailingZeros(int ticks, string expected)
     {
         var batch = Batch(("ts", Timestamps(Straddling.AddTicks(ticks))));
 
