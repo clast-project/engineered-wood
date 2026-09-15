@@ -335,3 +335,127 @@ public interface INullabilityRules
     /// </remarks>
     bool NeverNull(string name, ReadOnlySpan<bool> argumentsNeverNull);
 }
+
+/// <summary>
+/// A function registry that knows which expressions its dialect's ANALYZER refuses on type
+/// grounds, before a row is read.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast. <b>A registry that does not implement it
+/// refuses nothing</b>, which is exactly the behaviour without it: a comparison between operands
+/// with no rule between them answers null per row rather than being rejected. Silence has to be
+/// the default because the evaluator is shared — <c>DeltaTable</c>, <c>LanceTable</c> and
+/// <c>LanceDatasetWriter</c> each construct one with no registry at all, and none of them wants
+/// Spark's analyzer.
+/// </para>
+/// <para>
+/// It exists because Spark refuses these at ANALYSIS and we answer them. Measured over the nine
+/// types EW models, 522 expressions x 2 dialects: <b>171 ANSI and 157 legacy rows</b> where
+/// Spark's analyzer refuses and we produce a value. The consequence is not a rejected row — a
+/// Delta table carrying such a constraint is readable here while every Spark write against it
+/// fails, including a write that satisfies the constraint. #286.
+/// </para>
+/// <para>
+/// <b>Every method ANSWERS rather than throws, and null means accepted.</b> That is what lets
+/// one set of rules serve both callers. Evaluation has a row to refuse against and abandons the
+/// batch at the first failure; a definition-time pass — validating a <c>CHECK</c> constraint or a
+/// generation expression when it is DEFINED, against a schema and no data — has neither, and
+/// needs to collect what is wrong with an expression rather than stop at the first thing found.
+/// Raising is therefore the caller's decision: <see cref="ArrowRowEvaluator"/> turns a diagnostic
+/// into an <see cref="ExpressionAnalysisException"/> at the site that asked, and a pass would
+/// gather the same diagnostics into a report.
+/// </para>
+/// <para>
+/// <b>The dialect belongs to the implementation, not to the caller.</b> Spark's analyzer refuses
+/// under both dialects and refuses DIFFERENT sets — measured, boolean joins the numeric family
+/// for equality only and only under the legacy dialect (#333) — so the rule cannot be stated
+/// dialect-free, and the evaluator, which has no dialect, must not try. The same reasoning that
+/// produced <see cref="IComparisonCoercion"/>, one step earlier: that one says which operand a
+/// comparison casts, this one says whether there is a comparison to make at all.
+/// </para>
+/// </remarks>
+public interface IAnalysisRules
+{
+    /// <summary>
+    /// Why a comparison of <paramref name="left"/> against <paramref name="right"/> under
+    /// <paramref name="op"/> is refused at analysis, or null when it is accepted.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Asked with the operator, because equality and ordering do not answer alike.</b> Under
+    /// the legacy dialect <c>a = bl</c> compares an int against a boolean by casting the boolean
+    /// to the number, while <c>a &lt; bl</c> is refused as
+    /// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c> in both dialects — the same pair of types,
+    /// two answers, decided by the operator alone.
+    /// </para>
+    /// <para>
+    /// <b>This one question also covers boolean context and <c>IN</c></b>, which is why there is
+    /// no method for either. <c>SparkSqlParser.AsPredicate</c> lowers a non-boolean in predicate
+    /// position to <c>expr = TRUE</c> and <c>IS TRUE</c> to <c>expr &lt;=&gt; TRUE</c>, so
+    /// <c>0.5 IS TRUE</c> and <c>0.5 AND x</c> arrive here as an ordinary comparison against a
+    /// boolean. The measurement bears it out: a family check at this one site dropped the ANSI
+    /// gap from 171 rows to 17, and those 17 are exactly the cast table — the 28 boolean-context
+    /// rows fell to it without a rule of their own. A set test asks per MEMBER, because
+    /// membership legality is per pair even though the coercion is not; see
+    /// <see cref="IComparisonCoercion.SetComparisonTarget"/> for the half that is not.
+    /// </para>
+    /// <para>
+    /// Not asked about an operand whose type is unknown — a bare <c>NULL</c> literal. Spark types
+    /// one <c>void</c>, which is comparable with everything, and the caller cannot supply a type
+    /// it does not have without inventing one.
+    /// </para>
+    /// </remarks>
+    AnalysisDiagnostic? CheckComparison(ComparisonOperator op, IArrowType left, IArrowType right);
+
+    /// <summary>
+    /// Why a cast from <paramref name="source"/> to <paramref name="target"/> is refused at
+    /// analysis, or null when it is allowed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A property of the two TYPES, asked once, not of a value read inside a row loop.</b>
+    /// That distinction is the soundness bug under #286 rather than a tidiness point: a refusal
+    /// thrown after reading a value makes the same expression refuse or answer depending on the
+    /// batch, and measured, <c>CAST(nullif(dt, dt) AS INT)</c> answers today where
+    /// <c>CAST(dt AS INT)</c> refuses. #332.
+    /// </para>
+    /// <para>
+    /// <b><paramref name="tryCast"/> selects the table, not the outcome of a failure.</b>
+    /// Measured, <c>try_cast</c> uses the ANSI cast table under BOTH dialects, so every ANSI-only
+    /// refusal is also a legacy <c>try_cast</c> refusal — and it is a refusal, not the null that
+    /// <c>try_cast</c> gives a value it cannot convert.
+    /// </para>
+    /// <para>
+    /// <see cref="ArrowRowEvaluator"/> never asks this: a cast is a function call, the target
+    /// type is an argument of it, and the registry that implements the cast is the only party
+    /// that can read one. It is here so that the cast table is stated once, where a
+    /// definition-time pass can reach it too.
+    /// </para>
+    /// </remarks>
+    AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast);
+}
+
+/// <summary>
+/// Why an expression is refused at analysis, in the terms the engine whose analyzer refused it
+/// would have used.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="ErrorClass"/> carries that engine's own name for the condition —
+/// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c>,
+/// <c>DATATYPE_MISMATCH.CAST_WITH_FUNC_SUGGESTION</c> — for the reason
+/// <c>SparkEvaluationException</c> carries one: a caller reporting a refused write can name the
+/// condition the user would have seen from Spark, and a recorded refusal can be matched by class
+/// rather than by message text.
+/// </para>
+/// <para>
+/// <b>It carries no location.</b> A rule is a function of types and knows nothing of the tree it
+/// was asked about; the caller has the node and attaches it. That is what keeps one rule usable
+/// from a row evaluator, which needs no location because it raises immediately, and from a pass
+/// over a whole constraint, which needs one because it reports several at once.
+/// </para>
+/// </remarks>
+/// <param name="ErrorClass">The engine's name for the condition, without surrounding brackets.</param>
+/// <param name="Message">The condition, spelled for a human.</param>
+public sealed record AnalysisDiagnostic(string ErrorClass, string Message);
