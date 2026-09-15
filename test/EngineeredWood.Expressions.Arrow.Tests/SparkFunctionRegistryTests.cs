@@ -1684,6 +1684,100 @@ public sealed class SparkFunctionRegistryTests
                 .GetTimestamp(0)!.Value.ToUnixTimeSeconds());
     }
 
+    // ── A decimal target's SCALE is charged against its precision (#331) ────────────────────
+
+    /// <summary>
+    /// A value must fit the whole-number room the target has left after its scale.
+    /// </summary>
+    /// <remarks>
+    /// <b>The pairs are chosen so that precision alone cannot explain them.</b> The timestamp is
+    /// 1786451400 — ten digits — so a rule that counted digits against <c>Precision</c> and
+    /// ignored <c>Scale</c> passes <c>decimal(10,2)</c> and <c>decimal(11,2)</c>, which is exactly
+    /// what #331 was: the builder was left to catch the overflow, and it counts the digits of the
+    /// value it is handed, while <c>Rescale</c> is <c>Math.Round</c> and rounds TO a scale without
+    /// PADDING to one. 178645140000 went into a vector declared to hold ten digits.
+    /// <para>
+    /// <c>decimal(9,0)</c> is in the list as the case that USED to be caught — there the two
+    /// scales coincide, so the builder saw the real digit count and refused. A fix that only
+    /// re-spelled the existing check would keep that row and still fail its neighbours.
+    /// </para>
+    /// <para>
+    /// Measured on Spark 4.0.1, both dialects: ANSI raises
+    /// <c>NUMERIC_VALUE_OUT_OF_RANGE</c> and the legacy dialect answers null.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(10, 0, true)]    // ten digits in ten, none spent on scale
+    [InlineData(11, 0, true)]
+    [InlineData(38, 0, true)]
+    [InlineData(12, 2, true)]    // ten digits and two of scale: twelve, which fits
+    [InlineData(18, 6, true)]
+    [InlineData(38, 10, true)]
+    [InlineData(10, 2, false)]   // the issue's own case
+    [InlineData(11, 2, false)]
+    [InlineData(9, 0, false)]    // the one the builder already caught
+    [InlineData(1, 0, false)]
+    [InlineData(38, 38, false)]  // every digit is fractional, so nothing but zero fits
+    public void ADecimalTargetChargesItsScaleAgainstItsPrecision(int precision, int scale, bool fits)
+    {
+        var batch = Batch(("ts", Timestamps(
+            DateTimeOffset.Parse("2026-08-11T12:30:00Z", CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind))));   // epoch 1786451400
+        var sql = $"CAST(ts AS DECIMAL({precision},{scale}))";
+
+        if (fits)
+        {
+            var result = Assert.IsType<Decimal128Array>(Eval(Ansi, sql, batch));
+            Assert.Equal(1786451400m, result.GetValue(0)!.Value);
+            return;
+        }
+
+        Assert.Equal(
+            "NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, batch)).ErrorClass);
+
+        // The legacy dialect answers null for the same value rather than raising, and `try_cast`
+        // does so under either dialect -- the non-raising path has to reach the same verdict.
+        Assert.Null(Assert.IsType<Decimal128Array>(Eval(Legacy, sql, batch)).GetValue(0));
+        Assert.Null(Assert.IsType<Decimal128Array>(
+            Eval(Ansi, $"TRY_CAST(ts AS DECIMAL({precision},{scale}))", batch)).GetValue(0));
+    }
+
+    /// <summary>
+    /// The same rule over a BOOLEAN, where the value is 1 and only the target decides.
+    /// </summary>
+    /// <remarks>
+    /// The boolean reaches the same path as a temporal and is the cleanest statement of the rule:
+    /// <c>decimal(1,0)</c> and <c>decimal(2,1)</c> hold a 1 and <c>decimal(1,1)</c> does not,
+    /// which no digit count of the VALUE can distinguish — all three are one digit. Measured in
+    /// Spark, both dialects.
+    /// </remarks>
+    [Theory]
+    [InlineData(1, 0, true)]
+    [InlineData(2, 1, true)]
+    [InlineData(10, 2, true)]
+    [InlineData(1, 1, false)]
+    [InlineData(5, 5, false)]
+    [InlineData(38, 38, false)]
+    public void ABooleanFitsADecimalOnlyWhereTheTargetLeavesRoomForIt(int precision, int scale, bool fits)
+    {
+        var batch = Batch(("bl", Booleans(true)));
+        var sql = $"CAST(bl AS DECIMAL({precision},{scale}))";
+
+        if (fits)
+        {
+            Assert.Equal(
+                1m,
+                Assert.IsType<Decimal128Array>(Eval(Ansi, sql, batch)).GetValue(0)!.Value);
+            return;
+        }
+
+        Assert.Equal(
+            "NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, sql, batch)).ErrorClass);
+        Assert.Null(Assert.IsType<Decimal128Array>(Eval(Legacy, sql, batch)).GetValue(0));
+    }
+
     // ── A boolean cast to TIMESTAMP is MICROseconds (#330) ──────────────────────────────────
 
     /// <summary>

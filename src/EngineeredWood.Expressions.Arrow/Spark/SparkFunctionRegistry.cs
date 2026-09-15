@@ -1503,18 +1503,75 @@ public sealed class SparkFunctionRegistry
                 throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
 
+            // RANGE-CHECKED HERE RATHER THAN LEFT TO THE BUILDER, which is what #331 was: the
+            // builder's own check counts the digits of the value it is handed, and `Rescale` is
+            // `Math.Round`, which rounds TO a scale without PADDING to one. So a whole number
+            // arrived at scale 0 however deep the target's scale was, its digits were counted
+            // against the precision alone, and the scale's share of that precision was never
+            // charged for. `CAST(ts AS DECIMAL(10,2))` wrote 178645140000 into a vector declared
+            // to hold ten digits. Only when the two scales happened to coincide -- decimal(9,0)
+            // for a whole second -- did the builder catch anything.
+            var rounded = SparkArrays.Rescale(exact, target.Scale);
+
+            if (!FitsPrecision(rounded, target))
+            {
+                if (!raising) { builder.AppendNull(); continue; }
+                throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
+            }
+
             try
             {
-                builder.Append(SparkArrays.Rescale(exact, target.Scale));
+                builder.Append(rounded);
             }
             catch (OverflowException)
             {
+                // Kept behind the check rather than replaced by it. The check models Spark's
+                // range and the builder enforces Arrow's, and they are not the same rule --
+                // anything Arrow refuses that this does not model still has to become a refusal
+                // rather than escape as a bare BCL exception.
                 if (!raising) { builder.AppendNull(); continue; }
                 throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
         }
 
         return builder.Build();
+    }
+
+    /// <summary>
+    /// Whether a value fits the whole-number room <paramref name="target"/> has left after its
+    /// scale, which is the range Spark checks.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A <c>decimal(p, s)</c> holds <c>p</c> digits of which <c>s</c> are fractional, so the
+    /// value must satisfy <c>|v| &lt; 10^(p-s)</c>. Measured on Spark 4.0.1 over a timestamp
+    /// (1786451400, ten digits) and a boolean, both dialects: <c>decimal(10,0)</c> and
+    /// <c>decimal(12,2)</c> answer, <c>decimal(10,2)</c> and <c>decimal(11,2)</c> do not, and
+    /// <c>CAST(true AS DECIMAL(1,1))</c> does not either — one does not fit a type whose every
+    /// digit is fractional, though <c>decimal(2,1)</c> holds it.
+    /// </para>
+    /// <para>
+    /// <b>The ROUNDED value is the one measured</b>, because that is the order Spark works in:
+    /// a value is brought to the target's scale and the result is what has to fit.
+    /// </para>
+    /// <para>
+    /// Above 28 integer digits every <see cref="decimal"/> fits by construction — the type tops
+    /// out near 7.9e28 — and the bound itself would have no <see cref="decimal"/> form to compare
+    /// against, so it is answered without building one.
+    /// </para>
+    /// </remarks>
+    private static bool FitsPrecision(decimal value, Decimal128Type target)
+    {
+        var integerDigits = target.Precision - target.Scale;
+
+        if (integerDigits >= 29)
+            return true;
+
+        var limit = 1m;
+        for (var i = 0; i < integerDigits; i++)
+            limit *= 10m;
+
+        return value > -limit && value < limit;
     }
 
     /// <summary>
