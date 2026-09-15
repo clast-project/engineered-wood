@@ -47,6 +47,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     private readonly ILiteralPrecisionRules? _literalPrecision;
 
+    /// <summary>
+    /// The registry's analyzer, when it has one. See <see cref="CheckComparable"/>.
+    /// </summary>
+    private readonly IAnalysisRules? _analysis;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
@@ -54,6 +59,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         _shortCircuiting = functions as IShortCircuitingFunctions;
         _nullability = functions as INullabilityRules;
         _literalPrecision = functions as ILiteralPrecisionRules;
+        _analysis = functions as IAnalysisRules;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -215,6 +221,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         var (left, leftType) = EvalOperand(cmp.Left, batch);
         var (right, rightType) = EvalOperand(cmp.Right, batch);
+        CheckComparable(cmp.Op, leftType, left, rightType, right);
         CoerceOperands(cmp, leftType, rightType, ref left, ref right);
         var result = new bool?[batch.Length];
 
@@ -268,6 +275,109 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Refuses a comparison the registry's analyzer refuses, before the row loop can answer it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Nothing at all without a registry that implements <see cref="IAnalysisRules"/>, which is
+    /// every caller that supplies no registry. With one, the cost is resolving both operand types
+    /// where <see cref="CoerceOperands"/> would have resolved neither: a comparison between a
+    /// column and a literal of its own type resolves two types to be told there is nothing wrong
+    /// with it. That is the price of asking a question about TYPES at a site whose other work is
+    /// on values, and it is why the answer is asked for once per comparison rather than per row.
+    /// </para>
+    /// <para>
+    /// <b>An operand whose type cannot be read is not asked about</b>, rather than being given
+    /// <see cref="OperandType"/>'s string fallback. That fallback is right where it is — a string
+    /// is the type with no coercion rule, so an unresolvable operand is left as it stands — and
+    /// would be wrong here: it presents a bare <c>NULL</c> as a string, and <c>bin = NULL</c>
+    /// would be refused as a binary against a string where Spark types the NULL <c>void</c> and
+    /// compares it with anything.
+    /// </para>
+    /// </remarks>
+    private void CheckComparable(
+        ComparisonOperator op,
+        IArrowType? leftType, LiteralValue?[] left,
+        IArrowType? rightType, LiteralValue?[] right)
+    {
+        if (_analysis is null)
+            return;
+
+        var l = ReadType(leftType, left);
+        var r = ReadType(rightType, right);
+        if (l is null || r is null)
+            return;
+
+        Refuse(_analysis.CheckComparison(op, l, r));
+    }
+
+    /// <summary>
+    /// Refuses a set test whose operand cannot be compared against one of its members.
+    /// </summary>
+    /// <remarks>
+    /// Asked per MEMBER against the operand rather than once over the set's resolved type,
+    /// because legality and coercion are different questions:
+    /// <see cref="IComparisonCoercion.SetComparisonTarget"/> resolves ONE type over the operand
+    /// and the whole list, while whether a member can be compared at all is a property of that
+    /// member and the operand alone. Measured for #286, <c>a IN (bl)</c> is refused as an
+    /// ordinary cross-family comparison and needs no rule of its own.
+    /// </remarks>
+    private void CheckSetMembers(
+        IArrowType? operandType, LiteralValue?[] operand,
+        SetMember[] members, IArrowType?[] memberTypes)
+    {
+        if (_analysis is null)
+            return;
+
+        var type = ReadType(operandType, operand);
+        if (type is null)
+            return;
+
+        for (var k = 0; k < members.Length; k++)
+        {
+            var memberType = memberTypes[k]
+                ?? (members[k].IsConstant
+                    ? members[k].Constant is { } constant
+                        ? ConstantArray(constant, 1).Data.DataType
+                        : null
+                    : ReadType(null, members[k].PerRow));
+
+            if (memberType is not null)
+                Refuse(_analysis.CheckComparison(ComparisonOperator.Equal, type, memberType));
+        }
+    }
+
+    /// <summary>
+    /// The type an operand carries, or null when it carries none — every row null, and no type
+    /// declared to say what they are null OF.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <see cref="OperandType"/>, which answers the same question for the
+    /// coercion path and substitutes a string where this one declines to answer. See
+    /// <see cref="CheckComparable"/> for why the substitution cannot be shared.
+    /// </remarks>
+    private static IArrowType? ReadType(IArrowType? declared, LiteralValue?[] values)
+    {
+        if (declared is not null)
+            return declared;
+
+        foreach (var value in values)
+        {
+            if (value.HasValue)
+                return ConstantArray(value.Value, 1).Data.DataType;
+        }
+
+        return null;
+    }
+
+    /// <summary>Raises a diagnostic the analyzer returned; a null one is an acceptance.</summary>
+    private static void Refuse(AnalysisDiagnostic? diagnostic)
+    {
+        if (diagnostic is not null)
+            throw new ExpressionAnalysisException(diagnostic);
     }
 
     /// <summary>
@@ -918,6 +1028,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             memberTypes[k] = type;
         }
 
+        CheckSetMembers(operandType, operand, members, memberTypes);
         CoerceSet(ref operand, operandType, members, memberTypes, batch.Length);
 
         var result = new bool?[batch.Length];
