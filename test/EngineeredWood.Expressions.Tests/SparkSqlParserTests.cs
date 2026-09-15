@@ -576,6 +576,208 @@ public sealed class SparkSqlParserTests
             refused.OrderBy(x => x, StringComparer.Ordinal));
     }
 
+    /// <summary>
+    /// The other direction: every corpus expression Spark's PARSER refuses is refused here too.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The counterpart of <see cref="TheCorpusExpressionsWeRefuseAreExactlyThese"/>, and the gate
+    /// that was missing. That test pins what Spark accepts and we do not, which is a scope
+    /// decision; nothing pinned what Spark REJECTS and we accept, which is always a defect --
+    /// accepting a constraint Spark will not parse writes table metadata that no Spark session
+    /// can read back. #287 lived in that gap: `1e400` is INVALID_NUMERIC_LITERAL_RANGE there and
+    /// was an infinity here.
+    /// </para>
+    /// <para>
+    /// The exception list is EMPTY and is expected to stay that way. It exists so that a
+    /// deliberate divergence has somewhere to be written down rather than being discovered as a
+    /// mystery, in the same spelling as the list above -- but unlike that one, an entry here
+    /// needs an argument, because the refusing side is Spark.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void EveryCorpusExpressionSparkRefusesIsRefusedHereToo()
+    {
+        var allowed = Array.Empty<string>();
+
+        var accepted = new List<string>();
+        foreach (var entry in SparkCorpus.Entries())
+        {
+            var sql = entry.Expression();
+            if (entry.GetProperty("parse").GetProperty("ok").GetBoolean())
+                continue;
+
+            try
+            {
+                Parse(sql);
+                accepted.Add(sql);
+            }
+            catch (SparkSqlParseException)
+            {
+                // Refused, which is the point.
+            }
+        }
+
+        Assert.Equal(allowed.OrderBy(x => x, StringComparer.Ordinal),
+            accepted.Distinct().OrderBy(x => x, StringComparer.Ordinal));
+    }
+
+    // -- The range of a numeric literal, #287 ------------------------------------------------
+
+    /// <summary>
+    /// A floating-point literal outside the type's range is refused, as Spark's parser refuses
+    /// it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The check is on the literal's EXACT decimal text, which is what the last rows of each
+    /// width are for: `1.79769313486231575e308` and `3.4028234663852887e38F` both round to a
+    /// finite value, so an implementation that asked whether the parse overflowed would accept
+    /// both. Spark refuses them, comparing against the bound as a decimal.
+    /// </para>
+    /// <para>
+    /// It also removes a per-runtime divergence. `double.TryParse` answers an infinity on .NET
+    /// Core and FALSE on .NET Framework, so before this the same literal was an infinity on
+    /// net10.0 and a refusal on net472 -- the netstandard2.0 build disagreeing with itself
+    /// depending on which runtime loaded it, as in #282.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("1e400")]
+    [InlineData("1e400D")]
+    [InlineData("1e309")]
+    [InlineData("1.8e308")]
+    [InlineData("1.7976931348623158e308")]
+    [InlineData("1.7976931348623159e308")]
+    [InlineData("1.79769313486231575e308")]
+    [InlineData("1e39F")]
+    [InlineData("1e400F")]
+    [InlineData("3.5e38F")]
+    [InlineData("3.4028235e38F")]
+    [InlineData("3.4028234663852887e38F")]
+    public void AFloatingLiteralOutsideTheTypeRangeIsRefused(string sql)
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+        Assert.Contains("out of range", thrown.Reason, StringComparison.Ordinal);
+        Assert.Equal(sql, thrown.Expression);
+    }
+
+    /// <summary>The largest literal of each width, which must still be accepted.</summary>
+    /// <remarks>
+    /// `3.4028234663852886e38F` is the row that says the float bound is not the one Java prints:
+    /// `Float.toString(Float.MaxValue)` is `3.4028235E38`, which Spark refuses, while this -- the
+    /// same value widened to a double -- it accepts. Both were measured.
+    /// </remarks>
+    [Theory]
+    [InlineData("1.7976931348623157e308")]
+    [InlineData("17976931348623157e292")]
+    [InlineData("1e308")]
+    [InlineData("3.4028234663852886e38F")]
+    [InlineData("3.4e38F")]
+    [InlineData("1e38F")]
+    public void TheLargestLiteralOfEachWidthIsAccepted(string sql) =>
+        Assert.IsType<LiteralExpression>(Parse(sql));
+
+    /// <summary>
+    /// Underflow is not a range error, which is the half of #287 that does not reproduce.
+    /// </summary>
+    /// <remarks>
+    /// The issue reports `1e-400` as the same gap at the other end. Measured, Spark accepts it
+    /// and answers 0.0: the range it checks is [-MaxValue, MaxValue], and a value too small to
+    /// represent sits well inside that. `-1e-400` is a negative zero there, which is #282's rule
+    /// and not this one.
+    /// </remarks>
+    [Theory]
+    [InlineData("1e-400")]
+    [InlineData("1e-400D")]
+    [InlineData("1e-325")]
+    [InlineData("1e-324")]
+    [InlineData("1e-46F")]
+    // A zero mantissa is in range at every exponent, which is what stops a check written on the
+    // exponent alone.
+    [InlineData("0e400")]
+    [InlineData("0e-400")]
+    [InlineData("0.0e400")]
+    [InlineData("000e400")]
+    public void ALiteralThatUnderflowsIsAcceptedRatherThanRefused(string sql) =>
+        Assert.IsType<LiteralExpression>(Parse(sql));
+
+    /// <summary>
+    /// An exponent no decimal scale can carry is refused before the range is compared at all.
+    /// </summary>
+    /// <remarks>
+    /// `0e2147483648` is the row that pins the ORDER: its mantissa is zero, so it is in range by
+    /// the rule above and only a check running first can refuse it. `1e-2147483648` refuses
+    /// although the exponent fits an int, because it is the negation of the scale that overflows
+    /// -- which is why the bound is -int.MaxValue and not int.MinValue. All measured; Spark
+    /// answers these with a plain ParseException rather than INVALID_NUMERIC_LITERAL_RANGE, and
+    /// both are one refusal here.
+    /// </remarks>
+    [Theory]
+    [InlineData("1e2147483648")]
+    [InlineData("1e99999999999")]
+    [InlineData("1e-99999999999")]
+    [InlineData("1e-2147483648")]
+    [InlineData("1e-2147483649")]
+    [InlineData("0e2147483648")]
+    // The decimal path has the same guard, and had the same wrong wording before it was split.
+    [InlineData("0e2147483648BD")]
+    [InlineData("1e99999999999BD")]
+    public void AnExponentTooWideForAScaleIsRefused(string sql)
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse(sql));
+
+        // NOT the range reason, which would be FALSE for `0e2147483648`: that literal is
+        // numerically zero and in the range of every type there is. Raised in review of #287,
+        // and it is a distinction Spark draws too -- INVALID_NUMERIC_LITERAL_RANGE names the
+        // min and max it compared against, while these come back as a plain ParseException.
+        Assert.Contains("exponent", thrown.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("out of range", thrown.Reason, StringComparison.Ordinal);
+        Assert.Equal(sql, thrown.Expression);
+    }
+
+    /// <summary>
+    /// The largest exponent that DOES fit is refused by the RANGE check, with the range reason.
+    /// </summary>
+    /// <remarks>
+    /// The pair of tests is what says the two refusals are told apart rather than merged. It is
+    /// also the row that needs the normalisation to count in a long: `1e2147483647` normalises to
+    /// an exponent of 2147483648, which an int cannot hold.
+    /// </remarks>
+    [Fact]
+    public void TheLargestExponentThatFitsIsRefusedForItsValueInstead()
+    {
+        var thrown = Assert.Throws<SparkSqlParseException>(() => Parse("1e2147483647"));
+
+        Assert.Contains("out of range", thrown.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("exponent", thrown.Reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The neighbouring rules, which are NOT this one and must not have moved.
+    /// </summary>
+    /// <remarks>
+    /// A decimal literal is bounded by its PRECISION -- 39 digits is too many however small the
+    /// value, a different error class in Spark -- and an integral literal has no upper bound at
+    /// all, because Spark's ladder does not stop at bigint but widens to a decimal. #173.
+    /// </remarks>
+    [Fact]
+    public void ADecimalLiteralIsBoundedByPrecisionAndAnIntegralLiteralNotAtAll()
+    {
+        Assert.Contains("38", Assert.Throws<SparkSqlParseException>(() => Parse("1e38BD")).Reason,
+            StringComparison.Ordinal);
+        Assert.Contains("38", Assert.Throws<SparkSqlParseException>(() => Parse("1e400BD")).Reason,
+            StringComparison.Ordinal);
+
+        // A 38-digit unscaled value is past System.Decimal's 96 bits, so the accepted literal
+        // one below the precision bound lands on the high-precision kind rather than on
+        // System.Decimal. Both are decimals; which one is a storage question and not a range one.
+        Assert.Equal(LiteralValue.Kind.HighPrecisionDecimal,
+            Assert.IsType<LiteralExpression>(Parse("1e37BD")).Value.Type);
+        Assert.Equal(LiteralValue.Kind.Decimal,
+            Assert.IsType<LiteralExpression>(Parse("9223372036854775808")).Value.Type);
+    }
+
     [Fact]
     public void ASubqueryIsRefusedForBeingASubqueryRatherThanForAStrayParenthesis()
     {
