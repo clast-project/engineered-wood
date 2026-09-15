@@ -1576,6 +1576,147 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal(seconds, result.GetTimestamp(0)!.Value.ToUnixTimeSeconds());
     }
 
+    // ── A numeric cast to TIMESTAMP keeps its fraction (#329) ───────────────────────────────
+
+    /// <summary>
+    /// A fractional epoch second reaches the microsecond field instead of being thrown away.
+    /// </summary>
+    /// <remarks>
+    /// <b>Every expectation is Spark's own <c>CAST(… AS STRING)</c> rendering</b>, measured on
+    /// 4.0.1 / JDK 17 under both dialects, which agree. Asked for as text on purpose: the interop
+    /// driver localises a collected timestamp to the harvest machine's zone, so a raw value would
+    /// have to be un-shifted before it could be compared and the fraction is the only part that
+    /// survives that unharmed.
+    /// <para>
+    /// <b>The negative rows are the ones that matter.</b> Truncating the SECONDS — which is what
+    /// <c>decimal.Truncate(seconds)</c> did — moves a pre-epoch instant AWAY from zero and so past
+    /// the true instant: -2.5s landed on 23:59:58 where Spark says 23:59:57.5. A test with only
+    /// positive rows is satisfied by rounding, by flooring and by truncating alike.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("CAST(g AS TIMESTAMP)", 2.5, "1970-01-01T00:00:02.5000000Z")]
+    [InlineData("CAST(g AS TIMESTAMP)", -2.5, "1969-12-31T23:59:57.5000000Z")]
+    // Truncated, not rounded: .9999999 stays inside the same second rather than becoming the next.
+    [InlineData("CAST(g AS TIMESTAMP)", 1.9999999, "1970-01-01T00:00:01.9999990Z")]
+    // Below a microsecond there is nothing to keep, and it does not round up into one.
+    [InlineData("CAST(g AS TIMESTAMP)", 0.0000005, "1970-01-01T00:00:00.0000000Z")]
+    public void AFractionalEpochSecondKeepsItsMicroseconds(string sql, double value, string expected)
+    {
+        var batch = Batch(("g", Doubles(value)));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Assert.IsType<TimestampArray>(Eval(registry, sql, batch));
+            Assert.Equal(
+                DateTimeOffset.Parse(expected, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                result.GetTimestamp(0)!.Value);
+        }
+    }
+
+    /// <summary>The same rule through the other two fractional sources.</summary>
+    /// <remarks>
+    /// A FLOAT and a DECIMAL reach <c>CastToTimestamp</c> by different roads than a double, so
+    /// each is asked rather than assumed. Spark, both dialects:
+    /// <c>CAST(CAST(1.5 AS FLOAT) AS TIMESTAMP)</c> is <c>1970-01-01 00:00:01.5</c> and
+    /// <c>CAST(CAST(-12.34 AS DECIMAL(10,2)) AS TIMESTAMP)</c> is <c>1969-12-31 23:59:47.66</c>.
+    /// </remarks>
+    [Fact]
+    public void AFloatAndADecimalKeepTheirMicrosecondsToo()
+    {
+        var floats = Batch(("f", Floats(1.5f)));
+        Assert.Equal(
+            DateTimeOffset.Parse("1970-01-01T00:00:01.5000000Z", CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind),
+            Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(f AS TIMESTAMP)", floats)).GetTimestamp(0)!.Value);
+
+        var decimals = Batch(("d", Decimals(10, 2, 12.34m, -12.34m)));
+        var result = Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(d AS TIMESTAMP)", decimals));
+
+        Assert.Equal(
+            DateTimeOffset.Parse("1970-01-01T00:00:12.3400000Z", CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind),
+            result.GetTimestamp(0)!.Value);
+        Assert.Equal(
+            DateTimeOffset.Parse("1969-12-31T23:59:47.6600000Z", CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind),
+            result.GetTimestamp(1)!.Value);
+    }
+
+    /// <summary>Both ends of the representable range survive the move to microseconds.</summary>
+    /// <remarks>
+    /// The arithmetic behind a numeric cast is now a tick count off the epoch rather than a
+    /// second count, which multiplies the magnitude by 10^7 and is exactly where an edge would
+    /// overflow. Both bounds are reached rather than approached: the lower one lands on
+    /// <see cref="DateTimeOffset.MinValue"/> to the tick, so a negative remainder that wrapped
+    /// would not be subtle. The upper bound has its own test above;
+    /// this adds the end that only a negative tick count can reach.
+    /// </remarks>
+    [Fact]
+    public void TheLowestRepresentableEpochSecondStillConverts()
+    {
+        var batch = Batch(("d", Decimals(20, 0, -62_135_596_800m)));   // 0001-01-01T00:00:00Z
+
+        Assert.Equal(
+            DateTimeOffset.MinValue,
+            Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(d AS TIMESTAMP)", batch)).GetTimestamp(0)!.Value);
+    }
+
+    /// <summary>An integral source is still seconds, which is what keeps the two rules apart.</summary>
+    /// <remarks>
+    /// The control for both #329 and #330. If a fix reached this row it would be reading every
+    /// number as microseconds, and <c>CAST(CAST(10 AS BIGINT) AS TIMESTAMP)</c> would become
+    /// 10 microseconds past the epoch instead of ten seconds. Measured in Spark: 00:00:10.
+    /// </remarks>
+    [Fact]
+    public void AnIntegralEpochSecondIsStillSeconds()
+    {
+        var batch = Batch(("b", Longs(10L)));
+
+        Assert.Equal(
+            10L,
+            Assert.IsType<TimestampArray>(Eval(Ansi, "CAST(b AS TIMESTAMP)", batch))
+                .GetTimestamp(0)!.Value.ToUnixTimeSeconds());
+    }
+
+    // ── A boolean cast to TIMESTAMP is MICROseconds (#330) ──────────────────────────────────
+
+    /// <summary>
+    /// <c>CAST(true AS TIMESTAMP)</c> is the epoch plus one MICROsecond, not plus one second.
+    /// </summary>
+    /// <remarks>
+    /// <b>Boolean is the one source family that is not a number of seconds</b>, and the pairing
+    /// with <see cref="AnIntegralEpochSecondIsStillSeconds"/> is the whole content of the rule:
+    /// Spark hands the flag's 1 straight to the microsecond field. Measured on 4.0.1 with ansi
+    /// off — the only dialect that allows the cast at all, since ANSI refuses it as
+    /// <c>DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION</c>. Both registries are asked here anyway,
+    /// because reproducing that refusal is the cast-table question in #286 and until it is
+    /// answered the two dialects must at least agree with each other on the value.
+    /// <para>
+    /// A null flag stays null: there is no value to read as anything.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ABooleanCastToTimestampIsMicroseconds()
+    {
+        var batch = Batch(("bl", Booleans(true, false, null)));
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Assert.IsType<TimestampArray>(Eval(registry, "CAST(bl AS TIMESTAMP)", batch));
+
+            Assert.Equal(
+                DateTimeOffset.Parse("1970-01-01T00:00:00.0000010Z", CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind),
+                result.GetTimestamp(0)!.Value);
+            Assert.Equal(
+                DateTimeOffset.Parse("1970-01-01T00:00:00.0000000Z", CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind),
+                result.GetTimestamp(1)!.Value);
+            Assert.Null(result.GetTimestamp(2));
+        }
+    }
+
     // ── nullif over operands with no exact System.Decimal form (#290) ───────────────────────
 
     /// <summary>
