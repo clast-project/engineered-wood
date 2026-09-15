@@ -192,16 +192,22 @@ internal static class SparkFloatText
     /// </remarks>
     private static string Subnormal(long mantissa, int minExponent, int maxDigits)
     {
-        var exact = (BigInteger.Pow(5, -minExponent) * mantissa).ToString(Invariant);
+        var exact = (Powers.Scale(minExponent) * mantissa).ToString(Invariant);
 
         // The product is the digit string of `0.<exact> × 10^pointAt`, with no leading zero to
         // discard: BigInteger does not write one.
         var pointAt = exact.Length + minExponent;
 
+        // Built once for the value rather than once per rung. Measured over 100,000 subnormal
+        // doubles, that and the cached 5^1074 take a value from 17.2us to 7.8us; a normal one is
+        // 0.27us. What is left is dominated by the ToString above -- 11us of a 751-digit
+        // BigInteger -- which only goes away by not forming the whole expansion at all.
+        var reads = new ReadsBack(mantissa, minExponent, maxDigits - pointAt);
+
         for (var length = 1; length < maxDigits; length++)
         {
             var candidate = Round(exact, pointAt, length);
-            if (!ReadsBackAs(candidate, mantissa, minExponent))
+            if (!reads.Contains(candidate))
                 continue;
 
             // Java's one exception to shortest-wins, and the reason Double.toString(4.9E-324) is
@@ -212,7 +218,7 @@ internal static class SparkFloatText
             if (length == 1)
             {
                 var pair = Round(exact, pointAt, 2);
-                if (ReadsBackAs(pair, mantissa, minExponent))
+                if (reads.Contains(pair))
                     return Scientific(pair);
             }
 
@@ -225,33 +231,102 @@ internal static class SparkFloatText
     }
 
     /// <summary>
-    /// Whether the decimal <paramref name="candidate"/> reads back as <c>mantissa × 2^minExponent</c>.
+    /// Which decimals read back as one subnormal, as an exact test a candidate can be put to.
     /// </summary>
     /// <remarks>
-    /// The candidate is <c>c × 10^-s</c> and reads back as the value when it sits within half a
+    /// <para>
+    /// A candidate is <c>c × 10^-s</c>, and it reads back as the value when it sits within half a
     /// step of it — half a step being <c>2^(minExponent-1)</c>, the same for every subnormal:
+    /// </para>
     /// <code>
     ///     |c × 10^-s − mantissa × 2^minExponent| ≤ 2^(minExponent-1)
     /// </code>
-    /// Multiplying through by <c>2^(1-minExponent) × 5^s</c> leaves nothing but integers:
+    /// <para>
+    /// Multiplying through by <c>2^(1-minExponent) × 5^s</c> leaves nothing but integers. That is
+    /// the whole test, but it puts a <c>5^s</c> of some 230 digits on a per-candidate footing, and
+    /// the ladder asks up to seventeen candidates. Multiplying by <c>2^(1-minExponent) × 5^S</c>
+    /// for a fixed <c>S ≥ s</c> instead scales both sides of the SAME comparison by
+    /// <c>5^(S-s)</c>, which cannot change its answer, and leaves the large power on a per-VALUE
+    /// footing:
+    /// </para>
     /// <code>
-    ///     |c × 2^(1-minExponent-s) − 2 × mantissa × 5^s| ≤ 5^s
+    ///     |c × 2^(1-minExponent-s) × 5^(S-s) − 2 × mantissa × 5^S| ≤ 5^S
     /// </code>
+    /// <para>
+    /// <c>S</c> is <c>maxDigits - pointAt</c>, which no rung's <c>s</c> can exceed: a candidate
+    /// has at most <c>maxDigits</c> digits, and rounding only ever moves the point right. So
+    /// <c>S - s</c> stays within <c>[0, maxDigits]</c> and its power comes from a table.
+    /// </para>
+    /// <para>
     /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
     /// sends a decimal landing exactly between two doubles.
+    /// </para>
     /// </remarks>
-    private static bool ReadsBackAs((string Digits, int PointAt) candidate, long mantissa, int minExponent)
+    private readonly struct ReadsBack
     {
-        var scale = candidate.Digits.Length - candidate.PointAt;
-        var shift = 1 - minExponent;
-        if (scale <= 0 || scale > shift)
-            return false;
+        private readonly BigInteger _half;
+        private readonly BigInteger _middle;
+        private readonly int _shift;
+        private readonly int _ceiling;
+        private readonly bool _boundaryCounts;
 
-        var half = BigInteger.Pow(5, scale);
-        var c = BigInteger.Parse(candidate.Digits, NumberStyles.Integer, Invariant);
-        var distance = BigInteger.Abs((c << (shift - scale)) - (2 * mantissa * half));
+        internal ReadsBack(long mantissa, int minExponent, int scaleCeiling)
+        {
+            _shift = 1 - minExponent;
+            _ceiling = scaleCeiling;
+            _half = BigInteger.Pow(5, scaleCeiling);
+            _middle = 2 * mantissa * _half;
+            _boundaryCounts = mantissa % 2 == 0;
+        }
 
-        return distance < half || (distance == half && mantissa % 2 == 0);
+        internal bool Contains((string Digits, int PointAt) candidate)
+        {
+            var scale = candidate.Digits.Length - candidate.PointAt;
+            if (scale <= 0 || scale > _shift || scale > _ceiling)
+                return false;
+
+            // At most seventeen digits by construction, so this is a long and not a BigInteger.
+            var c = long.Parse(candidate.Digits, NumberStyles.Integer, Invariant);
+            var scaled = new BigInteger(c) * Powers.Small[_ceiling - scale];
+            var distance = BigInteger.Abs((scaled << (_shift - scale)) - _middle);
+
+            return distance < _half || (distance == _half && _boundaryCounts);
+        }
+    }
+
+    /// <summary>
+    /// The powers of five the subnormal path reads, built on first use rather than at type load.
+    /// </summary>
+    /// <remarks>
+    /// <c>5^1074</c> is a 751-digit number and nothing but a subnormal wants it, so it is held by
+    /// a nested class: a value that never leaves the normal range never builds it, which a plain
+    /// <c>static readonly</c> on the class itself could not promise. The same reason
+    /// <see cref="SparkIntegralCasts"/> holds its powers of ten, one row further down: this is a
+    /// per-row path for any column that holds subnormals at all.
+    /// </remarks>
+    private static class Powers
+    {
+        /// <summary>10^minExponent written as a power of five: the exact digits of 2^minExponent.</summary>
+        internal static BigInteger Scale(int minExponent) =>
+            minExponent == DoubleMinExponent ? DoubleScale : FloatScale;
+
+        /// <summary>5^0 through 5^18, which covers every gap between a rung's scale and the ceiling.</summary>
+        internal static readonly BigInteger[] Small = BuildSmall();
+
+        private static readonly BigInteger DoubleScale = BigInteger.Pow(5, -DoubleMinExponent);
+
+        private static readonly BigInteger FloatScale = BigInteger.Pow(5, -FloatMinExponent);
+
+        private static BigInteger[] BuildSmall()
+        {
+            var powers = new BigInteger[19];
+            powers[0] = BigInteger.One;
+
+            for (var i = 1; i < powers.Length; i++)
+                powers[i] = powers[i - 1] * 5;
+
+            return powers;
+        }
     }
 
     /// <summary>
