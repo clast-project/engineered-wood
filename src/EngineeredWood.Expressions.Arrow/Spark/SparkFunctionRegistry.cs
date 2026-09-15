@@ -54,8 +54,8 @@ public sealed class SparkFunctionRegistry
     private const decimal MicrosecondsPerSecond = 1_000_000m;
 
     /// <summary>
-    /// <see cref="TimeSpan.TicksPerMicrosecond"/>, spelled out because it is .NET 7 and this
-    /// library still builds for netstandard2.0.
+    /// <c>TimeSpan.TicksPerMicrosecond</c>, spelled out because it is .NET 7 and this library
+    /// still builds for netstandard2.0 — where a <c>cref</c> to it does not resolve either.
     /// </summary>
     private const long TicksPerMicrosecond = 10L;
 

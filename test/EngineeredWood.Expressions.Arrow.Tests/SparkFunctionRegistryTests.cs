@@ -1595,16 +1595,21 @@ public sealed class SparkFunctionRegistryTests
     /// </para>
     /// </remarks>
     [Theory]
-    [InlineData("CAST(g AS TIMESTAMP)", 2.5, "1970-01-01T00:00:02.5000000Z")]
-    [InlineData("CAST(g AS TIMESTAMP)", -2.5, "1969-12-31T23:59:57.5000000Z")]
+    [InlineData(2.5, "1970-01-01T00:00:02.5000000Z")]
+    [InlineData(-2.5, "1969-12-31T23:59:57.5000000Z")]
     // Truncated, not rounded: .9999999 stays inside the same second rather than becoming the next.
-    [InlineData("CAST(g AS TIMESTAMP)", 1.9999999, "1970-01-01T00:00:01.9999990Z")]
+    [InlineData(1.9999999, "1970-01-01T00:00:01.9999990Z")]
     // Below a microsecond there is nothing to keep, and it does not round up into one.
-    [InlineData("CAST(g AS TIMESTAMP)", 0.0000005, "1970-01-01T00:00:00.0000000Z")]
-    public void AFractionalEpochSecondKeepsItsMicroseconds(string sql, double value, string expected)
+    [InlineData(0.0000005, "1970-01-01T00:00:00.0000000Z")]
+    public void AFractionalEpochSecondKeepsItsMicroseconds(double value, string expected)
     {
         var batch = Batch(("g", Doubles(value)));
 
+        // Both forms, because `try_cast` dispatches with `raising: false` and so reaches
+        // CastToTimestamp down a different argument than CAST does. The VALUE cannot differ
+        // between them — nothing here can fail, so the flag is never read on this path — and
+        // asking anyway is what would catch a future refusal being added to one and not the other.
+        foreach (var sql in new[] { "CAST(g AS TIMESTAMP)", "TRY_CAST(g AS TIMESTAMP)" })
         foreach (var registry in new[] { Ansi, Legacy })
         {
             var result = Assert.IsType<TimestampArray>(Eval(registry, sql, batch));
@@ -1701,9 +1706,14 @@ public sealed class SparkFunctionRegistryTests
     {
         var batch = Batch(("bl", Booleans(true, false, null)));
 
+        // `try_cast` matters more here than it does for a fraction. A boolean is answered off the
+        // column's TYPE and returns before the row loop, so this is the one source family whose
+        // conversion never passes through the `raising` plumbing at all — the early return is
+        // exactly the kind of shortcut that can reach one form and not the other.
+        foreach (var sql in new[] { "CAST(bl AS TIMESTAMP)", "TRY_CAST(bl AS TIMESTAMP)" })
         foreach (var registry in new[] { Ansi, Legacy })
         {
-            var result = Assert.IsType<TimestampArray>(Eval(registry, "CAST(bl AS TIMESTAMP)", batch));
+            var result = Assert.IsType<TimestampArray>(Eval(registry, sql, batch));
 
             Assert.Equal(
                 DateTimeOffset.Parse("1970-01-01T00:00:00.0000010Z", CultureInfo.InvariantCulture,
