@@ -325,19 +325,13 @@ public sealed class SparkEvaluationCorpusTests
             ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
             ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
 
-            // #296, found by the `unicode-digits` group and nothing to do with the digit:
-            // ArithmeticResult has no string branch at all, so any string operand reaches
-            // IntegralRank and throws. #180/#259 did this for comparison and arithmetic was never
-            // measured.
-            //
-            // IT IS DECLARED HERE AND NOT IN THE ANSI LIST BECAUSE ONLY THIS DIALECT SEES IT.
-            // The comparison counts any throw as agreement when Spark refuses, and under ANSI
-            // Spark refuses this string as a BIGINT -- so the ANSI section passes on a right
-            // answer for a wrong reason, and the legacy section, where Spark answers NULL, is the
-            // only place the gap is visible. Deleting this entry once #296 lands is what proves
-            // the fix; the ANSI side would not have moved either way.
-            ["'" + Backslash + "u0663' + 1"] =
-                "#296: arithmetic has no string coercion; we throw",
+            // `'\u0663' + 1` used to sit here as #296: arithmetic had no string branch at all,
+            // so every string operand reached IntegralRank and threw. It is gone because the
+            // `arithmetic-string-coercion` group now measures both dialects' rules and the
+            // registry reproduces them -- and the entry could only ever have been deleted from
+            // THIS list, since the ANSI section passed throughout on a right answer for a wrong
+            // reason (Spark refuses the string as a BIGINT, and any throw reads as agreement).
+
             // #318, as in the ANSI list. Both dialects see it, and they see it differently:
             // under ANSI Spark refuses and we answer, here Spark answers NULL and we answer a
             // date -- the ordinary raise-or-null split around one wrong acceptance.
@@ -464,6 +458,11 @@ public sealed class SparkEvaluationCorpusTests
     [InlineData("decimal-literal-precision")]
     [InlineData("decimal-common-type")]
     [InlineData("coercion")]
+    // #296, and the group that needs this gate most: its rule is a CAST TARGET, and the two
+    // candidates agree on the value. `'1' + 1` is 2 whichever type the string took, so an
+    // evaluation comparison cannot tell a bigint from a double and this is the only test that
+    // can.
+    [InlineData("arithmetic-string-coercion")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -477,11 +476,16 @@ public sealed class SparkEvaluationCorpusTests
     /// above would pass unchanged if the legacy registry started resolving a different decimal,
     /// since the two evaluation gates either side of it compare VALUES, which carry no scale.
     /// The `coercion` group is absent here because it is not in the harvest's `LEGACY_GROUPS`,
-    /// so there is no second section for it to check.
+    /// so there is no second section for it to check; `arithmetic-string-coercion` is present
+    /// for the opposite reason — it is harvested twice precisely because its answers move.
     /// </remarks>
     [Theory]
     [InlineData("decimal-literal-precision")]
     [InlineData("decimal-common-type")]
+    // ...and here it is not a claim about dialect-independence at all: these types are the half
+    // of #296 that DIFFERS, since a string this dialect reads as a double is one ANSI reads as a
+    // bigint.
+    [InlineData("arithmetic-string-coercion")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
