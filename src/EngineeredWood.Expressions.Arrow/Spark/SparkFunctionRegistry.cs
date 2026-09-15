@@ -386,6 +386,9 @@ public sealed class SparkFunctionRegistry
 
     private IArrowArray Arithmetic(string op, IArrowArray left, IArrowArray right, int rowCount)
     {
+        if (left.Data.DataType is StringType || right.Data.DataType is StringType)
+            (left, right) = CoerceStringOperand(op, left, right, rowCount);
+
         var result = SparkNumericTypes.ArithmeticResult(op, left.Data.DataType, right.Data.DataType);
 
         return result switch
@@ -396,6 +399,148 @@ public sealed class SparkFunctionRegistry
             _ => IntegralArithmetic(op, left, right, result, rowCount),
         };
     }
+
+    /// <summary>
+    /// Casts a string operand of an arithmetic operator to the type Spark reads it as.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #296, and the arithmetic half of what #180/#259 did for comparison. Spark casts the STRING
+    /// side — it never renders the number as text — and the two dialects pick different targets,
+    /// exactly as they do for a comparison:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><b>The legacy dialect sends it to <c>double</c>, always.</b> Measured with the
+    ///     value discriminators, not read off a type: <c>'1000000000000000000000000000001' +
+    ///     CAST(0 AS DECIMAL(38,0))</c> is <c>1e30</c> rather than the exact sum, and
+    ///     <c>'0.1' + CAST(0 AS FLOAT)</c> is the double 0.1 rather than the float one.</item>
+    ///   <item><b>ANSI sends it to the OTHER operand's family</b> — <c>bigint</c> against any
+    ///     integral width, <c>double</c> against a float, a double or a decimal. The integral
+    ///     target is bigint whatever the other operand is: measured,
+    ///     <c>'32768' + CAST(0 AS SMALLINT)</c> is 32768 and not an overflow.</item>
+    /// </list>
+    /// <para>
+    /// <b>The target is the same for <c>/</c>, even though a division's RESULT is always a
+    /// double.</b> That is the rule the issue's table stated the other way round, and one
+    /// expression separates them: under ANSI <c>'1.5' / 3</c> raises CAST_INVALID_INPUT, because
+    /// the string is read as a bigint before the division widens anything, while
+    /// <c>'1.5' / g</c> answers 0.6. So the dialect decides which strings are ACCEPTED and not
+    /// only what type comes back — ANSI's integral target inherits #258's integral TEXT rule,
+    /// under which <c>'1.5'</c> and <c>'1e3'</c> are not integers at all.
+    /// </para>
+    /// <para>
+    /// <b>Two strings are not an arithmetic pair under ANSI</b>, for any of the five operators:
+    /// <c>'1' + '2'</c> is a DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE where the legacy dialect
+    /// answers the double 3.0. <b>Neither is a string against a bare <c>NULL</c></b> — measured,
+    /// <c>'1' + NULL</c> refuses under ANSI while <c>'1' + CAST(NULL AS INT)</c> is a perfectly
+    /// good bigint null, so it is the absence of a type that refuses rather than the nullness.
+    /// A refusal is spelled as a throw, which is what the pair already did.
+    /// </para>
+    /// <para>
+    /// Boolean, date, timestamp and binary refuse in BOTH dialects and reach that by the same
+    /// route: no target, so the pair throws as it did before.
+    /// </para>
+    /// <para>
+    /// <b>A ROW WHOSE OTHER OPERAND IS NULL IS NOT CAST</b>, which is the same short-circuit
+    /// <see cref="CastForEquality"/> reproduces for a comparison and the reason
+    /// <see cref="NulledWhereOtherIsNull"/> is reached from two places. Spark evaluates nothing
+    /// once an operand of a null-intolerant operator is null, so a malformed string sitting
+    /// opposite one is never read and never refused. <b>It is symmetric</b>, which is the part
+    /// worth measuring rather than deriving from "the left child goes first": over a batch of
+    /// <c>(a = 1, s = '1')</c> and <c>(a = NULL, s = 'abc')</c>, ANSI answers <c>[2, null]</c> for
+    /// <c>a + s</c> AND for <c>s + a</c>, and raises for both the moment the same <c>'abc'</c>
+    /// sits beside a non-null <c>a</c>. Every operator behaves this way, and <c>-s</c> does not,
+    /// having no other operand to be null.
+    /// </para>
+    /// <para>
+    /// Without the mask a batch mixing one such row with an ordinary one refuses arithmetic Spark
+    /// answers — fail-CLOSED, and inside a Delta CHECK constraint that is a rejected write rather
+    /// than a wrong value. <b>The corpus cannot see it</b>: its rows are ordinary or entirely
+    /// null, so no row ever puts a malformed string beside a null number. Asserted over a batch
+    /// built for it in <c>ArithmeticStringCoercionTests</c> instead.
+    /// </para>
+    /// </remarks>
+    private (IArrowArray Left, IArrowArray Right) CoerceStringOperand(
+        string op, IArrowArray left, IArrowArray right, int rowCount)
+    {
+        var leftIsString = left.Data.DataType is StringType;
+        var rightIsString = right.Data.DataType is StringType;
+
+        if (leftIsString && rightIsString)
+        {
+            if (_options.Ansi)
+                throw new NotSupportedException($"'{op}' is not defined over two strings");
+
+            return (CastForArithmetic(left, DoubleType.Default, rowCount),
+                    CastForArithmetic(right, DoubleType.Default, rowCount));
+        }
+
+        var other = (leftIsString ? right : left).Data.DataType;
+        var target = ArithmeticStringTarget(other)
+            ?? throw new NotSupportedException(
+                $"arithmetic is not defined for utf8 and {other.Name}");
+
+        // Masked before it is cast, and in EITHER operand order -- see the remarks.
+        return leftIsString
+            ? (CastForArithmetic(NulledWhereOtherIsNull(left, right, rowCount), target, rowCount),
+               right)
+            : (left,
+               CastForArithmetic(NulledWhereOtherIsNull(right, left, rowCount), target, rowCount));
+    }
+
+    /// <summary>
+    /// The type a string operand of an arithmetic operator is read as, against
+    /// <paramref name="other"/>; null when the pair has no rule and is refused.
+    /// </summary>
+    /// <remarks>
+    /// Close to <see cref="StringComparisonTarget"/> and deliberately not it. The ANSI halves
+    /// agree — bigint for an integral, double for anything else numeric — and the legacy halves
+    /// do not: a comparison casts the string to the other operand's OWN type, where arithmetic
+    /// sends it to double whatever the other operand is. Measured one expression apart,
+    /// <c>'0.1' = CAST(0.1 AS FLOAT)</c> is true (compared as floats) while
+    /// <c>'0.1' + CAST(0 AS FLOAT)</c> is the double 0.1. The other difference is <c>void</c>,
+    /// which a comparison has no case for and arithmetic must refuse under ANSI.
+    /// </remarks>
+    private IArrowType? ArithmeticStringTarget(IArrowType other)
+    {
+        // PAST SPARK'S MAXIMUM PRECISION THERE IS NO RULE, so there is no target either -- the
+        // same line `LegacyTarget` draws for a comparison, and drawn here for a second reason.
+        // Parquet's decimal runs wider than Spark's, so `ArrowSchemaConverter` builds a
+        // Decimal256Type above precision 38, and no Spark expression can name such a type: nothing
+        // measured says what adding a string to one means. Declining also keeps the refusal at the
+        // coercion site, where it can name the pair, rather than leaving it to
+        // `SparkArrays.ReadDouble`, whose numeric cases stop at Decimal128Array. The pair threw
+        // before this method existed and still throws; only the message moves.
+        if (other is Decimal256Type)
+            return null;
+
+        // A `void` operand takes the legacy target like any other, which is what makes
+        // `'1' + NULL` a column of double nulls rather than a refusal in this dialect.
+        if (!_options.Ansi)
+            return SparkNumericTypes.IsNumeric(other) || other is NullType
+                ? DoubleType.Default
+                : null;
+
+        if (SparkNumericTypes.IsIntegral(other))
+            return Int64Type.Default;
+
+        return SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other)
+            ? DoubleType.Default
+            : null;
+    }
+
+    /// <summary>
+    /// The cast an arithmetic operator inserts on its string operand.
+    /// </summary>
+    /// <remarks>
+    /// The SAME cast <c>CAST(...)</c> reaches, for the reason
+    /// <see cref="CastForComparison"/> is: a string arithmetic accepts is exactly a string the
+    /// explicit cast accepts, and under the legacy dialect one it refuses is a null rather than a
+    /// raise. Measured, <c>'abc' + 1</c> raises CAST_INVALID_INPUT under ANSI and is NULL without
+    /// it.
+    /// </remarks>
+    private IArrowArray CastForArithmetic(IArrowArray operand, IArrowType target, int rowCount) =>
+        Cast(operand, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
 
     /// <summary>
     /// Integral arithmetic, computed at 64 bits and then required to fit the result width.
@@ -632,6 +777,14 @@ public sealed class SparkFunctionRegistry
     /// </remarks>
     private IArrowArray Negate(IArrowArray operand, int rowCount)
     {
+        // A string negates as a DOUBLE, in BOTH dialects -- which is the one place #296's two
+        // rules agree, and it disagrees with the binary operators in the dialect that has a rule
+        // of its own: measured, `-'1'` is the double -1.0 under ANSI while `'1' + 1` is a bigint.
+        // Spark reads it through the same non-integral cast in either case, so `-'1e3'` is -1000.0
+        // where `'1e3' + 1` refuses. #296.
+        if (operand.Data.DataType is StringType)
+            operand = CastForArithmetic(operand, DoubleType.Default, rowCount);
+
         var type = SparkNumericTypes.NegateResult(operand.Data.DataType);
 
         return type switch

@@ -134,7 +134,12 @@ LEGACY_GROUPS = (
     # cast whose answer the switch does move. Asked twice to find out whether this is another, for
     # the reason decimal-common-type is asked twice: the registry has a legacy variant that shares
     # every one of these code paths.
-    "negative-zero")
+    "negative-zero",
+    # #296. THE WHOLE POINT OF THE GROUP is that the two dialects read a string operand as
+    # different types, so one harvest would record half a rule -- and the ANSI half is the half
+    # that hides, since a refusal reads as agreement against a registry that throws. It was the
+    # legacy section of `unicode-digits` that found the defect for exactly that reason.
+    "arithmetic-string-coercion")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -2693,6 +2698,74 @@ GROUPS = {
         # stop at bigint: past it the literal becomes a DECIMAL. The control that says "out of
         # range for the type" is a floating-point rule and not a numeric-literal rule. #173.
         "9223372036854775808", "-9223372036854775809",
+    ],
+
+    # What a string operand of an ARITHMETIC operator is read as, which #180/#259 measured for
+    # comparison and left unmeasured here. The dialects pick different targets again, and this
+    # time the target decides which strings are ACCEPTED rather than only what type comes back:
+    # ANSI's integral target inherits #258's integral TEXT rule, under which '1.5' is not a
+    # number at all. #296.
+    "arithmetic-string-coercion": [
+        # The four rows that separate the two rules. Legacy reads every string as a DOUBLE;
+        # ANSI reads it as the other operand's family, so an integral operand makes '1.5' and
+        # '1e3' refusals rather than 2.5 and 1001.0.
+        "'1.5' + 1", "'1e3' + 1", "'abc' + 1", "'1' + 1",
+
+        # Every operator, so the rule is arithmetic's and not addition's...
+        "'1' - 1", "'2' * 3", "'7' % 3", "'6' / 2",
+
+        # ...and `/` is the sharp one. Its RESULT is a double whatever the operands are, and the
+        # string is still read as a BIGINT against an integral: `'1.5' / 3` refuses under ANSI
+        # while `'1.5' / g` answers. Two expressions that would agree under "`/` is double".
+        "'1.5' / 3", "'1e3' / 2", "'1.5' / g", "'1.5' % 2", "fs / a", "fs % a", "fs % g",
+
+        # The other operand's type, across the numeric families. The integral target is BIGINT
+        # at every width -- '32768' against a smallint is 32768 and not an overflow -- and a
+        # decimal goes to DOUBLE under both dialects, which is not what a comparison does.
+        "'1' + sh", "'1' + b", "'1' + CAST(1 AS TINYINT)", "'1' + f", "'1' + g", "'1' + d1",
+        "'1' + d5", "'32768' + CAST(0 AS SMALLINT)", "'2147483648' + CAST(0 AS INT)",
+        "'1' + CAST(1 AS DECIMAL(10,2))",
+
+        # The value discriminators for the target, each sharp because the two candidates answer
+        # differently: 10^30+1 is exact as a decimal(38,0) and is not as a double, and 0.1 is
+        # exact as a float and is not as a double.
+        "'1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0))",
+        "'1000000000000000000000000000001' * CAST(1 AS DECIMAL(38,0))",
+        "'0.1' + CAST(0 AS FLOAT)", "'0.1' * CAST(1 AS FLOAT)",
+
+        # Either operand order, and a column rather than a literal on each side: measured
+        # identical, so one rule covers all four shapes.
+        "1 + '1'", "1 - '2'", "3 * '2'", "3 % '7'", "2 / '6'", "1 + '1.5'", "1.5 + '1'",
+        "g + '1'", "d1 + '1'", "ns + a", "a + ns", "s + a", "fs + a", "fs + g",
+        "s * 2", "ns % a", "ns - b", "ns + d4", "ns / g", "ns / a",
+
+        # TWO STRINGS ARE NOT AN ARITHMETIC PAIR UNDER ANSI, for any of the five operators --
+        # the legacy dialect answers a double. Same shape as the `bl IN ('true')` split.
+        "'1' + '2'", "'1' - '2'", "'1' * '2'", "'1' / '2'", "'1' % '2'",
+        "ns + ns", "ns / ns", "ns + '2'", "ns + fs",
+
+        # ...and neither is a string against a bare NULL. It is the absence of a TYPE that
+        # refuses rather than the nullness: `'1' + CAST(NULL AS INT)` is a perfectly good bigint
+        # null one expression away.
+        "'1' + NULL", "NULL + '1'", "ns + NULL", "'1' / NULL", "'1' % NULL",
+        "'1' + CAST(NULL AS INT)", "'1' + CAST(NULL AS DOUBLE)", "'1' + CAST(NULL AS STRING)",
+
+        # UNARY MINUS IS THE ONE PLACE THE TWO DIALECTS AGREE: a double in both, even against
+        # the integral shape where binary `+` is a bigint. So `-'1e3'` is -1000.0 where
+        # `'1e3' + 1` refuses -- one exponent, two answers, one dialect.
+        "-'1'", "-'1.5'", "-'1e3'", "-'abc'", "-''", "-'  1  '", "-'1d'", "-ns", "-s", "-fs",
+        "-CAST(NULL AS STRING)", "-'1' + 1", "- -'1'",
+        # A negative zero, which is what says the string reached a DOUBLE rather than a parse
+        # that dropped the sign. #282.
+        "-'0'",
+
+        # What the ANSI cast accepts on the way through, since the integral target is the strict
+        # one: padding is trimmed, an empty string is not a zero, 20 digits do not fit a bigint,
+        # and a value that does fit can still overflow the ADDITION.
+        "' 1 ' + 1", "'' + 1", "'99999999999999999999' + 1", "'9223372036854775807' + 1",
+
+        # The pairs with no rule in EITHER dialect, so the refusal is not ANSI's alone.
+        "'1' + bl", "'1' + ts", "'1' + X'41'", "'1' + dt", "dt + '1'",
     ],
 
     "malformed": [

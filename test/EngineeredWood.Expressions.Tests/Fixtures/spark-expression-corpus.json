@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-14 19:57:54.963695",
-      "2026-09-14 19:57:54.963695",
-      "2026-09-14 19:57:54.963695"
+      "2026-09-14 20:51:42.436724",
+      "2026-09-14 20:51:42.436724",
+      "2026-09-14 20:51:42.436724"
      ]
     }
    },
@@ -31087,6 +31087,1624 @@
     }
    }
   ],
+  "arithmetic-string-coercion": [
+   {
+    "expression": "'1.5' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1.5' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1.5' + 1) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1e3' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1e3' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1e3' + 1) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'abc' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('abc' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('abc' + 1) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "'1' - 1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "('1' - 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      0,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "'2' * 3",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "('2' * 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      6,
+      6,
+      6
+     ]
+    }
+   },
+   {
+    "expression": "'7' % 3",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "('7' % 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "'6' / 2",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('6' / 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.0,
+      3.0,
+      3.0
+     ]
+    }
+   },
+   {
+    "expression": "'1.5' / 3",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('1.5' / 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1.5' / 3) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1e3' / 2",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('1e3' / 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1e3' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1e3' / 2) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1.5' / g",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('1.5' / g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 2) ==\n('1.5' / g) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1.5' % 2",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "('1.5' % 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('1.5' % 2) AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs / a",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(fs / a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs / a) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs % a",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(fs % a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs % a) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs % g",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(fs % g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 2) ==\n(fs % g) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1' + sh",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "'1' + b",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      11,
+      null,
+      1
+     ]
+    }
+   },
+   {
+    "expression": "'1' + CAST(1 AS TINYINT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + CAST(1 AS TINYINT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "'1' + f",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + f)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      null,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "'1' + g",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.5,
+      null,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "'1' + d1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      13.34,
+      null,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "'1' + d5",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.1,
+      null,
+      1.5
+     ]
+    }
+   },
+   {
+    "expression": "'32768' + CAST(0 AS SMALLINT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('32768' + CAST(0 AS SMALLINT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      32768,
+      32768,
+      32768
+     ]
+    }
+   },
+   {
+    "expression": "'2147483648' + CAST(0 AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('2147483648' + CAST(0 AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2147483648,
+      2147483648,
+      2147483648
+     ]
+    }
+   },
+   {
+    "expression": "'1' + CAST(1 AS DECIMAL(10,2))",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + CAST(1 AS DECIMAL(10,2)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.0,
+      2.0,
+      2.0
+     ]
+    }
+   },
+   {
+    "expression": "'1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+30,
+      1e+30,
+      1e+30
+     ]
+    }
+   },
+   {
+    "expression": "'1000000000000000000000000000001' * CAST(1 AS DECIMAL(38,0))",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "('1000000000000000000000000000001' * CAST(1 AS DECIMAL(38,0)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+30,
+      1e+30,
+      1e+30
+     ]
+    }
+   },
+   {
+    "expression": "'0.1' + CAST(0 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('0.1' + CAST(0 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.1,
+      0.1,
+      0.1
+     ]
+    }
+   },
+   {
+    "expression": "'0.1' * CAST(1 AS FLOAT)",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "('0.1' * CAST(1 AS FLOAT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.1,
+      0.1,
+      0.1
+     ]
+    }
+   },
+   {
+    "expression": "1 + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(1 + '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "1 - '2'",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(1 - '2')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1,
+      -1,
+      -1
+     ]
+    }
+   },
+   {
+    "expression": "3 * '2'",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(3 * '2')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      6,
+      6,
+      6
+     ]
+    }
+   },
+   {
+    "expression": "3 % '7'",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(3 % '7')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3,
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "expression": "2 / '6'",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(2 / '6')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+     ]
+    }
+   },
+   {
+    "expression": "1 + '1.5'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(1 + '1.5')"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(1 + '1.5') AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1.5 + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(1.5BD + '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      2.5,
+      2.5
+     ]
+    }
+   },
+   {
+    "expression": "g + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(g + '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.5,
+      null,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "d1 + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      13.34,
+      null,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "ns + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "a + ns",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(a + ns)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "s + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(s + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s + a) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(fs + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(fs + a) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "fs + g",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(fs + g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      4.0,
+      null,
+      0.5
+     ]
+    }
+   },
+   {
+    "expression": "s * 2",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(s * 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(s * 2) AS r\n ^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns % a",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "(ns % a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "ns - b",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(ns - b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -9,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "ns + d4",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + d4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1e+30,
+      null,
+      -1e+30
+     ]
+    }
+   },
+   {
+    "expression": "ns / g",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(ns / g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012\n== SQL (line 1, position 2) ==\n(ns / g) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "ns / a",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(ns / a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      null,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "'1' + '2'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + 2) AS r#6448]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + 2) AS r#6449]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19"
+    }
+   },
+   {
+    "expression": "'1' - '2'",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "('1' - '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 - 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 - 2) AS r#6450]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 - 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 - 2) AS r#6451]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19"
+    }
+   },
+   {
+    "expression": "'1' * '2'",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "('1' * '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 * 2)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 * 2) AS r#6452]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 * 2)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 * 2) AS r#6453]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
+    }
+   },
+   {
+    "expression": "'1' / '2'",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('1' / '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 / 2)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 / 2) AS r#6454]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 / 2)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 / 2) AS r#6455]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#2"
+    }
+   },
+   {
+    "expression": "'1' % '2'",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "('1' % '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 % 2)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 % 2) AS r#6456]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 % 2)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 % 2) AS r#6457]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast(1.5 as"
+    }
+   },
+   {
+    "expression": "ns + ns",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + ns)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + ns)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#12 + ns#12) AS r#6458]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + ns)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#31 + ns#31) AS r#6459]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as in"
+    }
+   },
+   {
+    "expression": "ns / ns",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "(ns / ns)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns / ns)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#12 / ns#12) AS r#6460]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns / ns)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#31 / ns#31) AS r#6461]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallin"
+    }
+   },
+   {
+    "expression": "ns + '2'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + '2')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#12 + 2) AS r#6462]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + 2)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#31 + 2) AS r#6463]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS"
+    }
+   },
+   {
+    "expression": "ns + fs",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + fs)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + fs)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#12 + fs#13) AS r#6464]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + fs)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#31 + fs#32) AS r#6465]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as in"
+    }
+   },
+   {
+    "expression": "'1' + NULL",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + NULL)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + null) AS r#6466]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + NULL)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + null) AS r#6467]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) A"
+    }
+   },
+   {
+    "expression": "NULL + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(NULL + '1')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(NULL + 1)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(null + 1) AS r#6468]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(NULL + 1)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(null + 1) AS r#6469]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) A"
+    }
+   },
+   {
+    "expression": "ns + NULL",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(ns + NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + NULL)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#12 + null) AS r#6470]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(ns + NULL)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ns#31 + null) AS r#6471]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as i"
+    }
+   },
+   {
+    "expression": "'1' / NULL",
+    "parse": {
+     "ok": true,
+     "node": "Divide",
+     "sql": "('1' / NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 / NULL)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 / null) AS r#6472]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 / NULL)\" due to data type mismatch: the binary operator requires the input type (\"DOUBLE\" or \"DECIMAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 / null) AS r#6473]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) A"
+    }
+   },
+   {
+    "expression": "'1' % NULL",
+    "parse": {
+     "ok": true,
+     "node": "Remainder",
+     "sql": "('1' % NULL)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 % NULL)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 % null) AS r#6474]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl#16, bin#17, nested#18], false\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 % NULL)\" due to data type mismatch: the binary operator requires the input type \"NUMERIC\", not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 % null) AS r#6475]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#20L, cast(2 as smallint) AS sh#21, cast("
+    }
+   },
+   {
+    "expression": "'1' + CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "'1' + CAST(NULL AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + CAST(NULL AS DOUBLE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "'1' + CAST(NULL AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + CAST(NULL AS STRING))"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + CAST(NULL AS STRING))\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + cast(null as string)) AS r#6484]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + CAST(NULL AS STRING))\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"STRING\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(1 + cast(null as string)) AS r#6485]\n+- Union false, false\n   :- Union false, false\n  "
+    }
+   },
+   {
+    "expression": "-'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "-'1.5'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '1.5')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.5,
+      -1.5,
+      -1.5
+     ]
+    }
+   },
+   {
+    "expression": "-'1e3'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '1e3')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1000.0,
+      -1000.0,
+      -1000.0
+     ]
+    }
+   },
+   {
+    "expression": "-'abc'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(-'abc') AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-''",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(-'') AS r\n ^^^\n"
+    }
+   },
+   {
+    "expression": "-'  1  '",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '  1  ')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "-'1d'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '1d')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "-ns",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- ns)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      null,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "-s",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- s)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(-s) AS r\n ^^\n"
+    }
+   },
+   {
+    "expression": "-fs",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- fs)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.5,
+      null,
+      -0.5
+     ]
+    }
+   },
+   {
+    "expression": "-CAST(NULL AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- CAST(NULL AS STRING))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "-'1' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "((- '1') + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "- -'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- (- '1'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "-'0'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- '0')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "' 1 ' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(' 1 ' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "'' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('' + 1) AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'99999999999999999999' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('99999999999999999999' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '99999999999999999999' of the type \"STRING\" cannot be cast to \"BIGINT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n('99999999999999999999' + 1) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'9223372036854775807' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('9223372036854775807' + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] long overflow. Use 'try_add' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n('9223372036854775807' + 1) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "'1' + bl",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + bl)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as boolean) + bl#16) AS r#6558]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + bl)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as boolean) + bl#35) AS r#6559]\n+- Union false, false\n   :- Union false, false\n   :  :- Project "
+    }
+   },
+   {
+    "expression": "'1' + ts",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + ts)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + ts)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as timestamp) + ts#14) AS r#6560]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + ts)\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as timestamp) + ts#33) AS r#6561]\n+- Union false, false\n   :- Union false, false\n   :  :- Proj"
+    }
+   },
+   {
+    "expression": "'1' + X'41'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + X'41')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + X'41')\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as binary) + 0x41) AS r#6562]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE] Cannot resolve \"(1 + X'41')\" due to data type mismatch: the binary operator requires the input type (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\"), not \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as binary) + 0x41) AS r#6563]\n+- Union false, false\n   :- Union false, false\n   :  :- Project "
+    }
+   },
+   {
+    "expression": "'1' + dt",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "('1' + dt)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(1, dt)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(cast(1 as date), dt#15) AS r#6564]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(1, dt)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(cast(1 as date), dt#34) AS r#6565]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#"
+    }
+   },
+   {
+    "expression": "dt + '1'",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(dt + '1')"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#15, cast(1 as date)) AS r#6566]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#34, cast(1 as date)) AS r#6567]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#1"
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -50856,6 +52474,1768 @@
        "Infinity",
        "Infinity"
       ]
+     }
+    }
+   ],
+   "arithmetic-string-coercion": [
+    {
+     "expression": "'1.5' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1.5' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       2.5,
+       2.5
+      ]
+     }
+    },
+    {
+     "expression": "'1e3' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1e3' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1001.0,
+       1001.0,
+       1001.0
+      ]
+     }
+    },
+    {
+     "expression": "'abc' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('abc' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' - 1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "('1' - 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "'2' * 3",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "('2' * 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       6.0,
+       6.0,
+       6.0
+      ]
+     }
+    },
+    {
+     "expression": "'7' % 3",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "('7' % 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "'6' / 2",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('6' / 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.0,
+       3.0,
+       3.0
+      ]
+     }
+    },
+    {
+     "expression": "'1.5' / 3",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('1.5' / 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.5,
+       0.5,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "'1e3' / 2",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('1e3' / 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       500.0,
+       500.0,
+       500.0
+      ]
+     }
+    },
+    {
+     "expression": "'1.5' / g",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('1.5' / g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.6,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1.5' % 2",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "('1.5' % 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       1.5,
+       1.5
+      ]
+     }
+    },
+    {
+     "expression": "fs / a",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(fs / a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       null,
+       -2.3283064365386963e-10
+      ]
+     }
+    },
+    {
+     "expression": "fs % a",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(fs % a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.5,
+       null,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "fs % g",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(fs % g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' + sh",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + sh)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.0,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + b",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       11.0,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + CAST(1 AS TINYINT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + CAST(1 AS TINYINT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + f",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + f)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + g",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.5,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + d1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       13.34,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + d5",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.1,
+       null,
+       1.5
+      ]
+     }
+    },
+    {
+     "expression": "'32768' + CAST(0 AS SMALLINT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('32768' + CAST(0 AS SMALLINT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       32768.0,
+       32768.0,
+       32768.0
+      ]
+     }
+    },
+    {
+     "expression": "'2147483648' + CAST(0 AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('2147483648' + CAST(0 AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483648.0,
+       2147483648.0,
+       2147483648.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + CAST(1 AS DECIMAL(10,2))",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + CAST(1 AS DECIMAL(10,2)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "'1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+30,
+       1e+30,
+       1e+30
+      ]
+     }
+    },
+    {
+     "expression": "'1000000000000000000000000000001' * CAST(1 AS DECIMAL(38,0))",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "('1000000000000000000000000000001' * CAST(1 AS DECIMAL(38,0)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+30,
+       1e+30,
+       1e+30
+      ]
+     }
+    },
+    {
+     "expression": "'0.1' + CAST(0 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('0.1' + CAST(0 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.1,
+       0.1,
+       0.1
+      ]
+     }
+    },
+    {
+     "expression": "'0.1' * CAST(1 AS FLOAT)",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "('0.1' * CAST(1 AS FLOAT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.1,
+       0.1,
+       0.1
+      ]
+     }
+    },
+    {
+     "expression": "1 + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(1 + '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "1 - '2'",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(1 - '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "3 * '2'",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(3 * '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       6.0,
+       6.0,
+       6.0
+      ]
+     }
+    },
+    {
+     "expression": "3 % '7'",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(3 % '7')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.0,
+       3.0,
+       3.0
+      ]
+     }
+    },
+    {
+     "expression": "2 / '6'",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(2 / '6')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.3333333333333333,
+       0.3333333333333333,
+       0.3333333333333333
+      ]
+     }
+    },
+    {
+     "expression": "1 + '1.5'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(1 + '1.5')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       2.5,
+       2.5
+      ]
+     }
+    },
+    {
+     "expression": "1.5 + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(1.5BD + '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       2.5,
+       2.5
+      ]
+     }
+    },
+    {
+     "expression": "g + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(g + '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.5,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "d1 + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       13.34,
+       null,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "ns + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       null,
+       -2147483648.0
+      ]
+     }
+    },
+    {
+     "expression": "a + ns",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(a + ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       null,
+       -2147483648.0
+      ]
+     }
+    },
+    {
+     "expression": "s + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(s + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "fs + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(fs + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       null,
+       -2147483647.5
+      ]
+     }
+    },
+    {
+     "expression": "fs + g",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(fs + g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       4.0,
+       null,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "s * 2",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(s * 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns % a",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "(ns % a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.0,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "ns - b",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(ns - b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -9.0,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "ns + d4",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + d4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+30,
+       null,
+       -1e+30
+      ]
+     }
+    },
+    {
+     "expression": "ns / g",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(ns / g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.4,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns / a",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(ns / a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       null,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' + '2'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.0,
+       3.0,
+       3.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' - '2'",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "('1' - '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' * '2'",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "('1' * '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "'1' / '2'",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('1' / '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.5,
+       0.5,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "'1' % '2'",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "('1' % '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "ns + ns",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "ns / ns",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "(ns / ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns + '2'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + '2')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.0,
+       null,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "ns + fs",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + fs)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       null,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "'1' + NULL",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "NULL + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(NULL + '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "ns + NULL",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(ns + NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' / NULL",
+     "parse": {
+      "ok": true,
+      "node": "Divide",
+      "sql": "('1' / NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' % NULL",
+     "parse": {
+      "ok": true,
+      "node": "Remainder",
+      "sql": "('1' % NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' + CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' + CAST(NULL AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + CAST(NULL AS DOUBLE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'1' + CAST(NULL AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + CAST(NULL AS STRING))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "-'1.5'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '1.5')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.5,
+       -1.5,
+       -1.5
+      ]
+     }
+    },
+    {
+     "expression": "-'1e3'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '1e3')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1000.0,
+       -1000.0,
+       -1000.0
+      ]
+     }
+    },
+    {
+     "expression": "-'abc'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- 'abc')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-''",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-'  1  '",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '  1  ')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "-'1d'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '1d')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "-ns",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       null,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "-s",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- s)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-fs",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- fs)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.5,
+       null,
+       -0.5
+      ]
+     }
+    },
+    {
+     "expression": "-CAST(NULL AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- CAST(NULL AS STRING))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-'1' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "((- '1') + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "- -'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- (- '1'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "-'0'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- '0')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "' 1 ' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(' 1 ' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "'' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "'99999999999999999999' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('99999999999999999999' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1e+20,
+       1e+20,
+       1e+20
+      ]
+     }
+    },
+    {
+     "expression": "'9223372036854775807' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('9223372036854775807' + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       9.223372036854776e+18,
+       9.223372036854776e+18,
+       9.223372036854776e+18
+      ]
+     }
+    },
+    {
+     "expression": "'1' + bl",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + bl#16) AS r#4277]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, d"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + bl)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BOOLEAN\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + bl#35) AS r#4278]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint"
+     }
+    },
+    {
+     "expression": "'1' + ts",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + ts)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + ts)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"TIMESTAMP\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + ts#14) AS r#4279]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14,"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + ts)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"TIMESTAMP\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + ts#33) AS r#4280]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigi"
+     }
+    },
+    {
+     "expression": "'1' + X'41'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + X'41')"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + X'41')\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + 0x41) AS r#4281]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, "
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(1 + X'41')\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"DOUBLE\" and \"BINARY\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(cast(1 as double) + 0x41) AS r#4282]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigin"
+     }
+    },
+    {
+     "expression": "'1' + dt",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "('1' + dt)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#15, cast(1 as double)) AS r#4283]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#34, cast(1 as double)) AS r#4284]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS"
+     }
+    },
+    {
+     "expression": "dt + '1'",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(dt + '1')"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#15, cast(1 as double)) AS r#4285]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"date_add(dt, 1)\" due to data type mismatch: The second parameter requires the (\"INT\" or \"SMALLINT\" or \"TINYINT\") type, however \"1\" has the type \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [date_add(dt#34, cast(1 as double)) AS r#4286]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS"
      }
     }
    ]
