@@ -145,7 +145,11 @@ LEGACY_GROUPS = (
     # different types, so one harvest would record half a rule -- and the ANSI half is the half
     # that hides, since a refusal reads as agreement against a registry that throws. It was the
     # legacy section of `unicode-digits` that found the defect for exactly that reason.
-    "arithmetic-string-coercion")
+    "arithmetic-string-coercion",
+    # #333. THE MEASUREMENT IS THE LEGACY COLUMN. Under ANSI every equality in the group is refused
+    # at analysis -- that half belongs to #286 -- so an ANSI-only harvest would record a wall of
+    # refusals and leave `BooleanEquality` itself entirely unmeasured.
+    "boolean-equality")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -2952,6 +2956,74 @@ GROUPS = {
         # reachable from a CHECK constraint that never writes the word CAST.
         "dt = '2026-08-11'", "dt = '2026-08-11 extra'", "dt = '08/11/2026'",
         "ts = '2026-08-11 12:30:00'", "ts = '2026-08-11 12:30:00 extra'",
+    ],
+
+    # A BOOLEAN against a NUMERIC, which under the legacy dialect is an equality Spark ANSWERS and
+    # we answer NULL for. #333.
+    #
+    # Spark's `BooleanEquality` coercion: for an EQUALITY whose operands are a boolean and a
+    # numeric, the BOOLEAN is cast to the numeric type (true -> 1, false -> 0) and the two are
+    # compared as numbers. `sh = bl` over `sh smallint` = 2 is the discriminator that says which
+    # way the cast goes -- 2 is not 1, so it is false, where reading the NUMBER for truthiness
+    # would make it true.
+    #
+    # EQUALITY ONLY, and the ordering rows are here to pin that rather than as decoration: `a < bl`
+    # is DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES in BOTH dialects, so a fix that reached ordering
+    # would be adding a rule Spark does not have.
+    #
+    # LEGACY ONLY, which is why the group is in LEGACY_GROUPS: under ANSI every equality row below
+    # is refused at analysis, and that half is #286's question rather than this one's. One harvest
+    # would therefore record a refusal and miss the rule entirely -- the ANSI column here is the
+    # control, not the measurement.
+    "boolean-equality": [
+        # The rule, over a column pair. Both orders, because which operand moves is the answer.
+        "a = bl", "a <> bl", "a <=> bl", "bl = a", "bl <> a",
+
+        # THE DISCRIMINATOR. `sh` is 2, so a boolean cast to smallint gives 1 and the answer is
+        # false; a numeric read for truthiness would give true.
+        "sh = bl", "sh <=> bl",
+
+        # Every other numeric family, because the cast target is the NUMERIC's type and each of
+        # these is a different target -- and d5 is decimal(38,38), where 1 does not fit at all.
+        "b = bl", "f = bl", "g = bl", "d1 = bl", "d3 = bl", "d5 = bl",
+
+        # ORDERING, refused in both dialects. The rule is equality's alone.
+        "a < bl", "a > bl", "a <= bl", "bl > a",
+
+        # `IS TRUE` / `IS FALSE`, which the parser lowers to `<=> TRUE` / `<=> FALSE` and which are
+        # therefore the same rule wearing a different hat. `a IS FALSE` agrees with us today by
+        # LUCK -- the comparison against 0 happens to give the right answer for these rows -- so
+        # both polarities are asked, and both negations with them.
+        "a IS TRUE", "a IS NOT TRUE", "a IS FALSE", "a IS NOT FALSE",
+        "b IS TRUE", "b IS NOT FALSE", "g IS TRUE", "d1 IS TRUE",
+
+        # A LITERAL either side, where constant folding could take a different route from the
+        # column rows above.
+        "1 = TRUE", "0 = FALSE", "2 = TRUE", "TRUE = 1", "1 <=> TRUE",
+
+        # `nullif`, which Spark rewrites to `if(a = b, NULL, a)` and which therefore takes the
+        # equality rule (#298/#315). If BooleanEquality is an `=` coercion rather than a property
+        # of the operator node, this row moves with the others.
+        "nullif(a, bl)", "nullif(bl, a)",
+
+        # `IN`, which resolves ONE type over the operand and the list rather than per pair, so
+        # whether the rule reaches it is a separate question from `=`. #261/#286.
+        "a IN (bl)", "bl IN (a)", "a IN (bl, 1)",
+
+        # The conditional family, which folds branch TYPES rather than coercing a pair -- a
+        # boolean and a numeric have no common type, so these say whether the fold borrows the
+        # equality rule or refuses.
+        "coalesce(a, bl)", "greatest(a, bl)", "if(bl, a, bl)",
+
+        # CONTROLS. A boolean against a boolean and a numeric against a numeric are untouched by
+        # the rule, and `NOT (a = bl)` is the shape that matters in a CHECK constraint: a row whose
+        # rule evaluates to NULL is ADMITTED, so answering null where Spark answers false accepts
+        # data Spark rejects.
+        "bl = TRUE", "bl <=> TRUE", "a = 1", "NOT (a = bl)", "NOT (bl = a)",
+
+        # A STRING against a boolean, which is NOT this rule and is asked so that a fix cannot
+        # quietly widen to it: the string rules of #180/#259 own this pair.
+        "s = bl", "ns = bl",
     ],
 
     "malformed": [

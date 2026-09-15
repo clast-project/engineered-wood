@@ -488,32 +488,65 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         if (!leftIsString && !rightIsString)
         {
+            // A BOOLEAN against something that is not one is the second pair where a single
+            // operand moves, and the registry decides whether it does: under the legacy dialect
+            // Spark casts the boolean to the numeric opposite it and compares them as numbers,
+            // and under ANSI it refuses the comparison outright. #333. The cheap kind test comes
+            // first for the same reason the string one does — an operand's type is not resolved
+            // until the path that needs it is the path being taken.
+            bool leftIsBoolean = IsBoolean(leftType, left);
+            if (leftIsBoolean != IsBoolean(rightType, right)
+                && CoerceOneSide(cmp, leftIsBoolean, leftType, rightType, ref left, ref right))
+            {
+                return;
+            }
+
             CoerceExactNumerics(cmp, leftType, rightType, ref left, ref right);
             return;
         }
 
-        var strings = leftIsString ? left : right;
-        var other = leftIsString ? right : left;
-        var stringType = OperandType(leftIsString ? leftType : rightType, strings);
-        var otherType = OperandType(leftIsString ? rightType : leftType, other);
+        CoerceOneSide(cmp, leftIsString, leftType, rightType, ref left, ref right);
+    }
 
-        // Which operand moves is the registry's answer, not an assumption here: a string against
-        // a number is cast to the number, while a string against a binary stays and the BINARY
-        // is rendered as text. At most one side moves, so the second question is only asked when
-        // the first declines.
-        bool castTheString = true;
-        var target = _coercion.ComparisonTarget(stringType, otherType);
+    /// <summary>
+    /// Casts whichever of two operands the registry says moves, and reports whether one did.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Which operand moves is the registry's answer, not an assumption here: a string against a
+    /// number is cast to the number, while a string against a binary stays and the BINARY is
+    /// rendered as text. At most one side moves, so the second question is only asked when the
+    /// first declines.
+    /// </para>
+    /// <para>
+    /// <paramref name="leftIsCandidate"/> says which side to offer FIRST, not which one moves.
+    /// It is the operand whose kind selected this path — the string, or the boolean of #333 —
+    /// and asking about it first is what lets a registry answer the common case in one call.
+    /// </para>
+    /// </remarks>
+    private bool CoerceOneSide(
+        ComparisonPredicate cmp, bool leftIsCandidate,
+        IArrowType? leftType, IArrowType? rightType,
+        ref LiteralValue?[] left, ref LiteralValue?[] right)
+    {
+        var candidate = leftIsCandidate ? left : right;
+        var other = leftIsCandidate ? right : left;
+        var candidateType = OperandType(leftIsCandidate ? leftType : rightType, candidate);
+        var otherType = OperandType(leftIsCandidate ? rightType : leftType, other);
+
+        bool castTheCandidate = true;
+        var target = _coercion!.ComparisonTarget(cmp.Op, candidateType, otherType);
         if (target is null)
         {
-            castTheString = false;
-            target = _coercion.ComparisonTarget(otherType, stringType);
+            castTheCandidate = false;
+            target = _coercion.ComparisonTarget(cmp.Op, otherType, candidateType);
         }
 
         if (target is null)
-            return;   // a pair the registry has no rule for; compare it as it stands
+            return false;   // a pair the registry has no rule for; compare it as it stands
 
-        var moving = castTheString ? strings : other;
-        var staying = castTheString ? other : strings;
+        var moving = castTheCandidate ? candidate : other;
+        var staying = castTheCandidate ? other : candidate;
         int rowCount = moving.Length;
 
         var coerced = _coercion.CastForComparison(
@@ -524,8 +557,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             rowCount);
 
         var values = ArrowToLiteralValues(coerced, rowCount);
-        if (leftIsString == castTheString) left = values;
+        if (leftIsCandidate == castTheCandidate) left = values;
         else right = values;
+        return true;
     }
 
     /// <summary>
@@ -577,8 +611,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         resolvedLeft = minimumLeft ?? resolvedLeft;
         resolvedRight = minimumRight ?? resolvedRight;
 
-        var leftTarget = _coercion!.ComparisonTarget(resolvedLeft, resolvedRight);
-        var rightTarget = _coercion.ComparisonTarget(resolvedRight, resolvedLeft);
+        var leftTarget = _coercion!.ComparisonTarget(cmp.Op, resolvedLeft, resolvedRight);
+        var rightTarget = _coercion.ComparisonTarget(cmp.Op, resolvedRight, resolvedLeft);
         if (leftTarget is null && rightTarget is null)
             return;
 
@@ -677,6 +711,18 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         declared is not null
             ? declared is StringType
             : FirstKind(values) == LiteralValue.Kind.String;
+
+    /// <summary>Whether an operand is a boolean, without resolving its type.</summary>
+    /// <remarks>
+    /// The <see cref="IsString"/> shape, for the same reason: it decides which coercion path a
+    /// comparison takes, and resolving a type to find out costs an allocation on the path that
+    /// turns out not to need one. An operand null in every row with no declared type answers
+    /// false and takes neither path.
+    /// </remarks>
+    private static bool IsBoolean(IArrowType? declared, LiteralValue?[] values) =>
+        declared is not null
+            ? declared is BooleanType
+            : FirstKind(values) == LiteralValue.Kind.Boolean;
 
     /// <summary>
     /// <paramref name="values"/> with a null wherever <paramref name="mask"/> is null.

@@ -256,8 +256,9 @@ public sealed class NullPropagationTests
         public IArrowArray Invoke(string name, IConditionalArguments arguments, int rowCount) =>
             _inner.Invoke(name, arguments, rowCount);
 
-        public IArrowType? ComparisonTarget(IArrowType operand, IArrowType other) =>
-            _inner.ComparisonTarget(operand, other);
+        public IArrowType? ComparisonTarget(
+            ComparisonOperator op, IArrowType operand, IArrowType other) =>
+            _inner.ComparisonTarget(op, operand, other);
 
         public IArrowType? SetComparisonTarget(IReadOnlyList<IArrowType> memberTypes) =>
             _inner.SetComparisonTarget(memberTypes);

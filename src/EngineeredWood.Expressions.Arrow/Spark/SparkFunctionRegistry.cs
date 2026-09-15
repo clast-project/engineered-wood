@@ -923,7 +923,7 @@ public sealed class SparkFunctionRegistry
     /// </list>
     /// A pair with no rule gets null from both operands and is compared as it stands.
     /// </remarks>
-    public IArrowType? ComparisonTarget(IArrowType operand, IArrowType other)
+    public IArrowType? ComparisonTarget(ComparisonOperator op, IArrowType operand, IArrowType other)
     {
         if (operand is null)
             throw new ArgumentNullException(nameof(operand));
@@ -937,7 +937,59 @@ public sealed class SparkFunctionRegistry
         if (operand is BinaryType && other is StringType)
             return StringType.Default;
 
+        if (operand is BooleanType)
+            return BooleanEqualityTarget(op, other);
+
         return LossyDecimalTarget(operand, other);
+    }
+
+    /// <summary>
+    /// The numeric a BOOLEAN operand is cast to before an equality compares them, or null where
+    /// the pair has no such rule.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Spark's <c>BooleanEquality</c> coercion, and the BOOLEAN is what moves: measured on 4.0.3
+    /// with ansi off, <c>sh = bl</c> over <c>sh smallint</c> = 2 and <c>bl</c> = true is FALSE.
+    /// Reading the number for truthiness would make it true; casting the boolean to smallint
+    /// gives 1, and 2 is not 1. That single row is what fixes the direction.
+    /// </para>
+    /// <para>
+    /// <b>EQUALITY ONLY.</b> <c>=</c>, <c>&lt;&gt;</c> and <c>&lt;=&gt;</c> take it; ordering does
+    /// not, and is refused at analysis in BOTH dialects — <c>a &lt; bl</c> is
+    /// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c>. Answering ordering here would be inventing a
+    /// rule rather than reproducing one.
+    /// </para>
+    /// <para>
+    /// <b>LEGACY ONLY.</b> Under ANSI every one of these is refused at analysis too, so returning
+    /// null there leaves the comparison answering per-row nulls — which is the #286 gap and not
+    /// this rule's business. The <c>boolean-equality</c> group of
+    /// <c>Fixtures/spark-expression-corpus.json</c> carries both dialects for exactly that reason.
+    /// </para>
+    /// <para>
+    /// The target is the numeric's OWN type, so the cast can overflow: measured,
+    /// <c>d5 = bl</c> over <c>decimal(38,38)</c> is NULL on the row where <c>bl</c> is true,
+    /// because 1 does not fit a type that is all scale. The legacy cast answers null there, which
+    /// is the answer Spark gives.
+    /// </para>
+    /// <para>
+    /// <c>IN</c> does NOT take this rule and must not be given it here: measured,
+    /// <c>a IN (bl)</c> is <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c> in both dialects, as are
+    /// <c>coalesce(a, bl)</c> and <c>greatest(a, bl)</c>. A set resolves ONE type over its
+    /// members and there is no common type here, where an equality coerces a PAIR. See
+    /// <see cref="SetComparisonTarget"/>, which is asked separately and answers separately.
+    /// </para>
+    /// </remarks>
+    private IArrowType? BooleanEqualityTarget(ComparisonOperator op, IArrowType other)
+    {
+        if (_options.Ansi || !SparkNumericTypes.IsNumeric(other))
+            return null;
+
+        return op is ComparisonOperator.Equal
+            or ComparisonOperator.NotEqual
+            or ComparisonOperator.NullSafeEqual
+            ? other
+            : null;
     }
 
     /// <summary>
@@ -2912,8 +2964,11 @@ public sealed class SparkFunctionRegistry
         if (leftType is NullType || rightType is NullType)
             return (left, right);
 
-        var leftTarget = ComparisonTarget(leftType, rightType);
-        var rightTarget = ComparisonTarget(rightType, leftType);
+        // EQUAL, because that is the operator this site implements: `nullif(a, b)` is Spark's
+        // `if(a = b, NULL, a)`. Measured, the boolean rule reaches it — `nullif(a, bl)` resolves
+        // `int` and answers NULL on the row where a is 1 and bl is true. #333.
+        var leftTarget = ComparisonTarget(ComparisonOperator.Equal, leftType, rightType);
+        var rightTarget = ComparisonTarget(ComparisonOperator.Equal, rightType, leftType);
 
         // Each operand is cast against the ORIGINAL other one, not against a coerced one: the
         // mask below reads only which rows the other side populates, and a cast cannot move a

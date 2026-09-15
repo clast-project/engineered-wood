@@ -3081,4 +3081,108 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal(expected,
             Assert.IsType<StringArray>(Eval(Legacy, sql, batch)).GetString(0));
     }
+
+    /// <summary>
+    /// The BOOLEAN is the operand that moves, and it moves to the numeric's own type.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The corpus pins the ANSWERS; this pins the DIRECTION, which the answers only reveal
+    /// through one row. `sh = bl` over `sh` = 2 is false because a boolean cast to smallint is 1;
+    /// reading the number for truthiness would make it true. Asked here of the registry directly
+    /// so that the rule cannot quietly reverse while the values still happen to agree.
+    /// </para>
+    /// <para>
+    /// The target being the numeric's OWN type is what lets the cast overflow — measured,
+    /// `d5 = bl` over a decimal(38,38) is null on the row where the boolean is true. #333.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(ComparisonOperator.Equal)]
+    [InlineData(ComparisonOperator.NotEqual)]
+    [InlineData(ComparisonOperator.NullSafeEqual)]
+    public void TheBooleanIsTheOperandThatMovesUnderTheLegacyDialect(ComparisonOperator op)
+    {
+        Assert.Equal(
+            Int32Type.Default,
+            Legacy.ComparisonTarget(op, BooleanType.Default, Int32Type.Default));
+
+        // The numeric stays put, which is the half that says the boolean moved rather than the
+        // two meeting somewhere in between.
+        Assert.Null(Legacy.ComparisonTarget(op, Int32Type.Default, BooleanType.Default));
+
+        var wide = new Decimal128Type(38, 38);
+        Assert.Equal(wide, Legacy.ComparisonTarget(op, BooleanType.Default, wide));
+    }
+
+    /// <summary>
+    /// ORDERING takes no boolean rule, in either dialect, because Spark refuses it at analysis in
+    /// both.
+    /// </summary>
+    /// <remarks>
+    /// `a &lt; bl` is DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES with ansi on AND off — measured in
+    /// the `boolean-equality` group, whose ordering rows are declared differences for exactly
+    /// this reason. A target here would be a rule Spark does not have, and it would turn a
+    /// refusal we currently answer null for into a confidently wrong value. #333.
+    /// </remarks>
+    [Theory]
+    [InlineData(ComparisonOperator.LessThan)]
+    [InlineData(ComparisonOperator.LessThanOrEqual)]
+    [InlineData(ComparisonOperator.GreaterThan)]
+    [InlineData(ComparisonOperator.GreaterThanOrEqual)]
+    public void OrderingTakesNoBooleanRule(ComparisonOperator op)
+    {
+        Assert.Null(Legacy.ComparisonTarget(op, BooleanType.Default, Int32Type.Default));
+        Assert.Null(Legacy.ComparisonTarget(op, Int32Type.Default, BooleanType.Default));
+    }
+
+    /// <summary>
+    /// The ANSI dialect has no boolean rule at all, because Spark refuses the comparison instead
+    /// of coercing it.
+    /// </summary>
+    /// <remarks>
+    /// So the two dialects differ in what they DO here, not merely in what they do when a value
+    /// misbehaves. Reproducing the refusal is #286 and needs the analyzer table; until then an
+    /// ANSI session answers per-row nulls, which the corpus declares. What must not happen is
+    /// this registry quietly taking the legacy rule — that would be a wrong VALUE under the
+    /// dialect Spark ships by default.
+    /// </remarks>
+    [Fact]
+    public void TheAnsiDialectTakesNoBooleanRule()
+    {
+        foreach (var numeric in new IArrowType[]
+                 {
+                     Int8Type.Default, Int16Type.Default, Int32Type.Default, Int64Type.Default,
+                     FloatType.Default, DoubleType.Default, new Decimal128Type(10, 2),
+                 })
+        {
+            Assert.Null(Ansi.ComparisonTarget(ComparisonOperator.Equal, BooleanType.Default, numeric));
+            Assert.Equal(
+                numeric,
+                Legacy.ComparisonTarget(ComparisonOperator.Equal, BooleanType.Default, numeric));
+        }
+    }
+
+    /// <summary>
+    /// A boolean against something that is not a number takes no rule either, in either dialect.
+    /// </summary>
+    /// <remarks>
+    /// Spark's coercion names NumericType specifically. A boolean against a boolean needs no
+    /// cast, and a boolean against a string is the string rules' business (#180/#259) — measured,
+    /// `ns = bl` answers in BOTH dialects by reading the STRING as a boolean, which is the
+    /// opposite direction from this rule and must not be captured by it.
+    /// </remarks>
+    [Fact]
+    public void ABooleanAgainstANonNumericTakesNoRule()
+    {
+        foreach (var other in new IArrowType[]
+                 {
+                     BooleanType.Default, StringType.Default, BinaryType.Default,
+                     Date32Type.Default,
+                 })
+        {
+            Assert.Null(Legacy.ComparisonTarget(
+                ComparisonOperator.Equal, BooleanType.Default, other));
+        }
+    }
 }
