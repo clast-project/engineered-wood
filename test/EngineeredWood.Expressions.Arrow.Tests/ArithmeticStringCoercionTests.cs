@@ -257,6 +257,108 @@ public class ArithmeticStringCoercionTests
         Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "'1e3' + 1"));
     }
 
+    // ── A null opposite the string suppresses its cast, per row and in either order ──
+
+    /// <summary>
+    /// A batch whose second row puts a malformed string beside a NULL number — which is the row
+    /// the corpus cannot carry, since its own rows are ordinary or entirely null.
+    /// </summary>
+    private static RecordBatch NullBesideMalformed()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("a", Int32Type.Default, true))
+            .Field(new Field("g", DoubleType.Default, true))
+            .Field(new Field("s", StringType.Default, true))
+            .Build();
+
+        return new RecordBatch(schema, new IArrowArray[]
+        {
+            new Int32Array.Builder().Append(1).AppendNull().Build(),
+            new DoubleArray.Builder().Append(2.5).AppendNull().Build(),
+            new StringArray.Builder().Append("1").Append("abc").Build(),
+        }, 2);
+    }
+
+    private static IArrowArray EvaluateOver(
+        SparkFunctionRegistry registry, string expression, RecordBatch batch) =>
+        new ArrowRowEvaluator(registry)
+            .EvaluateExpression(SparkSqlParser.ParseExpression(expression), batch);
+
+    [Theory]
+    [InlineData("a + s")]
+    [InlineData("s + a")]     // SYMMETRIC: not "the left child goes first"
+    [InlineData("a - s")]
+    [InlineData("a * s")]
+    [InlineData("a / s")]
+    [InlineData("a % s")]
+    [InlineData("g + s")]     // the double target too, not only the integral one
+    public void ARowWhoseOtherOperandIsNullDoesNotCastTheStringAtAll(string expression)
+    {
+        // Spark evaluates nothing once an operand of a null-intolerant operator is null, so the
+        // malformed string on row 1 is never read. Measured under ANSI: `a + s` and `s + a` both
+        // answer [2, null] over this batch. Casting the column eagerly refuses arithmetic Spark
+        // ANSWERS -- fail-CLOSED, and inside a Delta CHECK constraint that is a rejected write.
+        var result = EvaluateOver(Ansi, expression, NullBesideMalformed());
+
+        Assert.False(SparkFunctions.IsNull(result, 0));
+        Assert.True(SparkFunctions.IsNull(result, 1));
+    }
+
+    [Fact]
+    public void TheSameStringStillRefusesTheMomentItSitsBesideANonNullOperand()
+    {
+        // The other half of the boundary: the mask is keyed on the OTHER OPERAND'S NULLNESS per
+        // row, not on the string being malformed. Measured — over a batch of (a = 1, s = 'abc')
+        // Spark raises in both operand orders.
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "a + s"));
+        Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "s + a"));
+    }
+
+    [Fact]
+    public void UnaryMinusHasNoOtherOperandAndSoSuppressesNothing()
+    {
+        // `-s` over the same batch raises, because there is no operand whose nullness could
+        // suppress the cast. Measured, and it is what says the rule belongs to the binary
+        // operators rather than to the string cast.
+        Assert.Throws<SparkEvaluationException>(
+            () => EvaluateOver(Ansi, "-s", NullBesideMalformed()));
+    }
+
+    // ── A type Spark cannot name ──
+
+    [Fact]
+    public void AWideDecimalOperandHasNoRuleAndIsRefusedRatherThanRead()
+    {
+        // Parquet's decimal runs wider than Spark's, so a decimal256 can reach the evaluator and
+        // no Spark expression can name one: nothing measured says what adding a string to it
+        // means. The refusal names the pair rather than surfacing from the double reader, whose
+        // numeric cases stop at Decimal128Array.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("wide", new Decimal256Type(50, 0), true))
+            .Field(new Field("ns", StringType.Default, true))
+            .Build();
+
+        var bytes = new byte[32];
+        bytes[0] = 7;
+        var validity = new ArrowBuffer.BitmapBuilder();
+        validity.Append(true);
+        var wide = new Decimal256Array(new ArrayData(
+            new Decimal256Type(50, 0), 1, 0, 0, new[] { validity.Build(), new ArrowBuffer(bytes) }));
+
+        var batch = new RecordBatch(schema, new IArrowArray[]
+        {
+            wide,
+            new StringArray.Builder().Append("1").Build(),
+        }, 1);
+
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var thrown = Assert.Throws<NotSupportedException>(
+                () => EvaluateOver(registry, "ns + wide", batch));
+            Assert.Contains("decimal256", thrown.Message, StringComparison.Ordinal);
+        }
+    }
+
     [Fact]
     public void NegatingAStringZeroKeepsTheSign()
     {

@@ -1143,6 +1143,17 @@ the absence of a TYPE rather than the nullness: `'1' + CAST(NULL AS INT)` is a
 perfectly good bigint null beside it. Boolean, date, timestamp and binary refuse
 in both dialects.
 
+**A row whose other operand is null is not cast**, the same short-circuit the
+comparison path reproduces — and it is **symmetric**, which is worth measuring
+rather than deriving from "the left child goes first". Over a batch of
+`(a = 1, s = '1')` and `(a = NULL, s = 'abc')`, ANSI answers `[2, null]` for
+`a + s` **and** for `s + a`, and raises for both the moment that `'abc'` sits
+beside a non-null `a`. `-s` has no other operand and raises. Without the mask a
+batch mixing one such row with an ordinary one refuses arithmetic Spark answers —
+fail-closed, which inside a CHECK constraint is a rejected write. The corpus
+cannot see this: its rows are ordinary or entirely null, so none of them ever puts
+a malformed string beside a null number.
+
 The rule lives on `SparkFunctionRegistry` beside the comparison one, and routes
 to the same `Cast` that `CAST(…)` reaches — so a string arithmetic accepts is
 exactly a string the explicit cast accepts, and one it refuses is a raise under

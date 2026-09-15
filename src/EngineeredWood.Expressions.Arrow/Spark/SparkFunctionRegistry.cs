@@ -440,6 +440,25 @@ public sealed class SparkFunctionRegistry
     /// Boolean, date, timestamp and binary refuse in BOTH dialects and reach that by the same
     /// route: no target, so the pair throws as it did before.
     /// </para>
+    /// <para>
+    /// <b>A ROW WHOSE OTHER OPERAND IS NULL IS NOT CAST</b>, which is the same short-circuit
+    /// <see cref="CastForEquality"/> reproduces for a comparison and the reason
+    /// <see cref="NulledWhereOtherIsNull"/> is reached from two places. Spark evaluates nothing
+    /// once an operand of a null-intolerant operator is null, so a malformed string sitting
+    /// opposite one is never read and never refused. <b>It is symmetric</b>, which is the part
+    /// worth measuring rather than deriving from "the left child goes first": over a batch of
+    /// <c>(a = 1, s = '1')</c> and <c>(a = NULL, s = 'abc')</c>, ANSI answers <c>[2, null]</c> for
+    /// <c>a + s</c> AND for <c>s + a</c>, and raises for both the moment the same <c>'abc'</c>
+    /// sits beside a non-null <c>a</c>. Every operator behaves this way, and <c>-s</c> does not,
+    /// having no other operand to be null.
+    /// </para>
+    /// <para>
+    /// Without the mask a batch mixing one such row with an ordinary one refuses arithmetic Spark
+    /// answers — fail-CLOSED, and inside a Delta CHECK constraint that is a rejected write rather
+    /// than a wrong value. <b>The corpus cannot see it</b>: its rows are ordinary or entirely
+    /// null, so no row ever puts a malformed string beside a null number. Asserted over a batch
+    /// built for it in <c>ArithmeticStringCoercionTests</c> instead.
+    /// </para>
     /// </remarks>
     private (IArrowArray Left, IArrowArray Right) CoerceStringOperand(
         string op, IArrowArray left, IArrowArray right, int rowCount)
@@ -461,9 +480,12 @@ public sealed class SparkFunctionRegistry
             ?? throw new NotSupportedException(
                 $"arithmetic is not defined for utf8 and {other.Name}");
 
+        // Masked before it is cast, and in EITHER operand order -- see the remarks.
         return leftIsString
-            ? (CastForArithmetic(left, target, rowCount), right)
-            : (left, CastForArithmetic(right, target, rowCount));
+            ? (CastForArithmetic(NulledWhereOtherIsNull(left, right, rowCount), target, rowCount),
+               right)
+            : (left,
+               CastForArithmetic(NulledWhereOtherIsNull(right, left, rowCount), target, rowCount));
     }
 
     /// <summary>
@@ -481,6 +503,17 @@ public sealed class SparkFunctionRegistry
     /// </remarks>
     private IArrowType? ArithmeticStringTarget(IArrowType other)
     {
+        // PAST SPARK'S MAXIMUM PRECISION THERE IS NO RULE, so there is no target either -- the
+        // same line `LegacyTarget` draws for a comparison, and drawn here for a second reason.
+        // Parquet's decimal runs wider than Spark's, so `ArrowSchemaConverter` builds a
+        // Decimal256Type above precision 38, and no Spark expression can name such a type: nothing
+        // measured says what adding a string to one means. Declining also keeps the refusal at the
+        // coercion site, where it can name the pair, rather than leaving it to
+        // `SparkArrays.ReadDouble`, whose numeric cases stop at Decimal128Array. The pair threw
+        // before this method existed and still throws; only the message moves.
+        if (other is Decimal256Type)
+            return null;
+
         // A `void` operand takes the legacy target like any other, which is what makes
         // `'1' + NULL` a column of double nulls rather than a refusal in this dialect.
         if (!_options.Ansi)
