@@ -405,14 +405,32 @@ internal static class SparkArrays
     /// <remarks>
     /// Measured: a timestamp prints as <c>2026-08-11 03:00:00</c> and a date as
     /// <c>2026-08-11</c>, both in the resolved timezone.
+    /// <para>
+    /// <b>The sub-second is printed and its trailing zeros are not</b>, which is a rule of its
+    /// own rather than a fixed number of digits. Measured on 4.0.3:
+    /// <c>.100000</c> prints as <c>.1</c>, <c>.010000</c> as <c>.01</c>, <c>.123400</c> as
+    /// <c>.1234</c>, <c>.000001</c> as <c>.000001</c> and <c>.000000</c> not at all. Until #318
+    /// the format string stopped at the seconds, so <c>CAST(ts AS STRING)</c> silently dropped
+    /// every fraction — a defect on the way OUT that a corpus row cannot tell apart from one in
+    /// the parse, which is why it is named here.
+    /// </para>
     /// </remarks>
     public static string RenderInstant(DateTimeOffset instant, bool isDate)
     {
         var local = TimeZoneInfo.ConvertTime(instant, SparkDialectOptions.TimeZone);
-        return isDate
-            ? local.ToString("yyyy-MM-dd", Invariant)
-            : local.ToString("yyyy-MM-dd HH:mm:ss", Invariant);
+        if (isDate)
+            return local.ToString("yyyy-MM-dd", Invariant);
+
+        var seconds = local.ToString("yyyy-MM-dd HH:mm:ss", Invariant);
+        var microseconds = (int)(local.Ticks % TimeSpan.TicksPerSecond / TicksPerMicrosecond);
+
+        return microseconds == 0
+            ? seconds
+            : seconds + "." + microseconds.ToString("D6", Invariant).TrimEnd('0');
     }
+
+    /// <summary>The <see cref="DateTime"/> ticks in one microsecond.</summary>
+    private const long TicksPerMicrosecond = 10L;
 
     /// <summary>Builds a Date32 array from instants, taking the calendar date in the zone.</summary>
     public static IArrowArray BuildDate32(DateTimeOffset?[] values, int rowCount)

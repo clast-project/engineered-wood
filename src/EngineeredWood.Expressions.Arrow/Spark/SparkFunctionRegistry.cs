@@ -1273,40 +1273,6 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>
-    /// The text a temporal parse should see, or null when .NET's parser would see less of it.
-    /// </summary>
-    /// <remarks>
-    /// <b>The one place trimming Spark's way is not enough.</b> Everywhere else the parse under
-    /// <see cref="SparkText.TrimBounds"/> skips no more whitespace than the trim already removed:
-    /// .NET's number parser recognises 0x20 and 0x09-0x0D, which are all at or below 0x20.
-    /// <see cref="DateTimeOffset.TryParse(string, IFormatProvider, DateTimeStyles, out DateTimeOffset)"/>
-    /// is the exception — it skips <see cref="char.IsWhiteSpace(char)"/> ITSELF, at either end, so
-    /// measured in .NET it reads U+00A0 followed by <c>2026-08-11</c> as that date and hands back
-    /// a value Spark refuses. Trimming less would not have reached it.
-    /// <para>
-    /// So a Spark-trimmed string whose first or last character is still .NET whitespace is
-    /// precisely the string the two disagree about, and it is refused here rather than left for
-    /// the parser to swallow. #316.
-    /// </para>
-    /// <para>
-    /// <b>INTERIOR whitespace is a different defect and this guard does not touch it.</b>
-    /// <c>DateTimeOffset.TryParse</c> reads <c>'2026-08 -11'</c> as a date where Spark refuses
-    /// it, and it still does under this guard, because the space is not at an edge for the trim
-    /// or for this test to see. That is the grammar difference in #318 rather than a trim, and
-    /// the corpus row for it is declared against that issue.
-    /// </para>
-    /// </remarks>
-    private static string? TemporalText(string source)
-    {
-        var text = SparkText.Trim(source);
-
-        return text.Length > 0
-            && (char.IsWhiteSpace(text[0]) || char.IsWhiteSpace(text[text.Length - 1]))
-            ? null
-            : text;
-    }
-
-    /// <summary>
     /// Casts to a calendar date, taking the date the instant falls on in the resolved timezone.
     /// </summary>
     /// <remarks>
@@ -1315,6 +1281,12 @@ public sealed class SparkFunctionRegistry
     /// America/Los_Angeles, so a generated column defined as <c>CAST(ts AS DATE)</c> stores a
     /// different value depending on which zone resolves it. UTC is the fixed choice; see the
     /// option for why it is not settable.
+    /// <para>
+    /// A STRING source is read by <see cref="SparkTemporalText.TryReadDate"/>, which is Spark's
+    /// own grammar and not <c>DateTimeOffset.TryParse</c>. #318, and worth reading before
+    /// assuming this accepts what a date parser usually accepts — <c>'08/11/2026'</c> is not a
+    /// date, and <c>'2026'</c> is.
+    /// </para>
     /// </remarks>
     private IArrowArray CastToDate(IArrowArray source, int rowCount, bool raising)
     {
@@ -1333,9 +1305,7 @@ public sealed class SparkFunctionRegistry
             }
 
             if (value.Value.FromString
-                && TemporalText(value.Value.Text) is { } text
-                && DateTimeOffset.TryParse(text, Invariant,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+                && SparkTemporalText.TryReadDate(value.Value.Text, out var parsed))
             {
                 instants[i] = parsed;
                 continue;
@@ -1376,9 +1346,7 @@ public sealed class SparkFunctionRegistry
 
             if (value.Value.FromString)
             {
-                if (TemporalText(value.Value.Text) is { } text
-                    && DateTimeOffset.TryParse(text, Invariant,
-                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+                if (SparkTemporalText.TryReadTimestamp(value.Value.Text, out var parsed))
                 {
                     instants[i] = parsed;
                     continue;

@@ -1588,6 +1588,68 @@ public sealed class SparkFunctionRegistryTests
             .GetString(0));
     }
 
+    /// <summary>A timestamp's sub-second is rendered, and its trailing zeros are not.</summary>
+    /// <remarks>
+    /// The corpus pins this from the parse side, where the value arrives as a literal. Here it
+    /// arrives as a COLUMN, which is the path a Delta generated column takes and the one the
+    /// corpus cannot reach: its <c>ts</c> rows both hold a whole second, so every one of them
+    /// agreed while <c>RenderInstant</c>'s format string stopped at the seconds. #318.
+    /// <para>
+    /// Spark's rule is the value's own digits rather than a fixed width — measured on 4.0.3,
+    /// <c>.100000</c> prints as <c>.1</c> and <c>.000001</c> prints in full — so the number of
+    /// digits is not something a reader can assume from any one row.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(0, "2026-08-11 03:00:00")]
+    [InlineData(1000000, "2026-08-11 03:00:00.1")]
+    [InlineData(100000, "2026-08-11 03:00:00.01")]
+    [InlineData(1234000, "2026-08-11 03:00:00.1234")]
+    [InlineData(1234560, "2026-08-11 03:00:00.123456")]
+    [InlineData(10, "2026-08-11 03:00:00.000001")]
+    // Below a microsecond there is nothing to print: Spark's timestamp has no such digit, so a
+    // tick that fine is truncated rather than rounded into the one above it.
+    [InlineData(9, "2026-08-11 03:00:00")]
+    public void ATimestampsSubSecondIsRenderedWithoutItsTrailingZeros(int ticks, string expected)
+    {
+        var batch = Batch(("ts", Timestamps(Straddling.AddTicks(ticks))));
+
+        Assert.Equal(expected, Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(ts AS STRING)", batch)).GetString(0));
+    }
+
+    /// <summary>
+    /// The years EngineeredWood is narrower than Spark in, and the ones either side of them.
+    /// </summary>
+    /// <remarks>
+    /// Spark reads a date's year from up to seven digits and honours a leading <c>-</c>; an
+    /// instant travels through this cast as a <see cref="DateTimeOffset"/>, which starts at year
+    /// 1 and ends at 9999. The corpus declares the two rows outside it as known differences —
+    /// what it cannot show is that the bound is the TYPE's and not an accident of the grammar,
+    /// which is what the accepted pair here says. #318.
+    /// </remarks>
+    [Theory]
+    [InlineData("0001-01-01", true)]
+    [InlineData("9999-12-31", true)]
+    [InlineData("0000-12-31", false)]
+    [InlineData("-0001-01-01", false)]
+    [InlineData("10000-01-01", false)]
+    [InlineData("123456-01-01", false)]
+    public void ADateOutsideDateTimeOffsetsYearsIsRefusedRatherThanWrapped(string text, bool read)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        if (read)
+        {
+            Assert.False(Eval(Ansi, "CAST(s AS DATE)", batch).IsNull(0));
+            return;
+        }
+
+        Assert.Equal("CAST_INVALID_INPUT", Assert.Throws<SparkEvaluationException>(
+            () => Eval(Ansi, "CAST(s AS DATE)", batch)).ErrorClass);
+        Assert.True(Eval(Legacy, "CAST(s AS DATE)", batch).IsNull(0));
+    }
+
     [Fact]
     public void ATimestampCastsToEpochSecondsAndBack()
     {
@@ -2918,9 +2980,16 @@ public sealed class SparkFunctionRegistryTests
     /// <remarks>
     /// <see cref="DateTimeOffset.TryParse(string, IFormatProvider, System.Globalization.DateTimeStyles, out DateTimeOffset)"/>
     /// skips <see cref="char.IsWhiteSpace(char)"/> itself, at either end, so a U+00A0 the trim
-    /// deliberately left in place would have been swallowed by the parser instead and the cast
-    /// would have answered anyway. <c>TemporalText</c> is the guard, and these are the rows that
-    /// fail without it while every numeric row above still passes.
+    /// deliberately left in place was swallowed by the parser instead and the cast answered
+    /// anyway. #316 held the line with a guard that refused a Spark-trimmed string still edged
+    /// with .NET whitespace; #318 removed the guard by removing what it was guarding, and these
+    /// rows now pass for a plainer reason: <see cref="SparkTemporalText"/> reads Spark's own
+    /// grammar, in which U+00A0 is not a digit and nothing skips it.
+    /// <para>
+    /// The <c>TryParse</c> assertion below is what keeps that honest — it says the string the
+    /// cast refuses is still one .NET reads, so the rows would come back if the parse ever
+    /// returned to a general one.
+    /// </para>
     /// </remarks>
     [Theory]
     [InlineData("CAST(s AS DATE)", "2026-08-11")]
