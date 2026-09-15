@@ -401,15 +401,21 @@ public interface IAnalysisRules
     /// two answers, decided by the operator alone.
     /// </para>
     /// <para>
-    /// <b>This one question also covers boolean context and <c>IN</c></b>, which is why there is
-    /// no method for either. <c>SparkSqlParser.AsPredicate</c> lowers a non-boolean in predicate
-    /// position to <c>expr = TRUE</c> and <c>IS TRUE</c> to <c>expr &lt;=&gt; TRUE</c>, so
-    /// <c>0.5 IS TRUE</c> and <c>0.5 AND x</c> arrive here as an ordinary comparison against a
-    /// boolean. The measurement bears it out: a family check at this one site dropped the ANSI
-    /// gap from 171 rows to 17, and those 17 are exactly the cast table — the 28 boolean-context
-    /// rows fell to it without a rule of their own. A set test asks per MEMBER, because
-    /// membership legality is per pair even though the coercion is not; see
-    /// <see cref="IComparisonCoercion.SetComparisonTarget"/> for the half that is not.
+    /// <b>This one question also covers boolean context</b>, which is why there is no method for
+    /// it. <c>SparkSqlParser.AsPredicate</c> lowers a non-boolean in predicate position to
+    /// <c>expr = TRUE</c> and <c>IS TRUE</c> to <c>expr &lt;=&gt; TRUE</c>, so <c>0.5 IS TRUE</c>
+    /// and <c>0.5 AND x</c> arrive here as an ordinary comparison against a boolean. The
+    /// measurement bears it out: a family check at this one site dropped the ANSI gap from 171
+    /// rows to 17, and those 17 are exactly the cast table — the 28 boolean-context rows fell to
+    /// it without a rule of their own.
+    /// </para>
+    /// <para>
+    /// <b>A set test does NOT come here</b>, and an earlier version of this interface had it
+    /// wrong: asking per member with <c>Equal</c> looked right and is not. Measured on 4.0.3,
+    /// <c>a = bl</c> ANSWERS under the legacy dialect — Spark's <c>BooleanEquality</c>, #333 —
+    /// while <c>a IN (bl)</c> is refused in BOTH dialects. A set resolves ONE type over the
+    /// operand and every member, so it can refuse a pair an equality accepts.
+    /// <see cref="CheckSetComparison"/> is the question for it.
     /// </para>
     /// <para>
     /// Not asked about an operand whose type is unknown — a bare <c>NULL</c> literal. Spark types
@@ -445,6 +451,28 @@ public interface IAnalysisRules
     /// </para>
     /// </remarks>
     AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast);
+
+    /// <summary>
+    /// Why a set membership test over <paramref name="memberTypes"/> — the operand's type first,
+    /// then each member's — is refused at analysis, or null when it is accepted.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Separate from <see cref="CheckComparison"/> for the reason
+    /// <see cref="IComparisonCoercion.SetComparisonTarget"/> is separate from
+    /// <see cref="IComparisonCoercion.ComparisonTarget"/>: <c>IN</c> is not the disjunction of
+    /// equalities it resembles. It resolves ONE type over the operand and the whole list, so the
+    /// question is about the list and not about any pair in it — and the two genuinely disagree,
+    /// measured: <c>a = bl</c> answers under the legacy dialect while <c>a IN (bl)</c> is refused
+    /// under both.
+    /// </para>
+    /// <para>
+    /// One list rather than an operand and a list, because the resolution does not privilege the
+    /// operand — it is the least common type of everything, the operand included. A bare
+    /// <c>NULL</c> member is left out by the caller, since <c>void</c> constrains nothing.
+    /// </para>
+    /// </remarks>
+    AnalysisDiagnostic? CheckSetComparison(IReadOnlyList<IArrowType> memberTypes);
 }
 
 /// <summary>

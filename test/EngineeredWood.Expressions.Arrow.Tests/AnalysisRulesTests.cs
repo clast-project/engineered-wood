@@ -54,6 +54,20 @@ public sealed class AnalysisRulesTests
 
         public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast)
             => null;
+
+        /// <summary>Every list the evaluator asked about, in the order it asked.</summary>
+        public List<string> AskedSets { get; } = new();
+
+        public AnalysisDiagnostic? CheckSetComparison(IReadOnlyList<IArrowType> memberTypes)
+        {
+            AskedSets.Add(string.Join(",", memberTypes.Select(t => t.Name)));
+
+            // The same shape the pair rule uses, applied to a list: an int and a boolean in one
+            // set is the refusal, whatever else is in it.
+            return memberTypes.Any(t => t is Int32Type) && memberTypes.Any(t => t is BooleanType)
+                ? DiffTypes
+                : null;
+        }
     }
 
     private static readonly AnalysisDiagnostic DiffTypes =
@@ -121,20 +135,47 @@ public sealed class AnalysisRulesTests
         Enumerable.Range(0, array.Length).Select(array.GetValue).ToArray();
 
     /// <summary>
-    /// Without a registry that implements the seam a cross-family comparison answers null per row
-    /// exactly as it did before — including with <see cref="SparkFunctionRegistry"/>, which does
-    /// not implement it yet.
+    /// Without a registry that implements the seam, a cross-family comparison answers null per row
+    /// exactly as it did before the seam existed.
     /// </summary>
     /// <remarks>
-    /// The Spark row is the one that matters: it pins that adding the seam changed no answer any
-    /// caller sees today. It is expected to CHANGE when the comparison table lands with #333, and
-    /// changing is how that slice will announce itself.
+    /// The default has to be silence: <c>DeltaTable</c>, <c>LanceTable</c> and
+    /// <c>LanceDatasetWriter</c> all construct an evaluator with no registry at all, and none of
+    /// them wants Spark's analyzer.
     /// </remarks>
     [Fact]
-    public void ARegistryWithoutTheSeamRefusesNothing()
-    {
+    public void ARegistryWithoutTheSeamRefusesNothing() =>
         Assert.Equal(new bool?[] { null, null, null }, Rows(Eval("a = bl", registry: null)));
-        Assert.Equal(new bool?[] { null, null, null }, Rows(Eval("a = bl", Spark)));
+
+    /// <summary>
+    /// <see cref="SparkFunctionRegistry"/> implements it, and the two dialects answer DIFFERENTLY
+    /// — which is the whole shape of #286 and #333 in one expression.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ANSI refuses an int against a boolean at analysis, so we refuse it too rather than handing
+    /// back a column of nulls. The legacy dialect coerces the boolean to the number and answers,
+    /// which is #333 — and the two rules have to agree, since a check that refused what the
+    /// coercion goes on to cast would turn those answers straight back into refusals.
+    /// </para>
+    /// <para>
+    /// This replaces the placeholder that pinned "the seam changes nothing yet". That it changed
+    /// is the point.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheSparkRegistryRefusesUnderAnsiAndAnswersUnderLegacy()
+    {
+        var refusal = Assert.Throws<ExpressionAnalysisException>(() => Eval("a = bl", Spark));
+        Assert.Equal("DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES", refusal.ErrorClass);
+        Assert.Contains("\"INT\" and \"BOOLEAN\"", refusal.Message);
+
+        var legacy = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false });
+        Assert.Equal(new bool?[] { true, null, false }, Rows(Eval("a = bl", legacy)));
+
+        // ...and ordering stays refused in BOTH dialects, which is what says the legacy exception
+        // is equality's alone.
+        Assert.Throws<ExpressionAnalysisException>(() => Eval("a < bl", legacy));
     }
 
     /// <summary>A diagnostic reaches the caller as a refusal carrying the class it named.</summary>
@@ -208,23 +249,49 @@ public sealed class AnalysisRulesTests
         Assert.Throws<ExpressionAnalysisException>(() => Eval(sql, RefusingIntAgainstBoolean()));
     }
 
-    /// <summary>A set test asks about each member against the operand.</summary>
+    /// <summary>
+    /// A set test asks ONE question over the whole list, and never the pair question.
+    /// </summary>
     /// <remarks>
-    /// Per member, not once over the type the set resolves through, because legality is a property
-    /// of the pair. Measured for #286, <c>a IN (bl)</c> needs no rule beyond the cross-family one
-    /// a comparison already has.
+    /// <para>
+    /// An earlier version of this seam asked per member with <c>Equal</c>, which looked right and
+    /// is not: <c>IN</c> resolves a single type over the operand and every member, so it can
+    /// refuse a pair an equality accepts. Measured on 4.0.3, <c>a = bl</c> ANSWERS under the
+    /// legacy dialect — Spark's <c>BooleanEquality</c>, #333 — while <c>a IN (bl)</c> is refused
+    /// under BOTH dialects. Asking the pair question here would have made the legacy set answer.
+    /// </para>
+    /// <para>
+    /// The operand comes first and the members follow, which is the order Spark prints them in.
+    /// </para>
     /// </remarks>
     [Fact]
-    public void ASetTestAsksAboutEachMember()
+    public void ASetTestAsksOneQuestionOverTheWholeList()
     {
         Assert.Throws<ExpressionAnalysisException>(
             () => Eval("a IN (bl)", RefusingIntAgainstBoolean()));
 
         var accepting = RefusingIntAgainstBoolean();
-        Assert.Equal(new bool?[] { true, null, false }, Rows(Eval("a IN (1)", accepting)));
-        Assert.Equal(
-            new[] { (ComparisonOperator.Equal, "int32", "int32") },
-            accepting.Asked);
+        Assert.Equal(new bool?[] { true, null, false }, Rows(Eval("a IN (1, 2)", accepting)));
+
+        Assert.Equal(new[] { "int32,int32,int32" }, accepting.AskedSets);
+        Assert.Empty(accepting.Asked);
+    }
+
+    /// <summary>A bare <c>NULL</c> member is left out of the list rather than typed.</summary>
+    /// <remarks>
+    /// Spark types one <c>void</c>, which constrains the resolution no more than it constrains a
+    /// comparison — the same rule <c>CoerceSet</c> already applies when it resolves the set's
+    /// cast target, and the same structural test: read from the TREE, not from a column that came
+    /// back all null.
+    /// </remarks>
+    [Fact]
+    public void ABareNullMemberIsLeftOutOfTheList()
+    {
+        var accepting = RefusingIntAgainstBoolean();
+
+        Eval("a IN (1, NULL)", accepting);
+
+        Assert.Equal(new[] { "int32,int32" }, accepting.AskedSets);
     }
 
     /// <summary>

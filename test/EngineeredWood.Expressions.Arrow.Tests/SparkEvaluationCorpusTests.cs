@@ -103,89 +103,16 @@ public sealed class SparkEvaluationCorpusTests
     private static readonly Dictionary<string, string> KnownDifferences = new(StringComparer.Ordinal)
     {
         // ── DIVERGENT: we and Spark both answer, and disagree. Each has an issue. ──────────────
-        // Spark TYPE-CHECKS an IN list and refuses one whose members share no type -- in both
-        // dialects, and with no string involved in `a IN (bl)` at all. It refuses at ANALYSIS,
-        // so in a CHECK constraint the effect is not a rejected row: measured, a table carrying
-        // one is readable and every Spark write against it fails, including a write that
-        // satisfies it.
+        // WHAT USED TO BE HERE, and why its absence is the point. Two blocks stood here: 34 rows
+        // of the `boolean-equality` group, where ANSI Spark refuses a boolean against a numeric at
+        // analysis and we answered a column of nulls; and `a IN (bl)` / `ns IN (a, bl)`, declared
+        // against #261 as a type check we had decided NOT to adopt.
         //
-        // DECIDED AND NOT ADOPTED, #261. The general rule is "the members must share a type",
-        // which spans every type pair, and reproducing it for the pairs that happen to be
-        // measured would put the boundary somewhere arbitrary. The legacy list carries two more
-        // where ANSI -- the dialect Spark ships -- resolves the set and we already match it.
-        ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
-        ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
-
-        // #333/#286, and the whole `boolean-equality` group under THIS dialect. Spark refuses a
-        // boolean against a numeric at ANALYSIS under ANSI -- every equality below is
-        // DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES -- and we answer a row of nulls instead. The
-        // legacy half of the same group is the rule we DO reproduce: see BooleanEqualityTarget.
-        //
-        // UNLIKE #261 ABOVE, THIS ONE IS DECIDED ADOPTED. #286 was measured as three closed
-        // tables rather than an open-ended type checker, and the seam it plugs into is already
-        // in place (IAnalysisRules). These rows are what the comparison table will remove, so a
-        // shrinking list here is the progress report rather than a regression.
-        //
-        // `IS TRUE` / `IS FALSE` are in the list because the parser lowers them to `<=> TRUE` /
-        // `<=> FALSE`, which makes them comparisons against a boolean like any other.
-        ["0 = FALSE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["1 <=> TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["1 = TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["2 = TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["NOT (a = bl)"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["NOT (bl = a)"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["TRUE = 1"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a < bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a <= bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a <=> bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a <> bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a = bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a > bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a IN (bl, 1)"] = "#261: Spark type-checks IN and refuses; we answer",
-        ["a IS FALSE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a IS NOT FALSE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a IS NOT TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["a IS TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["b = bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["b IS NOT FALSE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["b IS TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["bl <> a"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["bl = a"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["bl > a"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["bl IN (a)"] = "#261: Spark type-checks IN and refuses; we answer",
-        ["d1 = bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["d1 IS TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["d3 = bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["d5 = bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["f = bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["g = bl"] = "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["g IS TRUE"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["sh <=> bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
-        ["sh = bl"] =
-            "#286: ANSI Spark refuses a boolean/numeric comparison at analysis; we answer",
+        // Both are gone because #286's comparison table is implemented -- see
+        // `SparkFunctionRegistry.CheckComparison`, and the `comparison-families` group that
+        // measures it. The #261 decision went with them: its "the members must share a type" rule
+        // is the SAME family table asked of a list, so adopting the comparison half answered the
+        // set half for free rather than by a second judgement call.
 
         // #319, and the two rows of the `null-propagation` group that diverge. Spark discards the
         // operand of IS NULL / IS NOT NULL when the operand can never be null, so an error inside
@@ -400,31 +327,18 @@ public sealed class SparkEvaluationCorpusTests
             ["nested.arr[99]"] = "struct columns are not modelled",
             ["element_at(nested.m, 'missing')"] = "struct columns are not modelled",
 
-            // Spark's string promotion excludes boolean and binary, so it REFUSES these two sets
-            // at analysis rather than answering -- under THIS dialect only. Measured, an ANSI
-            // session adds `CHECK (bl IN ('true'))` to a table quite happily and writes against
-            // it, and our answer is ANSI's; a legacy session then cannot write to that table at
-            // all. So what is left here is Spark disagreeing with itself across dialects. See
-            // the ANSI list, and #261 for the decision.
-            ["bl IN ('true')"] = "#261: legacy Spark refuses a boolean/string set; we answer",
-            ["bin IN ('A')"] = "#261: legacy Spark refuses a binary/string set; we answer",
+            // THE FOUR `IN` ROWS THAT STOOD HERE ARE GONE, and the legacy half is why the set
+            // rule needed measuring rather than assuming. Spark's string promotion excludes
+            // boolean and binary in a SET under this dialect and not under ANSI, so
+            // `bl IN ('true')` and `bin IN ('A')` are refused here and resolved there -- the only
+            // four rows of the 9x9 matrix where the dialects disagree about a set.
+            // `CheckSetComparison` carries that asymmetry, which is also why it is a question of
+            // its own and not `CheckComparison` asked once per member.
 
-            // The same type-check the ANSI list carries, and for the same reason.
-            ["a IN (bl)"] = "#261: Spark type-checks IN and refuses; we answer",
-            ["ns IN (a, bl)"] = "#261: Spark type-checks IN and refuses; we answer",
-
-            // #333/#286. What is left of the `boolean-equality` group once the equality rule is
-            // reproduced: ORDERING, which Spark refuses in both dialects -- the rule is
-            // equality's alone, and answering these would be inventing one Spark does not have --
-            // and two IN sets, which are #261's question rather than this one's since a set
-            // resolves ONE type over its members where an equality coerces a pair.
-            ["a < bl"] = "#286: Spark refuses boolean/numeric ordering in both dialects; we answer",
-            ["a <= bl"] =
-                "#286: Spark refuses boolean/numeric ordering in both dialects; we answer",
-            ["a > bl"] = "#286: Spark refuses boolean/numeric ordering in both dialects; we answer",
-            ["a IN (bl, 1)"] = "#261: Spark type-checks IN and refuses; we answer",
-            ["bl > a"] = "#286: Spark refuses boolean/numeric ordering in both dialects; we answer",
-            ["bl IN (a)"] = "#261: Spark type-checks IN and refuses; we answer",
+            // NOTHING OF THE `boolean-equality` GROUP IS LEFT HERE. The ordering rows went when
+            // #286's comparison table landed -- `a < bl` is refused in both dialects, the boolean
+            // exception being equality's alone -- and the `IN` rows went with the set rule beside
+            // it.
 
             // `'\u0663' + 1` used to sit here as #296: arithmetic had no string branch at all,
             // so every string operand reached IntegralRank and threw. It is gone because the

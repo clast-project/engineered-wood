@@ -149,7 +149,11 @@ LEGACY_GROUPS = (
     # #333. THE MEASUREMENT IS THE LEGACY COLUMN. Under ANSI every equality in the group is refused
     # at analysis -- that half belongs to #286 -- so an ANSI-only harvest would record a wall of
     # refusals and leave `BooleanEquality` itself entirely unmeasured.
-    "boolean-equality")
+    "boolean-equality",
+    # #286. The ANSI and legacy analyzers refuse DIFFERENT sets -- boolean joins the numeric
+    # family for equality under legacy and under ANSI it does not -- so the rule cannot be read
+    # off one dialect. Both halves are the measurement.
+    "comparison-families")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -203,6 +207,11 @@ ROWS = [
      "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
+
+# ONE COLUMN PER TYPE EngineeredWood MODELS, for the 9x9 matrix of #286. Every entry is a column
+# of SCHEMA above and they are deliberately columns rather than literals: a literal folds, and a
+# fold can take a different route through the analyzer than a reference does.
+COMPARISON_COLUMNS = ("a", "b", "g", "d1", "dt", "ts", "bl", "bin", "s")
 
 # --- Identifier case, which needs a schema of its own ----------------------------------
 # Issue #181. Spark resolves an identifier case-insensitively by default, and EngineeredWood did
@@ -3024,6 +3033,32 @@ GROUPS = {
         # A STRING against a boolean, which is NOT this rule and is asked so that a fix cannot
         # quietly widen to it: the string rules of #180/#259 own this pair.
         "s = bl", "ns = bl",
+    ],
+
+    # THE 9x9 COMPARISON MATRIX. #286, and the measurement the family rule is derived from rather
+    # than remembered: one column per type EW models, asked of both dialects, for the three
+    # comparison shapes that resolve differently.
+    #
+    # WHY IT IS GENERATED. 81 pairs x 4 shapes is 324 expressions, and writing them out by hand
+    # would invite exactly the gap this group exists to close -- a pair nobody thought to ask
+    # about becomes a rule nobody implemented. The ORDER matters and both directions are asked:
+    # which operand a rule moves is part of the answer (a string against a number is cast to the
+    # number; a string against a binary stays put and the BINARY is rendered as text).
+    #
+    # `<=>` is here beside `=` because it is an equality that never answers null, and `<` because
+    # ordering is where the boolean rule of #333 must NOT reach. `IN` is here because it is not
+    # the disjunction of equalities it resembles: it resolves ONE type over the whole list, so it
+    # can refuse a pair that `=` accepts -- measured, `a = bl` answers under the legacy dialect
+    # while `a IN (bl)` is refused in BOTH.
+    "comparison-families": [
+        f"{left} {op} {right}"
+        for op in ("=", "<>", "<=>", "<")
+        for left in COMPARISON_COLUMNS
+        for right in COMPARISON_COLUMNS
+    ] + [
+        f"{left} IN ({right})"
+        for left in COMPARISON_COLUMNS
+        for right in COMPARISON_COLUMNS
     ],
 
     "malformed": [
