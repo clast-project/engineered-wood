@@ -3359,4 +3359,36 @@ public sealed class SparkFunctionRegistryTests
         Assert.Null(
             Assert.IsType<Int32Array>(Eval(Legacy, "nullif(a, bl)", populated)).GetValue(0));
     }
+
+    /// <summary>
+    /// The shared unary type rule names the operator it was asked about.
+    /// </summary>
+    /// <remarks>
+    /// <c>SparkNumericTypes.UnaryResult</c> serves both operators because the rule is one rule —
+    /// a numeric keeps its type, a <c>void</c> resolves <c>double</c>, nothing else has a rule —
+    /// and only the message differs. Measured for #313/#340, Spark refuses both with
+    /// <c>DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE</c> over a boolean, a date, a timestamp and a
+    /// binary, in both dialects; what this pins is that a reader of OUR failure is told which
+    /// operator they wrote.
+    /// </remarks>
+    [Theory]
+    [InlineData("+bl", "plus")]
+    [InlineData("-bl", "minus")]
+    [InlineData("+dt", "plus")]
+    [InlineData("-dt", "minus")]
+    public void TheUnaryRefusalNamesTheOperatorItWasAskedAbout(string sql, string expected)
+    {
+        var batch = Batch(("bl", Booleans(true)), ("dt", Dates(2026, 8, 11)));
+
+        var refusal = Assert.Throws<NotSupportedException>(() => Eval(Ansi, sql, batch));
+
+        Assert.Contains($"unary {expected}", refusal.Message, StringComparison.Ordinal);
+    }
+
+    private static IArrowArray Dates(int year, int month, int day)
+    {
+        var builder = new Date32Array.Builder();
+        builder.Append(new DateTime(year, month, day, 0, 0, 0, DateTimeKind.Utc));
+        return builder.Build();
+    }
 }

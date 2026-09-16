@@ -333,8 +333,14 @@ public static class SparkSqlParser
 
         private Expression ParseUnary()
         {
+            // A LEADING `+` IS NOT THE IDENTITY, and dropping it was right for every numeric
+            // operand -- which is why it survived so long. Spark's `UnaryPositive` keeps a
+            // numeric operand's type and casts a STRING to double, the same target unary minus
+            // takes, so `+'1'` is the double 1.0 and `+'abc'` refuses where the bare string did
+            // neither. It types a bare NULL `double` as well, which a conditional then reads:
+            // `coalesce(a, +NULL)` is a double to Spark. #313, #340.
             if (TakeToken(TokenKind.Plus))
-                return ParseUnary();
+                return new FunctionCall("positive", new[] { ParseUnary() });
 
             if (TakeToken(TokenKind.Minus))
                 return new FunctionCall("negative", new[] { ParseUnary() });
