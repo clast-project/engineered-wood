@@ -31,5 +31,6 @@ vortex-onpair = "0.86.1"
 vortex-pco = "0.86.1"
 vortex-sequence = "0.86.1"
 vortex-zigzag = "0.86.1"
+vortex-zstd = "0.86.1"
 futures = "0.3"
-vortex = { version = "0.86.1", default-features = false, features = ["files", "tokio"] }
+vortex = { version = "0.86.1", default-features = false, features = ["files", "tokio", "zstd"] }

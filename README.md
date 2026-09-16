@@ -555,8 +555,7 @@ implementation.
 `vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
 `vortex.time` / `vortex.uuid`), `fastlanes.bitpacked` (with patches),
 `fastlanes.for`, `fastlanes.rle`, `fastlanes.delta` (signed and unsigned),
-`vortex.zigzag`,
-`vortex.pco`.
+`vortex.zigzag`, `vortex.zstd`, `vortex.pco`.
 
 **Array encodings — write**: `vortex.primitive`, `vortex.bool`,
 `vortex.varbin`, `vortex.varbinview`, `vortex.constant`,

@@ -302,17 +302,22 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         return Decompress(tail.Span.Slice(startInTail, checked((int)loc.Length)), loc, label);
     }
 
+    /// <summary>
+    /// Segment compression is a reserved field in Vortex's footer and postscript: the format
+    /// names the codecs, but no upstream writer sets it (vortex 0.86) and a segment carries no
+    /// uncompressed length to decompress to. There is nothing to implement until the format
+    /// defines it, so a file that sets it is refused.
+    /// </summary>
+    private static NotSupportedException UndefinedSegmentCompression(string label, CompressionCodec codec) =>
+        new($"The {label} segment declares {codec} compression, which the Vortex format reserves but does " +
+            "not define: no writer produces it, and a segment records no uncompressed length.");
+
     private static byte[] Decompress(ReadOnlySpan<byte> compressed, SegmentLocator loc, string label)
     {
         if (loc.Codec == CompressionCodec.Uncompressed)
             return compressed.ToArray();
 
-        // The Vortex spec does not carry an uncompressed length on a segment, so
-        // we have no upfront size for decompression. Wire this up alongside the
-        // first fixture that exercises it.
-        throw new NotSupportedException(
-            $"Decompressing the {label} segment with codec {loc.Codec} is not yet implemented. " +
-            "Add support and a fixture that exercises it.");
+        throw UndefinedSegmentCompression(label, loc.Codec);
     }
 
     /// <summary>
@@ -920,8 +925,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         var compressed = owner.Memory.Span;
         var raw = locator.Codec == CompressionCodec.Uncompressed
             ? compressed
-            : throw new NotSupportedException(
-                $"Decompressing the zones segment with codec {locator.Codec} is not yet implemented.");
+            : throw UndefinedSegmentCompression("zones", locator.Codec);
         var serialized = SerializedArray.Parse(raw);
 
         // The zones segment contains a vortex.struct ArrayNode whose fields
@@ -951,8 +955,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         var compressed = owner.Memory.Span;
         var raw = locator.Codec == CompressionCodec.Uncompressed
             ? compressed
-            : throw new NotSupportedException(
-                $"Decompressing segments with codec {locator.Codec} is not yet implemented.");
+            : throw UndefinedSegmentCompression("data", locator.Codec);
 
         var serialized = SerializedArray.Parse(raw);
         return ArrayDecoder.Decode(serialized, _arraySpecs, plan.ArrowType, checked((long)chunk.RowCount));

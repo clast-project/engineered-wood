@@ -298,15 +298,7 @@ internal static class OnPairArrayDecoder
                 }
                 continue;
             }
-            switch (wireType)
-            {
-                case 1: pos += 8; break;
-                case 2: pos += checked((int)Varint.ReadUnsigned(bytes, ref pos)); break;
-                case 5: pos += 4; break;
-                default:
-                    throw new VortexFormatException(
-                        $"Unsupported protobuf wire type {wireType} in OnPairMetadata.");
-            }
+            ProtobufWire.SkipField(bytes, ref pos, wireType, "OnPairMetadata");
         }
         return new Metadata(uncompressedLengths, dictSize, codesLen, dictOffsets, codes, codesOffsets);
     }
