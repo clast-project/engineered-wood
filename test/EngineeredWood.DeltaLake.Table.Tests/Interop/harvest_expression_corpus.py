@@ -157,7 +157,14 @@ LEGACY_GROUPS = (
     # #313/#340. A bad string is the half that splits: `+'abc'` raises CAST_INVALID_INPUT under
     # ANSI and answers NULL without it, exactly as `-'abc'` does. One harvest would record the
     # accept-set and leave the whole boundary around it unmeasured.
-    "unary-operators")
+    "unary-operators",
+    # #311. The fold's own rule ought to be dialect-independent -- unifying a date with a
+    # timestamp is coercion, and the ANSI switch moves overflow and cast BEHAVIOUR -- and the
+    # group's last four rows are string coercions, which is the one place in this file where the
+    # two dialects are known to choose OPPOSITE directions. So half the group cannot be read off
+    # one harvest at all, and the other half is a claim until a second one says so, exactly as
+    # for `decimal-common-type`.
+    "date-timestamp-fold")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3132,6 +3139,67 @@ GROUPS = {
 
         # THE NON-NUMERIC BOUNDARY, both operators. Unmeasured until now for either.
         "+bl", "-bl", "+dt", "-dt", "+ts", "-ts", "+bin", "-bin",
+    ],
+
+    # A DATE folded with a TIMESTAMP. #311, and the INVERSE of `comparison-families`: there we
+    # answered where Spark's analyzer refuses, here we REFUSED where Spark answers. Every site
+    # below raised `no common type for timestamp and date32`, which made a constraint Spark
+    # accepts unwritable through us.
+    #
+    # THE GROUP IS THE FOLD, NOT ANY ONE FUNCTION, which is why it asks seven callers for one
+    # rule. It was invisible until now because the corpus carries `ts` and `dt` and had no row
+    # that folded them together -- `nullif(ts, dt)` came closest and does not fold at all, since
+    # it types from its first argument.
+    #
+    # EVERY TIMESTAMP ANSWER IS ASKED TWICE, bare and wrapped in `CAST(... AS STRING)`. The bare
+    # row is the one that records the TYPE, which is the rule; the wrapped one records the VALUE,
+    # because PySpark localises a timestamp to the DRIVER's zone on collect and a bare answer
+    # would pin the harvest machine rather than the pinned UTC. The value is not decoration
+    # either -- it is the only thing that says the DATE moved UP to midnight rather than the
+    # timestamp being truncated DOWN, and both folds answer `timestamp` either way.
+    "date-timestamp-fold": [
+        # --- THE SEVEN SITES, bare: the type is the measurement.
+        "coalesce(ts, dt)", "coalesce(dt, ts)",
+        "nvl(ts, dt)", "ifnull(dt, ts)",
+        "if(a > 0, ts, dt)", "if(a < 0, ts, dt)",
+        "nvl2(a, ts, dt)",
+        "CASE WHEN a > 0 THEN ts ELSE dt END", "CASE WHEN a < 0 THEN ts ELSE dt END",
+        "greatest(ts, dt)", "least(ts, dt)", "greatest(dt, ts)", "least(dt, ts)",
+
+        # --- THE SAME SEVEN, rendered by the JVM: the value is the DIRECTION of the promotion.
+        # `coalesce(ts, dt)` and `greatest(ts, dt)` must come back at 12:30, `coalesce(dt, ts)`
+        # and `least(ts, dt)` at midnight of the same day. A fold that truncated to DATE instead
+        # would answer midnight for all four and still resolve the pair.
+        "CAST(coalesce(ts, dt) AS STRING)", "CAST(coalesce(dt, ts) AS STRING)",
+        "CAST(nvl(ts, dt) AS STRING)", "CAST(ifnull(dt, ts) AS STRING)",
+        "CAST(if(a > 0, ts, dt) AS STRING)", "CAST(if(a < 0, ts, dt) AS STRING)",
+        "CAST(nvl2(a, ts, dt) AS STRING)",
+        "CAST(CASE WHEN a > 0 THEN ts ELSE dt END AS STRING)",
+        "CAST(CASE WHEN a < 0 THEN ts ELSE dt END AS STRING)",
+        "CAST(greatest(ts, dt) AS STRING)", "CAST(least(ts, dt) AS STRING)",
+        "CAST(greatest(dt, ts) AS STRING)", "CAST(least(dt, ts) AS STRING)",
+
+        # --- A PAIR THAT NEEDS NO PROMOTION, so the rule cannot be "every temporal is a
+        # timestamp". Two dates stay a DATE, and a date answer survives collect untouched --
+        # PySpark shifts a timestamp and not a date -- so these are comparable bare.
+        "coalesce(dt, dt)", "greatest(dt, dt)", "if(a > 0, dt, dt)",
+        "coalesce(dt, CAST(NULL AS DATE))", "coalesce(CAST(NULL AS TIMESTAMP), dt)",
+
+        # --- THE UNTYPED NULL, which constrains nothing and must not disturb the pair.
+        "CAST(coalesce(NULL, ts, dt) AS STRING)", "CAST(coalesce(ts, NULL, dt) AS STRING)",
+        "coalesce(NULL, dt)", "greatest(dt, NULL)",
+
+        # --- WHERE THE RULE STOPS. A temporal against a number, a boolean or a binary has no
+        # common type in Spark either (DATATYPE_MISMATCH.DATA_DIFF_TYPES), so these refusals are
+        # what says the fix adds one PAIR rather than a general "temporals fold with anything".
+        "coalesce(a, dt)", "coalesce(a, ts)", "greatest(a, ts)", "least(dt, a)",
+        "coalesce(bl, dt)", "greatest(ts, X'41')",
+
+        # --- A STRING against either, which DOES have a rule and a dialect-dependent one --
+        # `conditional-string-coercion`'s, reached through this same fold. Here so that adding
+        # the temporal branch above is shown not to have moved it.
+        "CAST(coalesce(ts, s) AS STRING)", "CAST(coalesce(dt, s) AS STRING)",
+        "coalesce(ts, s)", "coalesce(dt, s)",
     ],
 
     "malformed": [

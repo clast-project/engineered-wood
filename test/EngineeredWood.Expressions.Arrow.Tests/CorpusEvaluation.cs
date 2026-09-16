@@ -377,6 +377,20 @@ internal static class CorpusEvaluation
                     : $"expected {expected}, got '{got}'";
             }
 
+            // Compared as TEXT, like the date above it, because that is how the fixture holds it:
+            // the driver renders a timestamp answer through the JVM rather than collecting it, so
+            // what is recorded is Spark's own spelling in the session zone. Before #311 there was
+            // no arm here at all -- a timestamp fell through to "no comparison for timestamp",
+            // which nothing ever saw because the three rows that would have reached it were
+            // EXCLUDED for carrying the harvest machine's zone.
+            case TimestampArray a:
+            {
+                var got = ShowTimestamp(a.GetTimestamp(row)!.Value);
+                return string.Equals(expected.GetString(), got, StringComparison.Ordinal)
+                    ? null
+                    : $"expected {expected}, got '{got}'";
+            }
+
             case DoubleArray a:
                 return SameDouble(ExpectedDouble(expected), a.GetValue(row)!.Value)
                     ? null
@@ -518,8 +532,26 @@ internal static class CorpusEvaluation
         Int64Array a => a.GetValue(row)?.ToString() ?? "null",
         FloatArray a => a.GetValue(row) is { } f ? ShowDouble(f) : "null",
         DoubleArray a => a.GetValue(row) is { } d ? ShowDouble(d) : "null",
+        Date32Array a => a.GetDateTimeOffset(row)?.ToString("yyyy-MM-dd", Invariant) ?? "null",
+        TimestampArray a => a.GetTimestamp(row) is { } t ? ShowTimestamp(t) : "null",
         _ => "value",
     };
+
+    /// <summary>An instant spelled the way Spark's timestamp-to-string cast spells it.</summary>
+    /// <remarks>
+    /// Seconds always, and a fractional part only when there is one — Spark renders
+    /// <c>2026-08-11 12:30:00</c> and <c>2026-09-15 18:15:36.045894</c>, never a padded
+    /// <c>.000000</c>. Written out here rather than borrowed from the evaluator's own cast on
+    /// purpose: a comparison that formatted through the code under test would agree with itself
+    /// however wrong both were.
+    /// </remarks>
+    private static string ShowTimestamp(DateTimeOffset instant)
+    {
+        var utc = instant.ToUniversalTime();
+        var text = utc.ToString("yyyy-MM-dd HH:mm:ss", Invariant);
+        var fraction = utc.ToString("ffffff", Invariant).TrimEnd('0');
+        return fraction.Length == 0 ? text : text + "." + fraction;
+    }
 }
 
 /// <summary>
