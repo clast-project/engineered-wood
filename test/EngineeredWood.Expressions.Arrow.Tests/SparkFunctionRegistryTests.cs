@@ -330,7 +330,7 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal("0.1", SparkFloatText.ShortestRoundTrip(0.1));
         Assert.Equal("2.5", SparkFloatText.ShortestRoundTrip(2.5));
 
-        // Every rendering must read back as the value it came from, whichever rung produced it.
+        // Every rendering must read back as the value it came from, at whatever length it settled.
         foreach (var value in new[] { 0.1, 2.5, 1e30, -1e30, 1.0000000150474662E30, 5e-324, double.MaxValue })
         {
             Assert.Equal(value, double.Parse(
@@ -484,15 +484,21 @@ public sealed class SparkFunctionRegistryTests
     }
 
     /// <summary>
-    /// The float ladder starts at six digits, because seven does not always reach the shortest form.
+    /// Six digits can be a normal float's shortest form, which rounding to seven does not reach.
     /// </summary>
     /// <remarks>
     /// Half a step is at most 2^-24 = 5.96e-8 of a normal float, and half of the seven-digit
     /// grid's step falls to 5.0e-8 where the leading digit is a 9 — so rounding to seven digits
-    /// can miss a six-digit answer. Measured against <c>Float.toString</c> on JDK 21 over a
-    /// 200,000-float sweep: six values disagreed, every one of them beginning with a 9, and the
-    /// extra rung takes it to none. Unrelated to <see cref="ASubnormalFloatPrintsTheWayJavaPrintsIt"/>
-    /// — these are ordinary normal floats.
+    /// can miss a six-digit answer, and it printed <c>9.458641E-10</c> where Java prints
+    /// <c>9.45864E-10</c>. Measured against <c>Float.toString</c> on JDK 21 over a 200,000-float
+    /// sweep: six values disagreed, every one of them beginning with a 9.
+    /// <para>
+    /// #336 answered it by starting the ladder a rung lower. The ladder is gone (#337, #338) and
+    /// the generator bisects for the shortest length that reads back instead of rounding to a
+    /// chosen one, so the premise these values broke no longer exists — they stay as the
+    /// regression pins for it. Unrelated to
+    /// <see cref="ASubnormalFloatPrintsTheWayJavaPrintsIt"/>; these are ordinary normal floats.
+    /// </para>
     /// </remarks>
     [Theory]
     [InlineData(-1333657694, "-9.45864E-10")]   // seven digits gave -9.458641E-10
@@ -549,6 +555,159 @@ public sealed class SparkFunctionRegistryTests
     {
         Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
         Assert.Equal("-" + expected, SparkFloatText.Render(-Float(bits)));
+    }
+
+    /// <summary>
+    /// A power of two prints in as few digits as Java uses, which is one fewer than rounding finds.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #337. At an exact power of two the gap down to the previous value is half the gap up to the
+    /// next, so the rounding interval is <c>[v - ulp/4, v + ulp/2]</c> and the CLOSEST k-digit
+    /// decimal — the only one a rounding ladder ever tested — can fall outside it while another
+    /// k-digit decimal falls inside. For <c>2^-24</c> the two sixteen-digit candidates are
+    /// <c>...062</c>, which is 5.0e-24 below the value where the lower bound is 3.31e-24 away, and
+    /// <c>...063</c>, which is 5.0e-24 above it where the upper bound is 6.62e-24 away. Only the
+    /// second reads back, and only the first was asked.
+    /// </para>
+    /// <para>
+    /// Exactly 46 of the 2,046 normal double powers of two were affected and 3 of the 254 normal
+    /// float ones, measured against <c>Double.toString</c> on JDK 21 over a set that contains every
+    /// one of them. A non-zero mantissa makes the interval symmetric, so nothing else can be.
+    /// </para>
+    /// <para>
+    /// <b>net472 answered some of these correctly by accident</b>, which is why this could not be
+    /// fixed apart from <see cref="TheDigitsOfANormalValueDoNotDependOnTheTargetFramework"/>: its
+    /// <c>ToString("G16")</c> of <c>2^-24</c> is a digit out in the direction that happens to name
+    /// the surviving candidate, so making that platform exact on its own would have turned these
+    /// values from right into wrong there.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(4499096027743125504L, "5.960464477539063E-8")]     // 2^-24, the issue's own repro
+    [InlineData(27021597764222976L, "7.120236347223045E-307")]     // 2^-1017, the smallest affected
+    [InlineData(1670835461754454016L, "5.351097043477547E-197")]   // 2^-652
+    [InlineData(6399615070493474816L, "6.455624695217272E119")]    // 2^398
+    [InlineData(9002695655113621504L, "6.386688990511104E293")]    // 2^976, the largest affected
+    public void APowerOfTwoDoublePrintsInAsFewDigitsAsJavaDoes(long bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(BitConverter.Int64BitsToDouble(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-BitConverter.Int64BitsToDouble(bits)));
+    }
+
+    /// <summary>The three normal float powers of two the same interval catches.</summary>
+    [Theory]
+    [InlineData(260046848, "1.2621775E-29")]    // 2^-96
+    [InlineData(1795162112, "1.5474251E26")]    // 2^87
+    [InlineData(1820327936, "1.2379401E27")]    // 2^90
+    public void APowerOfTwoFloatPrintsInAsFewDigitsAsJavaDoes(int bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-Float(bits)));
+    }
+
+    /// <summary>
+    /// An ordinary normal value renders the same on net472 as on net10.0, which it did not.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #338. The G15/G16/G17 ladder asked the platform two questions and .NET Framework answers
+    /// both wrongly past fifteen significant digits. <b>Its parser accepts a form that does not
+    /// round-trip</b>, so the ladder stopped a rung early and returned too few digits —
+    /// <c>double.Parse("3.465494185217035E-271")</c> is a different double there than it is on
+    /// .NET Core, but net472 reports the match. <b>And its formatter's last digit is wrong</b>, so
+    /// even the right rung carried the wrong digits: <c>ToString("G16")</c> of bits
+    /// 3109743661010044618 ends <c>...729E-101</c> against .NET Core's <c>...728E-101</c>.
+    /// </para>
+    /// <para>
+    /// Measured against JDK 21 over 224,016 doubles and 418,883 floats — the sets these rows are
+    /// drawn from, which contain every normal power of two of both widths. Before: 92 double
+    /// mismatches on net10.0 and 3,331 on net472, 6 float mismatches and 11,886. After: none on
+    /// either, and the two frameworks' whole output is byte-identical.
+    /// </para>
+    /// <para>
+    /// <b>A single-target run cannot see any of this</b>, and neither can a test that only checks
+    /// the rendering reads back — every spelling in this table reads back. It has to be the
+    /// digits, against the JVM. See <c>doc/running-tests.md</c>.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(4634874968833006078L, "73.53480521226444")]         // net472 said ...45
+    [InlineData(2480906809061150284L, "7.675584602179282E-143")]
+    [InlineData(6504076432838151485L, "6.471811433918814E126")]
+    [InlineData(560538912182121945L, "3.4654941852170353E-271")]    // the parser half
+    [InlineData(3109743661010044618L, "8.582707334825728E-101")]    // the formatter half
+    public void TheDigitsOfANormalValueDoNotDependOnTheTargetFramework(long bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(BitConverter.Int64BitsToDouble(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-BitConverter.Int64BitsToDouble(bits)));
+    }
+
+    /// <summary>The same for a float, whose ladder net472 broke almost three times as often.</summary>
+    [Theory]
+    [InlineData(1052270123, "0.36009344")]      // net472 said ...45
+    [InlineData(1003478845, "0.0063437507")]
+    [InlineData(1474162179, "4.8802864E14")]
+    [InlineData(750459404, "5.3177514E-12")]
+    public void TheDigitsOfANormalFloatDoNotDependOnTheTargetFramework(int bits, string expected)
+    {
+        Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
+        Assert.Equal("-" + expected, SparkFloatText.Render(-Float(bits)));
+    }
+
+    /// <summary>
+    /// NaN and the infinities keep their spellings on the digits entry point too, not only on
+    /// <c>Render</c>.
+    /// </summary>
+    /// <remarks>
+    /// Reading the bits directly means owning this: an all-ones exponent decodes as a perfectly
+    /// ordinary finite mantissa, so without a guard <c>ShortestRoundTrip(double.NaN)</c> answers
+    /// <c>-2.696539702293474E308</c> and an infinity answers the largest double. The ladder never
+    /// had to say so because it took the spellings from the platform's formatter.
+    /// <para>
+    /// No caller reaches it that way today — <c>CastFloatingToDecimal</c> drops these rows before
+    /// it asks, and a decimal has no spelling for them — so this pins the contract rather than a
+    /// live path.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheDigitsEntryPointKeepsTheNonFiniteSpellings()
+    {
+        Assert.Equal("NaN", SparkFloatText.ShortestRoundTrip(double.NaN));
+        Assert.Equal("Infinity", SparkFloatText.ShortestRoundTrip(double.PositiveInfinity));
+        Assert.Equal("-Infinity", SparkFloatText.ShortestRoundTrip(double.NegativeInfinity));
+
+        Assert.Equal("NaN", SparkFloatText.ShortestRoundTrip(float.NaN));
+        Assert.Equal("Infinity", SparkFloatText.ShortestRoundTrip(float.PositiveInfinity));
+        Assert.Equal("-Infinity", SparkFloatText.ShortestRoundTrip(float.NegativeInfinity));
+    }
+
+    /// <summary>
+    /// The step from the largest subnormal to the smallest normal, where the decode changes hands.
+    /// </summary>
+    /// <remarks>
+    /// Adjacent values that reach <see cref="SparkFloatText.ShortestDigits"/> by different routes:
+    /// one has a raw exponent of zero and takes its mantissa as written, the other has a raw
+    /// exponent of one and gets the implicit leading bit put back. Both come out at the same
+    /// binary exponent, so a mistake in either branch shows up as a jump in the rendering.
+    /// <para>
+    /// It is NOT a test of the smallest normal's exception in <c>NarrowBelow</c>. That guard is
+    /// measurably unobservable: flipping <c>rawExponent > 1</c> to <c>rawExponent > 0</c> leaves
+    /// all four values below unchanged, because the shortest form here already runs to the full
+    /// width. The exception is kept because the interval genuinely IS symmetric there — the
+    /// predecessor is one ordinary step away — and not because any output depends on it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheSubnormalBoundaryRendersContinuously()
+    {
+        Assert.Equal("2.2250738585072014E-308",
+            SparkFloatText.Render(BitConverter.Int64BitsToDouble(4503599627370496L)));   // smallest normal
+        Assert.Equal("2.225073858507201E-308",
+            SparkFloatText.Render(BitConverter.Int64BitsToDouble(4503599627370495L)));   // largest subnormal
+
+        Assert.Equal("1.1754944E-38", SparkFloatText.Render(Float(8388608)));            // smallest normal
+        Assert.Equal("1.1754942E-38", SparkFloatText.Render(Float(8388607)));            // largest subnormal
     }
 
     /// <summary>
