@@ -170,7 +170,10 @@ internal static class SparkNumericTypes
         // BEFORE the identity check below, so that two timestamps resolve the type this
         // evaluator actually BUILDS rather than echoing whichever unit and zone the left-hand
         // column happened to carry. See SparkArrays.Timestamp.
-        if (SparkArrays.IsTemporal(left) && SparkArrays.IsTemporal(right))
+        //
+        // A NAIVE timestamp is excluded and falls through, which is the whole of the
+        // TIMESTAMP_NTZ boundary -- see IsZonedOrDate.
+        if (IsZonedOrDate(left) && IsZonedOrDate(right))
             return TemporalCommonType(left, right);
 
         if (left.GetType() == right.GetType() && !IsDecimal(left))
@@ -238,13 +241,50 @@ internal static class SparkNumericTypes
     /// <para>
     /// A temporal against anything else has NO rule and falls through to the refusal, which is
     /// Spark's answer too: <c>coalesce(a, dt)</c> is
-    /// <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c>.
+    /// <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c>. So does a TIMESTAMP_NTZ, which is not this
+    /// rule's pair at all — <see cref="IsZonedOrDate"/> is where that boundary is drawn and why.
     /// </para>
     /// </remarks>
     private static IArrowType TemporalCommonType(IArrowType left, IArrowType right) =>
         SparkArrays.IsDateType(left) && SparkArrays.IsDateType(right)
             ? Date32Type.Default
             : SparkArrays.Timestamp;
+
+    /// <summary>
+    /// A date, or a timestamp that carries a zone — the operands the rule above was measured on.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>TIMESTAMP_NTZ IS A DIFFERENT SPARK TYPE AND IS DELIBERATELY NOT FOLDED HERE.</b> Delta
+    /// maps it to an Arrow <c>TimestampType</c> with a null zone
+    /// (<c>SchemaConverter.FromDeltaPrimitive</c>), so it reaches this method looking exactly like
+    /// a timestamp — and #311's corpus group contains no NTZ column at all, because the harvest
+    /// schema has none. Folding it here would be inventing a rule rather than reproducing a
+    /// measured one, and the answer it would invent is wrong twice over: Spark resolves
+    /// <c>coalesce(ntz, dt)</c> to <c>timestamp_ntz</c>, not to a zoned timestamp, and Delta's own
+    /// widening permits <c>date -&gt; timestamp_ntz</c> while REFUSING <c>date -&gt;</c> a zoned
+    /// timestamp, since that reinterprets a naive calendar date as an absolute instant
+    /// (<c>ValueWidener</c>, and <c>TypeWideningPolicyTests.Date32ToZonedTimestamp_IsNotWidened</c>).
+    /// <c>SparkArrays.SparkTypeFromName</c> draws the same line for the CAST target and for the
+    /// same reason.
+    /// </para>
+    /// <para>
+    /// So an NTZ operand falls through to exactly what this method did before #311: two of them
+    /// take the identity arm and keep the left type, and an NTZ against a DATE is refused. That is
+    /// not the right long-term answer — both are gaps, and the second is #311's own false
+    /// rejection one type over — but closing them needs an NTZ column in the harvest schema first.
+    /// Filed as #349.
+    /// </para>
+    /// <para>
+    /// <b>The test is "clearly zoned", not "not null"</b>, so a timestamp carrying an empty zone
+    /// string — which the Delta converter never produces but nothing here can rule out — takes the
+    /// old path too. The conservative direction is the one that cannot silently relabel a
+    /// wall-clock value as an instant.
+    /// </para>
+    /// </remarks>
+    private static bool IsZonedOrDate(IArrowType type) =>
+        SparkArrays.IsDateType(type)
+        || (type is TimestampType timestamp && !string.IsNullOrEmpty(timestamp.Timezone));
 
     /// <summary>
     /// The decimal type Spark reads an integral LITERAL as when it meets a decimal: the narrowest

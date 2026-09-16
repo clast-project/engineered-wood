@@ -148,6 +148,49 @@ public class DateTimestampFoldTests
     }
 
     /// <summary>
+    /// A TIMESTAMP_NTZ is left exactly where it was, because it was never measured.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Delta maps <c>timestamp_ntz</c> to an Arrow <c>TimestampType</c> with a NULL ZONE, so it
+    /// arrives here looking just like a timestamp — and the corpus has no NTZ column, so nothing
+    /// in #311's group says what Spark does with one. Folding it would have been inventing a
+    /// rule, and the invented answer is wrong twice: Spark resolves <c>coalesce(ntz, dt)</c> to
+    /// <c>timestamp_ntz</c>, and Delta's widening permits <c>date -&gt; timestamp_ntz</c> while
+    /// refusing <c>date -&gt;</c> a ZONED timestamp, because that reads a naive calendar date as
+    /// an absolute instant.
+    /// </para>
+    /// <para>
+    /// <b>These are main's answers, pinned as such.</b> Both were verified against the branch
+    /// point rather than asserted from the code: two naive timestamps resolved the naive type and
+    /// an NTZ against a DATE threw, and both still do. #349 carries what it would take to answer
+    /// them properly, which starts with an NTZ column in the harvest schema.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ANaiveTimestampIsNotThisRulesPairAndKeepsItsOldAnswer()
+    {
+        var naive = new TimestampType(TimeUnit.Microsecond, (string?)null);
+
+        // Two naive timestamps take the identity arm, exactly as before #311.
+        var both = Assert.IsType<TimestampType>(SparkNumericTypes.CommonType(naive, naive));
+        Assert.Null(both.Timezone);
+
+        // ...and a naive timestamp against a DATE is still refused, which is the gap #349 names.
+        Assert.Throws<NotSupportedException>(
+            () => SparkNumericTypes.CommonType(naive, Date32Type.Default));
+        Assert.Throws<NotSupportedException>(
+            () => SparkNumericTypes.CommonType(Date32Type.Default, naive));
+
+        // An empty zone string is treated as naive too. Nothing in this repository produces one,
+        // and the conservative direction is the one that cannot relabel a wall clock as an
+        // instant.
+        Assert.Throws<NotSupportedException>(
+            () => SparkNumericTypes.CommonType(
+                new TimestampType(TimeUnit.Microsecond, string.Empty), Date32Type.Default));
+    }
+
+    /// <summary>
     /// A temporal against a type Spark will not fold it with is still refused.
     /// </summary>
     /// <remarks>

@@ -328,6 +328,13 @@ internal static class SparkArrays
     /// resolution that echoed the source's type back would promise a type the array it hands
     /// over does not have. #311.
     /// <para>
+    /// <b>A TIMESTAMP_NTZ source is the one case where the promise is still unkept</b>, and
+    /// knowingly: <see cref="BuildTimestamp"/> labels its result UTC whatever it read, so a fold
+    /// over two naive timestamps hands back a zoned array while resolving the naive type. That
+    /// predates #311 and is unchanged by it — <c>SparkNumericTypes.IsZonedOrDate</c> keeps the
+    /// new rule off NTZ precisely so the two stay where they were. #349.
+    /// </para>
+    /// <para>
     /// <c>ArrowRowEvaluator</c> spells the same type out for itself when it materialises a
     /// <c>TIMESTAMP'…'</c> literal, and deliberately: it is registry-agnostic, and reaching into
     /// the Spark namespace for a constant would couple the evaluator to the dialect it dispatches
