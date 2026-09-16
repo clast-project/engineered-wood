@@ -494,8 +494,9 @@ public sealed class SparkFunctionRegistryTests
     /// sweep: six values disagreed, every one of them beginning with a 9.
     /// <para>
     /// #336 answered it by starting the ladder a rung lower. The ladder is gone (#337, #338) and
-    /// the generator asks every length from one upward, so the premise these values broke no
-    /// longer exists — they stay as the regression pins for it. Unrelated to
+    /// the generator bisects for the shortest length that reads back instead of rounding to a
+    /// chosen one, so the premise these values broke no longer exists — they stay as the
+    /// regression pins for it. Unrelated to
     /// <see cref="ASubnormalFloatPrintsTheWayJavaPrintsIt"/>; these are ordinary normal floats.
     /// </para>
     /// </remarks>
@@ -652,6 +653,61 @@ public sealed class SparkFunctionRegistryTests
     {
         Assert.Equal(expected, SparkFloatText.Render(Float(bits)));
         Assert.Equal("-" + expected, SparkFloatText.Render(-Float(bits)));
+    }
+
+    /// <summary>
+    /// NaN and the infinities keep their spellings on the digits entry point too, not only on
+    /// <c>Render</c>.
+    /// </summary>
+    /// <remarks>
+    /// Reading the bits directly means owning this: an all-ones exponent decodes as a perfectly
+    /// ordinary finite mantissa, so without a guard <c>ShortestRoundTrip(double.NaN)</c> answers
+    /// <c>-2.696539702293474E308</c> and an infinity answers the largest double. The ladder never
+    /// had to say so because it took the spellings from the platform's formatter.
+    /// <para>
+    /// No caller reaches it that way today — <c>CastFloatingToDecimal</c> drops these rows before
+    /// it asks, and a decimal has no spelling for them — so this pins the contract rather than a
+    /// live path.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheDigitsEntryPointKeepsTheNonFiniteSpellings()
+    {
+        Assert.Equal("NaN", SparkFloatText.ShortestRoundTrip(double.NaN));
+        Assert.Equal("Infinity", SparkFloatText.ShortestRoundTrip(double.PositiveInfinity));
+        Assert.Equal("-Infinity", SparkFloatText.ShortestRoundTrip(double.NegativeInfinity));
+
+        Assert.Equal("NaN", SparkFloatText.ShortestRoundTrip(float.NaN));
+        Assert.Equal("Infinity", SparkFloatText.ShortestRoundTrip(float.PositiveInfinity));
+        Assert.Equal("-Infinity", SparkFloatText.ShortestRoundTrip(float.NegativeInfinity));
+    }
+
+    /// <summary>
+    /// The step from the largest subnormal to the smallest normal, where the decode changes hands.
+    /// </summary>
+    /// <remarks>
+    /// Adjacent values that reach <see cref="SparkFloatText.ShortestDigits"/> by different routes:
+    /// one has a raw exponent of zero and takes its mantissa as written, the other has a raw
+    /// exponent of one and gets the implicit leading bit put back. Both come out at the same
+    /// binary exponent, so a mistake in either branch shows up as a jump in the rendering.
+    /// <para>
+    /// It is NOT a test of the smallest normal's exception in <c>NarrowBelow</c>. That guard is
+    /// measurably unobservable: flipping <c>rawExponent > 1</c> to <c>rawExponent > 0</c> leaves
+    /// all four values below unchanged, because the shortest form here already runs to the full
+    /// width. The exception is kept because the interval genuinely IS symmetric there — the
+    /// predecessor is one ordinary step away — and not because any output depends on it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheSubnormalBoundaryRendersContinuously()
+    {
+        Assert.Equal("2.2250738585072014E-308",
+            SparkFloatText.Render(BitConverter.Int64BitsToDouble(4503599627370496L)));   // smallest normal
+        Assert.Equal("2.225073858507201E-308",
+            SparkFloatText.Render(BitConverter.Int64BitsToDouble(4503599627370495L)));   // largest subnormal
+
+        Assert.Equal("1.1754944E-38", SparkFloatText.Render(Float(8388608)));            // smallest normal
+        Assert.Equal("1.1754942E-38", SparkFloatText.Render(Float(8388607)));            // largest subnormal
     }
 
     /// <summary>

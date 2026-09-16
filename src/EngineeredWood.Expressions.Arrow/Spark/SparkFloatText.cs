@@ -4,6 +4,7 @@
 using System.Globalization;
 using System.Numerics;
 using System.Text;
+using System.Threading;
 
 namespace EngineeredWood.Expressions.Arrow.Spark;
 
@@ -67,24 +68,10 @@ internal static class SparkFloatText
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
     /// <summary>Java's rendering of a double.</summary>
-    internal static string Render(double value)
-    {
-        if (double.IsNaN(value)) return "NaN";
-        if (double.IsPositiveInfinity(value)) return "Infinity";
-        if (double.IsNegativeInfinity(value)) return "-Infinity";
-
-        return ShortestRoundTrip(value);
-    }
+    internal static string Render(double value) => ShortestRoundTrip(value);
 
     /// <summary>Java's rendering of a float, whose digits are the float's own and not the double's.</summary>
-    internal static string Render(float value)
-    {
-        if (float.IsNaN(value)) return "NaN";
-        if (float.IsPositiveInfinity(value)) return "Infinity";
-        if (float.IsNegativeInfinity(value)) return "-Infinity";
-
-        return ShortestRoundTrip(value);
-    }
+    internal static string Render(float value) => ShortestRoundTrip(value);
 
     /// <summary>
     /// The shortest decimal text that round-trips <paramref name="value"/>, in Java's shape.
@@ -104,6 +91,14 @@ internal static class SparkFloatText
     /// </remarks>
     internal static string ShortestRoundTrip(double value)
     {
+        // BEFORE the bits are read, not after: an all-ones exponent decodes as a perfectly
+        // ordinary finite mantissa, so without this NaN renders as -2.696539702293474E308 and an
+        // infinity as the largest double. The old ladder got the spellings from the platform's
+        // formatter and so never had to say this; reading the bits means owning it.
+        if (double.IsNaN(value)) return "NaN";
+        if (double.IsPositiveInfinity(value)) return "Infinity";
+        if (double.IsNegativeInfinity(value)) return "-Infinity";
+
         var bits = BitConverter.DoubleToInt64Bits(value);
         var negative = bits < 0;
         var magnitude = bits & long.MaxValue;
@@ -128,6 +123,12 @@ internal static class SparkFloatText
     /// <summary>The shortest decimal text that round-trips a float, which needs at most nine digits.</summary>
     internal static string ShortestRoundTrip(float value)
     {
+        // The same non-finite guard the double overload needs, and for the same reason: exponent
+        // 255 decodes as a finite value.
+        if (float.IsNaN(value)) return "NaN";
+        if (float.IsPositiveInfinity(value)) return "Infinity";
+        if (float.IsNegativeInfinity(value)) return "-Infinity";
+
         // Through the bits rather than through `(double)value`, because the question is which
         // FLOATS a decimal can land between: the widened double's neighbours are 2^29 times closer.
         var bits = SingleToInt32Bits(value);
@@ -467,6 +468,15 @@ internal static class SparkFloatText
     /// sign paired with another power's digits. Two threads racing on a cold slot compute the same
     /// number and one of them wins, which costs nothing and is always correct.
     /// </para>
+    /// <para>
+    /// <b>Through <see cref="Volatile"/> on both sides, though, and atomicity is not the reason.</b>
+    /// A plain store publishes the reference with no ordering against the writes that filled the box,
+    /// so a reader on a weakly-ordered target — arm64 — may follow a non-null slot to a
+    /// <c>BigInteger</c> whose digit array it cannot yet see. The release on the write and the
+    /// acquire on the read are what forbid that. Neither is measurable here: on x64 both are ordinary
+    /// instructions the JIT merely declines to move, and a slot is written once however many values
+    /// read it.
+    /// </para>
     /// </remarks>
     private static class Powers
     {
@@ -489,11 +499,11 @@ internal static class SparkFloatText
                 return BigInteger.One << exponent;
 
             var index = -exponent;
-            if (Fives[index] is BigInteger cached)
+            if (Volatile.Read(ref Fives[index]) is BigInteger cached)
                 return cached;
 
             var computed = BigInteger.Pow(5, index);
-            Fives[index] = computed;
+            Volatile.Write(ref Fives[index], computed);
 
             return computed;
         }
@@ -513,11 +523,11 @@ internal static class SparkFloatText
                 return exponent == 0 ? BigInteger.Zero : BigInteger.One << (exponent - 1);
 
             var index = -exponent;
-            if (Halves[index] is BigInteger cached)
+            if (Volatile.Read(ref Halves[index]) is BigInteger cached)
                 return cached;
 
             var computed = Scale(exponent) >> 1;
-            Halves[index] = computed;
+            Volatile.Write(ref Halves[index], computed);
 
             return computed;
         }
@@ -538,11 +548,11 @@ internal static class SparkFloatText
         /// </remarks>
         internal static BigInteger Ten(int power)
         {
-            if (Tens[power] is BigInteger cached)
+            if (Volatile.Read(ref Tens[power]) is BigInteger cached)
                 return cached;
 
             var computed = Scale(-power) << power;
-            Tens[power] = computed;
+            Volatile.Write(ref Tens[power], computed);
 
             return computed;
         }
