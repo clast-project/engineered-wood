@@ -9,8 +9,8 @@ namespace EngineeredWood.Vortex.Layouts;
 /// <summary>
 /// Walks a materialized layout tree against the Arrow schema to produce one
 /// <see cref="ColumnPlan"/> per top-level Arrow field. Handles
-/// <c>vortex.struct</c> at the root, then per-field: <c>vortex.stats</c>
-/// (skip-to-data), <c>vortex.chunked</c> (concatenated row chunks),
+/// <c>vortex.struct</c> at the root, then per-field: <c>vortex.stats</c> and
+/// <c>vortex.zoned</c> (skip-to-data), <c>vortex.chunked</c> (concatenated row chunks),
 /// <c>vortex.flat</c> (leaf segment), and <c>vortex.dict</c> (a layout-level
 /// dictionary with values + codes children → <see cref="DictColumnPlan"/>).
 ///
@@ -40,21 +40,24 @@ internal static class LayoutPlanner
         switch (layout.EncodingId)
         {
             case VortexLayoutEncodings.Stats:
+            case VortexLayoutEncodings.Zoned:
                 {
-                    // vortex.stats wire id == upstream's ZonedLayout (the
-                    // string is preserved for legacy compatibility per
-                    // vortex-layout/src/layouts/zoned/mod.rs). Two children:
-                    // child[0] is the transparent data layout, child[1] is
-                    // the auxiliary zones-table flat segment. Metadata
-                    // carries zone_len + present_stats bitset; we capture
-                    // both so the reader can materialize per-zone stats and
-                    // drive Predicate-based pruning on demand.
-                    if (layout.Children.Count < 2)
+                    // Both zoned layouts have two children: child[0] is the
+                    // transparent data layout, child[1] is the auxiliary
+                    // zones-table flat segment. Their metadata differs:
+                    // vortex.stats carries zone_len + a present_stats bitset,
+                    // vortex.zoned carries zone_len + aggregate specs. We
+                    // capture it so the reader can materialize per-zone
+                    // stats and drive Predicate-based pruning on demand.
+                    if (layout.Children.Count != 2)
                         throw new VortexFormatException(
-                            $"vortex.stats layout must have 2 children (data, zones), got {layout.Children.Count}.");
+                            $"{layout.EncodingId} layout must have 2 children (data, zones), got {layout.Children.Count}.");
                     var dataPlan = PlanField(arrowType, layout.Children[0]);
-                    if (TryParseStatsLayout(layout, out var zoneInfo))
-                        dataPlan = WithZoneInfo(dataPlan, zoneInfo!);
+                    var zoneInfo = layout.EncodingId == VortexLayoutEncodings.Stats
+                        ? TryParseStatsLayout(layout)
+                        : TryParseZonedLayout(arrowType, layout);
+                    if (zoneInfo is not null)
+                        dataPlan = WithZoneInfo(dataPlan, zoneInfo);
                     return dataPlan;
                 }
 
@@ -98,31 +101,54 @@ internal static class LayoutPlanner
     /// Parses a <c>vortex.stats</c> layout: extracts <c>zone_len</c> +
     /// <c>present_stats</c> from the metadata and pulls the zones segment
     /// ref out of children[1] (which we expect to be a <c>vortex.flat</c>
-    /// pointing at a single segment). Returns false when the metadata is
+    /// pointing at a single segment). Returns null when the metadata is
     /// malformed or zone_len is 0 (legacy / pruning-disabled marker).
     /// </summary>
-    private static bool TryParseStatsLayout(VortexLayout layout, out ZoneInfo? zoneInfo)
+    private static ZoneInfo? TryParseStatsLayout(VortexLayout layout)
     {
-        zoneInfo = null;
         var meta = layout.Metadata;
-        if (meta.Length < 4) return false;
+        if (meta.Length < 4) return null;
         // u32 LE zone_len at bytes 0..3.
         int zoneLen =
             meta[0] |
             (meta[1] << 8) |
             (meta[2] << 16) |
             (meta[3] << 24);
-        if (zoneLen <= 0) return false;
+        if (zoneLen <= 0) return null;
 
         var presentStats = ParseStatBitset(meta, 4);
 
-        // Zones layout (child[1]) — typically vortex.flat with one segment.
+        if (!TryGetZonesSegment(layout, out var zonesSegmentRef, out var zoneCount)) return null;
+        return new ZoneInfo(zoneLen, presentStats, zonesSegmentRef, zoneCount);
+    }
+
+    /// <summary>
+    /// Parses a <c>vortex.zoned</c> layout (see <see cref="ZonedZoneMap"/>). Returns null, so
+    /// the column is read without pruning, when the metadata version or an aggregate is one
+    /// this reader doesn't know, or when zone_len is 0.
+    /// </summary>
+    private static ZoneInfo? TryParseZonedLayout(IArrowType arrowType, VortexLayout layout)
+    {
+        if (!ZonedZoneMap.TryParseMetadata(layout.Metadata, out var zoneLen, out var aggregates))
+            return null;
+        if (zoneLen <= 0) return null;
+        if (ZonedZoneMap.BuildStructType(arrowType, aggregates) is null) return null;
+        if (!TryGetZonesSegment(layout, out var zonesSegmentRef, out var zoneCount)) return null;
+        return new ZoneInfo(zoneLen, aggregates, zonesSegmentRef, zoneCount);
+    }
+
+    /// <summary>
+    /// The zones table (child[1]) is expected to be a <c>vortex.flat</c> with one segment.
+    /// </summary>
+    private static bool TryGetZonesSegment(VortexLayout layout, out uint segmentRef, out int zoneCount)
+    {
+        segmentRef = 0;
+        zoneCount = 0;
         var zonesLayout = layout.Children[1];
         if (zonesLayout.EncodingId != VortexLayoutEncodings.Flat) return false;
         if (zonesLayout.SegmentRefs.Count != 1) return false;
-        int zoneCount = checked((int)zonesLayout.RowCount);
-
-        zoneInfo = new ZoneInfo(zoneLen, presentStats, zonesLayout.SegmentRefs[0], zoneCount);
+        segmentRef = zonesLayout.SegmentRefs[0];
+        zoneCount = checked((int)zonesLayout.RowCount);
         return true;
     }
 
@@ -233,8 +259,9 @@ internal static class LayoutPlanner
                 break;
 
             case VortexLayoutEncodings.Stats:
+            case VortexLayoutEncodings.Zoned:
                 if (layout.Children.Count < 1)
-                    throw new VortexFormatException("vortex.stats layout has no children.");
+                    throw new VortexFormatException($"{layout.EncodingId} layout has no children.");
                 CollectFlatChunks(layout.Children[0], sink);
                 break;
 

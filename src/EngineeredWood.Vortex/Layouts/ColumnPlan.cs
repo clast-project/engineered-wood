@@ -14,7 +14,7 @@ internal readonly record struct SegmentChunk(uint SegmentRef, ulong RowCount);
 
 /// <summary>
 /// Per-column zoned-stats descriptor. Set when the layout was wrapped in
-/// <c>vortex.stats</c>; null otherwise. Captures everything the reader
+/// <c>vortex.stats</c> or <c>vortex.zoned</c>; null otherwise. Captures everything the reader
 /// needs to materialize the per-zone stats table on demand.
 /// </summary>
 internal sealed class ZoneInfo
@@ -30,12 +30,28 @@ internal sealed class ZoneInfo
     /// <summary>Number of zones (= zones-table row count = batch count for our writer).</summary>
     public int ZoneCount { get; }
 
+    /// <summary>
+    /// The aggregates of a <c>vortex.zoned</c> zone map, or null for a legacy <c>vortex.stats</c>
+    /// one (described by <see cref="PresentStats"/>).
+    /// </summary>
+    public IReadOnlyList<ZoneAggregate>? Aggregates { get; }
+
     public ZoneInfo(int zoneLen, IReadOnlyList<int> presentStats, uint zonesSegmentRef, int zoneCount)
     {
         ZoneLen = zoneLen;
         PresentStats = presentStats;
         ZonesSegmentRef = zonesSegmentRef;
         ZoneCount = zoneCount;
+    }
+
+    /// <summary>
+    /// A <c>vortex.zoned</c> zone map, whose table is described by <paramref name="aggregates"/>
+    /// rather than a <see cref="Stat"/> bitset.
+    /// </summary>
+    public ZoneInfo(int zoneLen, IReadOnlyList<ZoneAggregate> aggregates, uint zonesSegmentRef, int zoneCount)
+        : this(zoneLen, Array.Empty<int>(), zonesSegmentRef, zoneCount)
+    {
+        Aggregates = aggregates;
     }
 }
 

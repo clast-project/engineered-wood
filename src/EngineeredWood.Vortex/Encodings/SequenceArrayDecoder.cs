@@ -16,9 +16,12 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <c>SequenceMetadata { ScalarValue base = 1; ScalarValue multiplier = 2; }</c>
 /// (see <c>encodings/sequence/src/array.rs</c> upstream).
 ///
-/// <para>Phase 1 scope: integer sequences encoded as ScalarValue.int64_value
-/// (the only path our fixtures hit). Float / bool / etc. variants land alongside
-/// fixtures that need them.</para>
+/// <para>Scope: integer sequences. Upstream stores the base in the output ptype and,
+/// since 0.86, normalizes the multiplier to <c>i64</c> or <c>u64</c> independently
+/// of it (a descending <c>u64</c> sequence has an <c>i64</c> step), so either
+/// ScalarValue kind can appear in either field. The values are computed with
+/// wrapping arithmetic on the 64-bit patterns and narrowed to the output type,
+/// which is exact because upstream guarantees every value fits it.</para>
 /// </summary>
 internal static class SequenceArrayDecoder
 {
@@ -61,10 +64,7 @@ internal static class SequenceArrayDecoder
                     {
                         var len = (int)Varint.ReadUnsigned(bytes, ref pos);
                         var sv = ScalarValueProto.Parse(bytes.Slice(pos, len));
-                        if (sv.Kind != ScalarValueKind.Int64)
-                            throw new NotSupportedException(
-                                $"vortex.sequence base is {sv.Kind}, only Int64 is supported.");
-                        baseVal = sv.Int64Value;
+                        baseVal = IntegerBits(sv, "base");
                         pos += len;
                         break;
                     }
@@ -72,10 +72,7 @@ internal static class SequenceArrayDecoder
                     {
                         var len = (int)Varint.ReadUnsigned(bytes, ref pos);
                         var sv = ScalarValueProto.Parse(bytes.Slice(pos, len));
-                        if (sv.Kind != ScalarValueKind.Int64)
-                            throw new NotSupportedException(
-                                $"vortex.sequence multiplier is {sv.Kind}, only Int64 is supported.");
-                        multiplier = sv.Int64Value;
+                        multiplier = IntegerBits(sv, "multiplier");
                         pos += len;
                         break;
                     }
@@ -89,6 +86,15 @@ internal static class SequenceArrayDecoder
                 "vortex.sequence metadata is missing base or multiplier.");
         return (baseVal.Value, multiplier.Value);
     }
+
+    /// <summary>The two's-complement bit pattern of an integer scalar.</summary>
+    private static long IntegerBits(ScalarValueProto sv, string field) => sv.Kind switch
+    {
+        ScalarValueKind.Int64 => sv.Int64Value,
+        ScalarValueKind.UInt64 => unchecked((long)sv.UInt64Value),
+        _ => throw new NotSupportedException(
+            $"vortex.sequence {field} is {sv.Kind}, only integer sequences are supported."),
+    };
 
     private static void SkipField(ReadOnlySpan<byte> bytes, ref int pos, uint wireType)
     {

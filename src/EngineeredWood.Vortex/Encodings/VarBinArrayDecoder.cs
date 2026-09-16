@@ -85,6 +85,8 @@ internal static class VarBinArrayDecoder
 
     private static int[] OffsetsToInt32(IArrowArray offsets, int count) => offsets switch
     {
+        UInt8Array u8 => CopyUInt8(u8, count),
+        UInt16Array u16 => CopyUInt16(u16, count),
         Int32Array i32 => CopyInt32(i32, count),
         UInt32Array u32 => CopyUInt32(u32, count),
         Int64Array i64 => CopyInt64(i64, count),
@@ -92,6 +94,20 @@ internal static class VarBinArrayDecoder
         _ => throw new NotSupportedException(
             $"vortex.varbin offsets type {offsets.GetType().Name} not supported."),
     };
+
+    private static int[] CopyUInt8(UInt8Array a, int count)
+    {
+        var r = new int[count];
+        for (int i = 0; i < count; i++) r[i] = a.GetValue(i)!.Value;
+        return r;
+    }
+
+    private static int[] CopyUInt16(UInt16Array a, int count)
+    {
+        var r = new int[count];
+        for (int i = 0; i < count; i++) r[i] = a.GetValue(i)!.Value;
+        return r;
+    }
 
     private static int[] CopyInt32(Int32Array a, int count)
     {

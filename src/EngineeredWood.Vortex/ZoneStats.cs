@@ -8,7 +8,7 @@ namespace EngineeredWood.Vortex;
 
 /// <summary>
 /// Materialized per-zone statistics for a single column, decoded from a
-/// <c>vortex.stats</c> layout. Each property corresponds to a <see cref="Stat"/>
+/// <c>vortex.stats</c> or <c>vortex.zoned</c> layout. Each property corresponds to a <see cref="Stat"/>
 /// and is non-null exactly when that stat appears in <see cref="PresentStats"/>.
 ///
 /// <para>Each stat array has one row per zone (<see cref="ZoneCount"/>); the
@@ -44,8 +44,9 @@ public sealed class ZoneStats
     /// <summary>Per-zone max (parent dtype, nullable). Null if Max isn't in <see cref="PresentStats"/>.</summary>
     public IArrowArray? Max { get; }
 
-    /// <summary>Per-zone min-truncation flag. Always false for files this writer produces;
-    /// upstream may use it to mark approximated min values for long strings.</summary>
+    /// <summary>Per-zone min-truncation flag: when set, <see cref="Min"/> is only a lower bound.
+    /// Always false for files this writer produces; upstream sets it for long strings, whose
+    /// <c>vortex.zoned</c> bounds are truncated to a byte limit. Null when every min is exact.</summary>
     public BooleanArray? MinIsTruncated { get; }
 
     /// <summary>Per-zone max-truncation flag. See <see cref="MinIsTruncated"/>.</summary>
