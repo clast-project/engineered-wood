@@ -86,6 +86,42 @@ public class VortexFileReaderTests
             await VortexFileReader.OpenAsync(stream));
     }
 
+    /// <summary>
+    /// Upstream's limit is <c>u16::MAX - 8</c> = 65527 bytes. A longer postscript is
+    /// rejected by the length check, before anything tries to parse it.
+    /// </summary>
+    [Theory]
+    [InlineData(65528)]
+    [InlineData(ushort.MaxValue)]
+    public async Task RejectsPostscriptLongerThanTheFormatAllows(int postscriptLen)
+    {
+        using var stream = new ByteArrayRandomAccessFile(FileWithPostscriptLength(postscriptLen));
+        var ex = await Assert.ThrowsAsync<VortexFormatException>(async () =>
+            await VortexFileReader.OpenAsync(stream));
+        Assert.Contains("out of range", ex.Message);
+    }
+
+    [Fact]
+    public async Task AcceptsTheLongestPostscriptLength()
+    {
+        // The postscript is all zeros, so the file is still rejected, but not for its length.
+        using var stream = new ByteArrayRandomAccessFile(FileWithPostscriptLength(65527));
+        var ex = await Record.ExceptionAsync(async () => await VortexFileReader.OpenAsync(stream));
+        Assert.DoesNotContain("out of range", ex?.Message ?? "");
+    }
+
+    /// <summary>Leading magic, a zeroed postscript, and an EndOfFile naming its length.</summary>
+    private static byte[] FileWithPostscriptLength(int postscriptLen)
+    {
+        var bytes = new byte[4 + postscriptLen + 8];
+        "VTXF"u8.CopyTo(bytes);
+        var eof = bytes.AsSpan(bytes.Length - 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(eof, 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(eof.Slice(2), (ushort)postscriptLen);
+        "VTXF"u8.CopyTo(eof.Slice(4));
+        return bytes;
+    }
+
     [Fact]
     public async Task RejectsMissingTrailingMagic()
     {

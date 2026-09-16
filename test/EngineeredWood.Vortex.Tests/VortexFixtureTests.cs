@@ -42,7 +42,7 @@ public class VortexFixtureTests
         var postscriptLen = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(bytes.Length - 6, 2));
 
         Assert.Equal(1, version);
-        Assert.True(postscriptLen > 0 && postscriptLen <= 65528,
+        Assert.True(postscriptLen > 0 && postscriptLen <= 65527,
             $"postscript_len out of range: {postscriptLen}");
 
         var postscriptStart = bytes.Length - 8 - postscriptLen;

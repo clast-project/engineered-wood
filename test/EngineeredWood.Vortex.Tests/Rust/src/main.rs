@@ -107,6 +107,7 @@ async fn main() -> std::io::Result<()> {
     write_delta_signed_2k(&session, &out_dir.join("delta_signed_2048rows.vortex")).await?;
     write_sequence_u64_desc(&session, &out_dir.join("sequence_u64_desc_64rows.vortex")).await?;
     write_zoned_mixed(&session, &out_dir.join("zoned_mixed_20000rows.vortex")).await?;
+    write_dict_nullable_values(&session, &out_dir.join("dict_nullable_values_20000rows.vortex")).await?;
 
     Ok(())
 }
@@ -1497,6 +1498,39 @@ async fn write_zoned_mixed(session: &VortexSession, path: &PathBuf) -> std::io::
     ])
     .expect("from_fields")
     .into_array();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Low-cardinality nullable columns through the default write strategy, which
+/// gives each a vortex.dict layout whose nulls live in the dictionary values
+/// (a null entry that null rows point at) rather than in the codes.
+///   u:   nullable u16, row % 50, null on every seventh row
+///   tag: nullable utf8, "t{row % 30}", null on every eleventh row
+async fn write_dict_nullable_values(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    const ROWS: usize = 20_000;
+
+    let u = PrimitiveArray::new(
+        vortex_buffer::Buffer::from_iter((0..ROWS).map(|i| (i % 50) as u16)),
+        Validity::from_iter((0..ROWS).map(|i| i % 7 != 0)),
+    )
+    .into_array();
+    let tag = VarBinViewArray::from_iter_nullable_str(
+        (0..ROWS).map(|i| (i % 11 != 0).then(|| format!("t{}", i % 30))),
+    )
+    .into_array();
+
+    let data = StructArray::from_fields(&[("u", u), ("tag", tag)])
+        .expect("from_fields")
+        .into_array();
 
     let mut bytes: Vec<u8> = Vec::new();
     session
