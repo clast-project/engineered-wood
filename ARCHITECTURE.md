@@ -504,7 +504,7 @@ crate.
 ```
 
 `EndOfFile` is `version:u16 | postscript_len:u16 | "VTXF"`. The
-postscript (≤ 65 528 bytes) holds offsets to the DType / Layout /
+postscript (≤ 65 527 bytes) holds offsets to the DType / Layout /
 Statistics / Footer FlatBuffers; the footer carries the file's
 **registries** — the strings that segments and array nodes reference by
 small integer index:

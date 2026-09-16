@@ -9,13 +9,15 @@ namespace EngineeredWood.Vortex.Layouts;
 
 /// <summary>
 /// Materializes a <c>vortex.dict</c>-encoded column from its values dictionary
-/// and per-row codes. <c>output[i] = values[codes[i]]</c> for valid rows;
-/// <c>output[i] = null</c> when the code at row i is null (the codes child
-/// carries the validity bitmap).
+/// and per-row codes. <c>output[i] = values[codes[i]]</c>, and is null when
+/// either the code at row i is null or the dictionary entry it points at is.
+/// Upstream writers use both: nullable codes, or non-nullable codes with a
+/// null entry in the dictionary (vortex 0.86's default for low-cardinality
+/// nullable columns).
 ///
-/// <para>Phase 1 scope: <see cref="StringType"/> output backed by a
-/// <see cref="StringArray"/> dictionary. Other Arrow types land alongside
-/// fixtures that need them.</para>
+/// <para>Scope: <see cref="StringType"/> output backed by a
+/// <see cref="StringArray"/> dictionary, and integer and floating-point
+/// types. Other Arrow types land alongside fixtures that need them.</para>
 /// </summary>
 internal static class DictReconstructor
 {
@@ -24,7 +26,9 @@ internal static class DictReconstructor
         IArrowArray values,
         IArrowArray codes)
     {
-        var (codeIndices, codesValidity, codesNullCount) = ResolveCodes(codes);
+        var codeIndices = ResolveCodes(codes);
+        MaskNullValues(codeIndices, values);
+        var (codesValidity, codesNullCount) = Validity(codeIndices);
 
         return (arrowType, values) switch
         {
@@ -72,31 +76,65 @@ internal static class DictReconstructor
     }
 
     /// <summary>
-    /// Returns the codes' index values + validity buffer + null count. Null
-    /// positions in the codes' validity bitmap get a sentinel index of -1 so
-    /// downstream gather can skip them (the (uint)idx range check in
-    /// ReconstructString would still reject negatives, but the explicit
-    /// null-skip in Build/ReconstructString keeps gather logic simple).
+    /// Sets the code of every row that points at a null dictionary entry to the
+    /// null sentinel -1, after checking each code is in range.
     /// </summary>
-    private static (int[] Codes, ArrowBuffer ValidityBuf, int NullCount) ResolveCodes(IArrowArray codes)
+    private static void MaskNullValues(int[] codes, IArrowArray values)
+    {
+        for (int i = 0; i < codes.Length; i++)
+        {
+            var idx = codes[i];
+            if (idx < 0) continue;
+            if (idx >= values.Length)
+                throw new VortexFormatException(
+                    $"vortex.dict code {idx} at row {i} is out of range (dict has {values.Length} entries).");
+            if (values.NullCount > 0 && values.IsNull(idx))
+                codes[i] = -1;
+        }
+    }
+
+    /// <summary>
+    /// The output's validity bitmap and null count: a row is valid when its
+    /// code is not the null sentinel. Empty when no row is null.
+    /// </summary>
+    private static (ArrowBuffer Validity, int NullCount) Validity(int[] codes)
+    {
+        int nullCount = 0;
+        foreach (var c in codes)
+            if (c < 0) nullCount++;
+        if (nullCount == 0)
+            return (ArrowBuffer.Empty, 0);
+
+        var bitmap = new ArrowBuffer.BitmapBuilder(codes.Length);
+        foreach (var c in codes)
+            bitmap.Append(c >= 0);
+        return (bitmap.Build(), nullCount);
+    }
+
+    /// <summary>
+    /// Returns the codes' index values. Null positions in the codes' validity
+    /// bitmap get a sentinel index of -1 so downstream gather can skip them.
+    /// </summary>
+    private static int[] ResolveCodes(IArrowArray codes)
     {
         var data = ((Apache.Arrow.Array)codes).Data;
         var validityBuf = data.Buffers.Length > 0 ? data.Buffers[0] : ArrowBuffer.Empty;
         int nullCount = data.GetNullCount();
         if (nullCount < 0) nullCount = 0;
 
-        int[] indices = codes switch
+        return codes switch
         {
             UInt32Array u32 => CopyUInt32(u32, validityBuf.Span, nullCount),
             UInt16Array u16 => CopyUInt16(u16, validityBuf.Span, nullCount),
             UInt8Array u8 => CopyUInt8(u8, validityBuf.Span, nullCount),
             UInt64Array u64 => CopyUInt64(u64, validityBuf.Span, nullCount),
+            Int8Array i8 => CopyInt8(i8, validityBuf.Span, nullCount),
+            Int16Array i16 => CopyInt16(i16, validityBuf.Span, nullCount),
             Int32Array i32 => CopyInt32(i32, validityBuf.Span, nullCount),
             Int64Array i64 => CopyInt64(i64, validityBuf.Span, nullCount),
             _ => throw new NotSupportedException(
                 $"vortex.dict codes type {codes.GetType().Name} is not supported."),
         };
-        return (indices, validityBuf, nullCount);
     }
 
     /// <summary>True at bit position i in the validity bitmap (LSB-first).</summary>
@@ -150,6 +188,31 @@ internal static class DictReconstructor
         return r;
     }
 
+    // Signed codes are allowed upstream, but a code is an index, so a valid
+    // row's code can't be negative. Rejecting it here also keeps a stored -1
+    // from passing for the null sentinel.
+    private static int[] CopyInt8(Int8Array a, ReadOnlySpan<byte> validity, int nullCount)
+    {
+        var r = new int[a.Length];
+        var src = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, sbyte>(
+            a.Data.Buffers[1].Span.Slice(a.Offset, a.Length));
+        bool hasNulls = nullCount > 0;
+        for (int i = 0; i < a.Length; i++)
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
+        return r;
+    }
+
+    private static int[] CopyInt16(Int16Array a, ReadOnlySpan<byte> validity, int nullCount)
+    {
+        var r = new int[a.Length];
+        var src = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, short>(
+            a.Data.Buffers[1].Span.Slice(a.Offset * 2, a.Length * 2));
+        bool hasNulls = nullCount > 0;
+        for (int i = 0; i < a.Length; i++)
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
+        return r;
+    }
+
     private static int[] CopyInt32(Int32Array a, ReadOnlySpan<byte> validity, int nullCount)
     {
         var r = new int[a.Length];
@@ -157,7 +220,7 @@ internal static class DictReconstructor
             a.Data.Buffers[1].Span.Slice(a.Offset * 4, a.Length * 4));
         bool hasNulls = nullCount > 0;
         for (int i = 0; i < a.Length; i++)
-            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : src[i];
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
         return r;
     }
 
@@ -168,9 +231,13 @@ internal static class DictReconstructor
             a.Data.Buffers[1].Span.Slice(a.Offset * 8, a.Length * 8));
         bool hasNulls = nullCount > 0;
         for (int i = 0; i < a.Length; i++)
-            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : checked((int)src[i]);
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
         return r;
     }
+
+    private static int SignedCode(long code, int row) => code >= 0
+        ? checked((int)code)
+        : throw new VortexFormatException($"vortex.dict code {code} at row {row} is negative.");
 
     private static IArrowArray ReconstructString(
         IArrowArray values, int[] codes, ArrowBuffer codesValidity, int codesNullCount)
@@ -191,9 +258,6 @@ internal static class DictReconstructor
             BinaryPrimitives.WriteInt32LittleEndian(offsetBytes.AsSpan(i * 4), total);
             var idx = codes[i];
             if (idx < 0) continue; // null row — leave offset == previous, no bytes written
-            if ((uint)idx >= (uint)dict.Length)
-                throw new VortexFormatException(
-                    $"vortex.dict code {idx} at row {i} is out of range (dict has {dict.Length} entries).");
             var bytes = dict.GetBytes(idx);
 #if NET8_0_OR_GREATER
             sink.Write(bytes);

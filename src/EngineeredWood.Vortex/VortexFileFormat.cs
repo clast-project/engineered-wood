@@ -19,8 +19,12 @@ internal static class VortexFileFormat
     /// </summary>
     public const int EndOfFileSize = 8;
 
-    /// <summary>Maximum allowed postscript length (<c>u16::MAX - 8</c>).</summary>
-    public const int MaxPostscriptLen = 65528;
+    /// <summary>
+    /// Maximum allowed postscript length: <c>u16::MAX - 8</c> = 65527, upstream's
+    /// <c>MAX_POSTSCRIPT_SIZE</c>, so the postscript and <c>EndOfFile</c> fit in one
+    /// 65535-byte tail read.
+    /// </summary>
+    public const int MaxPostscriptLen = ushort.MaxValue - 8;
 
     /// <summary>Default tail-read size used to fetch <c>EndOfFile</c> + postscript in one I/O.</summary>
     public const int DefaultTailReadSize = 64 * 1024;

@@ -148,7 +148,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
             throw new VortexFormatException(
                 $"Postscript would start at file offset {postscriptStart}, before the leading magic.");
 
-        // The postscript is part of the tail by construction (postscript ≤ 65528,
+        // The postscript is part of the tail by construction (postscript ≤ 65527,
         // tail ≥ 65536 when the file is at least that big; for smaller files the
         // tail covers the whole file).
         if (postscriptStart < tailOffset)
