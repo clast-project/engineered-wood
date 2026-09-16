@@ -106,8 +106,9 @@ public class VortexFileReaderTests
     {
         // The postscript is all zeros, so the file is still rejected, but not for its length.
         using var stream = new ByteArrayRandomAccessFile(FileWithPostscriptLength(65527));
-        var ex = await Record.ExceptionAsync(async () => await VortexFileReader.OpenAsync(stream));
-        Assert.DoesNotContain("out of range", ex?.Message ?? "");
+        var ex = await Assert.ThrowsAsync<VortexFormatException>(async () =>
+            await VortexFileReader.OpenAsync(stream));
+        Assert.DoesNotContain("out of range", ex.Message);
     }
 
     /// <summary>Leading magic, a zeroed postscript, and an EndOfFile naming its length.</summary>

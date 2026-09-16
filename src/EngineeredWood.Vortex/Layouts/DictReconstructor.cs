@@ -128,6 +128,8 @@ internal static class DictReconstructor
             UInt16Array u16 => CopyUInt16(u16, validityBuf.Span, nullCount),
             UInt8Array u8 => CopyUInt8(u8, validityBuf.Span, nullCount),
             UInt64Array u64 => CopyUInt64(u64, validityBuf.Span, nullCount),
+            Int8Array i8 => CopyInt8(i8, validityBuf.Span, nullCount),
+            Int16Array i16 => CopyInt16(i16, validityBuf.Span, nullCount),
             Int32Array i32 => CopyInt32(i32, validityBuf.Span, nullCount),
             Int64Array i64 => CopyInt64(i64, validityBuf.Span, nullCount),
             _ => throw new NotSupportedException(
@@ -186,6 +188,31 @@ internal static class DictReconstructor
         return r;
     }
 
+    // Signed codes are allowed upstream, but a code is an index, so a valid
+    // row's code can't be negative. Rejecting it here also keeps a stored -1
+    // from passing for the null sentinel.
+    private static int[] CopyInt8(Int8Array a, ReadOnlySpan<byte> validity, int nullCount)
+    {
+        var r = new int[a.Length];
+        var src = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, sbyte>(
+            a.Data.Buffers[1].Span.Slice(a.Offset, a.Length));
+        bool hasNulls = nullCount > 0;
+        for (int i = 0; i < a.Length; i++)
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
+        return r;
+    }
+
+    private static int[] CopyInt16(Int16Array a, ReadOnlySpan<byte> validity, int nullCount)
+    {
+        var r = new int[a.Length];
+        var src = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, short>(
+            a.Data.Buffers[1].Span.Slice(a.Offset * 2, a.Length * 2));
+        bool hasNulls = nullCount > 0;
+        for (int i = 0; i < a.Length; i++)
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
+        return r;
+    }
+
     private static int[] CopyInt32(Int32Array a, ReadOnlySpan<byte> validity, int nullCount)
     {
         var r = new int[a.Length];
@@ -193,7 +220,7 @@ internal static class DictReconstructor
             a.Data.Buffers[1].Span.Slice(a.Offset * 4, a.Length * 4));
         bool hasNulls = nullCount > 0;
         for (int i = 0; i < a.Length; i++)
-            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : src[i];
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
         return r;
     }
 
@@ -204,9 +231,13 @@ internal static class DictReconstructor
             a.Data.Buffers[1].Span.Slice(a.Offset * 8, a.Length * 8));
         bool hasNulls = nullCount > 0;
         for (int i = 0; i < a.Length; i++)
-            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : checked((int)src[i]);
+            r[i] = (hasNulls && !BitAt(validity, i, a.Offset)) ? -1 : SignedCode(src[i], i);
         return r;
     }
+
+    private static int SignedCode(long code, int row) => code >= 0
+        ? checked((int)code)
+        : throw new VortexFormatException($"vortex.dict code {code} at row {row} is negative.");
 
     private static IArrowArray ReconstructString(
         IArrowArray values, int[] codes, ArrowBuffer codesValidity, int codesNullCount)

@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.Vortex.Layouts;
 using EngineeredWood.Vortex.Tests.TestData;
 
@@ -72,5 +73,63 @@ public class VortexDictNullTests
             }
         }
         Assert.Equal(Rows, row);
+    }
+
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-1)] // a stored -1 is not the null sentinel
+    public void NegativeSignedCodeIsRejected(int code)
+    {
+        var values = new StringArray.Builder().Append("a").Append("b").Build();
+        var codes = new Int32Array.Builder().Append(0).Append(code).Build();
+
+        var ex = Assert.Throws<VortexFormatException>(
+            () => DictReconstructor.Reconstruct(StringType.Default, values, codes));
+        Assert.Contains("negative", ex.Message);
+    }
+
+    [Fact]
+    public void NullSignedCodeIsANullRowWhateverItStores()
+    {
+        var values = new Int64Array.Builder().Append(10).Append(20).Build();
+        // Row 1 is null; the value under it is garbage and must not be read.
+        var data = new byte[12];
+        BitConverter.GetBytes(1).CopyTo(data, 0);
+        BitConverter.GetBytes(-7).CopyTo(data, 4);
+        BitConverter.GetBytes(0).CopyTo(data, 8);
+        var validity = new ArrowBuffer.BitmapBuilder(3).Append(true).Append(false).Append(true).Build();
+        var codes = new Int32Array(new ArrowBuffer(data), validity, 3, nullCount: 1, offset: 0);
+
+        var result = Assert.IsType<Int64Array>(
+            DictReconstructor.Reconstruct(Int64Type.Default, values, codes));
+        Assert.Equal(new long?[] { 20, null, 10 }, Enumerable.Range(0, 3).Select(i => result.GetValue(i)));
+    }
+
+    [Fact]
+    public void NarrowSignedCodesAreAccepted()
+    {
+        var values = new StringArray.Builder().Append("a").AppendNull().Append("c").Build();
+        var i8 = new Int8Array.Builder().Append(2).Append(1).Append(0).Build();
+        var i16 = new Int16Array.Builder().Append(2).Append(1).Append(0).Build();
+
+        foreach (IArrowArray codes in new IArrowArray[] { i8, i16 })
+        {
+            var result = Assert.IsType<StringArray>(
+                DictReconstructor.Reconstruct(StringType.Default, values, codes));
+            Assert.Equal("c", result.GetString(0));
+            Assert.True(result.IsNull(1));
+            Assert.Equal("a", result.GetString(2));
+        }
+    }
+
+    [Fact]
+    public void OutOfRangeCodeIsRejectedForEveryType()
+    {
+        var values = new DoubleArray.Builder().Append(1.5).Build();
+        var codes = new UInt8Array.Builder().Append(0).Append(1).Build();
+
+        var ex = Assert.Throws<VortexFormatException>(
+            () => DictReconstructor.Reconstruct(DoubleType.Default, values, codes));
+        Assert.Contains("out of range", ex.Message);
     }
 }
