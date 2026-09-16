@@ -8,8 +8,10 @@ name: CI
 # NOTE: a pull request builds and tests only the projects its changes can
 # affect; see the "Select affected projects" step. That selection happens
 # INSIDE the job for the same reason as above: the required check must always
-# report. Pushes to main always run everything, so anything the selection
-# misses is still caught the moment it merges.
+# report. A push to main that changes any code runs everything, so anything
+# the selection misses is still caught the moment it merges. (A
+# documentation-only push still builds nothing, as before; the main commit
+# before it was already verified in full.)
 # NOTE: `pull_request` is deliberately NOT filtered by base branch. A stacked PR
 # (one targeting another PR's branch rather than main) would otherwise get no CI
 # at all — and the failure is silent in the same way path filtering is: the
@@ -136,7 +138,8 @@ jobs:
       # are attributed, and why anything unattributable runs everything, is documented in
       # the script. The job summary shows what was selected and why.
       #
-      # Pushes to main pass --full: main is always verified whole. If the script itself
+      # Pushes to main pass --full, so every code change on main is verified whole
+      # (documentation-only pushes never reach this step). If the script itself
       # fails, the job runs everything rather than failing every pull request on a
       # selection bug.
       - name: Select affected projects

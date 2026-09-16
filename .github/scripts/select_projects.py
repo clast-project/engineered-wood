@@ -14,7 +14,7 @@ listed test projects run.
 FAILS SAFE. Any changed file this cannot attribute to a project selects the full
 solution: repository-wide build inputs (Directory.Build.props, the solution,
 the signing key, .editorconfig, CI itself), a deleted project, a path nothing
-claims. Running too much is slow; running too little lets a break merge.
+claims. So does an empty diff. Running too much is slow; running too little lets a break merge.
 
 What owns a file:
   * the project whose directory contains it;
@@ -135,6 +135,10 @@ def is_doc(path: str) -> bool:
 def select(changed: list[str]) -> tuple[str, list[str], list[str]]:
     """Returns (scope, selected projects, explanation lines)."""
     projects = solution_projects()
+    if not changed:
+        # Nothing to attribute says nothing about what is safe to skip; the
+        # documentation check in ci.yml treats an empty diff as code, too.
+        return "full", projects, ["the diff is empty"]
     for p in projects:
         if not os.path.isfile(p):
             return "full", projects, [f"{p}: listed in {SOLUTION} but missing"]

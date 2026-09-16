@@ -391,7 +391,7 @@ On a pull request, CI builds and tests only the projects its changes can
 affect: the projects owning the changed files, plus every project that
 references them, directly or transitively. Anything it can't attribute to a
 project (`Directory.Build.props`, the solution, `.github/`, an unfamiliar
-path) runs the whole solution, and pushes to `main` always do. The job summary
+path) runs the whole solution, as does every push to `main` that changes code. The job summary
 lists what was selected and why.
 
 The same script writes a solution filter you can use locally:
