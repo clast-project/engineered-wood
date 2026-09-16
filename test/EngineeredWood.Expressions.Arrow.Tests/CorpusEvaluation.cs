@@ -301,6 +301,9 @@ internal static class CorpusEvaluation
     /// Spark's <c>1.0</c> through <c>GetInt64</c> — throws <c>FormatException</c>. Measured on
     /// #340, where Spark answers the double 1.0 for <c>+'1'</c> and we answered the string '1'.
     /// </remarks>
+    /// <exception cref="CorpusTypeMismatchException">
+    /// When the recorded value and ours are not the same kind of thing.
+    /// </exception>
     public static string? Compare(JsonElement expected, IArrowArray actual, int row)
     {
         try
@@ -309,8 +312,15 @@ internal static class CorpusEvaluation
         }
         catch (Exception ex) when (ex is InvalidOperationException or FormatException)
         {
-            // The accessor refused the recorded value, so the two are not the same kind of thing.
-            return $"expected {expected}, got {Show(actual, row)} ({actual.Data.DataType.Name})";
+            // RAISED, NOT RETURNED, and the distinction is a caller's rather than this method's.
+            // `SparkEvaluationCorpusTests` wants a reported difference, because its fixture is
+            // curated and every row is one somebody chose; `SparkFuzzTriage` wants the SIGNAL,
+            // because it sorts thousands of generated rows and "we produced the wrong type" is a
+            // different verdict from "we produced the wrong value" -- Verdict.TypeDiffers, which
+            // reads the two types and reports them. Flattening this into a comparison string
+            // would have left the fuzzer calling every type mismatch a value mismatch.
+            throw new CorpusTypeMismatchException(
+                $"expected {expected}, got {Show(actual, row)} ({actual.Data.DataType.Name})");
         }
     }
 
@@ -510,4 +520,21 @@ internal static class CorpusEvaluation
         DoubleArray a => a.GetValue(row) is { } d ? ShowDouble(d) : "null",
         _ => "value",
     };
+}
+
+/// <summary>
+/// A recorded cell and ours are not the same KIND of thing — Spark answered a number and we
+/// produced a string, or the reverse.
+/// </summary>
+/// <remarks>
+/// A type of its own so that a caller can tell this apart from an ordinary difference without
+/// reading a message. It carries the same text a difference would have, so a caller that only
+/// wants to report something has nothing extra to do.
+/// </remarks>
+internal sealed class CorpusTypeMismatchException : Exception
+{
+    public CorpusTypeMismatchException(string message)
+        : base(message)
+    {
+    }
 }

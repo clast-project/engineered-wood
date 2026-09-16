@@ -783,6 +783,27 @@ public sealed class SparkFunctionRegistry
     /// a column of zeros to subtract from, and reads one value per row instead of two.
     /// </para>
     /// </remarks>
+    private IArrowArray Negate(IArrowArray operand, int rowCount)
+    {
+        // A string negates as a DOUBLE, in BOTH dialects -- which is the one place #296's two
+        // rules agree, and it disagrees with the binary operators in the dialect that has a rule
+        // of its own: measured, `-'1'` is the double -1.0 under ANSI while `'1' + 1` is a bigint.
+        // Spark reads it through the same non-integral cast in either case, so `-'1e3'` is -1000.0
+        // where `'1e3' + 1` refuses. #296.
+        if (operand.Data.DataType is StringType)
+            operand = CastForArithmetic(operand, DoubleType.Default, rowCount);
+
+        var type = SparkNumericTypes.UnaryResult(operand.Data.DataType, "minus");
+
+        return type switch
+        {
+            Decimal128Type d => DecimalArithmetic("-", ZeroLike(d, rowCount), operand, d, rowCount),
+            DoubleType => NegateFloating(operand, isFloat: false, rowCount),
+            FloatType => NegateFloating(operand, isFloat: true, rowCount),
+            _ => IntegralArithmetic("-", ZeroLike(type, rowCount), operand, type, rowCount),
+        };
+    }
+
     /// <summary>
     /// Spark's <c>UnaryPositive</c>: the identity over a numeric, a cast over everything that has
     /// a rule at all.
@@ -813,27 +834,6 @@ public sealed class SparkFunctionRegistry
         return operand.Data.DataType is NullType
             ? ArrowCompute.MakeNullArray(type, rowCount)
             : operand;
-    }
-
-    private IArrowArray Negate(IArrowArray operand, int rowCount)
-    {
-        // A string negates as a DOUBLE, in BOTH dialects -- which is the one place #296's two
-        // rules agree, and it disagrees with the binary operators in the dialect that has a rule
-        // of its own: measured, `-'1'` is the double -1.0 under ANSI while `'1' + 1` is a bigint.
-        // Spark reads it through the same non-integral cast in either case, so `-'1e3'` is -1000.0
-        // where `'1e3' + 1` refuses. #296.
-        if (operand.Data.DataType is StringType)
-            operand = CastForArithmetic(operand, DoubleType.Default, rowCount);
-
-        var type = SparkNumericTypes.UnaryResult(operand.Data.DataType, "minus");
-
-        return type switch
-        {
-            Decimal128Type d => DecimalArithmetic("-", ZeroLike(d, rowCount), operand, d, rowCount),
-            DoubleType => NegateFloating(operand, isFloat: false, rowCount),
-            FloatType => NegateFloating(operand, isFloat: true, rowCount),
-            _ => IntegralArithmetic("-", ZeroLike(type, rowCount), operand, type, rowCount),
-        };
     }
 
     /// <summary>Unary minus over a float or a double, which is a flip of the sign bit.</summary>
