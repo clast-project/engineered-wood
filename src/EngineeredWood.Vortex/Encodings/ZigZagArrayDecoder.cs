@@ -56,35 +56,50 @@ internal static class ZigZagArrayDecoder
             throw new VortexFormatException(
                 $"vortex.zigzag encoded child has {encoded.Length} values, expected {expectedRowCount}.");
 
-        return encoded switch
-        {
-            UInt8Array u8 => Build(u8, u8.Values, (byte v) => (sbyte)((v >> 1) ^ -(v & 1)),
-                (data, validity, nulls) => new Int8Array(data, validity, u8.Length, nulls, 0)),
-            UInt16Array u16 => Build(u16, u16.Values, (ushort v) => (short)((v >> 1) ^ -(v & 1)),
-                (data, validity, nulls) => new Int16Array(data, validity, u16.Length, nulls, 0)),
-            UInt32Array u32 => Build(u32, u32.Values, (uint v) => (int)(v >> 1) ^ -(int)(v & 1),
-                (data, validity, nulls) => new Int32Array(data, validity, u32.Length, nulls, 0)),
-            UInt64Array u64 => Build(u64, u64.Values, (ulong v) => (long)(v >> 1) ^ -(long)(v & 1),
-                (data, validity, nulls) => new Int64Array(data, validity, u64.Length, nulls, 0)),
-            _ => throw new VortexFormatException(
-                $"vortex.zigzag encoded child decoded to {encoded.GetType().Name}, expected {encodedType}."),
-        };
-    }
-
-    private static IArrowArray Build<TIn, TOut>(
-        IArrowArray encoded,
-        ReadOnlySpan<TIn> values,
-        Func<TIn, TOut> decode,
-        Func<ArrowBuffer, ArrowBuffer, int, IArrowArray> ctor)
-        where TIn : struct
-        where TOut : struct
-    {
-        var output = new TOut[values.Length];
-        for (int i = 0; i < values.Length; i++)
-            output[i] = decode(values[i]);
-        var data = new ArrowBuffer(MemoryMarshal.AsBytes(output.AsSpan()).ToArray());
         var (validity, nulls) = Validity(encoded);
-        return ctor(data, validity, nulls);
+        int length = encoded.Length;
+        switch (encoded)
+        {
+            case UInt8Array u8:
+                {
+                    var bytes = new byte[length];
+                    var src = u8.Values;
+                    var dst = MemoryMarshal.Cast<byte, sbyte>(bytes.AsSpan());
+                    for (int i = 0; i < src.Length; i++)
+                        dst[i] = (sbyte)((src[i] >> 1) ^ -(src[i] & 1));
+                    return new Int8Array(new ArrowBuffer(bytes), validity, length, nulls, 0);
+                }
+            case UInt16Array u16:
+                {
+                    var bytes = new byte[(long)length * sizeof(short)];
+                    var src = u16.Values;
+                    var dst = MemoryMarshal.Cast<byte, short>(bytes.AsSpan());
+                    for (int i = 0; i < src.Length; i++)
+                        dst[i] = (short)((src[i] >> 1) ^ -(src[i] & 1));
+                    return new Int16Array(new ArrowBuffer(bytes), validity, length, nulls, 0);
+                }
+            case UInt32Array u32:
+                {
+                    var bytes = new byte[(long)length * sizeof(int)];
+                    var src = u32.Values;
+                    var dst = MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
+                    for (int i = 0; i < src.Length; i++)
+                        dst[i] = (int)(src[i] >> 1) ^ -(int)(src[i] & 1);
+                    return new Int32Array(new ArrowBuffer(bytes), validity, length, nulls, 0);
+                }
+            case UInt64Array u64:
+                {
+                    var bytes = new byte[(long)length * sizeof(long)];
+                    var src = u64.Values;
+                    var dst = MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+                    for (int i = 0; i < src.Length; i++)
+                        dst[i] = (long)(src[i] >> 1) ^ -(long)(src[i] & 1);
+                    return new Int64Array(new ArrowBuffer(bytes), validity, length, nulls, 0);
+                }
+            default:
+                throw new VortexFormatException(
+                    $"vortex.zigzag encoded child decoded to {encoded.GetType().Name}, expected {encodedType}.");
+        }
     }
 
     /// <summary>The child's validity, rebased to offset 0 so it lines up with the new values.</summary>

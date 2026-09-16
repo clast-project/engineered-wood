@@ -51,14 +51,16 @@ public class VortexZigZagTests
         Assert.Equal(5, nodes.Count(n => n.Encoding == VortexArrayEncodings.ZigZag));
     }
 
-    [Fact]
-    public async Task DefaultWriterChoosesZigZagWithPackedChildren()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task DefaultWriterChoosesZigZagWithPackedChildren(int column)
     {
-        var nodes = await FixtureArrayNodes.ReadAsync(TestDataPath.Resolve(Default));
-        var zigzag = nodes.Where(n => n.Encoding == VortexArrayEncodings.ZigZag).ToList();
+        var roots = await FixtureArrayNodes.ReadColumnRootsAsync(TestDataPath.Resolve(Default), column);
 
-        Assert.True(zigzag.Count >= 2, $"expected zigzag in both columns, found {zigzag.Count}");
-        Assert.Contains(zigzag, n => n.Children[0] != VortexArrayEncodings.Primitive);
+        Assert.NotEmpty(roots);
+        Assert.All(roots, r => Assert.Equal(VortexArrayEncodings.ZigZag, r.Encoding));
+        Assert.Contains(roots, r => r.Children[0] != VortexArrayEncodings.Primitive);
     }
 
     [Fact]

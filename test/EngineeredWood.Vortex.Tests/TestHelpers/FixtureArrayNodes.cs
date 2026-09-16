@@ -5,6 +5,7 @@ using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Vortex.Encodings;
 using EngineeredWood.Vortex.Format;
+using EngineeredWood.Vortex.Layouts;
 
 namespace EngineeredWood.Vortex.Tests.TestHelpers;
 
@@ -31,6 +32,37 @@ internal static class FixtureArrayNodes
         }
         return nodes;
     }
+
+    /// <summary>
+    /// The root array node of each data segment of column <paramref name="field"/>, in chunk
+    /// order (a dict layout contributes its values' segments, then its codes').
+    /// </summary>
+    public static async Task<List<ArrayNodeInfo>> ReadColumnRootsAsync(string path, int field)
+    {
+        await using var reader = await VortexFileReader.OpenAsync(path);
+        using var file = new LocalRandomAccessFile(path);
+
+        var roots = new List<ArrayNodeInfo>();
+        foreach (var segmentRef in SegmentRefs(reader.ColumnPlans[field]))
+        {
+            var locator = reader.SegmentSpecs[(int)segmentRef];
+            using var owner = await file.ReadAsync(
+                new FileRange(checked((long)locator.Offset), checked((int)locator.Length)));
+            var root = SerializedArray.Parse(owner.Memory.Span).Message.Root;
+            var children = new string[root.ChildCount];
+            for (int i = 0; i < children.Length; i++)
+                children[i] = reader.ArraySpecs[root.Child(i).EncodingIndex];
+            roots.Add(new ArrayNodeInfo(reader.ArraySpecs[root.EncodingIndex], children));
+        }
+        return roots;
+    }
+
+    private static IEnumerable<uint> SegmentRefs(ColumnPlan plan) => plan switch
+    {
+        FlatColumnPlan flat => flat.Chunks.Select(c => c.SegmentRef),
+        DictColumnPlan dict => SegmentRefs(dict.Values).Concat(SegmentRefs(dict.Codes)),
+        _ => throw new NotSupportedException($"No segment listing for {plan.GetType().Name}."),
+    };
 
     private static void Collect(ArrayNode node, IReadOnlyList<string> specs, List<ArrayNodeInfo> nodes)
     {
