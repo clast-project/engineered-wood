@@ -283,23 +283,13 @@ internal static class SparkFloatScaling
     /// those zeros is exact. Java counts a decimal's length without trailing zeros, which is how a
     /// two-digit candidate ending in one comes back as the one-digit answer.
     /// <para>
-    /// <b>Scanned by hand rather than by <c>TrimEnd('0')</c>, which is not the same call on every
-    /// target.</b> netstandard2.0 has no single-character overload, so it binds to
-    /// <c>TrimEnd(params char[])</c> and allocates a one-element array on every render — on the
-    /// path this whole type exists to keep cheap. The scan also returns the original instance when
-    /// there is nothing to drop, which is the common case at full length.
+    /// Through <see cref="SparkText.TrimTrailingZeros"/> rather than <c>TrimEnd('0')</c>, which
+    /// binds to the <c>params char[]</c> overload on netstandard2.0 and allocates an array per
+    /// render — on the path this whole type exists to keep cheap.
     /// </para>
     /// </remarks>
-    private static string Digits(long chosen)
-    {
-        var text = chosen.ToString(CultureInfo.InvariantCulture);
-
-        var end = text.Length;
-        while (end > 1 && text[end - 1] == '0')
-            end--;
-
-        return end == text.Length ? text : text.Substring(0, end);
-    }
+    private static string Digits(long chosen) =>
+        SparkText.TrimTrailingZeros(chosen.ToString(CultureInfo.InvariantCulture));
 
     private static readonly long[] Pow10 =
     {

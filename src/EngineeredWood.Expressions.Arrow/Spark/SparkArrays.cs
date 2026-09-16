@@ -449,7 +449,7 @@ internal static class SparkArrays
 
         return microseconds == 0
             ? seconds
-            : seconds + "." + microseconds.ToString("D6", Invariant).TrimEnd('0');
+            : seconds + "." + SparkText.TrimTrailingZeros(microseconds.ToString("D6", Invariant));
     }
 
     /// <summary>The <see cref="DateTime"/> ticks in one microsecond.</summary>

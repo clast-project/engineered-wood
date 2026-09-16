@@ -446,7 +446,7 @@ internal static class SparkFloatText
     /// one: <c>1.0E-310</c> is one digit long, not two.
     /// </remarks>
     private static (string Digits, int PointAt) Trim(in Candidate candidate, int pointAt) =>
-        (candidate.Digits.TrimEnd('0'), pointAt + candidate.PointShift);
+        (SparkText.TrimTrailingZeros(candidate.Digits), pointAt + candidate.PointShift);
 
     /// <summary>The next decimal up at the same length, carrying into a shifted point if it must.</summary>
     private static Candidate Increment(string digits)

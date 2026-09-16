@@ -126,4 +126,29 @@ internal static class SparkText
         var (start, end) = TrimBounds(text.AsSpan());
         return start == 0 && end == text.Length ? text : text.Substring(start, end - start);
     }
+
+    /// <summary>
+    /// Trailing zeros removed, which is what a rendered number does with the digits it does not
+    /// count.
+    /// </summary>
+    /// <remarks>
+    /// <b><c>TrimEnd('0')</c> is not the same call on every target.</b> netstandard2.0 has no
+    /// single-character overload, so it binds there to <c>TrimEnd(params char[])</c> and allocates
+    /// a one-element array on every call — and every caller of this is per-row: the fraction of a
+    /// rendered timestamp, and the digits of a rendered float. Scanning by hand costs nothing and
+    /// costs the same everywhere, which is the same reason <see cref="TrimTrailingSpaces"/> above
+    /// is written out rather than handed to <c>TrimEnd(' ')</c>.
+    /// <para>
+    /// Matches <c>TrimEnd('0')</c> exactly, down to returning an empty string for digits that are
+    /// all zero, and returns <paramref name="text"/> itself when there is nothing to drop — which
+    /// is the common case for a float at full width.
+    /// </para>
+    /// </remarks>
+    public static string TrimTrailingZeros(string text)
+    {
+        var end = text.Length;
+        while (end > 0 && text[end - 1] == '0') end--;
+
+        return end == text.Length ? text : text.Substring(0, end);
+    }
 }
