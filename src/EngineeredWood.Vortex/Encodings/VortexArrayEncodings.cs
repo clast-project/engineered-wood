@@ -36,6 +36,7 @@ internal static class VortexArrayEncodings
     public const string AlpRD = "vortex.alprd";
     public const string Pco = "vortex.pco";
     public const string RunEnd = "vortex.runend";
+    public const string ZigZag = "vortex.zigzag";
 
     public const string FastlanesBitPacked = "fastlanes.bitpacked";
     public const string FastlanesFor = "fastlanes.for";

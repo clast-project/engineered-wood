@@ -112,6 +112,9 @@ async fn main() -> std::io::Result<()> {
     write_onpair_string(&session, &out_dir.join("onpair_sliced_40rows.vortex"), Some(10..50)).await?;
     write_onpair_default(&session, &out_dir.join("onpair_default_20000rows.vortex")).await?;
     write_bool_sliced(&session, &out_dir.join("bool_sliced_61rows.vortex")).await?;
+    write_zigzag_widths(&session, &out_dir.join("zigzag_widths_64rows.vortex"), None).await?;
+    write_zigzag_widths(&session, &out_dir.join("zigzag_sliced_59rows.vortex"), Some(5..64)).await?;
+    write_zigzag_default(&session, &out_dir.join("zigzag_default_20000rows.vortex")).await?;
 
     Ok(())
 }
@@ -1665,6 +1668,118 @@ async fn write_bool_sliced(session: &VortexSession, path: &PathBuf) -> std::io::
     session
         .write_options()
         .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Row `i` of the hand-built zigzag columns: the type's extremes, zero and -1
+/// first, then small values alternating in sign.
+fn zigzag_row(i: usize, min: i64, max: i64) -> i64 {
+    match i {
+        0 => min,
+        1 => max,
+        2 => 0,
+        3 => -1,
+        _ => {
+            let magnitude = (i as i64 * 37) % 100;
+            if i % 2 == 0 { magnitude } else { -magnitude }
+        }
+    }
+}
+
+/// Hand-built vortex.zigzag columns, one per signed width, plus a nullable
+/// i32 (`n32`, null on every sixth row), written as-is by a flat strategy.
+/// With `slice`, every column is sliced first, which slices each encoded child.
+async fn write_zigzag_widths(
+    session: &VortexSession,
+    path: &PathBuf,
+    slice: Option<std::ops::Range<usize>>,
+) -> std::io::Result<()> {
+    use vortex_zigzag::zigzag_encode;
+
+    const ROWS: usize = 64;
+    let zz = |array: PrimitiveArray| -> vortex_array::ArrayRef {
+        let encoded = zigzag_encode(array.as_view()).expect("zigzag_encode").into_array();
+        match &slice {
+            Some(range) => encoded.slice(range.clone()).expect("slice"),
+            None => encoded,
+        }
+    };
+
+    let i8s = zz(PrimitiveArray::from_iter((0..ROWS).map(|i| zigzag_row(i, i8::MIN.into(), i8::MAX.into()) as i8)));
+    let i16s = zz(PrimitiveArray::from_iter((0..ROWS).map(|i| zigzag_row(i, i16::MIN.into(), i16::MAX.into()) as i16)));
+    let i32s = zz(PrimitiveArray::from_iter((0..ROWS).map(|i| zigzag_row(i, i32::MIN.into(), i32::MAX.into()) as i32)));
+    let i64s = zz(PrimitiveArray::from_iter((0..ROWS).map(|i| zigzag_row(i, i64::MIN, i64::MAX))));
+    let n32 = zz(PrimitiveArray::new(
+        vortex_buffer::Buffer::from_iter((0..ROWS).map(|i| zigzag_row(i, i32::MIN.into(), i32::MAX.into()) as i32)),
+        Validity::from_iter((0..ROWS).map(|i| i % 6 != 0)),
+    ));
+
+    let data = StructArray::from_fields(&[
+        ("i8", i8s),
+        ("i16", i16s),
+        ("i32", i32s),
+        ("i64", i64s),
+        ("n32", n32),
+    ])
+    .expect("from_fields")
+    .into_array();
+    let strategy = Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ));
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Signed columns the default strategy compresses with vortex.zigzag: values
+/// near zero of both signs with rare huge outliers, which frame-of-reference
+/// can't narrow but zigzag plus patched bit-packing can.
+///   a: i32, (i * 7919) % 7 - 3, with +-1e9 on every 997th row, null on every 11th
+///   b: i64, (i * 31) % 5 - 2, with -2^50 / 2^50 on rows 0 / 750 mod 1500
+async fn write_zigzag_default(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    const ROWS: usize = 20_000;
+
+    let a = PrimitiveArray::new(
+        vortex_buffer::Buffer::from_iter((0..ROWS).map(|i| {
+            if i % 997 == 0 {
+                if i % 2 == 0 { 1_000_000_000 } else { -1_000_000_000 }
+            } else {
+                ((i * 7919) % 7) as i32 - 3
+            }
+        })),
+        Validity::from_iter((0..ROWS).map(|i| i % 11 != 0)),
+    )
+    .into_array();
+    let b = PrimitiveArray::from_iter((0..ROWS).map(|i| {
+        if i % 1500 == 0 {
+            -(1i64 << 50)
+        } else if i % 1500 == 750 {
+            1i64 << 50
+        } else {
+            (i as i64 * 31) % 5 - 2
+        }
+    }))
+    .into_array();
+    let data = StructArray::from_fields(&[("a", a), ("b", b)])
+        .expect("from_fields")
+        .into_array();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
         .write(&mut bytes, data.to_array_stream())
         .await
         .expect("write");

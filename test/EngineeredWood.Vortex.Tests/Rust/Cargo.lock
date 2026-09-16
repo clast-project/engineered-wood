@@ -2788,6 +2788,7 @@ dependencies = [
  "vortex-sequence",
  "vortex-session",
  "vortex-utils",
+ "vortex-zigzag",
 ]
 
 [[package]]
