@@ -226,6 +226,21 @@ internal static class SparkFloatText
     private static (string Digits, int PointAt) ShortestDigits(
         long mantissa, int exponent, bool narrowBelow, int maxDigits)
     {
+        // The same question in machine words, which answers it for all but a handful of values
+        // and declines rather than guessing on those. Everything below is what it declines to.
+        if (SparkFloatScaling.TryShortestDigits(
+                mantissa, exponent, narrowBelow, maxDigits, out var fast, out var fastPoint))
+        {
+            return (fast, fastPoint);
+        }
+
+        return ExactDigits(mantissa, exponent, narrowBelow, maxDigits);
+    }
+
+    /// <summary>The same answer by exact expansion, for whatever the scaled path would not call.</summary>
+    internal static (string Digits, int PointAt) ExactDigits(
+        long mantissa, int exponent, bool narrowBelow, int maxDigits)
+    {
         var scale = Powers.Scale(exponent);
         var product = scale * mantissa;
         var length = DigitCount(mantissa, exponent, product);
