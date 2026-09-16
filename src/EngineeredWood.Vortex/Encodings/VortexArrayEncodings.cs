@@ -6,7 +6,7 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <summary>
 /// Well-known array encoding ids registered by
 /// <c>vortex_file::register_default_encodings</c>. Match exactly the strings
-/// produced by the canonical Rust impl as of vortex 0.70.
+/// produced by the canonical Rust impl as of vortex 0.86.
 /// </summary>
 internal static class VortexArrayEncodings
 {

@@ -1226,7 +1226,7 @@ public class VortexCrossValidationTests
 
         // Default Timestamp path: vortex.timestamp Extension wrapping
         // vortex.ext { vortex.primitive } i64 storage. Validates that the
-        // Extension dtype + array wrapping round-trip through vortex 0.70.
+        // Extension dtype + array wrapping round-trip through vortex.
         var type = new TimestampType(TimeUnit.Microsecond, (string?)"UTC");
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -1571,7 +1571,7 @@ public class VortexCrossValidationTests
 
         // Nullable f64 ALP-RD column. Validates that the writer's null
         // handling on left_parts (validity bitmap rebased to offset 0) and
-        // patch-skip-at-null behaviour produce a wire shape vortex 0.70
+        // patch-skip-at-null behaviour produce a wire shape vortex
         // accepts.
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -1617,7 +1617,7 @@ public class VortexCrossValidationTests
 
         // Repetitive binary column → FSST. Validates the symbol-table +
         // codes wire shape works for BinaryType the same way it does for
-        // StringType (vortex 0.70 dispatches both through the same
+        // StringType (vortex dispatches both through the same
         // vortex.fsst encoding).
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -1756,7 +1756,7 @@ public class VortexCrossValidationTests
 
         // preferDictLayout AND preserveStats: each column's data layout is
         // wrapped in vortex.stats(vortex.dict(values, codes-chunked), zones).
-        // Confirms vortex 0.70 accepts the dict-inside-stats layout shape.
+        // Confirms vortex accepts the dict-inside-stats layout shape.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("color", StringType.Default, nullable: false),
@@ -1807,7 +1807,7 @@ public class VortexCrossValidationTests
         // children of the zones-table struct. Validates that the bitset
         // (0xD8) and child layout (max + max_is_truncated, min +
         // min_is_truncated, null_count, uncompressed_size) match what
-        // vortex 0.70's reader expects.
+        // vortex's reader expects.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("v", StringType.Default, nullable: false),

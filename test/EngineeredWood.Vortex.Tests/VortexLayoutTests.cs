@@ -68,19 +68,24 @@ public class VortexLayoutTests
     }
 
     /// <summary>
-    /// Locks in the tree shape vortex 0.70 emits for our reference fixture:
+    /// Locks in the tree shape vortex emits for our reference fixture
+    /// (vortex.zoned since 0.84, vortex.stats before):
     ///   vortex.struct rows=3
-    ///     vortex.stats rows=3 meta=6B
+    ///     vortex.zoned rows=3
     ///       vortex.flat rows=3 segs=[0]   (data array for field "a")
     ///       vortex.flat rows=1 segs=[1]   (per-field stats table)
     /// If a future Rust upgrade changes this we'll see the test fail and
     /// update the chunk-6 decoder dispatch to match.
     /// </summary>
-    [Fact]
-    public async Task FixtureLayoutMatchesExpectedShape()
+    [Theory]
+    [InlineData("", VortexLayoutEncodings.Zoned)]
+    [InlineData("legacy-0.70/", VortexLayoutEncodings.Stats)]
+    public async Task FixtureLayoutMatchesExpectedShape(string fixtureDir, string zoneMapEncoding)
     {
+        // vortex 0.84 renamed the zone-map layout's wire id from vortex.stats to
+        // vortex.zoned; the tree shape is otherwise unchanged.
         await using var reader = await VortexFileReader.OpenAsync(
-            TestDataPath.Resolve("struct_int_3rows.vortex"));
+            TestDataPath.Resolve(fixtureDir + "struct_int_3rows.vortex"));
 
         var root = reader.RootLayout;
         Assert.Equal(VortexLayoutEncodings.Struct, root.EncodingId);
@@ -89,7 +94,7 @@ public class VortexLayoutTests
         Assert.Single(root.Children);
 
         var statsWrap = root.Children[0];
-        Assert.Equal(VortexLayoutEncodings.Stats, statsWrap.EncodingId);
+        Assert.Equal(zoneMapEncoding, statsWrap.EncodingId);
         Assert.Equal(3UL, statsWrap.RowCount);
         Assert.Equal(2, statsWrap.Children.Count);
         Assert.Empty(statsWrap.SegmentRefs);

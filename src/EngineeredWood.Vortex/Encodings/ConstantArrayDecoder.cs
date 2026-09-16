@@ -75,6 +75,14 @@ internal static class ConstantArrayDecoder
                 (data, len) => new DoubleArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0),
                 scalar.F64Value),
             (BooleanType, ScalarValueKind.Bool) => BuildBool(n, scalar.BoolValue),
+            // Temporal extension scalars carry their storage integer, e.g. a
+            // zone-map min/max of a vortex.time column.
+            (Date32Type or Time32Type, ScalarValueKind.Int64) => Filled<int>(n,
+                (data, len) => WithType(type, data, len),
+                (int)scalar.Int64Value),
+            (Date64Type or Time64Type or TimestampType or DurationType, ScalarValueKind.Int64) => Filled<long>(n,
+                (data, len) => WithType(type, data, len),
+                scalar.Int64Value),
             // Repeated-string / repeated-binary constants typically arise as
             // a zone-stats Min or Max when every zone has the same lex-min /
             // lex-max (or is the only zone). vortex's writer collapses both
@@ -112,6 +120,10 @@ internal static class ConstantArrayDecoder
             ? new StringArray(rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0)
             : new BinaryArray(BinaryType.Default, rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0);
     }
+
+    private static IArrowArray WithType(IArrowType type, byte[] data, int length) =>
+        ArrowArrayFactory.BuildArray(new ArrayData(
+            type, length, 0, 0, new[] { ArrowBuffer.Empty, new ArrowBuffer(data) }));
 
     private static IArrowArray Filled<T>(
         int rowCount, Func<byte[], int, IArrowArray> ctor, T value) where T : struct

@@ -67,10 +67,12 @@ internal static class FsstArrayDecoder
         if (lengths.Length > 255) lengths[255] = 0;
 
         // Resolve uncompressed_lengths Arrow type from FSSTMetadata, then decode child[0].
+        // Empty metadata is a valid FSSTMetadata whose fields all hold their
+        // proto3 defaults (both ptypes U8), which vortex 0.86 writes for short strings.
         var metaVec = node.Metadata;
-        if (metaVec.Length == 0)
-            throw new VortexFormatException("vortex.fsst ArrayNode has empty metadata; expected FSSTMetadata proto.");
-        var metaBytes = metaVec.RawBytes(metaVec.Length);
+        var metaBytes = metaVec.Length == 0
+            ? ReadOnlySpan<byte>.Empty
+            : metaVec.RawBytes(metaVec.Length);
         var (uncompressedLensPtype, _codesOffsetsPtype) = ParseFsstMetadata(metaBytes);
         _ = _codesOffsetsPtype; // unused: we don't need codes_offsets for bulk decompress
 

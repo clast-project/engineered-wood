@@ -34,6 +34,11 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <para>LANES per ptype (16 for u64, 32 for u32, 64 for u16, 128 for u8) is queried via
 /// <c>Delta.LaneCount&lt;T&gt;()</c>.</para>
 ///
+/// <para>Signed integers are accepted since vortex 0.86 (0.70 required unsigned bases). Both
+/// children keep the signed ptype, but the deltas are the wrapping differences of the values'
+/// unsigned bit patterns, so a signed column decodes exactly as its unsigned counterpart and is
+/// then reinterpreted.</para>
+///
 /// <para>Phase 1 scope: <c>offset == 0</c> only (no slicing); deltas child is
 /// fully materialized via the recursive decoder.</para>
 /// </summary>
@@ -104,8 +109,16 @@ internal static class DeltaArrayDecoder
                 (data, len) => new UInt32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
             UInt64Type => UndeltaTo<ulong>(rowCount, offset, lanes, bases, deltas,
                 (data, len) => new UInt64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            Int8Type => UndeltaTo<byte>(rowCount, offset, lanes, bases, deltas,
+                (data, len) => new Int8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            Int16Type => UndeltaTo<ushort>(rowCount, offset, lanes, bases, deltas,
+                (data, len) => new Int16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            Int32Type => UndeltaTo<uint>(rowCount, offset, lanes, bases, deltas,
+                (data, len) => new Int32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+            Int64Type => UndeltaTo<ulong>(rowCount, offset, lanes, bases, deltas,
+                (data, len) => new Int64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
             _ => throw new NotSupportedException(
-                $"fastlanes.delta currently supports unsigned integer types only, got {type}."),
+                $"fastlanes.delta supports integer types only, got {type}."),
         };
     }
 
@@ -191,10 +204,10 @@ internal static class DeltaArrayDecoder
 
     private static int LaneCountFor(IArrowType type) => type switch
     {
-        UInt8Type => Clast.FastLanes.Delta.LaneCount<byte>(),
-        UInt16Type => Clast.FastLanes.Delta.LaneCount<ushort>(),
-        UInt32Type => Clast.FastLanes.Delta.LaneCount<uint>(),
-        UInt64Type => Clast.FastLanes.Delta.LaneCount<ulong>(),
+        UInt8Type or Int8Type => Clast.FastLanes.Delta.LaneCount<byte>(),
+        UInt16Type or Int16Type => Clast.FastLanes.Delta.LaneCount<ushort>(),
+        UInt32Type or Int32Type => Clast.FastLanes.Delta.LaneCount<uint>(),
+        UInt64Type or Int64Type => Clast.FastLanes.Delta.LaneCount<ulong>(),
         _ => throw new NotSupportedException(
             $"fastlanes.delta: no lane count for {type}."),
     };

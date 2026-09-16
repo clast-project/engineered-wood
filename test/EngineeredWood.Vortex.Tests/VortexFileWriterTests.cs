@@ -15,6 +15,12 @@ namespace EngineeredWood.Vortex.Tests;
 /// </summary>
 public class VortexFileWriterTests
 {
+    /// <summary>
+    /// Copies of fixtures as vortex 0.70 wrote them, before upstream's zone maps moved from
+    /// <c>vortex.stats</c> to <c>vortex.zoned</c>. Tests over zone-map pruning run against both.
+    /// </summary>
+    private const string LegacyFixtures = "legacy-0.70/";
+
     [Fact]
     public async Task SelfRoundtrip_PrimitiveColumns()
     {
@@ -1595,12 +1601,14 @@ public class VortexFileWriterTests
     // keeps the only zone (1 batch yielded) or prunes it (0 batches). All
     // three fixtures' Min/Max are confirmed non-null in zone stats.
 
-    [Fact]
-    public async Task Predicate_TimestampMicrosecond_PrunesByRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task Predicate_TimestampMicrosecond_PrunesByRange(string fixtureDir)
     {
         // timestamp_us_2048rows.vortex: zone 0 covers [2024-01-01 .. 2024-12-30]
         // microseconds. col 0 is TimestampType(Microsecond, "UTC").
-        var path = TestData.TestDataPath.Resolve("timestamp_us_2048rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "timestamp_us_2048rows.vortex");
         if (!File.Exists(path)) return;
         await using var reader = await VortexFileReader.OpenAsync(path);
 
@@ -1627,14 +1635,16 @@ public class VortexFileWriterTests
     }
 
 #if NET6_0_OR_GREATER
-    [Fact]
-    public async Task Predicate_Date32_PrunesByRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task Predicate_Date32_PrunesByRange(string fixtureDir)
     {
         // date_days_2048rows.vortex: zone 0 covers days [19723 (2024-01-01) .. 21547 (2028-12-30)].
         // Date32 stats decode to LiteralValue.Of(DateOnly), so callers build
         // predicates with DateOnly literals; this test is gated to net6+
         // because System.DateOnly itself is net6+.
-        var path = TestData.TestDataPath.Resolve("date_days_2048rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "date_days_2048rows.vortex");
         if (!File.Exists(path)) return;
         await using var reader = await VortexFileReader.OpenAsync(path);
 
@@ -1654,13 +1664,15 @@ public class VortexFileWriterTests
         Assert.Equal(1, kept);
     }
 
-    [Fact]
-    public async Task Predicate_Time64Microsecond_PrunesByRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task Predicate_Time64Microsecond_PrunesByRange(string fixtureDir)
     {
         // time_us_2048rows.vortex: zone 0 covers ~[1m15s .. 23h59m16s] microseconds-of-day.
         // Time64 stats decode to LiteralValue.Of(TimeOnly); gated to net6+
         // because System.TimeOnly is net6+.
-        var path = TestData.TestDataPath.Resolve("time_us_2048rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "time_us_2048rows.vortex");
         if (!File.Exists(path)) return;
         await using var reader = await VortexFileReader.OpenAsync(path);
 
@@ -6898,13 +6910,15 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_EqualKeepsZoneInRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_EqualKeepsZoneInRange(string fixtureDir)
     {
         // dict_string_64rows.vortex has one zone with min='alpha' max='foxtrot'.
         // 'delta' is lex-in [alpha, foxtrot] so the zone is kept and the batch
         // surfaces. Tests Predicate.Equal(string).
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.Equal("color", LiteralValue.Of("delta")))) batches.Add(b);
@@ -6918,11 +6932,13 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_EqualOutOfRangePrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_EqualOutOfRangePrunes(string fixtureDir)
     {
         // 'zebra' > 'foxtrot' (max), so the zone is dropped.
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.Equal("color", LiteralValue.Of("zebra")))) batches.Add(b);
@@ -6936,11 +6952,13 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_GreaterThanMaxPrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_GreaterThanMaxPrunes(string fixtureDir)
     {
         // Predicate "> max" drops the zone (max is foxtrot, cmp(max, foxtrot)=0 ≤ 0).
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.GreaterThan("color", LiteralValue.Of("foxtrot")))) batches.Add(b);
@@ -6954,11 +6972,13 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_LessThanMinPrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_LessThanMinPrunes(string fixtureDir)
     {
         // Predicate "< min" drops the zone (min is alpha, cmp(min, alpha)=0 ≥ 0).
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.LessThan("color", LiteralValue.Of("alpha")))) batches.Add(b);
@@ -6972,11 +6992,13 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_GreaterOrEqualKeeps()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_GreaterOrEqualKeeps(string fixtureDir)
     {
         // GreaterOrEqual(min) keeps the zone (cmp(max, min) >= 0 trivially).
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.GreaterThanOrEqual("color", LiteralValue.Of("alpha")))) batches.Add(b);
@@ -7765,13 +7787,15 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task BinaryFixture_ColumnRoundTrip()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryFixture_ColumnRoundTrip(string fixtureDir)
     {
         // Sanity-check the read path itself before exercising predicates:
         // open binary_col_64rows.vortex, decode column 0, verify each row's
         // bytes match the deterministic Rust generator pattern.
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         Assert.IsType<BinaryType>(r.Schema.FieldsList[0].DataType);
         var batches = new List<RecordBatch>();
@@ -7796,8 +7820,10 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task BinaryPredicate_OpensFixtureAndSeesStats()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryPredicate_OpensFixtureAndSeesStats(string fixtureDir)
     {
         // binary_col_64rows.vortex is a Rust-written single-column BinaryArray
         // file with 64 rows of 8-byte payloads [0x10, i, 0, 0, 0, 0, 0, 0]
@@ -7806,7 +7832,7 @@ public class VortexFileWriterTests
         // [0x10 0x3F ...]. This test sanity-checks GetZoneStatsAsync surfaces
         // BinaryArray Min/Max — the actual predicate prune/keep logic is in
         // the four BinaryPredicate_ tests below.
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         Assert.IsType<BinaryType>(r.Schema.FieldsList[0].DataType);
         var stats = await r.GetZoneStatsAsync(0);
@@ -7815,11 +7841,13 @@ public class VortexFileWriterTests
         Assert.IsType<BinaryArray>(stats.Max);
     }
 
-    [Fact]
-    public async Task BinaryPredicate_EqualKeepsZoneInRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryPredicate_EqualKeepsZoneInRange(string fixtureDir)
     {
         // [0x10 0x20 0…0] is lex-in [0x10 0x00 …, 0x10 0x3F …] so the zone is kept.
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var midValue = new byte[] { 0x10, 0x20, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
@@ -7834,12 +7862,14 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task BinaryPredicate_GreaterThanMaxPrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryPredicate_GreaterThanMaxPrunes(string fixtureDir)
     {
         // value > max ⇒ all zones drop. value = [0x11 0x00 …] which is
         // lex-greater than max = [0x10 0x3F …].
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var pastMax = new byte[] { 0x11, 0, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
@@ -7854,12 +7884,14 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task BinaryPredicate_LessThanMinPrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryPredicate_LessThanMinPrunes(string fixtureDir)
     {
         // value < min ⇒ all zones drop. value = [0x0F 0xFF …] which is
         // lex-less than min = [0x10 0x00 …].
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var beforeMin = new byte[] { 0x0F, 0xFF, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
@@ -7874,11 +7906,13 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task BinaryPredicate_OutOfRangeEqualPrunes()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task BinaryPredicate_OutOfRangeEqualPrunes(string fixtureDir)
     {
         // Equal to a value past max ⇒ drops the zone (value > max).
-        var path = TestData.TestDataPath.Resolve("binary_col_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "binary_col_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var unreachable = new byte[] { 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99 };
         var batches = new List<RecordBatch>();
@@ -7893,12 +7927,14 @@ public class VortexFileWriterTests
         }
     }
 
-    [Fact]
-    public async Task StringPredicate_NotEqualKeepsRange()
+    [Theory]
+    [InlineData("")]
+    [InlineData(LegacyFixtures)]
+    public async Task StringPredicate_NotEqualKeepsRange(string fixtureDir)
     {
         // NotEqual is conservative: drops only when min == max == K. Here
         // min='alpha' max='foxtrot' so the zone stays.
-        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        var path = TestData.TestDataPath.Resolve(fixtureDir + "dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
         await foreach (var b in r.ReadAllAsync(Pred.NotEqual("color", LiteralValue.Of("delta")))) batches.Add(b);

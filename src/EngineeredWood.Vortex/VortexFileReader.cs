@@ -388,14 +388,16 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// Streams the file as Arrow <see cref="Apache.Arrow.RecordBatch"/>es, optionally
     /// filtered by zone. When <paramref name="acceptedZones"/> is non-null,
-    /// only chunks whose zone index is in the set are decoded — letting
+    /// only rows in zones whose index is in the set are decoded — letting
     /// callers prune whole zones based on the per-column stats returned
     /// from <see cref="GetZoneStatsAsync"/>.
     ///
-    /// <para>For files written with <c>preserveStats: true</c> using uniform
-    /// batch sizes, chunk index == zone index. For non-zoned files
-    /// <paramref name="acceptedZones"/> still filters the chunk index but
-    /// the caller has no per-zone stats to drive the decision.</para>
+    /// <para>Zone <c>z</c> covers rows <c>[z * ZoneLen, (z + 1) * ZoneLen)</c>
+    /// of <see cref="ZoneStats.ZoneLen"/>, whatever the columns' chunking. For
+    /// files written with <c>preserveStats: true</c> that is one chunk per zone.
+    /// For files without zone maps <paramref name="acceptedZones"/> filters
+    /// chunk indices of the first column, but the caller has no per-zone stats
+    /// to drive the decision.</para>
     /// </summary>
     public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         ISet<int>? acceptedZones,
@@ -489,15 +491,14 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         Predicate? predicate,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        ISet<int>? acceptedZones = null;
+        IReadOnlyList<RowRange>? acceptedRanges = null;
         if (predicate is not null && _columnPlans.Length > 0)
         {
-            int totalZones = _columnPlans[0].ChunkCount;
-            acceptedZones = await EvaluatePredicateZonesAsync(
-                predicate, totalZones, cancellationToken).ConfigureAwait(false);
+            acceptedRanges = await EvaluatePredicateRangesAsync(predicate, cancellationToken)
+                .ConfigureAwait(false);
         }
-        await foreach (var batch in ReadAllCoreAsync(
-            acceptedZones, columnIndices, rowOffset, rowCount, cancellationToken).ConfigureAwait(false))
+        await foreach (var batch in ReadRangesAsync(
+            acceptedRanges, columnIndices, rowOffset, rowCount, cancellationToken).ConfigureAwait(false))
             yield return batch;
     }
 
@@ -522,10 +523,9 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (_columnPlans.Length == 0) yield break;
-        int totalZones = _columnPlans[0].ChunkCount;
-        var accepted = await EvaluatePredicateZonesAsync(
-            predicate, totalZones, cancellationToken).ConfigureAwait(false);
-        await foreach (var batch in ReadAllCoreAsync(accepted, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken)
+        var accepted = await EvaluatePredicateRangesAsync(predicate, cancellationToken)
+            .ConfigureAwait(false);
+        await foreach (var batch in ReadRangesAsync(accepted, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken)
             .ConfigureAwait(false))
             yield return batch;
     }
@@ -535,37 +535,119 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// every column it references (one <see cref="GetZoneStatsAsync"/> call
     /// per referenced column), then iterates the zones and runs the shared
     /// <see cref="StatisticsEvaluator"/> against a per-zone cursor. Returns
-    /// the set of zone indices that aren't proven to contain no matches.
+    /// the row ranges of the zones that aren't proven to contain no matches,
+    /// or null to read everything.
     /// </summary>
-    private async Task<HashSet<int>> EvaluatePredicateZonesAsync(
-        Predicate predicate, int totalZones, CancellationToken cancellationToken)
+    /// <remarks>
+    /// The cursor addresses every column's stats by one zone index, which is
+    /// only meaningful when the referenced columns share a zone length. They
+    /// always do for files from this writer and from upstream's default
+    /// strategy. When they don't, or when no referenced column has zone
+    /// stats, see <see cref="EvaluateWithoutZoneStats"/>.
+    /// </remarks>
+    private async Task<IReadOnlyList<RowRange>?> EvaluatePredicateRangesAsync(
+        Predicate predicate, CancellationToken cancellationToken)
     {
         // Collect referenced column names once. Predicates over columns that
         // aren't in the schema, or that the predicate doesn't reference at
         // all, don't trigger any stats fetch.
         var referenced = VortexZoneStatsAccessor.CollectReferencedColumns(predicate);
         var statsByColumn = new Dictionary<string, ZoneStats?>(referenced.Count, StringComparer.Ordinal);
+        int zoneLen = 0, zoneCount = 0;
         foreach (var name in referenced)
         {
             int idx = FindFieldIndex(name);
             // Unresolvable reference → null entry → accessor returns null for
             // min/max/etc. → evaluator stays at Unknown → zone kept.
-            statsByColumn[name] = idx < 0
+            var stats = idx < 0
                 ? null
                 : await GetZoneStatsAsync(idx, cancellationToken).ConfigureAwait(false);
+            statsByColumn[name] = stats;
+            if (stats is null) continue;
+            if (zoneLen != 0 && (stats.ZoneLen != zoneLen || stats.ZoneCount != zoneCount))
+                return EvaluateWithoutZoneStats(predicate);
+            zoneLen = stats.ZoneLen;
+            zoneCount = stats.ZoneCount;
         }
+        if (zoneLen == 0)
+            return EvaluateWithoutZoneStats(predicate);
 
         var accessor = new VortexZoneStatsAccessor(Schema);
         var cursor = new VortexZoneCursor(statsByColumn);
-        var accepted = new HashSet<int>();
-        for (int z = 0; z < totalZones; z++)
+        var accepted = new List<int>();
+        for (int z = 0; z < zoneCount; z++)
         {
             cursor.ZoneIndex = z;
             var result = StatisticsEvaluator.Evaluate(predicate, cursor, accessor);
             if (result != FilterResult.AlwaysFalse)
                 accepted.Add(z);
         }
-        return accepted;
+        return ZonesToRowRanges(accepted, zoneLen);
+    }
+
+    /// <summary>
+    /// Evaluates <paramref name="predicate"/> once with no stats for any column,
+    /// for when there are no per-zone stats to evaluate it against. The answer
+    /// then can't depend on the data, so it holds for the whole file: nothing to
+    /// read when the predicate is <see cref="FilterResult.AlwaysFalse"/> (as
+    /// <see cref="Expressions.Expressions.False"/> is), everything otherwise.
+    /// </summary>
+    private IReadOnlyList<RowRange>? EvaluateWithoutZoneStats(Predicate predicate)
+    {
+        var cursor = new VortexZoneCursor(
+            new Dictionary<string, ZoneStats?>(StringComparer.Ordinal));
+        var result = StatisticsEvaluator.Evaluate(
+            predicate, cursor, new VortexZoneStatsAccessor(Schema));
+        return result == FilterResult.AlwaysFalse ? System.Array.Empty<RowRange>() : null;
+    }
+
+    /// <summary>
+    /// Zone <c>z</c> of a zone map with length <paramref name="zoneLen"/> covers rows
+    /// <c>[z * zoneLen, (z + 1) * zoneLen)</c>, the last zone ending with the file.
+    /// </summary>
+    private List<RowRange> ZonesToRowRanges(IEnumerable<int> zones, int zoneLen)
+    {
+        long total = NumberOfRows;
+        var ranges = new List<RowRange>();
+        foreach (var z in zones)
+        {
+            if (z < 0) continue;
+            long start = (long)z * zoneLen;
+            if (start >= total) continue;
+            ranges.Add(new RowRange(start, Math.Min(start + zoneLen, total)));
+        }
+        return ranges;
+    }
+
+    /// <summary>
+    /// Resolves caller-supplied zone indices (from <see cref="GetZoneStatsAsync"/>)
+    /// to row ranges. A file with no zone maps has no zones, so the indices are
+    /// taken as chunk indices of the first column, which is what they meant for
+    /// the chunk-per-zone files this writer produces.
+    /// </summary>
+    private List<RowRange> CallerZonesToRowRanges(ISet<int> zones)
+    {
+        int zoneLen = 0;
+        foreach (var plan in _columnPlans)
+        {
+            if (plan.ZoneInfo is null) continue;
+            if (zoneLen != 0 && plan.ZoneInfo.ZoneLen != zoneLen)
+                throw new NotSupportedException(
+                    "Zone indices are ambiguous: the file's columns have zone maps with different zone lengths.");
+            zoneLen = plan.ZoneInfo.ZoneLen;
+        }
+        if (zoneLen != 0)
+            return ZonesToRowRanges(zones.OrderBy(z => z), zoneLen);
+
+        var ranges = new List<RowRange>();
+        if (_columnPlans.Length == 0) return ranges;
+        var starts = ChunkStarts(_columnPlans[0]);
+        for (int c = 0; c < starts.Length - 1; c++)
+        {
+            if (zones.Contains(c))
+                ranges.Add(new RowRange(starts[c], starts[c + 1]));
+        }
+        return ranges;
     }
 
     private int FindFieldIndex(string name)
@@ -580,18 +662,38 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Shared chunk-streaming loop. <paramref name="columnIndices"/>
-    /// defaults (null) to "all columns in schema order"; otherwise only the
-    /// listed columns are decoded and the emitted batch's schema is
-    /// projected to that subset. <paramref name="acceptedZones"/> defaults
-    /// (null) to "all chunks"; otherwise only chunks whose index is in the
-    /// set are emitted. <paramref name="rowOffset"/> + <paramref name="rowCount"/>
-    /// further trim the surviving chunks to a logical row range — chunks
-    /// fully outside the range incur zero I/O; boundary chunks are decoded
-    /// and sliced via <see cref="Apache.Arrow.RecordBatch.Slice(int, int)"/>.
+    /// Streams the file with <paramref name="acceptedZones"/> (null for all
+    /// rows) resolved to row ranges; see <see cref="ReadRangesAsync"/>.
     /// </summary>
-    private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllCoreAsync(
+    private IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllCoreAsync(
         ISet<int>? acceptedZones,
+        IReadOnlyList<int>? columnIndices,
+        long rowOffset,
+        long rowCount,
+        CancellationToken cancellationToken)
+        => ReadRangesAsync(
+            acceptedZones is null ? null : CallerZonesToRowRanges(acceptedZones),
+            columnIndices, rowOffset, rowCount, cancellationToken);
+
+    /// <summary>
+    /// Shared streaming loop. <paramref name="columnIndices"/> defaults
+    /// (null) to "all columns in schema order"; otherwise only the listed
+    /// columns are decoded and the emitted batch's schema is projected to
+    /// that subset. <paramref name="acceptedRanges"/> defaults (null) to
+    /// "all rows"; otherwise only rows inside the ranges are emitted.
+    /// <paramref name="rowOffset"/> + <paramref name="rowCount"/> further
+    /// trim them to a logical row range.
+    /// </summary>
+    /// <remarks>
+    /// Columns may be chunked independently (upstream's writer does), so a
+    /// batch ends wherever any read column's chunk ends, as well as at the
+    /// edges of the accepted ranges. When every read column shares its
+    /// chunk boundaries and whole chunks are accepted, that is one batch per
+    /// chunk. A chunk is decoded only if an emitted row falls inside it, and
+    /// only once however many batches it is sliced into.
+    /// </remarks>
+    private async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadRangesAsync(
+        IReadOnlyList<RowRange>? acceptedRanges,
         IReadOnlyList<int>? columnIndices,
         long rowOffset,
         long rowCount,
@@ -602,81 +704,153 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         if (rowCount == 0)
             yield break;
 
-        int chunkCount = _columnPlans[0].ChunkCount;
-        for (int i = 1; i < _columnPlans.Length; i++)
-        {
-            if (_columnPlans[i].ChunkCount != chunkCount)
-                throw new NotSupportedException(
-                    $"Column {i} has {_columnPlans[i].ChunkCount} chunks but column 0 has {chunkCount}. " +
-                    "Per-column chunking with mismatched chunk counts is not yet supported.");
-        }
-
         // Pre-compute the projected schema once. ValidateColumnIndices
-        // ensures the list is non-empty, so colsToRead >= 1 — the
-        // first-column rowCount fallback is always reachable.
+        // ensures the list is non-empty, so colsToRead >= 1.
         var (projectedSchema, projectedIndices) = columnIndices is null
             ? (Schema, null)
             : ProjectSchema(columnIndices);
 
         int colsToRead = projectedIndices?.Length ?? _columnPlans.Length;
+        long totalRows = NumberOfRows;
+        var columns = new ColumnCursor[colsToRead];
+        for (int outIdx = 0; outIdx < colsToRead; outIdx++)
+        {
+            int srcIdx = projectedIndices is null ? outIdx : projectedIndices[outIdx];
+            var starts = ChunkStarts(_columnPlans[srcIdx]);
+            if (starts[starts.Length - 1] != totalRows)
+                throw new VortexFormatException(
+                    $"Column {srcIdx} has {starts[starts.Length - 1]} rows but the file has {totalRows}.");
+            columns[outIdx] = new ColumnCursor(_columnPlans[srcIdx], srcIdx, starts);
+        }
 
         // Saturating end: rowOffset + rowCount may overflow long.MaxValue
         // when the caller passes long.MaxValue (= "to end"). Saturate to
         // long.MaxValue so the boundary check stays correct.
         long rangeEnd = rowOffset > long.MaxValue - rowCount ? long.MaxValue : rowOffset + rowCount;
-        long cursor = 0;
+        var ranges = NormalizeRanges(
+            acceptedRanges ?? new[] { new RowRange(0, totalRows) },
+            Math.Min(rowOffset, totalRows), Math.Min(rangeEnd, totalRows));
 
-        for (int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++)
+        foreach (var range in ranges)
         {
-            long chunkLen = checked((long)_columnPlans[0].ChunkRowCount(chunkIdx));
-            long chunkEnd = cursor + chunkLen;
+            long pos = range.Start;
+            while (pos < range.End)
+            {
+                long segEnd = range.End;
+                foreach (var col in columns)
+                    segEnd = Math.Min(segEnd, col.SeekChunkEnd(pos));
 
-            if (acceptedZones is not null && !acceptedZones.Contains(chunkIdx))
-            {
-                cursor = chunkEnd;
-                continue;
+                var arrays = new Apache.Arrow.IArrowArray[colsToRead];
+                for (int outIdx = 0; outIdx < colsToRead; outIdx++)
+                {
+                    arrays[outIdx] = await columns[outIdx]
+                        .SliceAsync(this, pos, segEnd, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                yield return new Apache.Arrow.RecordBatch(
+                    projectedSchema, arrays, checked((int)(segEnd - pos)));
+                pos = segEnd;
             }
-            // Wholly before the range — skip without I/O.
-            if (chunkEnd <= rowOffset)
-            {
-                cursor = chunkEnd;
-                continue;
-            }
-            // Past the range — done.
-            if (cursor >= rangeEnd)
-                yield break;
+        }
+    }
 
-            var arrays = new Apache.Arrow.IArrowArray[colsToRead];
-            int decodedRowCount = -1;
-            for (int outIdx = 0; outIdx < colsToRead; outIdx++)
-            {
-                int srcIdx = projectedIndices is null ? outIdx : projectedIndices[outIdx];
-                arrays[outIdx] = await ReadPlanChunkAsync(_columnPlans[srcIdx], chunkIdx, cancellationToken)
-                    .ConfigureAwait(false);
-                var len = arrays[outIdx].Length;
-                if (decodedRowCount < 0) decodedRowCount = len;
-                else if (len != decodedRowCount)
-                    throw new VortexFormatException(
-                        $"Chunk {chunkIdx}: first read column has {decodedRowCount} rows but column index {srcIdx} has {len}.");
-            }
-            var batch = new Apache.Arrow.RecordBatch(projectedSchema, arrays, decodedRowCount);
+    /// <summary>
+    /// Clips <paramref name="ranges"/> to <c>[start, end)</c>, then sorts and
+    /// merges them so adjacent accepted zones are read as one span.
+    /// </summary>
+    private static List<RowRange> NormalizeRanges(IEnumerable<RowRange> ranges, long start, long end)
+    {
+        var clipped = new List<RowRange>();
+        foreach (var r in ranges)
+        {
+            long s = Math.Max(r.Start, start), e = Math.Min(r.End, end);
+            if (s < e) clipped.Add(new RowRange(s, e));
+        }
+        clipped.Sort((a, b) => a.Start.CompareTo(b.Start));
 
-            // Slice at range boundaries. RecordBatch.Slice is O(1) — it just
-            // bumps offset/length on each ArrayData.
-            long localOffset = Math.Max(0, rowOffset - cursor);
-            long localEnd = Math.Min(chunkLen, rangeEnd - cursor);
-            if (localOffset > 0 || localEnd < chunkLen)
+        var merged = new List<RowRange>(clipped.Count);
+        foreach (var r in clipped)
+        {
+            if (merged.Count > 0 && r.Start <= merged[merged.Count - 1].End)
             {
-                int sliceLen = checked((int)(localEnd - localOffset));
-                if (sliceLen > 0)
-                    yield return batch.Slice(checked((int)localOffset), sliceLen);
+                var last = merged[merged.Count - 1];
+                merged[merged.Count - 1] = new RowRange(last.Start, Math.Max(last.End, r.End));
             }
             else
             {
-                yield return batch;
+                merged.Add(r);
+            }
+        }
+        return merged;
+    }
+
+    /// <summary>Row offsets of each chunk's start, plus the column's total row count.</summary>
+    private static long[] ChunkStarts(ColumnPlan plan)
+    {
+        var starts = new long[plan.ChunkCount + 1];
+        for (int c = 0; c < plan.ChunkCount; c++)
+            starts[c + 1] = starts[c] + checked((long)plan.ChunkRowCount(c));
+        return starts;
+    }
+
+    /// <summary>A half-open range of logical rows.</summary>
+    private readonly record struct RowRange(long Start, long End);
+
+    /// <summary>
+    /// Tracks one column while <see cref="ReadRangesAsync"/> walks forward
+    /// through the file, holding the most recently decoded chunk.
+    /// </summary>
+    private sealed class ColumnCursor
+    {
+        private readonly ColumnPlan _plan;
+        private readonly int _fieldIndex;
+        private readonly long[] _starts;
+        private int _chunk;
+        private int _decodedChunk = -1;
+        private Apache.Arrow.IArrowArray? _decoded;
+
+        public ColumnCursor(ColumnPlan plan, int fieldIndex, long[] starts)
+        {
+            _plan = plan;
+            _fieldIndex = fieldIndex;
+            _starts = starts;
+        }
+
+        /// <summary>
+        /// Moves to the chunk holding row <paramref name="pos"/> (rows only
+        /// move forward) and returns the row where that chunk ends.
+        /// </summary>
+        public long SeekChunkEnd(long pos)
+        {
+            while (_starts[_chunk + 1] <= pos)
+                _chunk++;
+            return _starts[_chunk + 1];
+        }
+
+        /// <summary>
+        /// Returns rows <c>[start, end)</c>, which must lie in the current chunk.
+        /// </summary>
+        public async Task<Apache.Arrow.IArrowArray> SliceAsync(
+            VortexFileReader reader, long start, long end, CancellationToken cancellationToken)
+        {
+            if (_decodedChunk != _chunk)
+            {
+                _decoded = null;
+                var array = await reader.ReadPlanChunkAsync(_plan, _chunk, cancellationToken)
+                    .ConfigureAwait(false);
+                long expected = _starts[_chunk + 1] - _starts[_chunk];
+                if (array.Length != expected)
+                    throw new VortexFormatException(
+                        $"Column {_fieldIndex} chunk {_chunk}: decoded {array.Length} rows, layout says {expected}.");
+                _decoded = array;
+                _decodedChunk = _chunk;
             }
 
-            cursor = chunkEnd;
+            int offset = checked((int)(start - _starts[_chunk]));
+            int length = checked((int)(end - start));
+            return offset == 0 && length == _decoded!.Length
+                ? _decoded
+                : Apache.Arrow.ArrowArrayFactory.Slice(_decoded, offset, length);
         }
     }
 
@@ -720,8 +894,8 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Returns the per-zone stats table for column <paramref name="fieldIndex"/>,
-    /// or <c>null</c> if the column wasn't written with a <c>vortex.stats</c>
-    /// (zoned) layout. Materializes the stats segment lazily — the file open
+    /// or <c>null</c> if the column wasn't written with a zoned layout
+    /// (<c>vortex.stats</c> or <c>vortex.zoned</c>) whose zone map this reader understands. Materializes the stats segment lazily — the file open
     /// path doesn't decode it.
     ///
     /// <para>Use the returned <see cref="ZoneStats"/> to derive a
@@ -754,10 +928,14 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         // correspond to PresentStats (with min/max followed by their
         // truncation flag). Build the matching Arrow struct dtype, decode,
         // then map fields back to ZoneStats.
-        var structType = ZoneStatsLayout.BuildStructType(plan.ArrowType, zi.PresentStats);
+        var structType = zi.Aggregates is null
+            ? ZoneStatsLayout.BuildStructType(plan.ArrowType, zi.PresentStats)
+            : ZonedZoneMap.BuildStructType(plan.ArrowType, zi.Aggregates)!;
         var structArray = (Apache.Arrow.StructArray)ArrayDecoder.Decode(
             serialized, _arraySpecs, structType, zi.ZoneCount);
-        return ZoneStatsLayout.FromStruct(structArray, plan.ArrowType, zi);
+        return zi.Aggregates is null
+            ? ZoneStatsLayout.FromStruct(structArray, plan.ArrowType, zi)
+            : ZonedZoneMap.FromStruct(structArray, plan.ArrowType, zi);
     }
 
     private async Task<Apache.Arrow.IArrowArray> ReadFlatChunkAsync(

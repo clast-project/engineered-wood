@@ -12,7 +12,6 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use vortex_array::Array;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::DecimalArray;
@@ -35,31 +34,29 @@ use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::extension::datetime::Timestamp;
 use vortex_array::extension::uuid::Uuid as VortexUuid;
 use vortex_array::extension::uuid::UuidMetadata;
-use vortex_array::scalar_fn::session::ScalarFnSession;
-use vortex_array::session::ArraySession;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
+use vortex::VortexSessionDefault;
+use vortex::editions::CORE_2026_08_0;
+use vortex::editions::EditionSessionExt;
 use vortex_file::WriteOptionsSessionExt;
-use vortex_file::register_default_encodings;
-use vortex_io::session::RuntimeSession;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::table::TableStrategy;
-use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
-use vortex_session::registry::Id;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     // The session needs a tokio handle bound to the CURRENT runtime, so it must
     // be built inside `#[tokio::main]` rather than in a global LazyLock.
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>()
-        .with_tokio();
-    register_default_encodings(&session);
+    let session = <VortexSession as VortexSessionDefault>::default().with_tokio();
+    // Default writes target the newest core edition the .NET reader fully
+    // understands. core2026.08.0 adds vortex.zoned; the later August editions
+    // add vortex.onpair (08.1), vortex.map (08.2) and vortex.variant (08.3),
+    // which the reader can't decode yet.
+    session
+        .enable_edition(CORE_2026_08_0)
+        .expect("core2026.08.0 is registered by the default session");
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -107,6 +104,9 @@ async fn main() -> std::io::Result<()> {
     write_fsst_string(&session, &out_dir.join("fsst_string_64rows.vortex")).await?;
     write_masked_int(&session, &out_dir.join("masked_int_1024rows.vortex")).await?;
     write_binary_col(&session, &out_dir.join("binary_col_64rows.vortex")).await?;
+    write_delta_signed_2k(&session, &out_dir.join("delta_signed_2048rows.vortex")).await?;
+    write_sequence_u64_desc(&session, &out_dir.join("sequence_u64_desc_64rows.vortex")).await?;
+    write_zoned_mixed(&session, &out_dir.join("zoned_mixed_20000rows.vortex")).await?;
 
     Ok(())
 }
@@ -244,19 +244,15 @@ async fn write_pco_nullable_2k(session: &VortexSession, path: &PathBuf) -> std::
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("vortex.pco"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -292,20 +288,15 @@ async fn write_rle_nullable(session: &VortexSession, path: &PathBuf) -> std::io:
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.rle"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -321,7 +312,7 @@ async fn write_rle_nullable(session: &VortexSession, path: &PathBuf) -> std::io:
 async fn write_rle_sliced(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
     use vortex_fastlanes::RLE;
     use vortex_fastlanes::RLEData;
-    use vortex_fastlanes::RLEArrayExt;
+    use vortex_fastlanes::RLEArraySlotsExt;
 
     let mut vals: Vec<u32> = Vec::with_capacity(2048);
     for i in 0..1024u32 { vals.push(i / 50); }
@@ -347,20 +338,15 @@ async fn write_rle_sliced(session: &VortexSession, path: &PathBuf) -> std::io::R
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.rle"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -394,19 +380,15 @@ async fn write_pco_double_2k(session: &VortexSession, path: &PathBuf) -> std::io
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("vortex.pco"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -441,20 +423,15 @@ async fn write_delta_sliced(session: &VortexSession, path: &PathBuf) -> std::io:
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.delta"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -488,21 +465,17 @@ async fn write_bitpacked_sliced(session: &VortexSession, path: &PathBuf) -> std:
         .expect("from_fields")
         .into_array();
 
-    // Whitelist fastlanes.bitpacked so the writer preserves it rather than
-    // canonicalizing to plain primitive.
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
+    // A flat strategy has no compressor, so the writer serializes the
+    // hand-built bit-packed array as-is.
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -622,19 +595,13 @@ async fn write_delta_diag(session: &VortexSession, path: &PathBuf) -> std::io::R
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.delta"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
-    session.write_options().with_strategy(strategy)
+    session.write_options().disable_editions().with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream()).await.expect("write");
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
@@ -644,7 +611,8 @@ async fn write_delta_diag(session: &VortexSession, path: &PathBuf) -> std::io::R
 async fn write_delta_int_2k(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
     // Hand-construct a DeltaArray so the writer is forced to serialize it
     // (rather than the compressor choosing a different encoding). u64 column
-    // because vortex-fastlanes Delta only supports unsigned integers.
+    // because vortex-fastlanes Delta only supported unsigned integers before
+    // 0.86; `write_delta_signed_2k` covers the signed form.
     use vortex_fastlanes::Delta;
 
     let mut vals: Vec<u64> = Vec::with_capacity(2048);
@@ -664,22 +632,18 @@ async fn write_delta_int_2k(session: &VortexSession, path: &PathBuf) -> std::io:
         .expect("from_fields")
         .into_array();
 
-    // Whitelist fastlanes.delta + its bitpacked child so the writer preserves
-    // (rather than canonicalizes away) our delta-encoded array.
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.delta"));
+    // A flat strategy has no compressor, so the writer serializes the
+    // hand-built delta array as-is. fastlanes.delta belongs to no edition,
+    // which is why these writes disable edition enforcement.
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -708,20 +672,15 @@ async fn write_rle_int_2k(session: &VortexSession, path: &PathBuf) -> std::io::R
         .expect("from_fields")
         .into_array();
 
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("fastlanes.bitpacked"));
-    allowed.insert(Id::new("fastlanes.rle"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -761,8 +720,15 @@ async fn write_uuid_2k(session: &VortexSession, path: &PathBuf) -> std::io::Resu
         .expect("from_fields")
         .into_array();
 
+    // The vortex.uuid extension dtype only joined an edition in core2026.08.3,
+    // past the edition the session targets, so this write opts out.
     let mut bytes: Vec<u8> = Vec::new();
-    session.write_options().write(&mut bytes, data.to_array_stream()).await.expect("write");
+    session
+        .write_options()
+        .disable_editions()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())
@@ -959,19 +925,15 @@ async fn write_decimal256_2k(
 
     // Force vortex.decimal (vs vortex.decimal_byte_parts) so the I128→256
     // sign-extend path in DecimalArrayDecoder is exercised.
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("vortex.decimal"));
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -1276,6 +1238,7 @@ async fn write_string_col(session: &VortexSession, path: &PathBuf) -> std::io::R
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(writer)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -1363,22 +1326,18 @@ async fn write_masked(session: &VortexSession, path: &PathBuf) -> std::io::Resul
         .expect("from_fields")
         .into_array();
 
-    // Whitelist primitive + bool + masked so the writer preserves the
-    // hand-constructed MaskedArray instead of canonicalising it back to
-    // vortex.primitive with inline validity.
-    let mut allowed: vortex_utils::aliases::hash_set::HashSet<Id> =
-        vortex_utils::aliases::hash_set::HashSet::default();
-    allowed.insert(Id::new("vortex.primitive"));
-    allowed.insert(Id::new("vortex.bool"));
-    allowed.insert(Id::new("vortex.masked"));
+    // A flat strategy has no compressor, so the writer serializes the
+    // hand-constructed MaskedArray as-is rather than as vortex.primitive
+    // with inline validity.
     let strategy = std::sync::Arc::new(TableStrategy::new(
         std::sync::Arc::new(FlatLayoutStrategy::default()),
-        std::sync::Arc::new(FlatLayoutStrategy::default().with_allow_encodings(allowed)),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
     ));
 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .disable_editions()
         .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
@@ -1410,6 +1369,141 @@ async fn write_constant_int(session: &VortexSession, path: &PathBuf) -> std::io:
         .await
         .expect("write");
 
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// A hand-built fastlanes.delta over i32. Vortex 0.86 accepts signed inputs,
+/// delta-encoding their unsigned bit patterns; 0.70 required unsigned.
+/// The walk crosses zero and wraps past i32::MIN so both signs and a
+/// wrapping difference appear.
+async fn write_delta_signed_2k(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_fastlanes::Delta;
+
+    let mut vals: Vec<i32> = Vec::with_capacity(2048);
+    let mut x: u64 = 0x5EED_0086;
+    let mut acc: i32 = -1_000;
+    for i in 0..2048 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        acc = acc.wrapping_add((x % 7) as i32 - 2);
+        vals.push(if i == 1500 { i32::MIN + 1 } else { acc });
+    }
+    let prim = PrimitiveArray::from_iter(vals);
+    let mut ctx = session.create_execution_ctx();
+    let delta_arr = Delta::try_from_primitive_array(&prim, &mut ctx)
+        .expect("Delta::try_from_primitive_array")
+        .into_array();
+    let data = StructArray::from_fields(&[("a", delta_arr)])
+        .expect("from_fields")
+        .into_array();
+
+    let strategy = Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ));
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .disable_editions()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// A descending u64 vortex.sequence starting above i64::MAX. The base is
+/// stored as a u64 scalar and the step, normalized to i64 since 0.86, as a
+/// negative i64 scalar.
+async fn write_sequence_u64_desc(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_array::scalar::PValue;
+    use vortex_sequence::Sequence;
+
+    let seq = Sequence::try_new(
+        PValue::U64(u64::MAX - 5),
+        PValue::I64(-3),
+        PType::U64,
+        Nullability::NonNullable,
+        64,
+    )
+    .expect("Sequence::try_new")
+    .into_array();
+    let data = StructArray::from_fields(&[("a", seq)])
+        .expect("from_fields")
+        .into_array();
+
+    let strategy = Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ));
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Several columns through the default write strategy, so the writer picks
+/// the encodings and wraps each column in a vortex.zoned layout with 8192-row
+/// zones (three zones here). The values are arranged so zones have disjoint
+/// ranges and can be pruned:
+///   id:  i64, row index
+///   val: i32, zone * 1000 + noise in [0, 500)
+///   f:   f64, row * 0.5, with NaN every 1000th row of zone 1 only
+///   s:   utf8, "{row:06}-" + 70 'x', longer than the 64-byte zone-map bound
+///        so its min/max are stored truncated (vortex.bounded_min/max)
+///   tag: utf8, "k{zone}-{row % 7}", short enough for exact bounds
+///   n:   nullable i32, row * 3, null on every third row
+async fn write_zoned_mixed(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    const ROWS: usize = 20_000;
+    const ZONE: usize = 8192;
+
+    let id = PrimitiveArray::from_iter((0..ROWS).map(|i| i as i64)).into_array();
+    let mut x: u64 = 0x2026_0916;
+    let val = PrimitiveArray::from_iter((0..ROWS).map(|i| {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((i / ZONE) * 1000) as i32 + ((x >> 33) % 500) as i32
+    }))
+    .into_array();
+    let f = PrimitiveArray::from_iter((0..ROWS).map(|i| {
+        if i / ZONE == 1 && i % 1000 == 0 { f64::NAN } else { i as f64 * 0.5 }
+    }))
+    .into_array();
+    let long: Vec<String> = (0..ROWS).map(|i| format!("{:06}-{}", i, "x".repeat(70))).collect();
+    let s = VarBinViewArray::from_iter_str(long.iter().map(String::as_str)).into_array();
+    let tags: Vec<String> = (0..ROWS).map(|i| format!("k{}-{}", i / ZONE, i % 7)).collect();
+    let tag = VarBinViewArray::from_iter_str(tags.iter().map(String::as_str)).into_array();
+    let n = PrimitiveArray::new(
+        vortex_buffer::Buffer::from_iter((0..ROWS).map(|i| (i * 3) as i32)),
+        Validity::from_iter((0..ROWS).map(|i| i % 3 != 0)),
+    )
+    .into_array();
+
+    let data = StructArray::from_fields(&[
+        ("id", id),
+        ("val", val),
+        ("f", f),
+        ("s", s),
+        ("tag", tag),
+        ("n", n),
+    ])
+    .expect("from_fields")
+    .into_array();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())

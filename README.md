@@ -473,7 +473,7 @@ FastLanes bit-packing / FoR / delta / RLE, Pco, sparse, run-end, dict,
 etc.). `EngineeredWood.Vortex` ships a reader, a writer, and a
 predicate-based zone-pruning API — all driven by hand-rolled
 FlatBuffers/protobuf parsing (no `Google.FlatBuffers` or `flatc`
-dependency) and cross-validated against the Rust `vortex-array` 0.70
+dependency) and cross-validated against the Rust `vortex-array` 0.86
 implementation.
 
 ### Reading
@@ -542,7 +542,8 @@ implementation.
 ### Encoding coverage
 
 **Layouts**: `vortex.flat`, `vortex.struct`, `vortex.chunked`,
-`vortex.stats` (zoned), `vortex.dict` (layout-level, shared dict).
+`vortex.stats` and `vortex.zoned` (zone maps; the writer emits
+`vortex.stats`), `vortex.dict` (layout-level, shared dict).
 
 **Array encodings — read**: `vortex.primitive` (nullable + non-nullable),
 `vortex.constant`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,

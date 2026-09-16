@@ -158,7 +158,7 @@ test/
   EngineeredWood.Lance.Benchmarks/          BenchmarkDotNet suites for Lance
   EngineeredWood.Vortex.Tests/              xUnit tests for the Vortex reader and
                                               writer; cross-validates against the
-                                              Rust vortex-array 0.70 implementation
+                                              Rust vortex-array 0.86 implementation
                                               via a Rust binary (test/.../Rust/)
                                               that emits .vortex fixtures and a
                                               vortex-validator that opens
@@ -490,8 +490,10 @@ All 19 ORC types are supported for both reading and writing:
 
 [Vortex](https://github.com/vortex-data/vortex) is a columnar file format
 with FlatBuffers-based metadata and a rich array-encoding zoo. The
-EngineeredWood implementation reads + writes Vortex 0.70-format files,
-cross-validated against the Rust `vortex-array` crate.
+EngineeredWood implementation reads files written by Vortex up to 0.86
+(through edition `core2026.08.0`; see below) and writes files any Vortex
+reader since 0.36 accepts, cross-validated against the Rust `vortex-array`
+crate.
 
 ### File container
 
@@ -510,7 +512,7 @@ small integer index:
 - `array_specs` — encoding ids the file actually uses
   (`vortex.primitive`, `fastlanes.bitpacked`, `vortex.fsst`, etc.).
 - `layout_specs` — layout ids (`vortex.flat`, `vortex.struct`,
-  `vortex.chunked`, `vortex.stats`, `vortex.dict`).
+  `vortex.chunked`, `vortex.stats` / `vortex.zoned`, `vortex.dict`).
 - `segment_specs` — `(offset, length, alignment_exponent,
   compression_codec)` per segment.
 
@@ -555,18 +557,40 @@ public API is RecordBatch-shaped.
 - **`LayoutPlanner.PlanField`** — recursive walk over the layout tree
   per Arrow field, producing a `ColumnPlan` (a sequence of per-chunk
   `(SegmentRef, RowCount)`). Handles `vortex.struct` (descend by field
-  index), `vortex.stats` (descend to child[0]; capture per-zone stats
-  ref from child[1] when present), `vortex.chunked` (flatten children),
+  index), `vortex.stats` / `vortex.zoned` (descend to child[0]; capture
+  per-zone stats ref from child[1] when present), `vortex.chunked` (flatten children),
   `vortex.dict` (return a `DictColumnPlan` with separate values + codes
   references), `vortex.flat` (leaf with one segment ref).
 - **`DictReconstructor`** — materialises `output[i] = values[codes[i]]`
   for the layout-level dict path; supports `StringType` + all integer
   / float Arrow types and propagates validity from the codes child.
 - **`ZoneStatsLayout`** — reconstructs the zones-table struct dtype
-  from the stats bitset so `GetZoneStatsAsync` can decode it.
+  from the `vortex.stats` bitset so `GetZoneStatsAsync` can decode it.
+- **`ZonedZoneMap`** — the same for `vortex.zoned`, whose metadata names
+  aggregate functions (`vortex.min`/`max`, `vortex.bounded_min`/`max`,
+  `vortex.null_count`, `vortex.nan_count`) instead of a bitset. Bounded
+  string bounds are truncated to a byte limit, so they surface as
+  inexact min/max. A zone map with an aggregate the reader doesn't know
+  is ignored and the column is read unpruned.
 
-The wire encoding id `vortex.stats` is also known upstream as
-`ZonedLayout` — for legacy reasons the serialized id stayed `vortex.stats`.
+Upstream's zone-map layout (`ZonedLayout`) was serialized as
+`vortex.stats` until 0.84, when it moved to `vortex.zoned` with the
+aggregate-based metadata. The writer still emits `vortex.stats`, which
+every reader since 0.36 understands.
+
+A zone covers `zone_len` logical rows regardless of how the column is
+chunked, and upstream chunks each column independently. The reader
+therefore turns pruned zones into row ranges and cuts batches at the
+union of the read columns' chunk boundaries.
+
+**Editions.** Since 0.84 upstream groups encoding, layout, extension-type
+and aggregate ids into frozen *editions* (`docs/specs/editions.md`
+upstream); a writer may only emit ids from the editions it enables. The
+reader covers `core2026.08.0`. Not yet read: `vortex.onpair` (08.1, which
+the default compressor picks for strings), `vortex.map` (08.2), and
+`vortex.variant` / `vortex.parquet.variant` (08.3). `fastlanes.delta`,
+which the writer emits, is in no edition, so files that use it carry no
+upstream compatibility promise (0.86 still reads them).
 
 ### Read pipeline
 
@@ -581,18 +605,21 @@ VortexFileReader.OpenAsync()
   └─ LayoutPlanner.Plan → ColumnPlan[] with optional ZoneInfo per column
 
 VortexFileReader.ReadAllAsync(rowOffset, rowCount, columnIndices, predicate)
-  ├─ predicate.EvaluateZonesAsync(this, totalZones) → HashSet<int> acceptedZones
-  ├─ For each chunkIdx:
-  │    ├─ Skip if chunkIdx ∉ acceptedZones
-  │    ├─ Skip via row-range cursor if chunk wholly outside [rowOffset, rowOffset + rowCount)
-  │    ├─ For each requested column:
-  │    │    ├─ Fetch the chunk's segment(s) via IRandomAccessFile
-  │    │    ├─ Decompress (None today)
-  │    │    ├─ SerializedArray.Parse → Array FlatBuffer + raw buffer slices
-  │    │    └─ ArrayDecoder.Decode → IArrowArray
-  │    ├─ Assemble RecordBatch
-  │    └─ Slice via RecordBatch.Slice if at the row-range boundary
-  └─ yield batch
+  ├─ EvaluatePredicateRangesAsync(predicate) → accepted row ranges (null = all rows)
+  │    ├─ GetZoneStatsAsync for each referenced column
+  │    ├─ Referenced zone maps share zone_len: StatisticsEvaluator per zone;
+  │    │   zone z → rows [z·zone_len, (z+1)·zone_len)
+  │    └─ Otherwise: evaluate once without stats; AlwaysFalse → no rows
+  ├─ ReadRangesAsync: clip ranges to [rowOffset, rowOffset + rowCount), sort, merge
+  └─ For each range, walk forward; each batch ends at the next chunk end of
+     any requested column (columns may be chunked independently) or the range end:
+       ├─ Per column (ColumnCursor), decode the chunk once on first use:
+       │    ├─ Fetch the chunk's segment(s) via IRandomAccessFile
+       │    ├─ Decompress (None today)
+       │    ├─ SerializedArray.Parse → Array FlatBuffer + raw buffer slices
+       │    └─ ArrayDecoder.Decode → IArrowArray
+       ├─ Slice each column to the batch's rows (whole chunk: no slice)
+       └─ yield RecordBatch
 ```
 
 ### Array decoders (`Encodings/`)
@@ -607,7 +634,7 @@ Per-encoding decoder classes, dispatched by encoding string in
 | String / Binary | `vortex.varbin`, `vortex.varbinview`, `vortex.fsst` (via `Clast.Fsst`) |
 | Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked` |
 | Float | `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.pco` (via `Clast.Pcodec`) |
-| FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` wired but skipped pending an upstream Clast.FastLanes lane-major helper |
+| FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` (signed and unsigned integers) |
 | Composite | `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`, `vortex.struct`, `vortex.ext` |
 | Decimal | `vortex.decimal` (i8..i256 → Decimal128/256), `vortex.decimal_byte_parts` |
 | Temporal | `vortex.datetimeparts` (combined with `vortex.ext` → Timestamp) |
@@ -728,7 +755,7 @@ short-circuiting) come for free.
 
 Test fixtures are built by a Rust crate at
 `test/EngineeredWood.Vortex.Tests/Rust/` that uses `vortex-array` /
-`vortex-file` 0.70 from crates.io. A second Rust binary (also under
+`vortex-file` 0.86 from crates.io. A second Rust binary (also under
 `Rust/`) acts as a `vortex-validator` — it opens .NET-written files and
 emits the row-by-row contents in JSON. The C# `VortexCrossValidationTests`
 shells out to that validator to verify writer output.
@@ -984,7 +1011,7 @@ Pattern match ordering matters: `Decimal32/64/128/256Type` all inherit from `Fix
 - **Parquet:** `TestData.cs` locates the `parquet-testing/data/` submodule by walking up from `AppContext.BaseDirectory`. Sweep tests iterate all sample files, skip encrypted/malformed, collect failures, assert none. The `EngineeredWood.Parquet.Compatibility` project downloads 92 files from fastparquet, parquet-dotnet, parquet-tools, and HuggingFace and validates all row groups. Decoder/encoder tests use both unit-level checks and round-trip verification against ParquetSharp.
 - **ORC:** Test data files (.orc) are included directly in the test project. `CrossValidationTests` validates round-trip correctness against PyArrow's ORC implementation when available.
 - **Avro:** Test data generated by a Python script (`generate_test_data.py`) using fastavro. Cross-validation tests verify both directions: fastavro writes → EngineeredWood reads, and EngineeredWood writes → fastavro reads. Coverage includes all types (primitives, nullable, enum, array, map, fixed, struct, decimal, uuid), all codecs (null, deflate, snappy, zstandard, lz4), schema evolution, projection, and dense unions.
-- **Vortex:** Test fixtures (`*.vortex`) are produced by a Rust crate at `test/EngineeredWood.Vortex.Tests/Rust/` that depends on `vortex-array` / `vortex-file` 0.70 from crates.io. A second Rust binary in the same crate (`vortex-validator`) opens .NET-written files and dumps the row-by-row contents in JSON; `VortexCrossValidationTests` shells out to it. Each Vortex array encoding has at least one fixture chosen to force vortex's Rust compressor to pick it (often via `with_strategy(...)` overrides when the default heuristics would pick something else). The test project targets `net8.0`, `net10.0`, and `net472`; only the two HalfFloat tests are gated to net6+.
+- **Vortex:** Test fixtures (`*.vortex`) are produced by a Rust crate at `test/EngineeredWood.Vortex.Tests/Rust/` that depends on `vortex-array` / `vortex-file` 0.86 from crates.io. Default writes target edition `core2026.08.0`, the newest the reader fully covers; `TestData/legacy-0.70/` keeps a few fixtures as 0.70 wrote them, with `vortex.stats` zone maps, for the pruning tests to run against both. A second Rust binary in the same crate (`vortex-validator`) opens .NET-written files and dumps the row-by-row contents in JSON; `VortexCrossValidationTests` shells out to it. Each Vortex array encoding has at least one fixture chosen to force vortex's Rust compressor to pick it (often via `with_strategy(...)` overrides when the default heuristics would pick something else). The test project targets `net8.0`, `net10.0`, and `net472`; only the two HalfFloat tests are gated to net6+.
 - **Delta Lake:** Two suites. `EngineeredWood.DeltaLake.Tests` covers the log layer (action serialization, snapshot reconstruction, checkpoints, deletion vectors, in-commit timestamps, etc.). `EngineeredWood.DeltaLake.Table.Tests` covers the table API end-to-end with temp-directory tables, including write/read round-trips, partitioning, Iceberg compatibility, identity columns, row tracking, change data feed, deletion vectors, and predicate pushdown.
 - **Iceberg:** `EngineeredWood.Iceberg.Tests` covers schema/partition/snapshot updates, V3 features (geometry, variant, default values, row IDs), catalog operations, manifest serialization, and `TableScan` with predicate pruning.
 - **Expressions:** `EngineeredWood.Expressions.Tests` covers `LiteralValue` (cross-type comparison, high-precision decimal, hashing), expression factories (constant folding, flattening), the binder (identity preservation, lenient mode), and the statistics evaluator (every predicate variant with synthetic stats including truncation edge cases). `EngineeredWood.Expressions.Arrow.Tests` covers the row evaluator with full SQL three-valued logic.

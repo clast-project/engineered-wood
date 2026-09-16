@@ -17,15 +17,17 @@ name = "vortex-validator"
 path = "src/validator.rs"
 
 [dependencies]
-vortex-array = "0.70"
-vortex-buffer = "0.70"
-vortex-file = "0.70"
-vortex-io = { version = "0.70", features = ["tokio"] }
-vortex-layout = "0.70"
-vortex-session = "0.70"
+vortex-array = "0.86.1"
+vortex-buffer = "0.86.1"
+vortex-file = "0.86.1"
+vortex-io = { version = "0.86.1", features = ["tokio"] }
+vortex-layout = "0.86.1"
+vortex-session = "0.86.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = "1"
-vortex-utils = "0.70"
-vortex-fastlanes = "0.70"
-vortex-pco = "0.70"
+vortex-utils = "0.86.1"
+vortex-fastlanes = "0.86.1"
+vortex-pco = "0.86.1"
+vortex-sequence = "0.86.1"
 futures = "0.3"
+vortex = { version = "0.86.1", default-features = false, features = ["files", "tokio"] }
