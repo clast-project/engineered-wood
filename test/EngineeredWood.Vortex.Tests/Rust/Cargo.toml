@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = "1"
 vortex-utils = "0.86.1"
 vortex-fastlanes = "0.86.1"
+vortex-onpair = "0.86.1"
 vortex-pco = "0.86.1"
 vortex-sequence = "0.86.1"
 futures = "0.3"

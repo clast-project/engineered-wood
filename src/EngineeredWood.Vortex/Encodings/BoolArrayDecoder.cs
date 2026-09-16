@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.Format;
 
 namespace EngineeredWood.Vortex.Encodings;
@@ -12,6 +13,9 @@ namespace EngineeredWood.Vortex.Encodings;
 /// byte, matching Arrow's convention). One data buffer holding the values;
 /// optionally one child (a nested <c>vortex.bool</c> ArrayNode) carrying the
 /// validity bitmap when nullable.
+///
+/// <para>Metadata is <c>BoolMetadata { 1: uint32 offset }</c>: the bit (under 8) of the
+/// buffer's first byte where the array starts, which a sliced array carries.</para>
 /// </summary>
 internal static class BoolArrayDecoder
 {
@@ -70,13 +74,50 @@ internal static class BoolArrayDecoder
             throw new NotSupportedException(
                 $"vortex.bool buffer compression {bufferDesc.Compression} not yet implemented.");
 
+        var metaVec = node.Metadata;
+        int bitOffset = ParseOffset(metaVec.Length == 0
+            ? ReadOnlySpan<byte>.Empty
+            : metaVec.RawBytes(metaVec.Length));
+
         var data = serialized.BufferBytes(bufferRef);
-        var minBytes = (int)((rowCount + 7) / 8);
+        var minBytes = (int)((bitOffset + rowCount + 7) / 8);
         if (data.Length < minBytes)
             throw new VortexFormatException(
-                $"vortex.bool buffer is {data.Length} bytes but needs at least {minBytes} for {rowCount} bits.");
+                $"vortex.bool buffer is {data.Length} bytes but needs at least {minBytes} for {rowCount} bits at offset {bitOffset}.");
 
-        return new ArrowBuffer(data.Slice(0, minBytes).ToArray());
+        if (bitOffset == 0)
+            return new ArrowBuffer(data.Slice(0, minBytes).ToArray());
+
+        // Re-pack so bit 0 of the result is the array's first bit.
+        var count = checked((int)rowCount);
+        var packed = new byte[(count + 7) / 8];
+        for (int i = 0; i < count; i++)
+        {
+            int src = bitOffset + i;
+            if ((data[src >> 3] & (1 << (src & 7))) != 0)
+                packed[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        return new ArrowBuffer(packed);
+    }
+
+    /// <summary>Reads <c>BoolMetadata.offset</c> (field 1), which upstream keeps under 8.</summary>
+    private static int ParseOffset(ReadOnlySpan<byte> bytes)
+    {
+        ulong offset = 0;
+        int pos = 0;
+        while (pos < bytes.Length)
+        {
+            var tag = (ulong)Varint.ReadUnsigned(bytes, ref pos);
+            if ((tag & 7) != 0)
+                throw new VortexFormatException(
+                    $"Unsupported protobuf wire type {tag & 7} in vortex.bool metadata.");
+            var value = (ulong)Varint.ReadUnsigned(bytes, ref pos);
+            if (tag >> 3 == 1)
+                offset = value;
+        }
+        if (offset >= 8)
+            throw new VortexFormatException($"vortex.bool bit offset {offset} must be less than 8.");
+        return (int)offset;
     }
 
     /// <summary>

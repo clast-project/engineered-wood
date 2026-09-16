@@ -37,7 +37,7 @@ use vortex_array::extension::uuid::UuidMetadata;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex::VortexSessionDefault;
-use vortex::editions::CORE_2026_08_0;
+use vortex::editions::CORE_2026_08_1;
 use vortex::editions::EditionSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_io::session::RuntimeSessionExt;
@@ -51,12 +51,12 @@ async fn main() -> std::io::Result<()> {
     // be built inside `#[tokio::main]` rather than in a global LazyLock.
     let session = <VortexSession as VortexSessionDefault>::default().with_tokio();
     // Default writes target the newest core edition the .NET reader fully
-    // understands. core2026.08.0 adds vortex.zoned; the later August editions
-    // add vortex.onpair (08.1), vortex.map (08.2) and vortex.variant (08.3),
+    // understands. core2026.08.0 adds vortex.zoned and 08.1 vortex.onpair; the
+    // later August editions add vortex.map (08.2) and vortex.variant (08.3),
     // which the reader can't decode yet.
     session
-        .enable_edition(CORE_2026_08_0)
-        .expect("core2026.08.0 is registered by the default session");
+        .enable_edition(CORE_2026_08_1)
+        .expect("core2026.08.1 is registered by the default session");
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -108,6 +108,10 @@ async fn main() -> std::io::Result<()> {
     write_sequence_u64_desc(&session, &out_dir.join("sequence_u64_desc_64rows.vortex")).await?;
     write_zoned_mixed(&session, &out_dir.join("zoned_mixed_20000rows.vortex")).await?;
     write_dict_nullable_values(&session, &out_dir.join("dict_nullable_values_20000rows.vortex")).await?;
+    write_onpair_string(&session, &out_dir.join("onpair_string_64rows.vortex"), None).await?;
+    write_onpair_string(&session, &out_dir.join("onpair_sliced_40rows.vortex"), Some(10..50)).await?;
+    write_onpair_default(&session, &out_dir.join("onpair_default_20000rows.vortex")).await?;
+    write_bool_sliced(&session, &out_dir.join("bool_sliced_61rows.vortex")).await?;
 
     Ok(())
 }
@@ -1535,6 +1539,132 @@ async fn write_dict_nullable_values(session: &VortexSession, path: &PathBuf) -> 
     let mut bytes: Vec<u8> = Vec::new();
     session
         .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Row `i` of the hand-built OnPair fixtures: URL-like strings sharing
+/// prefixes (so tokens span several bytes), a multi-byte UTF-8 run, an empty
+/// string, and nulls.
+fn onpair_row(i: usize) -> Option<String> {
+    match i % 9 {
+        0 => None,
+        1 => Some(String::new()),
+        2 => Some(format!("https://example.com/products/{}", i * 7)),
+        3 => Some(format!("https://example.com/profile/{}", i)),
+        4 => Some(format!("café-{}-naïve-日本語", i % 5)),
+        5 => Some("https://example.org/about".to_string()),
+        6 => Some(format!("user-{:04}@example.com", i)),
+        7 => Some("x".repeat(i % 40)),
+        _ => Some(format!("https://example.com/products/{}?ref=home", i)),
+    }
+}
+
+/// A hand-built vortex.onpair array over `onpair_row`, written as-is by a flat
+/// strategy (uncompressed integer children). With `slice`, the array is sliced
+/// first: OnPair's slice keeps the whole `codes` child and narrows only
+/// `codes_offsets`, so the decoder must start from `codes_offsets[0]`.
+async fn write_onpair_string(
+    session: &VortexSession,
+    path: &PathBuf,
+    slice: Option<std::ops::Range<usize>>,
+) -> std::io::Result<()> {
+    use vortex_onpair::OnPair;
+    use vortex_onpair::DEFAULT_CONFIG;
+    use vortex_onpair::onpair_compress;
+
+    let rows: Vec<Option<String>> = (0..64).map(onpair_row).collect();
+    let strings = VarBinViewArray::from_iter_nullable_str(rows.iter().map(|r| r.as_deref())).into_array();
+    let mut ctx = session.create_execution_ctx();
+    let mut onpair = onpair_compress(&strings, DEFAULT_CONFIG, &mut ctx).expect("onpair_compress");
+    if let Some(range) = slice {
+        onpair = onpair.slice(range).expect("slice");
+    }
+    assert!(onpair.is::<OnPair>(), "expected OnPair, got {}", onpair.encoding_id());
+
+    let data = StructArray::from_fields(&[("s", onpair)])
+        .expect("from_fields")
+        .into_array();
+    let strategy = Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ));
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// Row `i` of `write_onpair_default`: one of a few URL templates with a query
+/// id, null on every thirteenth row.
+fn onpair_default_row(i: usize) -> Option<String> {
+    const PAGES: [&str; 5] = [
+        "https://example.com/products/widget",
+        "https://example.com/products/gadget",
+        "https://example.org/about",
+        "https://example.net/blog/2026/09/post",
+        "mailto:someone@example.com",
+    ];
+    (i % 13 != 0).then(|| format!("{}?id={}", PAGES[i % 5], (i * 7919) % 10007))
+}
+
+/// A string column the default strategy compresses with vortex.onpair,
+/// cascading its integer children through the compressor, across several
+/// chunks and zones. The strings share long prefixes and vary only in a short
+/// id, which is where OnPair beats FSST in the compressor's sampling; with
+/// `onpair_row`'s more varied strings it picks FSST.
+async fn write_onpair_default(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    const ROWS: usize = 20_000;
+
+    let rows: Vec<Option<String>> = (0..ROWS).map(onpair_default_row).collect();
+    let s = VarBinViewArray::from_iter_nullable_str(rows.iter().map(|r| r.as_deref())).into_array();
+    let data = StructArray::from_fields(&[("s", s)])
+        .expect("from_fields")
+        .into_array();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// A nullable vortex.bool sliced three bits in, written as-is by a flat
+/// strategy, so both its value buffer and its validity child carry
+/// `BoolMetadata.offset = 3`. Row `i` of the unsliced array is `i % 3 == 0`,
+/// null when `i % 5 == 0`.
+async fn write_bool_sliced(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_array::arrays::BoolArray;
+
+    let bools = BoolArray::from_iter((0..64).map(|i| (i % 5 != 0).then_some(i % 3 == 0)))
+        .into_array()
+        .slice(3..64)
+        .expect("slice");
+    let data = StructArray::from_fields(&[("b", bools)])
+        .expect("from_fields")
+        .into_array();
+    let strategy = Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ));
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
         .write(&mut bytes, data.to_array_stream())
         .await
         .expect("write");
