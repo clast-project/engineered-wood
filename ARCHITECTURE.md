@@ -632,7 +632,7 @@ Per-encoding decoder classes, dispatched by encoding string in
 | Primitive | `vortex.primitive` (nullable + non-nullable), `vortex.constant`, `vortex.sequence`, `vortex.null` |
 | Bool | `vortex.bool` (LSB-packed bitmap), `vortex.bytebool` |
 | String / Binary | `vortex.varbin`, `vortex.varbinview`, `vortex.fsst` (via `Clast.Fsst`), `vortex.onpair` (a token dictionary of 1–16-byte strings addressed by u16 codes) |
-| Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked` |
+| Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked`, `vortex.zigzag` (signed integers) |
 | Float | `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.pco` (via `Clast.Pcodec`) |
 | FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` (signed and unsigned integers) |
 | Composite | `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`, `vortex.struct`, `vortex.ext` |
