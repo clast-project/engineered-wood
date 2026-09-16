@@ -47,6 +47,8 @@ internal static class ArrayDecoder
                 node, serialized, expectedType, expectedRowCount),
             VortexArrayEncodings.FsstString => FsstArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
+            VortexArrayEncodings.OnPair => OnPairArrayDecoder.Decode(
+                node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.RunEnd => RunEndArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.FastlanesBitPacked => BitPackedArrayDecoder.Decode(

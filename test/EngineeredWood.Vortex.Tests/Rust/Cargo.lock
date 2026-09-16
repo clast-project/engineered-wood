@@ -2783,6 +2783,7 @@ dependencies = [
  "vortex-file",
  "vortex-io",
  "vortex-layout",
+ "vortex-onpair",
  "vortex-pco",
  "vortex-sequence",
  "vortex-session",

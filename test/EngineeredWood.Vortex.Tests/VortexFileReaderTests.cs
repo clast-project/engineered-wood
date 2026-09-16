@@ -5,6 +5,7 @@ using System.Buffers;
 using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.Vortex.Tests.TestData;
+using EngineeredWood.Vortex.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace EngineeredWood.Vortex.Tests;
@@ -148,42 +149,5 @@ public class VortexFileReaderTests
         var ex = await Assert.ThrowsAsync<VortexFormatException>(async () =>
             await VortexFileReader.OpenAsync(stream));
         Assert.Contains("start of file", ex.Message);
-    }
-
-    private sealed class ByteArrayRandomAccessFile : IRandomAccessFile
-    {
-        private readonly byte[] _bytes;
-
-        public ByteArrayRandomAccessFile(byte[] bytes) { _bytes = bytes; }
-
-        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
-            => new(_bytes.LongLength);
-
-        public ValueTask<IMemoryOwner<byte>> ReadAsync(
-            FileRange range, CancellationToken cancellationToken = default)
-        {
-            if (range.Offset < 0 || range.Offset + range.Length > _bytes.LongLength)
-                throw new IOException(
-                    $"Range {range.Offset}..+{range.Length} is out of bounds for {_bytes.LongLength}-byte file.");
-            var copy = new byte[range.Length];
-            Array.Copy(_bytes, range.Offset, copy, 0, range.Length);
-            return new(new ArrayMemoryOwner(copy));
-        }
-
-        public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
-            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public ValueTask DisposeAsync() => default;
-        public void Dispose() { }
-
-        private sealed class ArrayMemoryOwner : IMemoryOwner<byte>
-        {
-            public ArrayMemoryOwner(byte[] bytes) { Memory = bytes; }
-            public Memory<byte> Memory { get; }
-            public void Dispose() { }
-        }
     }
 }

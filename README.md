@@ -548,15 +548,14 @@ implementation.
 **Array encodings — read**: `vortex.primitive` (nullable + non-nullable),
 `vortex.constant`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
 `vortex.null`, `vortex.varbin`, `vortex.varbinview`, `vortex.fsst`,
-`vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
+`vortex.onpair`, `vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
 `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`,
 `vortex.struct`, `vortex.decimal`, `vortex.decimal_byte_parts`,
 `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.datetimeparts`,
 `vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
 `vortex.time` / `vortex.uuid`), `fastlanes.bitpacked` (with patches),
-`fastlanes.for`, `fastlanes.rle`, `vortex.pco`. `fastlanes.delta`
-decoder is wired but the test is skipped pending an upstream API in
-`Clast.FastLanes` to handle vortex's lane-major byte transposition.
+`fastlanes.for`, `fastlanes.rle`, `fastlanes.delta` (signed and unsigned),
+`vortex.pco`.
 
 **Array encodings — write**: `vortex.primitive`, `vortex.bool`,
 `vortex.varbin`, `vortex.varbinview`, `vortex.constant`,

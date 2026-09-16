@@ -31,6 +31,7 @@ internal static class VortexArrayEncodings
     public const string ByteBool = "vortex.bytebool";
     public const string DateTimeParts = "vortex.datetimeparts";
     public const string FsstString = "vortex.fsst";
+    public const string OnPair = "vortex.onpair";
     public const string Alp = "vortex.alp";
     public const string AlpRD = "vortex.alprd";
     public const string Pco = "vortex.pco";
