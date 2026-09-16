@@ -289,7 +289,32 @@ internal static class CorpusEvaluation
         DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal;
 
     /// <summary>Compares one cell against Spark's recorded value, or returns why it differs.</summary>
+    /// <remarks>
+    /// <b>A cell whose SHAPE disagrees is a difference, not a crash.</b> Every branch below reads
+    /// the fixture through the accessor its own array type implies — a <c>StringArray</c> asks
+    /// for <c>GetString</c>, a <c>BooleanArray</c> for <c>GetBoolean</c> — and
+    /// <c>System.Text.Json</c> THROWS when the recorded value is of another kind. That is exactly
+    /// the case where we produced the wrong TYPE, which is the most interesting failure the
+    /// corpus can find, and it arrived as an exception from inside the harness with no expression
+    /// named. TWO exception types, which is why the catch names both: a kind the accessor refuses
+    /// outright throws <c>InvalidOperationException</c>, while a NUMBER it can read but not fit —
+    /// Spark's <c>1.0</c> through <c>GetInt64</c> — throws <c>FormatException</c>. Measured on
+    /// #340, where Spark answers the double 1.0 for <c>+'1'</c> and we answered the string '1'.
+    /// </remarks>
     public static string? Compare(JsonElement expected, IArrowArray actual, int row)
+    {
+        try
+        {
+            return CompareCell(expected, actual, row);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+        {
+            // The accessor refused the recorded value, so the two are not the same kind of thing.
+            return $"expected {expected}, got {Show(actual, row)} ({actual.Data.DataType.Name})";
+        }
+    }
+
+    private static string? CompareCell(JsonElement expected, IArrowArray actual, int row)
     {
         var isNull = actual.IsNull(row);
 
@@ -458,12 +483,31 @@ internal static class CorpusEvaluation
         return BitConverter.DoubleToInt64Bits(expected) == BitConverter.DoubleToInt64Bits(actual);
     }
 
+    /// <remarks>
+    /// The numeric widths are listed rather than left to the fallback because <see cref="Compare"/>
+    /// now reports a SHAPE disagreement through this, and "expected 2.0, got value" names neither
+    /// what we produced nor what is wrong with it. Anything still unlisted keeps the fallback,
+    /// which the type name beside it makes readable enough.
+    /// </remarks>
     public static string Show(IArrowArray array, int row) => array switch
     {
         BooleanArray a => a.GetValue(row)?.ToString() ?? "null",
-        StringArray a => $"'{a.GetString(row)}'",
+
+        StringArray a => a.IsNull(row) ? "null" : $"'{a.GetString(row)}'",
+
+        // AFTER StringArray, which DERIVES from BinaryArray in Apache.Arrow -- the same ordering
+        // Compare carries, and putting it first makes the string arm unreachable (the compiler
+        // says so, which is how this was caught rather than by rendering a string as hex).
+        BinaryArray a => a.IsNull(row)
+            ? "null"
+            : $"X'{BitConverter.ToString(a.GetBytes(row).ToArray()).Replace("-", string.Empty)}'",
         Decimal128Array a => SparkWideDecimals.Render(SparkWideDecimals.Read(a, row)!.Value),
         Int8Array a => a.GetValue(row)?.ToString() ?? "null",
+        Int16Array a => a.GetValue(row)?.ToString() ?? "null",
+        Int32Array a => a.GetValue(row)?.ToString() ?? "null",
+        Int64Array a => a.GetValue(row)?.ToString() ?? "null",
+        FloatArray a => a.GetValue(row) is { } f ? ShowDouble(f) : "null",
+        DoubleArray a => a.GetValue(row) is { } d ? ShowDouble(d) : "null",
         _ => "value",
     };
 }

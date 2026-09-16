@@ -2257,9 +2257,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-15",
-      "2026-09-15",
-      "2026-09-15"
+      "2026-09-16",
+      "2026-09-16",
+      "2026-09-16"
      ]
     }
    },
@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-15 16:45:44.631274",
-      "2026-09-15 16:45:44.631274",
-      "2026-09-15 16:45:44.631274"
+      "2026-09-15 17:30:08.114086",
+      "2026-09-15 17:30:08.114086",
+      "2026-09-15 17:30:08.114086"
      ]
     }
    },
@@ -43039,6 +43039,724 @@
     }
    }
   ],
+  "unary-operators": [
+   {
+    "expression": "+'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '1')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "+'1.5'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '1.5')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      1.5,
+      1.5
+     ]
+    }
+   },
+   {
+    "expression": "+'1e3'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '1e3')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1000.0,
+      1000.0,
+      1000.0
+     ]
+    }
+   },
+   {
+    "expression": "+'abc'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ 'abc')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(+'abc') AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "+''",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(+'') AS r\n ^^^\n"
+    }
+   },
+   {
+    "expression": "+'  1  '",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '  1  ')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "+'1d'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '1d')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "+'0'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ '0')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "+ns",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ ns)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "+s",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ s)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'abc' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(+s) AS r\n ^^\n"
+    }
+   },
+   {
+    "expression": "+fs",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ fs)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      null,
+      0.5
+     ]
+    }
+   },
+   {
+    "expression": "+CAST(NULL AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ CAST(NULL AS STRING))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "+'1' + 1",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "((+ '1') + 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.0,
+      2.0,
+      2.0
+     ]
+    }
+   },
+   {
+    "expression": "+ +'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ (+ '1'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   },
+   {
+    "expression": "- +'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- (+ '1'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "+ -'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ (- '1'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "-+'1'",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- (+ '1'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.0,
+      -1.0,
+      -1.0
+     ]
+    }
+   },
+   {
+    "expression": "+a",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1,
+      null,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "+b",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ b)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      10,
+      null,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "+sh",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ sh)"
+    },
+    "type": {
+     "ok": true,
+     "type": "smallint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      null,
+      -1
+     ]
+    }
+   },
+   {
+    "expression": "+f",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ f)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "+g",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2.5,
+      null,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "+d1",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ d1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(10,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "12.34",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "+d5",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(38,38)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.10000000000000000000000000000000000000",
+      null,
+      "0.50000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "+NULL",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "-NULL",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, +NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, (+ NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      null,
+      -2147483648.0
+     ]
+    }
+   },
+   {
+    "expression": "coalesce(a, -NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(a, (- NULL))"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1.0,
+      null,
+      -2147483648.0
+     ]
+    }
+   },
+   {
+    "expression": "+CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "-CAST(NULL AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- CAST(NULL AS INT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "+bl",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bl#16) AS r#8432]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bl#35) AS r#8433]\n+- Union false, false\n   :- Union false, false\n   :  :- Projec"
+    }
+   },
+   {
+    "expression": "-bl",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- bl)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bl#16 AS r#8434]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bl#35 AS r#8435]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1"
+    }
+   },
+   {
+    "expression": "+dt",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ dt)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(dt#15) AS r#8436]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(dt#34) AS r#8437]\n+- Union false, false\n   :- Union false, false\n   :  :- Project ["
+    }
+   },
+   {
+    "expression": "-dt",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- dt)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-dt#15 AS r#8438]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-dt#34 AS r#8439]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as"
+    }
+   },
+   {
+    "expression": "+ts",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ ts)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(ts#14) AS r#8440]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(ts#33) AS r#8441]\n+- Union false, false\n   :- Union false, false\n   :  :- Proj"
+    }
+   },
+   {
+    "expression": "-ts",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- ts)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-ts#14 AS r#8442]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-ts#33 AS r#8443]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast"
+    }
+   },
+   {
+    "expression": "+bin",
+    "parse": {
+     "ok": true,
+     "node": "UnaryPositive",
+     "sql": "(+ bin)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bin#17) AS r#8444]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bin#36) AS r#8445]\n+- Union false, false\n   :- Union false, false\n   :  :- Proj"
+    }
+   },
+   {
+    "expression": "-bin",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- bin)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bin#17 AS r#8446]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bin#36 AS r#8447]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast"
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -75628,6 +76346,736 @@
      "eval": {
       "ok": false,
       "error": "AnalysisException: [DATATYPE_MISMATCH.DATA_DIFF_TYPES] Cannot resolve \"(CAST(NULL AS BOOLEAN) IN (a))\" due to data type mismatch: Input to `in` should all be the same type, but it's [\"BOOLEAN\", \"INT\"]. SQLSTATE: 42K09; line 1 pos 23;\n'Project [cast(null as boolean) IN (a#19) AS r#6152]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#"
+     }
+    }
+   ],
+   "unary-operators": [
+    {
+     "expression": "+'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '1')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "+'1.5'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '1.5')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       1.5,
+       1.5
+      ]
+     }
+    },
+    {
+     "expression": "+'1e3'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '1e3')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1000.0,
+       1000.0,
+       1000.0
+      ]
+     }
+    },
+    {
+     "expression": "+'abc'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ 'abc')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "+''",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "+'  1  '",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '  1  ')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "+'1d'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '1d')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "+'0'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ '0')"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "+ns",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ ns)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "+s",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ s)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "+fs",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ fs)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       null,
+       0.5
+      ]
+     }
+    },
+    {
+     "expression": "+CAST(NULL AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ CAST(NULL AS STRING))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "+'1' + 1",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "((+ '1') + 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.0,
+       2.0,
+       2.0
+      ]
+     }
+    },
+    {
+     "expression": "+ +'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ (+ '1'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       1.0,
+       1.0
+      ]
+     }
+    },
+    {
+     "expression": "- +'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- (+ '1'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "+ -'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ (- '1'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "-+'1'",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- (+ '1'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.0,
+       -1.0,
+       -1.0
+      ]
+     }
+    },
+    {
+     "expression": "+a",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1,
+       null,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "+b",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ b)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       10,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "+sh",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ sh)"
+     },
+     "type": {
+      "ok": true,
+      "type": "smallint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       null,
+       -1
+      ]
+     }
+    },
+    {
+     "expression": "+f",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ f)"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.5,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "+g",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2.5,
+       null,
+       0.0
+      ]
+     }
+    },
+    {
+     "expression": "+d1",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ d1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(10,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "12.34",
+       null,
+       "0.00"
+      ]
+     }
+    },
+    {
+     "expression": "+d5",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(38,38)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.10000000000000000000000000000000000000",
+       null,
+       "0.50000000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "+NULL",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-NULL",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(a, +NULL)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(a, (+ NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       null,
+       -2147483648.0
+      ]
+     }
+    },
+    {
+     "expression": "coalesce(a, -NULL)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(a, (- NULL))"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1.0,
+       null,
+       -2147483648.0
+      ]
+     }
+    },
+    {
+     "expression": "+CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "-CAST(NULL AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- CAST(NULL AS INT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "+bl",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bl#16) AS r#6269]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bl#35) AS r#6270]\n+- Union false, false\n   :- Union false, false\n   :  :- Projec"
+     }
+    },
+    {
+     "expression": "-bl",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- bl)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bl#16 AS r#6271]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9,"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bl)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bl#35 AS r#6272]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1"
+     }
+    },
+    {
+     "expression": "+dt",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ dt)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(dt#15) AS r#6273]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8,"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(dt#34) AS r#6274]\n+- Union false, false\n   :- Union false, false\n   :  :- Project ["
+     }
+    },
+    {
+     "expression": "-dt",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- dt)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-dt#15 AS r#6275]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- dt)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"dt\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-dt#34 AS r#6276]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as"
+     }
+    },
+    {
+     "expression": "+ts",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ ts)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(ts#14) AS r#6277]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, "
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(ts#33) AS r#6278]\n+- Union false, false\n   :- Union false, false\n   :  :- Proj"
+     }
+    },
+    {
+     "expression": "-ts",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- ts)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-ts#14 AS r#6279]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- ts)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"ts\" has the type \"TIMESTAMP\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-ts#33 AS r#6280]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast"
+     }
+    },
+    {
+     "expression": "+bin",
+     "parse": {
+      "ok": true,
+      "node": "UnaryPositive",
+      "sql": "(+ bin)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bin#17) AS r#6281]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, "
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(+ bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [positive(bin#36) AS r#6282]\n+- Union false, false\n   :- Union false, false\n   :  :- Proj"
+     }
+    },
+    {
+     "expression": "-bin",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- bin)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bin#17 AS r#6283]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"(- bin)\" due to data type mismatch: The first parameter requires the (\"NUMERIC\" or \"INTERVAL DAY TO SECOND\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL\") type, however \"bin\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [-bin#36 AS r#6284]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast"
      }
     }
    ]

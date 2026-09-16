@@ -153,7 +153,11 @@ LEGACY_GROUPS = (
     # #286. The ANSI and legacy analyzers refuse DIFFERENT sets -- boolean joins the numeric
     # family for equality under legacy and under ANSI it does not -- so the rule cannot be read
     # off one dialect. Both halves are the measurement.
-    "comparison-families")
+    "comparison-families",
+    # #313/#340. A bad string is the half that splits: `+'abc'` raises CAST_INVALID_INPUT under
+    # ANSI and answers NULL without it, exactly as `-'abc'` does. One harvest would record the
+    # accept-set and leave the whole boundary around it unmeasured.
+    "unary-operators")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3090,6 +3094,44 @@ GROUPS = {
         "CAST(NULL AS INT) IN (bl)",
         "CAST(NULL AS INT) = bl",
         "CAST(NULL AS BOOLEAN) IN (a)",
+    ],
+
+    # UNARY PLUS, and the unary operators' boundary generally. #313 and #340, which are one defect
+    # measured twice: `SparkSqlParser.ParseUnary` DISCARDS a leading `+`, so the operand reaches
+    # the tree unchanged.
+    #
+    # DISCARDING IT IS RIGHT FOR EVERY NUMERIC, which is why it went unnoticed -- `+a` is `a` --
+    # and the corpus carried exactly one unary-plus row (`+a`, in `arithmetic-precedence`) against
+    # fourteen for unary minus. That one row is the case the bug gets right.
+    #
+    # Spark's `UnaryPositive` is a real expression with a type rule: it keeps a numeric operand's
+    # type and CASTS A STRING TO DOUBLE, the same target unary minus takes. So the rows below
+    # mirror the minus rows of `arithmetic-string-coercion` one for one -- a difference between
+    # the two operators is then a difference in our fix rather than in Spark.
+    #
+    # THE NON-NUMERIC ROWS ARE FOR BOTH OPERATORS, and they close a gap the minus side has had all
+    # along: nothing measured what `-bl` or `-dt` do, and `SparkNumericTypes.NegateResult` refuses
+    # them with a NotSupportedException whose class is ours rather than Spark's. Asked here so the
+    # refusal is recorded rather than assumed.
+    "unary-operators": [
+        # The string rules, mirroring `arithmetic-string-coercion`'s minus rows exactly.
+        "+'1'", "+'1.5'", "+'1e3'", "+'abc'", "+''", "+'  1  '", "+'1d'", "+'0'",
+        "+ns", "+s", "+fs", "+CAST(NULL AS STRING)",
+
+        # Composition, where the type of the inner expression is what the outer one reads.
+        "+'1' + 1", "+ +'1'", "- +'1'", "+ -'1'", "-+'1'",
+
+        # Every numeric, which the identity reading gets right and a fix must not break.
+        "+a", "+b", "+sh", "+f", "+g", "+d1", "+d5",
+
+        # VOID. Spark types `+NULL` a DOUBLE, so the plus is not the identity here either -- and
+        # the type is observable through a conditional, which is the row that makes it matter
+        # rather than being a label. #313.
+        "+NULL", "-NULL", "coalesce(a, +NULL)", "coalesce(a, -NULL)",
+        "+CAST(NULL AS INT)", "-CAST(NULL AS INT)",
+
+        # THE NON-NUMERIC BOUNDARY, both operators. Unmeasured until now for either.
+        "+bl", "-bl", "+dt", "-dt", "+ts", "-ts", "+bin", "-bin",
     ],
 
     "malformed": [
