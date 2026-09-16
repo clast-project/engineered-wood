@@ -116,6 +116,48 @@ public class SparkFloatScalingTests
     public void ADeclinedValueStillRendersTheWayJavaDoes(long bits, string expected) =>
         Assert.Equal(expected, SparkFloatText.Render(BitConverter.Int64BitsToDouble(bits)));
 
+    /// <summary>
+    /// The trailing-zero trim is <c>TrimEnd('0')</c>'s answer, on the targets where it is not
+    /// <c>TrimEnd('0')</c>'s call.
+    /// </summary>
+    /// <remarks>
+    /// netstandard2.0 has no single-character <c>TrimEnd</c>, so <c>TrimEnd('0')</c> binds there to
+    /// the <c>params char[]</c> overload and allocates an array per call. Every caller of
+    /// <see cref="SparkText.TrimTrailingZeros"/> is per-row — the fraction of a rendered timestamp
+    /// and the digits of a rendered float — so it is written out instead, and this holds it to the
+    /// behaviour it replaced, including the empty string that all-zero digits trim to.
+    /// <para>
+    /// Run on net472 as well as the modern targets, which is the only place the two could differ.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheTrailingZeroTrimMatchesTheCallItReplaced()
+    {
+        string[] named =
+        {
+            string.Empty, "0", "00", "000", "1", "10", "100", "100000", "010000", "123400",
+            "000001", "1234567890000000", "9", "90",
+        };
+
+        foreach (var text in named)
+            Assert.Equal(text.TrimEnd('0'), SparkText.TrimTrailingZeros(text));
+
+        var random = new Random(7);
+        for (var i = 0; i < 20000; i++)
+        {
+            var digits = new char[random.Next(0, 20)];
+            for (var j = 0; j < digits.Length; j++)
+                digits[j] = (char)('0' + random.Next(0, 10));
+
+            var text = new string(digits);
+            Assert.Equal(text.TrimEnd('0'), SparkText.TrimTrailingZeros(text));
+        }
+
+        // Nothing to drop gives the same instance back, which is the common case at full width.
+        var untrimmed = "123456789";
+        Assert.Same(untrimmed, SparkText.TrimTrailingZeros(untrimmed));
+    }
+
     private static IEnumerable<(long Mantissa, int Exponent, bool NarrowBelow, int MaxDigits, string Source)>
         Population(string population)
     {
