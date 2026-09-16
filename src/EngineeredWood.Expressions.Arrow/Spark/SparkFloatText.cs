@@ -37,8 +37,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <para>
 /// <b>A float prints as a float.</b> <c>Float.toString(0.3333333f)</c> is <c>0.3333333</c>, not
 /// the widened double's <c>0.3333333134651184</c> — which is the opposite of the cast to a
-/// decimal, where the widened double is exactly what Spark converts. The two paths need separate
-/// ladders for that reason and not merely for width.
+/// decimal, where the widened double is exactly what Spark converts. The two widths therefore
+/// decompose separately, even though one routine picks the digits for both.
 /// </para>
 /// <para>
 /// The JDK band from #244 reaches here too, because this is the same <c>Double.toString</c>: the
@@ -47,24 +47,22 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// band are declared differences.
 /// </para>
 /// <para>
-/// <b>A subnormal is a different question and gets its own answer.</b> Every rule above is about
-/// where the point goes; <see cref="Subnormal"/> is about which digits there are at all, and it
-/// reaches them without the platform's formatter or its parser. #288.
+/// <b>Nothing here asks the platform for a digit.</b> Not the formatter, not the parser — see
+/// <see cref="ShortestDigits"/>. #288, #337, #338.
 /// </para>
 /// </remarks>
 internal static class SparkFloatText
 {
-    /// <summary>The smallest positive normal double, below which a double loses significant bits.</summary>
-    private const double DoubleMinNormal = 2.2250738585072014E-308;
-
-    /// <summary>The smallest positive normal float.</summary>
-    private const float FloatMinNormal = 1.17549435E-38f;
-
     /// <summary>The exponent every subnormal double is written at: <c>double.Epsilon</c> is 2^-1074.</summary>
     private const int DoubleMinExponent = -1074;
 
     /// <summary>The exponent every subnormal float is written at: <c>float.Epsilon</c> is 2^-149.</summary>
     private const int FloatMinExponent = -149;
+
+    /// <summary>Seventeen significant digits always identify a double, and nine always a float.</summary>
+    private const int DoubleMaxDigits = 17;
+
+    private const int FloatMaxDigits = 9;
 
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -75,7 +73,7 @@ internal static class SparkFloatText
         if (double.IsPositiveInfinity(value)) return "Infinity";
         if (double.IsNegativeInfinity(value)) return "-Infinity";
 
-        return Format(IsNegative(value), ShortestRoundTrip(Math.Abs(value)));
+        return ShortestRoundTrip(value);
     }
 
     /// <summary>Java's rendering of a float, whose digits are the float's own and not the double's.</summary>
@@ -85,20 +83,19 @@ internal static class SparkFloatText
         if (float.IsPositiveInfinity(value)) return "Infinity";
         if (float.IsNegativeInfinity(value)) return "-Infinity";
 
-        return Format(IsNegative(value), ShortestRoundTrip(Math.Abs(value)));
+        return ShortestRoundTrip(value);
     }
 
     /// <summary>
-    /// The shortest decimal text that round-trips <paramref name="value"/>.
+    /// The shortest decimal text that round-trips <paramref name="value"/>, in Java's shape.
     /// </summary>
     /// <remarks>
-    /// <b>Deliberately not <c>ToString("R")</c></b>, which is the shortest form only on .NET Core.
-    /// Measured: on net472 the double 0.3333333333333333 renders as seventeen digits there and as
-    /// sixteen on net10.0, which made <c>CAST(g AS DECIMAL(38,20))</c> answer differently per
-    /// target framework — a cast is not allowed to depend on which build of this library is
-    /// loaded. The G15/G16/G17 ladder is the portable spelling of the same thing, and produces the
-    /// identical value on every target: checked against <c>"R"</c> over ~1e6 doubles on net10.0
-    /// with no disagreement at all.
+    /// <b>Deliberately not <c>ToString("R")</c></b>, which is the shortest form only on .NET Core
+    /// — and not even reliably there: <c>(2^-25).ToString("R")</c> is
+    /// <c>2.980232238769531E-08</c>, which reads back as a DIFFERENT double. It is also
+    /// deliberately not a ladder of <c>G15</c>/<c>G16</c>/<c>G17</c> round-trip probes, which is
+    /// what this was until #337 and #338; see <see cref="ShortestDigits"/> for why both halves of
+    /// that had to go.
     /// <para>
     /// This is also what Spark's <c>BigDecimal.valueOf(d)</c> reads — up to the JVM's own version
     /// of the question, since <c>Double.toString</c> did not produce the shortest form before
@@ -107,273 +104,300 @@ internal static class SparkFloatText
     /// </remarks>
     internal static string ShortestRoundTrip(double value)
     {
-        var magnitude = Math.Abs(value);
-        if (magnitude > 0 && magnitude < DoubleMinNormal)
-            return Sign(value) + Subnormal((long)(magnitude / double.Epsilon), DoubleMinExponent, 17);
+        var bits = BitConverter.DoubleToInt64Bits(value);
+        var negative = bits < 0;
+        var magnitude = bits & long.MaxValue;
 
-        // Unrolled onto constant format strings rather than built per iteration: this runs for
-        // every row of every cast, and there are only ever three rungs.
-        if (RoundTrips(value, "G15", out var fifteen))
-            return fifteen;
+        if (magnitude == 0)
+            return negative ? "-0.0" : "0.0";
 
-        if (RoundTrips(value, "G16", out var sixteen))
-            return sixteen;
+        // 11 exponent bits over 52 mantissa bits, biased by 1023 and written with an implicit
+        // leading one: the value is `mantissa x 2^(rawExponent - 1023 - 52)`.
+        var rawExponent = (int)(magnitude >> 52);
+        var rawMantissa = magnitude & 0xF_FFFF_FFFF_FFFFL;
 
-        // Seventeen significant digits always round-trip a double, so there is nothing to check.
-        return value.ToString("G17", Invariant);
+        var subnormal = rawExponent == 0;
+        var mantissa = subnormal ? rawMantissa : rawMantissa | (1L << 52);
+        var exponent = subnormal ? DoubleMinExponent : rawExponent - 1075;
+
+        return Format(
+            negative,
+            ShortestDigits(mantissa, exponent, NarrowBelow(rawExponent, rawMantissa), DoubleMaxDigits));
     }
 
     /// <summary>The shortest decimal text that round-trips a float, which needs at most nine digits.</summary>
     internal static string ShortestRoundTrip(float value)
     {
-        var magnitude = Math.Abs(value);
-        if (magnitude > 0 && magnitude < FloatMinNormal)
-            return Sign(value) + Subnormal((long)((double)magnitude / float.Epsilon), FloatMinExponent, 9);
+        // Through the bits rather than through `(double)value`, because the question is which
+        // FLOATS a decimal can land between: the widened double's neighbours are 2^29 times closer.
+        var bits = SingleToInt32Bits(value);
+        var negative = bits < 0;
+        var magnitude = bits & int.MaxValue;
 
-        // Six, not seven. Half a step is at most 2^-24 of a normal float, and half of the
-        // seven-digit grid's step is as little as 0.05e-6 = 5.0e-8 where the leading digit is a 9
-        // -- SMALLER than 2^-24 = 5.96e-8, so rounding to seven digits does not always land on a
-        // six-digit shortest form. Measured: it prints 9.458641E-10 where Java prints 9.45864E-10,
-        // and the six mismatches in a 200,000-float sweep all began with a 9. The same arithmetic
-        // is what makes fifteen right for a double: half of its sixteen-digit step can be 5.0e-17
-        // against a half-step of 2^-53 = 1.11e-16, and half of the fifteen-digit step cannot.
-        if (RoundTrips(value, "G6", out var six))
-            return six;
+        if (magnitude == 0)
+            return negative ? "-0.0" : "0.0";
 
-        if (RoundTrips(value, "G7", out var seven))
-            return seven;
+        var rawExponent = magnitude >> 23;
+        var rawMantissa = magnitude & 0x7F_FFFF;
 
-        if (RoundTrips(value, "G8", out var eight))
-            return eight;
+        var subnormal = rawExponent == 0;
+        var mantissa = subnormal ? rawMantissa : rawMantissa | (1 << 23);
+        var exponent = subnormal ? FloatMinExponent : rawExponent - 150;
 
-        return value.ToString("G9", Invariant);
-    }
-
-    private static bool RoundTrips(double value, string format, out string text)
-    {
-        text = value.ToString(format, Invariant);
-        return double.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value;
-    }
-
-    private static bool RoundTrips(float value, string format, out string text)
-    {
-        text = value.ToString(format, Invariant);
-        return float.TryParse(text, NumberStyles.Float, Invariant, out var parsed) && parsed == value;
+        return Format(
+            negative,
+            ShortestDigits(mantissa, exponent, NarrowBelow(rawExponent, rawMantissa), FloatMaxDigits));
     }
 
     /// <summary>
-    /// The shortest decimal text that reads back as the subnormal <c>mantissa × 2^minExponent</c>.
+    /// Whether the gap below the value is half the gap above it, which only a power of two has.
+    /// </summary>
+    /// <remarks>
+    /// <b>This is #337.</b> A value whose mantissa bits are all zero sits at the bottom of its
+    /// binade, so its predecessor comes from the binade below where the step is half as long. Its
+    /// rounding interval is therefore <c>[v - ulp/4, v + ulp/2]</c> and not
+    /// <c>[v - ulp/2, v + ulp/2]</c> — and a lopsided interval can contain a k-digit decimal
+    /// while excluding the CLOSEST k-digit decimal, which is the one a rounding ladder tests.
+    /// Measured: 46 of the 2,046 normal double powers of two and 3 of the 254 normal float ones
+    /// rendered one digit longer than Java's for exactly that reason. A non-zero mantissa makes
+    /// the interval symmetric, so nothing else can be affected, and a sweep of all 2,130,706,432
+    /// normal floats turns up no case that is not a power of two.
+    /// <para>
+    /// The smallest normal value is the exception the raw exponent catches: its predecessor is the
+    /// largest subnormal, one ordinary step below, so its interval is symmetric after all.
+    /// </para>
+    /// </remarks>
+    private static bool NarrowBelow(int rawExponent, long rawMantissa) =>
+        rawMantissa == 0 && rawExponent > 1;
+
+    /// <summary>
+    /// The shortest decimal that reads back as <c>mantissa x 2^exponent</c>, by exact arithmetic.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The ladder above starts at fifteen digits because that is where a NORMAL double's shortest
-    /// form can first appear: half a step is at most 2^-53 of the value, so rounding to fifteen
-    /// digits lands on the shortest form whenever the shortest form is that short or shorter. A
-    /// subnormal breaks the premise. Its step is a fixed 2^-1074 no matter how small the value
-    /// gets, so at the bottom of the range half a step is half the value itself and ONE digit
-    /// round-trips — which is why we printed <c>9.88131291682493E-324</c> where Spark prints two
-    /// digits. #288.
+    /// <b>Neither the platform's formatter nor its parser may be asked any part of this.</b> Both
+    /// are wrong on .NET Framework and right on .NET Core, which is the one thing a cast may not
+    /// depend on. Measured: <c>double.Parse("2.12E-322")</c> returns the wrong double there, so a
+    /// round-trip probe answers falsely and a ladder stops a rung early; <c>ToString("G16")</c> of
+    /// bits 3109743661010044618 ends <c>...729E-101</c> against .NET Core's <c>...728E-101</c>, so
+    /// the digits it hands over are not the value's. Over a 200,000-value sweep against JDK 21 the
+    /// old ladder disagreed with itself across target frameworks on 6,428 doubles and 5,957
+    /// floats. #338.
     /// </para>
     /// <para>
-    /// <b>Neither the platform's formatter nor its parser can be asked here.</b> Both are wrong
-    /// about subnormals on .NET Framework and right on .NET Core, which is the one thing a cast
-    /// may not depend on. Measured: <c>double.Parse("2.12E-322")</c> returns the wrong double
-    /// there, so a round-trip test answers falsely, and <c>ToString("G16")</c> of the double just
-    /// below the smallest normal one is a digit out, so the digits it hands over are not the
-    /// value's. So the digits come from exact integer arithmetic instead: a subnormal is
-    /// <c>mantissa × 2^minExponent</c>, which is <c>(mantissa × 5^-minExponent) × 10^minExponent</c>,
-    /// and the significant digits are simply the digits of that integer product.
+    /// So the digits are computed. Writing the value as <c>mantissa x scale x 10^shift</c> —
+    /// <c>scale = 5^-exponent, shift = exponent</c> when the exponent is negative, and
+    /// <c>scale = 2^exponent, shift = 0</c> when it is not — makes <c>mantissa x scale</c> an
+    /// integer whose digits ARE the value's, exactly and in full. One big multiplication per
+    /// value, and no division anywhere.
     /// </para>
     /// <para>
-    /// Checked against <c>Float.toString</c> on JDK 21 over all 8,388,607 subnormal floats and
-    /// <c>Double.toString</c> over 22,000 subnormal doubles: identical on every one, on net10.0
-    /// and on net472 alike.
+    /// <b>Both neighbours are tested at every length, not just the rounded one.</b> That is the
+    /// other half of #337: rounding to k digits finds the CLOSEST k-digit decimal, which is the
+    /// right candidate only while the rounding interval is symmetric. Truncating gives the
+    /// k-digit decimal below and incrementing gives the one above, and those two are the only
+    /// candidates there can be at that length — so asking about both settles the length whatever
+    /// shape the interval has.
+    /// </para>
+    /// <para>
+    /// Where both read back, Java takes the closer, and the even significand where they are
+    /// equally close. That is the JDK 19+ <c>Double.toString</c> specification, and it is also why
+    /// <c>Double.toString(Double.MIN_VALUE)</c> is <c>4.9E-324</c> rather than <c>5E-324</c>: at a
+    /// length of one the javadoc widens the field to the one- AND two-digit decimals before
+    /// choosing, which <see cref="TwoDigitsCanBeatOne"/> below reproduces.
     /// </para>
     /// </remarks>
-    private static string Subnormal(long mantissa, int minExponent, int maxDigits)
+    private static (string Digits, int PointAt) ShortestDigits(
+        long mantissa, int exponent, bool narrowBelow, int maxDigits)
     {
-        var exact = (Powers.Scale(minExponent) * mantissa).ToString(Invariant);
+        var scale = Powers.Scale(exponent);
+        var exact = (scale * mantissa).ToString(Invariant);
 
-        // The product is the digit string of `0.<exact> × 10^pointAt`, with no leading zero to
+        // The product is the digit string of `0.<exact> x 10^pointAt`, with no leading zero to
         // discard: BigInteger does not write one.
-        var pointAt = exact.Length + minExponent;
+        var pointAt = exponent < 0 ? exact.Length + exponent : exact.Length;
 
-        // Built once for the value rather than once per rung. Measured over 100,000 subnormal
-        // doubles, that and the cached 5^1074 take a value from 17.2us to 7.8us; a normal one is
-        // 0.27us. What is left is dominated by the ToString above -- 11us of a 751-digit
-        // BigInteger -- which only goes away by not forming the whole expansion at all.
-        var reads = new ReadsBack(mantissa, minExponent, maxDigits - pointAt);
+        var interval = new ReadsBack(scale, narrowBelow, mantissa % 2 == 0);
 
         for (var length = 1; length < maxDigits; length++)
         {
-            var candidate = Round(exact, pointAt, length);
-            if (!reads.Contains(candidate))
+            if (!interval.TryChoose(exact, length, out var candidate))
                 continue;
 
-            // Java's one exception to shortest-wins, and the reason Double.toString(4.9E-324) is
-            // not `5E-324`: where a single digit suffices, the answer is the closer of the best
-            // one- and two-digit decimals rather than the one-digit one. Measured -- it is the
-            // difference between `9.9E-324` and `1.0E-323` for the double just above the
-            // smallest, and both of those round-trip.
-            if (length == 1)
-            {
-                var pair = Round(exact, pointAt, 2);
-                if (reads.Contains(pair))
-                    return Scientific(pair);
-            }
+            if (length == 1 && TwoDigitsCanBeatOne(interval, exact, ref candidate))
+                return Trim(candidate, pointAt);
 
-            return Scientific(candidate);
+            return Trim(candidate, pointAt);
         }
 
-        // Seventeen digits always identify a double and nine always identify a float, subnormal
-        // or not, so the last rung needs no test.
-        return Scientific(Round(exact, pointAt, maxDigits));
+        // The closest decimal of maxDigits digits is within half a step of the value by
+        // construction, so the last rung always reads back and needs no test.
+        interval.TryChoose(exact, maxDigits, out var last);
+        return Trim(last, pointAt);
     }
 
     /// <summary>
-    /// Which decimals read back as one subnormal, as an exact test a candidate can be put to.
+    /// Java's one exception to shortest-wins, applied where a single digit already round-trips.
+    /// </summary>
+    /// <remarks>
+    /// The javadoc defines the field of candidates as the decimals of minimal length p, EXCEPT
+    /// that when p is 1 it takes those of length 1 and 2 together and picks the closest of all of
+    /// them. It is the difference between <c>9.9E-324</c> and <c>1.0E-323</c> for the double just
+    /// above the smallest, both of which read back.
+    /// <para>
+    /// The two-digit answer is always available when a one-digit one is: every one-digit decimal
+    /// sits on the two-digit grid as well, the nearest two-digit decimal is therefore at least as
+    /// close to the value, and the interval is convex — so if the one-digit decimal is inside it,
+    /// anything between it and the value is too. The call below cannot fail; it is written as a
+    /// test rather than an assertion so that a future width with a different grid cannot trip on it.
+    /// </para>
+    /// </remarks>
+    private static bool TwoDigitsCanBeatOne(in ReadsBack interval, string exact, ref Candidate candidate)
+    {
+        if (!interval.TryChoose(exact, 2, out var pair))
+            return false;
+
+        candidate = pair;
+        return true;
+    }
+
+    /// <summary>A decimal of a chosen length, and whether carrying moved the point one place right.</summary>
+    /// <remarks>
+    /// Incrementing 999 gives 1000, which is the four-digit spelling of a three-digit grid point:
+    /// the digits are 100 and the value is ten times what the same digits meant before. Carrying
+    /// the shift here rather than re-deriving it keeps <see cref="Trim"/> a pure string operation.
+    /// </remarks>
+    private readonly struct Candidate(string digits, int pointShift)
+    {
+        internal string Digits { get; } = digits;
+
+        internal int PointShift { get; } = pointShift;
+    }
+
+    /// <summary>Drops the trailing zeros Java does not count, and places the point.</summary>
+    /// <remarks>
+    /// A trailing zero is not a significant digit, and Java counts the length of a decimal without
+    /// one: <c>1.0E-310</c> is one digit long, not two.
+    /// </remarks>
+    private static (string Digits, int PointAt) Trim(in Candidate candidate, int pointAt) =>
+        (candidate.Digits.TrimEnd('0'), pointAt + candidate.PointShift);
+
+    /// <summary>
+    /// Which decimals read back as one value, as an exact test a candidate can be put to.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A candidate is <c>c × 10^-s</c>, and it reads back as the value when it sits within half a
-    /// step of it — half a step being <c>2^(minExponent-1)</c>, the same for every subnormal:
+    /// A candidate reads back when it sits within half a step of the value, and the arithmetic
+    /// stays small because the candidates are measured against the value's own exact expansion
+    /// rather than against the value. Writing the expansion as <c>0.&lt;exact&gt; x 10^pointAt</c>,
+    /// its last place is worth <c>10^(pointAt - exact.Length)</c>, and in THOSE units half a step
+    /// up is exactly <c>scale / 2</c> whichever sign the exponent had:
     /// </para>
     /// <code>
-    ///     |c × 10^-s − mantissa × 2^minExponent| ≤ 2^(minExponent-1)
+    ///     exponent &lt; 0:  2^(e-1) / 10^e = 2^(e-1) x 2^-e x 5^-e = 5^-e / 2 = scale / 2
+    ///     exponent >= 0:  2^(e-1) / 10^0 =                          2^e  / 2 = scale / 2
     /// </code>
     /// <para>
-    /// Multiplying through by <c>2^(1-minExponent) × 5^s</c> leaves nothing but integers. That is
-    /// the whole test, but it puts a <c>5^s</c> of some 230 digits on a per-candidate footing, and
-    /// the ladder asks up to seventeen candidates. Multiplying by <c>2^(1-minExponent) × 5^S</c>
-    /// for a fixed <c>S ≥ s</c> instead scales both sides of the SAME comparison by
-    /// <c>5^(S-s)</c>, which cannot change its answer, and leaves the large power on a per-VALUE
-    /// footing:
-    /// </para>
-    /// <code>
-    ///     |c × 2^(1-minExponent-s) × 5^(S-s) − 2 × mantissa × 5^S| ≤ 5^S
-    /// </code>
-    /// <para>
-    /// <c>S</c> is <c>maxDigits - pointAt</c>, which no rung's <c>s</c> can exceed: a candidate
-    /// has at most <c>maxDigits</c> digits, and rounding only ever moves the point right. So
-    /// <c>S - s</c> stays within <c>[0, maxDigits]</c> and its power comes from a table.
+    /// So the whole test is a comparison against the same <c>scale</c> the digits were built from
+    /// — no second big power, and nothing per candidate but the tail it discards. Everything is
+    /// multiplied by four so that the quarter-step below a power of two stays an integer.
     /// </para>
     /// <para>
     /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
-    /// sends a decimal landing exactly between two doubles.
+    /// sends a decimal landing exactly between two values. It is the same rule on both sides: at a
+    /// power of two the value's mantissa is even and its predecessor's is odd, so the midpoint
+    /// below belongs to the value.
     /// </para>
     /// </remarks>
     private readonly struct ReadsBack
     {
-        private readonly BigInteger _half;
-        private readonly BigInteger _middle;
-        private readonly int _shift;
-        private readonly int _ceiling;
+        private readonly BigInteger _above;
+        private readonly BigInteger _below;
         private readonly bool _boundaryCounts;
 
-        internal ReadsBack(long mantissa, int minExponent, int scaleCeiling)
+        internal ReadsBack(BigInteger scale, bool narrowBelow, bool evenMantissa)
         {
-            _shift = 1 - minExponent;
-            _ceiling = scaleCeiling;
-            _half = BigInteger.Pow(5, scaleCeiling);
-            _middle = 2 * mantissa * _half;
-            _boundaryCounts = mantissa % 2 == 0;
+            _above = 2 * scale;
+            _below = narrowBelow ? scale : _above;
+            _boundaryCounts = evenMantissa;
         }
 
-        internal bool Contains((string Digits, int PointAt) candidate)
+        /// <summary>
+        /// The decimal of <paramref name="length"/> digits that Java would choose, if any reads back.
+        /// </summary>
+        internal bool TryChoose(string exact, int length, out Candidate candidate)
         {
-            var scale = candidate.Digits.Length - candidate.PointAt;
-            if (scale <= 0 || scale > _shift || scale > _ceiling)
-                return false;
-
-            // At most seventeen digits by construction, so this is a long and not a BigInteger.
-            var c = long.Parse(candidate.Digits, NumberStyles.Integer, Invariant);
-            var scaled = new BigInteger(c) * Powers.Small[_ceiling - scale];
-            var distance = BigInteger.Abs((scaled << (_shift - scale)) - _middle);
-
-            return distance < _half || (distance == _half && _boundaryCounts);
-        }
-    }
-
-    /// <summary>
-    /// The powers of five the subnormal path reads, built on first use rather than at type load.
-    /// </summary>
-    /// <remarks>
-    /// <c>5^1074</c> is a 751-digit number and nothing but a subnormal wants it, so it is held by
-    /// a nested class: a value that never leaves the normal range never builds it, which a plain
-    /// <c>static readonly</c> on the class itself could not promise. The same reason
-    /// <see cref="SparkIntegralCasts"/> holds its powers of ten, one row further down: this is a
-    /// per-row path for any column that holds subnormals at all.
-    /// </remarks>
-    private static class Powers
-    {
-        /// <summary>10^minExponent written as a power of five: the exact digits of 2^minExponent.</summary>
-        internal static BigInteger Scale(int minExponent) =>
-            minExponent == DoubleMinExponent ? DoubleScale : FloatScale;
-
-        /// <summary>5^0 through 5^18, which covers every gap between a rung's scale and the ceiling.</summary>
-        internal static readonly BigInteger[] Small = BuildSmall();
-
-        private static readonly BigInteger DoubleScale = BigInteger.Pow(5, -DoubleMinExponent);
-
-        private static readonly BigInteger FloatScale = BigInteger.Pow(5, -FloatMinExponent);
-
-        private static BigInteger[] BuildSmall()
-        {
-            var powers = new BigInteger[19];
-            powers[0] = BigInteger.One;
-
-            for (var i = 1; i < powers.Length; i++)
-                powers[i] = powers[i - 1] * 5;
-
-            return powers;
-        }
-    }
-
-    /// <summary>
-    /// Rounds the exact digit string to <paramref name="length"/> significant digits, half to even.
-    /// </summary>
-    /// <returns>The digits with trailing zeros dropped, and the exponent of <c>0.&lt;digits&gt;</c>.</returns>
-    private static (string Digits, int PointAt) Round(string exact, int pointAt, int length)
-    {
-        if (exact.Length > length)
-        {
-            var head = exact.Substring(0, length);
-
-            if (RoundsUp(exact, length))
+            // The expansion already fits, so this length holds the value itself and nothing is
+            // discarded: no neighbour can be closer than a distance of zero.
+            if (exact.Length <= length)
             {
-                head = Increment(head);
-
-                // 99 -> 100: one digit too many, and the point has moved.
-                if (head.Length > length)
-                {
-                    head = head.Substring(0, length);
-                    pointAt++;
-                }
+                candidate = new Candidate(exact, 0);
+                return true;
             }
 
-            exact = head;
+            var head = exact.Substring(0, length);
+            var tail = exact.Substring(length);
+
+            // What truncating discarded, and what incrementing would overshoot by: the two sum to
+            // one unit of the chosen length's last place.
+            var down = BigInteger.Parse(tail, NumberStyles.None, Invariant);
+            var up = TensComplement(tail);
+
+            var downReads = Within(down, _below);
+            var upReads = Within(up, _above);
+
+            if (!downReads && !upReads)
+            {
+                candidate = default;
+                return false;
+            }
+
+            if (downReads != upReads)
+            {
+                candidate = downReads ? new Candidate(head, 0) : Increment(head);
+                return true;
+            }
+
+            // Both read back, so Java takes the closer of them — and the even significand where
+            // they are equally close, which a terminating expansion like this one can genuinely
+            // reach.
+            var comparison = down.CompareTo(up);
+            var keepHead = comparison < 0 || (comparison == 0 && (head[length - 1] - '0') % 2 == 0);
+
+            candidate = keepHead ? new Candidate(head, 0) : Increment(head);
+            return true;
         }
 
-        // A trailing zero is not a significant digit, and Java counts the length of a decimal
-        // without one: 1.0E-310 is one digit long, not two.
-        return (exact.TrimEnd('0'), pointAt);
+        private bool Within(BigInteger distance, BigInteger half)
+        {
+            var scaled = 4 * distance;
+            var comparison = scaled.CompareTo(half);
+
+            return comparison < 0 || (comparison == 0 && _boundaryCounts);
+        }
     }
 
-    private static bool RoundsUp(string exact, int length)
+    /// <summary>
+    /// <c>10^n - value</c> for the n-digit <paramref name="tail"/>, without forming <c>10^n</c>.
+    /// </summary>
+    /// <remarks>
+    /// The nines complement plus one, which is the same number: <c>10^n - 1</c> is n nines, so
+    /// subtracting each digit from nine and adding one lands on it. It matters because n reaches
+    /// 750 for a subnormal double and a power of ten that long would be a per-candidate cost,
+    /// where this is a walk over a string that has already been built.
+    /// </remarks>
+    private static BigInteger TensComplement(string tail)
     {
-        var next = exact[length];
-        if (next != '5')
-            return next > '5';
+        var complement = new char[tail.Length];
 
-        for (var i = length + 1; i < exact.Length; i++)
-            if (exact[i] != '0')
-                return true;
+        for (var i = 0; i < tail.Length; i++)
+            complement[i] = (char)('9' - (tail[i] - '0'));
 
-        // An exact tie, which a terminating expansion like this one can genuinely reach.
-        return (exact[length - 1] - '0') % 2 == 1;
+        return BigInteger.Parse(new string(complement), NumberStyles.None, Invariant) + BigInteger.One;
     }
 
-    private static string Increment(string digits)
+    /// <summary>The next decimal up at the same length, carrying into a shifted point if it must.</summary>
+    private static Candidate Increment(string digits)
     {
         var carried = digits.ToCharArray();
 
@@ -382,49 +406,70 @@ internal static class SparkFloatText
             if (carried[i] != '9')
             {
                 carried[i]++;
-                return new string(carried);
+                return new Candidate(new string(carried), 0);
             }
 
             carried[i] = '0';
         }
 
-        return "1" + new string(carried);
+        // Every digit was a nine, so the answer is a one followed by the zeros already written —
+        // one digit too many for this length, and the point has moved.
+        return new Candidate("1" + new string(carried, 0, carried.Length - 1), 1);
     }
-
-    /// <summary>Writes the digits in the shape a "G" format would, for <see cref="Split"/> to read.</summary>
-    private static string Scientific((string Digits, int PointAt) value)
-    {
-        var exponent = (value.PointAt - 1).ToString(Invariant);
-
-        return value.Digits.Length == 1
-            ? value.Digits + "E" + exponent
-            : value.Digits.Substring(0, 1) + "." + value.Digits.Substring(1) + "E" + exponent;
-    }
-
-    private static string Sign(double value) => value < 0 ? "-" : string.Empty;
 
     /// <summary>
-    /// Whether the value carries a negative sign, including negative zero.
+    /// The powers the digits are built from, held on first use rather than at type load.
     /// </summary>
     /// <remarks>
-    /// By the sign bit rather than <c>&lt; 0</c>, which is false for -0.0, and by hand rather
-    /// than through <c>double.IsNegative</c>, which netstandard2.0 does not have.
+    /// <c>5^1074</c> is a 751-digit number and only a subnormal double wants it, so the table is
+    /// held by a nested class: a caller that never renders one never builds it, which a plain
+    /// <c>static readonly</c> on <see cref="SparkFloatText"/> could not promise. The same reason
+    /// <see cref="SparkIntegralCasts"/> holds its powers of ten.
+    /// <para>
+    /// Boxed rather than a <c>BigInteger[]</c> because the slots are published without a lock: a
+    /// reference assignment is atomic where a two-field struct is not, so a reader can never see a
+    /// sign paired with another power's digits. Two threads racing on a cold slot compute the same
+    /// number and one of them wins, which costs nothing and is always correct.
+    /// </para>
     /// </remarks>
-    private static bool IsNegative(double value) => BitConverter.DoubleToInt64Bits(value) < 0;
+    private static class Powers
+    {
+        private static readonly object?[] Fives = new object?[-DoubleMinExponent + 1];
 
-    private static bool IsNegative(float value) => IsNegative((double)value);
+        /// <summary>
+        /// <c>5^-exponent</c> below zero and <c>2^exponent</c> at or above it.
+        /// </summary>
+        /// <remarks>
+        /// Only the fives are worth a table. A power of two is a shift, which BigInteger does in
+        /// one pass over a buffer it has to allocate anyway.
+        /// </remarks>
+        internal static BigInteger Scale(int exponent)
+        {
+            if (exponent >= 0)
+                return BigInteger.One << exponent;
+
+            var index = -exponent;
+            if (Fives[index] is BigInteger cached)
+                return cached;
+
+            var computed = BigInteger.Pow(5, index);
+            Fives[index] = computed;
+
+            return computed;
+        }
+    }
 
     /// <summary>
-    /// Re-spells shortest-round-trip text in Java's shape.
+    /// Re-spells the chosen digits in Java's shape.
     /// </summary>
     /// <remarks>
     /// The digits are already decided by the time this runs; all that is left is where the point
-    /// goes and whether an exponent is written. Working from the text rather than from the value
+    /// goes and whether an exponent is written. Working from the digits rather than from the value
     /// keeps this one function for both widths.
     /// </remarks>
-    private static string Format(bool negative, string shortest)
+    private static string Format(bool negative, (string Digits, int PointAt) value)
     {
-        var (digits, pointAt) = Split(shortest);
+        var (digits, pointAt) = value;
         var sign = negative ? "-" : string.Empty;
 
         if (digits.Length == 0)
@@ -467,40 +512,14 @@ internal static class SparkFloatText
     }
 
     /// <summary>
-    /// The significant digits of unsigned decimal text, and the base-10 exponent of the point.
+    /// A float's bits, by hand because netstandard2.0 has no <c>BitConverter.SingleToInt32Bits</c>.
     /// </summary>
-    /// <remarks>
-    /// The value is <c>0.&lt;digits&gt; × 10^pointAt</c>. Zero comes back as an empty digit
-    /// string, which the caller answers directly.
-    /// </remarks>
-    private static (string Digits, int PointAt) Split(string text)
+    private static int SingleToInt32Bits(float value)
     {
-        var exponent = 0;
-
-        // Two IndexOf calls rather than IndexOfAny(new[] { 'e', 'E' }), which allocates its
-        // needle array on every call — and this runs for every rendered value. Uppercase first
-        // because that is what the G formats above produce; lowercase is accepted so the method
-        // reads any well-formed decimal text.
-        var e = text.IndexOf('E');
-        if (e < 0)
-            e = text.IndexOf('e');
-
-        if (e >= 0)
-        {
-            exponent = int.Parse(text.Substring(e + 1), NumberStyles.Integer, Invariant);
-            text = text.Substring(0, e);
-        }
-
-        var dot = text.IndexOf('.');
-        if (dot >= 0)
-        {
-            exponent -= text.Length - dot - 1;
-            text = text.Remove(dot, 1);
-        }
-
-        var digits = text.TrimStart('0');
-        exponent += digits.Length;
-
-        return (digits.TrimEnd('0'), exponent);
+#if NETSTANDARD2_0
+        return BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
+#else
+        return BitConverter.SingleToInt32Bits(value);
+#endif
     }
 }
