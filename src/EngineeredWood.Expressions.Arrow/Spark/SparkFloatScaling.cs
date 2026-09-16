@@ -34,8 +34,9 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// round-half-even tie rule has to decide — this declines, and the exact path answers instead.
 /// Correctness therefore rests on the error bar being conservative rather than on the
 /// approximation being good enough, which is a far smaller thing to have to get right, and it is
-/// checked by differential sweep rather than argued: every one of the 2,130,706,432 finite
-/// non-negative floats agrees with the exact path, and so does every double tried.
+/// checked by differential sweep rather than argued: every one of the 2,139,095,040 finite
+/// non-negative floats agrees with the exact path — exhaustively, not sampled — and so does every
+/// double tried.
 /// </para>
 /// <para>
 /// One routine serves both widths. A float's nine digits would fit in narrower arithmetic, but

@@ -16,7 +16,7 @@ namespace EngineeredWood.Expressions.Arrow.Tests;
 /// <para>
 /// The exact path is itself pinned against <c>Double.toString</c> on JDK 21 by the sweeps in
 /// <c>SparkFunctionRegistryTests</c>, so agreeing with it is agreeing with the JVM. Checked
-/// outside the test run over every one of the 2,130,706,432 finite non-negative floats and many
+/// outside the test run over every one of the 2,139,095,040 finite non-negative floats and many
 /// millions of doubles; what is here is the sample small enough to run on every build.
 /// </para>
 /// </remarks>
