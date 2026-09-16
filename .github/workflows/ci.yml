@@ -5,6 +5,13 @@ name: CI
 # filtering never reports its checks — they stay Pending forever and the PR
 # can never merge. The job below therefore always runs and always reports;
 # it decides internally whether there is anything worth compiling.
+# NOTE: a pull request builds and tests only the projects its changes can
+# affect; see the "Select affected projects" step. That selection happens
+# INSIDE the job for the same reason as above: the required check must always
+# report. A push to main that changes any code runs everything, so anything
+# the selection misses is still caught the moment it merges. (A
+# documentation-only push still builds nothing, as before; the main commit
+# before it was already verified in full.)
 # NOTE: `pull_request` is deliberately NOT filtered by base branch. A stacked PR
 # (one targeting another PR's branch rather than main) would otherwise get no CI
 # at all — and the failure is silent in the same way path filtering is: the
@@ -124,6 +131,32 @@ jobs:
         with:
           python-version: '3.13'
 
+      # Maps the changed files to the projects that own them, adds every project that
+      # references those (transitively), and writes a solution filter listing the result.
+      # The steps below restore, build, test and pack that filter instead of the solution,
+      # so a change to one library runs only its own tests and its dependents'. How files
+      # are attributed, and why anything unattributable runs everything, is documented in
+      # the script. The job summary shows what was selected and why.
+      #
+      # Pushes to main pass --full, so every code change on main is verified whole
+      # (documentation-only pushes never reach this step). If the script itself
+      # fails, the job runs everything rather than failing every pull request on a
+      # selection bug.
+      - name: Select affected projects
+        id: select
+        if: steps.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          python .github/scripts/select_projects.py \
+            --base "${{ github.event.pull_request.base.sha || github.event.before }}" \
+            --head "${{ github.sha }}" \
+            ${{ github.event_name == 'push' && '--full' || '' }} \
+          || {
+            echo "::warning::Project selection failed; building and testing everything."
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            echo "target=engineered-wood.slnx" >> "$GITHUB_OUTPUT"
+          }
+
       # The two interop tiers cheap enough to gate every commit on. Both are pure
       # Python — no JDK, no JVM — and add seconds. The Spark tier is the expensive
       # one and runs in interop-nightly.yml instead.
@@ -172,7 +205,7 @@ jobs:
       # It shares the DuckDB pin's reasoning: an upgrade that changes what these readers
       # accept must arrive as a deliberate bump here.
       - name: Install interop oracles (delta-rs, DuckDB, DataFusion, fastavro)
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         run: >
           python -m pip install --disable-pip-version-check
           deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5 tzdata==2026.3
@@ -180,15 +213,15 @@ jobs:
           fastavro==1.12.2 lz4==4.4.5
 
       - name: Restore
-        if: steps.changes.outputs.code == 'true'
-        run: dotnet restore engineered-wood.slnx
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        run: dotnet restore "${{ steps.select.outputs.target }}"
 
       - name: Build
-        if: steps.changes.outputs.code == 'true'
-        run: dotnet build engineered-wood.slnx --no-restore --configuration Release
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        run: dotnet build "${{ steps.select.outputs.target }}" --no-restore --configuration Release
 
       - name: Test
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a skip,
         # which is the whole point of setting them here.
         #
@@ -210,23 +243,24 @@ jobs:
           EW_REQUIRE_DELTA_INTEROP: '1'
           EW_REQUIRE_DUCKDB_INTEROP: '1'
           EW_REQUIRE_PARQUET_READERS_INTEROP: '1'
-        run: dotnet test engineered-wood.slnx --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
+        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
 
       - name: Pack
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         # test/ and benchmark projects opt out of packing (test/Directory.Build.props),
-        # so this produces only the 15 src/ libraries.
-        run: dotnet pack engineered-wood.slnx --no-build --configuration Release --output artifacts
+        # so this produces only the src/ libraries: all 15 of them on a full run, and on a
+        # selective one just those that were selected.
+        run: dotnet pack "${{ steps.select.outputs.target }}" --no-build --configuration Release --output artifacts
 
       - name: Upload test results
-        if: always() && steps.changes.outputs.code == 'true'
+        if: always() && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: '**/*.trx'
 
       - name: Upload packages
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
           name: packages
@@ -252,22 +286,51 @@ jobs:
   # THIS JOB IS NOT A REQUIRED CHECK. Making it one is a deliberate follow-up: it should earn
   # that by being green and non-flaky across a few runs first. Until then a failure here is
   # visible on the PR but does not block merging.
+  #
+  # ONLY WHEN IT CAN MATTER. The cloud-backend tests live in EngineeredWood.Parquet.Tests, so
+  # this job runs when the project selection (the same script as in `build`) includes that
+  # project, and otherwise skips its remaining steps. It is not a required check, so a skipped
+  # run cannot block a merge.
   cloud-io:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          # Full history so the project selection can diff against the base commit.
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Select affected projects
+        id: select
+        shell: bash
+        run: |
+          python .github/scripts/select_projects.py \
+            --base "${{ github.event.pull_request.base.sha || github.event.before }}" \
+            --head "${{ github.sha }}" \
+            --slnf /dev/null \
+            ${{ github.event_name == 'push' && '--full' || '' }} \
+          || echo "scope=full" >> "$GITHUB_OUTPUT"
+          echo "::group::cloud-io relevance"
+          if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
+             || grep -q '^tests=.*EngineeredWood\.Parquet\.Tests\.csproj' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "EngineeredWood.Parquet.Tests is not affected; skipping the cloud backends."
+          fi
+          echo "::endgroup::"
+
+      - name: Setup .NET
+        if: steps.select.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
 
       # All three are PINNED, for the same reason the interop oracles above are: these decide
       # whether the backends conform, so a behaviour change must arrive as a deliberate bump in
@@ -285,6 +348,7 @@ jobs:
       # its own client libraries, which is what makes it credible: it is the fake the vendor's
       # own conformance tests run against.
       - name: Install storage-testbench (GCS emulator)
+        if: steps.select.outputs.run == 'true'
         run: >
           python -m pip install --disable-pip-version-check
           "git+https://github.com/googleapis/storage-testbench.git@v0.63.0"
@@ -296,6 +360,7 @@ jobs:
       # and immediate -- the install step exits non-zero under `bash -e` and the job goes red -- so
       # defending against it in advance would only add noise to a step that cannot fail quietly.
       - name: Install Azurite (Azure Blob emulator)
+        if: steps.select.outputs.run == 'true'
         run: npm install -g azurite@3.36.0
 
       # MinIO rather than gofakes3, which was used while this ran only on a dev box: gofakes3
@@ -319,6 +384,7 @@ jobs:
       # that will see updates. That is tolerable for an oracle -- it is pinned by tag anyway -- but
       # it does mean the S3 emulator will eventually want replacing rather than upgrading.
       - name: Install MinIO (S3 emulator)
+        if: steps.select.outputs.run == 'true'
         run: |
           release=RELEASE.2025-09-07T16-13-09Z
           curl -fsSL -o /usr/local/bin/minio \
@@ -327,6 +393,7 @@ jobs:
           chmod +x /usr/local/bin/minio
 
       - name: Start emulators
+        if: steps.select.outputs.run == 'true'
         run: |
           mkdir -p /tmp/azurite /tmp/minio-data
           azurite --silent --location /tmp/azurite \
@@ -340,6 +407,7 @@ jobs:
       # connection error and the run goes green having tested nothing. That is the exact failure
       # #79 exists to remove, so the readiness check is a gate and not a convenience.
       - name: Wait for emulators
+        if: steps.select.outputs.run == 'true'
         run: |
           for hostport in 127.0.0.1:10000 127.0.0.1:9000 127.0.0.1:4443; do
             host="${hostport%:*}"; port="${hostport#*:}"
@@ -357,9 +425,11 @@ jobs:
           done
 
       - name: Restore
+        if: steps.select.outputs.run == 'true'
         run: dotnet restore test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
 
       - name: Build
+        if: steps.select.outputs.run == 'true'
         run: >
           dotnet build test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
           --no-restore --configuration Release --framework net10.0
@@ -369,6 +439,7 @@ jobs:
       # indistinguishable from having tested the backends. With it, an unreachable emulator is a
       # failure naming the emulator and the diagnosis its probe produced.
       - name: Test cloud backends
+        if: steps.select.outputs.run == 'true'
         env:
           EW_REQUIRE_CLOUD_EMULATORS: '1'
         run: >
@@ -378,7 +449,7 @@ jobs:
           --logger "trx;LogFileName=cloud-io-results.trx"
 
       - name: Upload test results
-        if: always()
+        if: always() && steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cloud-io-test-results

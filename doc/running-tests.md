@@ -385,6 +385,28 @@ dotnet test --filter "FullyQualifiedName~CrossValidat"
 dotnet test --filter "FullyQualifiedName~BatchedRead"
 ```
 
+### Only what a branch affects
+
+On a pull request, CI builds and tests only the projects its changes can
+affect: the projects owning the changed files, plus every project that
+references them, directly or transitively. Anything it can't attribute to a
+project (`Directory.Build.props`, the solution, `.github/`, an unfamiliar
+path) runs the whole solution, as does every push to `main` that changes code. The job summary
+lists what was selected and why.
+
+The same script writes a solution filter you can use locally:
+
+```
+python .github/scripts/select_projects.py --base origin/main
+dotnet test ci-affected.slnf
+```
+
+It prints `scope: full` and writes no filter when the whole solution is
+needed; use `engineered-wood.slnx` then. A test that reads files outside its
+own project directory at run time (as `EngineeredWood.Parquet.Tests` reads
+`parquet-testing/`) must be listed in the script's `RUNTIME_INPUTS`, or a
+change to those files will run everything.
+
 ## Understanding Test Output
 
 ### Skipped tests
