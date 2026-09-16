@@ -21,3 +21,6 @@ tmp/
 ## Claude Code session state
 .claude/
 __pycache__/
+
+## CI project selection (written by .github/scripts/select_projects.py)
+ci-affected.slnf
