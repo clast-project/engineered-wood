@@ -27,9 +27,10 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <c>dict_bytes[dict_offsets[t]..dict_offsets[t + 1]]</c>, 1 to 16 bytes long, with at most
 /// 2^16 tokens so every code fits a u16 (the <c>onpair</c> crate's <c>CompactDictionary</c>).
 /// A row is the concatenation of its codes' tokens. As upstream's <c>canonicalize_onpair</c>
-/// does, the whole code window <c>codes[codes_offsets[0]..codes_offsets[rows]]</c> is decoded in
-/// one pass (a sliced array keeps the full <c>codes</c> child and narrows only
-/// <c>codes_offsets</c>), and the rows are cut from it by <c>uncompressed_lengths</c>, which is
+/// does, the code window <c>codes[codes_offsets[0]..codes_offsets[rows]]</c> is decoded in
+/// order (a sliced array keeps the full <c>codes</c> child and narrows only
+/// <c>codes_offsets</c>). Each row is the run of codes between its two
+/// <c>codes_offsets</c>, and must decode to its <c>uncompressed_lengths</c> entry, which is
 /// zero for null rows.</para>
 /// </summary>
 internal static class OnPairArrayDecoder
@@ -69,12 +70,24 @@ internal static class OnPairArrayDecoder
             : metaVec.RawBytes(metaVec.Length));
 
         int rowCount = checked((int)expectedRowCount);
-        var dictOffsets = DecodeIntegers(node, serialized, arraySpecs, 0, meta.DictOffsetsPtype, (long)meta.DictSize + 1, "dict_offsets");
-        var codes = DecodeIntegers(node, serialized, arraySpecs, 1, meta.CodesPtype, checked((long)meta.CodesLen), "codes");
-        var codesOffsets = DecodeIntegers(node, serialized, arraySpecs, 2, meta.CodesOffsetsPtype, (long)rowCount + 1, "codes_offsets");
-        var lengths = DecodeIntegers(node, serialized, arraySpecs, 3, meta.UncompressedLengthsPtype, rowCount, "uncompressed_lengths");
+        // Bounded before anything is allocated from it.
+        if (meta.DictSize > MaxTokens)
+            throw new VortexFormatException(
+                $"vortex.onpair dictionary has {meta.DictSize} tokens; at most {MaxTokens} are addressable.");
+        if (meta.CodesLen > int.MaxValue)
+            throw new NotSupportedException(
+                $"vortex.onpair codes_len {meta.CodesLen} exceeds what this reader can index.");
+
+        var dictOffsets = ToInt64s(
+            DecodeChild(node, serialized, arraySpecs, 0, meta.DictOffsetsPtype, (long)meta.DictSize + 1, "dict_offsets"));
+        var codes = DecodeChild(node, serialized, arraySpecs, 1, meta.CodesPtype, (long)meta.CodesLen, "codes");
+        var codesOffsets = ToInt64s(
+            DecodeChild(node, serialized, arraySpecs, 2, meta.CodesOffsetsPtype, (long)rowCount + 1, "codes_offsets"));
+        var lengths = ToInt64s(
+            DecodeChild(node, serialized, arraySpecs, 3, meta.UncompressedLengthsPtype, rowCount, "uncompressed_lengths"));
 
         ValidateDictionary(dictOffsets, dictBytes.Length);
+        int numTokens = dictOffsets.Length - 1;
 
         // Arrow offsets from the per-row decoded lengths.
         var offsetBytes = new byte[((long)rowCount + 1) * 4];
@@ -93,33 +106,37 @@ internal static class OnPairArrayDecoder
 
         long codeStart = codesOffsets[0];
         long codeEnd = codesOffsets[rowCount];
-        if (codeStart < 0 || codeStart > codeEnd)
+        if (codeStart < 0 || codeStart > codeEnd || codeEnd > codes.Length)
             throw new VortexFormatException(
-                $"vortex.onpair codes_offsets must be nondecreasing from 0 (first {codeStart}, last {codeEnd}).");
-        if (codeEnd > codes.Length)
-            throw new VortexFormatException(
-                $"vortex.onpair codes_offsets end {codeEnd} exceeds codes length {codes.Length}.");
+                $"vortex.onpair code window [{codeStart}, {codeEnd}) is not within the {codes.Length} codes.");
+        var window = CodeWindow(codes, (int)codeStart, (int)codeEnd, numTokens);
 
+        // Row by row, so every boundary is checked: nondecreasing and within the
+        // window, and decoding to exactly the row's recorded length.
         var values = new byte[total];
-        long written = 0;
-        int numTokens = dictOffsets.Length - 1;
-        for (long c = codeStart; c < codeEnd; c++)
+        int written = 0;
+        for (int i = 0; i < rowCount; i++)
         {
-            long code = codes[c];
-            if ((ulong)code >= (ulong)numTokens)
+            long runStart = codesOffsets[i], runEnd = codesOffsets[i + 1];
+            if (runEnd < runStart || runEnd > codeEnd)
                 throw new VortexFormatException(
-                    $"vortex.onpair code {code} at position {c} is out of range (dictionary has {numTokens} tokens).");
-            int begin = checked((int)dictOffsets[code]);
-            int len = checked((int)(dictOffsets[code + 1] - begin));
-            if (written + len > total)
+                    $"vortex.onpair codes_offsets at row {i} ({runStart} to {runEnd}) decrease or pass the window end {codeEnd}.");
+            int rowEnd = checked(written + (int)lengths[i]);
+            for (long c = runStart; c < runEnd; c++)
+            {
+                var code = window[c - codeStart];
+                int begin = (int)dictOffsets[code];
+                int len = (int)dictOffsets[code + 1] - begin;
+                if (written + len > rowEnd)
+                    throw new VortexFormatException(
+                        $"vortex.onpair row {i} decodes to more than its {lengths[i]} recorded bytes.");
+                dictBytes.Slice(begin, len).CopyTo(values.AsSpan(written));
+                written += len;
+            }
+            if (written != rowEnd)
                 throw new VortexFormatException(
-                    "vortex.onpair codes decode to more bytes than uncompressed_lengths records.");
-            dictBytes.Slice(begin, len).CopyTo(values.AsSpan((int)written));
-            written += len;
+                    $"vortex.onpair row {i} decodes to {lengths[i] - (rowEnd - written)} bytes but records {lengths[i]}.");
         }
-        if (written != total)
-            throw new VortexFormatException(
-                $"vortex.onpair codes decoded to {written} bytes but uncompressed_lengths records {total}.");
 
         ArrowBuffer nullBuffer;
         int nullCount;
@@ -168,7 +185,7 @@ internal static class OnPairArrayDecoder
                 $"vortex.onpair dict_offsets end {offsets[numTokens]} exceeds dict_bytes length {dictBytesLength}.");
     }
 
-    private static long[] DecodeIntegers(
+    private static IArrowArray DecodeChild(
         ArrayNode node, SerializedArray serialized, IReadOnlyList<string> arraySpecs,
         int child, int ptype, long length, string name)
     {
@@ -179,26 +196,70 @@ internal static class OnPairArrayDecoder
                 $"vortex.onpair {name} has {array.Length} values, expected {length}.");
         if (array.NullCount != 0)
             throw new VortexFormatException($"vortex.onpair {name} must not contain nulls.");
+        return array;
+    }
 
-        var result = new long[length];
+    private static long[] ToInt64s(IArrowArray array)
+    {
+        var result = new long[array.Length];
         for (int i = 0; i < result.Length; i++)
-        {
-            result[i] = array switch
-            {
-                UInt8Array u8 => u8.GetValue(i)!.Value,
-                UInt16Array u16 => u16.GetValue(i)!.Value,
-                UInt32Array u32 => u32.GetValue(i)!.Value,
-                UInt64Array u64 => checked((long)u64.GetValue(i)!.Value),
-                Int8Array i8 => i8.GetValue(i)!.Value,
-                Int16Array i16 => i16.GetValue(i)!.Value,
-                Int32Array i32 => i32.GetValue(i)!.Value,
-                Int64Array i64 => i64.GetValue(i)!.Value,
-                _ => throw new VortexFormatException(
-                    $"vortex.onpair {name} decoded to unsupported array type {array.GetType().Name}."),
-            };
-        }
+            result[i] = ValueAt(array, i);
         return result;
     }
+
+    /// <summary>
+    /// Codes <c>[start, end)</c> as token ids, each checked against the dictionary. Only the
+    /// window is copied, at two bytes a code; the child decoders materialize a child whole, so
+    /// the full <c>codes</c> array has already been decoded.
+    /// </summary>
+    private static ushort[] CodeWindow(IArrowArray codes, int start, int end, int numTokens)
+    {
+        var window = new ushort[end - start];
+        switch (codes)
+        {
+            case UInt16Array u16:
+                {
+                    var src = u16.Values.Slice(start, end - start);
+                    for (int i = 0; i < src.Length; i++)
+                        window[i] = CheckCode(src[i], start + i, numTokens);
+                    break;
+                }
+            case UInt8Array u8:
+                {
+                    var src = u8.Values.Slice(start, end - start);
+                    for (int i = 0; i < src.Length; i++)
+                        window[i] = CheckCode(src[i], start + i, numTokens);
+                    break;
+                }
+            default:
+                for (int i = 0; i < window.Length; i++)
+                    window[i] = CheckCode(ValueAt(codes, start + i), start + i, numTokens);
+                break;
+        }
+        return window;
+    }
+
+    private static ushort CheckCode(long code, long position, int numTokens) =>
+        (ulong)code < (ulong)numTokens
+            ? (ushort)code
+            : throw new VortexFormatException(
+                $"vortex.onpair code {code} at position {position} is out of range (dictionary has {numTokens} tokens).");
+
+    private static long ValueAt(IArrowArray array, int i) => array switch
+    {
+        UInt8Array u8 => u8.GetValue(i)!.Value,
+        UInt16Array u16 => u16.GetValue(i)!.Value,
+        UInt32Array u32 => u32.GetValue(i)!.Value,
+        UInt64Array u64 => u64.GetValue(i)!.Value <= long.MaxValue
+            ? (long)u64.GetValue(i)!.Value
+            : throw new VortexFormatException($"vortex.onpair value {u64.GetValue(i)} does not fit a signed 64-bit integer."),
+        Int8Array i8 => i8.GetValue(i)!.Value,
+        Int16Array i16 => i16.GetValue(i)!.Value,
+        Int32Array i32 => i32.GetValue(i)!.Value,
+        Int64Array i64 => i64.GetValue(i)!.Value,
+        _ => throw new VortexFormatException(
+            $"vortex.onpair child decoded to unsupported array type {array.GetType().Name}."),
+    };
 
     private readonly record struct Metadata(
         int UncompressedLengthsPtype,

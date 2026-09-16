@@ -8,6 +8,7 @@ using EngineeredWood.IO.Local;
 using EngineeredWood.Vortex.Encodings;
 using EngineeredWood.Vortex.Format;
 using EngineeredWood.Vortex.Tests.TestData;
+using EngineeredWood.Vortex.Tests.TestHelpers;
 
 namespace EngineeredWood.Vortex.Tests;
 
@@ -88,6 +89,101 @@ public class VortexOnPairTests
         Assert.Equal(20_000, row);
     }
 
+    // Corrupt copies of the hand-built fixture: each must fail as a format error, not as an
+    // index or allocation failure, however the bad value would have been used.
+
+    [Fact]
+    public async Task RejectsDecreasingInteriorRowOffset()
+    {
+        var bytes = await PatchChild(HandBuilt, child: 2, (buf, width) =>
+            Write(buf, width, 10, Read(buf, width, 11) + 1));
+        await AssertRejected(bytes, "vortex.onpair");
+    }
+
+    [Fact]
+    public async Task RejectsInteriorRowOffsetPastTheCodes()
+    {
+        var bytes = await PatchChild(HandBuilt, child: 2, (buf, width) =>
+            Write(buf, width, 5, 1_000_000));
+        await AssertRejected(bytes, "codes_offsets");
+    }
+
+    [Fact]
+    public async Task RejectsCodeOutsideTheDictionary()
+    {
+        var bytes = await PatchChild(HandBuilt, child: 1, (buf, width) =>
+            Write(buf, width, 0, (1L << (8 * width)) - 1));
+        await AssertRejected(bytes, "out of range");
+    }
+
+    [Fact]
+    public async Task RejectsEmptyDictionaryToken()
+    {
+        var bytes = await PatchChild(HandBuilt, child: 0, (buf, width) =>
+            Write(buf, width, 1, 0));
+        await AssertRejected(bytes, "tokens are 1 to 16 bytes");
+    }
+
+    private static async Task AssertRejected(byte[] file, string messagePart)
+    {
+        using var stream = new ByteArrayRandomAccessFile(file);
+        await using var reader = await VortexFileReader.OpenAsync(stream);
+        var ex = await Assert.ThrowsAsync<VortexFormatException>(async () => await reader.ReadColumnAsync(0));
+        Assert.Contains(messagePart, ex.Message);
+    }
+
+    /// <summary>
+    /// The fixture's bytes with <paramref name="patch"/> applied to the data buffer of the given
+    /// child of its OnPair array (the root of segment 0). The patch gets the buffer and its
+    /// element width, derived from the child's value count.
+    /// </summary>
+    private static async Task<byte[]> PatchChild(string fixture, int child, Action<byte[], int> patch)
+    {
+        var path = TestDataPath.Resolve(fixture);
+        var bytes = File.ReadAllBytes(path);
+        long segmentOffset, segmentLength;
+        await using (var reader = await VortexFileReader.OpenAsync(path))
+        {
+            segmentOffset = checked((long)reader.SegmentSpecs[0].Offset);
+            segmentLength = checked((long)reader.SegmentSpecs[0].Length);
+        }
+        var node = (await OnPairNodes(fixture))[0];
+        var (offset, length) = LocateChildBuffer(bytes, (int)segmentOffset, (int)segmentLength, child);
+        long count = child switch
+        {
+            0 => (long)node.DictSize + 1,
+            1 => (long)node.CodesLen,
+            _ => 65,
+        };
+        int width = checked((int)(length / count));
+        var buffer = bytes.AsSpan(offset, length).ToArray();
+        patch(buffer, width);
+        buffer.CopyTo(bytes, offset);
+        return bytes;
+    }
+
+    private static (int Offset, int Length) LocateChildBuffer(
+        byte[] file, int segmentOffset, int segmentLength, int child)
+    {
+        var serialized = SerializedArray.Parse(file.AsSpan(segmentOffset, segmentLength));
+        var bufferRef = serialized.Message.Root.Child(child).BufferRef(0);
+        return (segmentOffset + serialized.BufferOffset(bufferRef), serialized.BufferBytes(bufferRef).Length);
+    }
+
+    private static long Read(byte[] buf, int width, int index)
+    {
+        long value = 0;
+        for (int b = width - 1; b >= 0; b--)
+            value = (value << 8) | buf[index * width + b];
+        return value;
+    }
+
+    private static void Write(byte[] buf, int width, int index, long value)
+    {
+        for (int b = 0; b < width; b++)
+            buf[index * width + b] = (byte)(value >> (8 * b));
+    }
+
     /// <summary>Port of <c>onpair_row</c> in the fixture generator.</summary>
     private static string? Row(int i) => (i % 9) switch
     {
@@ -128,7 +224,7 @@ public class VortexOnPairTests
         }
     }
 
-    private sealed record OnPairNode(ulong CodesLen, IReadOnlyList<string> ChildEncodings);
+    private sealed record OnPairNode(ulong CodesLen, ulong DictSize, IReadOnlyList<string> ChildEncodings);
 
     /// <summary>Every <c>vortex.onpair</c> array node in the file's segments.</summary>
     private static async Task<List<OnPairNode>> OnPairNodes(string fixture)
@@ -156,14 +252,15 @@ public class VortexOnPairTests
             for (int i = 0; i < node.ChildCount; i++)
                 children.Add(specs[node.Child(i).EncodingIndex]);
             var meta = node.Metadata;
-            found.Add(new OnPairNode(CodesLen(meta.Length == 0 ? default : meta.RawBytes(meta.Length)), children));
+            var raw = meta.Length == 0 ? default : meta.RawBytes(meta.Length);
+            found.Add(new OnPairNode(MetadataField(raw, 4), MetadataField(raw, 3), children));
         }
         for (int i = 0; i < node.ChildCount; i++)
             Collect(node.Child(i), specs, found);
     }
 
-    /// <summary>Field 4 of <c>OnPairMetadata</c>.</summary>
-    private static ulong CodesLen(ReadOnlySpan<byte> metadata)
+    /// <summary>A varint field of <c>OnPairMetadata</c> (3 = dict_size, 4 = codes_len).</summary>
+    private static ulong MetadataField(ReadOnlySpan<byte> metadata, int field)
     {
         int pos = 0;
         while (pos < metadata.Length)
@@ -172,7 +269,7 @@ public class VortexOnPairTests
             if ((tag & 7) != 0)
                 throw new InvalidOperationException("OnPairMetadata has only varint fields.");
             var value = (ulong)Varint.ReadUnsigned(metadata, ref pos);
-            if (tag >> 3 == 4)
+            if (tag >> 3 == (ulong)field)
                 return value;
         }
         return 0;
