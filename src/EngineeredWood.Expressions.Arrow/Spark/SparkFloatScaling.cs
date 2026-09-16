@@ -16,8 +16,15 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <c>mantissa x scale x 10^shift</c>, and the digits of <c>mantissa x scale</c> ARE the value's.
 /// That is correct for every input and it is why it is still there, but the expansion reaches 767
 /// digits for a subnormal double, and even an ordinary magnitude costs a handful of big-integer
-/// divisions per row — 0.86us against the 0.22us of the round-and-probe ladder it replaced
-/// (#337, #338). This runs for every row of every cast to a string or a wide decimal.
+/// divisions per row — 0.32us against the 0.14us of the round-and-probe ladder it replaced
+/// (#337, #338), and 1.42us where the exponent is far from zero. This runs for every row of every
+/// cast to a string or a wide decimal.
+/// <para>
+/// Those are per-process measurements. #351 published 0.86us and 0.22us for the same two, taken by
+/// interleaving the implementations in ONE process, where tiering and the shared heap move a
+/// number by up to 4x — reversing the order changed the answers. Measure one implementation per
+/// process.
+/// </para>
 /// </para>
 /// <para>
 /// <b>The whole question fits in machine words once both sides are scaled into the same
@@ -272,14 +279,27 @@ internal static class SparkFloatScaling
 
     /// <summary>The chosen candidate's significant digits, with the trailing zeros dropped.</summary>
     /// <remarks>
-    /// The candidate is a multiple of <c>10^(maxDigits - length)</c> by construction, so dividing
-    /// those zeros away is exact. Java counts a decimal's length without trailing zeros, which is
-    /// how a two-digit candidate ending in one comes back as the one-digit answer.
+    /// The candidate is a multiple of <c>10^(maxDigits - length)</c> by construction, so dropping
+    /// those zeros is exact. Java counts a decimal's length without trailing zeros, which is how a
+    /// two-digit candidate ending in one comes back as the one-digit answer.
+    /// <para>
+    /// <b>Scanned by hand rather than by <c>TrimEnd('0')</c>, which is not the same call on every
+    /// target.</b> netstandard2.0 has no single-character overload, so it binds to
+    /// <c>TrimEnd(params char[])</c> and allocates a one-element array on every render — on the
+    /// path this whole type exists to keep cheap. The scan also returns the original instance when
+    /// there is nothing to drop, which is the common case at full length.
+    /// </para>
     /// </remarks>
-    private static string Digits(long chosen) =>
-        chosen.ToString(CultureInfo.InvariantCulture).TrimEnd('0') is { Length: > 0 } trimmed
-            ? trimmed
-            : "0";
+    private static string Digits(long chosen)
+    {
+        var text = chosen.ToString(CultureInfo.InvariantCulture);
+
+        var end = text.Length;
+        while (end > 1 && text[end - 1] == '0')
+            end--;
+
+        return end == text.Length ? text : text.Substring(0, end);
+    }
 
     private static readonly long[] Pow10 =
     {
@@ -440,7 +460,10 @@ internal static class SparkFloatScaling
 
             var index = power - Lowest;
 
-            if (!Built[index])
+            // ACQUIRE, to pair with the release at the end of Fill. A plain read here would let
+            // the three array reads below be hoisted above it on a weakly-ordered target, so a
+            // thread could see the row marked built and still read the zeros it was born with.
+            if (!Volatile.Read(ref Built[index]))
                 Fill(power, index);
 
             high = Highs[index];
