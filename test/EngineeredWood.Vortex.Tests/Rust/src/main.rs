@@ -115,6 +115,9 @@ async fn main() -> std::io::Result<()> {
     write_zigzag_widths(&session, &out_dir.join("zigzag_widths_64rows.vortex"), None).await?;
     write_zigzag_widths(&session, &out_dir.join("zigzag_sliced_59rows.vortex"), Some(5..64)).await?;
     write_zigzag_default(&session, &out_dir.join("zigzag_default_20000rows.vortex")).await?;
+    write_zstd_single_frame(&session, &out_dir.join("zstd_string_64rows.vortex")).await?;
+    write_zstd_framed(&session, &out_dir.join("zstd_framed_2000rows.vortex")).await?;
+    write_zstd_compact(&session, &out_dir.join("zstd_compact_20000rows.vortex")).await?;
 
     Ok(())
 }
@@ -1786,4 +1789,132 @@ async fn write_zigzag_default(session: &VortexSession, path: &PathBuf) -> std::i
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())
+}
+
+/// Row `i` of the vortex.zstd fixtures: short sentences built from a small
+/// vocabulary, so they compress, with an empty string and non-ASCII text.
+fn zstd_row(i: usize) -> String {
+    const WORDS: [&str; 12] = [
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+        "zstd", "frames", "façade", "日本",
+    ];
+    if i % 17 == 3 {
+        return String::new();
+    }
+    let n = 3 + (i * 7) % 9;
+    (0..n)
+        .map(|k| WORDS[(i * 31 + k * 11) % WORDS.len()])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Writes each column as-is: a flat strategy has no compressor.
+fn flat_strategy() -> Arc<TableStrategy> {
+    Arc::new(TableStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(FlatLayoutStrategy::default()),
+    ))
+}
+
+async fn write_bytes(
+    session: &VortexSession,
+    path: &PathBuf,
+    data: vortex_array::ArrayRef,
+    strategy: Arc<dyn vortex_layout::LayoutStrategy>,
+) -> std::io::Result<()> {
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// A hand-built vortex.zstd string column compressed as one frame, which is
+/// too few samples to train a dictionary. Null on every fifth row.
+async fn write_zstd_single_frame(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_zstd::Zstd;
+
+    let rows: Vec<Option<String>> = (0..64).map(|i| (i % 5 != 0).then(|| zstd_row(i))).collect();
+    let strings = VarBinViewArray::from_iter_nullable_str(rows.iter().map(|r| r.as_deref()));
+    let mut ctx = session.create_execution_ctx();
+    let zstd = Zstd::from_var_bin_view(&strings, 3, 0, &mut ctx).expect("zstd").into_array();
+    let data = StructArray::from_fields(&[("s", zstd)]).expect("from_fields").into_array();
+    write_bytes(session, path, data, flat_strategy()).await
+}
+
+/// Hand-built vortex.zstd columns split into 100-value frames that share a
+/// trained dictionary (20 frames is enough samples to train one):
+///   s: nullable utf8, `zstd_row(i)`, null on every fifth row
+///   b: binary, `zstd_row(i)`'s bytes followed by a 0xff byte
+///   n: nullable i64, i * i - 1000, null on every seventh row
+async fn write_zstd_framed(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_zstd::Zstd;
+
+    const ROWS: usize = 2000;
+    let mut ctx = session.create_execution_ctx();
+
+    let rows: Vec<Option<String>> = (0..ROWS).map(|i| (i % 5 != 0).then(|| zstd_row(i))).collect();
+    let strings = VarBinViewArray::from_iter_nullable_str(rows.iter().map(|r| r.as_deref()));
+    let s = Zstd::from_var_bin_view(&strings, 3, 100, &mut ctx).expect("zstd s");
+
+    let blobs: Vec<Vec<u8>> = (0..ROWS)
+        .map(|i| {
+            let mut v = zstd_row(i).into_bytes();
+            v.push(0xff);
+            v
+        })
+        .collect();
+    let binary = VarBinViewArray::from_iter_bin(blobs.iter().map(|b| b.as_slice()));
+    let b = Zstd::from_var_bin_view(&binary, 3, 100, &mut ctx).expect("zstd b");
+
+    let numbers = PrimitiveArray::new(
+        vortex_buffer::Buffer::from_iter((0..ROWS).map(|i| (i * i) as i64 - 1000)),
+        Validity::from_iter((0..ROWS).map(|i| i % 7 != 0)),
+    );
+    let n = Zstd::from_primitive(&numbers, 3, 100, &mut ctx).expect("zstd n");
+    let data = StructArray::from_fields(&[("s", s.into_array()), ("b", b.into_array()), ("n", n.into_array())])
+        .expect("from_fields")
+        .into_array();
+    write_bytes(session, path, data, flat_strategy()).await
+}
+
+/// Row `i` of `write_zstd_compact`: five sentences joined, null on every
+/// thirteenth row.
+fn zstd_compact_row(i: usize) -> Option<String> {
+    (i % 13 != 0).then(|| {
+        format!(
+            "{} / {} / {} / {} / {}",
+            zstd_row(i),
+            zstd_row(i / 3),
+            zstd_row(i / 7),
+            zstd_row(i / 11),
+            zstd_row(i / 19)
+        )
+    })
+}
+
+/// The same rows as utf8 (`s`) and as binary (`b`) through upstream's
+/// "compact" write strategy, which adds vortex.zstd to the string and binary
+/// schemes. For binary, the only competition is dictionary and plain varbin,
+/// so zstd wins; for utf8, OnPair and FSST compete too.
+async fn write_zstd_compact(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex::compressor::BtrBlocksCompressorBuilder;
+    use vortex_file::WriteStrategyBuilder;
+
+    const ROWS: usize = 20_000;
+    let rows: Vec<Option<String>> = (0..ROWS).map(zstd_compact_row).collect();
+    let s = VarBinViewArray::from_iter_nullable_str(rows.iter().map(|r| r.as_deref())).into_array();
+    let b = VarBinViewArray::from_iter_nullable_bin(rows.iter().map(|r| r.as_deref().map(str::as_bytes)))
+        .into_array();
+    let data = StructArray::from_fields(&[("s", s), ("b", b)]).expect("from_fields").into_array();
+
+    let strategy = WriteStrategyBuilder::default()
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    write_bytes(session, path, data, strategy).await
 }

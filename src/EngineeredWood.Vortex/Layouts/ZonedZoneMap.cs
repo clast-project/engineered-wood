@@ -364,16 +364,6 @@ internal static class ZonedZoneMap
         return new ZoneAggregate(id, options);
     }
 
-    private static void SkipField(ReadOnlySpan<byte> span, ref int pos, ulong wireType)
-    {
-        switch (wireType)
-        {
-            case 0: Varint.ReadUnsigned(span, ref pos); break;
-            case 1: pos += 8; break;
-            case 2: pos += checked((int)Varint.ReadUnsigned(span, ref pos)); break;
-            case 5: pos += 4; break;
-            default:
-                throw new VortexFormatException($"Unsupported protobuf wire type {wireType} in vortex.zoned metadata.");
-        }
-    }
+    private static void SkipField(ReadOnlySpan<byte> span, ref int pos, ulong wireType) =>
+        Encodings.ProtobufWire.SkipField(span, ref pos, wireType, "vortex.zoned metadata");
 }

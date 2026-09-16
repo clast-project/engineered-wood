@@ -516,10 +516,13 @@ small integer index:
 - `segment_specs` — `(offset, length, alignment_exponent,
   compression_codec)` per segment.
 
-Segment compression is wired through to Core's `CompressionCodec` —
-`None` is implemented; LZ4 / ZLib / ZStd are recognised in the
-locator but rejected at decode time pending fixtures that exercise
-them. Encryption is rejected outright.
+Segment compression is mapped to Core's `CompressionCodec`, but only
+`None` is read: the footer schema reserves the field ("not used in the
+current version of the file format"), no upstream writer sets it, and a
+segment records no uncompressed length, so LZ4 / ZLib / ZStd segments are
+refused. The array schema's per-buffer `LZ4` flag is reserved the same
+way. Compression that writers do use lives in array encodings, such as
+`vortex.zstd`. Encryption is rejected outright.
 
 ### FlatBuffers without codegen
 
@@ -632,7 +635,7 @@ Per-encoding decoder classes, dispatched by encoding string in
 | Primitive | `vortex.primitive` (nullable + non-nullable), `vortex.constant`, `vortex.sequence`, `vortex.null` |
 | Bool | `vortex.bool` (LSB-packed bitmap), `vortex.bytebool` |
 | String / Binary | `vortex.varbin`, `vortex.varbinview`, `vortex.fsst` (via `Clast.Fsst`), `vortex.onpair` (a token dictionary of 1–16-byte strings addressed by u16 codes) |
-| Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked`, `vortex.zigzag` (signed integers) |
+| Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked`, `vortex.zigzag` (signed integers), `vortex.zstd` (primitive / string / binary, framed, with or without a shared dictionary, via `ZstdSharp`) |
 | Float | `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.pco` (via `Clast.Pcodec`) |
 | FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` (signed and unsigned integers) |
 | Composite | `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`, `vortex.struct`, `vortex.ext` |

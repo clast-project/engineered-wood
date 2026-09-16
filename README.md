@@ -555,8 +555,7 @@ implementation.
 `vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
 `vortex.time` / `vortex.uuid`), `fastlanes.bitpacked` (with patches),
 `fastlanes.for`, `fastlanes.rle`, `fastlanes.delta` (signed and unsigned),
-`vortex.zigzag`,
-`vortex.pco`.
+`vortex.zigzag`, `vortex.zstd`, `vortex.pco`.
 
 **Array encodings — write**: `vortex.primitive`, `vortex.bool`,
 `vortex.varbin`, `vortex.varbinview`, `vortex.constant`,
@@ -573,9 +572,11 @@ and patches), `fastlanes.for`, `fastlanes.delta`, `fastlanes.rle`
 ### Storage and compression
 
 - Uses the existing offset-based `IRandomAccessFile`. Per-segment
-  compression — `None` is implemented today; `LZ4`/`ZLib`/`ZStd` are
-  recognised in the segment locator but rejected at decode time pending
-  fixtures that exercise them. Encryption is rejected outright.
+  compression: only `None` is read. The format reserves the
+  `LZ4`/`ZLib`/`ZStd` segment codecs without defining them (no writer sets
+  them, and a segment records no uncompressed length), so a segment that
+  names one is refused. Compression that writers use lives in array
+  encodings such as `vortex.zstd`. Encryption is rejected outright.
 
 ### Multi-targeting
 
