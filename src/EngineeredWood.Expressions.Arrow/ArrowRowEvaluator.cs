@@ -318,35 +318,69 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// Asks about every member of a set test whose type and the operand's can both be read
-    /// without evaluating either, and reports which members it asked about.
+    /// Asks about a set test whose operand and members can all be typed without evaluating any of
+    /// them, and reports whether it asked.
     /// </summary>
     /// <remarks>
-    /// Null when nothing could be asked — an operand with no readable type — so that the fallback
-    /// asks about every member rather than none.
+    /// <para>
+    /// ONE question over the whole list, not one per member. <c>IN</c> resolves a single type over
+    /// the operand and every member, so a list can be refused although each pair in it would be
+    /// accepted — measured, <c>a = bl</c> answers under the legacy dialect and <c>a IN (bl)</c>
+    /// is refused under both. See <see cref="IAnalysisRules.CheckSetComparison"/>.
+    /// </para>
+    /// <para>
+    /// All or nothing: a member that cannot be typed from the tree leaves the whole list to the
+    /// fallback, because a list asked about with one of its members missing is a different list.
+    /// A bare <c>NULL</c> is not missing, though — it is left OUT, since Spark types one
+    /// <c>void</c> and a void constrains the resolution no more than it constrains a comparison.
+    /// </para>
+    /// <para>
+    /// <b>That applies to the OPERAND as well as to a member</b>, and reading it as "cannot be
+    /// typed, so give up" was a hole: measured on 4.0.3, <c>NULL IN (1, TRUE)</c> is refused in
+    /// both dialects — the void operand does not excuse the members from agreeing with each other
+    /// — while giving up left it unasked and answering. Caught by the Copilot reviewer on #346.
+    /// </para>
     /// </remarks>
-    private bool[]? CheckSetFromTree(SetPredicate set, RecordBatch batch)
+    private bool CheckSetFromTree(SetPredicate set, RecordBatch batch)
     {
         if (_analysis is null)
-            return null;
+            return false;
 
-        var operandType = AnalysisType(set.Operand, batch);
-        if (operandType is null)
-            return null;
+        var types = new List<IArrowType>(set.Values.Count + 1);
 
-        var asked = new bool[set.Values.Count];
-        for (var k = 0; k < set.Values.Count; k++)
+        if (!IsNullLiteral(set.Operand))
         {
-            var memberType = AnalysisType(set.Values[k], batch);
-            if (memberType is null)
-                continue;
+            var operandType = AnalysisType(set.Operand, batch);
+            if (operandType is null)
+                return false;
 
-            asked[k] = true;
-            Refuse(_analysis.CheckComparison(ComparisonOperator.Equal, operandType, memberType));
+            types.Add(operandType);
         }
 
-        return asked;
+        foreach (var member in set.Values)
+        {
+            if (IsNullLiteral(member))
+                continue;
+
+            var memberType = AnalysisType(member, batch);
+            if (memberType is null)
+                return false;
+
+            types.Add(memberType);
+        }
+
+        Refuse(_analysis.CheckSetComparison(types));
+        return true;
     }
+
+    /// <summary>Whether an expression is a bare <c>NULL</c> literal, structurally.</summary>
+    /// <remarks>
+    /// Read from the TREE rather than from a column that came back all null, which is the
+    /// discipline <see cref="IConditionalArguments.IsNullLiteral"/> records: a string column
+    /// holding nothing in this batch is not a void, and treating it as one retypes the answer.
+    /// </remarks>
+    private static bool IsNullLiteral(Expression expression) =>
+        expression is LiteralExpression literal && literal.Value.IsNull;
 
     /// <summary>
     /// The type an expression produces, read WITHOUT reading any of its values, or null when that
@@ -457,29 +491,27 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// Refuses a set test whose operand cannot be compared against one of its members.
     /// </summary>
     /// <remarks>
-    /// Asked per MEMBER against the operand rather than once over the set's resolved type,
-    /// because legality and coercion are different questions:
-    /// <see cref="IComparisonCoercion.SetComparisonTarget"/> resolves ONE type over the operand
-    /// and the whole list, while whether a member can be compared at all is a property of that
-    /// member and the operand alone. Measured for #286, <c>a IN (bl)</c> is refused as an
-    /// ordinary cross-family comparison and needs no rule of its own.
+    /// The fallback behind <see cref="CheckSetFromTree"/>, reached only when that could not type
+    /// the operand or one of the members without evaluating it. Asks the same single question
+    /// over the same list; see <see cref="IAnalysisRules.CheckSetComparison"/> for why it is one
+    /// question and not one per member.
     /// </remarks>
     private void CheckSetMembers(
         IArrowType? operandType, LiteralValue?[] operand,
-        SetMember[] members, IArrowType?[] memberTypes, bool[]? askedFromTree)
+        SetMember[] members, IArrowType?[] memberTypes, bool askedFromTree)
     {
-        if (_analysis is null)
+        if (_analysis is null || askedFromTree)
             return;
 
-        var type = ReadType(operandType, operand);
-        if (type is null)
-            return;
-
+        // An operand with no readable type is the value-side spelling of a bare NULL, and is left
+        // OUT rather than abandoning the check -- see CheckSetFromTree for the measurement.
+        var types = new List<IArrowType>(members.Length + 1);
+        if (ReadType(operandType, operand) is { } type)
+            types.Add(type);
         for (var k = 0; k < members.Length; k++)
         {
-            if (askedFromTree is not null && askedFromTree[k])
-                continue;
-
+            // A member null in every row with no declared type is the value-side spelling of a
+            // bare NULL literal, and is left out for the same reason.
             var memberType = memberTypes[k]
                 ?? (members[k].IsConstant
                     ? members[k].Constant is { } constant
@@ -487,9 +519,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                         : null
                     : ReadType(null, members[k].PerRow));
 
-            if (memberType is not null)
-                Refuse(_analysis.CheckComparison(ComparisonOperator.Equal, type, memberType));
+            if (memberType is null)
+                continue;
+
+            types.Add(memberType);
         }
+
+        Refuse(_analysis.CheckSetComparison(types));
     }
 
     /// <summary>
@@ -1196,7 +1232,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         // Before any member is evaluated, for the reason EvalComparison gives: a member that
         // raises must not displace the refusal of a member whose TYPE is already wrong.
-        var askedFromTree = CheckSetFromTree(set, batch);
+        bool askedFromTree = CheckSetFromTree(set, batch);
 
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 

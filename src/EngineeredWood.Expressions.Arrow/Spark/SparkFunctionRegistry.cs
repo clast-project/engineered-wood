@@ -35,7 +35,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry
     : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
-      ILiteralPrecisionRules
+      ILiteralPrecisionRules, IAnalysisRules
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -1001,6 +1001,224 @@ public sealed class SparkFunctionRegistry
             or ComparisonOperator.NullSafeEqual
             ? other
             : null;
+    }
+
+    // ── Analysis: what Spark's analyzer refuses on type grounds (#286) ────────────────────────
+
+    /// <summary>
+    /// The family a type compares within. Operands must share one, and a STRING shares every one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// MEASURED, not read off Spark's source: the `comparison-families` group asks all 81 ordered
+    /// pairs of the nine types EW models, under `=`, `&lt;&gt;`, `&lt;=&gt;`, `&lt;` and `IN`, in
+    /// both dialects. The whole 405-expression matrix collapses to these four families plus the
+    /// string row and column, and it is the SAME table for every one of those operators.
+    /// </para>
+    /// <para>
+    /// <see cref="Unknown"/> is every type this does not name — a struct, a list, a map, a time.
+    /// It accepts rather than refuses, which is the direction that cannot break a caller: this
+    /// answers only where Spark's analyzer would have refused, and a type the matrix never asked
+    /// about is one we have no measurement for.
+    /// </para>
+    /// </remarks>
+    private enum Family
+    {
+        Unknown,
+        Numeric,
+        Temporal,
+        Boolean,
+        Binary,
+        Text,
+    }
+
+    private static Family FamilyOf(IArrowType type) =>
+        type switch
+        {
+            StringType => Family.Text,
+            BooleanType => Family.Boolean,
+            BinaryType => Family.Binary,
+            TimestampType => Family.Temporal,
+            _ when SparkArrays.IsDateType(type) => Family.Temporal,
+            _ when SparkNumericTypes.IsNumeric(type) => Family.Numeric,
+            _ => Family.Unknown,
+        };
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// The family rule, and the one exception to it: under the LEGACY dialect a boolean joins the
+    /// numeric family for equality — Spark's <c>BooleanEquality</c>, which
+    /// <see cref="BooleanEqualityTarget"/> then actually performs. The two must agree, and that is
+    /// not a tidiness point: a check that refused what the coercion goes on to cast would turn
+    /// #333's fixed answers straight back into refusals, which is exactly the 24 legacy rows a
+    /// naive family check over-refused when this was first measured.
+    /// </para>
+    /// <para>
+    /// A <c>void</c> operand is comparable with everything and is accepted here. It reaches this
+    /// method only as a typed null — <c>ArrowRowEvaluator</c> does not ask about a bare
+    /// <c>NULL</c> literal at all, having no type to ask with.
+    /// </para>
+    /// </remarks>
+    public AnalysisDiagnostic? CheckComparison(
+        ComparisonOperator op, IArrowType left, IArrowType right)
+    {
+        if (left is null)
+            throw new ArgumentNullException(nameof(left));
+        if (right is null)
+            throw new ArgumentNullException(nameof(right));
+
+        // A VOID operand is comparable with everything, ORDERING INCLUDED. Measured on 4.0.3,
+        // `NULL = bl`, `NULL = a` and even `NULL < bl` all resolve `boolean` in both dialects,
+        // where the same expressions over a typed null do not: `CAST(NULL AS INT) = bl` is
+        // refused under ANSI. So it is the absence of a type that is permissive, not nullness.
+        if (left is NullType || right is NullType)
+            return null;
+
+        if (Comparable(op, left, right))
+            return null;
+
+        return new AnalysisDiagnostic(
+            "DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES",
+            "the left and right operands of the binary operator have incompatible types " +
+            $"(\"{SparkArrays.Describe(left)}\" and \"{SparkArrays.Describe(right)}\").");
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// <b>A set is not the disjunction of its equalities, and the matrix says so twice.</b> Under
+    /// the legacy dialect <c>a = bl</c> answers and <c>a IN (bl)</c> is refused, so the boolean
+    /// exception above does NOT reach a set; and a set mixing a string with a boolean or a binary
+    /// is refused under legacy where ANSI resolves it, which no comparison does. Measured, those
+    /// four rows — <c>bl IN (s)</c>, <c>bin IN (s)</c>, <c>s IN (bl)</c>, <c>s IN (bin)</c> — are
+    /// the only ones where the two dialects disagree about a set.
+    /// </para>
+    /// <para>
+    /// So: every member must share one family, a string is compatible with every family under
+    /// ANSI, and under legacy a string is compatible with every family EXCEPT boolean and binary.
+    /// Spark's own name for the failure is <c>DATA_DIFF_TYPES</c> rather than the binary
+    /// operator's class, and the list it prints is the members in order.
+    /// </para>
+    /// </remarks>
+    public AnalysisDiagnostic? CheckSetComparison(IReadOnlyList<IArrowType> memberTypes)
+    {
+        if (memberTypes is null)
+            throw new ArgumentNullException(nameof(memberTypes));
+
+        // A VOID MEMBER CONSTRAINS NOTHING and is dropped before anything is judged -- the same
+        // rule `CoerceSet` applies when it resolves the set's cast target. What is left still has
+        // to agree: measured, `NULL IN (1, TRUE)` is refused in both dialects while
+        // `NULL IN (1, 2)` resolves, so dropping the void does not excuse the rest of the list.
+        if (memberTypes.Any(t => t is NullType))
+        {
+            var typed = new List<IArrowType>(memberTypes.Count);
+            foreach (var type in memberTypes)
+            {
+                if (type is not NullType)
+                    typed.Add(type);
+            }
+
+            memberTypes = typed;
+        }
+
+        // SCANNED FOR UNKNOWNS FIRST, so the answer cannot depend on the ORDER of the members.
+        // Returning "no opinion" the moment one is met made `[INT, BOOLEAN, STRUCT]` a refusal
+        // and `[STRUCT, INT, BOOLEAN]` an acceptance -- the same set, two answers, decided by
+        // where the unmeasured type happened to sit. Since the promise this method makes is no
+        // opinion about a list containing a type the matrix never asked about, it has to look for
+        // one before judging anything.
+        foreach (var type in memberTypes)
+        {
+            if (FamilyOf(type) == Family.Unknown)
+                return null;
+        }
+
+        var resolved = Family.Unknown;
+        bool anyText = false;
+
+        foreach (var type in memberTypes)
+        {
+            var family = FamilyOf(type);
+            if (family == Family.Text)
+            {
+                anyText = true;
+                continue;
+            }
+
+            if (resolved == Family.Unknown)
+                resolved = family;
+            else if (resolved != family)
+                return DataDiffTypes(memberTypes);
+        }
+
+        // A string PROMOTES to the one family the rest of the list shares -- except in the legacy
+        // dialect, where Spark's string promotion excludes boolean and binary and the set is
+        // refused instead. An all-string list resolves as text and needs no rule at all.
+        if (anyText && !_options.Ansi && resolved is Family.Boolean or Family.Binary)
+            return DataDiffTypes(memberTypes);
+
+        return null;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <b>Not implemented yet, and null is the interface's "nothing refused".</b> The cast table
+    /// is the third slice of #286 — 17 ANSI rows and 25 legacy ones — and it lands with #332,
+    /// whose two directions are rows of it. Answering null here leaves every cast exactly as it
+    /// is rather than half-refusing a table that has not been written.
+    /// </remarks>
+    public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast) => null;
+
+    /// <summary>Whether two operands may be compared at all under this dialect.</summary>
+    private bool Comparable(ComparisonOperator op, IArrowType left, IArrowType right)
+    {
+        var leftFamily = FamilyOf(left);
+        var rightFamily = FamilyOf(right);
+
+        if (leftFamily == Family.Unknown || rightFamily == Family.Unknown)
+            return true;   // a type the matrix never asked about; no opinion
+
+        if (leftFamily == rightFamily)
+            return true;
+
+        // A STRING is comparable with every family, in both dialects. WHICH operand then moves,
+        // and to what, is `ComparisonTarget`'s answer and not this one's.
+        if (leftFamily == Family.Text || rightFamily == Family.Text)
+            return true;
+
+        // #333: a boolean joins the numeric family, under the legacy dialect and for equality
+        // only. Every other cross-family pair is refused.
+        //
+        // THE FAMILY DECIDES, NOT `BooleanEqualityTarget`. That one answers a different question
+        // -- what to cast the boolean TO -- and it declines a Decimal256 because our own `Cast`
+        // cannot produce one, which is a limitation of ours rather than a rule of Spark's.
+        // Refusing here on its answer would turn `bl = wide256` from the null it answers today
+        // into an analysis refusal, which is the regression #345's review caught in the
+        // coercion and would simply reappear one layer up.
+        if (_options.Ansi)
+            return false;
+
+        if (!(leftFamily == Family.Boolean && rightFamily == Family.Numeric)
+            && !(rightFamily == Family.Boolean && leftFamily == Family.Numeric))
+        {
+            return false;
+        }
+
+        return op is ComparisonOperator.Equal
+            or ComparisonOperator.NotEqual
+            or ComparisonOperator.NullSafeEqual;
+    }
+
+    private static AnalysisDiagnostic DataDiffTypes(IReadOnlyList<IArrowType> memberTypes)
+    {
+        var names = new List<string>(memberTypes.Count);
+        foreach (var type in memberTypes)
+            names.Add($"\"{SparkArrays.Describe(type)}\"");
+
+        return new AnalysisDiagnostic(
+            "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+            $"Input to `in` should all be the same type, but it's [{string.Join(", ", names)}].");
     }
 
     /// <summary>
@@ -2974,6 +3192,17 @@ public sealed class SparkFunctionRegistry
 
         if (leftType is NullType || rightType is NullType)
             return (left, right);
+
+        // ANALYSED BEFORE THE ROW LOOP, because `nullif` reaches equality by a road
+        // `ArrowRowEvaluator` never travels: it is a function call, so the evaluator's own
+        // comparison check never sees the pair. Without this, `nullif(a, bl)` under ANSI ANSWERS
+        // over an empty or all-null batch and fails somewhere in `AreEqual` over any other --
+        // the refusal decided by the data, which is the defect #286 exists to remove rather than
+        // to relocate. The legacy dialect accepts the pair here exactly as it does for `=`,
+        // because `CheckComparison` carries #333's exception.
+        var diagnostic = CheckComparison(ComparisonOperator.Equal, leftType, rightType);
+        if (diagnostic is not null)
+            throw new ExpressionAnalysisException(diagnostic);
 
         // EQUAL, because that is the operator this site implements: `nullif(a, b)` is Spark's
         // `if(a = b, NULL, a)`. Measured, the boolean rule reaches it — `nullif(a, bl)` resolves

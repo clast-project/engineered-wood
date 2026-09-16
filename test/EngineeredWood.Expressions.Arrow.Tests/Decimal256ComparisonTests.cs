@@ -106,7 +106,13 @@ public sealed class Decimal256ComparisonTests
     /// Null is the right answer rather than a poor one: Spark's decimal stops at precision 38 and
     /// cannot name this type, so there is no rule to reproduce, and declining leaves the operands
     /// compared as they stand — which for a boolean against a decimal is no comparison at all.
-    /// ORDERING already answered null and still does, since it never takes the rule.
+    /// </para>
+    /// <para>
+    /// <b>The ANALYSIS check must not inherit the cast's limitation</b>, which is the trap #286's
+    /// comparison table walked into and out of. <c>CheckComparison</c> decides from the FAMILY —
+    /// a decimal256 is a numeric, so a legacy boolean equality against one is legal — and not from
+    /// <c>BooleanEqualityTarget</c>, which declines it because our own <c>Cast</c> cannot produce
+    /// one. Asking the coercion would have turned these rows back into refusals one layer up.
     /// </para>
     /// </remarks>
     [Theory]
@@ -114,7 +120,6 @@ public sealed class Decimal256ComparisonTests
     [InlineData("wide256 = bl")]
     [InlineData("bl <=> wide256")]
     [InlineData("bl <> wide256")]
-    [InlineData("wide256 < bl")]
     public void ABooleanAgainstADecimal256AnswersNullRatherThanThrowing(string expression)
     {
         var legacy = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false });
@@ -126,6 +131,29 @@ public sealed class Decimal256ComparisonTests
         // false for a pair with no comparison between them, exactly as it did before #333.
         var values = Assert.IsType<BooleanArray>(actual);
         Assert.Equal(expression.Contains("<=>") ? false : (bool?)null, values.GetValue(0));
+    }
+
+    /// <summary>
+    /// ORDERING against a decimal256 is REFUSED, because a boolean against a numeric is refused
+    /// at analysis in both dialects however wide the numeric is.
+    /// </summary>
+    /// <remarks>
+    /// It answered null until #286's comparison table landed, and the change is the table working
+    /// rather than the decimal256 guard leaking: the boolean exception is equality's alone, so
+    /// <c>wide256 &lt; bl</c> is refused for exactly the reason <c>a &lt; bl</c> is.
+    /// </remarks>
+    [Theory]
+    [InlineData("wide256 < bl")]
+    [InlineData("bl > wide256")]
+    public void OrderingAgainstADecimal256IsRefusedLikeAnyBooleanOrdering(string expression)
+    {
+        var legacy = new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false });
+
+        var refusal = Assert.Throws<ExpressionAnalysisException>(
+            () => new ArrowRowEvaluator(legacy)
+                .EvaluateExpression(SparkSqlParser.ParseExpression(expression), BooleanWideBatch()));
+
+        Assert.Equal("DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES", refusal.ErrorClass);
     }
 
     /// <summary>The registry declines directly, which is where this guard lives too.</summary>

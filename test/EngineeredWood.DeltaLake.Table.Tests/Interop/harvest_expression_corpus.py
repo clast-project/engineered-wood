@@ -149,7 +149,11 @@ LEGACY_GROUPS = (
     # #333. THE MEASUREMENT IS THE LEGACY COLUMN. Under ANSI every equality in the group is refused
     # at analysis -- that half belongs to #286 -- so an ANSI-only harvest would record a wall of
     # refusals and leave `BooleanEquality` itself entirely unmeasured.
-    "boolean-equality")
+    "boolean-equality",
+    # #286. The ANSI and legacy analyzers refuse DIFFERENT sets -- boolean joins the numeric
+    # family for equality under legacy and under ANSI it does not -- so the rule cannot be read
+    # off one dialect. Both halves are the measurement.
+    "comparison-families")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -203,6 +207,11 @@ ROWS = [
      "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
+
+# ONE COLUMN PER TYPE EngineeredWood MODELS, for the 9x9 matrix of #286. Every entry is a column
+# of SCHEMA above and they are deliberately columns rather than literals: a literal folds, and a
+# fold can take a different route through the analyzer than a reference does.
+COMPARISON_COLUMNS = ("a", "b", "g", "d1", "dt", "ts", "bl", "bin", "s")
 
 # --- Identifier case, which needs a schema of its own ----------------------------------
 # Issue #181. Spark resolves an identifier case-insensitively by default, and EngineeredWood did
@@ -3024,6 +3033,63 @@ GROUPS = {
         # A STRING against a boolean, which is NOT this rule and is asked so that a fix cannot
         # quietly widen to it: the string rules of #180/#259 own this pair.
         "s = bl", "ns = bl",
+    ],
+
+    # THE 9x9 COMPARISON MATRIX. #286, and the measurement the family rule is derived from rather
+    # than remembered: one column per type EW models, asked of both dialects, under the five
+    # shapes below.
+    #
+    # WHY IT IS GENERATED. 81 pairs x 5 shapes is 405 expressions, and writing them out by hand
+    # would invite exactly the gap this group exists to close -- a pair nobody thought to ask
+    # about becomes a rule nobody implemented. The ORDER matters and both directions are asked:
+    # which operand a rule moves is part of the answer (a string against a number is cast to the
+    # number; a string against a binary stays put and the BINARY is rendered as text).
+    #
+    # `<=>` is here beside `=` because it is an equality that never answers null, and `<` because
+    # ordering is where the boolean rule of #333 must NOT reach. `IN` is here because it is not
+    # the disjunction of equalities it resembles: it resolves ONE type over the whole list, so it
+    # can refuse a pair that `=` accepts -- measured, `a = bl` answers under the legacy dialect
+    # while `a IN (bl)` is refused in BOTH.
+    "comparison-families": [
+        f"{left} {op} {right}"
+        for op in ("=", "<>", "<=>", "<")
+        for left in COMPARISON_COLUMNS
+        for right in COMPARISON_COLUMNS
+    ] + [
+        f"{left} IN ({right})"
+        for left in COMPARISON_COLUMNS
+        for right in COMPARISON_COLUMNS
+    ] + [
+        # VOID, which the matrix cannot reach because `void` is not a column of SCHEMA and cannot
+        # be: a bare NULL is a LITERAL and only a literal. Spark types one `void`, which
+        # constrains nothing -- so the question is whether the rest of a set still has to agree
+        # among itself once a void is dropped from it, and whether a void operand exempts the
+        # members from each other.
+        #
+        # Asked because the answer decides a real branch: a void operand cannot be typed, so an
+        # analyzer that gives up when it meets one would skip `NULL IN (1, TRUE)` entirely.
+        "NULL IN (1, TRUE)",
+        "NULL IN (1, 2)",
+        "NULL IN (a, bl)",
+        "NULL IN (bl)",
+        "a IN (NULL, bl)",
+        "a IN (bl, NULL)",
+        "a IN (NULL, 1)",
+        "bl IN (NULL, a)",
+
+        # ...and the same question for a comparison, where a void operand is the shape #293
+        # measured and this one only has to not regress.
+        "NULL = bl",
+        "NULL = a",
+        "a = NULL",
+        "NULL < bl",
+
+        # A TYPED null is not a void and does constrain: `CAST(NULL AS INT)` is an int, so these
+        # must be refused exactly as the column rows are. The pair that says an analyzer reading
+        # "all rows null" instead of the TREE would answer wrongly.
+        "CAST(NULL AS INT) IN (bl)",
+        "CAST(NULL AS INT) = bl",
+        "CAST(NULL AS BOOLEAN) IN (a)",
     ],
 
     "malformed": [

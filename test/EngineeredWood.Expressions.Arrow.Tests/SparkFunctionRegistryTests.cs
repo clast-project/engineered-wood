@@ -3185,4 +3185,178 @@ public sealed class SparkFunctionRegistryTests
                 ComparisonOperator.Equal, BooleanType.Default, other));
         }
     }
+
+    /// <summary>
+    /// The SET rule refuses what the equality rule accepts, which is why they are two questions.
+    /// </summary>
+    /// <remarks>
+    /// The single row that forced <c>IAnalysisRules.CheckSetComparison</c> to exist. Measured on
+    /// 4.0.3 with ansi off, <c>a = bl</c> ANSWERS — Spark's <c>BooleanEquality</c>, #333 — while
+    /// <c>a IN (bl)</c> is refused in BOTH dialects. A seam that asked the pair question once per
+    /// member, which is what this one did first, would have let the legacy set through.
+    /// </remarks>
+    [Fact]
+    public void ASetRefusesTheBooleanNumericPairAnEqualityAccepts()
+    {
+        Assert.Null(Legacy.CheckComparison(
+            ComparisonOperator.Equal, Int32Type.Default, BooleanType.Default));
+
+        var refusal = Legacy.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, BooleanType.Default });
+
+        Assert.NotNull(refusal);
+        Assert.Equal("DATATYPE_MISMATCH.DATA_DIFF_TYPES", refusal!.ErrorClass);
+    }
+
+    /// <summary>
+    /// A string promotes into a set of any family — except to a boolean or a binary under the
+    /// legacy dialect, where Spark refuses the set instead.
+    /// </summary>
+    /// <remarks>
+    /// The only four rows of the 9x9 matrix where the two dialects disagree about a set:
+    /// <c>bl IN (s)</c>, <c>bin IN (s)</c>, <c>s IN (bl)</c> and <c>s IN (bin)</c>. It is the
+    /// mirror of #333 — there the LEGACY dialect is the permissive one, here it is the strict one
+    /// — which is why neither half could be read off the other.
+    /// </remarks>
+    [Theory]
+    [InlineData("boolean")]
+    [InlineData("binary")]
+    public void AStringDoesNotPromoteToABooleanOrBinarySetUnderTheLegacyDialect(string other)
+    {
+        IArrowType type = other == "boolean" ? BooleanType.Default : BinaryType.Default;
+        var members = new[] { type, StringType.Default };
+
+        Assert.Null(Ansi.CheckSetComparison(members));
+        Assert.NotNull(Legacy.CheckSetComparison(members));
+
+        // ...and the same string against a NUMERIC promotes in both, which is what says the rule
+        // is about those two families and not about strings in sets generally.
+        var numeric = new IArrowType[] { Int32Type.Default, StringType.Default };
+        Assert.Null(Ansi.CheckSetComparison(numeric));
+        Assert.Null(Legacy.CheckSetComparison(numeric));
+    }
+
+    /// <summary>
+    /// A type the matrix never asked about is not judged, in either question.
+    /// </summary>
+    /// <remarks>
+    /// Accepting is the direction that cannot break a caller: the analyzer answers only where
+    /// Spark's would have REFUSED, so a type with no measurement behind it must leave the
+    /// expression exactly as it was. A struct is the one such type the corpus carries.
+    /// </remarks>
+    [Fact]
+    public void ATypeTheMatrixNeverAskedAboutIsNotJudged()
+    {
+        var nested = new StructType(new[] { new Field("x", Int32Type.Default, true) });
+
+        Assert.Null(Ansi.CheckComparison(ComparisonOperator.Equal, nested, Int32Type.Default));
+        Assert.Null(Ansi.CheckComparison(ComparisonOperator.LessThan, BooleanType.Default, nested));
+        Assert.Null(Ansi.CheckSetComparison(new IArrowType[] { nested, BooleanType.Default }));
+    }
+
+    /// <summary>
+    /// The families themselves, asked of the registry directly: date and timestamp share one, and
+    /// every numeric width shares another.
+    /// </summary>
+    /// <remarks>
+    /// The corpus asks one column per family and so cannot reach tinyint, smallint or float, nor
+    /// a date against a date64. These are the widths the 9x9 matrix does not carry, checked
+    /// against the family rule it does establish.
+    /// </remarks>
+    [Fact]
+    public void TheFamiliesCoverTheWidthsTheMatrixDoesNotCarry()
+    {
+        foreach (var left in new IArrowType[]
+                 {
+                     Int8Type.Default, Int16Type.Default, FloatType.Default,
+                     new Decimal128Type(10, 2),
+                 })
+        {
+            foreach (var right in new IArrowType[]
+                     {
+                         Int64Type.Default, DoubleType.Default, new Decimal128Type(38, 0),
+                     })
+            {
+                Assert.Null(Ansi.CheckComparison(ComparisonOperator.LessThan, left, right));
+            }
+
+            // ...and every one of them is refused against a temporal, which is the boundary.
+            Assert.NotNull(Ansi.CheckComparison(
+                ComparisonOperator.LessThan, left, Date32Type.Default));
+        }
+
+        Assert.Null(Ansi.CheckComparison(
+            ComparisonOperator.LessThan, Date32Type.Default,
+            new TimestampType(TimeUnit.Microsecond, "UTC")));
+        Assert.Null(Ansi.CheckComparison(
+            ComparisonOperator.Equal, Date64Type.Default, Date32Type.Default));
+    }
+
+    /// <summary>
+    /// A list carrying a type the matrix never asked about gets no opinion, wherever in the list
+    /// that type sits.
+    /// </summary>
+    /// <remarks>
+    /// Caught by the Copilot reviewer on #346. Returning "no opinion" the moment an unknown type
+    /// was met made the answer depend on ORDER: <c>[INT, BOOLEAN, STRUCT]</c> refused because the
+    /// mismatch came first, and <c>[STRUCT, INT, BOOLEAN]</c> accepted because the struct did.
+    /// The same set, two answers. A rule whose promise is silence about unmeasured types has to
+    /// look for one before judging anything.
+    /// </remarks>
+    [Fact]
+    public void ASetCarryingAnUnknownTypeIsNotJudgedWhereverItSits()
+    {
+        var nested = new StructType(new[] { new Field("x", Int32Type.Default, true) });
+
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, BooleanType.Default, nested }));
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { nested, Int32Type.Default, BooleanType.Default }));
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, nested, BooleanType.Default }));
+
+        // ...and the same list WITHOUT the unknown is refused, which is what says the silence is
+        // about the struct rather than about the rule having stopped working.
+        Assert.NotNull(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, BooleanType.Default }));
+    }
+
+    /// <summary>
+    /// <c>nullif</c> takes the analysis too, and takes it BEFORE its row loop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Caught by the Copilot reviewer on #346. <c>nullif</c> reaches equality by a road
+    /// <c>ArrowRowEvaluator</c> never travels — it is a function call, so the evaluator's own
+    /// comparison check never sees the pair — and the registry coerced without analysing. Under
+    /// ANSI that left the refusal to whatever <c>AreEqual</c> did with the first non-null row, so
+    /// an EMPTY batch answered and a populated one threw: the refusal decided by the data, which
+    /// is the defect #286 exists to remove rather than relocate.
+    /// </para>
+    /// <para>
+    /// The empty batch is the assertion that matters. Spark rejects <c>nullif(a, bl)</c> at
+    /// analysis whatever the data, so no row count may change the answer.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void NullIfIsAnalysedBeforeItsRowLoop()
+    {
+        var populated = Batch(("a", Ints(1)), ("bl", Booleans(true)));
+        var empty = Batch(("a", Ints()), ("bl", Booleans()));
+
+        foreach (var batch in new[] { populated, empty })
+        {
+            var refusal = Assert.Throws<ExpressionAnalysisException>(
+                () => Eval(Ansi, "nullif(a, bl)", batch));
+            Assert.Equal("DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES", refusal.ErrorClass);
+        }
+
+        // The legacy dialect accepts the pair here exactly as it does for `=`, so the analysis
+        // must not refuse what #333 goes on to answer.
+        Assert.Equal(
+            1,
+            Assert.IsType<Int32Array>(Eval(Legacy, "nullif(a, 2)", populated)).GetValue(0));
+        Assert.Null(
+            Assert.IsType<Int32Array>(Eval(Legacy, "nullif(a, bl)", populated)).GetValue(0));
+    }
 }
