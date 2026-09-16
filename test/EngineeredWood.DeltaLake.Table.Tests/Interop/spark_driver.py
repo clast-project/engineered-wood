@@ -887,6 +887,35 @@ def _expr_value(value):
     return value
 
 
+def _collectable(projected):
+    """A one-column frame whose answer survives `collect()`, rendering a TIMESTAMP in the JVM.
+
+    THE DRIVER'S ZONE IS NOT THE SESSION'S. PySpark turns a timestamp into a NAIVE Python
+    datetime in the *driver machine's* local zone, whatever `spark.sql.session.timeZone` says, so
+    a collected answer records the harvest machine rather than the pinned UTC: 2026-08-11
+    12:30:00Z came back as `2026-08-11 05:30:00` on a PDT box. That is a property of the
+    transport, not of Spark, and it made every timestamp answer in the corpus uncomparable --
+    three rows were simply EXCLUDED from the .NET comparison for it.
+
+    Converting on the Python side does not work, and not marginally: `naive.astimezone(utc)` goes
+    through the C runtime's `localtime`, which on Windows raises `OSError: [Errno 22]` for ANY
+    instant outside the 1970..9999-in-local-time window. Measured on 3.13 -- 1969-12-31 16:00:00,
+    which is how UTC midnight of the epoch arrives in PDT, is already outside it. That same
+    failure is a known harness artifact of this command: a pre-epoch `CAST(... AS TIMESTAMP)`
+    raised OSError during `collect()` and was recorded in `eval.error` as though SPARK had
+    refused, which the expression fuzzer read as 15 false "we answered where Spark refused".
+
+    So the JVM renders it instead, through Spark's own timestamp-to-string cast under the session
+    zone. The value that crosses is text, which is exactly what a date already does -- PySpark
+    shifts a timestamp and leaves a `date` alone -- and the `type` answer beside it still says
+    `timestamp`, so a reader knows to read the text as one. #311.
+    """
+    if projected.schema[0].dataType.simpleString().startswith("timestamp"):
+        return projected.selectExpr("CAST(r AS STRING) AS r")
+
+    return projected
+
+
 def cmd_expr_oracle(args):
     """Ask Spark what an expression MEANS, for differential-testing the EW parser and registry.
 
@@ -976,7 +1005,8 @@ def cmd_expr_oracle(args):
             try:
                 entry["eval"] = {"ok": True,
                                  "values": [_expr_value(r[0]) for r in
-                                            data.selectExpr(f"({expr}) AS r").collect()]}
+                                            _collectable(data.selectExpr(f"({expr}) AS r"))
+                                            .collect()]}
             except Exception as exc:
                 entry["eval"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
 

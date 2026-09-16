@@ -57,11 +57,15 @@ public sealed class SparkEvaluationCorpusTests
     /// </remarks>
     private static readonly Dictionary<string, string> Excluded = new(StringComparer.Ordinal)
     {
-        // PySpark converts a timestamp to a naive datetime in the DRIVER's local zone on collect,
-        // so these were recorded as America/Los_Angeles despite the session pinning UTC. The
-        // recorded text is a property of the machine that harvested it.
-        ["CAST(dt AS TIMESTAMP)"] = "timestamp localised to the harvest machine's zone",
-        ["TIMESTAMP'2026-08-11 12:30:00'"] = "timestamp localised to the harvest machine's zone",
+        // THE TWO TIMESTAMP ROWS THAT USED TO SIT HERE ARE GONE, and their absence is what makes
+        // #311's group measurable. PySpark converts a timestamp to a naive datetime in the
+        // DRIVER's local zone on collect, so `CAST(dt AS TIMESTAMP)` and
+        // `TIMESTAMP'2026-08-11 12:30:00'` were recorded as America/Los_Angeles despite the
+        // session pinning UTC -- the recorded text was a property of the harvest machine. The
+        // driver now renders a timestamp through the JVM instead (`_collectable` in
+        // spark_driver.py), so both are compared, and so is every timestamp #311's fold resolves.
+        // Excluding them instead would have taken the bare rows out of the TYPE comparison too,
+        // which is the half that measures the rule.
 
         // The two binary rows used to sit here, excluded because `default=str` recorded a
         // bytearray as PYTHON'S REPR rather than as a value. #295 records binary as hex instead,
@@ -491,6 +495,12 @@ public sealed class SparkEvaluationCorpusTests
     // evaluation gate either side of this one compares VALUES -- where the recorded 1 and a wrongly
     // widened 1.0 are the same number. Only this test can see the difference.
     [InlineData("unary-operators")]
+    // #311, and the group that needs this gate MOST of all: the whole defect was a resolution
+    // one. Every site in it threw `no common type for timestamp and date32` where Spark resolves
+    // a timestamp, so before the fix these rows failed here as exceptions rather than as wrong
+    // values -- and the evaluation gate below cannot tell a date from a timestamp holding the
+    // same midnight, which is the answer a fold that truncated the other way would give.
+    [InlineData("date-timestamp-fold")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -518,6 +528,12 @@ public sealed class SparkEvaluationCorpusTests
     // assuming: measured, `+'1'` is a double under both dialects and only what a BAD string does
     // differs. A registry that started resolving a bigint under one of them would move no value.
     [InlineData("unary-operators")]
+    // ...and #311 here because half its rows are dialect-INDEPENDENT and half are not, in one
+    // group. The fold's own rule is the same under both -- `coalesce(ts, dt)` is a timestamp
+    // either way -- while its last four rows are string coercions, where the dialects choose
+    // opposite directions: `coalesce(ts, s)` is a `timestamp` under ANSI and a `string` here.
+    // Only this theory sees that second half at all.
+    [InlineData("date-timestamp-fold")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
@@ -583,6 +599,12 @@ public sealed class SparkEvaluationCorpusTests
         BooleanType => "boolean",
         StringType => "string",
         NullType => "void",
+        // Spark has ONE name for each, whatever width or unit Arrow carries underneath -- which
+        // is the point of the comparison for #311's group, since resolving a millisecond
+        // timestamp where the evaluator builds a microsecond one is a difference this deliberately
+        // cannot see. SparkArrays.Timestamp is what keeps the two in step.
+        Date32Type or Date64Type => "date",
+        TimestampType => "timestamp",
         _ => throw new NotSupportedException($"no Spark spelling for {type.Name}"),
     };
 

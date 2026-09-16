@@ -320,6 +320,22 @@ internal static class SparkArrays
     /// <summary>The Unix epoch, as the instant a Date32 counts days from.</summary>
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
+    /// <summary>The one timestamp type this evaluator ever produces.</summary>
+    /// <remarks>
+    /// Microseconds in UTC, which is what <see cref="BuildTimestamp"/> builds — so a rule that
+    /// RESOLVES a timestamp must name this instance and not construct its own. A source column
+    /// may well carry another unit or zone (Parquet writes milliseconds happily), and a
+    /// resolution that echoed the source's type back would promise a type the array it hands
+    /// over does not have. #311.
+    /// <para>
+    /// <c>ArrowRowEvaluator</c> spells the same type out for itself when it materialises a
+    /// <c>TIMESTAMP'…'</c> literal, and deliberately: it is registry-agnostic, and reaching into
+    /// the Spark namespace for a constant would couple the evaluator to the dialect it dispatches
+    /// to. The duplication is one line and the direction of the dependency is worth more.
+    /// </para>
+    /// </remarks>
+    public static readonly TimestampType Timestamp = new(TimeUnit.Microsecond, "UTC");
+
     /// <summary>The instant a temporal cell denotes, or null if the array is not temporal.</summary>
     public static DateTimeOffset? ReadInstant(IArrowArray array, int index) => array switch
     {
@@ -455,7 +471,7 @@ internal static class SparkArrays
     /// <summary>Builds a microsecond UTC timestamp array from instants.</summary>
     public static IArrowArray BuildTimestamp(DateTimeOffset?[] values, int rowCount)
     {
-        var builder = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        var builder = new TimestampArray.Builder(Timestamp);
         for (var i = 0; i < rowCount; i++)
         {
             if (values[i] is { } instant) builder.Append(instant);
@@ -821,7 +837,7 @@ internal static class SparkArrays
             // policy. TIMESTAMP_NTZ is a distinct Spark type and is deliberately not aliased
             // here: it has no offset at all, and pretending otherwise would silently reinterpret
             // values rather than refuse them.
-            "TIMESTAMP" => new TimestampType(TimeUnit.Microsecond, "UTC"),
+            "TIMESTAMP" => Timestamp,
             "DECIMAL" or "DEC" or "NUMERIC" => new Decimal128Type(10, 0),
             _ => throw new NotSupportedException($"cast to '{text}' is not implemented"),
         };

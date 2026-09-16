@@ -144,6 +144,11 @@ internal static class SparkNumericTypes
     /// which is the clamp this half takes.
     /// </para>
     /// <para>
+    /// <b>Not only numbers, despite the class name.</b> A DATE and a TIMESTAMP unify here too,
+    /// and refusing them was #311 — see <see cref="TemporalCommonType"/>. The class is where the
+    /// fold lives, not a claim about what it folds.
+    /// </para>
+    /// <para>
     /// <b>Greatest and least unify here too</b>, not only the conditionals in the summary. They
     /// are the callers where a lossy common type is visible as a wrong VALUE rather than a wrong
     /// type: both cast every argument to this type first and then compare, so measured,
@@ -161,6 +166,12 @@ internal static class SparkNumericTypes
 
         if (right is NullType)
             return left;
+
+        // BEFORE the identity check below, so that two timestamps resolve the type this
+        // evaluator actually BUILDS rather than echoing whichever unit and zone the left-hand
+        // column happened to carry. See SparkArrays.Timestamp.
+        if (SparkArrays.IsTemporal(left) && SparkArrays.IsTemporal(right))
+            return TemporalCommonType(left, right);
 
         if (left.GetType() == right.GetType() && !IsDecimal(left))
             return left;
@@ -194,6 +205,46 @@ internal static class SparkNumericTypes
 
         throw new NotSupportedException($"no common type for {left.Name} and {right.Name}");
     }
+
+    /// <summary>The type a DATE and a TIMESTAMP unify to, which is TIMESTAMP.</summary>
+    /// <remarks>
+    /// <para>
+    /// Measured on 4.0.3 and identical under the legacy dialect: <c>coalesce(ts, dt)</c> is a
+    /// <c>timestamp</c>, and so are <c>if</c>, <c>CASE</c>, <c>nvl2</c>, <c>greatest</c> and
+    /// <c>least</c> over the same pair. <b>The DATE moves UP</b>, to midnight of that day in the
+    /// session zone, rather than the timestamp being truncated down — visible in which instant
+    /// comes back rather than only in the type: with <c>ts</c> at 12:30:00Z and <c>dt</c> on the
+    /// same day, <c>coalesce(ts, dt)</c> is 12:30:00Z while <c>coalesce(dt, ts)</c> is
+    /// 00:00:00Z.
+    /// </para>
+    /// <para>
+    /// <b>This rule is the whole of #311, and its absence was a FALSE REJECTION</b> — the
+    /// inverse of #286. Every one of those seven sites threw
+    /// <c>no common type for timestamp and date32</c>, so a CHECK constraint Spark accepts made
+    /// the table unwritable through us. Nothing either side of the fold was missing:
+    /// <c>CAST(dt AS TIMESTAMP)</c>, <c>ts = dt</c>, <c>ts &gt; dt</c>, <c>ts IN (dt)</c> and
+    /// <c>nullif(ts, dt)</c> all already agreed with Spark exactly. Only the fold lacked the
+    /// rule, and <c>nullif</c> answered only because it types from <c>args[0]</c> instead of
+    /// folding — it SIDESTEPS the rule rather than exercising it, which is why the gap stayed
+    /// invisible.
+    /// </para>
+    /// <para>
+    /// The promotion itself is not restated here. <c>SparkFunctions.Unify</c> reads every
+    /// temporal branch through <c>SparkArrays.ReadInstant</c> and rebuilds it at the unified
+    /// type, which is the same instant <c>CastToTimestamp</c> takes for a date source — so the
+    /// fold adopts whatever answer the cast already gives, timezone policy included, rather than
+    /// deciding that policy a second time.
+    /// </para>
+    /// <para>
+    /// A temporal against anything else has NO rule and falls through to the refusal, which is
+    /// Spark's answer too: <c>coalesce(a, dt)</c> is
+    /// <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c>.
+    /// </para>
+    /// </remarks>
+    private static IArrowType TemporalCommonType(IArrowType left, IArrowType right) =>
+        SparkArrays.IsDateType(left) && SparkArrays.IsDateType(right)
+            ? Date32Type.Default
+            : SparkArrays.Timestamp;
 
     /// <summary>
     /// The decimal type Spark reads an integral LITERAL as when it meets a decimal: the narrowest
