@@ -189,76 +189,226 @@ internal static class SparkFloatText
     /// <c>scale = 5^-exponent, shift = exponent</c> when the exponent is negative, and
     /// <c>scale = 2^exponent, shift = 0</c> when it is not — makes <c>mantissa x scale</c> an
     /// integer whose digits ARE the value's, exactly and in full. One big multiplication per
-    /// value, and no division anywhere.
+    /// value, and the answer is a prefix of it.
     /// </para>
     /// <para>
     /// <b>Both neighbours are tested at every length, not just the rounded one.</b> That is the
     /// other half of #337: rounding to k digits finds the CLOSEST k-digit decimal, which is the
-    /// right candidate only while the rounding interval is symmetric. Truncating gives the
-    /// k-digit decimal below and incrementing gives the one above, and those two are the only
-    /// candidates there can be at that length — so asking about both settles the length whatever
-    /// shape the interval has.
+    /// right candidate only while the rounding interval is symmetric. Truncating the expansion
+    /// gives the k-digit decimal below and one more unit in its last place gives the one above;
+    /// those two are the only candidates there can be at that length, so asking about both settles
+    /// the length whatever shape the interval has.
     /// </para>
     /// <para>
     /// Where both read back, Java takes the closer, and the even significand where they are
-    /// equally close. That is the JDK 19+ <c>Double.toString</c> specification, and it is also why
-    /// <c>Double.toString(Double.MIN_VALUE)</c> is <c>4.9E-324</c> rather than <c>5E-324</c>: at a
-    /// length of one the javadoc widens the field to the one- AND two-digit decimals before
-    /// choosing, which <see cref="TwoDigitsCanBeatOne"/> below reproduces.
+    /// equally close.
+    /// </para>
+    /// <para>
+    /// <b>A length of one is never asked for, and that is deliberate.</b> The JDK 19+
+    /// specification widens the field to the one- AND two-digit decimals before choosing whenever
+    /// a single digit would do, which is why <c>Double.toString(Double.MIN_VALUE)</c> is
+    /// <c>4.9E-324</c> and not <c>5E-324</c>. Starting at two and letting <see cref="Trim"/> drop a
+    /// trailing zero IS that rule: every one-digit decimal sits on the two-digit grid, so the
+    /// nearer two-digit decimal is never further from the value, and the interval is convex — if
+    /// the one-digit decimal is inside it then so is anything between that and the value. The
+    /// answer comes back one digit long exactly when the closest two-digit decimal ends in a zero.
+    /// </para>
+    /// <para>
+    /// <b>The length is found by bisection, which is what makes this affordable.</b> Reading back
+    /// is monotone in length — a decimal that fits at k digits is still there at k+1 with a zero
+    /// after it — so the shortest length can be bisected rather than walked up to. Four probes
+    /// instead of up to seventeen, and each probe is one division rather than a digit's worth of
+    /// bookkeeping. This runs for every row of every cast, which is what #337 and #338 both
+    /// deferred over.
     /// </para>
     /// </remarks>
     private static (string Digits, int PointAt) ShortestDigits(
         long mantissa, int exponent, bool narrowBelow, int maxDigits)
     {
         var scale = Powers.Scale(exponent);
-        var exact = (scale * mantissa).ToString(Invariant);
+        var product = scale * mantissa;
+        var length = DigitCount(mantissa, exponent, product);
 
-        // The product is the digit string of `0.<exact> x 10^pointAt`, with no leading zero to
-        // discard: BigInteger does not write one.
-        var pointAt = exponent < 0 ? exact.Length + exponent : exact.Length;
+        // The product is the digit string of `0.<product> x 10^pointAt`.
+        var pointAt = exponent < 0 ? length + exponent : length;
 
-        var interval = new ReadsBack(scale, narrowBelow, mantissa % 2 == 0);
+        var interval = new Interval(scale, exponent, narrowBelow, mantissa % 2 == 0);
 
-        for (var length = 1; length < maxDigits; length++)
+        var shortest = 2;
+        var longest = maxDigits;
+
+        while (shortest < longest)
         {
-            if (!interval.TryChoose(exact, length, out var candidate))
-                continue;
+            var middle = (shortest + longest) / 2;
 
-            if (length == 1 && TwoDigitsCanBeatOne(interval, exact, ref candidate))
-                return Trim(candidate, pointAt);
-
-            return Trim(candidate, pointAt);
+            if (interval.Reads(product, length, middle))
+                longest = middle;
+            else
+                shortest = middle + 1;
         }
 
-        // The closest decimal of maxDigits digits is within half a step of the value by
-        // construction, so the last rung always reads back and needs no test.
-        interval.TryChoose(exact, maxDigits, out var last);
-        return Trim(last, pointAt);
+        return Trim(interval.Choose(product, length, shortest), pointAt);
     }
 
     /// <summary>
-    /// Java's one exception to shortest-wins, applied where a single digit already round-trips.
+    /// How many decimal digits <c>mantissa x scale</c> is written with.
     /// </summary>
     /// <remarks>
-    /// The javadoc defines the field of candidates as the decimals of minimal length p, EXCEPT
-    /// that when p is 1 it takes those of length 1 and 2 together and picks the closest of all of
-    /// them. It is the difference between <c>9.9E-324</c> and <c>1.0E-323</c> for the double just
-    /// above the smallest, both of which read back.
+    /// From the logarithm of the factors rather than of the product, because the factors are a
+    /// <c>long</c> and a power: <c>log10(m x 5^k)</c> is <c>log10 m + k log10 5</c>, and a double
+    /// carries that to about fourteen places over the whole exponent range. The estimate is then
+    /// corrected against the powers themselves, which matters because the product IS an exact
+    /// power of ten for some values — <c>1.0</c> is <c>2^52 x 5^52</c>.
     /// <para>
-    /// The two-digit answer is always available when a one-digit one is: every one-digit decimal
-    /// sits on the two-digit grid as well, the nearest two-digit decimal is therefore at least as
-    /// close to the value, and the interval is convex — so if the one-digit decimal is inside it,
-    /// anything between it and the value is too. The call below cannot fail; it is written as a
-    /// test rather than an assertion so that a future width with a different grid cannot trip on it.
+    /// Asking <c>product.ToString().Length</c> instead would be exact, and would also be the
+    /// single most expensive thing on this path: formatting the 767-digit expansion of a subnormal
+    /// double costs more than every other step of the render put together, and at most seventeen
+    /// of those digits are ever read.
     /// </para>
     /// </remarks>
-    private static bool TwoDigitsCanBeatOne(in ReadsBack interval, string exact, ref Candidate candidate)
+    private static int DigitCount(long mantissa, int exponent, BigInteger product)
     {
-        if (!interval.TryChoose(exact, 2, out var pair))
-            return false;
+        const double Log10Two = 0.30102999566398120;
+        const double Log10Five = 0.69897000433601880;
 
-        candidate = pair;
-        return true;
+        var logarithm = Math.Log10(mantissa)
+            + (exponent < 0 ? -exponent * Log10Five : exponent * Log10Two);
+
+        var count = (int)logarithm + 1;
+
+        while (product >= Powers.Ten(count)) count++;
+        while (count > 1 && product < Powers.Ten(count - 1)) count--;
+
+        return count;
+    }
+
+    /// <summary>
+    /// Which decimals read back as one value, as an exact test a length can be put to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A candidate reads back when it sits within half a step of the value, and the arithmetic
+    /// stays small because candidates are measured against the value's own exact expansion rather
+    /// than against the value. Writing the expansion as <c>0.&lt;product&gt; x 10^pointAt</c>, its
+    /// last place is worth <c>10^(pointAt - length)</c>, and in THOSE units half a step up is
+    /// exactly <c>scale / 2</c> whichever sign the exponent had:
+    /// </para>
+    /// <code>
+    ///     exponent &lt;  0:  2^(e-1) / 10^e = 2^(e-1) x 2^-e x 5^-e = 5^-e / 2 = scale / 2
+    ///     exponent >= 0:  2^(e-1) / 10^0 =                          2^e  / 2 = scale / 2
+    /// </code>
+    /// <para>
+    /// So the whole test comes back to the same <c>scale</c> the digits were built from — no
+    /// second big power is ever formed, and nothing is needed per candidate but the tail it
+    /// discards.
+    /// </para>
+    /// <para>
+    /// <b>The halving is done once, to the bound, and not per candidate to the distance.</b>
+    /// <c>4d &lt; scale</c> would be the direct spelling, but it allocates a shifted copy of a
+    /// number that reaches 750 digits, and a probe would pay for two of them. Writing
+    /// <c>scale = 4q + r</c> instead makes it <c>d &lt; q</c>, or <c>d == q</c> while <c>r</c> is
+    /// non-zero — a comparison, which allocates nothing. Measured: the shift and the subtraction
+    /// are the two most expensive operations on this path at 0.37us each against 0.008us for a
+    /// comparison, and dropping the pair of shifts is most of what makes bisection worth having.
+    /// </para>
+    /// <para>
+    /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
+    /// sends a decimal landing exactly between two values. It is the same rule on both sides: at a
+    /// power of two the value's mantissa is even and its predecessor's is odd, so the midpoint
+    /// below belongs to the value. It can only ever be reached from a non-negative exponent, where
+    /// <c>scale</c> is a power of two; below zero <c>scale</c> is a power of five and no doubling
+    /// of an integer can land on it.
+    /// </para>
+    /// </remarks>
+    private readonly struct Interval
+    {
+        /// <summary>Half a step down, which is a QUARTER of a step at a power of two.</summary>
+        private readonly BigInteger _below;
+
+        /// <summary>Half a step up, which the value always has in full.</summary>
+        private readonly BigInteger _above;
+
+        /// <summary>Whether the halving was exact, so that the bound is reachable at all.</summary>
+        private readonly bool _belowIsExact;
+
+        private readonly bool _aboveIsExact;
+
+        /// <summary>Whether a candidate exactly on the boundary rounds inwards.</summary>
+        private readonly bool _boundaryCounts;
+
+        internal Interval(BigInteger scale, int exponent, bool narrowBelow, bool evenMantissa)
+        {
+            // Off the table, because halving a 750-digit number costs as much as any other step
+            // here and every value at a given exponent wants the same answer. The QUARTER is not
+            // worth a row of its own: only a power of two asks for one, and there are 2,046 of
+            // those against every double there is.
+            _above = Powers.Half(exponent);
+            _aboveIsExact = scale.IsEven;
+
+            _below = narrowBelow ? scale >> 2 : _above;
+            _belowIsExact = narrowBelow ? (scale & 3).IsZero : _aboveIsExact;
+
+            _boundaryCounts = evenMantissa;
+        }
+
+        /// <summary>Whether any decimal of <paramref name="take"/> digits reads back as the value.</summary>
+        internal bool Reads(BigInteger product, int length, int take)
+        {
+            // The expansion already fits, so this length holds the value itself.
+            if (take >= length) return true;
+
+            var place = Powers.Ten(length - take);
+            var down = BigInteger.Remainder(product, place);
+
+            // The subtraction is on the right of `||` so that it is skipped whenever truncating
+            // already reads back, which is the common way out.
+            return Within(down, _below, _belowIsExact)
+                || Within(place - down, _above, _aboveIsExact);
+        }
+
+        /// <summary>The decimal of <paramref name="take"/> digits that Java would choose.</summary>
+        internal Candidate Choose(BigInteger product, int length, int take)
+        {
+            if (take >= length)
+                return new Candidate(product.ToString(Invariant), 0);
+
+            var place = Powers.Ten(length - take);
+            var head = BigInteger.DivRem(product, place, out var down).ToString(Invariant);
+            var up = place - down;
+
+            var downReads = Within(down, _below, _belowIsExact);
+            var upReads = Within(up, _above, _aboveIsExact);
+
+            if (downReads != upReads)
+                return downReads ? new Candidate(head, 0) : Increment(head);
+
+            // Both read back, so Java takes the closer of them — and the even significand where
+            // they are equally close, which a terminating expansion can genuinely reach.
+            var comparison = down.CompareTo(up);
+            var keepHead = comparison < 0
+                || (comparison == 0 && (head[head.Length - 1] - '0') % 2 == 0);
+
+            return keepHead ? new Candidate(head, 0) : Increment(head);
+        }
+
+        /// <summary>
+        /// Whether <paramref name="distance"/> is inside a bound that was rounded down to reach it.
+        /// </summary>
+        /// <remarks>
+        /// Landing ON the bound means one of two things. If the halving that produced it threw
+        /// digits away then the true bound is larger and the candidate is comfortably inside; if
+        /// it was exact then the candidate is the midpoint itself, and only an even mantissa
+        /// claims it.
+        /// </remarks>
+        private bool Within(BigInteger distance, BigInteger bound, bool boundIsExact)
+        {
+            var comparison = distance.CompareTo(bound);
+
+            if (comparison != 0)
+                return comparison < 0;
+
+            return !boundIsExact || _boundaryCounts;
+        }
     }
 
     /// <summary>A decimal of a chosen length, and whether carrying moved the point one place right.</summary>
@@ -281,120 +431,6 @@ internal static class SparkFloatText
     /// </remarks>
     private static (string Digits, int PointAt) Trim(in Candidate candidate, int pointAt) =>
         (candidate.Digits.TrimEnd('0'), pointAt + candidate.PointShift);
-
-    /// <summary>
-    /// Which decimals read back as one value, as an exact test a candidate can be put to.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// A candidate reads back when it sits within half a step of the value, and the arithmetic
-    /// stays small because the candidates are measured against the value's own exact expansion
-    /// rather than against the value. Writing the expansion as <c>0.&lt;exact&gt; x 10^pointAt</c>,
-    /// its last place is worth <c>10^(pointAt - exact.Length)</c>, and in THOSE units half a step
-    /// up is exactly <c>scale / 2</c> whichever sign the exponent had:
-    /// </para>
-    /// <code>
-    ///     exponent &lt; 0:  2^(e-1) / 10^e = 2^(e-1) x 2^-e x 5^-e = 5^-e / 2 = scale / 2
-    ///     exponent >= 0:  2^(e-1) / 10^0 =                          2^e  / 2 = scale / 2
-    /// </code>
-    /// <para>
-    /// So the whole test is a comparison against the same <c>scale</c> the digits were built from
-    /// — no second big power, and nothing per candidate but the tail it discards. Everything is
-    /// multiplied by four so that the quarter-step below a power of two stays an integer.
-    /// </para>
-    /// <para>
-    /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
-    /// sends a decimal landing exactly between two values. It is the same rule on both sides: at a
-    /// power of two the value's mantissa is even and its predecessor's is odd, so the midpoint
-    /// below belongs to the value.
-    /// </para>
-    /// </remarks>
-    private readonly struct ReadsBack
-    {
-        private readonly BigInteger _above;
-        private readonly BigInteger _below;
-        private readonly bool _boundaryCounts;
-
-        internal ReadsBack(BigInteger scale, bool narrowBelow, bool evenMantissa)
-        {
-            _above = 2 * scale;
-            _below = narrowBelow ? scale : _above;
-            _boundaryCounts = evenMantissa;
-        }
-
-        /// <summary>
-        /// The decimal of <paramref name="length"/> digits that Java would choose, if any reads back.
-        /// </summary>
-        internal bool TryChoose(string exact, int length, out Candidate candidate)
-        {
-            // The expansion already fits, so this length holds the value itself and nothing is
-            // discarded: no neighbour can be closer than a distance of zero.
-            if (exact.Length <= length)
-            {
-                candidate = new Candidate(exact, 0);
-                return true;
-            }
-
-            var head = exact.Substring(0, length);
-            var tail = exact.Substring(length);
-
-            // What truncating discarded, and what incrementing would overshoot by: the two sum to
-            // one unit of the chosen length's last place.
-            var down = BigInteger.Parse(tail, NumberStyles.None, Invariant);
-            var up = TensComplement(tail);
-
-            var downReads = Within(down, _below);
-            var upReads = Within(up, _above);
-
-            if (!downReads && !upReads)
-            {
-                candidate = default;
-                return false;
-            }
-
-            if (downReads != upReads)
-            {
-                candidate = downReads ? new Candidate(head, 0) : Increment(head);
-                return true;
-            }
-
-            // Both read back, so Java takes the closer of them — and the even significand where
-            // they are equally close, which a terminating expansion like this one can genuinely
-            // reach.
-            var comparison = down.CompareTo(up);
-            var keepHead = comparison < 0 || (comparison == 0 && (head[length - 1] - '0') % 2 == 0);
-
-            candidate = keepHead ? new Candidate(head, 0) : Increment(head);
-            return true;
-        }
-
-        private bool Within(BigInteger distance, BigInteger half)
-        {
-            var scaled = 4 * distance;
-            var comparison = scaled.CompareTo(half);
-
-            return comparison < 0 || (comparison == 0 && _boundaryCounts);
-        }
-    }
-
-    /// <summary>
-    /// <c>10^n - value</c> for the n-digit <paramref name="tail"/>, without forming <c>10^n</c>.
-    /// </summary>
-    /// <remarks>
-    /// The nines complement plus one, which is the same number: <c>10^n - 1</c> is n nines, so
-    /// subtracting each digit from nine and adding one lands on it. It matters because n reaches
-    /// 750 for a subnormal double and a power of ten that long would be a per-candidate cost,
-    /// where this is a walk over a string that has already been built.
-    /// </remarks>
-    private static BigInteger TensComplement(string tail)
-    {
-        var complement = new char[tail.Length];
-
-        for (var i = 0; i < tail.Length; i++)
-            complement[i] = (char)('9' - (tail[i] - '0'));
-
-        return BigInteger.Parse(new string(complement), NumberStyles.None, Invariant) + BigInteger.One;
-    }
 
     /// <summary>The next decimal up at the same length, carrying into a shifted point if it must.</summary>
     private static Candidate Increment(string digits)
@@ -436,6 +472,10 @@ internal static class SparkFloatText
     {
         private static readonly object?[] Fives = new object?[-DoubleMinExponent + 1];
 
+        private static readonly object?[] Tens = new object?[-DoubleMinExponent + 1];
+
+        private static readonly object?[] Halves = new object?[-DoubleMinExponent + 1];
+
         /// <summary>
         /// <c>5^-exponent</c> below zero and <c>2^exponent</c> at or above it.
         /// </summary>
@@ -454,6 +494,55 @@ internal static class SparkFloatText
 
             var computed = BigInteger.Pow(5, index);
             Fives[index] = computed;
+
+            return computed;
+        }
+
+        /// <summary>
+        /// Half of <see cref="Scale"/>, which is half a step in the expansion's own units.
+        /// </summary>
+        /// <remarks>
+        /// A row of its own because every candidate at every length is compared against it, and
+        /// for a subnormal double it is a 750-digit number that would otherwise be rebuilt once
+        /// per value. Above zero the scale is a power of two and halving it is another shift of a
+        /// small number, so nothing is stored.
+        /// </remarks>
+        internal static BigInteger Half(int exponent)
+        {
+            if (exponent >= 0)
+                return exponent == 0 ? BigInteger.Zero : BigInteger.One << (exponent - 1);
+
+            var index = -exponent;
+            if (Halves[index] is BigInteger cached)
+                return cached;
+
+            var computed = Scale(exponent) >> 1;
+            Halves[index] = computed;
+
+            return computed;
+        }
+
+        /// <summary>
+        /// <c>10^power</c>, for the place a candidate's last digit sits in.
+        /// </summary>
+        /// <remarks>
+        /// Derived from the fives — <c>10^n</c> is <c>5^n</c> shifted left by n — but held in its
+        /// own row, because bisection asks for four or five different places per value and the
+        /// shift is a pass over a buffer it has to allocate each time.
+        /// <para>
+        /// The power asked for is at most the digit count of <c>mantissa x scale</c>, which is 767
+        /// for a subnormal double and 309 for the largest normal one, so both rows are inside a
+        /// table sized for <c>5^1074</c>. Neither fills up: a row is written only for an exponent
+        /// some value actually had.
+        /// </para>
+        /// </remarks>
+        internal static BigInteger Ten(int power)
+        {
+            if (Tens[power] is BigInteger cached)
+                return cached;
+
+            var computed = Scale(-power) << power;
+            Tens[power] = computed;
 
             return computed;
         }
