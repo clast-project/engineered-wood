@@ -151,10 +151,7 @@ internal static class ZonedZoneMap
                 case BoundedMax:
                     if (max is null)
                     {
-                        // A null struct is an empty zone; a null bound under `unknown = true` has no
-                        // representable upper bound. Either way the max cell is null.
-                        var partial = (StructArray)field;
-                        max = FlattenValidity(partial.Fields[0], partial, zoneCount);
+                        max = BoundedMaxBound((StructArray)field, zoneCount);
                         // An upper bound that was truncated is indistinguishable from an exact one.
                         maxInexact = Constant(true, zoneCount);
                         present.Add(Stat.Max);
@@ -309,25 +306,31 @@ internal static class ZonedZoneMap
     }
 
     /// <summary>
-    /// Returns <paramref name="child"/> with its validity also cleared wherever
-    /// <paramref name="parent"/> is null, so a null partial reads as a null bound.
+    /// The upper bound of each zone from a <c>vortex.bounded_max</c> partial
+    /// <c>{ bound, unknown }</c>: null where the partial is null (an empty zone) or
+    /// <c>unknown</c> is set (no upper bound fits the byte limit). Upstream writes a
+    /// null bound under <c>unknown</c>, but its reader ignores the bound there
+    /// either way, and so does this one.
     /// </summary>
-    private static IArrowArray FlattenValidity(IArrowArray child, StructArray parent, int length)
+    private static IArrowArray BoundedMaxBound(StructArray partial, int length)
     {
-        if (parent.NullCount == 0)
-            return child;
+        var bound = partial.Fields[0];
+        var unknown = (BooleanArray)partial.Fields[1];
 
-        var data = child.Data;
+        bool Valid(int i) => partial.IsValid(i) && bound.IsValid(i) && unknown.GetValue(i) != true;
+
+        int nulls = 0;
+        for (int i = 0; i < length; i++)
+            if (!Valid(i)) nulls++;
+        if (nulls == bound.NullCount)
+            return bound;
+
+        var data = bound.Data;
         var bitmap = new ArrowBuffer.BitmapBuilder(data.Offset + length);
         for (int i = 0; i < data.Offset; i++)
             bitmap.Append(false);
-        int nulls = 0;
         for (int i = 0; i < length; i++)
-        {
-            bool valid = parent.IsValid(i) && child.IsValid(i);
-            bitmap.Append(valid);
-            if (!valid) nulls++;
-        }
+            bitmap.Append(Valid(i));
 
         var buffers = data.Buffers.ToArray();
         buffers[0] = bitmap.Build();

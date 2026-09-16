@@ -252,6 +252,29 @@ public class VortexZonedFixtureTests
         Assert.Equal(0, await CountRows(reader, miss));
     }
 
+    [Theory]
+    [InlineData(Zoned, "val")]
+    // No zone maps at all: nothing to evaluate per zone, but a predicate that
+    // is false regardless of the data still reads nothing.
+    [InlineData("sequence_u64_desc_64rows.vortex", "a")]
+    public async Task PredicateFalseWithoutStatsReadsNothing(string fixture, string column)
+    {
+        await using var reader = await VortexFileReader.OpenAsync(TestDataPath.Resolve(fixture));
+
+        Assert.Equal(0, await CountRows(reader, Pred.False));
+        Assert.Equal(0, await CountRows(reader,
+            Pred.And(Pred.False, Pred.GreaterThan(column, LiteralValue.Of(0)))));
+        Assert.Equal(0, await CountRowsInRange(reader, Pred.False));
+    }
+
+    private static async Task<int> CountRowsInRange(VortexFileReader reader, Predicate predicate)
+    {
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync(0, long.MaxValue, predicate: predicate))
+            rows += batch.Length;
+        return rows;
+    }
+
     private static async Task<int> CountRows(VortexFileReader reader, Predicate predicate)
     {
         int rows = 0;

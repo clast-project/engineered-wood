@@ -536,13 +536,14 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// per referenced column), then iterates the zones and runs the shared
     /// <see cref="StatisticsEvaluator"/> against a per-zone cursor. Returns
     /// the row ranges of the zones that aren't proven to contain no matches,
-    /// or null (read everything) when no referenced column has zone stats.
+    /// or null to read everything.
     /// </summary>
     /// <remarks>
     /// The cursor addresses every column's stats by one zone index, which is
     /// only meaningful when the referenced columns share a zone length. They
     /// always do for files from this writer and from upstream's default
-    /// strategy; if they ever don't, nothing is pruned.
+    /// strategy. When they don't, or when no referenced column has zone
+    /// stats, see <see cref="EvaluateWithoutZoneStats"/>.
     /// </remarks>
     private async Task<IReadOnlyList<RowRange>?> EvaluatePredicateRangesAsync(
         Predicate predicate, CancellationToken cancellationToken)
@@ -564,12 +565,12 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
             statsByColumn[name] = stats;
             if (stats is null) continue;
             if (zoneLen != 0 && (stats.ZoneLen != zoneLen || stats.ZoneCount != zoneCount))
-                return null;
+                return EvaluateWithoutZoneStats(predicate);
             zoneLen = stats.ZoneLen;
             zoneCount = stats.ZoneCount;
         }
         if (zoneLen == 0)
-            return null;
+            return EvaluateWithoutZoneStats(predicate);
 
         var accessor = new VortexZoneStatsAccessor(Schema);
         var cursor = new VortexZoneCursor(statsByColumn);
@@ -582,6 +583,22 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
                 accepted.Add(z);
         }
         return ZonesToRowRanges(accepted, zoneLen);
+    }
+
+    /// <summary>
+    /// Evaluates <paramref name="predicate"/> once with no stats for any column,
+    /// for when there are no per-zone stats to evaluate it against. The answer
+    /// then can't depend on the data, so it holds for the whole file: nothing to
+    /// read when the predicate is <see cref="FilterResult.AlwaysFalse"/> (as
+    /// <see cref="Expressions.Expressions.False"/> is), everything otherwise.
+    /// </summary>
+    private IReadOnlyList<RowRange>? EvaluateWithoutZoneStats(Predicate predicate)
+    {
+        var cursor = new VortexZoneCursor(
+            new Dictionary<string, ZoneStats?>(StringComparer.Ordinal));
+        var result = StatisticsEvaluator.Evaluate(
+            predicate, cursor, new VortexZoneStatsAccessor(Schema));
+        return result == FilterResult.AlwaysFalse ? System.Array.Empty<RowRange>() : null;
     }
 
     /// <summary>

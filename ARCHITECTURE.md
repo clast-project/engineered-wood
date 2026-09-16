@@ -605,18 +605,21 @@ VortexFileReader.OpenAsync()
   └─ LayoutPlanner.Plan → ColumnPlan[] with optional ZoneInfo per column
 
 VortexFileReader.ReadAllAsync(rowOffset, rowCount, columnIndices, predicate)
-  ├─ predicate.EvaluateZonesAsync(this, totalZones) → HashSet<int> acceptedZones
-  ├─ For each chunkIdx:
-  │    ├─ Skip if chunkIdx ∉ acceptedZones
-  │    ├─ Skip via row-range cursor if chunk wholly outside [rowOffset, rowOffset + rowCount)
-  │    ├─ For each requested column:
-  │    │    ├─ Fetch the chunk's segment(s) via IRandomAccessFile
-  │    │    ├─ Decompress (None today)
-  │    │    ├─ SerializedArray.Parse → Array FlatBuffer + raw buffer slices
-  │    │    └─ ArrayDecoder.Decode → IArrowArray
-  │    ├─ Assemble RecordBatch
-  │    └─ Slice via RecordBatch.Slice if at the row-range boundary
-  └─ yield batch
+  ├─ EvaluatePredicateRangesAsync(predicate) → accepted row ranges (null = all rows)
+  │    ├─ GetZoneStatsAsync for each referenced column
+  │    ├─ Referenced zone maps share zone_len: StatisticsEvaluator per zone;
+  │    │   zone z → rows [z·zone_len, (z+1)·zone_len)
+  │    └─ Otherwise: evaluate once without stats; AlwaysFalse → no rows
+  ├─ ReadRangesAsync: clip ranges to [rowOffset, rowOffset + rowCount), sort, merge
+  └─ For each range, walk forward; each batch ends at the next chunk end of
+     any requested column (columns may be chunked independently) or the range end:
+       ├─ Per column (ColumnCursor), decode the chunk once on first use:
+       │    ├─ Fetch the chunk's segment(s) via IRandomAccessFile
+       │    ├─ Decompress (None today)
+       │    ├─ SerializedArray.Parse → Array FlatBuffer + raw buffer slices
+       │    └─ ArrayDecoder.Decode → IArrowArray
+       ├─ Slice each column to the batch's rows (whole chunk: no slice)
+       └─ yield RecordBatch
 ```
 
 ### Array decoders (`Encodings/`)
@@ -631,7 +634,7 @@ Per-encoding decoder classes, dispatched by encoding string in
 | String / Binary | `vortex.varbin`, `vortex.varbinview`, `vortex.fsst` (via `Clast.Fsst`) |
 | Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked` |
 | Float | `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.pco` (via `Clast.Pcodec`) |
-| FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` wired but skipped pending an upstream Clast.FastLanes lane-major helper |
+| FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` (signed and unsigned integers) |
 | Composite | `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`, `vortex.struct`, `vortex.ext` |
 | Decimal | `vortex.decimal` (i8..i256 → Decimal128/256), `vortex.decimal_byte_parts` |
 | Temporal | `vortex.datetimeparts` (combined with `vortex.ext` → Timestamp) |
