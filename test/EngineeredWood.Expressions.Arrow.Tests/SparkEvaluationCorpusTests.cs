@@ -486,6 +486,11 @@ public sealed class SparkEvaluationCorpusTests
     // evaluation comparison cannot tell a bigint from a double and this is the only test that
     // can.
     [InlineData("arithmetic-string-coercion")]
+    // #313/#340, and the group that needs this gate for the same reason `arithmetic-string-coercion`
+    // does: the rule IS a type. `+a` must stay an `int` and `+NULL` must become a `double`, and the
+    // evaluation gate either side of this one compares VALUES -- where the recorded 1 and a wrongly
+    // widened 1.0 are the same number. Only this test can see the difference.
+    [InlineData("unary-operators")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -509,6 +514,10 @@ public sealed class SparkEvaluationCorpusTests
     // of #296 that DIFFERS, since a string this dialect reads as a double is one ANSI reads as a
     // bigint.
     [InlineData("arithmetic-string-coercion")]
+    // ...and here because the types are dialect-INDEPENDENT and that is worth checking rather than
+    // assuming: measured, `+'1'` is a double under both dialects and only what a BAD string does
+    // differs. A registry that started resolving a bigint under one of them would move no value.
+    [InlineData("unary-operators")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
@@ -749,7 +758,21 @@ public sealed class SparkEvaluationCorpusTests
                 var values = eval.GetProperty("values");
                 for (var row = 0; row < values.GetArrayLength(); row++)
                 {
-                    var problem = CorpusEvaluation.Compare(values[row], actual!, row);
+                    // A SHAPE mismatch is reported like any other difference HERE, and is a
+                    // signal rather than a string in `SparkFuzzTriage` -- see
+                    // `CorpusTypeMismatchException`. This fixture is curated, so every row is one
+                    // somebody chose and a difference names the expression either way; the
+                    // fuzzer sorts thousands of generated rows and needs the verdict.
+                    string? problem;
+                    try
+                    {
+                        problem = CorpusEvaluation.Compare(values[row], actual!, row);
+                    }
+                    catch (CorpusTypeMismatchException mismatch)
+                    {
+                        problem = mismatch.Message;
+                    }
+
                     if (problem is not null && !differing.ContainsKey(expression))
                         differing[expression] = $"row {row}: {problem}";
                 }

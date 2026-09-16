@@ -861,4 +861,59 @@ public sealed class SparkSqlParserTests
 
         return flattened;
     }
+
+    /// <summary>
+    /// A leading <c>+</c> becomes a call, exactly as a leading <c>-</c> does.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It used to be DISCARDED, which is right for every numeric operand and wrong for the two
+    /// that are not: Spark's <c>UnaryPositive</c> casts a string to <c>double</c> and types a bare
+    /// <c>NULL</c> as one, so <c>+'1'</c> is 1.0 and <c>+'abc'</c> refuses where the bare string
+    /// did neither. #313, #340.
+    /// </para>
+    /// <para>
+    /// Pinned here as well as by the <c>unary-operators</c> corpus group because it is a property
+    /// of the TREE: Spark's own parse names the node <c>UnaryPositive</c> and renders it
+    /// <c>(+ a)</c>, so a tree that dropped the operator would be a different tree even where it
+    /// happens to evaluate alike.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void UnaryPlusBecomesACallLikeUnaryMinus()
+    {
+        Assert.Equal(
+            new FunctionCall("positive", new Expression[] { new UnboundReference("a") }),
+            Parse("+a"));
+
+        Assert.Equal(
+            new FunctionCall("negative", new Expression[] { new UnboundReference("a") }),
+            Parse("-a"));
+
+        // Nested, in both orders, because each operator has a type rule and the inner one decides
+        // what the outer one is applied to.
+        Assert.Equal(
+            new FunctionCall(
+                "negative",
+                new Expression[]
+                {
+                    new FunctionCall("positive", new Expression[] { new UnboundReference("a") }),
+                }),
+            Parse("-+a"));
+
+        Assert.Equal(
+            new FunctionCall(
+                "positive",
+                new Expression[]
+                {
+                    new FunctionCall("positive", new Expression[] { new UnboundReference("a") }),
+                }),
+            Parse("+ +a"));
+
+        // BINARY plus is untouched: the change is confined to the prefix position.
+        Assert.Equal(
+            new FunctionCall(
+                "+", new Expression[] { new UnboundReference("a"), new UnboundReference("b") }),
+            Parse("a + b"));
+    }
 }

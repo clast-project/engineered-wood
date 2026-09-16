@@ -74,7 +74,8 @@ public sealed class SparkFunctionRegistry
 
     public bool IsRegistered(string name) => name switch
     {
-        "+" or "-" or "*" or "/" or "%" or "negative" or "cast" or "try_cast" => true,
+        "+" or "-" or "*" or "/" or "%" or "negative" or "positive"
+            or "cast" or "try_cast" => true,
         "length" or "upper" or "lower" or "trim" or "ltrim" or "rtrim" => true,
         "substring" or "substr" or "concat" or "||" => true,
         "like" or "ilike" or "rlike" => true,
@@ -99,6 +100,10 @@ public sealed class SparkFunctionRegistry
             case "negative":
                 Expect(name, args, 1);
                 return Negate(args[0], rowCount);
+
+            case "positive":
+                Expect(name, args, 1);
+                return Positive(args[0], rowCount);
 
             // try_cast is a cast that never raises. It is NOT the legacy dialect, though one flag
             // covered both for as long as every non-raising answer was null: the legacy dialect
@@ -788,7 +793,7 @@ public sealed class SparkFunctionRegistry
         if (operand.Data.DataType is StringType)
             operand = CastForArithmetic(operand, DoubleType.Default, rowCount);
 
-        var type = SparkNumericTypes.NegateResult(operand.Data.DataType);
+        var type = SparkNumericTypes.UnaryResult(operand.Data.DataType, "minus");
 
         return type switch
         {
@@ -797,6 +802,38 @@ public sealed class SparkFunctionRegistry
             FloatType => NegateFloating(operand, isFloat: true, rowCount),
             _ => IntegralArithmetic("-", ZeroLike(type, rowCount), operand, type, rowCount),
         };
+    }
+
+    /// <summary>
+    /// Spark's <c>UnaryPositive</c>: the identity over a numeric, a cast over everything that has
+    /// a rule at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Not the identity, which is the whole of #313 and #340.</b> It is the identity for every
+    /// NUMERIC operand — which is why the parser discarding the token went unnoticed, and why the
+    /// corpus carried one unary-plus row against fourteen for unary minus. A STRING is cast to
+    /// DOUBLE, the same target <see cref="Negate"/> takes and through the same dialect-aware cast,
+    /// so <c>+'1'</c> is 1.0 and <c>+'abc'</c> raises under ANSI and is null under legacy.
+    /// </para>
+    /// <para>
+    /// A <c>void</c> operand resolves <c>double</c> rather than staying void, and that is
+    /// observable rather than cosmetic: <c>coalesce(a, +NULL)</c> is a double to Spark where a
+    /// void branch would have left it an int. It has to be MATERIALISED at that type — returning
+    /// the operand unchanged would keep the void — which is the one place this differs from the
+    /// identity it otherwise is.
+    /// </para>
+    /// </remarks>
+    private IArrowArray Positive(IArrowArray operand, int rowCount)
+    {
+        if (operand.Data.DataType is StringType)
+            return CastForArithmetic(operand, DoubleType.Default, rowCount);
+
+        var type = SparkNumericTypes.UnaryResult(operand.Data.DataType, "plus");
+
+        return operand.Data.DataType is NullType
+            ? ArrowCompute.MakeNullArray(type, rowCount)
+            : operand;
     }
 
     /// <summary>Unary minus over a float or a double, which is a flip of the sign bit.</summary>

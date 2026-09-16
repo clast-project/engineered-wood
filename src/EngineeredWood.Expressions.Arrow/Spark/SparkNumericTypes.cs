@@ -99,18 +99,35 @@ internal static class SparkNumericTypes
         return WiderIntegral(left, right);
     }
 
-    /// <summary>The result type of unary minus, which never changes the operand's type.</summary>
+    /// <summary>
+    /// The result type of a unary <c>+</c> or <c>-</c>, which never changes the operand's type.
+    /// </summary>
     /// <remarks>
+    /// <para>
     /// The one exception is <c>void</c>, which has no arithmetic of its own: measured,
     /// <c>-NULL</c> is a <c>double</c>, the same default two void operands take in
     /// <see cref="ArithmeticResult"/>. #293.
+    /// </para>
+    /// <para>
+    /// <b>Shared by both unary operators</b>, which is why it takes the operator's name: the rule
+    /// is the same one — a numeric keeps its type, a <c>void</c> resolves <c>double</c>, and
+    /// nothing else has a rule at all — and only the message differs. Measured for #313/#340,
+    /// <c>+NULL</c> and <c>-NULL</c> are both <c>double</c> and <c>+a</c> and <c>-a</c> are both
+    /// <c>int</c>; the operators diverge in what they COMPUTE, not in what they resolve.
+    /// </para>
     /// </remarks>
-    public static IArrowType NegateResult(IArrowType operand) =>
+    /// <param name="operand">The type the operator was applied to.</param>
+    /// <param name="operatorName">
+    /// <c>plus</c> or <c>minus</c>, for the refusal a non-numeric operand earns — so that a
+    /// reader of the failure is told which operator they wrote.
+    /// </param>
+    public static IArrowType UnaryResult(IArrowType operand, string operatorName) =>
         operand is NullType
             ? DoubleType.Default
             : IsNumeric(operand)
                 ? operand
-                : throw new NotSupportedException($"unary minus is not defined for {operand.Name}");
+                : throw new NotSupportedException(
+                    $"unary {operatorName} is not defined for {operand.Name}");
 
     /// <summary>
     /// The type two branches of a conditional unify to — <c>coalesce</c>, <c>if</c>, <c>CASE</c>.
