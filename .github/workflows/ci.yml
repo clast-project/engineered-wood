@@ -243,7 +243,11 @@ jobs:
           EW_REQUIRE_DELTA_INTEROP: '1'
           EW_REQUIRE_DUCKDB_INTEROP: '1'
           EW_REQUIRE_PARQUET_READERS_INTEROP: '1'
-        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
+        # LogFilePrefix, not LogFileName: most test projects target three frameworks, and a
+        # fixed file name made each framework's results overwrite the last, so the uploaded
+        # artifact held one framework per project. The prefix gets the framework and a
+        # timestamp appended.
+        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFilePrefix=test-results"
 
       - name: Pack
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
