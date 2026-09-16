@@ -44,6 +44,27 @@ public class ProtobufWireTests
             () => ProtobufWire.SkipField(new byte[] { 0x05, 0x01 }, ref pos, 2, "test"));
     }
 
+    [Theory]
+    [InlineData(1ul)]
+    [InlineData(5ul)]
+    public void RejectsAFixedWidthFieldPastTheMessage(ulong wireType)
+    {
+        int pos = 1;
+        Assert.Throws<VortexFormatException>(
+            () => ProtobufWire.SkipField(new byte[] { 0, 1, 2 }, ref pos, wireType, "test"));
+    }
+
+    [Fact]
+    public void RejectsALengthThatWouldOverflowTheOffset()
+    {
+        // Three bytes in, a length of int.MaxValue: added first, it wraps negative and would
+        // pass a "past the end" check.
+        var bytes = new byte[] { 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0 };
+        int pos = 3;
+        Assert.Throws<VortexFormatException>(
+            () => ProtobufWire.SkipField(bytes, ref pos, 2, "test"));
+    }
+
     [Fact]
     public void ZonedMetadataReadsFieldsAfterAnUnknownBytesField()
     {

@@ -103,6 +103,18 @@ public class VortexZstdTests
         }
     }
 
+    [Fact]
+    public void RejectsALengthPrefixThatLeavesNoRoomForTheRest()
+    {
+        // Two valid values, but the first claims all 8 bytes after its prefix, so the second has
+        // no prefix and the payload would overrun the 4 bytes left for values.
+        var values = new byte[] { 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+
+        var ex = Assert.Throws<VortexFormatException>(() => ZstdArrayDecoder.BuildVarBin(
+            Apache.Arrow.Types.BinaryType.Default, values, ArrowBuffer.Empty, nullCount: 0, rowCount: 2, validCount: 2));
+        Assert.Contains("more than the decompressed data holds", ex.Message);
+    }
+
     private static readonly string[] Words =
         { "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "zstd", "frames", "façade", "日本" };
 

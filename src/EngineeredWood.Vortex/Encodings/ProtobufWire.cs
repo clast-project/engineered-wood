@@ -23,23 +23,34 @@ internal static class ProtobufWire
         {
             case 0:
                 Varint.ReadUnsigned(bytes, ref pos);
-                break;
+                return;
             case 1:
-                pos += 8;
-                break;
+                Advance(bytes, ref pos, 8, context);
+                return;
             case 2:
                 {
-                    int length = checked((int)Varint.ReadUnsigned(bytes, ref pos));
-                    pos += length;
-                    break;
+                    long length = Varint.ReadUnsigned(bytes, ref pos);
+                    Advance(bytes, ref pos, length, context);
+                    return;
                 }
             case 5:
-                pos += 4;
-                break;
+                Advance(bytes, ref pos, 4, context);
+                return;
             default:
                 throw new VortexFormatException($"Unsupported protobuf wire type {wireType} in {context}.");
         }
-        if (pos > bytes.Length)
-            throw new VortexFormatException($"A protobuf field in {context} runs past the end of its message.");
+    }
+
+    /// <summary>
+    /// Moves <paramref name="pos"/> forward <paramref name="count"/> bytes, which must be within
+    /// the message. Compared against the bytes remaining rather than added first, so a huge or
+    /// negative count can't wrap <paramref name="pos"/> past the check.
+    /// </summary>
+    private static void Advance(ReadOnlySpan<byte> bytes, ref int pos, long count, string context)
+    {
+        if (count < 0 || count > bytes.Length - pos)
+            throw new VortexFormatException(
+                $"A protobuf field of {count} bytes at offset {pos} in {context} runs past the end of its {bytes.Length}-byte message.");
+        pos += (int)count;
     }
 }

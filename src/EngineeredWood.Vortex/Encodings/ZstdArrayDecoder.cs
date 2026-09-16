@@ -143,7 +143,14 @@ internal static class ZstdArrayDecoder
         int width = type switch
         {
             Int8Type or UInt8Type => 1,
-            Int16Type or UInt16Type or HalfFloatType => 2,
+#if NET6_0_OR_GREATER
+            HalfFloatType => 2,
+#else
+            HalfFloatType => throw new NotSupportedException(
+                "HalfFloat (F16) decode requires System.Half (net6+); netstandard2.0 builds "
+                + "of Apache.Arrow don't ship HalfFloatArray."),
+#endif
+            Int16Type or UInt16Type => 2,
             Int32Type or UInt32Type or FloatType => 4,
             Int64Type or UInt64Type or DoubleType => 8,
             _ => throw new NotSupportedException($"vortex.zstd decoder does not support Arrow type {type}."),
@@ -176,7 +183,7 @@ internal static class ZstdArrayDecoder
             type, rowCount, nullCount, 0, new[] { validity, new ArrowBuffer(data) }));
     }
 
-    private static IArrowArray BuildVarBin(
+    internal static IArrowArray BuildVarBin(
         IArrowType type, byte[] values, ArrowBuffer validity, int nullCount, int rowCount, int validCount)
     {
         // Values are length-prefixed and back to back, so the payload bytes only need the
@@ -194,9 +201,12 @@ internal static class ZstdArrayDecoder
                 throw new VortexFormatException($"vortex.zstd value {seen} has no length prefix.");
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(values.AsSpan(pos));
             pos += 4;
-            if (len > (uint)(values.Length - pos))
+            // The output holds the payload bytes once every prefix is removed, so a length that
+            // doesn't leave room for the remaining prefixes is corrupt too.
+            long room = Math.Min(values.Length - pos, data.Length - end);
+            if (len > room)
                 throw new VortexFormatException(
-                    $"vortex.zstd value {seen} is {len} bytes, past the end of the decompressed data.");
+                    $"vortex.zstd value {seen} is {len} bytes, more than the decompressed data holds.");
             Buffer.BlockCopy(values, pos, data, end, (int)len);
             pos += (int)len;
             end += (int)len;
