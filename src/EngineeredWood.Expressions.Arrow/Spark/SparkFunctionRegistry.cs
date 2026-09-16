@@ -1068,6 +1068,13 @@ public sealed class SparkFunctionRegistry
         if (right is null)
             throw new ArgumentNullException(nameof(right));
 
+        // A VOID operand is comparable with everything, ORDERING INCLUDED. Measured on 4.0.3,
+        // `NULL = bl`, `NULL = a` and even `NULL < bl` all resolve `boolean` in both dialects,
+        // where the same expressions over a typed null do not: `CAST(NULL AS INT) = bl` is
+        // refused under ANSI. So it is the absence of a type that is permissive, not nullness.
+        if (left is NullType || right is NullType)
+            return null;
+
         if (Comparable(op, left, right))
             return null;
 
@@ -1099,20 +1106,44 @@ public sealed class SparkFunctionRegistry
         if (memberTypes is null)
             throw new ArgumentNullException(nameof(memberTypes));
 
+        // A VOID MEMBER CONSTRAINS NOTHING and is dropped before anything is judged -- the same
+        // rule `CoerceSet` applies when it resolves the set's cast target. What is left still has
+        // to agree: measured, `NULL IN (1, TRUE)` is refused in both dialects while
+        // `NULL IN (1, 2)` resolves, so dropping the void does not excuse the rest of the list.
+        if (memberTypes.Any(t => t is NullType))
+        {
+            var typed = new List<IArrowType>(memberTypes.Count);
+            foreach (var type in memberTypes)
+            {
+                if (type is not NullType)
+                    typed.Add(type);
+            }
+
+            memberTypes = typed;
+        }
+
+        // SCANNED FOR UNKNOWNS FIRST, so the answer cannot depend on the ORDER of the members.
+        // Returning "no opinion" the moment one is met made `[INT, BOOLEAN, STRUCT]` a refusal
+        // and `[STRUCT, INT, BOOLEAN]` an acceptance -- the same set, two answers, decided by
+        // where the unmeasured type happened to sit. Since the promise this method makes is no
+        // opinion about a list containing a type the matrix never asked about, it has to look for
+        // one before judging anything.
+        foreach (var type in memberTypes)
+        {
+            if (FamilyOf(type) == Family.Unknown)
+                return null;
+        }
+
         var resolved = Family.Unknown;
         bool anyText = false;
 
         foreach (var type in memberTypes)
         {
             var family = FamilyOf(type);
-            switch (family)
+            if (family == Family.Text)
             {
-                case Family.Unknown:
-                    return null;   // a type the matrix never asked about; no opinion
-
-                case Family.Text:
-                    anyText = true;
-                    continue;
+                anyText = true;
+                continue;
             }
 
             if (resolved == Family.Unknown)
@@ -3161,6 +3192,17 @@ public sealed class SparkFunctionRegistry
 
         if (leftType is NullType || rightType is NullType)
             return (left, right);
+
+        // ANALYSED BEFORE THE ROW LOOP, because `nullif` reaches equality by a road
+        // `ArrowRowEvaluator` never travels: it is a function call, so the evaluator's own
+        // comparison check never sees the pair. Without this, `nullif(a, bl)` under ANSI ANSWERS
+        // over an empty or all-null batch and fails somewhere in `AreEqual` over any other --
+        // the refusal decided by the data, which is the defect #286 exists to remove rather than
+        // to relocate. The legacy dialect accepts the pair here exactly as it does for `=`,
+        // because `CheckComparison` carries #333's exception.
+        var diagnostic = CheckComparison(ComparisonOperator.Equal, leftType, rightType);
+        if (diagnostic is not null)
+            throw new ExpressionAnalysisException(diagnostic);
 
         // EQUAL, because that is the operator this site implements: `nullif(a, b)` is Spark's
         // `if(a = b, NULL, a)`. Measured, the boolean rule reaches it — `nullif(a, bl)` resolves

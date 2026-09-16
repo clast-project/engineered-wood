@@ -3036,10 +3036,10 @@ GROUPS = {
     ],
 
     # THE 9x9 COMPARISON MATRIX. #286, and the measurement the family rule is derived from rather
-    # than remembered: one column per type EW models, asked of both dialects, for the three
-    # comparison shapes that resolve differently.
+    # than remembered: one column per type EW models, asked of both dialects, under the five
+    # shapes below.
     #
-    # WHY IT IS GENERATED. 81 pairs x 4 shapes is 324 expressions, and writing them out by hand
+    # WHY IT IS GENERATED. 81 pairs x 5 shapes is 405 expressions, and writing them out by hand
     # would invite exactly the gap this group exists to close -- a pair nobody thought to ask
     # about becomes a rule nobody implemented. The ORDER matters and both directions are asked:
     # which operand a rule moves is part of the answer (a string against a number is cast to the
@@ -3059,6 +3059,37 @@ GROUPS = {
         f"{left} IN ({right})"
         for left in COMPARISON_COLUMNS
         for right in COMPARISON_COLUMNS
+    ] + [
+        # VOID, which the matrix cannot reach because `void` is not a column of SCHEMA and cannot
+        # be: a bare NULL is a LITERAL and only a literal. Spark types one `void`, which
+        # constrains nothing -- so the question is whether the rest of a set still has to agree
+        # among itself once a void is dropped from it, and whether a void operand exempts the
+        # members from each other.
+        #
+        # Asked because the answer decides a real branch: a void operand cannot be typed, so an
+        # analyzer that gives up when it meets one would skip `NULL IN (1, TRUE)` entirely.
+        "NULL IN (1, TRUE)",
+        "NULL IN (1, 2)",
+        "NULL IN (a, bl)",
+        "NULL IN (bl)",
+        "a IN (NULL, bl)",
+        "a IN (bl, NULL)",
+        "a IN (NULL, 1)",
+        "bl IN (NULL, a)",
+
+        # ...and the same question for a comparison, where a void operand is the shape #293
+        # measured and this one only has to not regress.
+        "NULL = bl",
+        "NULL = a",
+        "a = NULL",
+        "NULL < bl",
+
+        # A TYPED null is not a void and does constrain: `CAST(NULL AS INT)` is an int, so these
+        # must be refused exactly as the column rows are. The pair that says an analyzer reading
+        # "all rows null" instead of the TREE would answer wrongly.
+        "CAST(NULL AS INT) IN (bl)",
+        "CAST(NULL AS INT) = bl",
+        "CAST(NULL AS BOOLEAN) IN (a)",
     ],
 
     "malformed": [

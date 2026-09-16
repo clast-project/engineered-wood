@@ -331,9 +331,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <para>
     /// All or nothing: a member that cannot be typed from the tree leaves the whole list to the
     /// fallback, because a list asked about with one of its members missing is a different list.
-    /// A bare <c>NULL</c> member is not missing, though — it is left OUT, since Spark types one
-    /// <c>void</c> and a void member constrains the resolution no more than it constrains a
-    /// comparison.
+    /// A bare <c>NULL</c> is not missing, though — it is left OUT, since Spark types one
+    /// <c>void</c> and a void constrains the resolution no more than it constrains a comparison.
+    /// </para>
+    /// <para>
+    /// <b>That applies to the OPERAND as well as to a member</b>, and reading it as "cannot be
+    /// typed, so give up" was a hole: measured on 4.0.3, <c>NULL IN (1, TRUE)</c> is refused in
+    /// both dialects — the void operand does not excuse the members from agreeing with each other
+    /// — while giving up left it unasked and answering. Caught by the Copilot reviewer on #346.
     /// </para>
     /// </remarks>
     private bool CheckSetFromTree(SetPredicate set, RecordBatch batch)
@@ -341,11 +346,17 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         if (_analysis is null)
             return false;
 
-        var operandType = AnalysisType(set.Operand, batch);
-        if (operandType is null)
-            return false;
+        var types = new List<IArrowType>(set.Values.Count + 1);
 
-        var types = new List<IArrowType>(set.Values.Count + 1) { operandType };
+        if (!IsNullLiteral(set.Operand))
+        {
+            var operandType = AnalysisType(set.Operand, batch);
+            if (operandType is null)
+                return false;
+
+            types.Add(operandType);
+        }
+
         foreach (var member in set.Values)
         {
             if (IsNullLiteral(member))
@@ -492,11 +503,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         if (_analysis is null || askedFromTree)
             return;
 
-        var type = ReadType(operandType, operand);
-        if (type is null)
-            return;
-
-        var types = new List<IArrowType>(members.Length + 1) { type };
+        // An operand with no readable type is the value-side spelling of a bare NULL, and is left
+        // OUT rather than abandoning the check -- see CheckSetFromTree for the measurement.
+        var types = new List<IArrowType>(members.Length + 1);
+        if (ReadType(operandType, operand) is { } type)
+            types.Add(type);
         for (var k = 0; k < members.Length; k++)
         {
             // A member null in every row with no declared type is the value-side spelling of a

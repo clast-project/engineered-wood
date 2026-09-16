@@ -277,6 +277,38 @@ public sealed class AnalysisRulesTests
         Assert.Empty(accepting.Asked);
     }
 
+    /// <summary>
+    /// A bare <c>NULL</c> OPERAND is left out too — it does not excuse the members from agreeing
+    /// with each other.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Caught by the Copilot reviewer on #346, then measured. <c>AnalysisType</c> cannot type a
+    /// bare <c>NULL</c>, and reading that as "cannot type the operand, so give up" left the whole
+    /// list unasked — so <c>NULL IN (1, TRUE)</c> answered where Spark refuses it.
+    /// </para>
+    /// <para>
+    /// Measured on 4.0.3, in BOTH dialects: <c>NULL IN (1, TRUE)</c> and <c>NULL IN (a, bl)</c>
+    /// are <c>DATA_DIFF_TYPES</c>, while <c>NULL IN (1, 2)</c> and <c>NULL IN (bl)</c> resolve.
+    /// So the void is dropped and what remains is judged exactly as it would have been without
+    /// it — which is the same rule a void MEMBER already took.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ABareNullOperandDoesNotExcuseTheMembers()
+    {
+        var refusing = RefusingIntAgainstBoolean();
+        Assert.Throws<ExpressionAnalysisException>(() => Eval("NULL IN (1, bl)", refusing));
+
+        // The operand is gone from the list, not merely ignored: what was asked is the members.
+        Assert.Equal(new[] { "int32,bool" }, refusing.AskedSets);
+
+        // ...and a list that agrees once the void is dropped still resolves.
+        var accepting = RefusingIntAgainstBoolean();
+        Eval("NULL IN (1, 2)", accepting);
+        Assert.Equal(new[] { "int32,int32" }, accepting.AskedSets);
+    }
+
     /// <summary>A bare <c>NULL</c> member is left out of the list rather than typed.</summary>
     /// <remarks>
     /// Spark types one <c>void</c>, which constrains the resolution no more than it constrains a

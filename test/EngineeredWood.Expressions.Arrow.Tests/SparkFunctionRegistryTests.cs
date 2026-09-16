@@ -3291,4 +3291,72 @@ public sealed class SparkFunctionRegistryTests
         Assert.Null(Ansi.CheckComparison(
             ComparisonOperator.Equal, Date64Type.Default, Date32Type.Default));
     }
+
+    /// <summary>
+    /// A list carrying a type the matrix never asked about gets no opinion, wherever in the list
+    /// that type sits.
+    /// </summary>
+    /// <remarks>
+    /// Caught by the Copilot reviewer on #346. Returning "no opinion" the moment an unknown type
+    /// was met made the answer depend on ORDER: <c>[INT, BOOLEAN, STRUCT]</c> refused because the
+    /// mismatch came first, and <c>[STRUCT, INT, BOOLEAN]</c> accepted because the struct did.
+    /// The same set, two answers. A rule whose promise is silence about unmeasured types has to
+    /// look for one before judging anything.
+    /// </remarks>
+    [Fact]
+    public void ASetCarryingAnUnknownTypeIsNotJudgedWhereverItSits()
+    {
+        var nested = new StructType(new[] { new Field("x", Int32Type.Default, true) });
+
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, BooleanType.Default, nested }));
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { nested, Int32Type.Default, BooleanType.Default }));
+        Assert.Null(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, nested, BooleanType.Default }));
+
+        // ...and the same list WITHOUT the unknown is refused, which is what says the silence is
+        // about the struct rather than about the rule having stopped working.
+        Assert.NotNull(Ansi.CheckSetComparison(
+            new IArrowType[] { Int32Type.Default, BooleanType.Default }));
+    }
+
+    /// <summary>
+    /// <c>nullif</c> takes the analysis too, and takes it BEFORE its row loop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Caught by the Copilot reviewer on #346. <c>nullif</c> reaches equality by a road
+    /// <c>ArrowRowEvaluator</c> never travels — it is a function call, so the evaluator's own
+    /// comparison check never sees the pair — and the registry coerced without analysing. Under
+    /// ANSI that left the refusal to whatever <c>AreEqual</c> did with the first non-null row, so
+    /// an EMPTY batch answered and a populated one threw: the refusal decided by the data, which
+    /// is the defect #286 exists to remove rather than relocate.
+    /// </para>
+    /// <para>
+    /// The empty batch is the assertion that matters. Spark rejects <c>nullif(a, bl)</c> at
+    /// analysis whatever the data, so no row count may change the answer.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void NullIfIsAnalysedBeforeItsRowLoop()
+    {
+        var populated = Batch(("a", Ints(1)), ("bl", Booleans(true)));
+        var empty = Batch(("a", Ints()), ("bl", Booleans()));
+
+        foreach (var batch in new[] { populated, empty })
+        {
+            var refusal = Assert.Throws<ExpressionAnalysisException>(
+                () => Eval(Ansi, "nullif(a, bl)", batch));
+            Assert.Equal("DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES", refusal.ErrorClass);
+        }
+
+        // The legacy dialect accepts the pair here exactly as it does for `=`, so the analysis
+        // must not refuse what #333 goes on to answer.
+        Assert.Equal(
+            1,
+            Assert.IsType<Int32Array>(Eval(Legacy, "nullif(a, 2)", populated)).GetValue(0));
+        Assert.Null(
+            Assert.IsType<Int32Array>(Eval(Legacy, "nullif(a, bl)", populated)).GetValue(0));
+    }
 }
