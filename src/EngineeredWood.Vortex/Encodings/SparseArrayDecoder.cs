@@ -4,6 +4,7 @@
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.Format;
 
@@ -18,7 +19,8 @@ namespace EngineeredWood.Vortex.Encodings;
 /// <c>SparseMetadata { patches: PatchesMetadata }</c> (required, includes
 /// indices_ptype, len, offset).</para>
 ///
-/// <para>Phase 1 scope: integer/float fill values only.</para>
+/// <para>Integer and float columns with a non-null fill are built directly; everything else is
+/// gathered from the fill value and the patches.</para>
 /// </summary>
 internal static class SparseArrayDecoder
 {
@@ -95,9 +97,31 @@ internal static class SparseArrayDecoder
             (DoubleType, ScalarValueKind.F64, DoubleArray v) => Build<double>(rowCount,
                 fill.F64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
                 (data, val, len, nc) => new DoubleArray(new ArrowBuffer(data), val, len, nc, 0)),
-            _ => throw new NotSupportedException(
-                $"vortex.sparse: unsupported (type={type}, fill={fill.Kind}, values={values.GetType().Name})."),
+            // Any other type or fill (a null fill, strings, booleans…): row 0 of the gathered source is
+            // the fill value and row 1 + k is patch k.
+            _ => MaterializeByTake(type, rowCount, fill, indices, values, patchesOffset),
         };
+    }
+
+    private static IArrowArray MaterializeByTake(
+        IArrowType type, int rowCount, ScalarValueProto fill,
+        IArrowArray indices, IArrowArray values, int patchesOffset)
+    {
+        var source = ArrowArrayConcatenator.Concatenate(new[]
+        {
+            ConstantArrayDecoder.BuildArray(type, 1, fill),
+            values,
+        });
+        var rows = new int[rowCount];
+        for (int k = 0; k < indices.Length; k++)
+        {
+            var rowIdx = GetIntAtIndex(indices, k) - patchesOffset;
+            if ((uint)rowIdx >= (uint)rowCount)
+                throw new VortexFormatException(
+                    $"vortex.sparse: patch index {rowIdx} out of range [0, {rowCount}).");
+            rows[rowIdx] = 1 + k;
+        }
+        return ArrowCompute.Take(source, rows);
     }
 
     private static IArrowArray Build<T>(
@@ -157,7 +181,7 @@ internal static class SparseArrayDecoder
         // SparseMetadata { patches: PatchesMetadata at field 1 }
         // PatchesMetadata { len@1, offset@2, indices_ptype@3, ... }
         ulong len = 0, offset = 0;
-        int indicesPtype = 2;
+        int indicesPtype = 0; // proto3 omits an enum at its default, and PType 0 is U8.
         int pos = 0;
         while (pos < bytes.Length)
         {
@@ -192,7 +216,7 @@ internal static class SparseArrayDecoder
     private static void ParsePatches(
         ReadOnlySpan<byte> bytes, out ulong len, out ulong offset, out int indicesPtype)
     {
-        len = 0; offset = 0; indicesPtype = 2;
+        len = 0; offset = 0; indicesPtype = 0; // proto3 omits an enum at its default, and PType 0 is U8.
         int pos = 0;
         while (pos < bytes.Length)
         {

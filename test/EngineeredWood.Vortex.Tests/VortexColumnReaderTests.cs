@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Vortex.Tests.TestData;
+using EngineeredWood.Vortex.Tests.TestHelpers;
 
 namespace EngineeredWood.Vortex.Tests;
 
@@ -702,6 +703,47 @@ public class VortexColumnReaderTests
         Assert.Equal(2048, int32.Length);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], int32.GetValue(i));
+    }
+
+    [Fact]
+    public async Task ReadsChunkedArrayWithNoChunks()
+    {
+        // chunked_array_empty_elements_3rows.vortex: three empty i32 lists whose elements are a
+        // vortex.chunked array with no chunks, so its only child is the chunk offsets [0]. There is
+        // no chunk to take a typed empty array from, so the decoder has to build one.
+        const string fixture = "chunked_array_empty_elements_3rows.vortex";
+        var chunked = Assert.Single(
+            await FixtureArrayNodes.ReadAsync(TestDataPath.Resolve(fixture)),
+            n => n.Encoding == "vortex.chunked");
+        Assert.Equal(new[] { "vortex.primitive" }, chunked.Children);
+
+        await using var reader = await VortexFileReader.OpenAsync(TestDataPath.Resolve(fixture));
+        var list = Assert.IsType<ListArray>(await reader.ReadColumnAsync(0));
+        Assert.Equal(3, list.Length);
+        Assert.Equal(0, list.Values.Length);
+        Assert.IsType<Int32Array>(list.Values);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(0, list.GetValueLength(i));
+    }
+
+    [Fact]
+    public async Task ReadsBitPackedPatchesWithU8Indices()
+    {
+        // bitpacked_patches_200rows.vortex: under 255 rows upstream types the patch indices u8,
+        // PType 0, which proto3 omits from the patches metadata. Reading them as the u32 an
+        // absent field was once taken for asks for 4 bytes per index from a 1-byte buffer.
+        const string fixture = "bitpacked_patches_200rows.vortex";
+        var bitpacked = Assert.Single(
+            await FixtureArrayNodes.ReadAsync(TestDataPath.Resolve(fixture)),
+            n => n.Encoding == "fastlanes.bitpacked");
+        // Patches: indices, values and chunk offsets.
+        Assert.Equal(new[] { "vortex.primitive", "vortex.primitive", "vortex.primitive" }, bitpacked.Children);
+
+        await using var reader = await VortexFileReader.OpenAsync(TestDataPath.Resolve(fixture));
+        var int32 = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+        Assert.Equal(200, int32.Length);
+        for (int i = 0; i < 200; i++)
+            Assert.Equal(i % 20 == 3 ? 1_000_000 + i : (i * 37) % 100, int32.GetValue(i));
     }
 
     [Fact]

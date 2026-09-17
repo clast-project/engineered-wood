@@ -474,7 +474,9 @@ etc.). `EngineeredWood.Vortex` ships a reader, a writer, and a
 predicate-based zone-pruning API — all driven by hand-rolled
 FlatBuffers/protobuf parsing (no `Google.FlatBuffers` or `flatc`
 dependency) and cross-validated against the Rust `vortex-array` 0.86
-implementation.
+implementation in both directions: upstream reads what the writer emits,
+and the reader decodes upstream's published compatibility fixtures — every
+release since 0.64 — to the same values upstream does.
 
 ### Reading
 
@@ -483,7 +485,9 @@ implementation.
   postscript / footer / DType / Layout FlatBuffer segments, and exposes
   `Schema` (`Apache.Arrow.Schema`) and `NumberOfRows`.
 - `ReadAllAsync()` streams the file as `IAsyncEnumerable<RecordBatch>`,
-  one batch per chunk for chunked layouts.
+  one batch per chunk for chunked layouts. Files whose root layout holds
+  whole rows rather than a `vortex.struct` of columns (upstream's flat
+  layout strategy) read the same way.
 - **Column projection**: `ReadAllAsync(IReadOnlyList<int> columnIndices)`
   decodes only the requested columns. `ReadColumnAsync(int fieldIndex)`
   returns a single column as one Arrow array (concatenated across chunks).
@@ -556,7 +560,7 @@ implementation.
 `vortex.stats`), `vortex.dict` (layout-level, shared dict).
 
 **Array encodings — read**: `vortex.primitive` (nullable + non-nullable),
-`vortex.constant`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
+`vortex.constant`, `vortex.chunked`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
 `vortex.null`, `vortex.varbin`, `vortex.varbinview`, `vortex.fsst`,
 `vortex.onpair`, `vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
 `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`,

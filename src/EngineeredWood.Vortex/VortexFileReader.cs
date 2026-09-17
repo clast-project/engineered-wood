@@ -892,10 +892,38 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
                         .ConfigureAwait(false);
                     return DictReconstructor.Reconstruct(plan.ArrowType, values, codes);
                 }
+            case StructFieldColumnPlan field:
+                {
+                    var rows = await ReadRowsChunkAsync(field.Rows, chunkIndex, cancellationToken)
+                        .ConfigureAwait(false);
+                    // StructArray.Fields already applies the struct's own offset and length.
+                    return rows.Fields[field.FieldIndex];
+                }
             default:
                 throw new NotSupportedException(
                     $"Column plan type {plan.GetType().Name} is not yet supported.");
         }
+    }
+
+    /// <summary>
+    /// The most recently decoded whole-row chunk. Every field of a file stored as whole rows reads
+    /// the same chunk in turn, so one entry saves decoding it once per field.
+    /// </summary>
+    private RowsCacheEntry? _rowsCache;
+
+    private sealed record RowsCacheEntry(ColumnPlan Plan, int Chunk, Apache.Arrow.StructArray Rows);
+
+    private async Task<Apache.Arrow.StructArray> ReadRowsChunkAsync(
+        ColumnPlan plan, int chunkIndex, CancellationToken cancellationToken)
+    {
+        var cached = Volatile.Read(ref _rowsCache);
+        if (cached is not null && ReferenceEquals(cached.Plan, plan) && cached.Chunk == chunkIndex)
+            return cached.Rows;
+
+        var rows = (Apache.Arrow.StructArray)await ReadPlanChunkAsync(plan, chunkIndex, cancellationToken)
+            .ConfigureAwait(false);
+        Volatile.Write(ref _rowsCache, new RowsCacheEntry(plan, chunkIndex, rows));
+        return rows;
     }
 
     /// <summary>

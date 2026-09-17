@@ -121,14 +121,32 @@ internal static class BoolArrayDecoder
     }
 
     /// <summary>
-    /// Reads the bitmap from a leaf <c>vortex.bool</c> ArrayNode used as a
-    /// validity child by other encodings (primitive, varbin, list, …). Such
-    /// nodes themselves can't have a validity child, so children are rejected
-    /// here. For top-level nullable bool columns, use <see cref="Decode"/>.
+    /// Reads the bitmap from a validity child of another encoding (primitive, varbin, list, …).
+    /// That child is usually a leaf <c>vortex.bool</c>, whose buffer is the bitmap; but any
+    /// non-nullable bool array may stand in — upstream writes an all-null column's validity as a
+    /// <c>vortex.constant</c> false — and those are decoded and packed. For top-level nullable
+    /// bool columns, use <see cref="Decode"/>.
     /// </summary>
     public static ArrowBuffer ReadBitmap(
         ArrayNode node, SerializedArray serialized, long rowCount)
     {
+        var specs = serialized.ArraySpecs;
+        if (specs is not null && node.EncodingIndex < specs.Count
+            && specs[node.EncodingIndex] != VortexArrayEncodings.Bool)
+        {
+            var validity = (BooleanArray)ArrayDecoder.DecodeNode(
+                node, serialized, specs, BooleanType.Default, rowCount);
+            int count = checked((int)rowCount);
+            var bits = new byte[(count + 7) / 8];
+            for (int i = 0; i < count; i++)
+            {
+                // A null in a validity array has no meaning upstream; treat it as not valid.
+                if (validity.GetValue(i) == true)
+                    bits[i >> 3] |= (byte)(1 << (i & 7));
+            }
+            return new ArrowBuffer(bits);
+        }
+
         if (node.ChildCount != 0)
             throw new NotSupportedException(
                 "vortex.bool used as a validity child must not itself have children.");

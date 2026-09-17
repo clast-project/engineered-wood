@@ -226,7 +226,7 @@ internal static class AlpRdArrayDecoder
         ushort[] dict = System.Array.Empty<ushort>();
         bool hasPatches = false;
         ulong patchesLen = 0, patchesOffset = 0;
-        int patchIndicesPtype = 2; // default U32
+        int patchIndicesPtype = 0; // U8, proto3's default; set from the patches message when present
 
         int pos = 0;
         while (pos < bytes.Length)
@@ -285,7 +285,7 @@ internal static class AlpRdArrayDecoder
     private static void ParsePatchesMetadata(
         ReadOnlySpan<byte> bytes, out ulong len, out ulong offset, out int indicesPtype)
     {
-        len = 0; offset = 0; indicesPtype = 2; // proto3 default = U32 (PType=2)
+        len = 0; offset = 0; indicesPtype = 0; // proto3 omits an enum at its default, and PType 0 is U8.
         int pos = 0;
         while (pos < bytes.Length)
         {

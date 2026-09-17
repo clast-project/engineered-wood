@@ -342,6 +342,33 @@ of the contract mean. Ten of the Parquet bugs fixed so far were found this way,
 including one that silently corrupted every value after the first row-group
 boundary at default write options.
 
+### Vortex interop (optional)
+
+Two suites check EngineeredWood against upstream vortex rather than against itself, each
+through a small Rust tool built against the pinned vortex crates in
+`test/EngineeredWood.Vortex.Tests/Rust`:
+
+- `VortexCrossValidationTests` hands files EW wrote to `vortex-validator`.
+- `VortexUpstreamCompatTests` reads upstream's published compatibility fixtures (one set per
+  release since 0.64, about 120 MB) and compares every value with what `vortex-oracle`
+  decodes from the same file.
+
+```console
+cd test/EngineeredWood.Vortex.Tests/Rust
+cargo build --release --locked --bin vortex-validator --bin vortex-oracle
+cd ..
+python UpstreamCompat/fetch_fixtures.py
+```
+
+The releases and files are pinned, with hashes, in `UpstreamCompat/fixtures.lock.json`; the
+downloads land in the git-ignored `UpstreamCompat/fixtures/` (or wherever
+`EW_VORTEX_COMPAT_FIXTURES` points). To take on a new upstream release, run
+`fetch_fixtures.py --update`, commit the lock, and see what breaks. Without the tools or the
+fixtures these tests skip; `EW_REQUIRE_VORTEX_VALIDATOR=1` and
+`EW_REQUIRE_VORTEX_UPSTREAM_COMPAT=1` make that a failure, as the `vortex-interop` CI job
+sets them. A handful of the fixtures, with the oracle's output for each, are committed under
+`TestData/upstream-compat/` and run everywhere.
+
 ### Regenerating Avro Test Data
 
 The Avro test suite includes pre-generated `.avro` files in
@@ -498,7 +525,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 | **Core** | 452 |
 | **DeltaLake.Table** | 922 (109 of them interop) — re-measured 2026-08-22 |
 | **DeltaLake** | 484 |
-| **Vortex** | 322 |
+| **Vortex** | 1175 (737 of them upstream fixtures) — re-measured 2026-09-17 |
 | **Avro** | 301 |
 | **Iceberg** | 243 |
 | **ORC** | 237 |

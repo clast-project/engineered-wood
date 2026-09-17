@@ -4,6 +4,7 @@
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Vortex.Format;
 
 namespace EngineeredWood.Vortex.Encodings;
@@ -39,11 +40,19 @@ internal static class ConstantArrayDecoder
         return BuildArray(expectedType, expectedRowCount, scalar);
     }
 
-    private static IArrowArray BuildArray(IArrowType type, long rowCount, ScalarValueProto scalar)
+    /// <summary>
+    /// <paramref name="rowCount"/> rows of <paramref name="scalar"/> as <paramref name="type"/>. Also
+    /// used for <c>vortex.sparse</c>'s fill value.
+    /// </summary>
+    internal static IArrowArray BuildArray(IArrowType type, long rowCount, ScalarValueProto scalar)
     {
         var n = checked((int)rowCount);
         return (type, scalar.Kind) switch
         {
+            // A null scalar has no kind of its own, whatever the column's type.
+            (_, ScalarValueKind.Null) => ArrowCompute.MakeNullArray(type, n),
+            (Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type, ScalarValueKind.Bytes) =>
+                ArrowCompute.Repeat(type, DecimalSlot(type, scalar.BytesValue!), n),
             (Int8Type, ScalarValueKind.Int64) => Filled<sbyte>(n,
                 (data, len) => new Int8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0),
                 (sbyte)scalar.Int64Value),
@@ -119,6 +128,28 @@ internal static class ConstantArrayDecoder
         return isString
             ? new StringArray(rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0)
             : new BinaryArray(BinaryType.Default, rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0);
+    }
+
+    /// <summary>
+    /// A decimal scalar — upstream writes its unscaled value as little-endian two's complement, in
+    /// the 1 to 32 bytes of whatever integer held it — as one value slot of the Arrow type's width.
+    /// </summary>
+    private static byte[] DecimalSlot(IArrowType type, byte[] value)
+    {
+        var slot = new byte[((FixedSizeBinaryType)type).ByteWidth];
+        if (value.Length == 0)
+            return slot;
+        bool negative = (value[value.Length - 1] & 0x80) != 0;
+        byte sign = negative ? (byte)0xFF : (byte)0;
+        for (int i = 0; i < slot.Length; i++)
+            slot[i] = i < value.Length ? value[i] : sign;
+        // Narrowing is fine only if every dropped byte is sign extension.
+        for (int i = slot.Length; i < value.Length; i++)
+        {
+            if (value[i] != sign || ((slot[slot.Length - 1] & 0x80) != 0) != negative)
+                throw new VortexFormatException($"Decimal scalar of {value.Length} bytes does not fit {type}.");
+        }
+        return slot;
     }
 
     private static IArrowArray WithType(IArrowType type, byte[] data, int length) =>

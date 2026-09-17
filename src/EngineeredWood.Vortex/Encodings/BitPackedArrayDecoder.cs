@@ -326,7 +326,7 @@ internal static class BitPackedArrayDecoder
         uint bitWidth = 0, offset = 0;
         bool hasPatches = false;
         ulong patchesLen = 0, patchesOffset = 0;
-        int patchIndicesPtype = 2; // default U32
+        int patchIndicesPtype = 0; // U8, proto3's default; set from the patches message when present
         bool patchHasChunkOffsets = false;
 
         int pos = 0;
@@ -361,7 +361,7 @@ internal static class BitPackedArrayDecoder
         ReadOnlySpan<byte> bytes,
         out ulong len, out ulong offset, out int indicesPtype, out bool hasChunkOffsets)
     {
-        len = 0; offset = 0; indicesPtype = 2; hasChunkOffsets = false;
+        len = 0; offset = 0; indicesPtype = 0; hasChunkOffsets = false; // proto3 omits an enum at its default, and PType 0 is U8.
         int pos = 0;
         while (pos < bytes.Length)
         {

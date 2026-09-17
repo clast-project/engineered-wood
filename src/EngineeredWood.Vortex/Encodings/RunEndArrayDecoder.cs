@@ -4,23 +4,25 @@
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.Format;
 
 namespace EngineeredWood.Vortex.Encodings;
 
 /// <summary>
-/// Decoder for <c>vortex.runend</c>: run-length-encoded primitive arrays.
+/// Decoder for <c>vortex.runend</c>: run-length-encoded arrays of any type.
 /// Two children: <c>ends</c> (monotonic run-end positions) and <c>values</c>
 /// (one value per run). For row <c>i</c>, find the smallest <c>j</c> where
 /// <c>ends[j] &gt; i</c>, output <c>values[j]</c>.
 ///
 /// <para>Metadata proto <c>RunEndMetadata { ends_ptype, num_runs, offset }</c>.
 /// We use <c>ends_ptype</c> to resolve the Arrow type for the ends child;
-/// <c>offset</c> is for slicing (currently always 0 for top-level use).</para>
+/// <c>offset</c> is for slicing, and a non-zero one is refused.</para>
 ///
-/// <para>Phase 1 scope: integer values only. Float / bool / string run-end
-/// arrays land alongside fixtures.</para>
+/// <para>Integer and float values expand directly, carrying the values' validity over their
+/// runs; every other type (strings, booleans, decimals, nested…) is gathered with
+/// <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>, one index per row.</para>
 /// </summary>
 internal static class RunEndArrayDecoder
 {
@@ -98,9 +100,30 @@ internal static class RunEndArrayDecoder
             (DoubleType, DoubleArray v) => ExpandPrimitive<double>(rowCount, ends, v,
                 i => v.GetValue(i) ?? default,
                 static (data, val, len, nc) => new DoubleArray(new ArrowBuffer(data), val, len, nc, 0)),
-            _ => throw new NotSupportedException(
-                $"vortex.runend: expansion for ({expectedType}, {values.GetType().Name}) not yet implemented."),
+            // Every other type (strings, booleans, decimals, nested…) gathers each row's run.
+            _ => ArrowCompute.Take(values, RunIndices(rowCount, ends)),
         };
+    }
+
+    /// <summary>The run each of <paramref name="rowCount"/> rows falls in.</summary>
+    private static int[] RunIndices(int rowCount, IArrowArray ends)
+    {
+        var runs = new int[rowCount];
+        int run = 0;
+        int runEnd = ends.Length == 0 ? 0 : GetIntAtIndex(ends, 0);
+        for (int i = 0; i < rowCount; i++)
+        {
+            while (i >= runEnd)
+            {
+                run++;
+                if (run >= ends.Length)
+                    throw new VortexFormatException(
+                        $"vortex.runend: row {i} exceeds last run end ({runEnd}).");
+                runEnd = GetIntAtIndex(ends, run);
+            }
+            runs[i] = run;
+        }
+        return runs;
     }
 
     private static IArrowArray ExpandPrimitive<T>(
