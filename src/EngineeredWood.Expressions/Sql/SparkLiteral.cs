@@ -307,12 +307,24 @@ internal static class SparkLiteral
         if (keyword.Equals("X", StringComparison.OrdinalIgnoreCase))
             return LiteralValue.Of(ParseHex(text, sql, position));
 
-        var styles = DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal;
-        if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, styles, out var instant))
-            return LiteralValue.Of(instant);
+        // SPARK'S GRAMMAR, NOT .NET'S. A typed literal is read by `stringToDate` and
+        // `stringToTimestamp`, the same two functions the casts use, so it takes the same reader
+        // #318 gave them. `DateTimeOffset.TryParse` under InvariantCulture accepted `08/11/2026`
+        // as 11 August -- a different day to whoever wrote dd/MM -- and `2026/08/11`,
+        // `11 Aug 2026` and `2026-08 -11` besides, all refused by Spark; and it refused `2026`,
+        // `2026-08-11 extra` and `…12:30:00 UTC`, all read by Spark. A malformed literal is
+        // INVALID_TYPED_LITERAL, a PARSE error, so no dialect or try_cast softens it. #341.
+        //
+        // The special words -- 'today', 'epoch', 'now' -- are read by Spark and refused here, as
+        // they were before. That is #342, and nothing below pretends otherwise.
+        var instant = keyword.Equals("DATE", StringComparison.OrdinalIgnoreCase)
+            ? (SparkTemporalText.TryReadDate(text.AsSpan(), out var date) ? date : (DateTimeOffset?)null)
+            : (SparkTemporalText.TryReadTimestamp(text.AsSpan(), out var timestamp) ? timestamp : null);
 
-        throw new SparkSqlParseException(
-            $"'{text}' is not a valid {keyword.ToUpperInvariant()} literal", sql, position);
+        return instant is { } value
+            ? LiteralValue.Of(value)
+            : throw new SparkSqlParseException(
+                $"'{text}' is not a valid {keyword.ToUpperInvariant()} literal", sql, position);
     }
 
     private static bool IsSuffixLetter(char c) =>

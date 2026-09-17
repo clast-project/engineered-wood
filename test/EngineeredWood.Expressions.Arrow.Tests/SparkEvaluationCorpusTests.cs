@@ -200,6 +200,12 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
             "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
+        // #342, from the `typed-literals` group #341 added. Spark reads the special word `epoch`
+        // in a typed literal and we refuse it at parse time, as we did before #341 -- the grammar
+        // fix deliberately does not reach the words.
+        ["DATE'epoch'"] = "#342: Spark reads the special word 'epoch'; we refuse it",
+        ["CAST(TIMESTAMP'epoch' AS STRING)"] = "#342: Spark reads the special word 'epoch'; we refuse it",
+
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -368,6 +374,10 @@ public sealed class SparkEvaluationCorpusTests
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
+
+            // #342, as in the ANSI list: a parse refusal, so the same in this dialect.
+            ["DATE'epoch'"] = "#342: Spark reads the special word 'epoch'; we refuse it",
+            ["CAST(TIMESTAMP'epoch' AS STRING)"] = "#342: Spark reads the special word 'epoch'; we refuse it",
 
             // `coalesce(X'00', CAST(NULL AS STRING))` used to sit here as #293: a typed null string
             // was indistinguishable from the untyped placeholder, so we dropped it and answered

@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 16:35:15.56082",
-      "2026-09-17 16:35:15.56082",
-      "2026-09-17 16:35:15.56082"
+      "2026-09-17 16:57:58.148192",
+      "2026-09-17 16:57:58.148192",
+      "2026-09-17 16:57:58.148192"
      ]
     }
    },
@@ -49480,6 +49480,808 @@
     }
    }
   ],
+  "typed-literals": [
+   {
+    "expression": "DATE'2026/08/11'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026/08/11'\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11') AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11') AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'08/11/2026'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'08/11/2026'\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'08/11/2026') AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'08/11/2026') AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-08 -11'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08 -11'\n^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08 -11') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08 -11') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'11 Aug 2026'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'11 Aug 2026'\n^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'11 Aug 2026') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'11 Aug 2026') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'Aug 11, 2026'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'Aug 11, 2026'\n^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'Aug 11, 2026') AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'Aug 11, 2026') AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TIMESTAMP'08/11/2026 12:30:00'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'08/11/2026 12:30:00'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'08/11/2026 12:30:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'08/11/2026 12:30:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-01-01'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-01-01",
+      "2026-01-01",
+      "2026-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-08'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-01'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-01",
+      "2026-08-01",
+      "2026-08-01"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11 extra'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11T12:30:00'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-8-1'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-01'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-01",
+      "2026-08-01",
+      "2026-08-01"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'+2026-08-11'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-01-01 00:00:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-01-01 00:00:00",
+      "2026-01-01 00:00:00",
+      "2026-01-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-01 00:00:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-01 00:00:00",
+      "2026-08-01 00:00:00",
+      "2026-08-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 00:00:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 00:00:00",
+      "2026-08-11 00:00:00",
+      "2026-08-11 00:00:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00 UTC' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11T12:30:00Z' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00+02:00' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 10:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 10:30:00",
+      "2026-08-11 10:30:00",
+      "2026-08-11 10:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00 +2:00' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 10:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 10:30:00",
+      "2026-08-11 10:30:00",
+      "2026-08-11 10:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00.1234567' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00.123456' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00.123456",
+      "2026-08-11 12:30:00.123456",
+      "2026-08-11 12:30:00.123456"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00+18:00' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-10 18:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-10 18:30:00",
+      "2026-08-10 18:30:00",
+      "2026-08-10 18:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "TIMESTAMP'2026-08-11 12:30:00 extra'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'2026-08-11 12:30:00 extra'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 12:30:00 extra') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 12:30:00 extra') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026 extra'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026 extra'\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026 extra') AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026 extra') AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-08T'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08T'\n^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08T') AS r\n ^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08T') AS r\n ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-13-01'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-13-01'\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-13-01') AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-13-01') AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-02-30'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-02-30'\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-02-30') AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-02-30') AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TIMESTAMP'2026-08-11 24:00:00'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'2026-08-11 24:00:00'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 24:00:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 24:00:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE''",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE''\n^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'') AS r\n ^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'') AS r\n ^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TIMESTAMP''",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP''\n^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'') AS r\n ^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'') AS r\n ^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'   '",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'   '\n^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'   ') AS r\n ^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'   ') AS r\n ^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE' 2026-08-11 '",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP' 2026-08-11 12:30:00 ' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11\t'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '2026-08-11'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11",
+      "2026-08-11",
+      "2026-08-11"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'20260811'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'20260811'\n^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'20260811') AS r\n ^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'20260811') AS r\n ^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11Z'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08-11Z'\n^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08-11Z') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08-11Z') AS r\n ^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'2026-08-11 extra' = dt",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(DATE '2026-08-11' = dt)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "dt < DATE'2026'",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(dt < DATE '2026-01-01')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "year(DATE'2026')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "year(DATE '2026-01-01')"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2026,
+      2026,
+      2026
+     ]
+    }
+   },
+   {
+    "expression": "DATE'2026/08/11' = dt",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026/08/11' = dt\n^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11' = dt) AS r\n ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11' = dt) AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "coalesce(DATE'2026', dt)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "coalesce(DATE '2026-01-01', dt)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-01-01",
+      "2026-01-01",
+      "2026-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "try_cast(DATE'2026/08/11' AS STRING)",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 10) ==\ntry_cast(DATE'2026/08/11' AS STRING)\n         ^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(DATE'2026/08/11' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(DATE'2026/08/11' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 10) ==\ntry_cast(TIMESTAMP'2026-08-11 extra' AS STRING)\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'epoch'",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '1970-01-01'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'epoch' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(TIMESTAMP '1970-01-01 00:00:00' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01 00:00:00",
+      "1970-01-01 00:00:00",
+      "1970-01-01 00:00:00"
+     ]
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -88621,6 +89423,808 @@
        1.0,
        null,
        0.0
+      ]
+     }
+    }
+   ],
+   "typed-literals": [
+    {
+     "expression": "DATE'2026/08/11'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026/08/11'\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11') AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11') AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'08/11/2026'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'08/11/2026'\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'08/11/2026') AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '08/11/2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'08/11/2026') AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-08 -11'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08 -11'\n^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08 -11') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08 -11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08 -11') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'11 Aug 2026'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'11 Aug 2026'\n^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'11 Aug 2026') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '11 Aug 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'11 Aug 2026') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'Aug 11, 2026'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'Aug 11, 2026'\n^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'Aug 11, 2026') AS r\n ^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'Aug 11, 2026'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'Aug 11, 2026') AS r\n ^^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "TIMESTAMP'08/11/2026 12:30:00'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'08/11/2026 12:30:00'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'08/11/2026 12:30:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '08/11/2026 12:30:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'08/11/2026 12:30:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-01-01'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-01-01",
+       "2026-01-01",
+       "2026-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026-08'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-01'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-01",
+       "2026-08-01",
+       "2026-08-01"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026-08-11 extra'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-11'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11",
+       "2026-08-11",
+       "2026-08-11"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026-08-11T12:30:00'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-11'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11",
+       "2026-08-11",
+       "2026-08-11"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026-8-1'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-01'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-01",
+       "2026-08-01",
+       "2026-08-01"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'+2026-08-11'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-11'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11",
+       "2026-08-11",
+       "2026-08-11"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-01-01 00:00:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-01-01 00:00:00",
+       "2026-01-01 00:00:00",
+       "2026-01-01 00:00:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-01 00:00:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-01 00:00:00",
+       "2026-08-01 00:00:00",
+       "2026-08-01 00:00:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 00:00:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 00:00:00",
+       "2026-08-11 00:00:00",
+       "2026-08-11 00:00:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00 UTC' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11T12:30:00Z' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00+02:00' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 10:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 10:30:00",
+       "2026-08-11 10:30:00",
+       "2026-08-11 10:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00 +2:00' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 10:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 10:30:00",
+       "2026-08-11 10:30:00",
+       "2026-08-11 10:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00.1234567' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00.123456' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00.123456",
+       "2026-08-11 12:30:00.123456",
+       "2026-08-11 12:30:00.123456"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'2026-08-11 12:30:00+18:00' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-10 18:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-10 18:30:00",
+       "2026-08-10 18:30:00",
+       "2026-08-10 18:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "TIMESTAMP'2026-08-11 12:30:00 extra'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'2026-08-11 12:30:00 extra'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 12:30:00 extra') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 12:30:00 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 12:30:00 extra') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026 extra'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026 extra'\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026 extra') AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026 extra'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026 extra') AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-08T'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08T'\n^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08T') AS r\n ^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08T'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08T') AS r\n ^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-13-01'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-13-01'\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-13-01') AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-13-01'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-13-01') AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-02-30'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-02-30'\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-02-30') AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-02-30'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-02-30') AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "TIMESTAMP'2026-08-11 24:00:00'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP'2026-08-11 24:00:00'\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 24:00:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 24:00:00'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'2026-08-11 24:00:00') AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE''",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE''\n^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'') AS r\n ^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'') AS r\n ^^^^^^\n"
+     }
+    },
+    {
+     "expression": "TIMESTAMP''",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nTIMESTAMP''\n^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'') AS r\n ^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: ''. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(TIMESTAMP'') AS r\n ^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'   '",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'   '\n^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'   ') AS r\n ^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '   '. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'   ') AS r\n ^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE' 2026-08-11 '",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-11'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11",
+       "2026-08-11",
+       "2026-08-11"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP' 2026-08-11 12:30:00 ' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '2026-08-11 12:30:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026-08-11\t'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '2026-08-11'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11",
+       "2026-08-11",
+       "2026-08-11"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'20260811'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'20260811'\n^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'20260811') AS r\n ^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '20260811'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'20260811') AS r\n ^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-08-11Z'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026-08-11Z'\n^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08-11Z') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026-08-11Z'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026-08-11Z') AS r\n ^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'2026-08-11 extra' = dt",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(DATE '2026-08-11' = dt)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "dt < DATE'2026'",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(dt < DATE '2026-01-01')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "year(DATE'2026')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "year(DATE '2026-01-01')"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2026,
+       2026,
+       2026
+      ]
+     }
+    },
+    {
+     "expression": "DATE'2026/08/11' = dt",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'2026/08/11' = dt\n^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11' = dt) AS r\n ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'2026/08/11' = dt) AS r\n ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "coalesce(DATE'2026', dt)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "coalesce(DATE '2026-01-01', dt)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-01-01",
+       "2026-01-01",
+       "2026-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "try_cast(DATE'2026/08/11' AS STRING)",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 10) ==\ntry_cast(DATE'2026/08/11' AS STRING)\n         ^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(DATE'2026/08/11' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: '2026/08/11'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(DATE'2026/08/11' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 10) ==\ntry_cast(TIMESTAMP'2026-08-11 extra' AS STRING)\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"TIMESTAMP\" is invalid: '2026-08-11 extra'. SQLSTATE: 42604\n== SQL (line 1, position 11) ==\n(try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)) AS r\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'epoch'",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '1970-01-01'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'epoch' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(TIMESTAMP '1970-01-01 00:00:00' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01 00:00:00",
+       "1970-01-01 00:00:00",
+       "1970-01-01 00:00:00"
       ]
      }
     }

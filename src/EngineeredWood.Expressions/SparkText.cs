@@ -1,7 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-namespace EngineeredWood.Expressions.Arrow.Spark;
+namespace EngineeredWood.Expressions;
 
 /// <summary>
 /// Text rules the Spark kernels share, where .NET's own would answer differently.
@@ -35,13 +35,13 @@ internal static class SparkText
     /// it, and every char at or below 0x20 encodes as the single byte with its own value.
     /// </para>
     /// <para>
-    /// Bounds rather than a trimmed span, because <see cref="SparkDecimalText"/> reads the text
+    /// Bounds rather than a trimmed span, because <c>SparkDecimalText</c> reads the text
     /// by index and a span would cost it a second pass to recover them. It is the caller that
     /// knows which it wants.
     /// </para>
     /// <para>
     /// <b>Every string CAST reads its text through here</b>, which is #316: the numeric parses
-    /// share it through <see cref="SparkArrays.CastInput"/>, and the integral, decimal, temporal
+    /// share it through <c>SparkArrays.CastInput</c>, and the integral, decimal, temporal
     /// and boolean rules each reach it from there.
     /// <para>
     /// <b>The <c>trim</c>/<c>ltrim</c>/<c>rtrim</c> FUNCTIONS do not, and must not</b> — they
