@@ -113,6 +113,15 @@ public class SparkFloatRoundingTests
     [InlineData("3.4028235E38", 0x7F7FFFFF)]                   // float.MaxValue
     [InlineData("3.40282356e38", 0x7F7FFFFF)]                  // below the midpoint to 2^128: still it
     [InlineData("3.40282357e38", 0x7F800000)]                  // past the midpoint to infinity
+    // .NET Framework REFUSES every one of the next five, so these are the rows that hold the
+    // netstandard2.0 overflow fallback to the exact answer. The midpoint between float.MaxValue and
+    // 2^128 is exactly 340282356779733661637539395458142568448; one below it rounds DOWN, and a
+    // double reading lands on the midpoint and then rounds to infinity.
+    [InlineData("340282356779733661637539395458142568447", 0x7F7FFFFF)]
+    [InlineData("-340282356779733661637539395458142568447", unchecked((int)0xFF7FFFFF))]
+    [InlineData("3.4028235677973366e38", 0x7F7FFFFF)]
+    [InlineData("340282356779733661637539395458142568448", 0x7F800000)] // the tie: to even, which is infinity
+    [InlineData("1e39", 0x7F800000)]
     [InlineData("1e400", 0x7F800000)]
     [InlineData("-1e400", unchecked((int)0xFF800000))]
     [InlineData("16777217", 0x4B800000)]                       // 2^24 + 1: a tie, to even (down)

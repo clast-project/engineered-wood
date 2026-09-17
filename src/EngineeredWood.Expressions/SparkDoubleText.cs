@@ -188,21 +188,41 @@ internal static class SparkDoubleText
     internal static bool TryParseSingle(string text, out float value)
     {
 #if NETSTANDARD2_0
+        // WHETHER the text is a number stays the platform's question, so the accepted shapes and
+        // whitespace are exactly what they were; only the VALUE is replaced. An infinite platform
+        // answer is corrected too -- the NaN and Infinity words are shapes TryScan declines, so
+        // they keep the platform's reading.
         if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
         {
-            if (!float.IsNaN(value) && !float.IsInfinity(value) && TryParseExactSingle(text, out var exact))
+            if (TryParseExactSingle(text, out var exact))
                 value = exact;
 
             return true;
         }
+
+        // .NET Framework REFUSES a float magnitude at or above the midpoint between float.MaxValue
+        // and 2^128 -- including text just below that midpoint, which Java rounds DOWN to
+        // float.MaxValue. The double parse still decides acceptance, but its value cannot stand
+        // in: narrowing it is the double rounding this reader exists to avoid, and one below the
+        // midpoint reads as the midpoint and then as infinity. Found in review of #374.
+        if (!TryOverflow(text, out var asDouble))
+        {
+            value = 0f;
+            return false;
+        }
+
+        value = TryParseExactSingle(text, out var exactOverflow) ? exactOverflow : (float)asDouble;
+        return true;
 #else
         if (float.TryParse(text.AsSpan(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
             return true;
-#endif
 
+        // .NET Core reads an overflowing float as an infinity rather than refusing it, so a
+        // refusal here is a malformed number and the double parse refuses it too.
         var parsed = TryOverflow(text, out var asDouble);
         value = (float)asDouble;
         return parsed;
+#endif
     }
 
 #if !NETSTANDARD2_0

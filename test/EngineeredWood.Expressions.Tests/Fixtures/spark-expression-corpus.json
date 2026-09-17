@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 16:06:50.62769",
-      "2026-09-17 16:06:50.62769",
-      "2026-09-17 16:06:50.62769"
+      "2026-09-17 16:35:15.56082",
+      "2026-09-17 16:35:15.56082",
+      "2026-09-17 16:35:15.56082"
      ]
     }
    },
@@ -49260,6 +49260,46 @@
     }
    },
    {
+    "expression": "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      3.4028234663852886e+38,
+      3.4028234663852886e+38,
+      3.4028234663852886e+38
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "Infinity",
+      "Infinity",
+      "Infinity"
+     ]
+    }
+   },
+   {
     "expression": "CAST(CAST('-1e-400' AS FLOAT) AS DOUBLE)",
     "parse": {
      "ok": true,
@@ -88350,6 +88390,46 @@
       "ok": true,
       "node": "Cast",
       "sql": "CAST(CAST('3.40282357e38' AS FLOAT) AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "Infinity",
+       "Infinity",
+       "Infinity"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       3.4028234663852886e+38,
+       3.4028234663852886e+38,
+       3.4028234663852886e+38
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)"
      },
      "type": {
       "ok": true,

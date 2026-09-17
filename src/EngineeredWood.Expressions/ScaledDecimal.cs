@@ -44,9 +44,6 @@ internal static class ScaledDecimal
     /// <summary>What the exponent is offset by to become the IEEE 754 biased exponent.</summary>
     private const int ExponentBias = 1075;
 
-    /// <summary>The 52 bits IEEE 754 gives the significand, the leading one being implicit.</summary>
-    private const long SignificandMask = 0xFFFFFFFFFFFFFL;
-
     /// <summary>log2(10), for a cheap bound on a value's magnitude before any big arithmetic.</summary>
     private const double Log2Of10 = 3.3219280948873626d;
 

@@ -3447,6 +3447,10 @@ GROUPS = {
         "CAST(CAST('16777217' AS FLOAT) AS DOUBLE)", "CAST(CAST('16777219' AS FLOAT) AS DOUBLE)",
         "CAST(CAST('16777217.000000000000000001' AS FLOAT) AS DOUBLE)",
         "CAST(CAST('3.40282356e38' AS FLOAT) AS DOUBLE)", "CAST(CAST('3.40282357e38' AS FLOAT) AS DOUBLE)",
+        # One below the midpoint between float.MaxValue and 2^128, which rounds DOWN, and the
+        # midpoint itself, a tie that goes to infinity. .NET Framework refuses both. Review of #374.
+        "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)",
         "CAST(CAST('-1e-400' AS FLOAT) AS DOUBLE)",
 
         # --- A DECIMAL beside a tie, and one that takes Java's fast path.
