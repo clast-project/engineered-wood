@@ -289,9 +289,10 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     {
         if (loc.Length == 0)
             return Array.Empty<byte>();
-        if ((long)loc.Offset + loc.Length > tailOffset + tail.Length)
+        if ((long)loc.Offset < tailOffset || (long)loc.Offset + loc.Length > tailOffset + tail.Length)
         {
-            // Not entirely in the tail — fetch from file.
+            // Not entirely in the tail (it can start before the tail's first
+            // byte as well as end past its last) — fetch from file.
             using var owner = await reader.ReadAsync(
                 new FileRange(checked((long)loc.Offset), checked((int)loc.Length)), cancellationToken)
                 .ConfigureAwait(false);

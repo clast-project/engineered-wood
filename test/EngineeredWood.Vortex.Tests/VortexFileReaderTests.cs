@@ -80,6 +80,66 @@ public class VortexFileReaderTests
     }
 
     [Fact]
+    public async Task OpensAFileWhosePostscriptSegmentStartsBeforeTheTailRead()
+    {
+        // The reader fetches the file's last 64 KiB up front and slices the
+        // footer, layout and dtype segments from it when they fit. Many small
+        // batches under zone maps and a dict layout make those segments large
+        // enough that one begins before that window and ends inside it.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Apache.Arrow.Field("id", Int32Type.Default, nullable: false),
+            new Apache.Arrow.Field("tag", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int batches = 1500, rowsPerBatch = 8;
+
+        using var ms = new MemoryStream();
+        using (var writer = new EngineeredWood.Vortex.Writer.VortexFileWriter(
+            ms, schema, compress: true, preserveStats: true, preferDictLayout: true))
+        {
+            for (int b = 0; b < batches; b++)
+            {
+                var ids = new Apache.Arrow.Int32Array.Builder();
+                var tags = new Apache.Arrow.StringArray.Builder();
+                for (int r = 0; r < rowsPerBatch; r++)
+                {
+                    ids.Append(b * rowsPerBatch + r);
+                    tags.Append((r % 3).ToString());
+                }
+                writer.WriteBatch(new Apache.Arrow.RecordBatch(
+                    schema, new Apache.Arrow.IArrowArray[] { ids.Build(), tags.Build() }, rowsPerBatch));
+            }
+            writer.Close();
+        }
+        var bytes = ms.ToArray();
+
+        Assert.True(PostscriptSegmentStraddlesTail(bytes),
+            "the file no longer has a postscript segment straddling the tail read; grow it");
+
+        using var stream = new ByteArrayRandomAccessFile(bytes);
+        await using var reader = await VortexFileReader.OpenAsync(stream);
+        Assert.Equal(batches * rowsPerBatch, reader.NumberOfRows);
+        var read = Assert.IsType<Apache.Arrow.Int32Array>(await reader.ReadColumnAsync(0));
+        Assert.Equal(Enumerable.Range(0, batches * rowsPerBatch), read.Values.ToArray());
+    }
+
+    private static bool PostscriptSegmentStraddlesTail(byte[] file)
+    {
+        long tailOffset = Math.Max(0, file.Length - 64 * 1024);
+        int postscriptLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(file.AsSpan(file.Length - 6));
+        var postscript = EngineeredWood.Vortex.Format.Postscript.ReadRoot(
+            file.AsSpan(file.Length - 8 - postscriptLen, postscriptLen));
+        return Straddles(postscript.DType, tailOffset)
+            || Straddles(postscript.Layout, tailOffset)
+            || Straddles(postscript.Footer, tailOffset);
+    }
+
+    private static bool Straddles(EngineeredWood.Vortex.Format.PostscriptSegment segment, long tailOffset) =>
+        segment.IsPresent
+        && (long)segment.Offset < tailOffset
+        && (long)segment.Offset + segment.Length > tailOffset;
+
+    [Fact]
     public async Task RejectsTooSmallFile()
     {
         using var stream = new ByteArrayRandomAccessFile(new byte[8]);
