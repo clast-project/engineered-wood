@@ -17,7 +17,10 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <list type="bullet">
 ///   <item><c>smallint * smallint</c> stays <c>smallint</c> — integral arithmetic does not widen,
 ///     so it can overflow at its own width.</item>
-///   <item><c>int + float</c> is <c>double</c>, not <c>float</c>.</item>
+///   <item><c>int + float</c> is <c>double</c> under ANSI, not <c>float</c> -- and <c>float</c>
+///     under the legacy dialect, which rounds the integral onto it first. The same pair splits
+///     the same way everywhere it is unified, comparison included; <c>/</c> is double in both.
+///     #299.</item>
 ///   <item><c>/</c> on two integers is <c>double</c>. It is never integer division.</item>
 ///   <item><c>%</c> takes the <em>narrower</em> operand's integer digits, so
 ///     <c>decimal(10,2) % decimal(6,4)</c> is <c>decimal(6,4)</c>.</item>
@@ -32,10 +35,12 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 ///     <c>coalesce</c>/<c>if</c>/<c>CASE</c> and comparison. #277.</item>
 /// </list>
 /// <para>
-/// These are ANSI-mode answers. The corpus was harvested with
-/// <c>spark.sql.ansi.enabled=true</c>, and ANSI type coercion differs from legacy in exactly the
-/// <c>int + float</c> sort of case, so the rules are not portable to
-/// <see cref="SparkDialectOptions.Ansi"/> being false without measuring that configuration too.
+/// <b>The dialect is a parameter where the answer depends on it</b>, and only there. The corpus
+/// carries a legacy section harvested with <c>spark.sql.ansi.enabled=false</c>, and the one rule
+/// here it found to differ is the integral against a float, which is why
+/// <see cref="CommonType"/> and <see cref="ArithmeticResult"/> take <c>legacy</c>. Every other
+/// rule above was measured in both dialects and is shared. A rule added here is not portable
+/// between them until the legacy section says so.
 /// </para>
 /// </remarks>
 internal static class SparkNumericTypes
@@ -67,6 +72,13 @@ internal static class SparkNumericTypes
     /// refinement of an answer that was nearly right.
     /// </para>
     /// </remarks>
+    /// <param name="op">The operator: <c>+</c>, <c>-</c>, <c>*</c>, <c>/</c> or <c>%</c>.</param>
+    /// <param name="left">The left operand's type.</param>
+    /// <param name="right">The right operand's type.</param>
+    /// <param name="legacy">
+    /// Whether the legacy dialect's rule applies, which differs only for an integral against a
+    /// <c>float</c>: <c>float</c> there, <c>double</c> under ANSI. #299.
+    /// </param>
     /// <exception cref="NotSupportedException">Either operand is not a supported numeric type.</exception>
     public static IArrowType ArithmeticResult(
         string op, IArrowType left, IArrowType right, bool legacy = false)
@@ -157,6 +169,12 @@ internal static class SparkNumericTypes
     /// because unifying rounded 0.5 up at scale 0 before the comparison ever ran.
     /// </para>
     /// </remarks>
+    /// <param name="left">One type to unify.</param>
+    /// <param name="right">The other type to unify.</param>
+    /// <param name="legacy">
+    /// Whether the legacy dialect's rule applies, which differs only for an integral against a
+    /// <c>float</c>: <c>float</c> there, <c>double</c> under ANSI. #299.
+    /// </param>
     public static IArrowType CommonType(IArrowType left, IArrowType right, bool legacy = false)
     {
         // `void` constrains nothing, so the other side IS the common type -- and two voids stay
