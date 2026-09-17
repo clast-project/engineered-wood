@@ -382,7 +382,6 @@ public sealed class SparkFunctionRegistryTests
                 () => Eval(Ansi, "CAST(g AS DECIMAL(3,0))", small)).ErrorClass);
     }
 
-    /// <summary>Renders one cell of a decimal result the way Spark prints it.</summary>
     // -- A numeric string past a double's range, which one framework refused (#326) ----------
 
     /// <summary>
@@ -497,6 +496,7 @@ public sealed class SparkFunctionRegistryTests
             Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS INT)", batch)).ErrorClass);
     }
 
+    /// <summary>Renders one cell of a decimal result the way Spark prints it.</summary>
     private static string Rendered(SparkFunctionRegistry registry, string sql, RecordBatch batch, int row)
     {
         var result = Assert.IsType<Decimal128Array>(Eval(registry, sql, batch));

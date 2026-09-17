@@ -4,8 +4,9 @@
 using System.Globalization;
 using System.Numerics;
 using System.Text;
+using System.Threading;
 
-namespace EngineeredWood.Expressions.Arrow.Spark;
+namespace EngineeredWood.Expressions;
 
 /// <summary>
 /// Reading a double out of text the way Java's <c>Double.parseDouble</c> does, which is not what
@@ -13,7 +14,13 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The mirror of <see cref="SparkFloatText"/>, and it has the same problem from the other
+/// <b>Down here rather than beside the renderer</b>, because a double is read in two places and
+/// only one of them is the Arrow cast: <c>SparkLiteral</c> reads the exponent-bearing SQL literal,
+/// and <c>SELECT 49.0793458194787E0</c> carried the same defect as the column value did. Nothing
+/// in this type needs Arrow.
+/// </para>
+/// <para>
+/// The mirror of <c>SparkFloatText</c>, and it has the same problem from the other
 /// direction: the answer must not depend on which target framework loaded the library, and the
 /// platform parse makes it depend on exactly that.
 /// </para>
@@ -149,7 +156,7 @@ internal static class SparkDoubleText
     /// <c>digits x 10^exponent</c>, which is a ratio of two integers, and the answer is the
     /// mantissa that ratio rounds to — one division, at whatever width the exponent demands.
     /// Eisel–Lemire would do it in machine words with a 128-bit power table, and this path already
-    /// has one in <see cref="SparkFloatScaling"/>; it is not used because the correctness argument
+    /// has one in <c>SparkFloatScaling</c>; it is not used because the correctness argument
     /// for the fast route is the part that takes the work, and this runs only on the framework
     /// that is already the slower one at everything.
     /// </para>
@@ -287,8 +294,8 @@ internal static class SparkDoubleText
         if (exponent < -400 - DigitCount(digits))
             return negative ? -0d : 0d;
 
-        var numerator = exponent >= 0 ? digits * BigInteger.Pow(10, exponent) : digits;
-        var denominator = exponent >= 0 ? BigInteger.One : BigInteger.Pow(10, -exponent);
+        var numerator = exponent >= 0 ? digits * Powers.Ten(exponent) : digits;
+        var denominator = exponent >= 0 ? BigInteger.One : Powers.Ten(-exponent);
 
         // Line the quotient up to 53 bits, then correct — the estimate is off by at most one.
         var binary = BitLength(numerator) - BitLength(denominator) - 53;
@@ -328,6 +335,44 @@ internal static class SparkDoubleText
     }
 
     /// <summary>The integer part of <c>num / den / 2^binary</c>, with what is left over.</summary>
+    /// <summary>
+    /// The powers of ten the ratio is built from, held on first use rather than rebuilt per value.
+    /// </summary>
+    /// <remarks>
+    /// This is a PER-ROW path on netstandard2.0 — every string cast to a double reaches it — and a
+    /// value with an exponent far from zero wants a power hundreds of digits long. Rebuilding one
+    /// per row is what the same nested-class cache in <c>SparkFloatText</c> and
+    /// <c>SparkIntegralCasts</c> exists to avoid, so this follows them, down to publishing each row
+    /// through <see cref="Volatile"/>: a reference assignment is atomic, but a plain store carries
+    /// no ordering against the writes that filled the box, and a reader on arm64 could otherwise
+    /// follow a non-null slot to digits it cannot see yet.
+    /// <para>
+    /// Sized for every exponent a finite double can be written with. Beyond that the value has
+    /// already been answered as a zero or an infinity, and the fallback is there only so that an
+    /// absurd literal cannot reach past the end of the table.
+    /// </para>
+    /// </remarks>
+    private static class Powers
+    {
+        private const int Highest = 1100;
+
+        private static readonly object?[] Tens = new object?[Highest + 1];
+
+        internal static BigInteger Ten(int power)
+        {
+            if (power < 0 || power > Highest)
+                return BigInteger.Pow(10, power);
+
+            if (Volatile.Read(ref Tens[power]) is BigInteger cached)
+                return cached;
+
+            var computed = BigInteger.Pow(10, power);
+            Volatile.Write(ref Tens[power], computed);
+
+            return computed;
+        }
+    }
+
     private static BigInteger Quotient(
         BigInteger numerator, BigInteger denominator, int binary,
         out BigInteger remainder, out BigInteger divisor)
