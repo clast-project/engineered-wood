@@ -182,7 +182,10 @@ LEGACY_GROUPS = (
     # #372. The rounding is dialect-independent -- measured over 8,400 strings and 2,253 decimals
     # under both -- and the group is asked twice anyway, because the legacy registry has its own
     # cast path and nothing else would record that it rounds the same way.
-    "float-rounding")
+    "float-rounding",
+    # #341. A malformed typed literal is a PARSE error, which no dialect ought to move -- asked
+    # twice to record that, and because the legacy registry evaluates the literals that parse.
+    "typed-literals")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3460,6 +3463,47 @@ GROUPS = {
         "CAST(CAST(CAST(0.1 AS DECIMAL(10,1)) AS FLOAT) AS DOUBLE)",
         "CAST(CAST(d3 AS FLOAT) AS DOUBLE)", "CAST(CAST(d5 AS FLOAT) AS DOUBLE)",
         "CAST(CAST(fs AS FLOAT) AS DOUBLE)", "CAST(CAST(ns AS FLOAT) AS DOUBLE)",
+    ],
+
+    # DATE '…' AND TIMESTAMP '…' LITERALS. #341. Spark reads them with stringToDate and
+    # stringToTimestamp, the same two functions CAST uses (#318's `temporal-text` group), so the
+    # grammar is the same; what differs is the refusal, which is INVALID_TYPED_LITERAL at PARSE
+    # time. Timestamps are read back through CAST(... AS STRING), because PySpark renders a bare
+    # timestamp in the DRIVER's zone.
+    "typed-literals": [
+        # --- THE ISSUE AS FILED: shapes .NET read and Spark refuses...
+        "DATE'2026/08/11'", "DATE'08/11/2026'", "DATE'2026-08 -11'", "DATE'11 Aug 2026'",
+        "DATE'Aug 11, 2026'", "TIMESTAMP'08/11/2026 12:30:00'",
+        # ...and shapes Spark reads that .NET refused.
+        "DATE'2026'", "DATE'2026-08'", "DATE'2026-08-11 extra'", "DATE'2026-08-11T12:30:00'",
+        "DATE'2026-8-1'", "DATE'+2026-08-11'",
+        "CAST(TIMESTAMP'2026' AS STRING)", "CAST(TIMESTAMP'2026-08' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00 UTC' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11T12:30:00Z' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00+02:00' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00 +2:00' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00.1234567' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30' AS STRING)",
+        "CAST(TIMESTAMP'2026-08-11 12:30:00+18:00' AS STRING)",
+
+        # --- WHAT A TIMESTAMP REFUSES THAT A DATE DISCARDS, and the grammar's other edges.
+        "TIMESTAMP'2026-08-11 12:30:00 extra'", "DATE'2026 extra'", "DATE'2026-08T'",
+        "DATE'2026-13-01'", "DATE'2026-02-30'", "TIMESTAMP'2026-08-11 24:00:00'",
+        "DATE''", "TIMESTAMP''", "DATE'   '", "DATE' 2026-08-11 '",
+        "CAST(TIMESTAMP' 2026-08-11 12:30:00 ' AS STRING)", "DATE'2026-08-11	'",
+        "DATE'20260811'", "DATE'2026-08-11Z'",
+
+        # --- A literal in the places one sits, which must not change what it is.
+        "DATE'2026-08-11 extra' = dt", "dt < DATE'2026'", "year(DATE'2026')",
+        "DATE'2026/08/11' = dt", "coalesce(DATE'2026', dt)",
+
+        # --- THE REFUSAL IS A PARSE ERROR: try_cast does not soften it, in either dialect.
+        "try_cast(DATE'2026/08/11' AS STRING)", "try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)",
+
+        # --- #342's special word, which Spark reads and we refuse. `epoch` only: `today` and
+        # `now` would move with every harvest.
+        "DATE'epoch'", "CAST(TIMESTAMP'epoch' AS STRING)",
     ],
 
     "malformed": [

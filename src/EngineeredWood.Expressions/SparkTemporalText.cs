@@ -1,7 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-namespace EngineeredWood.Expressions.Arrow.Spark;
+namespace EngineeredWood.Expressions;
 
 /// <summary>
 /// Spark's own grammar for a DATE or a TIMESTAMP written as text.
@@ -30,8 +30,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </description></item>
 /// </list>
 /// <para>
-/// So the rule is a hand-rolled reader, for the reason <see cref="SparkDecimalText"/> and
-/// <see cref="SparkIntegralCasts"/> are: the .NET parser next to it answers a different question.
+/// So the rule is a hand-rolled reader, for the reason <c>SparkDecimalText</c> and
+/// <c>SparkIntegralCasts</c> are: the .NET parser next to it answers a different question.
 /// This is a port of <c>SparkDateTimeUtils.stringToDate</c> and
 /// <c>SparkDateTimeUtils.parseTimestampString</c> from the Spark source, checked against the
 /// measurements above rather than against the reading of it.
@@ -46,7 +46,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// honours a leading <c>-</c>, so <c>CAST('-2026-08-11' AS DATE)</c> and
 /// <c>CAST('1234567-01-01' AS DATE)</c> are dates to it and are refused here. Widening that means
 /// carrying days-from-epoch rather than a <see cref="DateTimeOffset"/> through the cast, which is
-/// a change to <see cref="SparkArrays.ReadForCast"/>'s shape rather than to this grammar.
+/// a change to <c>SparkArrays.ReadForCast</c>'s shape rather than to this grammar.
 /// </description></item>
 /// <item><description>
 /// <b>A named zone is refused</b> — see <see cref="TryReadZone"/>.
@@ -55,6 +55,21 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 internal static class SparkTemporalText
 {
+    /// <summary>The session time zone a zone-less DATE or TIMESTAMP is read in.</summary>
+    /// <remarks>
+    /// <para>
+    /// Here rather than in <c>SparkDialectOptions</c>, which reads it from here: this reader is used
+    /// by the typed-literal parser as well as by the casts, and the parser's assembly cannot see
+    /// the options (#341). One zone for both is the point -- a <c>TIMESTAMP'…'</c> literal and a
+    /// column cast from the same text must name the same instant.
+    /// </para>
+    /// <para>
+    /// UTC, because that is what the harvested corpus is pinned to, and because the rest of the
+    /// library already assumes it: a Date32 is read as UTC midnight of its day.
+    /// </para>
+    /// </remarks>
+    internal static TimeZoneInfo SessionTimeZone => TimeZoneInfo.Utc;
+
     /// <summary>The <see cref="DateTime"/> ticks in one microsecond.</summary>
     private const long TicksPerMicrosecond = 10L;
 
@@ -361,7 +376,7 @@ internal static class SparkTemporalText
         {
             day = (zone is { } today
                 ? DateTimeOffset.UtcNow.UtcDateTime + today
-                : TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, SparkDialectOptions.TimeZone).DateTime)
+                : TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, SessionTimeZone).DateTime)
                 .Date;
         }
         else
@@ -380,7 +395,7 @@ internal static class SparkTemporalText
             // an offset at 14 HOURS and Java bounds one at 18 -- and Spark reads the whole Java
             // range: measured, `'…12:30:00+18:00'` is 18:30 on the previous day. The instant
             // itself is in range either way; only the constructor's argument check is not.
-            var offset = zone ?? SparkDialectOptions.TimeZone.GetUtcOffset(local);
+            var offset = zone ?? SessionTimeZone.GetUtcOffset(local);
             value = new DateTimeOffset(local - offset, TimeSpan.Zero);
         }
         catch (ArgumentOutOfRangeException)
@@ -435,7 +450,7 @@ internal static class SparkTemporalText
     /// <summary>The calendar date <paramref name="year"/>-<paramref name="month"/>-<paramref name="day"/>, at UTC midnight.</summary>
     /// <remarks>
     /// A date is UTC midnight of the day because that is how this library already surfaces one —
-    /// see <see cref="SparkArrays.ReadInstant"/>, where a Date32 is read the same way, so a
+    /// see <c>SparkArrays.ReadInstant</c>, where a Date32 is read the same way, so a
     /// literal and a column value compare on the same footing.
     /// <para>
     /// The year bound is EngineeredWood's and not Spark's; see the type's remarks.

@@ -55,10 +55,11 @@ public sealed record SparkDialectOptions
     /// <para>
     /// It is a fixed property rather than a settable one because honouring another zone needs
     /// more than this option. The parser resolves a zone-less <c>TIMESTAMP'…'</c> literal to an
-    /// instant in <c>EngineeredWood.Expressions</c>, which cannot see these options at all, so a
-    /// non-UTC setting here would make literals and column conversions disagree silently. Making
-    /// the zone configurable means moving both together.
+    /// instant in <c>EngineeredWood.Expressions</c>, which cannot see these options at all -- so
+    /// the zone is defined there, beside the grammar both the parser and the casts read text with,
+    /// and this property only reports it (#341). Making the zone configurable means carrying a
+    /// setting to the parser as well.
     /// </para>
     /// </remarks>
-    public static TimeZoneInfo TimeZone => TimeZoneInfo.Utc;
+    public static TimeZoneInfo TimeZone => SparkTemporalText.SessionTimeZone;
 }
