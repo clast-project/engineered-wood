@@ -96,6 +96,8 @@ internal static class ArrayDecoder
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.ListView => ListViewArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
+            VortexArrayEncodings.Map => MapArrayDecoder.Decode(
+                node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.Masked => MaskedArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.Chunked => ChunkedArrayDecoder.Decode(

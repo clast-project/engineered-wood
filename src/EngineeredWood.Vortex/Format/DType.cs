@@ -34,6 +34,8 @@ internal enum DTypeKind : byte
     Extension = 9,
     FixedSizeList = 10,
     Variant = 11,
+    Union = 12,
+    Map = 13,
 }
 
 /// <summary>
@@ -64,6 +66,7 @@ internal readonly ref struct DType
     public FixedSizeListDType AsFixedSizeList() => new(Variant);
     public ExtensionDType AsExtension() => new(Variant);
     public VariantDType AsVariant() => new(Variant);
+    public MapDType AsMap() => new(Variant);
 }
 
 /// <summary>Empty Null variant. The Null dtype is implicitly nullable.</summary>
@@ -151,4 +154,18 @@ internal readonly ref struct VariantDType
     private readonly FlatBufferTable _t;
     public VariantDType(FlatBufferTable t) { _t = t; }
     public bool Nullable => _t.ReadBool(0);
+}
+
+/// <summary>
+/// The Map dtype (vortex 0.86+). Keys are always non-nullable; <c>keys_sorted</c> is a
+/// producer assertion, carried through to Arrow rather than validated against the data.
+/// </summary>
+internal readonly ref struct MapDType
+{
+    private readonly FlatBufferTable _t;
+    public MapDType(FlatBufferTable t) { _t = t; }
+    public DType KeyType => new(_t.ReadTable(0));
+    public DType ValueType => new(_t.ReadTable(1));
+    public bool KeysSorted => _t.ReadBool(2);
+    public bool Nullable => _t.ReadBool(3);
 }
