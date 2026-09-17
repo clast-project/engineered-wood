@@ -155,7 +155,7 @@ public sealed class SparkFunctionRegistry
             case "substring" or "substr":
                 if (args.Count is not (2 or 3))
                     throw new ArgumentException($"'{name}' takes 2 or 3 arguments", nameof(args));
-                return SparkFunctions.Substring(AsText(args, count: 1), rowCount);
+                return SparkFunctions.Substring(SubstringArguments(name, args, rowCount), rowCount);
 
             case "concat" or "||":
                 return SparkFunctions.Concat(AsText(args, count: args.Count), rowCount);
@@ -2265,6 +2265,73 @@ public sealed class SparkFunctionRegistry
             converted[i] = i < count ? AsText(args[i]) : args[i];
 
         return converted;
+    }
+
+    /// <summary>
+    /// <c>substring</c>'s arguments as Spark's analyzer leaves them: the text converted, and the
+    /// position and length CAST to <c>int</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #370. The cast is the session's own, so a non-int argument answers what the cast answers:
+    /// a fraction truncates (<c>substring('abcdef', 2.7, 2)</c> is <c>bc</c>), a string reads by
+    /// the integral text rule, and an out-of-range value raises <c>CAST_OVERFLOW</c> under ANSI
+    /// and wraps under legacy, where <c>substring('abcdef', 4294967298, 2)</c> is <c>bc</c>.
+    /// Measured, a <c>try_cast</c> around the call does not rescue the ANSI overflow, because the
+    /// cast that raises is the inner one.
+    /// </para>
+    /// <para>
+    /// Anything with no implicit cast to int is refused before a row is read, in both dialects:
+    /// a boolean, a date and a binary are all <c>DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE</c>.
+    /// </para>
+    /// </remarks>
+    private IReadOnlyList<IArrowArray> SubstringArguments(
+        string name, IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        // Copied only once an argument actually changes, so the common call -- text and int
+        // arguments -- allocates nothing, the same rule `AsText` follows for a list.
+        IArrowArray[]? prepared = null;
+        for (var i = 0; i < args.Count; i++)
+        {
+            var argument = i == 0 ? AsText(args[0]) : IntArgument(name, i, args[i], rowCount);
+            if (prepared is null && ReferenceEquals(argument, args[i]))
+                continue;
+
+            if (prepared is null)
+            {
+                prepared = new IArrowArray[args.Count];
+                for (var j = 0; j < i; j++)
+                    prepared[j] = args[j];
+            }
+
+            prepared[i] = argument;
+        }
+
+        return prepared ?? args;
+    }
+
+    /// <remarks>
+    /// Cast over <paramref name="rowCount"/> rows and not over the array's own length. A literal
+    /// evaluated over no rows carries one extra row so its type survives, and casting that row
+    /// would raise an ANSI overflow while only the TYPE was being asked for -- which Spark
+    /// resolves without raising.
+    /// </remarks>
+    private IArrowArray IntArgument(string name, int position, IArrowArray argument, int rowCount)
+    {
+        var type = argument.Data.DataType;
+        if (type is Int32Type or NullType)
+            return argument;
+
+        if (!SparkNumericTypes.IsNumeric(type) && type is not StringType)
+        {
+            throw new ExpressionAnalysisException(new AnalysisDiagnostic(
+                "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+                $"parameter {position + 1} of {name} requires the \"INT\" type, " +
+                $"however it has the type \"{SparkArrays.Describe(type)}\"."));
+        }
+
+        return Cast(
+            argument, Int32Type.Default, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
     }
 
     private static bool AnyDecimal(IReadOnlyList<IArrowArray> args, int count)

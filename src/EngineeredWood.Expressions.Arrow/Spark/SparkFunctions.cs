@@ -53,10 +53,24 @@ internal static class SparkFunctions
     /// <c>substring(str, pos[, len])</c>, with Spark's position rules.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Measured, and none of it is the obvious reading: positions are 1-based, position 0 behaves
     /// as 1, a negative position counts back from the end (<c>-2</c> starts at the second-to-last
     /// character), a length past the end clamps rather than failing, and a start past the end
     /// gives an empty string rather than null.
+    /// </para>
+    /// <para>
+    /// <b>The end is taken from the UNCLAMPED start.</b> This is Spark's
+    /// <c>UTF8String.substringSQL</c>: a negative position before the beginning still spends its
+    /// length from where it would have started, so <c>substring('abcdef', -8, 3)</c> is <c>a</c>
+    /// and <c>substring('abcdef', -7, 1)</c> is empty. Clamping first answered <c>abc</c> and
+    /// <c>a</c>. The sum is taken in 64 bits and clamped to an int, as Spark does, so
+    /// <c>substring('abcdef', -2147483648, 2147483647)</c> is <c>abcde</c>. #370.
+    /// </para>
+    /// <para>
+    /// The position and length arrive as <c>int</c>: the registry casts them first, because the
+    /// cast is the dialect's. With no length, the length is <see cref="int.MaxValue"/>.
+    /// </para>
     /// </remarks>
     public static IArrowArray Substring(IReadOnlyList<IArrowArray> args, int rowCount)
     {
@@ -67,25 +81,26 @@ internal static class SparkFunctions
             var text = ReadString(args[0], i);
             var position = SparkArrays.ReadInt64(args[1], i);
 
-            long? length = args.Count > 2 ? SparkArrays.ReadInt64(args[2], i) : null;
-            if (text is null || position is null || (args.Count > 2 && length is null))
+            long? length = args.Count > 2 ? SparkArrays.ReadInt64(args[2], i) : int.MaxValue;
+            if (text is null || position is null || length is null)
             {
                 builder.AppendNull();
                 continue;
             }
 
-            var start = position.Value;
-            if (start < 0)
-                start = Math.Max(text.Length + start + 1, 1);
-            else if (start == 0)
-                start = 1;
+            var pos = checked((int)position.Value);
+            var start = pos > 0 ? pos - 1 : pos < 0 ? text.Length + pos : 0;
+            var end = Math.Min(Math.Max((long)start + checked((int)length.Value), int.MinValue), int.MaxValue);
+            start = Math.Max(start, 0);
 
-            var zeroBased = (int)Math.Min(start - 1, text.Length);
-            var take = length is null
-                ? text.Length - zeroBased
-                : (int)Math.Max(Math.Min(length.Value, text.Length - zeroBased), 0);
+            if (start >= end || start >= text.Length)
+            {
+                builder.Append(string.Empty);
+                continue;
+            }
 
-            builder.Append(text.Substring(zeroBased, take));
+            var until = (int)Math.Min(end, text.Length);
+            builder.Append(text.Substring(start, until - start));
         }
 
         return builder.Build();

@@ -172,7 +172,10 @@ LEGACY_GROUPS = (
     # #325. THE LEGACY COLUMN IS THE MEASUREMENT: a decimal casts to string through Java's
     # `BigDecimal.toString` there and through `toPlainString` under ANSI, so the ANSI half is the
     # control that says the plain spelling did not move.
-    "decimal-to-string")
+    "decimal-to-string",
+    # #370. The position and length are CAST to int in the session dialect, so overflow raises
+    # under ANSI and wraps under legacy, and a malformed string refuses or reads as null.
+    "substring-arguments")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3307,6 +3310,57 @@ GROUPS = {
         # --- AND THE SPELLING READS BACK, so a round trip keeps the value.
         "CAST(CAST(CAST(0 AS DECIMAL(10,7)) AS STRING) AS DECIMAL(10,7))",
         "CAST(CAST(CAST('-0.00000012' AS DECIMAL(20,8)) AS STRING) AS DOUBLE)",
+    ],
+
+    # WHAT substring DOES WITH ITS POSITION AND LENGTH. #370. Spark's analyzer casts both to INT
+    # with the session's own cast, so the answer for a non-int argument is the cast's answer --
+    # truncation, and an overflow that raises under ANSI and wraps under legacy. Then the
+    # arithmetic is `UTF8String.substringSQL`, which takes the END from the UNCLAMPED start:
+    # `substring('abcdef', -8, 3)` is 'a', not 'abc'.
+    "substring-arguments": [
+        # --- THE ARITHMETIC, with int arguments only.
+        "substring('abcdef', -8, 3)", "substring('abcdef', -7, 3)", "substring('abcdef', -6, 3)",
+        "substring('abcdef', -7, 1)", "substring('abcdef', -100, 96)", "substring('abcdef', -100, 97)",
+        "substring('abcdef', -8)", "substring('abcdef', -2)", "substring('abcdef', 0, 2)",
+        "substring('abcdef', 2, -1)", "substring('abcdef', 2, 0)", "substring('abcdef', 7, 2)",
+        "substring('abcdef', 6, 2)", "substring('', 1, 2)",
+        "substring('abcdef', 2147483647, 2147483647)", "substring('abcdef', -2147483648, 2147483647)",
+        "substring('abcdef', -2147483648, -2147483648)", "substring('abcdef', 2, 2147483647)",
+        "substring('abcdef', -3, 2147483647)",
+
+        # --- A BIGINT IS CAST, so its overflow is the cast's.
+        "substring('abcdef', 2, 3000000000)", "substring('abcdef', 2, -3000000000)",
+        "substring('abcdef', 4294967298, 2)", "substring('abcdef', 3000000000, 2)",
+        "substring('abcdef', 2L, 2L)",
+
+        # --- A FRACTION IS TRUNCATED, from every non-integral numeric type.
+        "substring('abcdef', 2.7, 2)", "substring('abcdef', -2.7, 2)", "substring('abcdef', 2.7D, 2)",
+        "substring('abcdef', 2.7F, 2)", "substring('abcdef', 2, 2.9)",
+        "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)", "substring('abcdef', CAST(2 AS DECIMAL(38,0)), 2)",
+        "substring('abcdef', CAST('99999999999999999999' AS DECIMAL(38,0)), 2)",
+        "substring('abcdef', CAST('NaN' AS DOUBLE), 2)", "substring('abcdef', 1e10, 2)",
+        "substring('abcdef', CAST(2 AS TINYINT), CAST(2 AS SMALLINT))",
+
+        # --- A STRING IS CAST TOO, under the integral TEXT rule of #258.
+        "substring('abcdef', '2', 2)", "substring('abcdef', ' 2 ', 2)", "substring('abcdef', '2.7', 2)",
+        "substring('abcdef', 'x', 2)", "substring('abcdef', 'NaN', 2)", "substring('abcdef', 2, '3')",
+
+        # --- NULL in either position, typed and untyped.
+        "substring('abcdef', NULL, 2)", "substring('abcdef', 2, NULL)",
+        "substring('abcdef', CAST(NULL AS DECIMAL(10,2)), 2)", "substring('abcdef', CAST(NULL AS STRING), 2)",
+
+        # --- WHAT HAS NO CAST TO INT here is refused at analysis, in both dialects.
+        "substring('abcdef', true, 2)", "substring('abcdef', DATE'2020-01-01', 2)",
+        "substring('abcdef', X'02', 2)", "substring('abcdef', 2, true)",
+
+        # --- OVER COLUMNS, so none of it is constant folding. `a` holds INT_MIN on the boundary
+        # row, `g` is a double and `fs` a string holding 1.5.
+        "substring(s, a, 2)", "substring(s, b, 2)", "substring(s, g, 2)", "substring(s, 1, a)",
+        "substring(s, fs, 2)", "substring(s, ns, 2)", "substring(s, d1, 2)", "substr(s, g)",
+        "substring(s, bl, 2)",
+
+        # --- and the ANSI cast is the INNER one, so try_cast outside does not rescue it.
+        "try_cast(substring('abcdef', 3000000000, 2) AS STRING)",
     ],
 
     "malformed": [

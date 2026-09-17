@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 12:54:12.635001",
-      "2026-09-17 12:54:12.635001",
-      "2026-09-17 12:54:12.635001"
+      "2026-09-17 13:49:19.589619",
+      "2026-09-17 13:49:19.589619",
+      "2026-09-17 13:49:19.589619"
      ]
     }
    },
@@ -46786,6 +46786,1120 @@
     }
    }
   ],
+  "substring-arguments": [
+   {
+    "expression": "substring('abcdef', -8, 3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -8, 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a",
+      "a",
+      "a"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -7, 3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -7, 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -6, 3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -6, 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      "abc",
+      "abc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -7, 1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -7, 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -100, 96)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -100, 96)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -100, 97)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -100, 97)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abc",
+      "abc",
+      "abc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -8)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -8)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abcdef",
+      "abcdef",
+      "abcdef"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ef",
+      "ef",
+      "ef"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 0, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 0, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      "ab",
+      "ab"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, -1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, -1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, 0)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, 0)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 7, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 7, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 6, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 6, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "f",
+      "f",
+      "f"
+     ]
+    }
+   },
+   {
+    "expression": "substring('', 1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('', 1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2147483647, 2147483647)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2147483647, 2147483647)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -2147483648, 2147483647)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -2147483648, 2147483647)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "abcde",
+      "abcde",
+      "abcde"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -2147483648, -2147483648)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -2147483648, -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      "",
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, 2147483647)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, 2147483647)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bcdef",
+      "bcdef",
+      "bcdef"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -3, 2147483647)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -3, 2147483647)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "def",
+      "def",
+      "def"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, 3000000000)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, 3000000000L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 3000000000L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, -3000000000)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, -3000000000L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value -3000000000L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 4294967298, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 4294967298L, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 4294967298L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 3000000000, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 3000000000L, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 3000000000L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2L, 2L)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2L, 2L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2.7, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2.7BD, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', -2.7, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', -2.7BD, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ef",
+      "ef",
+      "ef"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2.7D, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2.7D, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2.7F, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST('2.7' AS FLOAT), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, 2.9)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, 2.9BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(2 AS DECIMAL(38,0)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(2 AS DECIMAL(38,0)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST('99999999999999999999' AS DECIMAL(38,0)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST('99999999999999999999' AS DECIMAL(38,0)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 99999999999999999999BD of the type \"DECIMAL(38,0)\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST('NaN' AS DOUBLE), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST('NaN' AS DOUBLE), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value NaN of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 1e10, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 1.0E10D, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 1.0E10D of the type \"DOUBLE\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(2 AS TINYINT), CAST(2 AS SMALLINT))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(2 AS TINYINT), CAST(2 AS SMALLINT))"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', '2', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', '2', 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', ' 2 ', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', ' 2 ', 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', '2.7', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', '2.7', 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '2.7' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(substring('abcdef', '2.7', 2)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 'x', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 'x', 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(substring('abcdef', 'x', 2)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 'NaN', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 'NaN', 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'NaN' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(substring('abcdef', 'NaN', 2)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, '3')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, '3')"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bcd",
+      "bcd",
+      "bcd"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', NULL, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', NULL, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, NULL)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(NULL AS DECIMAL(10,2)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(NULL AS DECIMAL(10,2)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(NULL AS STRING), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(NULL AS STRING), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', true, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', true, 2)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, true, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, true, 2) AS r#9266]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14,"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, true, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, true, 2) AS r#9267]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigi"
+    }
+   },
+   {
+    "expression": "substring('abcdef', DATE'2020-01-01', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', DATE '2020-01-01', 2)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, DATE '2020-01-01', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"DATE '2020-01-01'\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2020-01-01, 2) AS r#9268]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#1"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, DATE '2020-01-01', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"DATE '2020-01-01'\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2020-01-01, 2) AS r#9269]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as "
+    }
+   },
+   {
+    "expression": "substring('abcdef', X'02', 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', X'02', 2)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, X'02', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"X'02'\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 0x02, 2) AS r#9270]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, X'02', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"X'02'\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 0x02, 2) AS r#9271]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as big"
+    }
+   },
+   {
+    "expression": "substring('abcdef', 2, true)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', 2, true)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, 2, true)\" due to data type mismatch: The third parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2, true) AS r#9272]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, "
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, 2, true)\" due to data type mismatch: The third parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2, true) AS r#9273]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigin"
+    }
+   },
+   {
+    "expression": "substring(s, a, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, a, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, b, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, b, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, g, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, g, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, 1, a)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, 1, a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "a",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, fs, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, fs, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value '1.5' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(substring(s, fs, 2)) AS r\n ^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "substring(s, ns, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, ns, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "ab",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, d1, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, d1, 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substr(s, g)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substr(s, g)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      null,
+      ""
+     ]
+    }
+   },
+   {
+    "expression": "substring(s, bl, 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(s, bl, 2)"
+    },
+    "type": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(s, bl, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(s#10, bl#16, 2) AS r#9306]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl"
+    },
+    "eval": {
+     "ok": false,
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(s, bl, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(s#29, bl#35, 2) AS r#9307]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#2"
+    }
+   },
+   {
+    "expression": "try_cast(substring('abcdef', 3000000000, 2) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(substring('abcdef', 3000000000L, 2) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [CAST_OVERFLOW] The value 3000000000L of the type \"BIGINT\" cannot be cast to \"INT\" due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead. SQLSTATE: 22003"
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -83181,6 +84295,1168 @@
        -1.2e-07,
        -1.2e-07,
        -1.2e-07
+      ]
+     }
+    }
+   ],
+   "substring-arguments": [
+    {
+     "expression": "substring('abcdef', -8, 3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -8, 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "a",
+       "a",
+       "a"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -7, 3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -7, 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       "ab",
+       "ab"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -6, 3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -6, 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "abc",
+       "abc",
+       "abc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -7, 1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -7, 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -100, 96)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -100, 96)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       "ab",
+       "ab"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -100, 97)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -100, 97)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "abc",
+       "abc",
+       "abc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -8)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -8)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "abcdef",
+       "abcdef",
+       "abcdef"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ef",
+       "ef",
+       "ef"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 0, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 0, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       "ab",
+       "ab"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, -1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, -1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, 0)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, 0)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 7, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 7, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 6, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 6, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "f",
+       "f",
+       "f"
+      ]
+     }
+    },
+    {
+     "expression": "substring('', 1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('', 1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2147483647, 2147483647)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2147483647, 2147483647)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -2147483648, 2147483647)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -2147483648, 2147483647)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "abcde",
+       "abcde",
+       "abcde"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -2147483648, -2147483648)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -2147483648, -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, 2147483647)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, 2147483647)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bcdef",
+       "bcdef",
+       "bcdef"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -3, 2147483647)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -3, 2147483647)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "def",
+       "def",
+       "def"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, 3000000000)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, 3000000000L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, -3000000000)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, -3000000000L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bcdef",
+       "bcdef",
+       "bcdef"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 4294967298, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 4294967298L, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 3000000000, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 3000000000L, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2L, 2L)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2L, 2L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2.7, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2.7BD, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', -2.7, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', -2.7BD, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ef",
+       "ef",
+       "ef"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2.7D, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2.7D, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2.7F, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST('2.7' AS FLOAT), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, 2.9)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, 2.9BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(2 AS DECIMAL(38,0)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(2 AS DECIMAL(38,0)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST('99999999999999999999' AS DECIMAL(38,0)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST('99999999999999999999' AS DECIMAL(38,0)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST('NaN' AS DOUBLE), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST('NaN' AS DOUBLE), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       "ab",
+       "ab"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 1e10, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 1.0E10D, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(2 AS TINYINT), CAST(2 AS SMALLINT))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(2 AS TINYINT), CAST(2 AS SMALLINT))"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', '2', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', '2', 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', ' 2 ', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', ' 2 ', 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', '2.7', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', '2.7', 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 'x', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 'x', 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 'NaN', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 'NaN', 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, '3')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, '3')"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bcd",
+       "bcd",
+       "bcd"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', NULL, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', NULL, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, NULL)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(NULL AS DECIMAL(10,2)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(NULL AS DECIMAL(10,2)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(NULL AS STRING), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(NULL AS STRING), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', true, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', true, 2)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, true, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, true, 2) AS r#7103]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14,"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, true, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, true, 2) AS r#7104]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigi"
+     }
+    },
+    {
+     "expression": "substring('abcdef', DATE'2020-01-01', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', DATE '2020-01-01', 2)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, DATE '2020-01-01', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"DATE '2020-01-01'\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2020-01-01, 2) AS r#7105]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#1"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, DATE '2020-01-01', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"DATE '2020-01-01'\" has the type \"DATE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2020-01-01, 2) AS r#7106]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as "
+     }
+    },
+    {
+     "expression": "substring('abcdef', X'02', 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', X'02', 2)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, X'02', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"X'02'\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 0x02, 2) AS r#7107]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, X'02', 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"X'02'\" has the type \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 0x02, 2) AS r#7108]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as big"
+     }
+    },
+    {
+     "expression": "substring('abcdef', 2, true)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', 2, true)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, 2, true)\" due to data type mismatch: The third parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2, true) AS r#7109]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, "
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(abcdef, 2, true)\" due to data type mismatch: The third parameter requires the \"INT\" type, however \"true\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(abcdef, 2, true) AS r#7110]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigin"
+     }
+    },
+    {
+     "expression": "substring(s, a, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, a, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, b, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, b, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, g, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, g, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, 1, a)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, 1, a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "a",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, fs, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, fs, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, ns, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, ns, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "ab",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, d1, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, d1, 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substr(s, g)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substr(s, g)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       null,
+       ""
+      ]
+     }
+    },
+    {
+     "expression": "substring(s, bl, 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(s, bl, 2)"
+     },
+     "type": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(s, bl, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(s#10, bl#16, 2) AS r#7143]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, bl"
+     },
+     "eval": {
+      "ok": false,
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"substring(s, bl, 2)\" due to data type mismatch: The second parameter requires the \"INT\" type, however \"bl\" has the type \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [substring(s#29, bl#35, 2) AS r#7144]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#19, cast(10 as bigint) AS b#2"
+     }
+    },
+    {
+     "expression": "try_cast(substring('abcdef', 3000000000, 2) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(substring('abcdef', 3000000000L, 2) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "",
+       "",
+       ""
       ]
      }
     }
