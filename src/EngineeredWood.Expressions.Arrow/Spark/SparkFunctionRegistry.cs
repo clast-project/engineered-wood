@@ -121,15 +121,15 @@ public sealed class SparkFunctionRegistry
 
             case "length":
                 Expect(name, args, 1);
-                return SparkFunctions.Length(args[0], rowCount);
+                return SparkFunctions.Length(AsText(args[0]), rowCount);
 
             case "upper":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.ToUpperInvariant());
+                return SparkFunctions.MapString(AsText(args[0]), rowCount, t => t.ToUpperInvariant());
 
             case "lower":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, t => t.ToLowerInvariant());
+                return SparkFunctions.MapString(AsText(args[0]), rowCount, t => t.ToLowerInvariant());
 
             // A THIRD whitespace rule, and the one the name makes hardest to guess: Spark's
             // one-argument `trim` removes the SPACE and nothing else. Not the CAST rule, which is
@@ -142,27 +142,27 @@ public sealed class SparkFunctionRegistry
             // one-element array per row -- MapString runs the lambda for every row.
             case "trim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimSpaces);
+                return SparkFunctions.MapString(AsText(args[0]), rowCount, SparkText.TrimSpaces);
 
             case "ltrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimLeadingSpaces);
+                return SparkFunctions.MapString(AsText(args[0]), rowCount, SparkText.TrimLeadingSpaces);
 
             case "rtrim":
                 Expect(name, args, 1);
-                return SparkFunctions.MapString(args[0], rowCount, SparkText.TrimTrailingSpaces);
+                return SparkFunctions.MapString(AsText(args[0]), rowCount, SparkText.TrimTrailingSpaces);
 
             case "substring" or "substr":
                 if (args.Count is not (2 or 3))
                     throw new ArgumentException($"'{name}' takes 2 or 3 arguments", nameof(args));
-                return SparkFunctions.Substring(args, rowCount);
+                return SparkFunctions.Substring(AsText(args, count: 1), rowCount);
 
             case "concat" or "||":
-                return SparkFunctions.Concat(args, rowCount);
+                return SparkFunctions.Concat(AsText(args, count: args.Count), rowCount);
 
             case "like" or "ilike" or "rlike":
                 Expect(name, args, 2);
-                return SparkFunctions.Match(name, args, rowCount);
+                return SparkFunctions.Match(name, AsText(args, count: 2), rowCount);
 
             case "year" or "month" or "day" or "dayofmonth" or "hour" or "minute" or "second":
                 Expect(name, args, 1);
@@ -1630,7 +1630,7 @@ public sealed class SparkFunctionRegistry
             return CastToDecimal(source, decimalTarget, rowCount, raising);
 
         if (target is StringType)
-            return CastToString(source, rowCount);
+            return CastToString(source, rowCount, legacy);
 
         if (target is BinaryType)
             return CastToBinary(source, rowCount, legacy);
@@ -2232,9 +2232,63 @@ public sealed class SparkFunctionRegistry
         return SparkWideDecimals.Build(mantissas, target, rowCount);
     }
 
-    private static IArrowArray CastToString(IArrowArray source, int rowCount)
+    /// <summary>
+    /// The implicit conversion to string Spark inserts where a decimal meets a string parameter.
+    /// </summary>
+    /// <remarks>
+    /// Spark's analyzer wraps the argument in a CAST, which runs in the session's dialect, so the
+    /// conversion is the dialect's and not a fixed rendering: measured, <c>upper</c>,
+    /// <c>length</c>, <c>concat</c>, <c>||</c>, <c>LIKE</c> and the conditional family's string
+    /// coercion all see <c>0E-7</c> under legacy where they see <c>0.0000000</c> under ANSI.
+    /// Only a decimal needs converting here: every other source renders the same in both
+    /// dialects, and the functions read it through <see cref="SparkFunctions.ReadString"/>.
+    /// #325.
+    /// </remarks>
+    private IArrowArray AsText(IArrowArray argument) =>
+        !_options.Ansi && argument is Decimal128Array
+            ? CastToString(argument, argument.Length, legacy: true)
+            : argument;
+
+    /// <summary><see cref="AsText(IArrowArray)"/> over the first <paramref name="count"/> arguments.</summary>
+    /// <remarks>The rest are not text parameters -- <c>substring</c>'s position and length.</remarks>
+    private IReadOnlyList<IArrowArray> AsText(IReadOnlyList<IArrowArray> args, int count)
+    {
+        if (_options.Ansi)
+            return args;
+
+        var converted = new IArrowArray[args.Count];
+        for (var i = 0; i < args.Count; i++)
+            converted[i] = i < count ? AsText(args[i]) : args[i];
+
+        return converted;
+    }
+
+    /// <summary>Casts a column to STRING.</summary>
+    /// <remarks>
+    /// <b>A decimal is spelled differently by the legacy dialect</b>, which prints Java's
+    /// <c>BigDecimal.toString</c>: <c>CAST(CAST(0 AS DECIMAL(10,7)) AS STRING)</c> is <c>0E-7</c>
+    /// there and <c>0.0000000</c> under ANSI. <paramref name="legacy"/> is exactly the right switch:
+    /// measured, <c>try_cast</c> prints plainly in BOTH dialects, and it is the one caller that
+    /// passes false under a legacy session. Every implicit conversion to string follows the cast,
+    /// so <c>concat</c>, <c>||</c>, <c>upper</c>, <c>length</c> and <c>LIKE</c> all see
+    /// <c>0E-7</c> under legacy. #325.
+    /// </remarks>
+    private static IArrowArray CastToString(IArrowArray source, int rowCount, bool legacy)
     {
         var builder = new StringArray.Builder();
+
+        if (legacy && source is Decimal128Array)
+        {
+            for (var i = 0; i < rowCount; i++)
+            {
+                if (SparkWideDecimals.Read(source, i) is { } decimalValue)
+                    builder.Append(SparkWideDecimals.RenderScientific(decimalValue));
+                else
+                    builder.AppendNull();
+            }
+
+            return builder.Build();
+        }
 
         for (var i = 0; i < rowCount; i++)
         {
@@ -2671,7 +2725,12 @@ public sealed class SparkFunctionRegistry
             prepared[i] = branches[i];
 
         if (type is StringType)
+        {
+            for (var i = 0; i < prepared.Length; i++)
+                prepared[i] = AsText(prepared[i]);
+
             return prepared;
+        }
 
         for (var i = 0; i < prepared.Length; i++)
         {

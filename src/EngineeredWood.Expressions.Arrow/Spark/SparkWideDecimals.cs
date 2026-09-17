@@ -356,6 +356,54 @@ internal static class SparkWideDecimals
     internal static string Render(Operand value) =>
         new Decimal128(value.Unscaled).ToString(value.Type.Scale);
 
+    /// <summary>
+    /// How the LEGACY dialect prints a decimal: Java's <c>BigDecimal.toString</c>, which goes
+    /// scientific once the adjusted exponent drops below -6.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #325. The adjusted exponent is the coefficient's digit count, less one, less the scale. It
+    /// depends on the value as well as the scale, so a zero at scale 7 is <c>0E-7</c> while
+    /// <c>0.0000010</c> at the same scale stays plain. The coefficient keeps every digit it has,
+    /// trailing zeros included: <c>-0.000000120</c> at scale 9 is <c>-1.20E-7</c>. Measured against
+    /// Spark 4.0.3, where the ANSI dialect and <c>try_cast</c> in either dialect use
+    /// <c>toPlainString</c> instead, which is <see cref="Render"/>.
+    /// </para>
+    /// <para>
+    /// A Spark decimal never has a negative scale, so the exponent here is always negative and
+    /// Java's <c>E+</c> spelling never arises. The coefficient comes from the exact plain
+    /// rendering rather than from a second conversion of the unscaled value, so both spellings
+    /// read the same digits.
+    /// </para>
+    /// </remarks>
+    internal static string RenderScientific(Operand value)
+    {
+        var plain = Render(value);
+        var scale = value.Type.Scale;
+        if (scale == 0)
+            return plain;
+
+        var negative = plain[0] == '-';
+        var coefficient = plain.Replace(".", string.Empty).TrimStart('-').TrimStart('0');
+        if (coefficient.Length == 0)
+            coefficient = "0";
+
+        var adjusted = coefficient.Length - 1 - scale;
+        if (adjusted >= -6)
+            return plain;
+
+        var text = new System.Text.StringBuilder(coefficient.Length + 8);
+        if (negative)
+            text.Append('-');
+        text.Append(coefficient[0]);
+        if (coefficient.Length > 1)
+            text.Append('.').Append(coefficient, 1, coefficient.Length - 1);
+
+        return text.Append('E')
+            .Append(adjusted.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .ToString();
+    }
+
     // ── Conversions the netstandard2.0 polyfill does not offer ─────────────────────────────────
 
     /// <summary>
