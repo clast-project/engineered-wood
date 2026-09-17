@@ -3291,6 +3291,18 @@ GROUPS = {
         "CAST(0 AS DECIMAL(10,7)) LIKE '0E%'", "CAST(0 AS DECIMAL(10,7)) = '0E-7'",
         "coalesce(CAST(0 AS DECIMAL(10,7)), 'x')", "if(a > 0, CAST(0 AS DECIMAL(10,7)), 'x')",
         "CASE WHEN a > 0 THEN CAST(0 AS DECIMAL(10,7)) ELSE 'x' END",
+        # Every dispatch site that converts, not only the first few: each is its own line of code.
+        "lower(CAST(0 AS DECIMAL(10,7)))", "trim(CAST(0 AS DECIMAL(10,7)))",
+        "ltrim(CAST(0 AS DECIMAL(10,7)))", "rtrim(CAST(0 AS DECIMAL(10,7)))",
+        "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')", "CAST(0 AS DECIMAL(10,7)) ILIKE '0e%'",
+        "CAST(0 AS DECIMAL(10,7)) RLIKE '^0E'", "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))",
+        "concat('x', CAST(0 AS DECIMAL(10,7)), d5)",
+        "nvl(CAST(0 AS DECIMAL(10,7)), 'x')", "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')",
+        "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')", "if(a > 0, 'x', d3)",
+        # `substring` converts its FIRST argument only: the position and length stay numbers,
+        # which a decimal position says -- it is truncated to an int, not rendered.
+        "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)", "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)",
+        "substring(d3, 1, 4)", "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
 
         # --- AND THE SPELLING READS BACK, so a round trip keeps the value.
         "CAST(CAST(CAST(0 AS DECIMAL(10,7)) AS STRING) AS DECIMAL(10,7))",

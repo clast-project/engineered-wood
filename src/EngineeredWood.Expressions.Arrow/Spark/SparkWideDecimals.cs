@@ -373,7 +373,8 @@ internal static class SparkWideDecimals
     /// A Spark decimal never has a negative scale, so the exponent here is always negative and
     /// Java's <c>E+</c> spelling never arises. The coefficient comes from the exact plain
     /// rendering rather than from a second conversion of the unscaled value, so both spellings
-    /// read the same digits.
+    /// read the same digits, and it is read in place, so a value that stays plain allocates
+    /// nothing beyond that rendering.
     /// </para>
     /// </remarks>
     internal static string RenderScientific(Operand value)
@@ -383,21 +384,37 @@ internal static class SparkWideDecimals
         if (scale == 0)
             return plain;
 
-        var negative = plain[0] == '-';
-        var coefficient = plain.Replace(".", string.Empty).TrimStart('-').TrimStart('0');
-        if (coefficient.Length == 0)
-            coefficient = "0";
+        // Read the exponent off the plain text rather than rebuilding the coefficient, so a value
+        // that stays plain -- nearly all of them -- costs no more than the plain rendering. That
+        // text is `[-]I.F` with exactly `scale` fraction digits, so a non-zero integer part means
+        // an exponent of at least zero, and otherwise the first non-zero fraction digit fixes it.
+        var start = plain[0] == '-' ? 1 : 0;
+        var point = plain.Length - scale - 1;
+        if (point - start > 1 || plain[start] != '0')
+            return plain;
 
-        var adjusted = coefficient.Length - 1 - scale;
+        var first = point + 1;
+        while (first < plain.Length && plain[first] == '0')
+            first++;
+
+        var isZero = first == plain.Length;
+        var adjusted = isZero ? -scale : point - first;
         if (adjusted >= -6)
             return plain;
 
-        var text = new System.Text.StringBuilder(coefficient.Length + 8);
-        if (negative)
+        var text = new System.Text.StringBuilder(plain.Length - first + 8);
+        if (start == 1)
             text.Append('-');
-        text.Append(coefficient[0]);
-        if (coefficient.Length > 1)
-            text.Append('.').Append(coefficient, 1, coefficient.Length - 1);
+        if (isZero)
+        {
+            text.Append('0');
+        }
+        else
+        {
+            text.Append(plain[first]);
+            if (first + 1 < plain.Length)
+                text.Append('.').Append(plain, first + 1, plain.Length - first - 1);
+        }
 
         return text.Append('E')
             .Append(adjusted.ToString(System.Globalization.CultureInfo.InvariantCulture))

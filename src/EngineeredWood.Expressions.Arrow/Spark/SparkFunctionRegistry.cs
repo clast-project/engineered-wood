@@ -2250,10 +2250,14 @@ public sealed class SparkFunctionRegistry
             : argument;
 
     /// <summary><see cref="AsText(IArrowArray)"/> over the first <paramref name="count"/> arguments.</summary>
-    /// <remarks>The rest are not text parameters -- <c>substring</c>'s position and length.</remarks>
+    /// <remarks>
+    /// The rest are not text parameters -- <c>substring</c>'s position and length. The arguments
+    /// come back as they were unless one of them needs converting, so a call with no decimal
+    /// argument allocates nothing.
+    /// </remarks>
     private IReadOnlyList<IArrowArray> AsText(IReadOnlyList<IArrowArray> args, int count)
     {
-        if (_options.Ansi)
+        if (_options.Ansi || !AnyDecimal(args, count))
             return args;
 
         var converted = new IArrowArray[args.Count];
@@ -2261,6 +2265,17 @@ public sealed class SparkFunctionRegistry
             converted[i] = i < count ? AsText(args[i]) : args[i];
 
         return converted;
+    }
+
+    private static bool AnyDecimal(IReadOnlyList<IArrowArray> args, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            if (args[i] is Decimal128Array)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>Casts a column to STRING.</summary>

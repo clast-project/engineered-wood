@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 12:16:46.864872",
-      "2026-09-17 12:16:46.864872",
-      "2026-09-17 12:16:46.864872"
+      "2026-09-17 12:54:12.635001",
+      "2026-09-17 12:54:12.635001",
+      "2026-09-17 12:54:12.635001"
      ]
     }
    },
@@ -46414,6 +46414,338 @@
     }
    },
    {
+    "expression": "lower(CAST(0 AS DECIMAL(10,7)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "lower(CAST(0 AS DECIMAL(10,7)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0000000",
+      "0.0000000",
+      "0.0000000"
+     ]
+    }
+   },
+   {
+    "expression": "trim(CAST(0 AS DECIMAL(10,7)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "trim(CAST(0 AS DECIMAL(10,7)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0000000",
+      "0.0000000",
+      "0.0000000"
+     ]
+    }
+   },
+   {
+    "expression": "ltrim(CAST(0 AS DECIMAL(10,7)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "ltrim(CAST(0 AS DECIMAL(10,7)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0000000",
+      "0.0000000",
+      "0.0000000"
+     ]
+    }
+   },
+   {
+    "expression": "rtrim(CAST(0 AS DECIMAL(10,7)))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "rtrim(CAST(0 AS DECIMAL(10,7)))"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0000000",
+      "0.0000000",
+      "0.0000000"
+     ]
+    }
+   },
+   {
+    "expression": "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS DECIMAL(10,7)) ILIKE '0e%'",
+    "parse": {
+     "ok": true,
+     "node": "ILike",
+     "sql": "ilike(CAST(0 AS DECIMAL(10,7)), '0e%')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "CAST(0 AS DECIMAL(10,7)) RLIKE '^0E'",
+    "parse": {
+     "ok": true,
+     "node": "RLike",
+     "sql": "RLIKE(CAST(0 AS DECIMAL(10,7)), '^0E')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))",
+    "parse": {
+     "ok": true,
+     "node": "Like",
+     "sql": "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "concat('x', CAST(0 AS DECIMAL(10,7)), d5)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "concat('x', CAST(0 AS DECIMAL(10,7)), d5)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "x0.00000000.10000000000000000000000000000000000000",
+      null,
+      "x0.00000000.50000000000000000000000000000000000000"
+     ]
+    }
+   },
+   {
+    "expression": "nvl(CAST(0 AS DECIMAL(10,7)), 'x')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl(CAST(0 AS DECIMAL(10,7)), 'x')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   },
+   {
+    "expression": "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "if(a > 0, 'x', d3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "if((a > 0), 'x', d3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": false,
+     "error": "NumberFormatException: [CAST_INVALID_INPUT] The value 'x' of the type \"STRING\" cannot be cast to \"DOUBLE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(if(a > 0, 'x', d3)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.00000012",
+      "0.00000012",
+      "0.00000012"
+     ]
+    }
+   },
+   {
+    "expression": "substring(d3, 1, 4)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring(d3, 1, 4)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "9.99",
+      null,
+      "0.00"
+     ]
+    }
+   },
+   {
+    "expression": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "bc",
+      "bc",
+      "bc"
+     ]
+    }
+   },
+   {
     "expression": "CAST(CAST(CAST(0 AS DECIMAL(10,7)) AS STRING) AS DECIMAL(10,7))",
     "parse": {
      "ok": true,
@@ -82469,6 +82801,346 @@
        "0E-7",
        "x",
        "x"
+      ]
+     }
+    },
+    {
+     "expression": "lower(CAST(0 AS DECIMAL(10,7)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "lower(CAST(0 AS DECIMAL(10,7)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0e-7",
+       "0e-7",
+       "0e-7"
+      ]
+     }
+    },
+    {
+     "expression": "trim(CAST(0 AS DECIMAL(10,7)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "trim(CAST(0 AS DECIMAL(10,7)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "0E-7",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "ltrim(CAST(0 AS DECIMAL(10,7)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "ltrim(CAST(0 AS DECIMAL(10,7)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "0E-7",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "rtrim(CAST(0 AS DECIMAL(10,7)))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "rtrim(CAST(0 AS DECIMAL(10,7)))"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "0E-7",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS DECIMAL(10,7)) ILIKE '0e%'",
+     "parse": {
+      "ok": true,
+      "node": "ILike",
+      "sql": "ilike(CAST(0 AS DECIMAL(10,7)), '0e%')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(0 AS DECIMAL(10,7)) RLIKE '^0E'",
+     "parse": {
+      "ok": true,
+      "node": "RLike",
+      "sql": "RLIKE(CAST(0 AS DECIMAL(10,7)), '^0E')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))",
+     "parse": {
+      "ok": true,
+      "node": "Like",
+      "sql": "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "concat('x', CAST(0 AS DECIMAL(10,7)), d5)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "concat('x', CAST(0 AS DECIMAL(10,7)), d5)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "x0E-70.10000000000000000000000000000000000000",
+       null,
+       "x0E-70.50000000000000000000000000000000000000"
+      ]
+     }
+    },
+    {
+     "expression": "nvl(CAST(0 AS DECIMAL(10,7)), 'x')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nvl(CAST(0 AS DECIMAL(10,7)), 'x')"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "0E-7",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "0E-7",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-7",
+       "x",
+       "0E-7"
+      ]
+     }
+    },
+    {
+     "expression": "if(a > 0, 'x', d3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "if((a > 0), 'x', d3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "x",
+       null,
+       "0E-10"
+      ]
+     }
+    },
+    {
+     "expression": "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0E-",
+       "0E-",
+       "0E-"
+      ]
+     }
+    },
+    {
+     "expression": "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1.2E-7",
+       "1.2E-7",
+       "1.2E-7"
+      ]
+     }
+    },
+    {
+     "expression": "substring(d3, 1, 4)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring(d3, 1, 4)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "9.99",
+       null,
+       "0E-1"
+      ]
+     }
+    },
+    {
+     "expression": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "bc",
+       "bc",
+       "bc"
       ]
      }
     },

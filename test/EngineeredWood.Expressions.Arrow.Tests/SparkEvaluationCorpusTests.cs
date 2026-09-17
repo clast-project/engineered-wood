@@ -200,6 +200,12 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
             "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
+        // #370, found by the `decimal-to-string` group's check that `substring` converts only its
+        // first argument to text. Spark casts the position and length to INT, truncating a
+        // decimal; we read them as integral arrays only and refuse. Older than #325.
+        ["substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"] =
+            "#370: substring's position is cast to INT by Spark and refused by us",
+
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
         // Spark reaches a decimal from a double through Double.toString, which did not produce
@@ -369,6 +375,10 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
+            // #370, as in the ANSI list: the same refusal, and a dialect-independent answer.
+            ["substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)"] =
+                "#370: substring's position is cast to INT by Spark and refused by us",
+
             // `coalesce(X'00', CAST(NULL AS STRING))` used to sit here as #293: a typed null string
             // was indistinguishable from the untyped placeholder, so we dropped it and answered
             // the binary where Spark refuses the pair. #279 replaced the content test with a
@@ -491,6 +501,10 @@ public sealed class SparkEvaluationCorpusTests
     // #303, and a gate the value comparison cannot replace: `-2147483648` is the same number as
     // an `int` and as a `bigint`, and the whole defect was that we resolved the wider one.
     [InlineData("negative-literal-fold")]
+    // #325. Mostly a spelling, which the value gates see -- but the conditional rows are a TYPE
+    // that differs by dialect, `double` here and `string` under legacy, and an answer of 0.0 is
+    // not distinguishable from the string a wrong fold would render.
+    [InlineData("decimal-to-string")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -527,6 +541,8 @@ public sealed class SparkEvaluationCorpusTests
     // ...and #303 here because the fold is the parser's and so cannot differ by dialect -- which
     // is a claim until this theory checks it, while the VALUES it leads to plainly do differ.
     [InlineData("negative-literal-fold")]
+    // ...and #325 here because this is the dialect where the conditional rows resolve a STRING.
+    [InlineData("decimal-to-string")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
