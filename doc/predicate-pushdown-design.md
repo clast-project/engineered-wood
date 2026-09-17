@@ -1224,6 +1224,73 @@ corpus row cannot tell a rendering defect from a parse defect — which is why t
 `CAST(CAST(… AS TIMESTAMP) AS STRING)` and the renderer has a unit test of its
 own over a timestamp COLUMN, the path the corpus cannot reach.
 
+#### A naive timestamp is a different type, and a zoned operand wins
+
+Added 2026-09-17, closing #349's two filed gaps. Delta maps `timestamp_ntz` to
+an Arrow `TimestampType` with a **null zone**, so it reaches the Spark registry
+looking exactly like a zoned timestamp — and until now the harvest schema had no
+naive column, so nothing said what Spark does with one. #311 kept NTZ out of the
+temporal fold for precisely that reason rather than guessing.
+
+The `timestamp-ntz` corpus group is that measurement: 81 expressions, both
+dialects, covering NTZ's row and column of the type matrix. Two things it
+settled that a guess would have got wrong:
+
+| expression | Spark |
+|---|---|
+| `coalesce(ntz, dt)` / `coalesce(dt, ntz)` | `timestamp_ntz` |
+| `coalesce(ntz, ts)` / `coalesce(ts, ntz)` | **zoned** `timestamp` |
+| `coalesce(ntz, ntz)` | `timestamp_ntz` |
+
+**The fold is asymmetric.** A zoned operand wins; a DATE does not force a zone,
+it takes whichever timestamp it is folded with. Answering a zoned timestamp for
+`coalesce(ntz, dt)` — which is what a rule that simply reused #311's would do —
+is exactly the reinterpretation Delta's own widening exists to refuse: it
+permits `date -> timestamp_ntz` and rejects `date ->` zoned, because that reads
+a naive calendar date as an absolute instant.
+
+**Gap 1 was a label, not a value.** `SparkFunctions.Unify` routed every temporal
+branch through `BuildTimestamp`, which stamps UTC on whatever it read, so a fold
+resolving `timestamp_ntz` handed back a zoned array. `SparkArrays.NaiveTimestamp`
+is now the canonical naive instance and `Unify` builds at the type it resolved.
+
+**Why no corpus row can ever catch a value-level NTZ bug.** Under the pinned UTC
+session zone a naive timestamp and a zoned one hold the *same* micros for the
+same wall clock, so the conversion between them is the identity. Probed under
+`America/Los_Angeles` to be sure: `CAST(ntz AS TIMESTAMP)` reinterprets the wall
+clock in the session zone exactly as a string cast does, and every value in the
+probe shifted by the same seven hours — including `ts` itself, since the row
+literals are resolved in the session zone too. Read out as text the shift
+cancels twice over and looks like nothing moved; read out as epoch seconds it is
+plain. So the group measures **types and refusals**, and that is not a
+limitation of the group but of any corpus pinned to one zone.
+
+Three things the measurement left open, each declared as a known difference with
+its count rather than fixed here, because they are a decision about whether this
+layer models `timestamp_ntz` as a distinct type at all rather than a rule that
+was merely missing:
+
+- **The cast table is not the zoned one** (#377, 5 rows ANSI / 6 legacy). Spark
+  refuses a numeric target for a naive timestamp and *allows* one for a zoned
+  timestamp; `CAST(ts AS LONG)` is in the group as the control that says so. We
+  reach both through one `Source.Temporal` arm.
+- **`TIMESTAMP_NTZ` is neither a cast target nor a typed literal here**, and a
+  string compared against a naive timestamp is cast to a **zoned** one (#378,
+  7 rows ANSI / 6 legacy). The cast keeps the wall clock and **discards** any
+  zone the text carried, so `ntz = '…08:00+02:00'` is true to Spark — it reads
+  08:00 — and false here, because we convert to 06:00Z. **Only an
+  offset-carrying string can show this** under a UTC session zone: every
+  offset-free one lands on the same micros either way.
+- **Subtracting two temporals yields an `interval day to second`** (#379, 2 rows
+  per dialect), a type this library does not model at all.
+
+One of those rows is a dialect split worth knowing, because it makes our answer
+accidentally right: `ntz IN ('…+02:00')` is **true** under ANSI and **false**
+under the legacy dialect, where a set resolves one type over the operand and the
+whole list and that type is `string` — so the timestamp is rendered and compared
+as text. `ntz = '…+02:00'` is true under both and has no such escape. That is
+#261's `IN`-versus-`=` rule reaching a type nothing had asked it about.
+
 #### Five words that are dates, over a constant only
 
 Added 2026-09-17, closing #342. Spark reads `epoch`, `today`, `yesterday`,

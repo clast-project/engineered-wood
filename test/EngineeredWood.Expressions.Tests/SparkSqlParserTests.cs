@@ -582,6 +582,13 @@ public sealed class SparkSqlParserTests
             // n. Spark reads them, and they even take part in the adjacent-literal concatenation
             // (R'it' 's' is "its"), but the tokenizer has no notion of a prefixed literal — `R`
             // scans as an identifier. Its own change, and not part of #179.
+            // #378, measured under #349. `TIMESTAMP_NTZ'...'` is a typed literal Spark reads and
+            // this tokenizer has no notion of -- `TIMESTAMP_NTZ` scans as an identifier, so the
+            // string after it is a syntax error rather than a bad literal. Refusing it is the
+            // same decision `SparkArrays.ParseTypeName` makes for the CAST target, and both
+            // stand until this layer models a naive timestamp as a type of its own.
+            "CAST(TIMESTAMP_NTZ'2026-08-11 12:30:00' AS STRING)",
+
             @"R'a\nb'",
             @"r'a\nb'",
             "R'it''s'",

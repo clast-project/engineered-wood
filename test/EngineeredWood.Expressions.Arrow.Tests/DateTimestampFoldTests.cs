@@ -48,6 +48,18 @@ public class DateTimestampFoldTests
     private static readonly DateTimeOffset Midnight =
         new(2026, 8, 11, 0, 0, 0, TimeSpan.Zero);
 
+    /// <summary>
+    /// The corpus's <c>ntz</c>: a WALL CLOCK on the same day, at neither of the other two.
+    /// </summary>
+    /// <remarks>
+    /// 08:00 rather than 12:30 deliberately, in the corpus and here alike: a naive timestamp
+    /// holding the same number as <c>ts</c> would let a fold that picked the wrong operand agree
+    /// by coincidence, and the direction the fold moved is exactly what these tests read off the
+    /// value. #349.
+    /// </remarks>
+    private static readonly DateTimeOffset Wall =
+        new(2026, 8, 11, 8, 0, 0, TimeSpan.Zero);
+
     /// <summary>One row carrying a timestamp, a date on the same day, and an int to branch on.</summary>
     private static RecordBatch Row()
     {
@@ -55,6 +67,11 @@ public class DateTimestampFoldTests
             .Field(new Field("a", Int32Type.Default, true))
             .Field(new Field("ts", SparkArrays.Timestamp, true))
             .Field(new Field("dt", Date32Type.Default, true))
+            .Field(new Field("ntz", SparkArrays.NaiveTimestamp, true))
+            // NON-CANONICAL sources: a millisecond zoned timestamp and a millisecond naive one,
+            // which is what a Parquet reader hands over and what no corpus row can supply.
+            .Field(new Field("tsms", MilliZoned, true))
+            .Field(new Field("ntzms", MilliNaive, true))
             .Build();
 
         var timestamps = new TimestampArray.Builder(SparkArrays.Timestamp);
@@ -63,12 +80,31 @@ public class DateTimestampFoldTests
         var dates = new Date32Array.Builder();
         dates.Append(Midnight);
 
+        // The micros of a wall clock, in an array that does NOT claim a zone -- which is how
+        // Delta's converter hands `timestamp_ntz` to this evaluator.
+        var naive = new TimestampArray.Builder(SparkArrays.NaiveTimestamp);
+        naive.Append(Wall);
+
         return new RecordBatch(schema, new IArrowArray[]
         {
             new Int32Array.Builder().Append(1).Build(),
             timestamps.Build(),
             dates.Build(),
+            naive.Build(),
+            Milli(MilliZoned, Noon),
+            Milli(MilliNaive, Wall),
         }, 1);
+    }
+
+    private static readonly TimestampType MilliZoned = new(TimeUnit.Millisecond, "UTC");
+
+    private static readonly TimestampType MilliNaive = new(TimeUnit.Millisecond, (string?)null);
+
+    private static IArrowArray Milli(TimestampType type, DateTimeOffset value)
+    {
+        var builder = new TimestampArray.Builder(type);
+        builder.Append(value);
+        return builder.Build();
     }
 
     private static IArrowArray Evaluate(SparkFunctionRegistry registry, string expression) =>
@@ -148,46 +184,151 @@ public class DateTimestampFoldTests
     }
 
     /// <summary>
-    /// A TIMESTAMP_NTZ is left exactly where it was, because it was never measured.
+    /// A TIMESTAMP_NTZ folds too since #349, and the rule is ASYMMETRIC.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Delta maps <c>timestamp_ntz</c> to an Arrow <c>TimestampType</c> with a NULL ZONE, so it
-    /// arrives here looking just like a timestamp — and the corpus has no NTZ column, so nothing
-    /// in #311's group says what Spark does with one. Folding it would have been inventing a
-    /// rule, and the invented answer is wrong twice: Spark resolves <c>coalesce(ntz, dt)</c> to
-    /// <c>timestamp_ntz</c>, and Delta's widening permits <c>date -&gt; timestamp_ntz</c> while
-    /// refusing <c>date -&gt;</c> a ZONED timestamp, because that reads a naive calendar date as
-    /// an absolute instant.
+    /// <b>This test used to pin the opposite.</b> #311 kept a naive timestamp out of the fold on
+    /// purpose — the harvest schema had no NTZ column, so folding one would have been inventing a
+    /// rule — and this method recorded that decision by asserting the refusal. #349 added the
+    /// column, the <c>timestamp-ntz</c> corpus group measured the rule, and the assertions below
+    /// are the measurement rather than the guess the old ones were written to avoid.
     /// </para>
     /// <para>
-    /// <b>These are main's answers, pinned as such.</b> Both were verified against the branch
-    /// point rather than asserted from the code: two naive timestamps resolved the naive type and
-    /// an NTZ against a DATE threw, and both still do. #349 carries what it would take to answer
-    /// them properly, which starts with an NTZ column in the harvest schema.
+    /// <b>A ZONED operand wins and a DATE does not force a zone</b>, which is the half a guess
+    /// would have got wrong: measured on 4.0.3, <c>coalesce(ntz, dt)</c> is <c>timestamp_ntz</c>
+    /// while <c>coalesce(ntz, ts)</c> is a zoned <c>timestamp</c>. Answering <c>Timestamp</c> for
+    /// the first is exactly the reinterpretation Delta's own widening refuses — it permits
+    /// <c>date -&gt; timestamp_ntz</c> and rejects <c>date -&gt;</c> zoned
+    /// (<c>TypeWideningPolicyTests.Date32ToZonedTimestamp_IsNotWidened</c>).
     /// </para>
     /// </remarks>
     [Fact]
-    public void ANaiveTimestampIsNotThisRulesPairAndKeepsItsOldAnswer()
+    public void ANaiveTimestampFoldsAndAZonedOperandWins()
     {
-        var naive = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        var naive = SparkArrays.NaiveTimestamp;
+        var zoned = SparkArrays.Timestamp;
+        var date = Date32Type.Default;
 
-        // Two naive timestamps take the identity arm, exactly as before #311.
-        var both = Assert.IsType<TimestampType>(SparkNumericTypes.CommonType(naive, naive));
-        Assert.Null(both.Timezone);
+        // No zoned operand: the naive type survives, which is what `coalesce(ntz, dt)` and
+        // `coalesce(ntz, ntz)` resolve.
+        Assert.Same(naive, SparkNumericTypes.CommonType(naive, naive));
+        Assert.Same(naive, SparkNumericTypes.CommonType(naive, date));
+        Assert.Same(naive, SparkNumericTypes.CommonType(date, naive));
 
-        // ...and a naive timestamp against a DATE is still refused, which is the gap #349 names.
-        Assert.Throws<NotSupportedException>(
-            () => SparkNumericTypes.CommonType(naive, Date32Type.Default));
-        Assert.Throws<NotSupportedException>(
-            () => SparkNumericTypes.CommonType(Date32Type.Default, naive));
+        // One zoned operand anywhere, and the pair is zoned.
+        Assert.Same(zoned, SparkNumericTypes.CommonType(naive, zoned));
+        Assert.Same(zoned, SparkNumericTypes.CommonType(zoned, naive));
 
-        // An empty zone string is treated as naive too. Nothing in this repository produces one,
-        // and the conservative direction is the one that cannot relabel a wall clock as an
-        // instant.
-        Assert.Throws<NotSupportedException>(
-            () => SparkNumericTypes.CommonType(
-                new TimestampType(TimeUnit.Microsecond, string.Empty), Date32Type.Default));
+        // A naive timestamp in another UNIT normalises like a zoned one does, for the reason
+        // #311 gave: the type resolved has to be the type the array is built at.
+        Assert.Same(
+            naive,
+            SparkNumericTypes.CommonType(new TimestampType(TimeUnit.Millisecond, (string?)null), date));
+
+        // An EMPTY zone string reads as naive, not as zoned. Nothing here produces one, and the
+        // conservative direction is the one that cannot relabel a wall clock as an instant.
+        Assert.Same(
+            naive,
+            SparkNumericTypes.CommonType(new TimestampType(TimeUnit.Microsecond, string.Empty), date));
+    }
+
+    /// <summary>
+    /// The array a naive fold hands back is naive too, which is #349's gap 1.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A LABELLING defect, and it survived #311 untouched.</b> <c>SparkFunctions.Unify</c>
+    /// routed every temporal branch through <c>BuildTimestamp</c>, which stamps UTC on whatever
+    /// it read — so a fold that resolved <c>timestamp_ntz</c> handed back a zoned array. The
+    /// micros were right either way, because under the pinned UTC session zone a wall clock and
+    /// an instant are the same number; what was wrong was the NAME, and a Delta generated column
+    /// writes its schema from the name.
+    /// </para>
+    /// <para>
+    /// Asserted on the ARRAY rather than on <c>CommonType</c>, because the two agreeing is the
+    /// whole content of the fix — the resolution was already right.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ANaiveFoldBuildsANaiveArray()
+    {
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var naive = Assert.IsType<TimestampArray>(Evaluate(registry, "coalesce(ntz, ntz)"));
+            Assert.True(string.IsNullOrEmpty(((TimestampType)naive.Data.DataType).Timezone));
+            Assert.Equal(Wall, naive.GetTimestamp(0));
+
+            // ...and the DATE pair, which is the one #311 refused outright.
+            var withDate = Assert.IsType<TimestampArray>(Evaluate(registry, "coalesce(ntz, dt)"));
+            Assert.True(string.IsNullOrEmpty(((TimestampType)withDate.Data.DataType).Timezone));
+            Assert.Equal(Wall, withDate.GetTimestamp(0));
+
+            // A zoned operand still produces a zoned array, and the same instant it always did.
+            var zoned = Assert.IsType<TimestampArray>(Evaluate(registry, "coalesce(ntz, ts)"));
+            Assert.Equal("UTC", ((TimestampType)zoned.Data.DataType).Timezone);
+            Assert.Equal(Wall, zoned.GetTimestamp(0));
+
+            // ...and the fold PICKS between them by instant, so `least` takes the date's midnight
+            // where `coalesce` took the first operand.
+            var least = Assert.IsType<TimestampArray>(Evaluate(registry, "least(ntz, dt)"));
+            Assert.True(string.IsNullOrEmpty(((TimestampType)least.Data.DataType).Timezone));
+            Assert.Equal(Midnight, least.GetTimestamp(0));
+        }
+    }
+
+    /// <summary>
+    /// A fold builds at a CANONICAL timestamp, never at a source column's own type.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The corpus cannot see this and never will</b>: the harvest schema has one timestamp
+    /// column and it is microseconds, so no row of it carries a unit the evaluator would have to
+    /// normalise. That is exactly how #349 nearly reintroduced the promise #311 removed — passing
+    /// the RESOLVED type to <c>BuildTimestamp</c> is right for the zone and wrong for everything
+    /// else, because two callers hand <c>Unify</c> a source column's raw type: <c>nullif</c>
+    /// passes <c>args[0].Data.DataType</c> straight through, and <c>ConditionalType</c> keeps a
+    /// sole surviving branch's own type.
+    /// </para>
+    /// <para>
+    /// Measured on the branch before the fix, over a <c>timestamp(ms, UTC)</c> column:
+    /// <c>coalesce(tsms)</c>, <c>coalesce(tsms, NULL)</c> and <c>nullif(tsms, dt)</c> all came
+    /// back MILLISECOND, where every route that actually unified two types came back microsecond.
+    /// Parquet writes millisecond timestamps happily, so this is an ordinary column rather than a
+    /// contrived one. Caught on review of #380.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("coalesce(tsms)")]
+    [InlineData("coalesce(tsms, NULL)")]
+    // Against `dt`, not `ts`: the two timestamps hold the same instant, so `nullif` would
+    // answer NULL and the value assertion would have nothing to check.
+    [InlineData("nullif(tsms, dt)")]
+    [InlineData("if(1 > 0, tsms, tsms)")]
+    [InlineData("coalesce(tsms, ts)")]
+    public void AFoldOverANonCanonicalSourceStillBuildsMicroseconds(string sql)
+    {
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Assert.IsType<TimestampArray>(Evaluate(registry, sql));
+            var type = (TimestampType)result.Data.DataType;
+
+            Assert.Equal(TimeUnit.Microsecond, type.Unit);
+            Assert.Equal("UTC", type.Timezone);
+            Assert.Equal(Noon, result.GetTimestamp(0));
+        }
+    }
+
+    /// <summary>...and the naive arm keeps its own canonical instance, not the source's.</summary>
+    [Fact]
+    public void ANaiveFoldOverANonCanonicalSourceIsCanonicalToo()
+    {
+        var result = Assert.IsType<TimestampArray>(Evaluate(Ansi, "coalesce(ntzms)"));
+        var type = (TimestampType)result.Data.DataType;
+
+        Assert.Equal(TimeUnit.Microsecond, type.Unit);
+        Assert.True(string.IsNullOrEmpty(type.Timezone));
+        Assert.Equal(Wall, result.GetTimestamp(0));
     }
 
     /// <summary>

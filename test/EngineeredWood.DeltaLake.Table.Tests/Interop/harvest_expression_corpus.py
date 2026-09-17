@@ -191,7 +191,12 @@ LEGACY_GROUPS = (
     # CAST_INVALID_INPUT under ANSI and NULL without it. So the accept side is asked twice to
     # record that the dialect does not reach it, and the refuse side because one harvest would
     # show only one of its two faces.
-    "special-datetime-values")
+    "special-datetime-values",
+    # #349. THE STRING ROWS ARE THE MEASUREMENT: `coalesce(ntz, s)` is `timestamp_ntz` under ANSI
+    # and `string` under legacy, and a comparison against a bad string raises there and reads
+    # NULL here -- #278's split reaching a type nothing had asked it about. The rest of the group
+    # is dialect-independent and is asked twice to record that.
+    "timestamp-ntz")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -217,6 +222,13 @@ SCHEMA = [
     {"name": "fs", "type": "string"},
     {"name": "ts", "type": "timestamp"},
     {"name": "dt", "type": "date"},
+    # A NAIVE timestamp, and the whole of #349 is blocked on its absence. Delta maps
+    # `timestamp_ntz` to an Arrow TimestampType with a NULL ZONE, so it reaches the Spark
+    # registry looking exactly like `ts` -- and until this column existed nothing said what Spark
+    # does with one. Its wall clock is DELIBERATELY not `ts`'s: 08:00 against 12:30, so a fold
+    # over the pair cannot agree by coincidence and the direction it moved is visible in the
+    # value.
+    {"name": "ntz", "type": "timestamp_ntz"},
     {"name": "bl", "type": "boolean"},
     {"name": "bin", "type": "binary"},
     {"name": "nested", "type": "struct<arr:array<int>,m:map<string,int>,name:string>"},
@@ -236,13 +248,13 @@ ROWS = [
     ["1", "10", "2", "1.5", "2.5", "'12.34'", "'1.2345'", "'9.99'",
      "'1000000000000000000000000000000'", "'0.1'", "'abc'", "'abc'",
      "'1'", "'1.5'",
-     "'2026-08-11 12:30:00'", "'2026-08-11'", "true", "X'00'",
+     "'2026-08-11 12:30:00'", "'2026-08-11'", "'2026-08-11 08:00:00'", "true", "X'00'",
      "named_struct('arr', array(1, 2, 3), 'm', map('k', 7), 'name', 'leaf')"],
-    ["NULL"] * 19,
+    ["NULL"] * 20,
     ["-2147483648", "0", "-1", "0.0", "0.0", "'0.00'", "'0.0000'", "'0.0'",
      "'-1000000000000000000000000000000'", "'0.5'", "''", "'xyz'",
      "'0'", "'0.5'",
-     "'1970-01-01 00:00:00'", "'1970-01-01'", "false", "NULL",
+     "'1970-01-01 00:00:00'", "'1970-01-01'", "'1970-01-01 00:00:00'", "false", "NULL",
      "named_struct('arr', array(CAST(NULL AS int)), 'm', map(), 'name', CAST(NULL AS string))"],
 ]
 
@@ -3578,6 +3590,95 @@ GROUPS = {
         "DATE'today' = CAST('today' AS DATE)", "DATE'yesterday' < DATE'today'",
         "CAST(TIMESTAMP'now' AS DATE) = DATE'today'", "DATE'  EPOCH  '",
         "DATE'now UTC'", "DATE'someday'", "TIMESTAMP'epoch' = TIMESTAMP'1970-01-01'",
+    ],
+
+    # TIMESTAMP_NTZ. #349, and the group exists to MEASURE rather than to pin a rule we already
+    # have: EngineeredWood models no naive timestamp at all -- `SparkArrays.IsTemporal` matches
+    # any `TimestampType`, `BuildTimestamp` labels every result UTC, and `SparkTypeFromName`
+    # refuses TIMESTAMP_NTZ as a cast target -- so most of what follows is a declared difference
+    # until that decision is taken.
+    #
+    # ONE READING OF THE WHOLE GROUP: under the pinned UTC session zone a naive timestamp and a
+    # zoned one hold the SAME micros for the same wall clock, so almost nothing here is a wrong
+    # VALUE. What is wrong is the TYPE and the REFUSAL, which is why the group asks for both.
+    "timestamp-ntz": [
+        # --- THE FOLD, and it is ASYMMETRIC: a DATE yields NTZ, a ZONED timestamp yields zoned.
+        # That is not #311's rule relabelled -- it has a direction #311's pair does not.
+        "coalesce(ntz, dt)", "coalesce(dt, ntz)", "coalesce(ntz, ts)", "coalesce(ts, ntz)",
+        "coalesce(ntz, ntz)", "greatest(ntz, dt)", "least(ntz, dt)",
+        "greatest(ntz, ts)", "least(ntz, ts)", "if(a > 0, ntz, dt)", "if(a > 0, ntz, ts)",
+        "CASE WHEN a > 0 THEN ntz ELSE dt END", "nvl2(a, ntz, dt)", "nvl(ntz, dt)",
+        "nullif(ntz, dt)", "nullif(ntz, ts)",
+
+        # --- ...and the VALUES, which say which way it moved. `ntz` is 08:00 and `ts` is 12:30,
+        # so these disagree wherever the fold picked a different operand.
+        "CAST(coalesce(ntz, dt) AS STRING)", "CAST(coalesce(dt, ntz) AS STRING)",
+        "CAST(coalesce(ntz, ts) AS STRING)", "CAST(coalesce(ts, ntz) AS STRING)",
+        "CAST(greatest(ntz, dt) AS STRING)", "CAST(least(ntz, dt) AS STRING)",
+        "CAST(greatest(ntz, ts) AS STRING)", "CAST(least(ntz, ts) AS STRING)",
+
+        # --- WHERE THE FOLD STOPS. A string is the interesting one: `coalesce` takes it and
+        # `greatest`/`least` refuse it, in the same group.
+        "coalesce(ntz, a)", "greatest(ntz, bl)", "least(ntz, bin)",
+        "greatest(ntz, s)", "least(ntz, s)", "coalesce(ntz, s)",
+
+        # --- THE COMPARISON FAMILY: NTZ's row of the type matrix, which is the ZONED row's
+        # shape -- temporal and string only, every numeric refused.
+        "ntz = a", "ntz = b", "ntz = g", "ntz = d1", "ntz = bl", "ntz = bin",
+        "ntz = dt", "ntz = ts", "ntz = ntz", "ntz < dt", "ntz < ts", "ntz <=> ts",
+        "ntz IN (dt)", "ntz IN (ts)", "dt = ntz", "ts = ntz",
+        "ntz = s", "ntz < s", "ntz <=> s", "ntz IN (s)",
+        "ntz = '2026-08-11 08:00:00'", "ntz IN ('2026-08-11 08:00:00')",
+
+        # --- A STRING CARRYING AN OFFSET, which is the only string that can tell the two
+        # temporal targets apart under a UTC session zone. Cast to a ZONED timestamp it converts
+        # (08:00+02:00 -> 06:00Z); cast to an NTZ the zone is DROPPED and the wall clock kept
+        # (08:00). Spark casts it to the NTZ and matches; we have no naive cast at all, so we
+        # convert and do not. Every other string in this group is offset-free and so agrees by
+        # construction -- which is why the group missed this until a review asked about the
+        # neighbouring set case.
+        "ntz = '2026-08-11 08:00:00+02:00'", "ntz IN ('2026-08-11 08:00:00+02:00')",
+        # ...the same string against a ZONED operand, which is the control: converting IS right
+        # there, and we agree.
+        "ts = '2026-08-11 12:30:00+02:00'",
+        # ...and the MIXED set the review asked about. Spark resolves the ZONED target when a
+        # zoned member is present -- measured, `ntz IN (ts, '…+02:00')` is false where
+        # `ntz IN ('…+02:00')` alone is true. We resolve the naive one and still answer the same,
+        # because our cast honours the offset whichever target it was handed; the target is
+        # unobservable until there is a naive cast for it to pick.
+        "ntz IN (ts, '2026-08-11 08:00:00+02:00')",
+        "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)",
+
+        # --- THE CAST TABLE, WHICH IS NOT THE ZONED ONE. A numeric target is refused for an NTZ
+        # and allowed for a zoned timestamp -- `CAST(ts AS LONG)` is the control that says so.
+        "CAST(ntz AS STRING)", "CAST(CAST(ntz AS DATE) AS STRING)",
+        "CAST(CAST(ntz AS TIMESTAMP) AS STRING)", "CAST(ntz AS LONG)", "CAST(ntz AS INT)",
+        "CAST(ntz AS DOUBLE)", "CAST(ntz AS DECIMAL(20,0))", "CAST(ntz AS BOOLEAN)",
+        "CAST(ntz AS BINARY)", "try_cast(ntz AS INT)", "CAST(ts AS LONG)",
+
+        # --- ...and NTZ as a cast TARGET and as a typed LITERAL, both of which this library
+        # refuses outright today.
+        "CAST(CAST(ts AS TIMESTAMP_NTZ) AS STRING)", "CAST(CAST(dt AS TIMESTAMP_NTZ) AS STRING)",
+        "CAST(CAST(b AS TIMESTAMP_NTZ) AS STRING)",
+        "CAST(TIMESTAMP_NTZ'2026-08-11 12:30:00' AS STRING)",
+        # A STRING SOURCE IS ASKED AS A LITERAL, not through `s`. Either spelling of the column
+        # form -- bare or wrapped -- is a row Spark RESOLVES and then refuses at eval, since `s`
+        # holds 'abc'; we refuse it structurally instead, because TIMESTAMP_NTZ is not a target
+        # here at all. That differs in the type gate and AGREES in the eval gate, and the two
+        # share one declaration list, so there is nowhere to record it. The literal below asks
+        # the same question of a string Spark can actually cast, and differs in both.
+        #
+        # What it measures is the rule that makes a naive cast something other than the zoned one
+        # renamed: the zone the text carries is DISCARDED and the wall clock kept.
+        "CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ) AS STRING)",
+
+        # --- FUNCTIONS over an NTZ, which read the WALL CLOCK rather than an instant.
+        "year(ntz)", "month(ntz)", "day(ntz)", "hour(ntz)", "minute(ntz)", "second(ntz)",
+        "date_format(ntz, 'yyyy-MM-dd HH:mm:ss')", "ntz IS NULL", "ntz IS NOT NULL",
+
+        # --- ARITHMETIC, which yields an INTERVAL -- a type this library does not model at all,
+        # so these are recorded as the boundary rather than as something to reproduce.
+        "ntz + 1", "ntz - ts", "ntz - dt", "round(ntz, 1)",
     ],
 
     "malformed": [

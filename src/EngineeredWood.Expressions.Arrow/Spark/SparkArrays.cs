@@ -368,19 +368,25 @@ internal static class SparkArrays
     /// <summary>The Unix epoch, as the instant a Date32 counts days from.</summary>
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    /// <summary>The one timestamp type this evaluator ever produces.</summary>
+    /// <summary>The one ZONED timestamp type this evaluator ever produces.</summary>
     /// <remarks>
-    /// Microseconds in UTC, which is what <see cref="BuildTimestamp"/> builds — so a rule that
-    /// RESOLVES a timestamp must name this instance and not construct its own. A source column
+    /// Microseconds in UTC, which is what
+    /// <see cref="BuildTimestamp(DateTimeOffset?[], int)"/> builds — so a rule that
+    /// RESOLVES a zoned timestamp must name this instance and not construct its own.
+    /// <see cref="NaiveTimestamp"/> is the other half of the pair, and between them they are
+    /// still the only two timestamp types anything here produces: a source column's own type is
+    /// never passed through, only read for its zone. A source column
     /// may well carry another unit or zone (Parquet writes milliseconds happily), and a
     /// resolution that echoed the source's type back would promise a type the array it hands
     /// over does not have. #311.
     /// <para>
-    /// <b>A TIMESTAMP_NTZ source is the one case where the promise is still unkept</b>, and
-    /// knowingly: <see cref="BuildTimestamp"/> labels its result UTC whatever it read, so a fold
-    /// over two naive timestamps hands back a zoned array while resolving the naive type. That
-    /// predates #311 and is unchanged by it — <c>SparkNumericTypes.IsZonedOrDate</c> keeps the
-    /// new rule off NTZ precisely so the two stay where they were. #349.
+    /// <b>A naive timestamp has <see cref="NaiveTimestamp"/> for the same job</b>, and until #349
+    /// it did not: <see cref="BuildTimestamp(DateTimeOffset?[], int)"/> labelled every result UTC
+    /// whatever it read, so a
+    /// fold over two naive timestamps resolved <c>timestamp_ntz</c> and handed back a zoned
+    /// array. The value was never wrong — under the pinned UTC session zone a wall clock and an
+    /// instant are the same micros — but a Delta generated column writes its schema from the type
+    /// the array carries, so a naive column silently became a zoned one.
     /// </para>
     /// <para>
     /// <c>ArrowRowEvaluator</c> spells the same type out for itself when it materialises a
@@ -390,6 +396,42 @@ internal static class SparkArrays
     /// </para>
     /// </remarks>
     public static readonly TimestampType Timestamp = new(TimeUnit.Microsecond, "UTC");
+
+    /// <summary>The one NAIVE timestamp type this evaluator ever produces — Spark's TIMESTAMP_NTZ.</summary>
+    /// <remarks>
+    /// <para>
+    /// Microseconds with NO zone, which is how Delta's <c>SchemaConverter.FromDeltaPrimitive</c>
+    /// spells <c>timestamp_ntz</c> in Arrow and therefore the only shape one ever arrives in.
+    /// It exists for the reason <see cref="Timestamp"/> does: a rule that resolves a naive
+    /// timestamp must name this instance, so that the type it promises is the type
+    /// <see cref="BuildTimestamp(DateTimeOffset?[], int, TimestampType)"/> builds.
+    /// </para>
+    /// <para>
+    /// <b>The two are not interchangeable to Spark, and the corpus cannot see the difference.</b>
+    /// Measured on 4.0.3: <c>coalesce(ntz, dt)</c> is <c>timestamp_ntz</c> while
+    /// <c>coalesce(ntz, ts)</c> is a ZONED timestamp — a naive operand promotes to zoned the
+    /// moment a zoned one is present, and stays naive otherwise. Under the pinned UTC session
+    /// zone both hold the same micros for the same wall clock, so only the TYPE tells them
+    /// apart; probed under <c>America/Los_Angeles</c>, <c>CAST(ntz AS TIMESTAMP)</c> reinterprets
+    /// the wall clock in the session zone exactly as a string cast does. #349.
+    /// </para>
+    /// </remarks>
+    public static readonly TimestampType NaiveTimestamp =
+        new(TimeUnit.Microsecond, (string?)null);
+
+    /// <summary>A timestamp that CARRIES a zone, as opposed to Spark's TIMESTAMP_NTZ.</summary>
+    /// <remarks>
+    /// <b>"Clearly zoned", not "not null".</b> A timestamp carrying an empty zone string — which
+    /// the Delta converter never produces and nothing here can rule out — reads as naive, because
+    /// the conservative direction is the one that cannot silently relabel a wall clock as an
+    /// instant. #348 introduced the test and #349 moved it here, where both callers can reach it.
+    /// </remarks>
+    public static bool IsZonedTimestamp(IArrowType type) =>
+        type is TimestampType timestamp && !string.IsNullOrEmpty(timestamp.Timezone);
+
+    /// <summary>A timestamp with no zone — Spark's TIMESTAMP_NTZ.</summary>
+    public static bool IsNaiveTimestamp(IArrowType type) =>
+        type is TimestampType && !IsZonedTimestamp(type);
 
     /// <summary>The instant a temporal cell denotes, or null if the array is not temporal.</summary>
     public static DateTimeOffset? ReadInstant(IArrowArray array, int index) => array switch
@@ -524,9 +566,23 @@ internal static class SparkArrays
     }
 
     /// <summary>Builds a microsecond UTC timestamp array from instants.</summary>
-    public static IArrowArray BuildTimestamp(DateTimeOffset?[] values, int rowCount)
+    public static IArrowArray BuildTimestamp(DateTimeOffset?[] values, int rowCount) =>
+        BuildTimestamp(values, rowCount, Timestamp);
+
+    /// <summary>Builds a microsecond timestamp array from instants, at <paramref name="type"/>.</summary>
+    /// <remarks>
+    /// <b>The zone is a LABEL here and nothing else.</b> The micros written are the instants
+    /// handed in, whichever type is asked for, because under the pinned UTC session zone a naive
+    /// timestamp and a zoned one hold the same number for the same wall clock — so building a
+    /// <see cref="NaiveTimestamp"/> is the same array with a different name on it. That is
+    /// exactly the defect #349 gap 1 reported: the name was the part that was wrong. A
+    /// configurable session zone (#133) is what would make this a conversion rather than a
+    /// label, and it would have to be written then.
+    /// </remarks>
+    public static IArrowArray BuildTimestamp(
+        DateTimeOffset?[] values, int rowCount, TimestampType type)
     {
-        var builder = new TimestampArray.Builder(Timestamp);
+        var builder = new TimestampArray.Builder(type);
         for (var i = 0; i < rowCount; i++)
         {
             if (values[i] is { } instant) builder.Append(instant);

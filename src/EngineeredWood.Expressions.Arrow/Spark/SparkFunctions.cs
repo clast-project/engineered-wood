@@ -358,9 +358,26 @@ internal static class SparkFunctions
             for (var i = 0; i < rowCount; i++)
                 instants[i] = choice[i] < 0 ? null : SparkArrays.ReadInstant(sources[choice[i]], i);
 
-            return SparkArrays.IsDateType(type)
-                ? SparkArrays.BuildDate32(instants, rowCount)
-                : SparkArrays.BuildTimestamp(instants, rowCount);
+            // AT A CANONICAL INSTANCE CHOSEN BY THE ZONE, and emphatically not at `type` itself.
+            //
+            // The zone is what #349 gap 1 was about: `BuildTimestamp`'s no-zone overload labels
+            // every result UTC whatever it read, so a fold that resolved `timestamp_ntz` handed
+            // back a zoned array. The micros were the same either way; the NAME was the defect.
+            //
+            // But `type` IS NOT ALWAYS CANONICAL, which is why it is read for its zone rather
+            // than passed through. `NullIf` hands over `args[0].Data.DataType` directly and
+            // `ConditionalType` keeps a sole surviving branch's own type, so a millisecond
+            // column -- which is what Parquet writes -- arrives here as `timestamp(ms, UTC)`.
+            // Passing that on rebuilt the very promise #311 removed, one type over: measured on
+            // this branch before the fix, `coalesce(tsms)`, `coalesce(tsms, NULL)` and
+            // `nullif(tsms, ts)` all came back MILLISECOND where every other route produces
+            // microseconds. Caught on review.
+            if (SparkArrays.IsDateType(type))
+                return SparkArrays.BuildDate32(instants, rowCount);
+
+            return SparkArrays.BuildTimestamp(
+                instants, rowCount,
+                SparkArrays.IsZonedTimestamp(type) ? SparkArrays.Timestamp : SparkArrays.NaiveTimestamp);
         }
 
         if (type is Decimal128Type decimalType)
