@@ -40,13 +40,17 @@ internal static class ArrayEncoderDispatch
     /// <param name="compress">When true, eligible columns auto-route through
     /// compressing encodings in dispatch order. The order matters: each gate
     /// rejects the column if its niche doesn't fit, so cheaper / more
-    /// specialised encodings are checked first. Order:
-    /// constant > dict > alp > rle > runend > delta (only when
+    /// specialised encodings are checked first. Order, as <c>EmitCore</c> checks it:
+    /// constant > dict > FSST > pco (only with <c>preferPco</c>) > ALP > ALP-RD >
+    /// RLE > sparse > runend > delta (only with
     /// <see cref="EncodingIndices.AllowDelta"/>) > FoR > bitpacked.
     /// Constant strictly subsumes everything when the column is uniform.
-    /// Dict is StringArray-only. ALP and RLE are float-only. RunEnd handles
-    /// long-run integer columns that bitpacked alone wouldn't compress as
-    /// hard. Delta is gated on <c>stats.IsStrictSorted</c>. FoR is checked
+    /// Dict takes strings, FSST strings and binary. Pco, when preferred, takes the numeric
+    /// columns ahead of the format-specific chain. ALP, ALP-RD and RLE are
+    /// float-only. Sparse takes columns dominated by a single value.
+    /// RunEnd handles long-run columns that bitpacked alone wouldn't compress
+    /// as hard. Delta takes non-null unsigned columns of at least 1024 rows
+    /// whose within-lane deltas its probe finds narrow. FoR is checked
     /// before plain bitpacked because it strictly subsumes bitpacked for
     /// columns where it applies (FoR with min=0 would be identical, but we
     /// only enable FoR when min != 0 or signed-with-negatives).</param>
