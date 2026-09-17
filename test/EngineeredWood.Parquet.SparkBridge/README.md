@@ -32,12 +32,16 @@ turning it off would make Spark agree with everyone else and report nothing.
 
 ## Setup
 
-Needs `pyspark`, a JDK, and on Windows the same Hadoop `winutils.exe` + `hadoop.dll` the Delta
-tier-3 tests need. See `doc/running-tests.md`, which documents all of it.
+Needs `pyspark` **and `pyarrow`**, a JDK, and on Windows the same Hadoop `winutils.exe` +
+`hadoop.dll` the Delta tier-3 tests need. See `doc/running-tests.md`, which documents all of it.
 
 ```console
-pip install pyspark
+pip install pyspark pyarrow
 ```
+
+`pyspark` does not require `pyarrow`, and the read path needs it twice — for `toArrow()` and for
+the Arrow IPC output. `info` probes both, so a half-installed environment reports itself at
+configuration time rather than dying on the first read.
 
 Declare it to Parquity through a TOML file:
 
@@ -73,11 +77,34 @@ parquity check cases/floating-point.case.json --out check-run ^
 `cases/floating-point.case.json` is here because of the second half of #274: #269 was invisible
 partly because no schema in reach had a floating-point column in it. That case carries `float32` and
 `float64` through the values that break naive encoders — a negative zero, both denormal minimums,
-`2^24 + 1` and `2^53 + 1`, and both maximums.
+both maximums, and the pairs that **bracket** the precision limit: `2^24` beside `2^24 + 2` for
+`float32`, `2^53` beside `2^53 + 2` for `float64`.
+
+> The brackets are deliberate. `2^24 + 1` and `2^53 + 1` are not representable, and a JSON case
+> cannot carry them: Parquity parses finite JSON numbers through Python `float`, so
+> `9007199254740993.0` has already become `9007199254740992.0` before any writer runs. A fixture
+> written that way tests the boundary it names only in the comment.
 
 `check` and `fuzz` work. **`scan` does not**: it refuses external engines outright with
 `ENGINE_CAPABILITY_ERROR`. That is the right trade here — `check` and `fuzz` are where our own
 output is under test, and `scan` is for reading a corpus we did not write.
+
+### What it can and cannot be asked
+
+Spark has **one** timestamp type, at microseconds, and normalizes every Parquet timestamp into it.
+The bridge returns Spark's schema, so a case declaring anything else compares as a mismatch that is
+Spark's type system rather than a defect in the file. Measured through `parquity check`:
+
+| case type | result |
+|---|---|
+| `date32` | fine |
+| `timestamp[us]` | fine |
+| `timestamp[ms]` | `SCHEMA_MISMATCH` — *expected timestamp[ms, tz=UTC], got timestamp[us, tz=UTC]* |
+| `timestamp[ns]` | `READ_ERROR`, and a **real** one — Spark refuses nanoseconds with `PARQUET_TYPE_ILLEGAL` |
+
+Casting Spark's output back to the file's schema would make the third row go away and would launder
+exactly the evidence this exists to collect, so the limitation is documented rather than hidden.
+The fourth row is the tool working: a Spark user cannot read that file at all.
 
 ## Why there is a server
 
@@ -98,6 +125,17 @@ socket rather than stdin because there is no parent process here to hold a pipe 
 The server exits after 30 minutes idle so a fuzz run does not leave a JVM behind for the day, and
 `spark_parquet_bridge.py stop` ends it now. `EW_SPARK_BRIDGE_STATE` points a second checkout — or a
 second Spark version — at a server of its own.
+
+Verified to persist **across separate `parquity check` invocations**, which is the thing that
+matters and not merely across two calls from a shell: a cold run is 7.3 s and the next is 1.1 s.
+Parquity launches a bridge with a plain `subprocess.run`, so the server is not tied to the client's
+lifetime. If you drive Parquity from something that *does* put its children in a kill-on-close job,
+the server will not survive and every read pays cold start — slower, never wrong.
+
+The endpoint file holds a bearer token that authorizes a read, so the state directory is created
+`0700` and the file `0600` — `chmod`-ed even when the directory already exists, since one left
+behind by an earlier run is the case that would otherwise stay open. On Windows the per-user temp
+directory is already private and the modes are a no-op.
 
 ## Checking that it still catches things
 

@@ -34,6 +34,20 @@ because there is no parent process here to hold the pipe open.
     read --parquet <path> --arrow <path>   -- through the server
     stop                                   -- shuts the server down, for scripts and CI
 
+WHAT IT CAN AND CANNOT BE ASKED, measured against `parquity check`. Spark has ONE timestamp type,
+at microseconds, and normalizes every Parquet timestamp into it -- so a case declaring anything
+else compares as a SCHEMA_MISMATCH that is Spark's type system rather than a defect in the file:
+
+    case type          result
+    date32             fine
+    timestamp[us]      fine
+    timestamp[ms]      SCHEMA_MISMATCH -- "expected timestamp[ms, tz=UTC], got timestamp[us, ...]"
+    timestamp[ns]      READ_ERROR, and a REAL one: Spark refuses nanosecond timestamps outright
+                       with PARQUET_TYPE_ILLEGAL, which is consumer risk worth knowing about
+
+The output is Spark's schema, deliberately. Casting it back to the file's would launder exactly
+the evidence this exists to collect, so the limitation is documented rather than hidden.
+
 EXIT CODES ARE THE CONTRACT, as in the EngineeredWood bridge beside this one: 0 succeeded, 1 is a
 failure of the implementation under test and is recorded as evidence, 2 is a request this bridge
 could not understand or serve and must stop the run instead of being filed as a Parquet defect.
@@ -79,14 +93,28 @@ sys.stdout = sys.stderr
 
 
 def state_directory() -> Path:
-    """Where the client and server rendezvous.
+    """Where the client and server rendezvous, readable only by this account.
 
     Under the system temp directory by default so that nothing is left in the repository, and
     overridable so that two checkouts -- or two Spark versions -- do not share one server.
+
+    THE MODE IS NOT DECORATION. The endpoint file holds a bearer token that authorizes a `read`,
+    and a read makes a long-lived Spark process open a path this account can reach and write it
+    somewhere the caller chooses. On a shared host with the usual 755/644 defaults that is a
+    capability any other local user could pick up out of /tmp. `chmod` is applied even when the
+    directory already exists, because a directory left behind by an earlier, laxer run is exactly
+    the case that would otherwise stay open.
     """
     configured = os.environ.get("EW_SPARK_BRIDGE_STATE")
     root = Path(configured) if configured else Path(tempfile.gettempdir()) / "parquity-spark-bridge"
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        # Windows has no POSIX mode, and its per-user temp directory is already private.
+        pass
+
     return root
 
 
@@ -133,6 +161,18 @@ def info() -> int:
         import pyspark
     except ImportError as error:
         raise BridgeRejection("PySparkMissing", f"pyspark could not be imported: {error}") from error
+
+    # PYARROW TOO, though nothing here uses it. The read path needs it twice -- `toArrow()` and
+    # the Arrow IPC output -- and pyspark does not require it, so `pip install pyspark` alone
+    # leaves a bridge that probes as available and then dies on the first read. A probe that only
+    # checks half its dependencies is a probe that reports the wrong thing.
+    try:
+        import pyarrow  # noqa: F401 - probed, not used here.
+    except ImportError as error:
+        raise BridgeRejection(
+            "PyArrowMissing",
+            f"pyarrow is needed to return a table and could not be imported: {error}",
+        ) from error
 
     emit(
         {
@@ -299,8 +339,22 @@ def serve() -> int:
                     answer(connection, {"status": "OK"})
                     return SUCCESS
                 elif operation == "read":
-                    session = session or open_session()
-                    answer(connection, serve_read(session, request))
+                    # EVERY FAILURE ANSWERS. The session is opened lazily -- the endpoint is
+                    # published and pings are served before Spark exists -- so a missing JDK or
+                    # an unusable Hadoop setup surfaces HERE, on the first read, long after the
+                    # probe said the bridge was available. Letting that escape would kill the
+                    # server mid-request and leave the client reading an empty socket, which it
+                    # would report as a crashed bridge rather than as the setup problem it is.
+                    try:
+                        session = session or open_session()
+                        answer(connection, serve_read(session, request))
+                    except Exception as error:  # noqa: BLE001 - the loop must outlive any request.
+                        session = None
+                        answer(connection, {
+                            "status": "REJECTED",
+                            "kind": "SparkUnavailable",
+                            "detail": f"the Spark session could not serve the read: {error}"[:2000],
+                        })
                 else:
                     answer(connection, {"status": "REJECTED", "kind": "UsageError",
                                         "detail": f"unknown server operation: {operation!r}"})
@@ -317,7 +371,13 @@ def publish_endpoint(port: int, token: str) -> None:
     """Writes the endpoint atomically, so a client never reads a half-written one."""
     target = endpoint_file()
     staging = target.with_suffix(".tmp")
-    staging.write_text(json.dumps({"port": port, "token": token}), encoding="utf-8")
+
+    # Opened 0600 rather than written and then chmod-ed: between the two there is a window where
+    # the token is on disk and readable, and the token is the whole of the authorization.
+    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"port": port, "token": token}))
+
     os.replace(staging, target)
 
 

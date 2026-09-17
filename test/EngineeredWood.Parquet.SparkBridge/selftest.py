@@ -8,8 +8,9 @@ green tick. So this asserts BOTH directions.
 
     1. `info` answers without starting a JVM.
     2. A plain Parquet file reads back, byte for byte equal to what was written.
-    3. A BYTE_STREAM_SPLIT file is REPORTED AS A FAILURE, naming the encoding and the vectorized
-       reader -- which is the shape of #269, the defect Parquity's matrix could not see.
+    3. A BYTE_STREAM_SPLIT file is REPORTED AS A FAILURE -- in BOTH page versions, since
+       EngineeredWood's own default was V2 when #269 shipped -- naming the encoding and the
+       vectorized reader, which is the shape of the defect Parquity's matrix could not see.
 
 (3) is the one that matters. #269 shipped because every engine in the matrix could read what we
 wrote; the bridge is only worth having while it still disagrees with them here.
@@ -70,17 +71,28 @@ def main() -> int:
         )
 
         plain = root / "plain.parquet"
-        split = root / "byte-stream-split.parquet"
         pq.write_table(table, plain, use_dictionary=False)
-        pq.write_table(
-            table, split, use_byte_stream_split=["f32", "f64"], use_dictionary=False
-        )
 
-        # The fixture has to BE what it claims, or (3) proves nothing.
-        encodings = pq.ParquetFile(split).metadata.row_group(0).column(0).encodings
-        print(f"fixture encodings: {encodings}")
-        if "BYTE_STREAM_SPLIT" not in encodings:
-            failures.append(f"the split fixture carries no BYTE_STREAM_SPLIT: {encodings}")
+        # BOTH PAGE VERSIONS. EngineeredWood's own default was V2 when #269 shipped, so a fixture
+        # that only built V1 would be testing the neighbouring case; and the two were measured to
+        # fail for the same reason rather than as a V1/V2 split, which is worth keeping asserted.
+        splits = {}
+        for version in ("1.0", "2.0"):
+            path = root / f"byte-stream-split-v{version[0]}.parquet"
+            pq.write_table(
+                table,
+                path,
+                use_byte_stream_split=["f32", "f64"],
+                use_dictionary=False,
+                data_page_version=version,
+            )
+            splits[version] = path
+
+            # The fixture has to BE what it claims, or (3) proves nothing.
+            encodings = pq.ParquetFile(path).metadata.row_group(0).column(0).encodings
+            print(f"fixture v{version[0]} encodings: {encodings}")
+            if "BYTE_STREAM_SPLIT" not in encodings:
+                failures.append(f"the v{version[0]} fixture carries no BYTE_STREAM_SPLIT: {encodings}")
 
         # 2 -- a plain file reads, and reads correctly.
         arrow = root / "plain.arrow"
@@ -96,19 +108,21 @@ def main() -> int:
             else:
                 print(f"plain: OK, {read_back.num_rows} rows round-tripped through Spark")
 
-        # 3 -- the one that matters.
-        outcome = run("read", "--parquet", str(split), "--arrow", str(root / "split.arrow"))
-        if outcome.returncode != 1:
-            failures.append(
-                "a BYTE_STREAM_SPLIT file was NOT reported as a failure "
-                f"(exit {outcome.returncode}) -- the bridge has stopped catching #269's class"
-            )
-        else:
+        # 3 -- the one that matters, in both page versions.
+        for version, path in splits.items():
+            outcome = run("read", "--parquet", str(path), "--arrow", str(root / f"split{version[0]}.arrow"))
+            if outcome.returncode != 1:
+                failures.append(
+                    f"a v{version[0]} BYTE_STREAM_SPLIT file was NOT reported as a failure "
+                    f"(exit {outcome.returncode}) -- the bridge has stopped catching #269's class"
+                )
+                continue
+
             evidence = json.loads(outcome.stdout)
             detail = str(evidence.get("detail", ""))
-            print(f"byte-stream-split: reported {evidence.get('kind')}: {detail}")
+            print(f"byte-stream-split v{version[0]}: reported {evidence.get('kind')}: {detail}")
             if "BYTE_STREAM_SPLIT" not in detail:
-                failures.append(f"the evidence does not name the encoding: {detail}")
+                failures.append(f"the v{version[0]} evidence does not name the encoding: {detail}")
             if "Vectorized" not in detail:
                 failures.append(
                     "the evidence does not name the vectorized reader, which is what separates "
