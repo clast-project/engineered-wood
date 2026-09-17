@@ -780,6 +780,13 @@ internal static class SparkArrays
         // Spark's name for the type of a bare NULL. Arrow calls it `null`, which would read as
         // "no type at all" in an error message rather than as the type it is. #293.
         NullType => "VOID",
+
+        // Spark has ONE date type and Arrow has two widths of it, so the fallback below spelled
+        // these "DATE32" and "DATE64" -- a type name no Spark user has ever seen. It reached every
+        // message this feeds, not only the cast refusal that found it: a date compared with a
+        // number is BINARY_OP_DIFF_TYPES, and it named the operand's type. #332.
+        Date32Type or Date64Type => "DATE",
+
         _ => type.Name.ToUpperInvariant(),
     };
 

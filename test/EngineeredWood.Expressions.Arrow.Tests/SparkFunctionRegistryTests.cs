@@ -1936,13 +1936,137 @@ public sealed class SparkFunctionRegistryTests
         Assert.Equal(Straddling, back.GetTimestamp(0)!.Value);
     }
 
-    [Fact]
-    public void ADateHasNoIntegerFormBecauseSparkRefusesOne()
+    /// <summary>
+    /// A DATE has no numeric reading: ANSI refuses the cast and the legacy dialect answers null.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #332, and it was wrong in BOTH directions at once. The integral targets refused — with a
+    /// <c>NotSupportedException</c>, in both dialects, where legacy Spark answers null — while the
+    /// floating and decimal targets had no rule at all and handed back epoch SECONDS for a value
+    /// Spark declines to give a number for. One source type, refused down one branch of
+    /// <c>Cast</c> and converted down another.
+    /// </para>
+    /// <para>
+    /// Measured on Spark 4.0.1 / JDK 17 with <c>storeAssignmentPolicy=ANSI</c> over the corpus's
+    /// <c>dt</c> at 2026-08-11: every numeric target is <c>CAST_WITH_FUNC_SUGGESTION</c> under
+    /// ANSI and null under legacy.
+    /// </para>
+    /// <para>
+    /// In a CHECK constraint the old answer was fail-open in the usual way:
+    /// <c>CAST(dt AS DOUBLE) &gt; 0</c> was true here, null in a legacy Spark session, and a
+    /// refused write in an ANSI one.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("TINYINT")]
+    [InlineData("SMALLINT")]
+    [InlineData("INT")]
+    [InlineData("BIGINT")]
+    [InlineData("FLOAT")]
+    [InlineData("DOUBLE")]
+    [InlineData("DECIMAL(10,2)")]
+    public void ADateHasNoNumericReading(string target)
     {
-        // Measured: CAST(DATE'…' AS LONG) is an error, unlike the timestamp case.
+        var batch = Batch(("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))));
+        var sql = $"CAST(dt AS {target})";
+
+        Assert.Equal(
+            "DATATYPE_MISMATCH.CAST_WITH_FUNC_SUGGESTION",
+            Assert.Throws<ExpressionAnalysisException>(() => Eval(Ansi, sql, batch)).ErrorClass);
+
+        // The legacy dialect answers, and what it answers is null -- not epoch seconds.
+        var legacy = Eval(Legacy, sql, batch);
+        Assert.Equal(1, legacy.Length);
+        Assert.True(legacy.IsNull(0), $"{sql} under the legacy dialect");
+
+        // try_cast selects the ANSI TABLE under both dialects, so it refuses rather than nulls.
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            Assert.Equal(
+                "DATATYPE_MISMATCH.CAST_WITH_FUNC_SUGGESTION",
+                Assert.Throws<ExpressionAnalysisException>(
+                    () => Eval(registry, $"try_cast(dt AS {target})", batch)).ErrorClass);
+        }
+    }
+
+    /// <summary>
+    /// The refusal is a property of the TYPES, so it does not depend on what the rows hold.
+    /// </summary>
+    /// <remarks>
+    /// The soundness half of #332, described in #286. The old refusal was thrown from inside the
+    /// row loop after reading a value, so it only fired on a row that actually held a date:
+    /// measured, <c>CAST(nullif(dt, dt) AS INT)</c> answered null while <c>CAST(dt AS INT)</c>
+    /// threw, and a batch of all-null dates would have converted quietly. The same expression must
+    /// refuse or answer for the same reason every time, whatever arrives in the batch.
+    /// </remarks>
+    [Fact]
+    public void TheRefusalDoesNotDependOnWhatTheRowsHold()
+    {
         var batch = Batch(("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))));
 
-        Assert.Throws<NotSupportedException>(() => Eval(Ansi, "CAST(dt AS BIGINT)", batch));
+        foreach (var sql in new[] { "CAST(dt AS INT)", "CAST(nullif(dt, dt) AS INT)" })
+        {
+            Assert.Equal(
+                "DATATYPE_MISMATCH.CAST_WITH_FUNC_SUGGESTION",
+                Assert.Throws<ExpressionAnalysisException>(() => Eval(Ansi, sql, batch)).ErrorClass);
+        }
+    }
+
+    /// <summary>
+    /// A diagnostic names a date the way Spark spells it, which is DATE and not DATE32.
+    /// </summary>
+    /// <remarks>
+    /// Spark has one date type and Arrow has two widths of it, so <c>SparkArrays.Describe</c>'s
+    /// fallback — <c>type.Name.ToUpperInvariant()</c> — spelled these <c>DATE32</c> and
+    /// <c>DATE64</c>, a type name no Spark user has ever seen. Found on #332's new cast refusal,
+    /// but it was never confined to it: <c>Describe</c> feeds a dozen message sites, and a date
+    /// compared with a number is a <c>BINARY_OP_DIFF_TYPES</c> that named the operand's type.
+    /// <para>
+    /// A TIMESTAMP already spelled itself correctly. That a NAIVE timestamp also spells itself
+    /// <c>TIMESTAMP</c> where Spark says <c>TIMESTAMP_NTZ</c> is a separate question, and it is
+    /// #349's.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ADiagnosticNamesADateTheWaySparkSpellsIt()
+    {
+        var batch = Batch(
+            ("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))),
+            ("a", Ints(1)));
+
+        // The cast refusal this issue added.
+        var cast = Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(Ansi, "CAST(dt AS INT)", batch));
+
+        Assert.Contains("\"DATE\"", cast.Message);
+        Assert.DoesNotContain("DATE32", cast.Message);
+
+        // And the comparison refusal, which had the same spelling and predates it.
+        var comparison = Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(Ansi, "dt < a", batch));
+
+        Assert.Contains("\"DATE\"", comparison.Message);
+        Assert.DoesNotContain("DATE32", comparison.Message);
+    }
+
+    /// <summary>A TIMESTAMP still reads as epoch seconds, which is the control for all of it.</summary>
+    /// <remarks>
+    /// The two types share a family everywhere else in the registry and part company on exactly
+    /// this question, so a rule that caught the timestamp too would be the same defect mirrored.
+    /// </remarks>
+    [Theory]
+    [InlineData("BIGINT")]
+    [InlineData("DOUBLE")]
+    [InlineData("DECIMAL(20,2)")]
+    public void ATimestampStillHasANumericReading(string target)
+    {
+        var batch = Batch(("ts", Timestamps(Straddling)));
+
+        var result = Eval(Ansi, $"CAST(ts AS {target})", batch);
+
+        Assert.Equal(1, result.Length);
+        Assert.False(result.IsNull(0), target);
     }
 
     [Fact]

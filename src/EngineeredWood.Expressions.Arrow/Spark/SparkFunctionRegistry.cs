@@ -1200,12 +1200,57 @@ public sealed class SparkFunctionRegistry
 
     /// <inheritdoc />
     /// <remarks>
-    /// <b>Not implemented yet, and null is the interface's "nothing refused".</b> The cast table
-    /// is the third slice of #286 — 17 ANSI rows and 25 legacy ones — and it lands with #332,
-    /// whose two directions are rows of it. Answering null here leaves every cast exactly as it
-    /// is rather than half-refusing a table that has not been written.
+    /// <para>
+    /// <b>A DATE has no numeric reading in Spark, in either dialect.</b> ANSI refuses the cast and
+    /// the legacy dialect answers null — it does not convert. Measured on 4.0.1 with
+    /// <c>storeAssignmentPolicy=ANSI</c> over the corpus's <c>dt</c>: <c>CAST(dt AS INT)</c>,
+    /// <c>BIGINT</c>, <c>FLOAT</c>, <c>DOUBLE</c> and <c>DECIMAL(10,2)</c> are all
+    /// <c>CAST_WITH_FUNC_SUGGESTION</c> under ANSI and all null under legacy. #332.
+    /// </para>
+    /// <para>
+    /// <b>A TIMESTAMP is not a DATE here.</b> It casts to epoch seconds and always has; the two
+    /// share a family everywhere else in this registry and part company on exactly this question.
+    /// </para>
+    /// <para>
+    /// The other direction is untouched: a number casts to a DATE, and that is <c>CastToDate</c>.
+    /// </para>
+    /// <para>
+    /// <b>One rule, not the table.</b> #286's cast table is 17 ANSI rows and 25 legacy ones; this
+    /// is the pair #332 measured and nothing else. Every other cast is still accepted here, which
+    /// leaves it exactly as it was rather than half-refusing a table that has not been written.
+    /// </para>
     /// </remarks>
-    public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast) => null;
+    public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast)
+    {
+        // `tryCast` selects the TABLE, not the outcome: try_cast uses the ANSI table under both
+        // dialects, so an ANSI-only refusal is a legacy try_cast refusal too. Under a legacy
+        // ordinary cast there is no refusal to report -- the answer is a null, which is a value
+        // and not a diagnostic.
+        if (!tryCast && !_options.Ansi)
+            return null;
+
+        if (!RefusesNumericReading(source, target))
+            return null;
+
+        return new AnalysisDiagnostic(
+            "DATATYPE_MISMATCH.CAST_WITH_FUNC_SUGGESTION",
+            $"cannot cast \"{SparkArrays.Describe(source)}\" to \"{SparkArrays.Describe(target)}\". "
+            + "To convert values from DATE to a number, you can use the function `unix_date` instead.");
+    }
+
+    /// <summary>Whether this is the DATE-to-number pair that has no reading in either dialect.</summary>
+    private static bool RefusesNumericReading(IArrowType source, IArrowType target) =>
+        SparkArrays.IsDateType(source) && IsNumericTarget(target);
+
+    /// <summary>Every target the rule covers, which is every numeric one.</summary>
+    /// <remarks>
+    /// Written out rather than asked of <see cref="SparkNumericTypes.IsNumeric"/> so that it
+    /// matches the dispatch in <see cref="Cast"/> exactly: the three branches that would otherwise
+    /// convert a date are the integral one, the floating one and the decimal one, and a rule that
+    /// covered a different set from the branches it guards would leave one of them converting.
+    /// </remarks>
+    private static bool IsNumericTarget(IArrowType target) =>
+        SparkNumericTypes.IsIntegral(target) || target is DoubleType or FloatType or Decimal128Type;
 
     /// <summary>Whether two operands may be compared at all under this dialect.</summary>
     private bool Comparable(ComparisonOperator op, IArrowType left, IArrowType right)
@@ -1565,6 +1610,22 @@ public sealed class SparkFunctionRegistry
         if (source.Data.DataType is NullType)
             return ArrowCompute.MakeNullArray(target, rowCount);
 
+        // A PROPERTY OF THE TWO TYPES, ASKED ONCE AND BEFORE THE ROW LOOP. The refusal this
+        // replaces was thrown from inside CastToIntegral after reading a value, which made the
+        // same expression refuse or answer depending on the batch: measured,
+        // `CAST(nullif(dt, dt) AS INT)` answered null where `CAST(dt AS INT)` threw. #332, #286.
+        //
+        // `legacy` is what separates the two outcomes, and it is exactly the right flag: it is
+        // false for try_cast as well as for an ANSI cast, which is the ANSI table applying in
+        // both -- see the `try_cast` case in Invoke for why one flag could not always do this.
+        if (RefusesNumericReading(source.Data.DataType, target))
+        {
+            if (!legacy)
+                throw new ExpressionAnalysisException(CheckCast(source.Data.DataType, target, tryCast: true)!);
+
+            return ArrowCompute.MakeNullArray(target, rowCount);
+        }
+
         if (target is Decimal128Type decimalTarget)
             return CastToDecimal(source, decimalTarget, rowCount, raising);
 
@@ -1776,11 +1837,6 @@ public sealed class SparkFunctionRegistry
             var value = SparkArrays.ReadForCast(source, i);
             if (value is null)
                 continue;
-
-            // Spark refuses a date-to-integer cast outright, while a timestamp becomes epoch
-            // seconds. Measured: CAST(DATE'…' AS LONG) is an error.
-            if (value.Value.IsDate)
-                throw new NotSupportedException($"cast from DATE to {described} is not allowed");
 
             if (!value.Value.IsNumeric)
             {
