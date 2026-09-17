@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Vortex.Format;
 
 namespace EngineeredWood.Vortex.Encodings;
@@ -58,7 +59,9 @@ internal static class ChunkedArrayDecoder
 
         return chunks.Count switch
         {
-            0 => ArrayDecoder.DecodeNode(node.Child(1), serialized, arraySpecs, expectedType, 0),
+            // No chunk to decode (upstream writes an empty chunked array as just its offsets, [0])
+            // or only empty ones: either way the result is a typed empty array.
+            0 => ArrowCompute.MakeNullArray(expectedType, 0),
             1 => chunks[0],
             _ => ArrowArrayConcatenator.Concatenate(chunks),
         };

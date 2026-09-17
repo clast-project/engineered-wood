@@ -152,8 +152,8 @@ public class VortexUpstreamCompatTests
             actual.Add(batch);
 
         Assert.Equal(
-            expectedSchema.FieldsList.Select(f => $"{f.Name}: {ArrowValues.TypeName(f.DataType)}{(f.IsNullable ? "?" : "")}"),
-            ew.Schema.FieldsList.Select(f => $"{f.Name}: {ArrowValues.TypeName(f.DataType)}{(f.IsNullable ? "?" : "")}"));
+            expectedSchema.FieldsList.Select(f => $"{f.Name}: {ArrowValues.FieldName(f)}"),
+            ew.Schema.FieldsList.Select(f => $"{f.Name}: {ArrowValues.FieldName(f)}"));
         Assert.Equal(expected.Sum(b => (long)b.Length), actual.Sum(b => (long)b.Length));
 
         for (int c = 0; c < expectedSchema.FieldsList.Count; c++)

@@ -18,18 +18,21 @@ namespace EngineeredWood.Vortex.Tests.TestHelpers;
 /// </summary>
 internal static class ArrowValues
 {
-    /// <summary>A canonical logical type name, for comparing schemas.</summary>
+    /// <summary>
+    /// A canonical logical type name, for comparing schemas. Nested fields carry their
+    /// nullability (<c>?</c>), and a map its key sortedness, since both are part of the type.
+    /// </summary>
     public static string TypeName(IArrowType type) => type switch
     {
         StringType or LargeStringType or StringViewType => "utf8",
         BinaryType or LargeBinaryType or BinaryViewType => "binary",
-        ListType l => $"list<{TypeName(l.ValueDataType)}>",
-        LargeListType l => $"list<{TypeName(l.ValueDataType)}>",
-        ListViewType l => $"list<{TypeName(l.ValueDataType)}>",
-        LargeListViewType l => $"list<{TypeName(l.ValueDataType)}>",
-        FixedSizeListType f => $"fixed_list<{TypeName(f.ValueDataType)}>[{f.ListSize}]",
-        MapType m => $"map<{TypeName(m.KeyField.DataType)},{TypeName(m.ValueField.DataType)}>",
-        StructType s => "struct<" + string.Join(",", s.Fields.Select(f => $"{f.Name}:{TypeName(f.DataType)}{(f.IsNullable ? "?" : "")}")) + ">",
+        MapType m => $"map<{FieldName(m.KeyField)},{FieldName(m.ValueField)}>{(m.KeySorted ? "(sorted)" : "")}",
+        ListType l => $"list<{FieldName(l.ValueField)}>",
+        LargeListType l => $"list<{FieldName(l.ValueField)}>",
+        ListViewType l => $"list<{FieldName(l.ValueField)}>",
+        LargeListViewType l => $"list<{FieldName(l.ValueField)}>",
+        FixedSizeListType f => $"fixed_list<{FieldName(f.ValueField)}>[{f.ListSize}]",
+        StructType s => "struct<" + string.Join(",", s.Fields.Select(f => $"{f.Name}:{FieldName(f)}")) + ">",
         DictionaryType d => TypeName(d.ValueType),
         Decimal32Type d => $"decimal({d.Precision},{d.Scale})",
         Decimal64Type d => $"decimal({d.Precision},{d.Scale})",
@@ -42,6 +45,9 @@ internal static class ArrowValues
         Time64Type t => $"time({t.Unit})",
         _ => type.Name,
     };
+
+    /// <summary>A field's canonical type, marked <c>?</c> when nullable.</summary>
+    public static string FieldName(Field field) => TypeName(field.DataType) + (field.IsNullable ? "?" : "");
 
     /// <summary>The canonical text of <paramref name="array"/>[<paramref name="index"/>].</summary>
     public static string Render(IArrowArray array, int index)

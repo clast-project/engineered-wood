@@ -525,7 +525,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 | **Core** | 452 |
 | **DeltaLake.Table** | 922 (109 of them interop) — re-measured 2026-08-22 |
 | **DeltaLake** | 484 |
-| **Vortex** | 1167 (737 of them upstream fixtures) — re-measured 2026-09-17 |
+| **Vortex** | 1175 (737 of them upstream fixtures) — re-measured 2026-09-17 |
 | **Avro** | 301 |
 | **Iceberg** | 243 |
 | **ORC** | 237 |

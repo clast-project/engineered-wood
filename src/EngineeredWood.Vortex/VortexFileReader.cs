@@ -896,10 +896,8 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
                 {
                     var rows = await ReadRowsChunkAsync(field.Rows, chunkIndex, cancellationToken)
                         .ConfigureAwait(false);
-                    var child = rows.Fields[field.FieldIndex];
-                    return rows.Offset == 0 && child.Length == rows.Length
-                        ? child
-                        : Apache.Arrow.ArrowArrayFactory.Slice(child, rows.Offset, rows.Length);
+                    // StructArray.Fields already applies the struct's own offset and length.
+                    return rows.Fields[field.FieldIndex];
                 }
             default:
                 throw new NotSupportedException(

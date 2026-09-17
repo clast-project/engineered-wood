@@ -11,17 +11,18 @@ using EngineeredWood.Vortex.Format;
 namespace EngineeredWood.Vortex.Encodings;
 
 /// <summary>
-/// Decoder for <c>vortex.runend</c>: run-length-encoded primitive arrays.
+/// Decoder for <c>vortex.runend</c>: run-length-encoded arrays of any type.
 /// Two children: <c>ends</c> (monotonic run-end positions) and <c>values</c>
 /// (one value per run). For row <c>i</c>, find the smallest <c>j</c> where
 /// <c>ends[j] &gt; i</c>, output <c>values[j]</c>.
 ///
 /// <para>Metadata proto <c>RunEndMetadata { ends_ptype, num_runs, offset }</c>.
 /// We use <c>ends_ptype</c> to resolve the Arrow type for the ends child;
-/// <c>offset</c> is for slicing (currently always 0 for top-level use).</para>
+/// <c>offset</c> is for slicing, and a non-zero one is refused.</para>
 ///
-/// <para>Phase 1 scope: integer values only. Float / bool / string run-end
-/// arrays land alongside fixtures.</para>
+/// <para>Integer and float values expand directly, carrying the values' validity over their
+/// runs; every other type (strings, booleans, decimals, nested…) is gathered with
+/// <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>, one index per row.</para>
 /// </summary>
 internal static class RunEndArrayDecoder
 {
