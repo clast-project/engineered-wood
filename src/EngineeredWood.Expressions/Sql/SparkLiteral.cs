@@ -515,19 +515,21 @@ internal static class SparkLiteral
     }
 
     /// <summary>
-    /// Reads a float literal, which needs no such help.
+    /// Reads a float literal, rounded once from its text.
     /// </summary>
     /// <remarks>
-    /// A float's shortest form is nine digits and .NET Framework's parser is good to about
-    /// fifteen, so it has the room the double path does not: measured over 100,000 random floats
-    /// rendered at six, seven, eight and nine digits, net472 read every one of them the same as
-    /// .NET Core. #350 is a double-only defect.
+    /// Through <see cref="SparkDoubleText.TryParseSingle(string, out float)"/>. A float's SHORTEST
+    /// form is nine digits, and .NET Framework reads every such form right -- measured over
+    /// 100,000 random floats at six to nine digits -- which is why #350 left this alone. A literal
+    /// is not limited to the shortest form, though: beside a rounding tie, net472's parse was
+    /// wrong on a third of 8,400 longer spellings where .NET Core's was right on all of them.
+    /// #372.
     /// </remarks>
     private static float ParseFloat(string text, string sql, int position)
     {
         RefuseOutOfRange(text, MaxFloatDigits, MaxFloatExponent, "a float", sql, position);
 
-        return float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+        return SparkDoubleText.TryParseSingle(text, out var value)
             ? value
             : throw Overflow(text, "a float", sql, position);
     }

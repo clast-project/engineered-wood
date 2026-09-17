@@ -178,7 +178,11 @@ LEGACY_GROUPS = (
     "substring-arguments",
     # #299. THE LEGACY COLUMN IS THE MEASUREMENT: an integral against a float resolves FLOAT there
     # and DOUBLE under ANSI, at every site that unifies, and one harvest would record half of it.
-    "integral-float")
+    "integral-float",
+    # #372. The rounding is dialect-independent -- measured over 8,400 strings and 2,253 decimals
+    # under both -- and the group is asked twice anyway, because the legacy registry has its own
+    # cast path and nothing else would record that it rounds the same way.
+    "float-rounding")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3411,6 +3415,51 @@ GROUPS = {
         "CAST(1152921573326323713 + CAST(0 AS FLOAT) AS DOUBLE)",
         "CAST(coalesce(1152921573326323713, CAST(0 AS FLOAT)) AS DOUBLE)",
         "1152921573326323713 = CAST(1152921642045800448 AS FLOAT)",
+    ],
+
+    # REACHING A FLOAT IN ONE ROUNDING STEP. #372. Spark reads text with Float.parseFloat and a
+    # decimal with BigDecimal.floatValue, both correctly rounded; a double read and then narrowed
+    # rounds twice, and lands on the float next door whenever the first rounding hits a tie the
+    # value was not on. 1 + 2^-24 is the float above 1, and the text below is one hair above the
+    # midpoint between them. Everything is read back as a DOUBLE so the float's bits are exact.
+    "float-rounding": [
+        # --- THE ISSUE AS FILED, with its controls.
+        "CAST(CAST('1.00000005960464477539062500001' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(CAST('1.00000005960464477539062500001' AS DECIMAL(38,29)) AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(1.00000005960464477539062500001BD AS FLOAT) AS DOUBLE)",
+        "CAST(1.00000005960464477539062500001F AS DOUBLE)",
+        "CAST(CAST(CAST('1.00000005960464477539062500001' AS DOUBLE) AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('1.000000059604644775390625' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('0.99999999999999999999999999999' AS FLOAT) AS DOUBLE)",
+
+        # --- EVERY SPELLING OF THE TEXT: padded, signed, Java-suffixed with either letter.
+        "CAST(CAST(' 1.00000005960464477539062500001 ' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('-1.00000005960464477539062500001' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('1.00000005960464477539062500001f' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('1.00000005960464477539062500001d' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('100000005960464477539062500001e-29' AS FLOAT) AS DOUBLE)",
+
+        # --- TIE-ADJACENT VALUES FROM THE SWEEP, across the range: large, small, subnormal.
+        "CAST(CAST('3.09095391071111921277084036786311659520000000001E+37' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('1.0922999503713893950027734046335022811639E-32' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('7.006492321624085354618647916449580656401309709382578858785341419448955413429304e-46' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('7.006492321624085354618647916449580656401309709382578858785341419448955413429303e-46' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('16777217' AS FLOAT) AS DOUBLE)", "CAST(CAST('16777219' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('16777217.000000000000000001' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('3.40282356e38' AS FLOAT) AS DOUBLE)", "CAST(CAST('3.40282357e38' AS FLOAT) AS DOUBLE)",
+        # One below the midpoint between float.MaxValue and 2^128, which rounds DOWN, and the
+        # midpoint itself, a tie that goes to infinity. .NET Framework refuses both. Review of #374.
+        "CAST(CAST('340282356779733661637539395458142568447' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('340282356779733661637539395458142568448' AS FLOAT) AS DOUBLE)",
+        "CAST(CAST('-1e-400' AS FLOAT) AS DOUBLE)",
+
+        # --- A DECIMAL beside a tie, and one that takes Java's fast path.
+        "CAST(CAST(8794138.500000000000000000000000000001 AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(8794138.499999999999999999999999999999 AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(CAST('16777217.000000000000000001' AS DECIMAL(38,18)) AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(CAST(0.1 AS DECIMAL(10,1)) AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(d3 AS FLOAT) AS DOUBLE)", "CAST(CAST(d5 AS FLOAT) AS DOUBLE)",
+        "CAST(CAST(fs AS FLOAT) AS DOUBLE)", "CAST(CAST(ns AS FLOAT) AS DOUBLE)",
     ],
 
     "malformed": [

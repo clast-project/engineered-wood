@@ -1931,6 +1931,24 @@ public sealed class SparkFunctionRegistry
 
     private IArrowArray CastToFloatingPoint(IArrowArray source, IArrowType target, int rowCount, bool raising)
     {
+        // A NUMERIC source reaches a float directly, rounded once from its exact value (#299 for
+        // a bigint, #372 for a decimal), and without building the per-row cast input at all: that
+        // input carries the DOUBLE reading, which for a wide decimal is an exact conversion of
+        // its own that the float would only throw away.
+        if (target is FloatType && SparkNumericTypes.IsNumeric(source.Data.DataType))
+        {
+            var direct = new FloatArray.Builder();
+            for (var i = 0; i < rowCount; i++)
+            {
+                if (SparkArrays.ReadFloat(source, i) is { } number)
+                    direct.Append(number);
+                else
+                    direct.AppendNull();
+            }
+
+            return direct.Build();
+        }
+
         var doubles = target is DoubleType ? new DoubleArray.Builder() : null;
         var floats = target is FloatType ? new FloatArray.Builder() : null;
 
@@ -1943,12 +1961,19 @@ public sealed class SparkFunctionRegistry
             // reads neither. It attaches to a NUMERIC form only -- 'NaNd' and 'Infinityf' are
             // refused -- and only a floating target takes it, CAST('1d' AS DECIMAL(20,4)) being
             // an error. Measured; #258.
-            if (value is { IsNumeric: false, FromString: true }
-                && SparkArrays.TryReadTypeSuffixed(value.Value.Text, out var suffixed))
+            if (value is { IsNumeric: false, FromString: true })
             {
-                doubles?.Append(suffixed);
-                floats?.Append((float)suffixed);
-                continue;
+                if (doubles is not null && SparkArrays.TryReadTypeSuffixed(value.Value.Text, out double suffixed))
+                {
+                    doubles.Append(suffixed);
+                    continue;
+                }
+
+                if (floats is not null && SparkArrays.TryReadTypeSuffixed(value.Value.Text, out float suffixedFloat))
+                {
+                    floats.Append(suffixedFloat);
+                    continue;
+                }
             }
 
             if (value is null || !value.Value.IsNumeric)
@@ -1971,13 +1996,16 @@ public sealed class SparkFunctionRegistry
 
             doubles?.Append(value.Value.AsDouble);
 
-            // Rounded ONCE from an integral source: a bigint reaches a float in one step in Spark,
-            // and two steps through double can land on the other side of a tie. #299.
+            // Rounded ONCE, from the text: Spark reads it with Float.parseFloat, and a double
+            // reading narrowed to float can land on the other side of a tie. #372. A numeric
+            // source never reaches here; what else does -- a boolean, a temporal -- is an integer
+            // well inside a double's exact range.
             if (floats is not null)
             {
-                floats.Append(SparkNumericTypes.IsIntegral(source.Data.DataType)
-                    ? SparkArrays.ReadFloat(source, i)!.Value
-                    : (float)value.Value.AsDouble);
+                if (value.Value.FromString && SparkArrays.TryReadFloat(value.Value.Text, out var fromText))
+                    floats.Append(fromText);
+                else
+                    floats.Append((float)value.Value.AsDouble);
             }
         }
 

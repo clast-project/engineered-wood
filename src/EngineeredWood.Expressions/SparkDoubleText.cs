@@ -173,6 +173,88 @@ internal static class SparkDoubleText
     }
 
     /// <summary>
+    /// Reads a float the way Java's <c>Float.parseFloat</c> does: rounded once, from the text.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Not a double parse narrowed to float</b>, which rounds twice and lands on the float next
+    /// door whenever the first rounding reaches a tie the text was not on -- a third of the
+    /// tie-adjacent strings measured for #372. .NET Core's <see cref="float"/> parse is correctly
+    /// rounded and is used as it stands; .NET Framework's is not (it missed the same third), so
+    /// that build replaces its answer with the exact one, as <see cref="TryParse(string, out double)"/>
+    /// does for a double. A magnitude too large is an infinity on every target.
+    /// </para>
+    /// </remarks>
+    internal static bool TryParseSingle(string text, out float value)
+    {
+#if NETSTANDARD2_0
+        // WHETHER the text is a number stays the platform's question, so the accepted shapes and
+        // whitespace are exactly what they were; only the VALUE is replaced. An infinite platform
+        // answer is corrected too -- the NaN and Infinity words are shapes TryScan declines, so
+        // they keep the platform's reading.
+        if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            if (TryParseExactSingle(text, out var exact))
+                value = exact;
+
+            return true;
+        }
+
+        // .NET Framework REFUSES a float magnitude at or above the midpoint between float.MaxValue
+        // and 2^128 -- including text just below that midpoint, which Java rounds DOWN to
+        // float.MaxValue. The double parse still decides acceptance, but its value cannot stand
+        // in: narrowing it is the double rounding this reader exists to avoid, and one below the
+        // midpoint reads as the midpoint and then as infinity. Found in review of #374.
+        if (!TryOverflow(text, out var asDouble))
+        {
+            value = 0f;
+            return false;
+        }
+
+        value = TryParseExactSingle(text, out var exactOverflow) ? exactOverflow : (float)asDouble;
+        return true;
+#else
+        if (float.TryParse(text.AsSpan(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            return true;
+
+        // .NET Core reads an overflowing float as an infinity rather than refusing it, so a
+        // refusal here is a malformed number and the double parse refuses it too.
+        var parsed = TryOverflow(text, out var asDouble);
+        value = (float)asDouble;
+        return parsed;
+#endif
+    }
+
+#if !NETSTANDARD2_0
+    /// <inheritdoc cref="TryParseSingle(string, out float)"/>
+    internal static bool TryParseSingle(ReadOnlySpan<char> text, out float value)
+    {
+        if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            return true;
+
+        var parsed = TryOverflow(text.ToString(), out var asDouble);
+        value = (float)asDouble;
+        return parsed;
+    }
+#endif
+
+    /// <summary>The correctly-rounded float for plain decimal text, by exact arithmetic.</summary>
+    /// <remarks>
+    /// The float counterpart of <see cref="TryParseExact"/>, and compiled on every target for the
+    /// same reason: so the tests can hold it against .NET Core's parser. #372.
+    /// </remarks>
+    internal static bool TryParseExactSingle(string text, out float value)
+    {
+        value = 0f;
+
+        if (!TryScan(text, out var negative, out var digits, out var exponent))
+            return false;
+
+        value = ScaledDecimal.ToSingle(negative ? -digits : digits, -exponent, negativeZero: negative);
+        return true;
+    }
+
+    /// <summary>
     /// Reads a plain decimal number into its digits and a base-ten exponent.
     /// </summary>
     /// <remarks>

@@ -44,14 +44,21 @@ internal static class ScaledDecimal
     /// <summary>What the exponent is offset by to become the IEEE 754 biased exponent.</summary>
     private const int ExponentBias = 1075;
 
-    /// <summary>The 52 bits IEEE 754 gives the significand, the leading one being implicit.</summary>
-    private const long SignificandMask = 0xFFFFFFFFFFFFFL;
-
     /// <summary>log2(10), for a cheap bound on a value's magnitude before any big arithmetic.</summary>
     private const double Log2Of10 = 3.3219280948873626d;
 
     /// <summary>10^0 through 10^22, every one of them exact.</summary>
     private static readonly double[] PowersOfTen = BuildPowersOfTen();
+
+    /// <summary>2^24, the float counterpart of <see cref="ExactIntegerLimit"/>.</summary>
+    private const int ExactIntegerLimitSingle = 1 << 24;
+
+    /// <summary>The largest power of ten a <see cref="float"/> holds exactly: 5^10 fits 24 bits.</summary>
+    private const int LargestExactPowerOfTenSingle = 10;
+
+    /// <summary>10^0 through 10^10, every one of them exact.</summary>
+    private static readonly float[] PowersOfTenSingle =
+        [1f, 1e1f, 1e2f, 1e3f, 1e4f, 1e5f, 1e6f, 1e7f, 1e8f, 1e9f, 1e10f];
 
     private static double[] BuildPowersOfTen()
     {
@@ -122,7 +129,90 @@ internal static class ScaledDecimal
             return (double)(long)unscaled / PowersOfTen[scale];
         }
 
+        var bits = RoundToBinary(unscaled, scale, DoubleFormat, out var infinite);
+        if (infinite)
+            return unscaled.Sign < 0 ? double.NegativeInfinity : double.PositiveInfinity;
+
+        var value = BitConverter.Int64BitsToDouble(bits);
+        return unscaled.Sign < 0 ? -value : value;
+    }
+
+    /// <summary>An unscaled integer and a scale as the nearest <see cref="float"/>.</summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Rounded ONCE, from the exact value.</b> Spark reaches a float from a decimal through
+    /// Java's <c>BigDecimal.floatValue</c> and from text through <c>Float.parseFloat</c>, and both
+    /// are correctly rounded: measured on 4.0.3 over 2,253 decimals and 8,400 strings placed
+    /// beside a float's rounding ties, not one differed from the exact answer. Going through
+    /// <see cref="ToDouble(BigInteger, int)"/> and narrowing rounds twice, and the first rounding
+    /// can land exactly on a tie the value itself was not on -- a third of those cases came back
+    /// as the float next door that way. #372.
+    /// </para>
+    /// <para>
+    /// The fast path is Java's own: an unscaled value below 2^24 and a scale up to 10 are both
+    /// exact floats (5^10 still fits in 24 bits), so one IEEE division rounds once. A zero keeps
+    /// the sign of the value it came from, which only text can carry -- a decimal zero has none.
+    /// </para>
+    /// </remarks>
+    internal static float ToSingle(BigInteger unscaled, int scale, bool negativeZero = false)
+    {
+        if (unscaled.IsZero)
+            return negativeZero ? -0f : 0f;
+
+        if (scale >= 0 && scale <= LargestExactPowerOfTenSingle
+            && unscaled > -ExactIntegerLimitSingle && unscaled < ExactIntegerLimitSingle)
+        {
+            return (float)(int)unscaled / PowersOfTenSingle[scale];
+        }
+
+        var bits = RoundToBinary(unscaled, scale, SingleFormat, out var infinite);
         var negative = unscaled.Sign < 0;
+        if (infinite)
+            return negative ? float.NegativeInfinity : float.PositiveInfinity;
+
+#if NETSTANDARD2_0
+        // No Int32BitsToSingle before netstandard2.1; the slow path is already BigInteger work.
+        var value = BitConverter.ToSingle(BitConverter.GetBytes((int)bits), 0);
+#else
+        var value = BitConverter.Int32BitsToSingle((int)bits);
+#endif
+        return negative ? -value : value;
+    }
+
+    /// <summary>The shape of an IEEE 754 binary format, as far as rounding into it needs.</summary>
+    private sealed class BinaryFormat(
+        int significandBits, int subnormalExponent, int maxExponent, int exponentBias)
+    {
+        /// <summary>Bits in the significand, the implicit leading one included.</summary>
+        public int SignificandBits { get; } = significandBits;
+
+        /// <summary>The exponent every subnormal shares.</summary>
+        public int SubnormalExponent { get; } = subnormalExponent;
+
+        /// <summary>The largest exponent a normal value reaches.</summary>
+        public int MaxExponent { get; } = maxExponent;
+
+        /// <summary>What the exponent is offset by to become the IEEE 754 biased exponent.</summary>
+        public int ExponentBias { get; } = exponentBias;
+
+        public long SignificandMask => (1L << (SignificandBits - 1)) - 1;
+    }
+
+    private static readonly BinaryFormat DoubleFormat =
+        new(SignificandBits, SubnormalExponent, MaxExponent, ExponentBias);
+
+    /// <summary>A float: 24 significand bits, the smallest subnormal 2^-149, the largest
+    /// finite value (2^24 - 1) × 2^104.</summary>
+    private static readonly BinaryFormat SingleFormat = new(24, -149, 104, 150);
+
+    /// <summary>
+    /// The IEEE 754 bits of <c>|unscaled| × 10^-scale</c> in <paramref name="format"/>, rounded
+    /// to nearest with ties to even; the sign is the caller's to apply.
+    /// </summary>
+    private static long RoundToBinary(
+        BigInteger unscaled, int scale, BinaryFormat format, out bool infinite)
+    {
+        infinite = false;
         var numerator = BigInteger.Abs(unscaled);
 
         // A generous bracket on log2 of the value, taken before anything is built. Its job is not
@@ -133,9 +223,13 @@ internal static class ScaledDecimal
         // multiply is in double, so it neither overflows nor needs the negation that would.
         var log2 = BitLength(numerator) - (scale * Log2Of10);
         if (log2 > 1100d)
-            return negative ? double.NegativeInfinity : double.PositiveInfinity;
+        {
+            infinite = true;
+            return 0L;
+        }
+
         if (log2 < -1200d)
-            return 0d;
+            return 0L;
 
         var denominator = BigInteger.One;
         if (scale > 0)
@@ -143,44 +237,45 @@ internal static class ScaledDecimal
         else if (scale < 0)
             numerator *= BigInteger.Pow(10, -scale);
 
-        // Line the quotient up on a double's 53 significand bits by shifting whichever side needs
+        // Line the quotient up on the format's significand bits by shifting whichever side needs
         // it, then round away what is left over. The bit-length estimate is out by at most one in
         // either direction. A subnormal cannot go below its fixed exponent however small it gets
         // -- that is the range where precision runs out rather than magnitude -- so the pin here
         // is what makes the loops below stop at the right place.
-        var exponent = BitLength(numerator) - BitLength(denominator) - SignificandBits;
-        if (exponent < SubnormalExponent)
-            exponent = SubnormalExponent;
+        var exponent = BitLength(numerator) - BitLength(denominator) - format.SignificandBits;
+        if (exponent < format.SubnormalExponent)
+            exponent = format.SubnormalExponent;
 
         var significand = RoundedQuotient(numerator, denominator, exponent);
 
-        // Rounding up can carry into a 54th bit, which needs this same step, so it is a loop
+        // Rounding up can carry into one bit more, which needs this same step, so it is a loop
         // rather than the single correction the estimate alone would want.
-        while (BitLength(significand) > SignificandBits)
+        while (BitLength(significand) > format.SignificandBits)
         {
             exponent++;
             significand = RoundedQuotient(numerator, denominator, exponent);
         }
 
-        while (BitLength(significand) < SignificandBits && exponent > SubnormalExponent)
+        while (BitLength(significand) < format.SignificandBits && exponent > format.SubnormalExponent)
         {
             exponent--;
             significand = RoundedQuotient(numerator, denominator, exponent);
         }
 
-        if (exponent > MaxExponent)
-            return negative ? double.NegativeInfinity : double.PositiveInfinity;
+        if (exponent > format.MaxExponent)
+        {
+            infinite = true;
+            return 0L;
+        }
 
-        // A subnormal is exactly the case where the significand never reached 53 bits, and IEEE
+        // A subnormal is exactly the case where the significand never reached full width, and IEEE
         // 754 spells it with a biased exponent of zero and no implicit leading one -- which is
-        // what writing the significand alone produces. Everything else has 53 bits, so its
-        // leading one falls off the 52-bit field on its own and the biased exponent is >= 1.
-        var bits = exponent == SubnormalExponent && BitLength(significand) < SignificandBits
+        // what writing the significand alone produces. Everything else is full width, so its
+        // leading one falls off the field on its own and the biased exponent is >= 1.
+        return exponent == format.SubnormalExponent && BitLength(significand) < format.SignificandBits
             ? (long)significand
-            : ((long)(exponent + ExponentBias) << 52) | ((long)significand & SignificandMask);
-
-        var value = BitConverter.Int64BitsToDouble(bits);
-        return negative ? -value : value;
+            : ((long)(exponent + format.ExponentBias) << (format.SignificandBits - 1))
+                | ((long)significand & format.SignificandMask);
     }
 
     /// <summary>

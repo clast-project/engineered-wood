@@ -440,28 +440,27 @@ internal static class CorpusEvaluation
     /// </remarks>
     public static double ExpectedDouble(JsonElement expected)
     {
-        var value = expected.ValueKind == JsonValueKind.String
-            ? expected.GetString() switch
-            {
-                "NaN" => double.NaN,
-                "Infinity" => double.PositiveInfinity,
-                "-Infinity" => double.NegativeInfinity,
-                var other => double.Parse(other!, Invariant),
-            }
-            : expected.GetDouble();
-
-        // THE SIGN OF A RECORDED ZERO COMES OFF THE TEXT, because .NET Framework's number parser
-        // drops it -- and the netstandard2.0 build of System.Text.Json this test loads under
-        // net472 reads a JSON number through that parser. Without this, the fixture's -0.0 became
-        // +0.0 on that target ALONE, and the two rows of `negative-zero` that compare a bare
-        // double failed there while their `CAST(... AS STRING)` twins passed: the expectation was
-        // wrong, not the answer. The same trap #282 fixes in SparkArrays, on the other side of
-        // the comparison.
         var text = expected.ValueKind == JsonValueKind.String
-            ? expected.GetString()
+            ? expected.GetString()!
             : expected.GetRawText();
 
-        return value == 0d && text is { Length: > 0 } && text[0] == '-' ? -0d : value;
+        switch (text)
+        {
+            case "NaN": return double.NaN;
+            case "Infinity": return double.PositiveInfinity;
+            case "-Infinity": return double.NegativeInfinity;
+        }
+
+        // READ WITH THE EXACT PARSER, NOT THE PLATFORM'S, because the netstandard2.0 build of
+        // System.Text.Json this test loads under net472 reads a JSON number through .NET
+        // Framework's parser -- and that parser is wrong twice over. It drops the sign of a zero,
+        // so the fixture's -0.0 became +0.0 on that target alone (#282); and it is an ulp out on
+        // some ordinary numbers, so two recorded floats of #372's group were expected one double
+        // away from the float Spark actually answered (#350's defect, on the EXPECTATION side).
+        // Both times the answer was right and the expectation was wrong.
+        return SparkDoubleText.TryParseExact(text, out var value)
+            ? value
+            : double.Parse(text, Invariant);
     }
 
     /// <summary>A double with the sign of a zero shown, which neither runtime's ToString does.</summary>
