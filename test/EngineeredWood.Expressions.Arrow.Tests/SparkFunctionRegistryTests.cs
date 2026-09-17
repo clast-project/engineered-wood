@@ -432,6 +432,42 @@ public sealed class SparkFunctionRegistryTests
     }
 
     /// <summary>
+    /// A numeric string reads the same double on every target framework.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #350. .NET Framework's parser is not correctly rounded — it reads about 1% of ordinary
+    /// fifteen- and sixteen-digit numbers as the double NEXT DOOR, with nothing raised — so
+    /// <c>CAST('&lt;a sixteen-digit number&gt;' AS DOUBLE)</c> read a different VALUE per runtime.
+    /// .NET Core has been correctly rounded since 3.0 and Java's <c>Double.parseDouble</c> always
+    /// was, so net472 was the odd one out.
+    /// </para>
+    /// <para>
+    /// Asserted through the rendering, which is where a one-ulp difference becomes visible. Every
+    /// expectation was taken from <c>Double.toString</c> on JDK 21 over the bits
+    /// <c>Double.parseDouble</c> produces, so they are Spark's answers and not merely .NET Core's,
+    /// and every row is a MEASURED net472 divergence rather than merely a long number — including
+    /// <c>49.0793458194787</c>, which shows this is not confined to exotic magnitudes.
+    /// </para>
+    /// <para>
+    /// <b>Only a run on net472 can fail this.</b>
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("49.0793458194787", "49.0793458194787")]
+    [InlineData("1.20823154016232E-221", "1.20823154016232E-221")]
+    [InlineData("2.17221101871326E+109", "2.17221101871326E109")]
+    [InlineData("5.596579825486209E-132", "5.596579825486209E-132")]
+    [InlineData("3.465494185217035E-271", "3.465494185217035E-271")]
+    public void ANumericStringReadsTheSameDoubleOnEveryTargetFramework(string text, string expected)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(expected, Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(CAST(s AS DOUBLE) AS STRING)", batch)).GetString(0));
+    }
+
+    /// <summary>
     /// What else the parse decided, which is every other reading of the same string.
     /// </summary>
     /// <remarks>
