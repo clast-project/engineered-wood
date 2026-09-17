@@ -4,6 +4,8 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
+using EngineeredWood.Vortex.Encodings;
+using EngineeredWood.Vortex.Tests.TestHelpers;
 using EngineeredWood.Vortex.Writer;
 using Pred = EngineeredWood.Expressions.Expressions;
 
@@ -5312,16 +5314,16 @@ public class VortexFileWriterTests
     [Fact]
     public async Task Delta_SlicedRoundtrips()
     {
-        // Sliced input of a delta-friendly locally-constant column. Slice still
-        // ≥ 1024 rows so delta is structurally applicable; probe should accept
-        // since within-lane deltas remain near-zero.
+        // Sliced input of a delta-friendly column. Slice still ≥ 1024 rows so
+        // delta is structurally applicable; the probe accepts since within-lane
+        // deltas stay small.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("v", UInt32Type.Default, nullable: false),
         }, metadata: null);
         const int total = 5_000;
         var b = new UInt32Array.Builder();
-        for (int i = 0; i < total; i++) b.Append((uint)(i / 64) + 1_000_000u);
+        for (int i = 0; i < total; i++) b.Append(DeltaFriendly(i));
         var full = b.Build();
         var sliced = (UInt32Array)full.Slice(800, 4_096);
         Assert.Equal(800, sliced.Offset);
@@ -5332,16 +5334,14 @@ public class VortexFileWriterTests
         try
         {
             using (var fs = File.Create(path))
-                VortexFileWriter.Write(fs, batch, compress: true);
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
+            await AssertEncodingUsed(path, VortexArrayEncodings.FastlanesDelta);
 
             await using var reader = await VortexFileReader.OpenAsync(path);
             var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
             Assert.Equal(4_096, read.Length);
             for (int i = 0; i < 4_096; i++)
-            {
-                int srcRow = 800 + i;
-                Assert.Equal((uint)(srcRow / 64) + 1_000_000u, read.GetValue(i));
-            }
+                Assert.Equal(DeltaFriendly(800 + i), read.GetValue(i));
         }
         finally
         {
@@ -5350,21 +5350,18 @@ public class VortexFileWriterTests
     }
 
     [Fact]
-    public async Task Delta_LocallyConstantUInt32Compresses()
+    public async Task Delta_BlockOffsetUInt32Compresses()
     {
-        // input[i] = i / 64 — every 64 consecutive rows share a value. Within
-        // each FastLanes lane (output positions p, p+LANES, p+2*LANES, ...),
-        // the source rows transpose(p), transpose(p+LANES), ... span a tight
-        // neighborhood, so within-lane deltas are 0 most of the time. The
-        // probe should accept this column and the bitpacked deltas child
-        // collapses to a tiny payload.
+        // See DeltaFriendly: each 64-row block has its own large base, which
+        // defeats FoR and bit-packing, and changes on every row, which defeats
+        // run-end, but the FastLanes lanes see only 0/1 steps.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("v", UInt32Type.Default, nullable: false),
         }, metadata: null);
         const int n = 4_096; // 4 chunks
         var b = new UInt32Array.Builder();
-        for (int i = 0; i < n; i++) b.Append((uint)(i / 64));
+        for (int i = 0; i < n; i++) b.Append(DeltaFriendly(i));
         var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
 
         var rawPath = Path.GetTempFileName();
@@ -5372,20 +5369,22 @@ public class VortexFileWriterTests
         try
         {
             using (var fs = File.Create(rawPath))
-                VortexFileWriter.Write(fs, batch);
-            using (var fs = File.Create(compressedPath))
                 VortexFileWriter.Write(fs, batch, compress: true);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
+            await AssertEncodingUsed(compressedPath, VortexArrayEncodings.FastlanesDelta);
 
-            long rawSize = new FileInfo(rawPath).Length;
-            long compressedSize = new FileInfo(compressedPath).Length;
-            Assert.True(compressedSize < rawSize / 4,
-                $"Delta on a locally-constant column should give >4x compression. raw={rawSize}, compressed={compressedSize}.");
+            // Without delta the column falls to bit-packing.
+            long withoutDelta = new FileInfo(rawPath).Length;
+            long withDelta = new FileInfo(compressedPath).Length;
+            Assert.True(withDelta < withoutDelta / 2,
+                $"Delta should at least halve this column. without={withoutDelta}, with={withDelta}.");
 
             await using var reader = await VortexFileReader.OpenAsync(compressedPath);
             var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
             Assert.Equal(n, read.Length);
             for (int i = 0; i < n; i++)
-                Assert.Equal((uint)(i / 64), read.GetValue(i));
+                Assert.Equal(DeltaFriendly(i), read.GetValue(i));
         }
         finally
         {
@@ -5416,7 +5415,8 @@ public class VortexFileWriterTests
         try
         {
             using (var fs = File.Create(path))
-                VortexFileWriter.Write(fs, batch, compress: true);
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
+            await AssertEncodingNotUsed(path, VortexArrayEncodings.FastlanesDelta);
 
             await using var reader = await VortexFileReader.OpenAsync(path);
             var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
@@ -5430,29 +5430,30 @@ public class VortexFileWriterTests
     }
 
     [Fact]
-    public async Task Delta_LocallyConstantUInt64Roundtrips()
+    public async Task Delta_BlockOffsetUInt64Roundtrips()
     {
-        // UInt64 path: LANES=16. Same locally-constant pattern triggers delta.
+        // UInt64 path: LANES=16. The same pattern selects delta.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("v", UInt64Type.Default, nullable: false),
         }, metadata: null);
         const int n = 2_048;
         var b = new UInt64Array.Builder();
-        for (int i = 0; i < n; i++) b.Append((ulong)(i / 64) + 1_000_000_000UL);
+        for (int i = 0; i < n; i++) b.Append(DeltaFriendly(i) * 1_000_000UL);
         var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
 
         var path = Path.GetTempFileName();
         try
         {
             using (var fs = File.Create(path))
-                VortexFileWriter.Write(fs, batch, compress: true);
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
+            await AssertEncodingUsed(path, VortexArrayEncodings.FastlanesDelta);
 
             await using var reader = await VortexFileReader.OpenAsync(path);
             var read = Assert.IsType<UInt64Array>(await reader.ReadColumnAsync(0));
             Assert.Equal(n, read.Length);
             for (int i = 0; i < n; i++)
-                Assert.Equal((ulong)(i / 64) + 1_000_000_000UL, read.GetValue(i));
+                Assert.Equal(DeltaFriendly(i) * 1_000_000UL, read.GetValue(i));
         }
         finally
         {
@@ -5478,7 +5479,8 @@ public class VortexFileWriterTests
         try
         {
             using (var fs = File.Create(path))
-                VortexFileWriter.Write(fs, batch, compress: true);
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
+            await AssertEncodingNotUsed(path, VortexArrayEncodings.FastlanesDelta);
 
             await using var reader = await VortexFileReader.OpenAsync(path);
             var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
@@ -5491,6 +5493,47 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    [Fact]
+    public async Task Delta_OnlyWhenPreferred()
+    {
+        // fastlanes.delta belongs to no Vortex edition, so compress alone never picks it,
+        // not even for a column it would shrink.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(DeltaFriendly(i));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+            await AssertEncodingNotUsed(path, VortexArrayEncodings.FastlanesDelta);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// A column fastlanes.delta takes and shrinks: a large base per 64-row block (so neither
+    /// FoR nor bit-packing narrows it) plus <c>i % 8</c> (so it never runs, and run-end
+    /// declines). FastLanes' lanes visit each block's rows in an order in which <c>i % 8</c>
+    /// only steps by 0 or 1, so the probe sees tiny deltas.
+    /// </summary>
+    private static uint DeltaFriendly(int i) => (uint)(i / 64) * 100_000u + (uint)(i % 8);
+
+    private static async Task AssertEncodingUsed(string path, string encoding) =>
+        Assert.Contains(encoding, (await FixtureArrayNodes.ReadAsync(path)).Select(n => n.Encoding));
+
+    private static async Task AssertEncodingNotUsed(string path, string encoding) =>
+        Assert.DoesNotContain(encoding, (await FixtureArrayNodes.ReadAsync(path)).Select(n => n.Encoding));
 
     [Fact]
     public async Task For_NullablePositiveMinRoundtrips()

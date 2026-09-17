@@ -10,12 +10,23 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// encoders so each can emit its <c>encoding</c> field with the right value.
 /// The values must match the writer's registry order (see VortexFileWriter).
 /// </summary>
+/// <remarks>
+/// Every encoder passes this down to the arrays it encodes recursively, so it also carries the
+/// one per-writer encoding policy that has to reach them: <see cref="AllowDelta"/>.
+/// </remarks>
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
     ushort FsstString, ushort AlpRd, ushort VarBinView, ushort Pco,
-    ushort DateTimeParts, ushort Ext);
+    ushort DateTimeParts, ushort Ext)
+{
+    /// <summary>
+    /// Whether the compressing chain may choose <c>fastlanes.delta</c>, which belongs to no
+    /// Vortex edition. Off unless the writer opts in (<c>preferDelta</c>).
+    /// </summary>
+    public bool AllowDelta { get; init; }
+}
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -30,7 +41,8 @@ internal static class ArrayEncoderDispatch
     /// compressing encodings in dispatch order. The order matters: each gate
     /// rejects the column if its niche doesn't fit, so cheaper / more
     /// specialised encodings are checked first. Order:
-    /// constant > dict > alp > rle > runend > delta > FoR > bitpacked.
+    /// constant > dict > alp > rle > runend > delta (only when
+    /// <see cref="EncodingIndices.AllowDelta"/>) > FoR > bitpacked.
     /// Constant strictly subsumes everything when the column is uniform.
     /// Dict is StringArray-only. ALP and RLE are float-only. RunEnd handles
     /// long-run integer columns that bitpacked alone wouldn't compress as
@@ -132,7 +144,7 @@ internal static class ArrayEncoderDispatch
             return SparseArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && RunEndArrayEncoder.IsApplicable(array))
             return RunEndArrayEncoder.Emit(sb, array, idx, statsTicket);
-        if (compress && DeltaArrayEncoder.IsApplicable(array))
+        if (compress && idx.AllowDelta && DeltaArrayEncoder.IsApplicable(array))
             return DeltaArrayEncoder.Emit(sb, array, idx.Delta, idx.Primitive, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && ForArrayEncoder.IsApplicable(array))
             return ForArrayEncoder.Emit(sb, array, idx.For, idx.BitPacked, idx.Primitive, idx.Bool, statsTicket);

@@ -429,21 +429,22 @@ public class VortexCrossValidationTests
         var validator = FindValidator();
         if (validator is null) return;
 
-        // Locally-constant pattern triggers fastlanes.delta dispatch.
+        // A large base per 64-row block plus i % 8 selects fastlanes.delta
+        // once the writer opts in (see VortexFileWriterTests.DeltaFriendly).
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("k", UInt32Type.Default, nullable: false),
         }, metadata: null);
         const int n = 4_096;
         var k = new UInt32Array.Builder();
-        for (int i = 0; i < n; i++) k.Append((uint)(i / 64) + 1_000_000u);
+        for (int i = 0; i < n; i++) k.Append((uint)(i / 64) * 100_000u + (uint)(i % 8));
         var batch = new RecordBatch(schema, new IArrowArray[] { k.Build() }, n);
 
         var path = Path.GetTempFileName();
         try
         {
             using (var fs = File.Create(path))
-                VortexFileWriter.Write(fs, batch, compress: true);
+                VortexFileWriter.Write(fs, batch, compress: true, preferDelta: true);
 
             var (code, stdout, stderr) = RunValidator(validator, path);
             Assert.True(code == 0,
