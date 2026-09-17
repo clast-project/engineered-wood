@@ -375,25 +375,6 @@ public sealed class SparkEvaluationCorpusTests
             // structural one -- the conditional family asks the EXPRESSION which branch is a bare
             // NULL -- and a typed null stopped being one.
 
-            // #299, and visible ONLY here. An integral compared with a FLOAT unifies to double
-            // under ANSI -- because int->float is lossy and ANSI refuses to lose bits -- and to
-            // FLOAT under this dialect, which rounds the integral onto the float and makes the
-            // two equal. We answer ANSI's rule under both. 16777217 is the first integer a float
-            // cannot hold.
-            //
-            // `greatest` shows it in the TYPE as well as the value, double against float, so it
-            // is a resolution difference and not only an evaluation one. The corpus carries
-            // `9007199254740993 = CAST(9007199254740992 AS DOUBLE)` beside these: it agrees in
-            // both dialects, which is what says #299 is about float specifically and not about
-            // floating point.
-            ["16777217 = CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
-            ["16777217 > CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
-            ["16777217 <=> CAST(16777216 AS FLOAT)"] = "#299: legacy unifies int/float as float",
-            ["CAST(16777216 AS FLOAT) IN (16777217)"] = "#299: legacy unifies int/float as float",
-            ["greatest(16777217, CAST(16777216 AS FLOAT))"] = "#299: legacy resolves float, not double",
-            ["nullif(16777217, CAST(16777216 AS FLOAT))"] = "#299: legacy unifies int/float as float",
-            ["nullif(CAST(16777216 AS FLOAT), 16777217)"] = "#299: legacy unifies int/float as float",
-
             // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
             // Spark reaches a decimal from a double through Double.toString, which did not produce
             // the shortest representation before JDK 19 (JDK-4511638). This corpus was gathered on
@@ -499,6 +480,9 @@ public sealed class SparkEvaluationCorpusTests
     // a boolean, date or binary position is refused at analysis, and only this gate asks over
     // no rows, where a refusal decided by the data could not be seen.
     [InlineData("substring-arguments")]
+    // #299. The type IS the defect: `coalesce(i, f)` is a double here and a float under legacy,
+    // and the value 16777217.0 against 16777216.0 is only half of how that shows.
+    [InlineData("integral-float")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -539,6 +523,8 @@ public sealed class SparkEvaluationCorpusTests
     [InlineData("decimal-to-string")]
     // ...and #370 here because the legacy dialect refuses the same positions.
     [InlineData("substring-arguments")]
+    // ...and #299 here above all, since this is the dialect that resolves FLOAT.
+    [InlineData("integral-float")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,

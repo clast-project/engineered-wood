@@ -195,6 +195,27 @@ internal static class SparkArrays
             $"{array.Data.DataType.Name} is not an integral array"),
     };
 
+    /// <summary>A numeric cell as a <see cref="float"/>, rounded once.</summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A bigint is converted directly, not through <see cref="ReadDouble"/>.</b> Rounding to 53
+    /// bits and then to 24 can land exactly on a tie the direct conversion does not see:
+    /// 2^60 + 2^36 + 1 is 2^60 + 2^37 as a float in Spark, which is Java's <c>(float) long</c>,
+    /// and 2^60 by way of a double. .NET's <c>(float) long</c> is correctly rounded on every
+    /// target framework -- checked over ten million random longs on .NET 10, and on this value
+    /// on .NET Framework. #299, which is what first sent a bigint to a float outside a CAST.
+    /// </para>
+    /// <para>
+    /// The narrower integrals and a float are exact in a double, and a double rounds once
+    /// either way, so those keep the double route. A decimal still rounds twice.
+    /// </para>
+    /// </remarks>
+    public static float? ReadFloat(IArrowArray array, int index) => array switch
+    {
+        Int64Array a => a.IsNull(index) ? null : a.GetValue(index)!.Value,
+        _ => ReadDouble(array, index) is { } value ? (float)value : null,
+    };
+
     public static double? ReadDouble(IArrowArray array, int index) => array switch
     {
         NullArray => null,
