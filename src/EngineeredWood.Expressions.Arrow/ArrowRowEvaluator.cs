@@ -52,6 +52,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     private readonly IAnalysisRules? _analysis;
 
+    /// <summary>
+    /// The registry's rule for a call every argument of which is constant, when it has one. See
+    /// <see cref="IsConstant"/>.
+    /// </summary>
+    private readonly IConstantFoldedFunctions? _constantFolded;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
@@ -60,6 +66,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         _nullability = functions as INullabilityRules;
         _literalPrecision = functions as ILiteralPrecisionRules;
         _analysis = functions as IAnalysisRules;
+        _constantFolded = functions as IConstantFoldedFunctions;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
@@ -1378,9 +1385,92 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         for (int i = 0; i < call.Arguments.Count; i++)
             arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
 
+        // A call whose every argument is constant may mean something the same call over a column
+        // does not -- see IConstantFoldedFunctions. Asked before PickMinimumPrecision, which is a
+        // rule about the types a call's operands take and has nothing to say about one that is
+        // answered without invoking the call at all.
+        if (_constantFolded is not null && AllConstant(call.Arguments))
+        {
+            var folded = _constantFolded.InvokeOverConstants(call.Name, arguments, batch.Length);
+            if (folded is not null)
+                return folded;
+        }
+
         PickMinimumPrecision(call, arguments);
 
         return _functions.Invoke(call.Name, arguments, batch.Length);
+    }
+
+    private static bool AllConstant(IReadOnlyList<Expression> expressions)
+    {
+        for (var i = 0; i < expressions.Count; i++)
+        {
+            if (!IsConstant(expressions[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expression"/> has the same value in every row -- Spark's
+    /// <c>foldable</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Structural, and it has to be.</b> The question is whether the expression reads a
+    /// COLUMN, not whether the column happens to hold one value in this batch: measured on 4.0.3,
+    /// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> is refused by Spark
+    /// although every row of it is the string <c>'epoch'</c>, and a content test would have
+    /// answered 1970-01-01 for it -- and, worse, would have answered differently for the same
+    /// CHECK constraint over the next batch. It is the same reasoning that makes
+    /// <see cref="IConditionalArguments.IsNullLiteral"/> read the tree rather than the values.
+    /// </para>
+    /// <para>
+    /// <b>A reference is the only thing this refuses</b>, because every function a registry may
+    /// hold here is deterministic: Spark's <c>foldable</c> also excludes <c>rand()</c>,
+    /// <c>current_date()</c> and the rest of its non-deterministic family, and none of them is
+    /// registered. A registry that adds one must state it here rather than leave this to infer
+    /// it, exactly as <see cref="INullabilityRules"/> requires of a function that can never be
+    /// null.
+    /// </para>
+    /// </remarks>
+    private static bool IsConstant(Expression expression)
+    {
+        switch (expression)
+        {
+            case LiteralExpression or TruePredicate or FalsePredicate:
+                return true;
+
+            case UnboundReference or BoundReference:
+                return false;
+
+            case FunctionCall call:
+                return AllConstant(call.Arguments);
+
+            case AndPredicate and:
+                return AllConstant(and.Children);
+
+            case OrPredicate or:
+                return AllConstant(or.Children);
+
+            case NotPredicate not:
+                return IsConstant(not.Child);
+
+            case ComparisonPredicate comparison:
+                return IsConstant(comparison.Left) && IsConstant(comparison.Right);
+
+            case UnaryPredicate unary:
+                return IsConstant(unary.Operand);
+
+            case SetPredicate set:
+                return IsConstant(set.Operand) && AllConstant(set.Values);
+
+            // Anything this does not recognise. Answering false only costs the fold, and a node
+            // added later is far likelier to read a column than not.
+            default:
+                return false;
+        }
     }
 
     /// <summary>

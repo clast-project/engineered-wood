@@ -471,6 +471,18 @@ internal static class SparkTemporalText
     }
 
     /// <summary>
+    /// Whether <paramref name="zone"/> names a timezone this library can resolve.
+    /// </summary>
+    /// <remarks>
+    /// For <c>SparkSpecialDatetimeValues</c>, whose <c>isValid</c> guard asks only whether the
+    /// text after a special word resolves as a zone and never uses the offset. The same
+    /// region-id limit applies -- see <see cref="TryReadZone"/> -- which there costs
+    /// <c>CAST('epoch America/Los_Angeles' AS DATE)</c> an answer it would otherwise have given
+    /// without consulting the zone at all.
+    /// </remarks>
+    internal static bool IsResolvableZone(ReadOnlySpan<char> zone) => TryReadZone(zone, out _);
+
+    /// <summary>
     /// The offset a timestamp's trailing timezone names, or false if it is one we cannot resolve.
     /// </summary>
     /// <remarks>

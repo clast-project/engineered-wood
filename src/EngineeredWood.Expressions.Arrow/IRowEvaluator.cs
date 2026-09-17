@@ -290,6 +290,55 @@ public interface ILiteralPrecisionRules
 }
 
 /// <summary>
+/// A function registry with calls that mean something different when every argument is a
+/// CONSTANT.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast: a registry that does not implement it
+/// evaluates every call the same way whatever its arguments are, exactly as before.
+/// </para>
+/// <para>
+/// It exists because Spark reads <c>epoch</c>, <c>today</c>, <c>yesterday</c>, <c>tomorrow</c>
+/// and <c>now</c> as dates and timestamps in a cast over a constant and refuses the same word
+/// arriving in a row. That is <c>SpecialDatetimeValues</c>, an optimizer rule over
+/// <c>Cast(e, DateType)</c> with <c>e.foldable</c>, and measured on 4.0.3 the discriminator is
+/// sharp: <c>CAST('epoch' AS DATE)</c> is 1970-01-01 while
+/// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> — a string that is
+/// <c>'epoch'</c> in every row — is <c>CAST_INVALID_INPUT</c>. #342.
+/// </para>
+/// <para>
+/// <b>The split is the same one the rest of this file makes.</b> Whether an argument is constant
+/// is a property of the TREE, which only <see cref="ArrowRowEvaluator"/> can see; which calls
+/// care and what they then answer is dialect knowledge, which only the registry has — it is the
+/// registry that knows <c>cast</c> from <c>try_cast</c>, that reads a cast's target type out of
+/// its second argument, and that owns the vocabulary. So the evaluator decides WHEN to ask and
+/// the registry decides WHAT to answer.
+/// </para>
+/// <para>
+/// <b>Asked with the arguments already evaluated</b>, rather than with the expressions. Spark's
+/// rule calls <c>e.eval()</c> for itself, so the operand is evaluated either way and an error
+/// inside it happens either way; handing over the arrays keeps this interface free of the
+/// expression tree and lets the answer be read from row 0 of a column every row of which holds
+/// the same value.
+/// </para>
+/// </remarks>
+public interface IConstantFoldedFunctions
+{
+    /// <summary>
+    /// The value a call to <paramref name="name"/> takes when every one of its arguments is
+    /// constant, or null to invoke it as usual.
+    /// </summary>
+    /// <remarks>
+    /// Null is the ordinary answer: it is what every name without a rule gets, and what a name
+    /// WITH one gets whenever the constant is not a value the rule recognises — a cast to a type
+    /// the rule does not cover, or a string that is not in the vocabulary, both of which must
+    /// fall through to the cast so that the dialect decides whether they refuse or read null.
+    /// </remarks>
+    IArrowArray? InvokeOverConstants(string name, IReadOnlyList<IArrowArray> args, int rowCount);
+}
+
+/// <summary>
 /// A function registry that knows which of its functions can never produce a null.
 /// </summary>
 /// <remarks>

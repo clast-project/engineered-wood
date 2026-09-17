@@ -315,11 +315,20 @@ internal static class SparkLiteral
         // `2026-08-11 extra` and `…12:30:00 UTC`, all read by Spark. A malformed literal is
         // INVALID_TYPED_LITERAL, a PARSE error, so no dialect or try_cast softens it. #341.
         //
-        // The special words -- 'today', 'epoch', 'now' -- are read by Spark and refused here, as
-        // they were before. That is #342, and nothing below pretends otherwise.
+        // THE SPECIAL WORDS COME FIRST, and that is Spark's order rather than a preference:
+        // `AstBuilder.visitTypeConstructor` tries `convertSpecialDate` before `stringToDate` and
+        // falls through to the grammar only when the text is not one of the five words. The one
+        // text both readers can see is a leading `T`, which starts the grammar's time-alone form
+        // AND satisfies the word reader's "begins with a letter" guard -- and it falls out of the
+        // word reader anyway, since `T` is not the vocabulary and what follows it is not a
+        // timezone. Measured: `TIMESTAMP'T12:30:00'` is still today at 12:30. #342.
         var instant = keyword.Equals("DATE", StringComparison.OrdinalIgnoreCase)
-            ? (SparkTemporalText.TryReadDate(text.AsSpan(), out var date) ? date : (DateTimeOffset?)null)
-            : (SparkTemporalText.TryReadTimestamp(text.AsSpan(), out var timestamp) ? timestamp : null);
+            ? (SparkSpecialDatetimeValues.TryReadDate(text.AsSpan(), out var special) ? special
+                : SparkTemporalText.TryReadDate(text.AsSpan(), out var date) ? date
+                : (DateTimeOffset?)null)
+            : (SparkSpecialDatetimeValues.TryReadTimestamp(text.AsSpan(), out var specialTs) ? specialTs
+                : SparkTemporalText.TryReadTimestamp(text.AsSpan(), out var timestamp) ? timestamp
+                : null);
 
         return instant is { } value
             ? LiteralValue.Of(value)

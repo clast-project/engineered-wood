@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 16:57:58.148192",
-      "2026-09-17 16:57:58.148192",
-      "2026-09-17 16:57:58.148192"
+      "2026-09-17 20:51:21.549527",
+      "2026-09-17 20:51:21.549527",
+      "2026-09-17 20:51:21.549527"
      ]
     }
    },
@@ -50282,6 +50282,806 @@
     }
    }
   ],
+  "special-datetime-values": [
+   {
+    "expression": "CAST('epoch' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('epoch' AS TIMESTAMP) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('epoch' AS TIMESTAMP) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01 00:00:00",
+      "1970-01-01 00:00:00",
+      "1970-01-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "expression": "try_cast('epoch' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('epoch' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "year(CAST('epoch' AS DATE))",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "year(CAST('epoch' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      1970,
+      1970,
+      1970
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('epoch' AS DATE) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('epoch' AS DATE) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'epoch' = CAST('epoch' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(DATE '1970-01-01' = CAST('epoch' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('epoch' AS TIMESTAMP) = TIMESTAMP'1970-01-01 00:00:00'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST('epoch' AS TIMESTAMP) = TIMESTAMP '1970-01-01 00:00:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('EPOCH' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('EPOCH' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('Epoch' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('Epoch' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('  epoch  ' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('  epoch  ' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(concat('epo','ch') AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(concat('epo', 'ch') AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(upper('epoch') AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(upper('epoch') AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(substring('epochal',1,5) AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(substring('epochal', 1, 5) AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(trim(' epoch ') AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(trim(' epoch ') AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST(if(a > 0, 'epoch', 'epoch') AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(if((a > 0), 'epoch', 'epoch') AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'epoch' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(if(a > 0, 'epoch', 'epoch') AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST(CASE WHEN a > 0 THEN 'epoch' ELSE 'epoch' END AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CASE WHEN (a > 0) THEN 'epoch' ELSE 'epoch' END AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'epoch' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST(CASE WHEN a > 0 THEN 'epoch' ELSE 'epoch' END AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^"
+    }
+   },
+   {
+    "expression": "try_cast(if(a > 0, 'epoch', 'epoch') AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST(if((a > 0), 'epoch', 'epoch') AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST('epoch UTC' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch UTC' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('epoch +02:00' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch +02:00' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('epoch extra' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch extra' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'epoch extra' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('epoch extra' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('epochUTC' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epochUTC' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'epochUTC' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('epochUTC' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('epoch America/Los_Angeles' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch America/Los_Angeles' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "CAST('ep' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('ep' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'ep' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('ep' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('epochs' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epochs' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'epochs' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('epochs' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "CAST('someday' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('someday' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'someday' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('someday' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "try_cast('someday' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('someday' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST('epoch' AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('epoch' AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "epoch",
+      "epoch",
+      "epoch"
+     ]
+    }
+   },
+   {
+    "expression": "try_cast('epoch' AS INT)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "TRY_CAST('epoch' AS INT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      null,
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "expression": "CAST('today' AS DATE) = CAST('now' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST('today' AS DATE) = CAST('now' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('yesterday' AS DATE) < CAST('today' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(CAST('yesterday' AS DATE) < CAST('today' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('tomorrow' AS DATE) > CAST('today' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThan",
+     "sql": "(CAST('tomorrow' AS DATE) > CAST('today' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('today' AS TIMESTAMP) <= CAST('now' AS TIMESTAMP)",
+    "parse": {
+     "ok": true,
+     "node": "LessThanOrEqual",
+     "sql": "(CAST('today' AS TIMESTAMP) <= CAST('now' AS TIMESTAMP))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('now' AS TIMESTAMP) AS DATE) = CAST('today' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(CAST('now' AS TIMESTAMP) AS DATE) = CAST('today' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('today UTC' AS DATE) = CAST('today' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST('today UTC' AS DATE) = CAST('today' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST('now UTC' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST('now UTC' AS DATE)"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": false,
+     "error": "DateTimeException: [CAST_INVALID_INPUT] The value 'now UTC' of the type \"STRING\" cannot be cast to \"DATE\" because it is malformed. Correct the value as per the syntax, or change its target type. Use `try_cast` to tolerate malformed input and return NULL instead. SQLSTATE: 22018\n== SQL (line 1, position 2) ==\n(CAST('now UTC' AS DATE)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'today' = CAST('today' AS DATE)",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(DATE '2026-09-17' = CAST('today' AS DATE))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "DATE'yesterday' < DATE'today'",
+    "parse": {
+     "ok": true,
+     "node": "LessThan",
+     "sql": "(DATE '2026-09-16' < DATE '2026-09-17')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(TIMESTAMP'now' AS DATE) = DATE'today'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(CAST(TIMESTAMP '2026-09-17 20:52:15.446292' AS DATE) = DATE '2026-09-17')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "DATE'  EPOCH  '",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "DATE '1970-01-01'"
+    },
+    "type": {
+     "ok": true,
+     "type": "date"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "1970-01-01",
+      "1970-01-01",
+      "1970-01-01"
+     ]
+    }
+   },
+   {
+    "expression": "DATE'now UTC'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'now UTC'\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'now UTC') AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'now UTC') AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "DATE'someday'",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'someday'\n^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'someday') AS r\n ^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'someday') AS r\n ^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "TIMESTAMP'epoch' = TIMESTAMP'1970-01-01'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(TIMESTAMP '1970-01-01 00:00:00' = TIMESTAMP '1970-01-01 00:00:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      true,
+      true
+     ]
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -90225,6 +91025,838 @@
        "1970-01-01 00:00:00",
        "1970-01-01 00:00:00",
        "1970-01-01 00:00:00"
+      ]
+     }
+    }
+   ],
+   "special-datetime-values": [
+    {
+     "expression": "CAST('epoch' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('epoch' AS TIMESTAMP) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('epoch' AS TIMESTAMP) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01 00:00:00",
+       "1970-01-01 00:00:00",
+       "1970-01-01 00:00:00"
+      ]
+     }
+    },
+    {
+     "expression": "try_cast('epoch' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('epoch' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "year(CAST('epoch' AS DATE))",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "year(CAST('epoch' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       1970,
+       1970,
+       1970
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('epoch' AS DATE) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('epoch' AS DATE) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'epoch' = CAST('epoch' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(DATE '1970-01-01' = CAST('epoch' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch' AS TIMESTAMP) = TIMESTAMP'1970-01-01 00:00:00'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST('epoch' AS TIMESTAMP) = TIMESTAMP '1970-01-01 00:00:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('EPOCH' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('EPOCH' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('Epoch' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('Epoch' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('  epoch  ' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('  epoch  ' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(concat('epo','ch') AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(concat('epo', 'ch') AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(upper('epoch') AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(upper('epoch') AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(substring('epochal',1,5) AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(substring('epochal', 1, 5) AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(trim(' epoch ') AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(trim(' epoch ') AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST(if(a > 0, 'epoch', 'epoch') AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(if((a > 0), 'epoch', 'epoch') AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CASE WHEN a > 0 THEN 'epoch' ELSE 'epoch' END AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CASE WHEN (a > 0) THEN 'epoch' ELSE 'epoch' END AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "try_cast(if(a > 0, 'epoch', 'epoch') AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST(if((a > 0), 'epoch', 'epoch') AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch UTC' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch UTC' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch +02:00' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch +02:00' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch extra' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch extra' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epochUTC' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epochUTC' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch America/Los_Angeles' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch America/Los_Angeles' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "CAST('ep' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('ep' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epochs' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epochs' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('someday' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('someday' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "try_cast('someday' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('someday' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('epoch' AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('epoch' AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "epoch",
+       "epoch",
+       "epoch"
+      ]
+     }
+    },
+    {
+     "expression": "try_cast('epoch' AS INT)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "TRY_CAST('epoch' AS INT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "CAST('today' AS DATE) = CAST('now' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST('today' AS DATE) = CAST('now' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('yesterday' AS DATE) < CAST('today' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(CAST('yesterday' AS DATE) < CAST('today' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('tomorrow' AS DATE) > CAST('today' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThan",
+      "sql": "(CAST('tomorrow' AS DATE) > CAST('today' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('today' AS TIMESTAMP) <= CAST('now' AS TIMESTAMP)",
+     "parse": {
+      "ok": true,
+      "node": "LessThanOrEqual",
+      "sql": "(CAST('today' AS TIMESTAMP) <= CAST('now' AS TIMESTAMP))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('now' AS TIMESTAMP) AS DATE) = CAST('today' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(CAST('now' AS TIMESTAMP) AS DATE) = CAST('today' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('today UTC' AS DATE) = CAST('today' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST('today UTC' AS DATE) = CAST('today' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST('now UTC' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST('now UTC' AS DATE)"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       null,
+       null,
+       null
+      ]
+     }
+    },
+    {
+     "expression": "DATE'today' = CAST('today' AS DATE)",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(DATE '2026-09-17' = CAST('today' AS DATE))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "DATE'yesterday' < DATE'today'",
+     "parse": {
+      "ok": true,
+      "node": "LessThan",
+      "sql": "(DATE '2026-09-16' < DATE '2026-09-17')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(TIMESTAMP'now' AS DATE) = DATE'today'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(CAST(TIMESTAMP '2026-09-17 20:53:10.909232' AS DATE) = DATE '2026-09-17')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "DATE'  EPOCH  '",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "DATE '1970-01-01'"
+     },
+     "type": {
+      "ok": true,
+      "type": "date"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "1970-01-01",
+       "1970-01-01",
+       "1970-01-01"
+      ]
+     }
+    },
+    {
+     "expression": "DATE'now UTC'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'now UTC'\n^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'now UTC') AS r\n ^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'now UTC'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'now UTC') AS r\n ^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "DATE'someday'",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 1) ==\nDATE'someday'\n^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'someday') AS r\n ^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_TYPED_LITERAL] The value of the typed literal \"DATE\" is invalid: 'someday'. SQLSTATE: 42604\n== SQL (line 1, position 2) ==\n(DATE'someday') AS r\n ^^^^^^^^^^^^^\n"
+     }
+    },
+    {
+     "expression": "TIMESTAMP'epoch' = TIMESTAMP'1970-01-01'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(TIMESTAMP '1970-01-01 00:00:00' = TIMESTAMP '1970-01-01 00:00:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       true,
+       true
       ]
      }
     }
