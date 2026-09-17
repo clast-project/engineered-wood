@@ -198,6 +198,52 @@ public sealed class SparkEvaluationCorpusTests
             "#342/#318: the zone after a special word need only resolve, and a region id does "
             + "not resolve on every target framework",
 
+
+        // ── TIMESTAMP_NTZ, the three things #349's measurement left open: #377, #378, #379. ──
+        // The `timestamp-ntz` group is 81 expressions and these are what is left of it: the fold
+        // and the label it resolved (#349's two filed gaps) are FIXED, and 12 of the group's
+        // 22 differences went with them. What remains is the part the issue's own comment says
+        // is a separate decision -- whether this layer models TIMESTAMP_NTZ as a distinct type
+        // at all -- rather than a rule that was merely missing.
+        //
+        // NOT A VALUE DIFFERENCE ANYWHERE IN THE GROUP. Under the pinned UTC session zone a naive
+        // timestamp and a zoned one hold the same micros for the same wall clock, measured: only
+        // the TYPE and the REFUSAL tell them apart, which is why every entry below is one or the
+        // other.
+
+        // 1. THE CAST TABLE IS NOT THE ZONED ONE, and that is the surprise. Spark refuses a
+        // numeric target for a naive timestamp and ALLOWS one for a zoned timestamp --
+        // `CAST(ts AS LONG)` is in the group as the control that says so. We reach both through
+        // one `Source.Temporal` arm and answer epoch seconds for either, so these are the #286
+        // direction: we answer where Spark's analyzer refuses.
+        ["CAST(ntz AS LONG)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+        ["CAST(ntz AS INT)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+        ["CAST(ntz AS DOUBLE)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+        ["CAST(ntz AS DECIMAL(20,0))"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+        ["try_cast(ntz AS INT)"] = "#377: try_cast reads the same table, so the refusal is a refusal here too",
+
+        // 2. TIMESTAMP_NTZ AS A CAST TARGET AND AS A TYPED LITERAL, neither of which exists here.
+        // `SparkArrays.ParseTypeName` refuses the spelling outright and the tokenizer has no
+        // `TIMESTAMP_NTZ'…'` literal, so these are refusals of the SYNTAX rather than wrong
+        // answers. Measured: the cast keeps the wall clock and drops any zone the text carried --
+        // `CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ)` is 12:30.
+        ["CAST(CAST(ts AS TIMESTAMP_NTZ) AS STRING)"] =
+            "#378: TIMESTAMP_NTZ is not a cast target here",
+        ["CAST(CAST(dt AS TIMESTAMP_NTZ) AS STRING)"] =
+            "#378: TIMESTAMP_NTZ is not a cast target here",
+        ["CAST(TIMESTAMP_NTZ'2026-08-11 12:30:00' AS STRING)"] =
+            "#378: TIMESTAMP_NTZ is not a typed literal here",
+        ["CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ) AS STRING)"] =
+            "#378: TIMESTAMP_NTZ is not a cast target here, and it DISCARDS the zone the text "
+            + "carried rather than resolving it",
+
+        // 3. AN INTERVAL, which this library does not model at all. `ntz - ts` is
+        // `interval day to second` to Spark, and so is `ts - ts`; no corpus group has ever asked
+        // for one and there is no Arrow type here to carry it. Recorded as the boundary rather
+        // than as something to reproduce.
+        ["ntz - ts"] = "#379: subtracting two temporals yields an INTERVAL, a type we do not model",
+        ["ntz - dt"] = "#379: subtracting two temporals yields an INTERVAL, a type we do not model",
+
         // #301, and the one row of the `binary-casts` group that diverges. Spark's STRING is a
         // BYTE string: `CAST(X'FF' AS STRING)` holds the raw FF, and casting it back hands the
         // same byte over. A .NET string is UTF-16 and cannot hold an unpaired FF, so the decode
@@ -379,6 +425,29 @@ public sealed class SparkEvaluationCorpusTests
                 "#342/#318: the zone after a special word need only resolve, and a region id "
                 + "does not resolve on every target framework",
 
+
+            // ── TIMESTAMP_NTZ, as in the ANSI list and for the same reasons. #377/#378/#379. ─
+            // One row MORE than the ANSI list: `CAST(ntz AS BOOLEAN)` is refused by Spark's
+            // analyzer under both dialects, and this is the dialect where our own cast answers
+            // instead of raising for its own reasons, so it surfaces here alone.
+            ["CAST(ntz AS LONG)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+            ["CAST(ntz AS INT)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+            ["CAST(ntz AS DOUBLE)"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+            ["CAST(ntz AS DECIMAL(20,0))"] = "#377: a numeric cast is refused for a naive timestamp and allowed for a zoned one",
+            ["CAST(ntz AS BOOLEAN)"] = "#377: a boolean cast is refused for a naive timestamp",
+            ["try_cast(ntz AS INT)"] = "#377: try_cast reads the same table, so the refusal is a refusal here too",
+            ["CAST(CAST(ts AS TIMESTAMP_NTZ) AS STRING)"] =
+                "#378: TIMESTAMP_NTZ is not a cast target here",
+            ["CAST(CAST(dt AS TIMESTAMP_NTZ) AS STRING)"] =
+                "#378: TIMESTAMP_NTZ is not a cast target here",
+            ["CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ) AS STRING)"] =
+                "#378: TIMESTAMP_NTZ is not a cast target here, and it DISCARDS the zone the "
+                + "text carried rather than resolving it",
+            ["CAST(TIMESTAMP_NTZ'2026-08-11 12:30:00' AS STRING)"] =
+                "#378: TIMESTAMP_NTZ is not a typed literal here",
+            ["ntz - ts"] = "#379: subtracting two temporals yields an INTERVAL, a type we do not model",
+            ["ntz - dt"] = "#379: subtracting two temporals yields an INTERVAL, a type we do not model",
+
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
@@ -498,6 +567,11 @@ public sealed class SparkEvaluationCorpusTests
     // #299. The type IS the defect: `coalesce(i, f)` is a double here and a float under legacy,
     // and the value 16777217.0 against 16777216.0 is only half of how that shows.
     [InlineData("integral-float")]
+    // ...and #349, where the TYPE is the whole measurement. Every value in this group is right
+    // under the pinned UTC session zone -- a wall clock and an instant are the same micros there
+    // -- so the evaluation gates either side of this one cannot see the defect at all. Only this
+    // theory says that we resolve a ZONED timestamp where Spark resolves `timestamp_ntz`.
+    [InlineData("timestamp-ntz")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -540,6 +614,10 @@ public sealed class SparkEvaluationCorpusTests
     [InlineData("substring-arguments")]
     // ...and #299 here above all, since this is the dialect that resolves FLOAT.
     [InlineData("integral-float")]
+    // ...and #349 here because the group's STRING rows are the dialect split: `coalesce(ntz, s)`
+    // resolves `timestamp_ntz` under ANSI and `string` here, which is #278's rule reaching a type
+    // nothing had asked it about.
+    [InlineData("timestamp-ntz")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,
@@ -583,7 +661,14 @@ public sealed class SparkEvaluationCorpusTests
             }
         }
 
-        Assert.Empty(differing);
+        // Joined rather than through Assert.Empty, for the reason AssertOnlyDeclaredDifferences
+        // gives: xUnit elides each entry after about 50 characters, and what it cuts is the part
+        // that says which type we resolved -- the only thing that says what to do next.
+        Assert.True(
+            differing.Count == 0,
+            $"{differing.Count} type difference(s) in '{group}':\n  "
+            + string.Join("\n  ", differing.OrderBy(x => x, StringComparer.Ordinal)));
+
         Assert.True(compared > 10, $"only {compared} expressions in '{group}' were compared");
     }
 
@@ -610,7 +695,14 @@ public sealed class SparkEvaluationCorpusTests
         // timestamp where the evaluator builds a microsecond one is a difference this deliberately
         // cannot see. SparkArrays.Timestamp is what keeps the two in step.
         Date32Type or Date64Type => "date",
-        TimestampType => "timestamp",
+
+        // THE ZONE IS PART OF THE NAME, and until #349 it was not. Spark has two timestamp types
+        // and Arrow tells them apart by whether the zone is set, so spelling every TimestampType
+        // "timestamp" made the one difference the `timestamp-ntz` group exists to measure
+        // invisible: an evaluator resolving a ZONED array where Spark says `timestamp_ntz` would
+        // have compared equal. "Clearly zoned" rather than `is not null`, which is the test
+        // SparkNumericTypes.IsZonedOrDate makes for the same reason.
+        TimestampType t => string.IsNullOrEmpty(t.Timezone) ? "timestamp_ntz" : "timestamp",
         _ => throw new NotSupportedException($"no Spark spelling for {type.Name}"),
     };
 

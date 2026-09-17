@@ -358,9 +358,13 @@ internal static class SparkFunctions
             for (var i = 0; i < rowCount; i++)
                 instants[i] = choice[i] < 0 ? null : SparkArrays.ReadInstant(sources[choice[i]], i);
 
+            // AT THE RESOLVED TYPE, not at the one this used to assume. `BuildTimestamp`'s
+            // no-zone overload labels its result UTC whatever it read, so a fold that resolved
+            // `timestamp_ntz` handed back a zoned array -- the type and the array disagreeing,
+            // which is #349 gap 1. The micros are the same either way; the NAME was the defect.
             return SparkArrays.IsDateType(type)
                 ? SparkArrays.BuildDate32(instants, rowCount)
-                : SparkArrays.BuildTimestamp(instants, rowCount);
+                : SparkArrays.BuildTimestamp(instants, rowCount, (TimestampType)type);
         }
 
         if (type is Decimal128Type decimalType)

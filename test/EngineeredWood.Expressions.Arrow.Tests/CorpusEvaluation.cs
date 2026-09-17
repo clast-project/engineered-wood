@@ -180,6 +180,24 @@ internal static class CorpusEvaluation
                 return b.Build();
             }
 
+            // A NAIVE timestamp: a null zone, which is how Delta's `SchemaConverter` spells
+            // `timestamp_ntz` in Arrow and therefore the only shape the registry will ever meet
+            // one in. The micros are read as UTC because under the corpus's pinned UTC session
+            // zone a wall clock and an instant ARE the same number -- the distinction this column
+            // exists to measure is in the TYPE, not in the value. #349.
+            case "timestamp_ntz":
+            {
+                var b = new TimestampArray.Builder(
+                    new TimestampType(TimeUnit.Microsecond, (string?)null));
+                foreach (var v in literals)
+                {
+                    if (IsNull(v)) b.AppendNull();
+                    else b.Append(DateTimeOffset.Parse(Unquote(v), Invariant, Utc));
+                }
+
+                return b.Build();
+            }
+
             // The corpus records a binary EXPRESSION as a Python bytearray repr, which is why
             // `X'ABCD'` is excluded -- but a binary COLUMN is only ever an operand, and an
             // expression over one answers with something comparable. `s = bin` is a boolean.
