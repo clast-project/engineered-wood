@@ -2013,6 +2013,43 @@ public sealed class SparkFunctionRegistryTests
         }
     }
 
+    /// <summary>
+    /// A diagnostic names a date the way Spark spells it, which is DATE and not DATE32.
+    /// </summary>
+    /// <remarks>
+    /// Spark has one date type and Arrow has two widths of it, so <c>SparkArrays.Describe</c>'s
+    /// fallback — <c>type.Name.ToUpperInvariant()</c> — spelled these <c>DATE32</c> and
+    /// <c>DATE64</c>, a type name no Spark user has ever seen. Found on #332's new cast refusal,
+    /// but it was never confined to it: <c>Describe</c> feeds a dozen message sites, and a date
+    /// compared with a number is a <c>BINARY_OP_DIFF_TYPES</c> that named the operand's type.
+    /// <para>
+    /// A TIMESTAMP already spelled itself correctly. That a NAIVE timestamp also spells itself
+    /// <c>TIMESTAMP</c> where Spark says <c>TIMESTAMP_NTZ</c> is a separate question, and it is
+    /// #349's.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void ADiagnosticNamesADateTheWaySparkSpellsIt()
+    {
+        var batch = Batch(
+            ("dt", Dates(new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero))),
+            ("a", Ints(1)));
+
+        // The cast refusal this issue added.
+        var cast = Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(Ansi, "CAST(dt AS INT)", batch));
+
+        Assert.Contains("\"DATE\"", cast.Message);
+        Assert.DoesNotContain("DATE32", cast.Message);
+
+        // And the comparison refusal, which had the same spelling and predates it.
+        var comparison = Assert.Throws<ExpressionAnalysisException>(
+            () => Eval(Ansi, "dt < a", batch));
+
+        Assert.Contains("\"DATE\"", comparison.Message);
+        Assert.DoesNotContain("DATE32", comparison.Message);
+    }
+
     /// <summary>A TIMESTAMP still reads as epoch seconds, which is the control for all of it.</summary>
     /// <remarks>
     /// The two types share a family everywhere else in the registry and part company on exactly

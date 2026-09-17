@@ -1200,13 +1200,6 @@ public sealed class SparkFunctionRegistry
 
     /// <inheritdoc />
     /// <remarks>
-    /// <b>Not implemented yet, and null is the interface's "nothing refused".</b> The cast table
-    /// is the third slice of #286 — 17 ANSI rows and 25 legacy ones — and it lands with #332,
-    /// whose two directions are rows of it. Answering null here leaves every cast exactly as it
-    /// is rather than half-refusing a table that has not been written.
-    /// </remarks>
-    /// <inheritdoc />
-    /// <remarks>
     /// <para>
     /// <b>A DATE has no numeric reading in Spark, in either dialect.</b> ANSI refuses the cast and
     /// the legacy dialect answers null — it does not convert. Measured on 4.0.1 with
@@ -1220,6 +1213,11 @@ public sealed class SparkFunctionRegistry
     /// </para>
     /// <para>
     /// The other direction is untouched: a number casts to a DATE, and that is <c>CastToDate</c>.
+    /// </para>
+    /// <para>
+    /// <b>One rule, not the table.</b> #286's cast table is 17 ANSI rows and 25 legacy ones; this
+    /// is the pair #332 measured and nothing else. Every other cast is still accepted here, which
+    /// leaves it exactly as it was rather than half-refusing a table that has not been written.
     /// </para>
     /// </remarks>
     public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast)
