@@ -213,8 +213,32 @@ internal static class SparkArrays
     public static float? ReadFloat(IArrowArray array, int index) => array switch
     {
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index)!.Value,
+
+        // Once from the exact value, as Java's BigDecimal.floatValue does. #372.
+        Decimal128Array a => a.IsNull(index)
+            ? null
+            : ScaledDecimal.ToSingle(Unscaled(a, index), ((Decimal128Type)a.Data.DataType).Scale),
+
         _ => ReadDouble(array, index) is { } value ? (float)value : null,
     };
+
+    /// <summary>
+    /// A numeric string as a <see cref="float"/>, read once from the text as Java's
+    /// <c>Float.parseFloat</c> reads it, after Spark's trim.
+    /// </summary>
+    /// <remarks>
+    /// For a string <see cref="CastInput"/> has already decided is numeric; it holds only the
+    /// DOUBLE reading, and narrowing that would round twice. #372.
+    /// </remarks>
+    public static bool TryReadFloat(string text, out float value)
+    {
+        var trimmed = SparkText.Trim(text);
+        var parsed = SparkDoubleText.TryParseSingle(trimmed, out value);
+        if (parsed)
+            value = WithSignOfZero(value, trimmed.Length > 0 && trimmed[0] == '-');
+
+        return parsed;
+    }
 
     public static double? ReadDouble(IArrowArray array, int index) => array switch
     {
@@ -525,16 +549,7 @@ internal static class SparkArrays
     public static bool TryReadTypeSuffixed(string text, out double value)
     {
         value = 0d;
-        var trimmed = SparkText.Trim(text);
-        if (trimmed.Length < 2)
-            return false;
-
-        var suffix = trimmed[trimmed.Length - 1];
-        if (suffix is not ('d' or 'D' or 'f' or 'F'))
-            return false;
-
-        var previous = trimmed[trimmed.Length - 2];
-        if (!((previous >= '0' && previous <= '9') || previous == '.'))
+        if (!IsTypeSuffixed(text, out var trimmed))
             return false;
 
         // Read without the suffix, and without copying the text to drop it. The span overload
@@ -550,6 +565,46 @@ internal static class SparkArrays
 
         return parsed;
     }
+
+    /// <summary>
+    /// <see cref="TryReadTypeSuffixed(string, out double)"/> for a FLOAT target, rounded once from
+    /// the text rather than narrowed from the double reading. #372.
+    /// </summary>
+    public static bool TryReadTypeSuffixed(string text, out float value)
+    {
+        value = 0f;
+        if (!IsTypeSuffixed(text, out var trimmed))
+            return false;
+
+#if NETSTANDARD2_0
+        var parsed = SparkDoubleText.TryParseSingle(trimmed.Substring(0, trimmed.Length - 1), out value);
+#else
+        var parsed = SparkDoubleText.TryParseSingle(trimmed.AsSpan(0, trimmed.Length - 1), out value);
+#endif
+
+        if (parsed)
+            value = WithSignOfZero(value, trimmed[0] == '-');
+
+        return parsed;
+    }
+
+    private static bool IsTypeSuffixed(string text, out string trimmed)
+    {
+        trimmed = SparkText.Trim(text);
+        if (trimmed.Length < 2)
+            return false;
+
+        var suffix = trimmed[trimmed.Length - 1];
+        if (suffix is not ('d' or 'D' or 'f' or 'F'))
+            return false;
+
+        var previous = trimmed[trimmed.Length - 2];
+        return (previous >= '0' && previous <= '9') || previous == '.';
+    }
+
+    /// <summary>A float with the sign its TEXT carried; see the double overload.</summary>
+    private static float WithSignOfZero(float value, bool negative) =>
+        value == 0f && negative ? -0f : value;
 
     /// <summary>
     /// A parsed value with the sign its TEXT carried, which only a zero can have lost.

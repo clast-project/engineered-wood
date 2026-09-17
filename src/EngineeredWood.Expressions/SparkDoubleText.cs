@@ -173,6 +173,68 @@ internal static class SparkDoubleText
     }
 
     /// <summary>
+    /// Reads a float the way Java's <c>Float.parseFloat</c> does: rounded once, from the text.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Not a double parse narrowed to float</b>, which rounds twice and lands on the float next
+    /// door whenever the first rounding reaches a tie the text was not on -- a third of the
+    /// tie-adjacent strings measured for #372. .NET Core's <see cref="float"/> parse is correctly
+    /// rounded and is used as it stands; .NET Framework's is not (it missed the same third), so
+    /// that build replaces its answer with the exact one, as <see cref="TryParse(string, out double)"/>
+    /// does for a double. A magnitude too large is an infinity on every target.
+    /// </para>
+    /// </remarks>
+    internal static bool TryParseSingle(string text, out float value)
+    {
+#if NETSTANDARD2_0
+        if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            if (!float.IsNaN(value) && !float.IsInfinity(value) && TryParseExactSingle(text, out var exact))
+                value = exact;
+
+            return true;
+        }
+#else
+        if (float.TryParse(text.AsSpan(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            return true;
+#endif
+
+        var parsed = TryOverflow(text, out var asDouble);
+        value = (float)asDouble;
+        return parsed;
+    }
+
+#if !NETSTANDARD2_0
+    /// <inheritdoc cref="TryParseSingle(string, out float)"/>
+    internal static bool TryParseSingle(ReadOnlySpan<char> text, out float value)
+    {
+        if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            return true;
+
+        var parsed = TryOverflow(text.ToString(), out var asDouble);
+        value = (float)asDouble;
+        return parsed;
+    }
+#endif
+
+    /// <summary>The correctly-rounded float for plain decimal text, by exact arithmetic.</summary>
+    /// <remarks>
+    /// The float counterpart of <see cref="TryParseExact"/>, and compiled on every target for the
+    /// same reason: so the tests can hold it against .NET Core's parser. #372.
+    /// </remarks>
+    internal static bool TryParseExactSingle(string text, out float value)
+    {
+        value = 0f;
+
+        if (!TryScan(text, out var negative, out var digits, out var exponent))
+            return false;
+
+        value = ScaledDecimal.ToSingle(negative ? -digits : digits, -exponent, negativeZero: negative);
+        return true;
+    }
+
+    /// <summary>
     /// Reads a plain decimal number into its digits and a base-ten exponent.
     /// </summary>
     /// <remarks>
