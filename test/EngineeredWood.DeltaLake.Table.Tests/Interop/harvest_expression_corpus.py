@@ -168,7 +168,11 @@ LEGACY_GROUPS = (
     # #303. The TYPES are dialect-independent -- the fold is the parser's -- and the reason the
     # group exists is what they do next: an `int` at its minimum overflows, raising under ANSI and
     # wrapping under legacy, where the `bigint` we used to type it had room for both.
-    "negative-literal-fold")
+    "negative-literal-fold",
+    # #325. THE LEGACY COLUMN IS THE MEASUREMENT: a decimal casts to string through Java's
+    # `BigDecimal.toString` there and through `toPlainString` under ANSI, so the ANSI half is the
+    # control that says the plain spelling did not move.
+    "decimal-to-string")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3237,6 +3241,72 @@ GROUPS = {
         "-1.5", "-.5", "-1.", "-1e3BD", "-1.5BD", "-0", "-0.0", "-0.0D", "-0.0F",
         "CAST(-0.0F AS STRING)", "-1e-400", "-3.4028234663852886e38F", "-1.7976931348623157e308",
         "-1.79769313486231575e308",
+    ],
+
+    # HOW A DECIMAL IS SPELLED AS TEXT. #325. ANSI prints `toPlainString`; the legacy dialect
+    # prints Java's `BigDecimal.toString`, which goes scientific once the ADJUSTED exponent
+    # (digits - 1 - scale) drops below -6. That depends on the value as well as the scale, so the
+    # rows walk both across the boundary. `try_cast` is plain in BOTH dialects, and every
+    # implicit conversion to string follows the cast.
+    "decimal-to-string": [
+        # --- A ZERO: the scale alone decides it, and the boundary is scale 7.
+        "CAST(CAST(0 AS DECIMAL(1,0)) AS STRING)", "CAST(CAST(0 AS DECIMAL(10,2)) AS STRING)",
+        "CAST(CAST(0 AS DECIMAL(10,6)) AS STRING)", "CAST(CAST(0 AS DECIMAL(10,7)) AS STRING)",
+        "CAST(CAST(0 AS DECIMAL(7,7)) AS STRING)", "CAST(CAST(0 AS DECIMAL(38,10)) AS STRING)",
+        "CAST(CAST(0 AS DECIMAL(38,37)) AS STRING)", "CAST(CAST(0 AS DECIMAL(38,38)) AS STRING)",
+
+        # --- A NON-ZERO: the digits count too, and trailing zeros stay in the coefficient.
+        "CAST(CAST('0.0000001' AS DECIMAL(38,7)) AS STRING)",
+        "CAST(CAST('0.0000010' AS DECIMAL(38,7)) AS STRING)",
+        "CAST(CAST('0.000001' AS DECIMAL(38,6)) AS STRING)",
+        "CAST(CAST('0.00000123' AS DECIMAL(38,8)) AS STRING)",
+        "CAST(CAST('-0.00000012' AS DECIMAL(20,8)) AS STRING)",
+        "CAST(CAST('-0.000000120' AS DECIMAL(38,9)) AS STRING)",
+        "CAST(CAST('12.00000000' AS DECIMAL(38,8)) AS STRING)",
+        "CAST(CAST('123.4500' AS DECIMAL(10,4)) AS STRING)",
+        "CAST(CAST('0.0000000000000000000000000000000000001' AS DECIMAL(38,37)) AS STRING)",
+        "CAST(CAST('-0.0000000000000000000000000000000000001' AS DECIMAL(38,37)) AS STRING)",
+        "CAST(CAST('-9.9999999999999999999999999999999999999' AS DECIMAL(38,37)) AS STRING)",
+        "CAST(CAST('0.00000000000000000000000000000000000099' AS DECIMAL(38,38)) AS STRING)",
+        "CAST(CAST(1e-20D AS DECIMAL(38,38)) AS STRING)",
+        "CAST(CAST('1.0' AS DECIMAL(38,37)) AS STRING)",
+        "CAST(CAST('12345678901234567890.123' AS DECIMAL(38,3)) AS STRING)",
+        "CAST(CAST(1 AS DECIMAL(38,0)) AS STRING)",
+
+        # --- OVER A COLUMN, so it is not constant folding, and at the scale arithmetic produces.
+        "CAST(d3 AS STRING)", "CAST(d5 AS STRING)", "CAST(d2 AS STRING)", "CAST(d1 AS STRING)",
+        "CAST(CAST(0 AS DECIMAL(38,38)) + 0 AS STRING)",
+        "CAST(d5 * 1 AS STRING)",
+
+        # --- try_cast is PLAIN in both dialects.
+        "try_cast(CAST(0 AS DECIMAL(10,7)) AS STRING)",
+        "try_cast(CAST('-0.00000012' AS DECIMAL(20,8)) AS STRING)",
+        "try_cast(d5 AS STRING)",
+
+        # --- EVERY IMPLICIT CONVERSION follows the cast.
+        "CAST(0 AS DECIMAL(10,7))::string",
+        "concat(CAST(0 AS DECIMAL(10,7)), '')", "CAST(0 AS DECIMAL(10,7)) || ''",
+        "concat(d5, '')", "d5 || ''",
+        "upper(CAST(0 AS DECIMAL(10,7)))", "length(CAST(0 AS DECIMAL(10,7)))",
+        "CAST(0 AS DECIMAL(10,7)) LIKE '0E%'", "CAST(0 AS DECIMAL(10,7)) = '0E-7'",
+        "coalesce(CAST(0 AS DECIMAL(10,7)), 'x')", "if(a > 0, CAST(0 AS DECIMAL(10,7)), 'x')",
+        "CASE WHEN a > 0 THEN CAST(0 AS DECIMAL(10,7)) ELSE 'x' END",
+        # Every dispatch site that converts, not only the first few: each is its own line of code.
+        "lower(CAST(0 AS DECIMAL(10,7)))", "trim(CAST(0 AS DECIMAL(10,7)))",
+        "ltrim(CAST(0 AS DECIMAL(10,7)))", "rtrim(CAST(0 AS DECIMAL(10,7)))",
+        "ILIKE(CAST(0 AS DECIMAL(10,7)), '0e%')", "CAST(0 AS DECIMAL(10,7)) ILIKE '0e%'",
+        "CAST(0 AS DECIMAL(10,7)) RLIKE '^0E'", "'0E-7' LIKE CAST(0 AS DECIMAL(10,7))",
+        "concat('x', CAST(0 AS DECIMAL(10,7)), d5)",
+        "nvl(CAST(0 AS DECIMAL(10,7)), 'x')", "ifnull(CAST(0 AS DECIMAL(10,7)), 'x')",
+        "nvl2(a, CAST(0 AS DECIMAL(10,7)), 'x')", "if(a > 0, 'x', d3)",
+        # `substring` converts its FIRST argument only: the position and length stay numbers,
+        # which a decimal position says -- it is truncated to an int, not rendered.
+        "substring(CAST(0 AS DECIMAL(10,7)), 1, 3)", "substr(CAST('-0.00000012' AS DECIMAL(20,8)), 2)",
+        "substring(d3, 1, 4)", "substring('abcdef', CAST(2 AS DECIMAL(10,7)), 2)",
+
+        # --- AND THE SPELLING READS BACK, so a round trip keeps the value.
+        "CAST(CAST(CAST(0 AS DECIMAL(10,7)) AS STRING) AS DECIMAL(10,7))",
+        "CAST(CAST(CAST('-0.00000012' AS DECIMAL(20,8)) AS STRING) AS DOUBLE)",
     ],
 
     "malformed": [
