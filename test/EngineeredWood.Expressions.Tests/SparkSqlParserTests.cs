@@ -191,6 +191,38 @@ public sealed class SparkSqlParserTests
     }
 
     /// <summary>
+    /// A double literal reads the same bits on every target framework.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #350, and the half of it that is not a cast. Only an exponent makes a numeric literal a
+    /// DOUBLE in Spark — <c>1.5</c> is a decimal and <c>1.5e0</c> is not — so an exponent-bearing
+    /// literal goes through the same parser a column's text does, and carried the same defect:
+    /// .NET Framework's is not correctly rounded and reads about 1% of ordinary fifteen- and
+    /// sixteen-digit numbers as the double NEXT DOOR.
+    /// </para>
+    /// <para>
+    /// The expectations are the bits <c>Double.parseDouble</c> produces on JDK 21, so they are
+    /// Spark's answers. <b>Only a run on net472 can fail these</b>, and the fix for the cast half
+    /// did not reach here — the literal parser lives in another assembly and had to be routed
+    /// separately.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("49.0793458194787E0", 4632104121170255391L)]
+    [InlineData("1.20823154016232E-221", 1301953993310182709L)]
+    [InlineData("2.17221101871326E+109", 6242692313457557362L)]
+    [InlineData("5.596579825486209E-132", 2643550992869693082L)]
+    [InlineData("3.465494185217035E-271", 560538912182121944L)]
+    public void ADoubleLiteralReadsTheSameBitsOnEveryTargetFramework(string sql, long expected)
+    {
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+
+        Assert.Equal(LiteralValue.Kind.Double, value.Type);
+        Assert.Equal(expected, BitConverter.DoubleToInt64Bits(value.AsDouble));
+    }
+
+    /// <summary>
     /// Spark's escape table, every row of it measured — #179.
     /// </summary>
     /// <remarks>

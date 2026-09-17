@@ -107,8 +107,11 @@ internal static class SparkArrays
 #else
             var trimmed = SparkText.Trim(text.AsSpan());
 #endif
-            IsNumeric = double.TryParse(
-                trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var asDouble);
+            // Through SparkDoubleText, not double.TryParse: .NET Framework REFUSES a magnitude too
+            // large to represent where .NET Core and Java both return an infinity, and the refusal
+            // does not stop at the double cast -- it goes through IsNumeric, so it decided the
+            // error class of every other numeric cast from this string too. #326.
+            IsNumeric = SparkDoubleText.TryParse(trimmed, out var asDouble);
             AsDouble = IsNumeric
                 ? WithSignOfZero(asDouble, trimmed.Length > 0 && trimmed[0] == '-')
                 : 0d;
@@ -516,11 +519,9 @@ internal static class SparkArrays
         // Read without the suffix, and without copying the text to drop it. The span overload
         // lands on net8.0 and net10.0; netstandard2.0 has only the string one.
 #if NETSTANDARD2_0
-        var parsed = double.TryParse(
-            trimmed.Substring(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+        var parsed = SparkDoubleText.TryParse(trimmed.Substring(0, trimmed.Length - 1), out value);
 #else
-        var parsed = double.TryParse(
-            trimmed.AsSpan(0, trimmed.Length - 1), NumberStyles.Float, Invariant, out value);
+        var parsed = SparkDoubleText.TryParse(trimmed.AsSpan(0, trimmed.Length - 1), out value);
 #endif
 
         if (parsed)

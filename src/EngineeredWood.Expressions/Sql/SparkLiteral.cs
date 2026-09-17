@@ -472,15 +472,39 @@ internal static class SparkLiteral
         return new decimal(low, mid, high, unscaled.Sign < 0, (byte)scale);
     }
 
+    /// <summary>
+    /// Reads a double LITERAL, which is the same question the cast asks of a column's text.
+    /// </summary>
+    /// <remarks>
+    /// Through <see cref="SparkDoubleText"/> rather than <c>double.TryParse</c>, because .NET
+    /// Framework's parser is not correctly rounded and reads about 1% of ordinary fifteen- and
+    /// sixteen-digit numbers as the double next door. A literal is not exempt from that:
+    /// <c>SELECT 49.0793458194787E0</c> is a DOUBLE in Spark, and it materialized different bits
+    /// per runtime exactly as <c>CAST('49.0793458194787' AS DOUBLE)</c> did. #350.
+    /// <para>
+    /// The overflow half of that type does not reach here — <see cref="RefuseOutOfRange"/> has
+    /// already refused a literal past a double's range on every framework, which is #287, so a
+    /// parse that fails at this point failed for some other reason and is still an error.
+    /// </para>
+    /// </remarks>
     private static double ParseDouble(string text, string sql, int position)
     {
         RefuseOutOfRange(text, MaxDoubleDigits, MaxDoubleExponent, "a double", sql, position);
 
-        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+        return SparkDoubleText.TryParse(text, out var value)
             ? value
             : throw Overflow(text, "a double", sql, position);
     }
 
+    /// <summary>
+    /// Reads a float literal, which needs no such help.
+    /// </summary>
+    /// <remarks>
+    /// A float's shortest form is nine digits and .NET Framework's parser is good to about
+    /// fifteen, so it has the room the double path does not: measured over 100,000 random floats
+    /// rendered at six, seven, eight and nine digits, net472 read every one of them the same as
+    /// .NET Core. #350 is a double-only defect.
+    /// </remarks>
     private static float ParseFloat(string text, string sql, int position)
     {
         RefuseOutOfRange(text, MaxFloatDigits, MaxFloatExponent, "a float", sql, position);

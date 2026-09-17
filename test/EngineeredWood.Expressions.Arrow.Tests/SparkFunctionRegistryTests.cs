@@ -382,6 +382,120 @@ public sealed class SparkFunctionRegistryTests
                 () => Eval(Ansi, "CAST(g AS DECIMAL(3,0))", small)).ErrorClass);
     }
 
+    // -- A numeric string past a double's range, which one framework refused (#326) ----------
+
+    /// <summary>
+    /// A magnitude too large for a double saturates to an infinity, on every target framework.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #326. <c>double.TryParse</c> REFUSES a value too large to represent on .NET Framework where
+    /// .NET Core returns an infinity, and Java's <c>Double.parseDouble</c> returns one too — so
+    /// <c>CAST('1e400' AS DOUBLE)</c> was <c>Infinity</c> on net10.0 and CAST_INVALID_INPUT on
+    /// net472. Measured against Spark 4.0.3 / JDK 17 under ANSI, which answers <c>Infinity</c>.
+    /// </para>
+    /// <para>
+    /// The underflow side needed nothing and is here as the control: <c>'1e-400'</c> is zero on
+    /// both frameworks already.
+    /// </para>
+    /// <para>
+    /// <b>Only a run on net472 can see this.</b> On net10.0 every row below passed before the fix.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("1e400", "Infinity")]
+    [InlineData("-1e400", "-Infinity")]
+    [InlineData("1E400", "Infinity")]
+    [InlineData("  1e400  ", "Infinity")]
+    [InlineData("1e-400", "0.0")]
+    [InlineData("-1e-400", "-0.0")]
+    [InlineData("1e309", "Infinity")]
+    public void ANumericStringPastADoublesRangeSaturates(string text, string expected)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(expected, Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(CAST(s AS DOUBLE) AS STRING)", batch)).GetString(0));
+    }
+
+    /// <summary>The same text carrying Java's type suffix, which is a second parse (#258).</summary>
+    [Theory]
+    [InlineData("1e400d", "Infinity")]
+    [InlineData("-1e400D", "-Infinity")]
+    public void ASuffixedStringPastADoublesRangeSaturates(string text, string expected)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(expected, Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(CAST(s AS DOUBLE) AS STRING)", batch)).GetString(0));
+    }
+
+    /// <summary>
+    /// A numeric string reads the same double on every target framework.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #350. .NET Framework's parser is not correctly rounded — it reads about 1% of ordinary
+    /// fifteen- and sixteen-digit numbers as the double NEXT DOOR, with nothing raised — so
+    /// <c>CAST('&lt;a sixteen-digit number&gt;' AS DOUBLE)</c> read a different VALUE per runtime.
+    /// .NET Core has been correctly rounded since 3.0 and Java's <c>Double.parseDouble</c> always
+    /// was, so net472 was the odd one out.
+    /// </para>
+    /// <para>
+    /// Asserted through the rendering, which is where a one-ulp difference becomes visible. Every
+    /// expectation was taken from <c>Double.toString</c> on JDK 21 over the bits
+    /// <c>Double.parseDouble</c> produces, so they are Spark's answers and not merely .NET Core's,
+    /// and every row is a MEASURED net472 divergence rather than merely a long number — including
+    /// <c>49.0793458194787</c>, which shows this is not confined to exotic magnitudes.
+    /// </para>
+    /// <para>
+    /// <b>Only a run on net472 can fail this.</b>
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("49.0793458194787", "49.0793458194787")]
+    [InlineData("1.20823154016232E-221", "1.20823154016232E-221")]
+    [InlineData("2.17221101871326E+109", "2.17221101871326E109")]
+    [InlineData("5.596579825486209E-132", "5.596579825486209E-132")]
+    [InlineData("3.465494185217035E-271", "3.465494185217035E-271")]
+    public void ANumericStringReadsTheSameDoubleOnEveryTargetFramework(string text, string expected)
+    {
+        var batch = Batch(("s", Strings(text)));
+
+        Assert.Equal(expected, Assert.IsType<StringArray>(
+            Eval(Ansi, "CAST(CAST(s AS DOUBLE) AS STRING)", batch)).GetString(0));
+    }
+
+    /// <summary>
+    /// What else the parse decided, which is every other reading of the same string.
+    /// </summary>
+    /// <remarks>
+    /// A failed parse does not merely refuse the double cast: it clears <c>IsNumeric</c>, and that
+    /// is the flag every other numeric reading of the cell consults. So the fix has to be checked
+    /// where the flag is READ, not only where it is set — a comparison against a number is the
+    /// case that moves, because a string Spark treats as a number is coerced to one and a string
+    /// it does not is compared as text.
+    /// <para>
+    /// The integral cast is here as the control. It refuses either way and with the same error
+    /// class, because a value outside <c>decimal</c>'s range has no exact form to truncate
+    /// whether it parsed as an infinity or not at all. I had expected these to differ by framework
+    /// and they do not.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheParseDecidesMoreThanTheDoubleCast()
+    {
+        var batch = Batch(("s", Strings("1e400")));
+
+        // An infinity is greater than any finite number, and this is the reading that changed.
+        Assert.True(Assert.IsType<BooleanArray>(Eval(Ansi, "s > 1.0", batch)).GetValue(0));
+
+        // The control: refused on both frameworks, before and after, and with one error class.
+        Assert.Equal(
+            "CAST_INVALID_INPUT",
+            Assert.Throws<SparkEvaluationException>(() => Eval(Ansi, "CAST(s AS INT)", batch)).ErrorClass);
+    }
+
     /// <summary>Renders one cell of a decimal result the way Spark prints it.</summary>
     private static string Rendered(SparkFunctionRegistry registry, string sql, RecordBatch batch, int row)
     {
