@@ -567,6 +567,84 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Of("x"), LiteralValue.Of(1)));
     }
 
+    /// <summary>
+    /// A decimal bound is compared the way Spark compares it, which is ROUNDED to the common type.
+    /// </summary>
+    /// <remarks>
+    /// #323. Spark casts both sides of an exact comparison to their least common type and compares
+    /// the rounded values (#280); this evaluator compared the stored bound against the literal
+    /// EXACTLY. Once the common type gives up scale the two disagree — and they disagree in the
+    /// direction that DROPS rows, because pruning says the file cannot match while Spark says it
+    /// does.
+    /// <para>
+    /// Measured against Spark 4.0.3 / JDK 17 with <c>spark.sql.ansi.enabled=true</c>, over a
+    /// <c>decimal(38,38)</c> column holding 38 nines. The comparison resolves to
+    /// <c>decimal(38,37)</c>, where that value rounds up to exactly 1 — so the row matches, and
+    /// an exact comparison that sees <c>max &lt; 1</c> prunes the file holding it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void DecimalBoundsAreComparedRoundedToTheCommonType()
+    {
+        var nines = LiteralValue.HighPrecisionDecimalOf(
+            System.Numerics.BigInteger.Parse(new string('9', 38)), 38);
+
+        var stats = new TestStats().With("d5", min: nines, max: nines, nullCount: 0);
+
+        // Spark answers true, true, false. Anything but AlwaysFalse on the first two is sound;
+        // AlwaysFalse is the answer that loses the row.
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Expressions.Equal("d5", 1), stats));
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Expressions.GreaterThanOrEqual("d5", 1), stats));
+        Assert.NotEqual(FilterResult.AlwaysTrue, Eval(Expressions.LessThan("d5", 1), stats));
+    }
+
+    /// <summary>
+    /// An <c>IN</c> set coerces by its members' TYPE, so it rounds where the same literal on the
+    /// left of <c>=</c> does not.
+    /// </summary>
+    /// <remarks>
+    /// #323, found in review of the first fix for it. Spark resolves one type over all of a set's
+    /// members before the comparison rule runs, so <c>d IN (1)</c> goes through bigint --
+    /// <c>decimal(20,0)</c> -- where <c>d = 1</c> goes through <c>decimal(1,0)</c> (#281). Against
+    /// a <c>decimal(38,29)</c> column those twenty integral digits force the clamp and round the
+    /// bound up to 1, so Spark matches the row; one digit does not, and the exact comparison is
+    /// right there. The same pair of values, two answers, and the set half was pruning the row.
+    /// </remarks>
+    [Fact]
+    public void ASetPredicateCoercesByTypeAndDoesNotPruneWhatSparkMatches()
+    {
+        var nines = LiteralValue.HighPrecisionDecimalOf(
+            System.Numerics.BigInteger.Parse(new string('9', 29)), 29);
+
+        var stats = new TestStats().With("d", min: nines, max: nines, nullCount: 0);
+
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Expressions.In("d", 1), stats));
+
+        // The binary comparison is decided exactly, and that is correct rather than a concession:
+        // decimal(38,29) against decimal(1,0) unifies to decimal(38,29) and rounds nothing.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("d", 1), stats));
+    }
+
+    /// <summary>An ordinary decimal column still prunes exactly, which is what must not be lost.</summary>
+    /// <remarks>
+    /// The control for <see cref="DecimalBoundsAreComparedRoundedToTheCommonType"/>: a
+    /// <c>decimal(10,2)</c> against an integral literal unifies without giving up scale, so
+    /// nothing rounds and the exact answer stands.
+    /// </remarks>
+    [Fact]
+    public void AnOrdinaryDecimalColumnStillPrunesExactly()
+    {
+        var stats = new TestStats().With(
+            "d",
+            min: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(250), 2),
+            max: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(375), 2),
+            nullCount: 0);
+
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("d", 1), stats));
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.GreaterThan("d", 4), stats));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.LessThan("d", 4), stats));
+    }
+
     private static FilterResult EvalLiterals(LiteralValue a, LiteralValue b) =>
         Eval(
             new ComparisonPredicate(
