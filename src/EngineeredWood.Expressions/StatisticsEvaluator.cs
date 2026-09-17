@@ -639,11 +639,20 @@ public static class StatisticsEvaluator
     /// #208.
     /// </para>
     /// </remarks>
-    private static int SafeCompare(LiteralValue a, LiteralValue b)
+    private static int SafeCompare(LiteralValue value, LiteralValue bound)
     {
+        // A THIRD way an answer cannot be trusted, and it announces itself least of all: the
+        // comparison is exact, and Spark's is not. Two exact numerics meet in their least common
+        // type and are compared THERE, so once that type gives up scale the answer is about the
+        // rounded values -- and the exact answer can be its opposite, again in the direction that
+        // skips a file holding matching rows. #323, and see SparkDecimalRounding for why this
+        // needs neither the unification itself nor the column's declared width.
+        if (SparkDecimalRounding.Rounds(value, bound))
+            return int.MinValue;
+
         try
         {
-            var result = a.CompareTo(b, out bool exact);
+            var result = value.CompareTo(bound, out bool exact);
             return exact ? result : int.MinValue;
         }
         catch (InvalidOperationException)
