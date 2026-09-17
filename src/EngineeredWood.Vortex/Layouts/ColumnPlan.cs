@@ -56,11 +56,10 @@ internal sealed class ZoneInfo
 }
 
 /// <summary>
-/// Per-Arrow-field plan. Today there are two concrete kinds:
-/// <see cref="FlatColumnPlan"/> (segments hold the column directly) and
-/// <see cref="DictColumnPlan"/> (the layout is <c>vortex.dict</c>: the column
-/// is materialized from a values dictionary plus per-row codes). Future:
-/// chunked-of-X, zoned, etc.
+/// Per-Arrow-field plan: <see cref="FlatColumnPlan"/> (segments hold the column directly),
+/// <see cref="DictColumnPlan"/> (the layout is <c>vortex.dict</c>: the column is materialized
+/// from a values dictionary plus per-row codes) or <see cref="StructFieldColumnPlan"/> (the
+/// column is one field of a struct stored as a whole).
 /// </summary>
 internal abstract class ColumnPlan
 {
@@ -118,4 +117,27 @@ internal sealed class DictColumnPlan : ColumnPlan
     public override int ChunkCount => Codes.ChunkCount;
     public override ulong TotalRows => Codes.TotalRows;
     public override ulong ChunkRowCount(int chunkIndex) => Codes.ChunkRowCount(chunkIndex);
+}
+
+/// <summary>
+/// One field of a struct-typed column. A file whose root layout is not <c>vortex.struct</c> —
+/// upstream's flat layout strategy writes the whole row struct into one <c>vortex.flat</c>
+/// segment, for example — has no per-field layouts, so every top-level field reads
+/// <see cref="Rows"/> (planned with the root struct type) and takes field <see cref="FieldIndex"/>.
+/// </summary>
+internal sealed class StructFieldColumnPlan : ColumnPlan
+{
+    public ColumnPlan Rows { get; }
+    public int FieldIndex { get; }
+
+    public StructFieldColumnPlan(IArrowType arrowType, ColumnPlan rows, int fieldIndex)
+        : base(arrowType)
+    {
+        Rows = rows;
+        FieldIndex = fieldIndex;
+    }
+
+    public override int ChunkCount => Rows.ChunkCount;
+    public override ulong TotalRows => Rows.TotalRows;
+    public override ulong ChunkRowCount(int chunkIndex) => Rows.ChunkRowCount(chunkIndex);
 }

@@ -9,7 +9,8 @@ namespace EngineeredWood.Vortex.Layouts;
 /// <summary>
 /// Walks a materialized layout tree against the Arrow schema to produce one
 /// <see cref="ColumnPlan"/> per top-level Arrow field. Handles
-/// <c>vortex.struct</c> at the root, then per-field: <c>vortex.stats</c> and
+/// <c>vortex.struct</c> at the root — or any other layout holding whole rows, whose fields become
+/// <see cref="StructFieldColumnPlan"/>s — then per-field: <c>vortex.stats</c> and
 /// <c>vortex.zoned</c> (skip-to-data), <c>vortex.chunked</c> (concatenated row chunks),
 /// <c>vortex.flat</c> (leaf segment), and <c>vortex.dict</c> (a layout-level
 /// dictionary with values + codes children → <see cref="DictColumnPlan"/>).
@@ -22,8 +23,16 @@ internal static class LayoutPlanner
     public static ColumnPlan[] Plan(Apache.Arrow.Schema schema, VortexLayout root)
     {
         if (root.EncodingId != VortexLayoutEncodings.Struct)
-            throw new VortexFormatException(
-                $"Expected root layout encoding '{VortexLayoutEncodings.Struct}', got '{root.EncodingId}'.");
+        {
+            // The root struct is stored whole (upstream's flat layout strategy writes it into a
+            // single vortex.flat segment), so each field is projected out of the decoded rows.
+            // A zone map over whole rows says nothing per field, so none is carried over.
+            var rows = PlanField(new StructType(schema.FieldsList), root);
+            var fields = new ColumnPlan[schema.FieldsList.Count];
+            for (int i = 0; i < fields.Length; i++)
+                fields[i] = new StructFieldColumnPlan(schema.FieldsList[i].DataType, rows, i);
+            return fields;
+        }
         if (root.Children.Count != schema.FieldsList.Count)
             throw new VortexFormatException(
                 $"Layout has {root.Children.Count} children but schema has {schema.FieldsList.Count} fields.");

@@ -226,7 +226,7 @@ internal static class AlpArrayDecoder
         int expE = 0, expF = 0;
         bool hasPatches = false;
         ulong patchesLen = 0, patchesOffset = 0;
-        int patchIndicesPtype = 2;
+        int patchIndicesPtype = 0; // U8, proto3's default; set from the patches message when present
 
         int pos = 0;
         while (pos < bytes.Length)
@@ -258,7 +258,7 @@ internal static class AlpArrayDecoder
     private static void ParsePatchesMetadata(
         ReadOnlySpan<byte> bytes, out ulong len, out ulong offset, out int indicesPtype)
     {
-        len = 0; offset = 0; indicesPtype = 2;
+        len = 0; offset = 0; indicesPtype = 0; // proto3 omits an enum at its default, and PType 0 is U8.
         int pos = 0;
         while (pos < bytes.Length)
         {

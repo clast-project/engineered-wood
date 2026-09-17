@@ -27,12 +27,27 @@ internal readonly ref struct SerializedArray
     public SerializedArray(
         ReadOnlySpan<byte> segment,
         ReadOnlySpan<byte> flatBuffer,
-        int[] bufferOffsets)
+        int[] bufferOffsets,
+        IReadOnlyList<string>? arraySpecs = null)
     {
         _segment = segment;
         _flatBuffer = flatBuffer;
         _bufferOffsets = bufferOffsets;
+        ArraySpecs = arraySpecs;
     }
+
+    /// <summary>
+    /// The file's array encoding ids, which <see cref="ArrayNode.EncodingIndex"/> indexes. Set by
+    /// <see cref="ArrayDecoder"/>, so decoders that aren't handed the table can still dispatch a
+    /// child whose encoding they don't know in advance.
+    /// </summary>
+    public IReadOnlyList<string>? ArraySpecs { get; }
+
+    /// <summary>This segment, resolving encodings through <paramref name="arraySpecs"/>.</summary>
+    public SerializedArray WithArraySpecs(IReadOnlyList<string> arraySpecs) =>
+        ReferenceEquals(ArraySpecs, arraySpecs)
+            ? this
+            : new SerializedArray(_segment, _flatBuffer, _bufferOffsets, arraySpecs);
 
     /// <summary>The full segment bytes (including data buffers and trailing FB).</summary>
     public ReadOnlySpan<byte> Segment => _segment;

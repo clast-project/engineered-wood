@@ -81,6 +81,7 @@ async fn main() -> std::io::Result<()> {
     write_nullable_bitpacked_2k(&session, &out_dir.join("nullable_bitpacked_2048rows.vortex")).await?;
     write_nullable_alp_2k(&session, &out_dir.join("nullable_alp_2048rows.vortex")).await?;
     write_bitpacked_with_patches_2k(&session, &out_dir.join("bitpacked_patches_2048rows.vortex")).await?;
+    write_bitpacked_patches_u8_indices(&session, &out_dir.join("bitpacked_patches_200rows.vortex")).await?;
     write_alp_with_patches_2k(&session, &out_dir.join("alp_patches_2048rows.vortex")).await?;
     write_decimal128_2k(&session, &out_dir.join("decimal128_2048rows.vortex")).await?;
     write_decimal256_2k(&session, &out_dir.join("decimal256_2048rows.vortex")).await?;
@@ -1018,6 +1019,43 @@ async fn write_bitpacked_with_patches_2k(
         .await
         .expect("write");
 
+    std::fs::write(path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// 200-row i32 column bit-packed at 7 bits with every 20th row an outlier patch. Under 255 rows,
+/// upstream stores patch indices as u8 — PType 0, which proto3 leaves out of the metadata — so
+/// this pins the reader to the default rather than the u32 it once assumed.
+async fn write_bitpacked_patches_u8_indices(
+    session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    use vortex_fastlanes::bitpack_compress::bitpack_encode;
+
+    let vals: Vec<i32> = (0..200)
+        .map(|i| if i % 20 == 3 { 1_000_000 + i } else { (i * 37) % 100 })
+        .collect();
+    let prim = PrimitiveArray::from_iter(vals);
+    let mut ctx = session.create_execution_ctx();
+    let bp = bitpack_encode(&prim, 7, None, &mut ctx).expect("bitpack_encode");
+
+    let data = StructArray::from_fields(&[("a", bp.into_array())])
+        .expect("from_fields")
+        .into_array();
+
+    // A flat strategy has no compressor, so the hand-built array is written as-is.
+    let strategy = std::sync::Arc::new(TableStrategy::new(
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
+        std::sync::Arc::new(FlatLayoutStrategy::default()),
+    ));
+
+    let mut bytes: Vec<u8> = Vec::new();
+    session
+        .write_options()
+        .disable_editions()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write");
     std::fs::write(path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     Ok(())

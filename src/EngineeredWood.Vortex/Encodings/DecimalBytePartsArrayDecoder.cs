@@ -75,32 +75,57 @@ internal static class DecimalBytePartsArrayDecoder
 
     private static void WidenToWide(IArrowArray msp, int rowCount, byte[] dst, int byteWidth)
     {
-        // Sign-extend a 64-bit signed value into byteWidth LE bytes.
+        // Sign-extend a 64-bit signed value into byteWidth LE bytes. The raw value slots are read,
+        // not GetValue: a null row has no value to return, and its slot is masked by the validity.
         switch (msp)
         {
             case Int8Array a:
-                for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, a.GetValue(i)!.Value);
+                {
+                    var v = a.Values;
+                    for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case Int16Array a:
-                for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, a.GetValue(i)!.Value);
+                {
+                    var v = a.Values;
+                    for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case Int32Array a:
-                for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, a.GetValue(i)!.Value);
+                {
+                    var v = a.Values;
+                    for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case Int64Array a:
-                for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, a.GetValue(i)!.Value);
+                {
+                    var v = a.Values;
+                    for (int i = 0; i < rowCount; i++) WriteSignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case UInt8Array u:
-                for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, u.GetValue(i)!.Value);
+                {
+                    var v = u.Values;
+                    for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case UInt16Array u:
-                for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, u.GetValue(i)!.Value);
+                {
+                    var v = u.Values;
+                    for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case UInt32Array u:
-                for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, u.GetValue(i)!.Value);
+                {
+                    var v = u.Values;
+                    for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             case UInt64Array u:
-                for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, u.GetValue(i)!.Value);
+                {
+                    var v = u.Values;
+                    for (int i = 0; i < rowCount; i++) WriteUnsignedLE(dst, i, byteWidth, v[i]);
+                }
                 break;
             default:
                 throw new NotSupportedException(

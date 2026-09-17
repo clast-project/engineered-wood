@@ -4,6 +4,7 @@
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.Format;
 
@@ -98,9 +99,30 @@ internal static class RunEndArrayDecoder
             (DoubleType, DoubleArray v) => ExpandPrimitive<double>(rowCount, ends, v,
                 i => v.GetValue(i) ?? default,
                 static (data, val, len, nc) => new DoubleArray(new ArrowBuffer(data), val, len, nc, 0)),
-            _ => throw new NotSupportedException(
-                $"vortex.runend: expansion for ({expectedType}, {values.GetType().Name}) not yet implemented."),
+            // Every other type (strings, booleans, decimals, nested…) gathers each row's run.
+            _ => ArrowCompute.Take(values, RunIndices(rowCount, ends)),
         };
+    }
+
+    /// <summary>The run each of <paramref name="rowCount"/> rows falls in.</summary>
+    private static int[] RunIndices(int rowCount, IArrowArray ends)
+    {
+        var runs = new int[rowCount];
+        int run = 0;
+        int runEnd = ends.Length == 0 ? 0 : GetIntAtIndex(ends, 0);
+        for (int i = 0; i < rowCount; i++)
+        {
+            while (i >= runEnd)
+            {
+                run++;
+                if (run >= ends.Length)
+                    throw new VortexFormatException(
+                        $"vortex.runend: row {i} exceeds last run end ({runEnd}).");
+                runEnd = GetIntAtIndex(ends, run);
+            }
+            runs[i] = run;
+        }
+        return runs;
     }
 
     private static IArrowArray ExpandPrimitive<T>(

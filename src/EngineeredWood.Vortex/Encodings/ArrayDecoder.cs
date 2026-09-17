@@ -32,6 +32,7 @@ internal static class ArrayDecoder
         IArrowType expectedType,
         long expectedRowCount)
     {
+        serialized = serialized.WithArraySpecs(arraySpecs);
         var encId = ResolveEncoding(node.EncodingIndex, arraySpecs);
         return encId switch
         {
@@ -96,6 +97,8 @@ internal static class ArrayDecoder
             VortexArrayEncodings.ListView => ListViewArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.Masked => MaskedArrayDecoder.Decode(
+                node, serialized, arraySpecs, expectedType, expectedRowCount),
+            VortexArrayEncodings.Chunked => ChunkedArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             _ => throw new NotSupportedException(
                 $"Vortex array encoding '{encId}' is not yet implemented. " +
