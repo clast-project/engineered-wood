@@ -35,7 +35,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry
     : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
-      ILiteralPrecisionRules, IAnalysisRules
+      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -1586,6 +1586,76 @@ public sealed class SparkFunctionRegistry
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Spark's <c>SpecialDatetimeValues</c>: a cast to DATE or TIMESTAMP over a constant string
+    /// reads the five special words.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The rule's whole content is in <c>SparkSpecialDatetimeValues</c>; what is here is where it
+    /// applies. <b>Both cast spellings, and no other function.</b> Spark's rule matches
+    /// <c>Cast(e, DateType | TimestampType | TimestampNTZType)</c>, and <c>try_cast</c> is a
+    /// <c>Cast</c> with a different eval mode rather than a node of its own, so it folds too --
+    /// measured, <c>try_cast('epoch' AS DATE)</c> is 1970-01-01 and not the null the name
+    /// suggests.
+    /// </para>
+    /// <para>
+    /// <b>TIMESTAMP_NTZ is left out, not forgotten.</b> Spark's rule covers it with a third
+    /// conversion whose <c>now</c> and <c>today</c> resolve in local time rather than as
+    /// instants, and this library has no NTZ type to produce -- <c>ParseTypeName</c> refuses the
+    /// spelling outright. #349.
+    /// </para>
+    /// <para>
+    /// <b>Null is returned for everything it does not recognise</b>, including a word that is not
+    /// in the vocabulary, so the cast still runs and the dialect still decides whether
+    /// <c>CAST('someday' AS DATE)</c> refuses or reads null.
+    /// </para>
+    /// </remarks>
+    public IArrowArray? InvokeOverConstants(string name, IReadOnlyList<IArrowArray> args, int rowCount)
+    {
+        if (args is null)
+            throw new ArgumentNullException(nameof(args));
+
+        if (name is not ("cast" or "try_cast") || args.Count != 2)
+            return null;
+
+        // Read from row 0, which is every row: the evaluator asks only when the argument holds no
+        // column reference. An empty array is the zero-row batch, where there is nothing to fold
+        // and nothing a cast could raise over either.
+        if (args[0] is not StringArray text || text.Length == 0 || text.IsNull(0))
+            return null;
+
+        var value = text.GetString(0);
+        if (value is null)
+            return null;
+
+        switch (TargetTypeOf(args[1]))
+        {
+            case Date32Type when SparkSpecialDatetimeValues.TryReadDate(value.AsSpan(), out var date):
+                return Folded(date, rowCount, SparkArrays.BuildDate32);
+
+            case TimestampType when SparkSpecialDatetimeValues.TryReadTimestamp(value.AsSpan(), out var instant):
+                return Folded(instant, rowCount, SparkArrays.BuildTimestamp);
+
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// The folded instant as a column of <paramref name="rowCount"/> rows, but never fewer than
+    /// one -- the length every constant is built at, for the reason
+    /// <c>ArrowRowEvaluator.ConstantArray</c> gives.
+    /// </summary>
+    private static IArrowArray Folded(
+        DateTimeOffset value, int rowCount, Func<DateTimeOffset?[], int, IArrowArray> build)
+    {
+        var length = Math.Max(rowCount, 1);
+        var values = new DateTimeOffset?[length];
+        for (var i = 0; i < length; i++) values[i] = value;
+        return build(values, length);
+    }
 
     /// <summary>Reads the target type out of the cast's second argument.</summary>
     /// <remarks>

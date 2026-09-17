@@ -1224,6 +1224,68 @@ corpus row cannot tell a rendering defect from a parse defect — which is why t
 `CAST(CAST(… AS TIMESTAMP) AS STRING)` and the renderer has a unit test of its
 own over a timestamp COLUMN, the path the corpus cannot reach.
 
+#### Five words that are dates, over a constant only
+
+Added 2026-09-17, closing #342. Spark reads `epoch`, `today`, `yesterday`,
+`tomorrow` and `now` as dates and timestamps — and the grammar above knows none
+of them. It is `SpecialDatetimeValues`, an **optimizer rule** over
+`Cast(e, DateType | TimestampType)` where `e.foldable`, plus the same conversion
+tried ahead of the grammar in `AstBuilder`'s typed literal. Measured on Spark
+4.0.3 / JDK 17.0.20, session zone UTC, in **both** dialects:
+
+| expression | Spark |
+|---|---|
+| `CAST('epoch' AS DATE)` | 1970-01-01 |
+| `CAST(concat('epo','ch') AS DATE)` | 1970-01-01 |
+| `CAST(s AS DATE)`, `s` = `'epoch'` | refused |
+| `CAST(CASE WHEN a > 0 THEN 'epoch' ELSE 'epoch' END AS DATE)` | refused |
+| `try_cast('epoch' AS DATE)` | 1970-01-01 |
+| `DATE'epoch'` | 1970-01-01 |
+
+The third and fourth rows are the whole shape of it. Both are the string
+`'epoch'` in **every row**, and both are refused, because the rule is a property
+of the expression TREE and not of the values: it fires where nothing below the
+cast reads a column. A fold keyed on the values would answer 1970-01-01 for them
+and — worse — would answer differently for the same CHECK constraint over the
+next batch.
+
+That split is why the rule arrives as a seam rather than as a case in the
+registry. Whether an argument is constant is something only `ArrowRowEvaluator`
+can see; which calls care, and what they then answer, is dialect knowledge only
+`SparkFunctionRegistry` has — it is the registry that tells `cast` from
+`try_cast`, reads a cast's target type out of its second argument, and owns the
+vocabulary. `IConstantFoldedFunctions` is that boundary, and it is optional in
+the way every other rule interface here is: a registry that does not implement
+it evaluates every call exactly as before, which is what `DeltaTable`,
+`LanceTable` and `LanceDatasetWriter` each get from an evaluator with no registry
+at all.
+
+Three properties of the word reader do not follow from its description, and each
+was measured rather than read off the source:
+
+- **The text after the word is a TIMEZONE**, and it has to resolve for the word
+  to count at all. `'epoch UTC'` is 1970-01-01 and `'epoch extra'` is refused;
+  `'epochUTC'` is refused because the alpha run is greedy and the match must
+  cover the string. The zone is never *used* — `'today America/Los_Angeles'` is
+  today in the **session** zone — which makes region ids the one place #318's
+  tz-database limit costs an answer it does not even affect. Declared as a known
+  difference, as the other region-zone rows are.
+- **`now` alone refuses a zone**, by name, in Spark's own `isValid`.
+- **`now` is not one value.** It is today for a DATE target and the current
+  instant for a TIMESTAMP one — the only word the two conversions disagree
+  about.
+
+Four of the five are a function of the clock, so the corpus can pin `epoch` by
+value and everything else only by SHAPE: `CAST('yesterday' AS DATE) <
+CAST('today' AS DATE)`, `DATE'today' = CAST('today' AS DATE)`. That shape is
+also the only form in which the parser's half and the evaluator's half can be
+checked against **each other**. What today's date actually is belongs in
+`SpecialDatetimeValuesTests`, where it can be recomputed instead of recorded.
+
+`TIMESTAMP_NTZ` is left out. Spark's rule covers it with a third conversion whose
+`now` and `today` resolve in local time rather than as instants, and this library
+has no NTZ type to produce — #349.
+
 ### Function set
 
 Minimum viable set for CHECK constraints and generated columns. The syntactic

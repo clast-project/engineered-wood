@@ -185,7 +185,13 @@ LEGACY_GROUPS = (
     "float-rounding",
     # #341. A malformed typed literal is a PARSE error, which no dialect ought to move -- asked
     # twice to record that, and because the legacy registry evaluates the literals that parse.
-    "typed-literals")
+    "typed-literals",
+    # #342. The FOLD is dialect-independent -- it is an optimizer rule that runs before either
+    # cast does -- and half the group is what happens to a word the fold does NOT take, which is
+    # CAST_INVALID_INPUT under ANSI and NULL without it. So the accept side is asked twice to
+    # record that the dialect does not reach it, and the refuse side because one harvest would
+    # show only one of its two faces.
+    "special-datetime-values")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3501,9 +3507,77 @@ GROUPS = {
         # --- THE REFUSAL IS A PARSE ERROR: try_cast does not soften it, in either dialect.
         "try_cast(DATE'2026/08/11' AS STRING)", "try_cast(TIMESTAMP'2026-08-11 extra' AS STRING)",
 
-        # --- #342's special word, which Spark reads and we refuse. `epoch` only: `today` and
-        # `now` would move with every harvest.
+        # --- #342's special word, kept here as well as in `special-datetime-values`: it is a
+        # TYPED LITERAL, so it belongs to this group's question too, and it was the row that
+        # recorded the gap before the fold existed. `epoch` only -- `today` and `now` would move
+        # with every harvest.
         "DATE'epoch'", "CAST(TIMESTAMP'epoch' AS STRING)",
+    ],
+
+    # THE SPECIAL DATETIME WORDS. #342. Spark reads `epoch`, `today`, `yesterday`, `tomorrow`
+    # and `now` as dates and timestamps -- but in `SpecialDatetimeValues`, an optimizer rule over
+    # a cast whose operand is FOLDABLE, and in `AstBuilder`'s typed literal. The grammar of #318
+    # knows none of them, so the same word arriving in a row is refused.
+    #
+    # ONLY `epoch` CAN BE PINNED BY VALUE. The other four are a function of the clock, so every
+    # row below that names one asks a SHAPE instead -- `yesterday < today`, `DATE'today' =
+    # CAST('today' AS DATE)` -- which is stable across harvests and is also the only form in
+    # which the two halves of the rule can be checked against each other at all.
+    "special-datetime-values": [
+        # --- THE STABLE WORD, through both targets and both cast spellings.
+        "CAST('epoch' AS DATE)", "CAST(CAST('epoch' AS TIMESTAMP) AS STRING)",
+        "try_cast('epoch' AS DATE)", "year(CAST('epoch' AS DATE))",
+        "CAST(CAST('epoch' AS DATE) AS STRING)", "DATE'epoch' = CAST('epoch' AS DATE)",
+        "CAST('epoch' AS TIMESTAMP) = TIMESTAMP'1970-01-01 00:00:00'",
+
+        # --- CASE AND TRIM. The text is trimmed as a cast trims it and the word matched
+        # case-insensitively, so these three are the same date.
+        "CAST('EPOCH' AS DATE)", "CAST('Epoch' AS DATE)", "CAST('  epoch  ' AS DATE)",
+
+        # --- FOLDABLE, NOT LITERAL. The rule calls `e.eval()` itself rather than waiting for
+        # constant folding, so a cast over any constant string takes it.
+        "CAST(concat('epo','ch') AS DATE)", "CAST(upper('epoch') AS DATE)",
+        "CAST(substring('epochal',1,5) AS DATE)", "CAST(trim(' epoch ') AS DATE)",
+
+        # --- ...AND OVER A CONSTANT ONLY, which is the discriminator the issue turns on. Both
+        # of these are the string 'epoch' in EVERY row and both are refused, because they read a
+        # column. A fold keyed on the values would answer 1970-01-01 for them.
+        "CAST(if(a > 0, 'epoch', 'epoch') AS DATE)",
+        "CAST(CASE WHEN a > 0 THEN 'epoch' ELSE 'epoch' END AS DATE)",
+        "try_cast(if(a > 0, 'epoch', 'epoch') AS DATE)",
+
+        # --- THE TAIL AFTER THE WORD IS A TIMEZONE, and it has to resolve for the word to count.
+        # Nothing about the shape suggests it, and the zone is never used: the answer is still
+        # the epoch. `epochUTC` is refused because the alpha run is greedy.
+        "CAST('epoch UTC' AS DATE)", "CAST('epoch +02:00' AS DATE)",
+        "CAST('epoch extra' AS DATE)", "CAST('epochUTC' AS DATE)",
+        "CAST('epoch America/Los_Angeles' AS DATE)",
+
+        # --- THE VOCABULARY'S EDGES. Under three characters, or a word that is not one of the
+        # five, never reaches the conversion at all.
+        "CAST('ep' AS DATE)", "CAST('epochs' AS DATE)", "CAST('someday' AS DATE)",
+        "try_cast('someday' AS DATE)",
+
+        # --- A NON-TEMPORAL TARGET is untouched, which is the control for the rule's reach.
+        "CAST('epoch' AS STRING)", "try_cast('epoch' AS INT)",
+
+        # --- THE CLOCK-DEPENDENT FOUR, asked only as shapes. The first says `now` is TODAY for a
+        # date target and the last says it is the INSTANT for a timestamp one -- the only word
+        # the two conversions disagree about.
+        "CAST('today' AS DATE) = CAST('now' AS DATE)",
+        "CAST('yesterday' AS DATE) < CAST('today' AS DATE)",
+        "CAST('tomorrow' AS DATE) > CAST('today' AS DATE)",
+        "CAST('today' AS TIMESTAMP) <= CAST('now' AS TIMESTAMP)",
+        "CAST(CAST('now' AS TIMESTAMP) AS DATE) = CAST('today' AS DATE)",
+        "CAST('today UTC' AS DATE) = CAST('today' AS DATE)",
+        "CAST('now UTC' AS DATE)",
+
+        # --- THE TYPED LITERAL, which is the parser's half of the same rule. It agrees with the
+        # cast, and a word it cannot read falls through to the grammar and is a PARSE error --
+        # which is a different failure from the cast's, on the same text.
+        "DATE'today' = CAST('today' AS DATE)", "DATE'yesterday' < DATE'today'",
+        "CAST(TIMESTAMP'now' AS DATE) = DATE'today'", "DATE'  EPOCH  '",
+        "DATE'now UTC'", "DATE'someday'", "TIMESTAMP'epoch' = TIMESTAMP'1970-01-01'",
     ],
 
     "malformed": [

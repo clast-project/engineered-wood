@@ -586,11 +586,6 @@ public sealed class SparkSqlParserTests
             @"r'a\nb'",
             "R'it''s'",
 
-            // #342. Spark reads the special words `epoch`, `today` and `now` in a typed literal;
-            // this parser reads the grammar Spark shares with CAST (#341) and not the words. Only
-            // `epoch` is in the corpus, because the other two move with every harvest.
-            "DATE'epoch'",
-            "CAST(TIMESTAMP'epoch' AS STRING)",
         };
 
         var refused = new List<string>();

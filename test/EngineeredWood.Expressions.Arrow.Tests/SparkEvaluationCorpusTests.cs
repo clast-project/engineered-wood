@@ -189,6 +189,15 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST('2026-08-11 12:30:00EST' AS TIMESTAMP) AS STRING)"] =
             "#318: a short-id timezone resolves through the same database",
 
+        // ...and the same limit reaching one row of #342's group, which is the cheapest place to
+        // see how narrow it is. `extractSpecialValue` treats whatever follows a special word as a
+        // timezone and requires only that it RESOLVE -- the zone is never used, so Spark answers
+        // 1970-01-01 here without consulting it. We refuse because the id is a region one, which
+        // makes this the one shape where the tz database costs an answer it does not affect.
+        ["CAST('epoch America/Los_Angeles' AS DATE)"] =
+            "#342/#318: the zone after a special word need only resolve, and a region id does "
+            + "not resolve on every target framework",
+
         // #301, and the one row of the `binary-casts` group that diverges. Spark's STRING is a
         // BYTE string: `CAST(X'FF' AS STRING)` holds the raw FF, and casting it back hands the
         // same byte over. A .NET string is UTF-16 and cannot hold an unpaired FF, so the decode
@@ -199,12 +208,6 @@ public sealed class SparkEvaluationCorpusTests
         // compares FF with FF; we compare U+FFFD with U+FFFD; both routes say equal.
         ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
             "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
-
-        // #342, from the `typed-literals` group #341 added. Spark reads the special word `epoch`
-        // in a typed literal and we refuse it at parse time, as we did before #341 -- the grammar
-        // fix deliberately does not reach the words.
-        ["DATE'epoch'"] = "#342: Spark reads the special word 'epoch'; we refuse it",
-        ["CAST(TIMESTAMP'epoch' AS STRING)"] = "#342: Spark reads the special word 'epoch'; we refuse it",
 
 
         // ── DIVERGENT BY JDK: the fixture's answers, not Spark's alone. ───────────────────────
@@ -371,13 +374,15 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(CAST('2026-08-11 12:30:00EST' AS TIMESTAMP) AS STRING)"] =
                 "#318: a short-id timezone resolves through the same database",
 
+            // ...and #342's one row of the same kind, as in the ANSI list.
+            ["CAST('epoch America/Los_Angeles' AS DATE)"] =
+                "#342/#318: the zone after a special word need only resolve, and a region id "
+                + "does not resolve on every target framework",
+
             // #301, as in the ANSI list: the round trip through STRING loses the raw byte.
             ["CAST(CAST(X'FF' AS STRING) AS BINARY)"] =
                 "#301: Spark's STRING is bytes, ours is UTF-16, so FF becomes U+FFFD",
 
-            // #342, as in the ANSI list: a parse refusal, so the same in this dialect.
-            ["DATE'epoch'"] = "#342: Spark reads the special word 'epoch'; we refuse it",
-            ["CAST(TIMESTAMP'epoch' AS STRING)"] = "#342: Spark reads the special word 'epoch'; we refuse it",
 
             // `coalesce(X'00', CAST(NULL AS STRING))` used to sit here as #293: a typed null string
             // was indistinguishable from the untyped placeholder, so we dropped it and answered
