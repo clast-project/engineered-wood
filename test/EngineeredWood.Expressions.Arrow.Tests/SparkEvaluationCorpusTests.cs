@@ -236,6 +236,26 @@ public sealed class SparkEvaluationCorpusTests
         ["CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ) AS STRING)"] =
             "#378: TIMESTAMP_NTZ is not a cast target here, and it DISCARDS the zone the text "
             + "carried rather than resolving it",
+        ["CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)"] =
+            "#378: the same, with an OFFSET rather than a named zone -- Spark keeps 12:30 and a "
+            + "zoned cast would have converted it to 10:30",
+
+        // 4. A STRING AGAINST A NAIVE TIMESTAMP IS CAST TO A ZONED ONE HERE, which is a wrong
+        // ANSWER rather than a wrong type -- the only one in the group. Spark casts it to the
+        // NTZ, so the offset is DROPPED and the wall clock kept; we have no naive cast, so we
+        // convert. Measured with `ntz` at 08:00 wall: Spark reads '08:00+02:00' as 08:00 and
+        // matches, we read it as 06:00Z and do not.
+        //
+        // AN OFFSET-CARRYING STRING IS THE ONLY STRING THAT CAN SHOW THIS under a UTC session
+        // zone -- every offset-free one converts to the same micros either way, which is why the
+        // rest of this group agrees and why these rows were missing until a review asked about
+        // the neighbouring set case. #378 is where the naive cast would land, and
+        // `StringComparisonTarget`/`ConditionalStringTarget` have to move with it.
+        ["ntz = '2026-08-11 08:00:00+02:00'"] =
+            "#378: a string against a naive timestamp is cast to a ZONED one here, so the offset "
+            + "converts where Spark discards it",
+        ["ntz IN ('2026-08-11 08:00:00+02:00')"] =
+            "#378: the same through a set, which under ANSI resolves the same temporal target",
 
         // 3. AN INTERVAL, which this library does not model at all. `ntz - ts` is
         // `interval day to second` to Spark, and so is `ts - ts`; no corpus group has ever asked
@@ -443,6 +463,19 @@ public sealed class SparkEvaluationCorpusTests
             ["CAST(CAST('2026-08-11 12:30:00 UTC' AS TIMESTAMP_NTZ) AS STRING)"] =
                 "#378: TIMESTAMP_NTZ is not a cast target here, and it DISCARDS the zone the "
                 + "text carried rather than resolving it",
+            ["CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)"] =
+                "#378: the same, with an OFFSET rather than a named zone",
+
+            // The string comparison, as in the ANSI list -- but ONE row rather than two, and the
+            // missing one is a rule rather than an accident. `ntz IN ('…+02:00')` is TRUE under
+            // ANSI and FALSE here, because a set resolves ONE type over the operand and the whole
+            // list and this dialect resolves that to STRING, so the timestamp is RENDERED and
+            // compared as text. That is #261's rule (`a IN ('01')` is false here, `a = '01'` is
+            // true) reaching a type nothing had asked it about -- and it happens to make our
+            // answer right, since we render the same text. The `=` row has no such escape.
+            ["ntz = '2026-08-11 08:00:00+02:00'"] =
+                "#378: a string against a naive timestamp is cast to a ZONED one here, so the "
+                + "offset converts where Spark discards it",
             ["CAST(TIMESTAMP_NTZ'2026-08-11 12:30:00' AS STRING)"] =
                 "#378: TIMESTAMP_NTZ is not a typed literal here",
             ["ntz - ts"] = "#379: subtracting two temporals yields an INTERVAL, a type we do not model",

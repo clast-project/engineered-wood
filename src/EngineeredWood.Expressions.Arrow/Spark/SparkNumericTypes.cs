@@ -228,8 +228,16 @@ internal static class SparkNumericTypes
         throw new NotSupportedException($"no common type for {left.Name} and {right.Name}");
     }
 
-    /// <summary>The type a DATE and a TIMESTAMP unify to, which is TIMESTAMP.</summary>
+    /// <summary>
+    /// The type two temporals unify to: a DATE, a zoned TIMESTAMP or a TIMESTAMP_NTZ.
+    /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>Three answers, not one.</b> Two dates stay a date; a pair with any zoned timestamp in
+    /// it is zoned; a pair with a naive timestamp and no zoned one is naive. The paragraphs below
+    /// give #311's half (a DATE against a zoned TIMESTAMP) and then #349's, which added the
+    /// other two.
+    /// </para>
     /// <para>
     /// Measured on 4.0.3 and identical under the legacy dialect: <c>coalesce(ts, dt)</c> is a
     /// <c>timestamp</c>, and so are <c>if</c>, <c>CASE</c>, <c>nvl2</c>, <c>greatest</c> and

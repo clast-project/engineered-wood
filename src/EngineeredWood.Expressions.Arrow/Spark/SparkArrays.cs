@@ -368,11 +368,14 @@ internal static class SparkArrays
     /// <summary>The Unix epoch, as the instant a Date32 counts days from.</summary>
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    /// <summary>The one timestamp type this evaluator ever produces.</summary>
+    /// <summary>The one ZONED timestamp type this evaluator ever produces.</summary>
     /// <remarks>
     /// Microseconds in UTC, which is what
     /// <see cref="BuildTimestamp(DateTimeOffset?[], int)"/> builds — so a rule that
-    /// RESOLVES a timestamp must name this instance and not construct its own. A source column
+    /// RESOLVES a zoned timestamp must name this instance and not construct its own.
+    /// <see cref="NaiveTimestamp"/> is the other half of the pair, and between them they are
+    /// still the only two timestamp types anything here produces: a source column's own type is
+    /// never passed through, only read for its zone. A source column
     /// may well carry another unit or zone (Parquet writes milliseconds happily), and a
     /// resolution that echoed the source's type back would promise a type the array it hands
     /// over does not have. #311.

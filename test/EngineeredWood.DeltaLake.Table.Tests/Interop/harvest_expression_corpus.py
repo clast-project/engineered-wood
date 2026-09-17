@@ -3630,6 +3630,25 @@ GROUPS = {
         "ntz = s", "ntz < s", "ntz <=> s", "ntz IN (s)",
         "ntz = '2026-08-11 08:00:00'", "ntz IN ('2026-08-11 08:00:00')",
 
+        # --- A STRING CARRYING AN OFFSET, which is the only string that can tell the two
+        # temporal targets apart under a UTC session zone. Cast to a ZONED timestamp it converts
+        # (08:00+02:00 -> 06:00Z); cast to an NTZ the zone is DROPPED and the wall clock kept
+        # (08:00). Spark casts it to the NTZ and matches; we have no naive cast at all, so we
+        # convert and do not. Every other string in this group is offset-free and so agrees by
+        # construction -- which is why the group missed this until a review asked about the
+        # neighbouring set case.
+        "ntz = '2026-08-11 08:00:00+02:00'", "ntz IN ('2026-08-11 08:00:00+02:00')",
+        # ...the same string against a ZONED operand, which is the control: converting IS right
+        # there, and we agree.
+        "ts = '2026-08-11 12:30:00+02:00'",
+        # ...and the MIXED set the review asked about. Spark resolves the ZONED target when a
+        # zoned member is present -- measured, `ntz IN (ts, '…+02:00')` is false where
+        # `ntz IN ('…+02:00')` alone is true. We resolve the naive one and still answer the same,
+        # because our cast honours the offset whichever target it was handed; the target is
+        # unobservable until there is a naive cast for it to pick.
+        "ntz IN (ts, '2026-08-11 08:00:00+02:00')",
+        "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)",
+
         # --- THE CAST TABLE, WHICH IS NOT THE ZONED ONE. A numeric target is refused for an NTZ
         # and allowed for a zoned timestamp -- `CAST(ts AS LONG)` is the control that says so.
         "CAST(ntz AS STRING)", "CAST(CAST(ntz AS DATE) AS STRING)",

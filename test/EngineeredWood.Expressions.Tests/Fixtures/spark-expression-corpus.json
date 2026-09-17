@@ -2284,9 +2284,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-17 21:47:47.467125",
-      "2026-09-17 21:47:47.467125",
-      "2026-09-17 21:47:47.467125"
+      "2026-09-17 22:07:01.657837",
+      "2026-09-17 22:07:01.657837",
+      "2026-09-17 22:07:01.657837"
      ]
     }
    },
@@ -51003,7 +51003,7 @@
     "parse": {
      "ok": true,
      "node": "EqualTo",
-     "sql": "(CAST(TIMESTAMP '2026-09-17 21:48:43.025465' AS DATE) = DATE '2026-09-17')"
+     "sql": "(CAST(TIMESTAMP '2026-09-17 22:07:54.884408' AS DATE) = DATE '2026-09-17')"
     },
     "type": {
      "ok": true,
@@ -52071,6 +52071,106 @@
     }
    },
    {
+    "expression": "ntz = '2026-08-11 08:00:00+02:00'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ntz = '2026-08-11 08:00:00+02:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ntz IN ('2026-08-11 08:00:00+02:00')",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ntz IN ('2026-08-11 08:00:00+02:00'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ts = '2026-08-11 12:30:00+02:00'",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(ts = '2026-08-11 12:30:00+02:00')"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "ntz IN (ts, '2026-08-11 08:00:00+02:00')",
+    "parse": {
+     "ok": true,
+     "node": "In",
+     "sql": "(ntz IN (ts, '2026-08-11 08:00:00+02:00'))"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00",
+      "2026-08-11 12:30:00"
+     ]
+    }
+   },
+   {
     "expression": "CAST(ntz AS STRING)",
     "parse": {
      "ok": true,
@@ -52139,11 +52239,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as bigint) AS r#10125]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as bigint) AS r#10145]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as bigint) AS r#10126]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as bigint) AS r#10146]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
     }
    },
    {
@@ -52155,11 +52255,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as int) AS r#10127]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as int) AS r#10147]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as int) AS r#10128]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 as float"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as int) AS r#10148]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 as float"
     }
    },
    {
@@ -52171,11 +52271,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as double) AS r#10129]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as double) AS r#10149]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as double) AS r#10130]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as double) AS r#10150]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
     }
    },
    {
@@ -52187,11 +52287,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as decimal(20,0)) AS r#10131]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as decimal(20,0)) AS r#10151]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, "
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as decimal(20,0)) AS r#10132]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallin"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as decimal(20,0)) AS r#10152]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallin"
     }
    },
    {
@@ -52203,11 +52303,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as boolean) AS r#10133]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as boolean) AS r#10153]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as boolean) AS r#10134]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast("
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as boolean) AS r#10154]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast("
     }
    },
    {
@@ -52219,11 +52319,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as binary) AS r#10135]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as binary) AS r#10155]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as binary) AS r#10136]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as binary) AS r#10156]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5"
     }
    },
    {
@@ -52235,11 +52335,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#16 as int) AS r#10137]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#16 as int) AS r#10157]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#36 as int) AS r#10138]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#36 as int) AS r#10158]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
     }
    },
    {
@@ -52311,11 +52411,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#1L as timestamp_ntz) as string) AS r#10151]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#1L as timestamp_ntz) as string) AS r#10171]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#21L as timestamp_ntz) as string) AS r#10152]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as s"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#21L as timestamp_ntz) as string) AS r#10172]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as s"
     }
    },
    {
@@ -52547,11 +52647,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#16 + 1) AS r#10197]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#16 + 1) AS r#10217]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#36 + 1) AS r#10198]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#36 + 1) AS r#10218]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L"
     }
    },
    {
@@ -52603,11 +52703,11 @@
     },
     "type": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#16, 1) AS r#10207]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16"
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#16, 1) AS r#10227]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16"
     },
     "eval": {
      "ok": false,
-     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#36, 1) AS r#10208]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, "
+     "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#36, 1) AS r#10228]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, "
     }
    }
   ],
@@ -93304,7 +93404,7 @@
      "parse": {
       "ok": true,
       "node": "EqualTo",
-      "sql": "(CAST(TIMESTAMP '2026-09-17 21:49:40.668473' AS DATE) = DATE '2026-09-17')"
+      "sql": "(CAST(TIMESTAMP '2026-09-17 22:08:53.548678' AS DATE) = DATE '2026-09-17')"
      },
      "type": {
       "ok": true,
@@ -94388,6 +94488,106 @@
      }
     },
     {
+     "expression": "ntz = '2026-08-11 08:00:00+02:00'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ntz = '2026-08-11 08:00:00+02:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ntz IN ('2026-08-11 08:00:00+02:00')",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ntz IN ('2026-08-11 08:00:00+02:00'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ts = '2026-08-11 12:30:00+02:00'",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(ts = '2026-08-11 12:30:00+02:00')"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "ntz IN (ts, '2026-08-11 08:00:00+02:00')",
+     "parse": {
+      "ok": true,
+      "node": "In",
+      "sql": "(ntz IN (ts, '2026-08-11 08:00:00+02:00'))"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('2026-08-11 12:30:00+02:00' AS TIMESTAMP_NTZ) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00",
+       "2026-08-11 12:30:00"
+      ]
+     }
+    },
+    {
      "expression": "CAST(ntz AS STRING)",
      "parse": {
       "ok": true,
@@ -94456,11 +94656,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as bigint) AS r#7971]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as bigint) AS r#7991]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as bigint) AS r#7972]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BIGINT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BIGINT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as bigint) AS r#7992]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
      }
     },
     {
@@ -94472,11 +94672,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as int) AS r#7973]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as int) AS r#7993]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as int) AS r#7974]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 as float)"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as int) AS r#7994]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 as float)"
      }
     },
     {
@@ -94488,11 +94688,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as double) AS r#7975]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as double) AS r#7995]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as double) AS r#7976]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DOUBLE)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DOUBLE\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as double) AS r#7996]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
      }
     },
     {
@@ -94504,11 +94704,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as decimal(20,0)) AS r#7977]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as decimal(20,0)) AS r#7997]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as decimal(20,0)) AS r#7978]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS DECIMAL(20,0))\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"DECIMAL(20,0)\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as decimal(20,0)) AS r#7998]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint"
      }
     },
     {
@@ -94520,11 +94720,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as boolean) AS r#7979]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as boolean) AS r#7999]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as boolean) AS r#7980]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BOOLEAN)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BOOLEAN\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as boolean) AS r#8000]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1"
      }
     },
     {
@@ -94536,11 +94736,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as binary) AS r#7981]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#16 as binary) AS r#8001]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as binary) AS r#7982]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(ntz AS BINARY)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"BINARY\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [cast(ntz#36 as binary) AS r#8002]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 "
      }
     },
     {
@@ -94552,11 +94752,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#16 as int) AS r#7983]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#16 as int) AS r#8003]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#18, nested#19], false\n"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#36 as int) AS r#7984]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 a"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"TRY_CAST(ntz AS INT)\" due to data type mismatch: cannot cast \"TIMESTAMP_NTZ\" to \"INT\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [try_cast(ntz#36 as int) AS r#8004]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as smallint) AS sh#22, cast(1.5 a"
      }
     },
     {
@@ -94628,11 +94828,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#1L as timestamp_ntz) as string) AS r#7997]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#1L as timestamp_ntz) as string) AS r#8017]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16, bl#17, bin#"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#21L as timestamp_ntz) as string) AS r#7998]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as sm"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve \"CAST(b AS TIMESTAMP_NTZ)\" due to data type mismatch: cannot cast \"BIGINT\" to \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 6;\n'Project [cast(cast(b#21L as timestamp_ntz) as string) AS r#8018]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, cast(2 as sm"
      }
     },
     {
@@ -94864,11 +95064,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#16 + 1) AS r#8043]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#1"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#16 + 1) AS r#8063]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#1"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#36 + 1) AS r#8044]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L,"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES] Cannot resolve \"(ntz + 1)\" due to data type mismatch: the left and right operands of the binary operator have incompatible types (\"TIMESTAMP_NTZ\" and \"INT\"). SQLSTATE: 42K09; line 1 pos 1;\n'Project [(ntz#36 + 1) AS r#8064]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L,"
      }
     },
     {
@@ -94920,11 +95120,11 @@
      },
      "type": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#16, 1) AS r#8053]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16,"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#16, 1) AS r#8073]\n+- LogicalRDD [a#0, b#1L, sh#2, f#3, g#4, d1#5, d2#6, d3#7, d4#8, d5#9, s#10, t#11, ns#12, fs#13, ts#14, dt#15, ntz#16,"
      },
      "eval": {
       "ok": false,
-      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#36, 1) AS r#8054]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, c"
+      "error": "AnalysisException: [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve \"round(ntz, 1)\" due to data type mismatch: The first parameter requires the \"NUMERIC\" type, however \"ntz\" has the type \"TIMESTAMP_NTZ\". SQLSTATE: 42K09; line 1 pos 1;\n'Project [round(ntz#36, 1) AS r#8074]\n+- Union false, false\n   :- Union false, false\n   :  :- Project [cast(1 as int) AS a#20, cast(10 as bigint) AS b#21L, c"
      }
     }
    ]

@@ -1270,15 +1270,26 @@ its count rather than fixed here, because they are a decision about whether this
 layer models `timestamp_ntz` as a distinct type at all rather than a rule that
 was merely missing:
 
-- **The cast table is not the zoned one** (#377). Spark refuses a numeric target for a
-  naive timestamp and *allows* one for a zoned timestamp; `CAST(ts AS LONG)` is
-  in the group as the control that says so. We reach both through one
-  `Source.Temporal` arm.
-- **`TIMESTAMP_NTZ` is neither a cast target nor a typed literal here** (#378).
-  Measured, the cast keeps the wall clock and **discards** any zone the text
-  carried.
-- **Subtracting two temporals yields an `interval day to second`** (#379), a type
-  this library does not model at all.
+- **The cast table is not the zoned one** (#377, 5 rows ANSI / 6 legacy). Spark
+  refuses a numeric target for a naive timestamp and *allows* one for a zoned
+  timestamp; `CAST(ts AS LONG)` is in the group as the control that says so. We
+  reach both through one `Source.Temporal` arm.
+- **`TIMESTAMP_NTZ` is neither a cast target nor a typed literal here**, and a
+  string compared against a naive timestamp is cast to a **zoned** one (#378,
+  7 rows ANSI / 6 legacy). The cast keeps the wall clock and **discards** any
+  zone the text carried, so `ntz = '…08:00+02:00'` is true to Spark — it reads
+  08:00 — and false here, because we convert to 06:00Z. **Only an
+  offset-carrying string can show this** under a UTC session zone: every
+  offset-free one lands on the same micros either way.
+- **Subtracting two temporals yields an `interval day to second`** (#379, 2 rows
+  per dialect), a type this library does not model at all.
+
+One of those rows is a dialect split worth knowing, because it makes our answer
+accidentally right: `ntz IN ('…+02:00')` is **true** under ANSI and **false**
+under the legacy dialect, where a set resolves one type over the operand and the
+whole list and that type is `string` — so the timestamp is rendered and compared
+as text. `ntz = '…+02:00'` is true under both and has no such escape. That is
+#261's `IN`-versus-`=` rule reaching a type nothing had asked it about.
 
 #### Five words that are dates, over a constant only
 

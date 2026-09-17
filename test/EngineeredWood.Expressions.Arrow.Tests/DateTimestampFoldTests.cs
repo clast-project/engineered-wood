@@ -68,6 +68,10 @@ public class DateTimestampFoldTests
             .Field(new Field("ts", SparkArrays.Timestamp, true))
             .Field(new Field("dt", Date32Type.Default, true))
             .Field(new Field("ntz", SparkArrays.NaiveTimestamp, true))
+            // NON-CANONICAL sources: a millisecond zoned timestamp and a millisecond naive one,
+            // which is what a Parquet reader hands over and what no corpus row can supply.
+            .Field(new Field("tsms", MilliZoned, true))
+            .Field(new Field("ntzms", MilliNaive, true))
             .Build();
 
         var timestamps = new TimestampArray.Builder(SparkArrays.Timestamp);
@@ -87,7 +91,20 @@ public class DateTimestampFoldTests
             timestamps.Build(),
             dates.Build(),
             naive.Build(),
+            Milli(MilliZoned, Noon),
+            Milli(MilliNaive, Wall),
         }, 1);
+    }
+
+    private static readonly TimestampType MilliZoned = new(TimeUnit.Millisecond, "UTC");
+
+    private static readonly TimestampType MilliNaive = new(TimeUnit.Millisecond, (string?)null);
+
+    private static IArrowArray Milli(TimestampType type, DateTimeOffset value)
+    {
+        var builder = new TimestampArray.Builder(type);
+        builder.Append(value);
+        return builder.Build();
     }
 
     private static IArrowArray Evaluate(SparkFunctionRegistry registry, string expression) =>
@@ -258,6 +275,60 @@ public class DateTimestampFoldTests
             Assert.True(string.IsNullOrEmpty(((TimestampType)least.Data.DataType).Timezone));
             Assert.Equal(Midnight, least.GetTimestamp(0));
         }
+    }
+
+    /// <summary>
+    /// A fold builds at a CANONICAL timestamp, never at a source column's own type.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The corpus cannot see this and never will</b>: the harvest schema has one timestamp
+    /// column and it is microseconds, so no row of it carries a unit the evaluator would have to
+    /// normalise. That is exactly how #349 nearly reintroduced the promise #311 removed — passing
+    /// the RESOLVED type to <c>BuildTimestamp</c> is right for the zone and wrong for everything
+    /// else, because two callers hand <c>Unify</c> a source column's raw type: <c>nullif</c>
+    /// passes <c>args[0].Data.DataType</c> straight through, and <c>ConditionalType</c> keeps a
+    /// sole surviving branch's own type.
+    /// </para>
+    /// <para>
+    /// Measured on the branch before the fix, over a <c>timestamp(ms, UTC)</c> column:
+    /// <c>coalesce(tsms)</c>, <c>coalesce(tsms, NULL)</c> and <c>nullif(tsms, dt)</c> all came
+    /// back MILLISECOND, where every route that actually unified two types came back microsecond.
+    /// Parquet writes millisecond timestamps happily, so this is an ordinary column rather than a
+    /// contrived one. Caught on review of #380.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("coalesce(tsms)")]
+    [InlineData("coalesce(tsms, NULL)")]
+    // Against `dt`, not `ts`: the two timestamps hold the same instant, so `nullif` would
+    // answer NULL and the value assertion would have nothing to check.
+    [InlineData("nullif(tsms, dt)")]
+    [InlineData("if(1 > 0, tsms, tsms)")]
+    [InlineData("coalesce(tsms, ts)")]
+    public void AFoldOverANonCanonicalSourceStillBuildsMicroseconds(string sql)
+    {
+        foreach (var registry in new[] { Ansi, Legacy })
+        {
+            var result = Assert.IsType<TimestampArray>(Evaluate(registry, sql));
+            var type = (TimestampType)result.Data.DataType;
+
+            Assert.Equal(TimeUnit.Microsecond, type.Unit);
+            Assert.Equal("UTC", type.Timezone);
+            Assert.Equal(Noon, result.GetTimestamp(0));
+        }
+    }
+
+    /// <summary>...and the naive arm keeps its own canonical instance, not the source's.</summary>
+    [Fact]
+    public void ANaiveFoldOverANonCanonicalSourceIsCanonicalToo()
+    {
+        var result = Assert.IsType<TimestampArray>(Evaluate(Ansi, "coalesce(ntzms)"));
+        var type = (TimestampType)result.Data.DataType;
+
+        Assert.Equal(TimeUnit.Microsecond, type.Unit);
+        Assert.True(string.IsNullOrEmpty(type.Timezone));
+        Assert.Equal(Wall, result.GetTimestamp(0));
     }
 
     /// <summary>
