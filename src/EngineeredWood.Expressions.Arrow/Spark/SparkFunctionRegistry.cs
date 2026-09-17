@@ -2288,12 +2288,26 @@ public sealed class SparkFunctionRegistry
     private IReadOnlyList<IArrowArray> SubstringArguments(
         string name, IReadOnlyList<IArrowArray> args, int rowCount)
     {
-        var prepared = new IArrowArray[args.Count];
-        prepared[0] = AsText(args[0]);
-        for (var i = 1; i < args.Count; i++)
-            prepared[i] = IntArgument(name, i, args[i], rowCount);
+        // Copied only once an argument actually changes, so the common call -- text and int
+        // arguments -- allocates nothing, the same rule `AsText` follows for a list.
+        IArrowArray[]? prepared = null;
+        for (var i = 0; i < args.Count; i++)
+        {
+            var argument = i == 0 ? AsText(args[0]) : IntArgument(name, i, args[i], rowCount);
+            if (prepared is null && ReferenceEquals(argument, args[i]))
+                continue;
 
-        return prepared;
+            if (prepared is null)
+            {
+                prepared = new IArrowArray[args.Count];
+                for (var j = 0; j < i; j++)
+                    prepared[j] = args[j];
+            }
+
+            prepared[i] = argument;
+        }
+
+        return prepared ?? args;
     }
 
     /// <remarks>
