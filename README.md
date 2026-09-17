@@ -515,10 +515,20 @@ implementation.
   numeric columns through `vortex.pco`), `preferDateTimeParts` (split
   `TimestampArray` into days/seconds/subseconds), `preferDictLayout`
   (share one global string dict across all batches via a
-  `vortex.dict` layout instead of per-batch array-level dicts), and
+  `vortex.dict` layout instead of per-batch array-level dicts),
   `preserveStats` (wrap each column in a `vortex.stats` layout that
   carries per-zone Min/Max/NullCount/etc., enabling reader-side zone
-  pruning).
+  pruning), and `preferDelta` (let the compressing chain use
+  `fastlanes.delta`; see below).
+- Everything the writer emits belongs to a frozen core Vortex edition
+  (`core2025.05.0` through `core2025.10.0`: vortex 0.36 reads the base set,
+  0.40 adds `vortex.pco`, 0.54 adds `fastlanes.rle` and
+  `vortex.fixed_size_list`), except
+  `fastlanes.delta`, which belongs to no edition and so carries no upstream
+  promise that later readers accept it. The writer only uses it under
+  `preferDelta`. A `FixedSizeBinary(16)` column is written as the
+  `vortex.uuid` extension, which vortex has read since before 0.70 but
+  only froze in `core2026.08.3` (0.85).
 - `preferDictLayout && preserveStats` emits
   `vortex.stats(vortex.dict(...), zones-flat)` so predicate pruning
   works against dict-layout files too.
@@ -565,7 +575,7 @@ implementation.
 `vortex.list`, `vortex.fixed_size_list`, `vortex.struct`,
 `vortex.decimal`, `vortex.datetimeparts`, `vortex.ext` (Date / Time /
 Timestamp / UUID), `fastlanes.bitpacked` (with best-bit-width selection
-and patches), `fastlanes.for`, `fastlanes.delta`, `fastlanes.rle`
+and patches), `fastlanes.for`, `fastlanes.delta` (under `preferDelta`), `fastlanes.rle`
 (floats, nullable), `vortex.pco`. Compressing encoders honor
 `data.Offset != 0` (sliced inputs).
 

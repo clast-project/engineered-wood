@@ -591,9 +591,14 @@ and aggregate ids into frozen *editions* (`docs/specs/editions.md`
 upstream); a writer may only emit ids from the editions it enables. The
 reader covers `core2026.08.1`, whose `vortex.onpair` the default compressor
 picks for strings. Not yet read: `vortex.map` (08.2) and `vortex.variant` /
-`vortex.parquet.variant` (08.3). `fastlanes.delta`,
-which the writer emits, is in no edition, so files that use it carry no
-upstream compatibility promise (0.86 still reads them).
+`vortex.parquet.variant` (08.3).
+
+The writer emits only core-edition components (`core2025.05.0`–`10.0`,
+checked by `VortexWriterEditionTests`), except `fastlanes.delta`, which is
+in no edition and so carries no upstream compatibility promise (0.86 still
+reads it). The compressing chain uses it only when the writer is built with
+`preferDelta`; the flag rides on `EncodingIndices.AllowDelta`, which every
+encoder already passes to its recursive children.
 
 ### Read pipeline
 
@@ -651,14 +656,15 @@ by constant / sequence / sparse / FoR.
 
 ```
 VortexFileWriter(stream, schema, compress?, preferVarBinView?, preserveStats?,
-                 preferPco?, preferDateTimeParts?, preferDictLayout?)
+                 preferPco?, preferDateTimeParts?, preferDictLayout?, preferDelta?)
   ├─ Reserve VTXF magic at file head
   ├─ DTypeSerializer.Emit → schema → DType FlatBuffer (held in memory)
   └─ Each WriteBatch(batch):
        ├─ Per column:
        │    ├─ ArrayEncoderDispatch.Emit (per encoding, recursive)
        │    │    │  Order: constant > dict > FSST > ALP > ALP-RD >
-       │    │    │  RLE > sparse > runend > delta > FoR > bitpacked >
+       │    │    │  RLE > sparse > runend > delta (preferDelta only) >
+       │    │    │  FoR > bitpacked >
        │    │    │  raw primitive (or varbin / varbinview / list / FSL /
        │    │    │  struct / decimal / datetimeparts / ext)
        │    │    ├─ Pco supersedes ALP/ALP-RD/RLE/FoR/bitpacked when

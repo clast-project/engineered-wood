@@ -60,7 +60,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort PcoEncodingIdx = 19;
     private const ushort DateTimePartsEncodingIdx = 20;
     private const ushort ExtEncodingIdx = 21;
-    private static readonly EncodingIndices Indices = new(
+    private static readonly EncodingIndices DefaultIndices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
         VarBin: VarBinEncodingIdx,
@@ -105,6 +105,7 @@ public sealed class VortexFileWriter : IDisposable
     private readonly bool _preferVarBinView;
     private readonly bool _preserveStats;
     private readonly bool _preferPco;
+    private readonly EncodingIndices _indices;
     private readonly bool _preferDateTimeParts;
     private readonly bool _preferDictLayout;
     /// <summary>One per column; non-null for columns that <see cref="_preferDictLayout"/>
@@ -279,14 +280,25 @@ public sealed class VortexFileWriter : IDisposable
     /// fields), the saving is roughly <c>(numBatches − 1) × dict_bytes</c>.
     /// High-cardinality columns shouldn't enable this — same caveat as
     /// the array-level dict gate.</param>
+    /// <param name="preferDelta">When true, the <paramref name="compress"/>
+    /// chain may encode unsigned-integer columns (and unsigned children of
+    /// other encodings) as <c>fastlanes.delta</c>, for locally-constant
+    /// data where it compresses well. Off by default because
+    /// <c>fastlanes.delta</c> belongs to no Vortex edition: upstream makes
+    /// no promise that later readers will accept it (vortex 0.86 does), and
+    /// its own writers only emit it with edition checks disabled. Every other
+    /// encoding this writer produces is in a frozen core edition. Has no
+    /// effect when <paramref name="compress"/> is <c>false</c>.</param>
     public VortexFileWriter(
         Stream stream, Apache.Arrow.Schema schema,
         bool compress = false, bool preferVarBinView = false,
         bool preserveStats = false, bool preferPco = false,
         bool preferDateTimeParts = false,
-        bool preferDictLayout = false)
+        bool preferDictLayout = false,
+        bool preferDelta = false)
     {
         _compress = compress;
+        _indices = DefaultIndices with { AllowDelta = preferDelta };
         _preferVarBinView = preferVarBinView;
         _preserveStats = preserveStats;
         _preferPco = preferPco;
@@ -354,7 +366,7 @@ public sealed class VortexFileWriter : IDisposable
             int? statsTicket = ArrayStatsEmitter.Emit(sb.Builder, statsValues);
 
             int rootTicket = ArrayEncoderDispatch.Emit(
-                sb, col, Indices, statsTicket, _compress, statsValues,
+                sb, col, _indices, statsTicket, _compress, statsValues,
                 _preferVarBinView, _preferPco, _preferDateTimeParts);
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
@@ -1442,12 +1454,13 @@ public sealed class VortexFileWriter : IDisposable
         bool compress = false, bool preferVarBinView = false,
         bool preserveStats = false, bool preferPco = false,
         bool preferDateTimeParts = false,
-        bool preferDictLayout = false)
+        bool preferDictLayout = false,
+        bool preferDelta = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
         using var writer = new VortexFileWriter(
             stream, batch.Schema, compress, preferVarBinView,
-            preserveStats, preferPco, preferDateTimeParts, preferDictLayout);
+            preserveStats, preferPco, preferDateTimeParts, preferDictLayout, preferDelta);
         writer.WriteBatch(batch);
         writer.Close();
     }
