@@ -598,6 +598,33 @@ public class StatisticsEvaluatorTests
         Assert.NotEqual(FilterResult.AlwaysTrue, Eval(Expressions.LessThan("d5", 1), stats));
     }
 
+    /// <summary>
+    /// An <c>IN</c> set coerces by its members' TYPE, so it rounds where the same literal on the
+    /// left of <c>=</c> does not.
+    /// </summary>
+    /// <remarks>
+    /// #323, found in review of the first fix for it. Spark resolves one type over all of a set's
+    /// members before the comparison rule runs, so <c>d IN (1)</c> goes through bigint --
+    /// <c>decimal(20,0)</c> -- where <c>d = 1</c> goes through <c>decimal(1,0)</c> (#281). Against
+    /// a <c>decimal(38,29)</c> column those twenty integral digits force the clamp and round the
+    /// bound up to 1, so Spark matches the row; one digit does not, and the exact comparison is
+    /// right there. The same pair of values, two answers, and the set half was pruning the row.
+    /// </remarks>
+    [Fact]
+    public void ASetPredicateCoercesByTypeAndDoesNotPruneWhatSparkMatches()
+    {
+        var nines = LiteralValue.HighPrecisionDecimalOf(
+            System.Numerics.BigInteger.Parse(new string('9', 29)), 29);
+
+        var stats = new TestStats().With("d", min: nines, max: nines, nullCount: 0);
+
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Expressions.In("d", 1), stats));
+
+        // The binary comparison is decided exactly, and that is correct rather than a concession:
+        // decimal(38,29) against decimal(1,0) unifies to decimal(38,29) and rounds nothing.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("d", 1), stats));
+    }
+
     /// <summary>An ordinary decimal column still prunes exactly, which is what must not be lost.</summary>
     /// <remarks>
     /// The control for <see cref="DecimalBoundsAreComparedRoundedToTheCommonType"/>: a

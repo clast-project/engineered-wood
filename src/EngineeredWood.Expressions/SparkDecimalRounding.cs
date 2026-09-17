@@ -62,34 +62,56 @@ internal static class SparkDecimalRounding
     /// at all for an integral column, whose width IS known from its kind.
     /// </para>
     /// </remarks>
-    internal static bool Rounds(LiteralValue literal, LiteralValue bound)
+    /// <param name="setMembership">
+    /// Whether the literal is a member of an <c>IN</c> set rather than a binary comparison's
+    /// right-hand side. It changes how the literal is WIDTHED and nothing else: a set resolves one
+    /// type over all its members before the comparison rule runs, so an integral member counts for
+    /// its TYPE's width - <c>ns IN (1, 2)</c> resolves through bigint, which is
+    /// <c>decimal(20,0)</c> - where the same literal in <c>ns = 1</c> counts for its digits, which
+    /// is <c>decimal(1,0)</c> (#281). Twenty digits against a high-scale column is enough to force
+    /// the clamp where one digit is not.
+    /// </param>
+    internal static bool Rounds(LiteralValue literal, LiteralValue bound, bool setMembership = false)
     {
-        if (!TryDescribe(literal, literalTyping: true, out var literalDigits, out var literalScale)
+        // Two integrals share a scale of zero and can never round. Checked before anything is
+        // measured, because this runs for every statistics comparison a predicate makes and the
+        // overwhelming majority of them are not decimals at all.
+        if (!IsExactDecimal(literal) && !IsExactDecimal(bound))
+            return false;
+
+        if (!TryDescribe(literal, literalTyping: !setMembership, out var literalDigits, out var literalScale)
             || !TryDescribe(bound, literalTyping: false, out var boundDigits, out var boundScale))
         {
-            // Not a pair Spark unifies as decimals — a float compares as a double, and anything
-            // else is not this rule's business. `CompareTo`'s own exactness flag covers those.
+            // Not a pair Spark unifies as decimals - a float compares as a double, and anything
+            // else is not this rule's business. CompareTo's own exactness flag covers those.
             return false;
         }
 
-        // The bound, exactly: only the literal's integral digits can force its scale down.
-        if (literalDigits + boundScale > MaxPrecision)
+        // A width of -1 is "declared, and not knowable from the value", which is every decimal
+        // that is not a binary comparison's literal. Bounded by the widest a declared
+        // decimal(p, scale) can be.
+        var literalWidest = literalDigits >= 0 ? literalDigits : MaxPrecision - literalScale;
+        var boundWidest = boundDigits >= 0 ? boundDigits : MaxPrecision - boundScale;
+
+        // The bound. Only the literal's integral digits can force its scale down, and for a binary
+        // comparison those are known exactly.
+        if (literalWidest + boundScale > MaxPrecision)
             return true;
 
-        // The literal cannot be rounded to a coarser scale than the bound's own, so a literal
-        // with no more scale than the bound is never touched.
+        // The literal cannot be rounded to a coarser scale than the bound's own, so a literal with
+        // no more scale than the bound is never touched.
         if (literalScale <= boundScale)
             return false;
 
         // An integral bound reports its width, so this is exact for it: a bigint is
         // decimal(20,0), which leaves eighteen digits of room before the clamp can bite.
-        if (boundDigits >= 0)
-            return boundDigits + literalScale > MaxPrecision;
+        if (boundWidest + literalScale <= MaxPrecision)
+            return false;
 
-        // A decimal bound's declared width is unknown, and bounding it by `38 - boundScale` would
-        // refuse EVERY predicate carrying more decimal places than the column -- sound, and it
-        // gave up a quarter of all type pairs. So ask the narrower question instead: could the
-        // rounding change THIS comparison?
+        // A decimal bound's declared width is unknown, and stopping here would refuse EVERY
+        // predicate carrying more decimal places than the column -- sound, and it gave up a
+        // quarter of all type pairs. So ask the narrower question instead: could the rounding
+        // change THIS comparison?
         //
         // Whatever scale the literal is rounded to, it is never coarser than the bound's own (the
         // case where it would be is the one already refused above), so the literal moves by less
@@ -97,6 +119,10 @@ internal static class SparkDecimalRounding
         // scale the clamp could choose leaves the comparison pointing the same way.
         return !FartherApartThanHalfAUnit(literal, bound, boundScale);
     }
+
+    /// <summary>Whether this is one of the two kinds Spark unifies as a decimal.</summary>
+    private static bool IsExactDecimal(LiteralValue value) =>
+        value.Type is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal;
 
     /// <summary>
     /// Whether the two differ by more than half a unit at <paramref name="scale"/>, exactly.
@@ -204,7 +230,10 @@ internal static class SparkDecimalRounding
             {
                 var d = value.AsDecimal;
                 scale = DecimalScale(d);
-                digits = literalTyping ? Digits(new BigInteger(d)) : -1;
+                // From the UNSCALED mantissa, as the high-precision branch does. Counting the
+                // truncated integer part instead reports one digit for 0.1m where it has none,
+                // which turns a safe comparison against a decimal(38,38) bound into Unknown.
+                digits = literalTyping ? Math.Max(Digits(UnscaledMagnitude(d)) - scale, 0) : -1;
                 return true;
             }
 
@@ -253,4 +282,14 @@ internal static class SparkDecimalRounding
 
     /// <summary>A <c>decimal</c>'s declared scale, which its representation carries.</summary>
     private static int DecimalScale(decimal value) => (decimal.GetBits(value)[3] >> 16) & 0xFF;
+
+    /// <summary>A <c>decimal</c>'s unscaled magnitude, which is the 96 bits below its flags.</summary>
+    private static BigInteger UnscaledMagnitude(decimal value)
+    {
+        var bits = decimal.GetBits(value);
+
+        return (new BigInteger((uint)bits[2]) << 64)
+            | (new BigInteger((uint)bits[1]) << 32)
+            | new BigInteger((uint)bits[0]);
+    }
 }

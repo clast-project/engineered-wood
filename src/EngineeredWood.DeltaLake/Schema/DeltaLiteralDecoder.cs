@@ -79,7 +79,7 @@ internal static class DeltaLiteralDecoder
                         ? ParseTimestamp(value.GetString()!) : null;
                 default:
                     if (typeName.StartsWith("decimal(", StringComparison.Ordinal))
-                        return ParseDecimalJson(value);
+                        return ParseDecimalJson(value, typeName);
                     return null;
             }
         }
@@ -132,7 +132,7 @@ internal static class DeltaLiteralDecoder
                     return ParseTimestamp(value);
                 default:
                     if (typeName.StartsWith("decimal(", StringComparison.Ordinal))
-                        return ParseDecimalText(value);
+                        return ParseDecimalText(value, typeName);
                     return null;
             }
         }
@@ -289,13 +289,13 @@ internal static class DeltaLiteralDecoder
             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto)
             ? (LiteralValue?)LiteralValue.Of(dto) : null;
 
-    private static LiteralValue? ParseDecimalJson(JsonElement value) => value.ValueKind switch
+    private static LiteralValue? ParseDecimalJson(JsonElement value, string typeName) => value.ValueKind switch
     {
         // Decode the EXACT digits, never System.Decimal — decimal.TryParse and JsonElement.TryGetDecimal
         // silently ROUND a value with more than ~28-29 significant digits (e.g. a decimal(38,30) stat) to
         // System.Decimal's precision, which would shift a min/max bound and could wrongly skip a file.
-        JsonValueKind.Number => ParseDecimalText(value.GetRawText()),
-        JsonValueKind.String => ParseDecimalText(value.GetString()),
+        JsonValueKind.Number => ParseDecimalText(value.GetRawText(), typeName),
+        JsonValueKind.String => ParseDecimalText(value.GetString(), typeName),
         _ => null,
     };
 
@@ -306,10 +306,77 @@ internal static class DeltaLiteralDecoder
     /// <see cref="decimal"/>), materialized as a <c>System.Decimal</c> only when that representation is
     /// exact, otherwise as a high-precision decimal.
     /// </summary>
-    private static LiteralValue? ParseDecimalText(string? text) =>
-        DecimalText.TryParse(text, out var unscaled, out int scale)
-            ? (LiteralValue?)MakeDecimalLiteral(unscaled, scale)
-            : null;
+    private static LiteralValue? ParseDecimalText(string? text, string typeName)
+    {
+        if (!DecimalText.TryParse(text, out var unscaled, out int scale))
+            return null;
+
+        // AT THE COLUMN'S DECLARED SCALE, not the text's own. JSON does not keep a trailing zero,
+        // so a decimal(10,2) bound of 1.00 arrives as "1" and would carry scale 0; a writer that
+        // pads instead sends "1.00" for a decimal(38,0) and would carry scale 2. Either way the
+        // scale on the value is a fact about the FORMATTING, and StatisticsEvaluator reads it as a
+        // fact about the TYPE -- it is what tells the pruner whether Spark would round this
+        // comparison. #323.
+        if (TryDeclaredScale(typeName, out var declared) && !TryRescale(ref unscaled, scale, declared))
+        {
+            // More decimals than the column declares: the statistic contradicts its own type, and
+            // rescaling would move the bound. Unknown is the only safe answer.
+            return null;
+        }
+        else if (declared >= 0)
+        {
+            scale = declared;
+        }
+
+        return MakeDecimalLiteral(unscaled, scale);
+    }
+
+    /// <summary>The scale out of a <c>decimal(p,s)</c> type name, or -1 when it does not parse.</summary>
+    private static bool TryDeclaredScale(string typeName, out int scale)
+    {
+        scale = -1;
+
+        var comma = typeName.IndexOf(',');
+        var close = typeName.IndexOf(')');
+        if (comma < 0 || close <= comma)
+            return false;
+
+#if NETSTANDARD2_0
+        var digits = typeName.Substring(comma + 1, close - comma - 1).Trim();
+#else
+        var digits = typeName.AsSpan(comma + 1, close - comma - 1).Trim();
+#endif
+
+        return int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out scale)
+            && scale >= 0;
+    }
+
+    /// <summary>
+    /// Moves an unscaled value to another scale, or false when that cannot be done exactly.
+    /// </summary>
+    /// <remarks>
+    /// Padding is always exact. Trimming is exact only when the digits being dropped are zeros,
+    /// and a value that fails that is one the declared type could not have held.
+    /// </remarks>
+    private static bool TryRescale(ref BigInteger unscaled, int from, int to)
+    {
+        if (to == from)
+            return true;
+
+        if (to > from)
+        {
+            unscaled *= BigInteger.Pow(10, to - from);
+            return true;
+        }
+
+        var divisor = BigInteger.Pow(10, from - to);
+        var quotient = BigInteger.DivRem(unscaled, divisor, out var remainder);
+        if (!remainder.IsZero)
+            return false;
+
+        unscaled = quotient;
+        return true;
+    }
 
     // The largest magnitude a System.Decimal can hold (96-bit unscaled integer).
     private static readonly BigInteger Decimal96Max = (BigInteger.One << 96) - 1;

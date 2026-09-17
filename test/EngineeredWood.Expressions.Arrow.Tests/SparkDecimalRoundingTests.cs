@@ -141,24 +141,105 @@ public class SparkDecimalRoundingTests
     }
 
     /// <summary>
-    /// An integral column is decided exactly, because its width comes from its kind.
+    /// An integral column takes an ordinary fractional predicate exactly, because its width comes
+    /// from its kind.
     /// </summary>
     /// <remarks>
     /// The case that would otherwise have cost the most pruning: a <c>bigint</c> column carries no
     /// scale, so every predicate with a decimal point in it has more scale than the bound. Spark
     /// types the column <c>decimal(20,0)</c>, which leaves eighteen digits of room before the clamp
     /// can bite, so nothing rounds and the comparison stays exact.
+    /// <para>
+    /// NOT an unconditional invariant, which is what this test used to claim. Eighteen digits is
+    /// room, not immunity -- see <see cref="AnIntegralColumnIsRefusedPastEighteenDecimalPlaces"/>.
+    /// </para>
     /// </remarks>
     [Theory]
     [InlineData(1.5)]
     [InlineData(0.125)]
     [InlineData(1234.5678)]
-    public void AnIntegralColumnIsNeverRefused(decimal literal)
+    public void AnIntegralColumnTakesAnOrdinaryFractionalPredicate(decimal literal)
     {
         var bound = LiteralValue.Of(9_000_000_000L);
 
         Assert.False(SparkDecimalRounding.Rounds(LiteralValue.Of(literal), bound));
         Assert.False(SparkDecimalRounding.Rounds(LiteralValue.Of(1), bound));
+    }
+
+    /// <summary>
+    /// An integral column IS refused, but it takes a deep literal AND a bound next to it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A <c>bigint</c> is <c>decimal(20,0)</c>, so a literal carrying nineteen decimal places
+    /// pushes the precision to 39 and the clamp takes a place back off the literal. That is the
+    /// scale condition — and on its own it is not enough, which is the thing worth pinning: the
+    /// clamp moves the literal by 5e-19, so it can only change a comparison against a bound
+    /// sitting within that of it. A bound nine billion away is decided exactly however deep the
+    /// literal goes.
+    /// </para>
+    /// <para>
+    /// So the invariant is neither "an integral column is never refused" nor "nineteen places is
+    /// always refused". Both were claimed here in turn, and both are wrong.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(18, false)]   // not deep enough to clamp at all
+    [InlineData(19, true)]    // deep enough, and the bound is one ulp away
+    [InlineData(25, true)]
+    public void AnIntegralColumnIsRefusedForADeepLiteralBesideIt(int literalScale, bool refused)
+    {
+        // One, and one-plus-the-smallest-thing-that-scale-can-say.
+        var bound = LiteralValue.Of(1L);
+        var beside = LiteralValue.HighPrecisionDecimalOf(
+            BigInteger.Pow(10, literalScale) + BigInteger.One, literalScale);
+
+        Assert.Equal(refused, SparkDecimalRounding.Rounds(beside, bound));
+
+        // The same literal against a bound a long way off is never refused: the rounding cannot
+        // reach across the gap.
+        var far = LiteralValue.Of(9_000_000_000L);
+        Assert.False(SparkDecimalRounding.Rounds(beside, far));
+    }
+
+    /// <summary>
+    /// A set member is widthed by its TYPE, where a binary comparison's literal is widthed by its
+    /// digits.
+    /// </summary>
+    /// <remarks>
+    /// Spark resolves one type over all of a set's members before the comparison rule runs, so
+    /// <c>d IN (1)</c> goes through bigint -- <c>decimal(20,0)</c> -- where <c>d = 1</c> goes
+    /// through <c>decimal(1,0)</c> (#281). Against a <c>decimal(38,29)</c> column those twenty
+    /// integral digits force the clamp and round the bound; one digit does not. The same pair,
+    /// two answers.
+    /// </remarks>
+    [Fact]
+    public void ASetMemberIsWidthedByItsTypeAndABinaryLiteralByItsDigits()
+    {
+        var bound = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(new string('9', 29)), 29);
+        var one = LiteralValue.Of(1);
+
+        Assert.False(SparkDecimalRounding.Rounds(one, bound));
+        Assert.True(SparkDecimalRounding.Rounds(one, bound, setMembership: true));
+    }
+
+    /// <summary>
+    /// A fractional <c>System.Decimal</c> literal has no integral digits, and is not treated as
+    /// having one.
+    /// </summary>
+    /// <remarks>
+    /// The integral digits come from the unscaled mantissa, not from the truncated integer part:
+    /// <c>0.1m</c> truncates to zero, which counts as one digit and would report rounding against
+    /// a <c>decimal(38,38)</c> bound where <c>CommonType(decimal(1,1), decimal(38,38))</c> is
+    /// <c>decimal(38,38)</c> and nothing rounds at all.
+    /// </remarks>
+    [Fact]
+    public void AFractionalDecimalLiteralHasNoIntegralDigits()
+    {
+        var bound = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(new string('9', 38)), 38);
+
+        Assert.False(SparkDecimalRounding.Rounds(0.1m, bound));
+        Assert.True(SparkDecimalRounding.Rounds(1.1m, bound));
     }
 
     /// <summary>The issue's own pair, and the control beside it.</summary>

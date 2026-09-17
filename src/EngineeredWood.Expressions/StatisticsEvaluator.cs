@@ -536,8 +536,13 @@ public static class StatisticsEvaluator
         bool allOutside = true;
         foreach (var v in values)
         {
-            int cmpVMin = SafeCompare(v, min.Value);
-            int cmpVMax = SafeCompare(v, max.Value);
+            // A SET MEMBER IS WIDTHED BY ITS TYPE, NOT BY ITS DIGITS. Spark resolves one type over
+            // all the members before the comparison rule runs, so `d IN (1)` goes through bigint
+            // -- decimal(20,0) -- where `d = 1` goes through decimal(1,0). Twenty integral digits
+            // against a high-scale column forces the clamp that one digit does not, so the same
+            // pair that compares exactly on the left rounds on the right. #323.
+            int cmpVMin = SafeCompare(v, min.Value, setMembership: true);
+            int cmpVMax = SafeCompare(v, max.Value, setMembership: true);
             if (cmpVMin == int.MinValue || cmpVMax == int.MinValue)
                 return FilterResult.Unknown;
 
@@ -639,7 +644,7 @@ public static class StatisticsEvaluator
     /// #208.
     /// </para>
     /// </remarks>
-    private static int SafeCompare(LiteralValue value, LiteralValue bound)
+    private static int SafeCompare(LiteralValue value, LiteralValue bound, bool setMembership = false)
     {
         // A THIRD way an answer cannot be trusted, and it announces itself least of all: the
         // comparison is exact, and Spark's is not. Two exact numerics meet in their least common
@@ -647,7 +652,7 @@ public static class StatisticsEvaluator
         // rounded values -- and the exact answer can be its opposite, again in the direction that
         // skips a file holding matching rows. #323, and see SparkDecimalRounding for why this
         // needs neither the unification itself nor the column's declared width.
-        if (SparkDecimalRounding.Rounds(value, bound))
+        if (SparkDecimalRounding.Rounds(value, bound, setMembership))
             return int.MinValue;
 
         try
