@@ -17,6 +17,11 @@
     <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
   </ItemGroup>
 
+  <!-- System.Text.Json ships in the shared framework from net8.0 on; net472 needs the package. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
+  </ItemGroup>
+
   <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
@@ -27,6 +32,11 @@
 
   <ItemGroup>
     <None Update="TestData\**\*.vortex" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="TestData\upstream-compat\*.arrow" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The pins, not the fixtures: the tests enumerate their cases from this file. The
+         downloaded fixtures stay out of the project; the tests read them in place. -->
+    <None Remove="UpstreamCompat\fixtures\**" />
+    <None Update="UpstreamCompat\fixtures.lock.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

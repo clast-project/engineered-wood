@@ -170,6 +170,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-ipc"
+version = "59.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcc41681ea80f521df14c36725b74d4c60702c47f0793af2be469c04527e2599"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+ "flatbuffers",
+]
+
+[[package]]
 name = "arrow-ord"
 version = "59.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2796,6 +2810,9 @@ dependencies = [
 name = "vortex-fixtures"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "futures",
  "tokio",
  "uuid",

@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "vortex-validator"
 path = "src/validator.rs"
 
+[[bin]]
+name = "vortex-oracle"
+path = "src/oracle.rs"
+
 [dependencies]
 vortex-array = "0.86.1"
 vortex-buffer = "0.86.1"
@@ -33,4 +37,7 @@ vortex-sequence = "0.86.1"
 vortex-zigzag = "0.86.1"
 vortex-zstd = "0.86.1"
 futures = "0.3"
+arrow-array = "59.3.0"
+arrow-ipc = "59.3.0"
+arrow-schema = "59.3.0"
 vortex = { version = "0.86.1", default-features = false, features = ["files", "tokio", "zstd"] }

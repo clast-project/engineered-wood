@@ -1,11 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
-using EngineeredWood.Vortex.Tests.TestData;
+using EngineeredWood.Vortex.Tests.TestHelpers;
 using EngineeredWood.Vortex.Writer;
 
 namespace EngineeredWood.Vortex.Tests;
@@ -22,68 +20,16 @@ namespace EngineeredWood.Vortex.Tests;
 /// </summary>
 public class VortexCrossValidationTests
 {
-    private static string? FindValidator()
-    {
-        // TestDataPath.Resolve returns bin/.../TestData/<file>; walk up until
-        // we land on the EngineeredWood.Vortex.Tests project dir (sibling to
-        // the Rust crate at Rust/target/release/vortex-validator).
-        var exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? "vortex-validator.exe" : "vortex-validator";
-        var dir = Path.GetDirectoryName(TestDataPath.Resolve("struct_int_3rows.vortex"));
-        for (int i = 0; i < 8 && dir is not null; i++)
-        {
-            var candidate = Path.Combine(dir, "Rust", "target", "release", exeName);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        return null;
-    }
-
     /// <summary>Set to <c>1</c> in a job that builds the validator, so a missing binary fails
-    /// rather than quietly skipping every check that upstream can read what this writer emits.</summary>
+    /// rather than quietly skipping every check that upstream can read what this writer emits.
+    /// These tests used to <c>return</c> without it, which xUnit counts as a pass, so a run
+    /// without the binary reported every cross-validation green having validated nothing.</summary>
     private const string RequireEnvVar = "EW_REQUIRE_VORTEX_VALIDATOR";
 
-    /// <summary>
-    /// The validator's path. Skips the calling test when it isn't built — or throws, when
-    /// <see cref="RequireEnvVar"/> says this job built it. These tests used to <c>return</c>
-    /// instead, which xUnit counts as a pass, so a run without the binary reported every
-    /// cross-validation green having validated nothing.
-    /// </summary>
-    private static string RequireValidator()
-    {
-        var validator = FindValidator();
-        if (validator is not null)
-            return validator;
-
-        const string build = "cd test/EngineeredWood.Vortex.Tests/Rust && cargo build --release --bin vortex-validator";
-        if (Environment.GetEnvironmentVariable(RequireEnvVar) == "1")
-            throw new InvalidOperationException($"{RequireEnvVar}=1 but vortex-validator is not built ({build}).");
-
-        Skip.If(true, $"vortex-validator is not built ({build}).");
-        return null!;
-    }
+    private static string RequireValidator() => RustTools.Require("vortex-validator", RequireEnvVar);
 
     private static (int ExitCode, string Stdout, string Stderr) RunValidator(string validator, string fileArg)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = validator,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-#if NETCOREAPP2_1_OR_GREATER
-        psi.ArgumentList.Add(fileArg);
-#else
-        psi.Arguments = "\"" + fileArg.Replace("\"", "\\\"") + "\"";
-#endif
-        using var p = Process.Start(psi)!;
-        var stdout = p.StandardOutput.ReadToEnd();
-        var stderr = p.StandardError.ReadToEnd();
-        p.WaitForExit();
-        return (p.ExitCode, stdout, stderr);
-    }
+        => RustTools.Run(validator, fileArg);
 
     [SkippableFact]
     public void RustReader_OpensDotNetWrittenPrimitiveFile()

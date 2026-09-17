@@ -459,22 +459,33 @@ jobs:
           name: cloud-io-test-results
           path: '**/cloud-io-results.trx'
 
-  # Upstream vortex reads what VortexFileWriter writes. The Vortex test suite's round trips prove
-  # EW agrees with itself, and VortexWriterEditionTests proves the writer names only frozen
-  # encodings; neither proves the reference reader can decode the result. VortexCrossValidationTests
-  # does, by handing each file to `vortex-validator`, a small Rust binary built against the same
-  # pinned vortex crates as the fixture generator (test/EngineeredWood.Vortex.Tests/Rust).
+  # EW and upstream vortex agree on the files each other writes, in both directions.
   #
-  # WHY A SEPARATE JOB. Until this job existed nothing in CI built that binary, and the tests
+  # EW WRITES, VORTEX READS. The Vortex test suite's round trips prove EW agrees with itself, and
+  # VortexWriterEditionTests proves the writer names only frozen encodings; neither proves the
+  # reference reader can decode the result. VortexCrossValidationTests does, by handing each file to
+  # `vortex-validator`.
+  #
+  # VORTEX WRITES, EW READS. VortexUpstreamCompatTests reads upstream's published backward-
+  # compatibility fixtures — the files vortex-test/compat-gen writes for every release since 0.64 —
+  # and compares each value with what `vortex-oracle` decodes from the same file. The releases and
+  # files are pinned, with hashes, in UpstreamCompat/fixtures.lock.json; taking on a new upstream
+  # release is a deliberate `fetch_fixtures.py --update`, not something this job does by itself.
+  #
+  # Both tools are small Rust binaries built against the same pinned vortex crates as the fixture
+  # generator (test/EngineeredWood.Vortex.Tests/Rust).
+  #
+  # WHY A SEPARATE JOB. Until this job existed nothing in CI built the validator, and its tests
   # returned early without it — a PASS — so all of them reported green on every run having
-  # validated nothing. The only real check was on a dev box that happened to have the binary.
-  # Building vortex needs a Rust toolchain and several minutes of compilation that the Windows
-  # `build` job should not pay for every change; on Linux, cached, it is cheap after the first run.
+  # validated nothing. Building vortex needs a Rust toolchain and several minutes of compilation
+  # that the Windows `build` job should not pay for every change; on Linux, cached, it is cheap
+  # after the first run. The `build` job still covers the upstream fixtures through the few samples
+  # committed under TestData/upstream-compat, which need neither Rust nor the network.
   #
   # ONLY WHEN IT CAN MATTER. It runs when the project selection includes the Vortex tests, which
-  # covers changes to the writer, to the Rust crate, and to anything Vortex depends on. Like
-  # cloud-io it is not a required check.
-  vortex-validator:
+  # covers changes to the reader and writer, to the Rust crate, and to anything Vortex depends on.
+  # Like cloud-io it is not a required check.
+  vortex-interop:
     runs-on: ubuntu-latest
 
     steps:
@@ -499,17 +510,17 @@ jobs:
             --slnf /dev/null \
             ${{ github.event_name == 'push' && '--full' || '' }} \
           || echo "scope=full" >> "$GITHUB_OUTPUT"
-          echo "::group::vortex-validator relevance"
+          echo "::group::vortex-interop relevance"
           if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
              || grep -q '^tests=.*EngineeredWood\.Vortex\.Tests\.csproj' "$GITHUB_OUTPUT"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "EngineeredWood.Vortex.Tests is not affected; skipping the Rust validator."
+            echo "EngineeredWood.Vortex.Tests is not affected; skipping the vortex interop checks."
           fi
           echo "::endgroup::"
 
-      # Pinned, like the other oracles: the toolchain is part of what built the validator. 1.96.0
+      # Pinned, like the other oracles: the toolchain is part of what built the tools. 1.96.0
       # is what the fixtures were last generated with; vortex 0.86.1 needs 1.95 or later.
       - name: Setup Rust
         if: steps.select.outputs.run == 'true'
@@ -523,12 +534,25 @@ jobs:
         with:
           workspaces: test/EngineeredWood.Vortex.Tests/Rust
 
-      # --locked: the vortex versions are pinned in Cargo.lock, and a validator resolved afresh
-      # would be a different oracle from the one the fixtures were generated with.
-      - name: Build vortex-validator
+      # --locked: the vortex versions are pinned in Cargo.lock, and tools resolved afresh would be
+      # different oracles from the one the fixtures were generated with.
+      - name: Build vortex-validator and vortex-oracle
         if: steps.select.outputs.run == 'true'
         working-directory: test/EngineeredWood.Vortex.Tests/Rust
-        run: cargo build --release --locked --bin vortex-validator
+        run: cargo build --release --locked --bin vortex-validator --bin vortex-oracle
+
+      # ~120 MB across every pinned release, so cached on the lock file. The fetch always runs: it
+      # re-hashes whatever the cache restored and downloads only what is missing or wrong.
+      - name: Cache upstream compat fixtures
+        if: steps.select.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: test/EngineeredWood.Vortex.Tests/UpstreamCompat/fixtures
+          key: vortex-compat-${{ hashFiles('test/EngineeredWood.Vortex.Tests/UpstreamCompat/fixtures.lock.json') }}
+
+      - name: Fetch upstream compat fixtures
+        if: steps.select.outputs.run == 'true'
+        run: python test/EngineeredWood.Vortex.Tests/UpstreamCompat/fetch_fixtures.py
 
       - name: Setup .NET
         if: steps.select.outputs.run == 'true'
@@ -546,21 +570,22 @@ jobs:
           dotnet build test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj
           --no-restore --configuration Release --framework net10.0
 
-      # EW_REQUIRE_VORTEX_VALIDATOR=1 turns a missing binary into a failure rather than 42 skips,
+      # The EW_REQUIRE_* variables turn a missing tool or fixture into a failure rather than a skip,
       # which is the difference between this job checking something and merely reporting green.
-      - name: Test against the Rust reader
+      - name: Test against upstream vortex
         if: steps.select.outputs.run == 'true'
         env:
           EW_REQUIRE_VORTEX_VALIDATOR: '1'
+          EW_REQUIRE_VORTEX_UPSTREAM_COMPAT: '1'
         run: >
           dotnet test test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj
           --no-build --configuration Release --framework net10.0
-          --filter "FullyQualifiedName~VortexCrossValidationTests"
-          --logger "trx;LogFileName=vortex-validator-results.trx"
+          --filter "FullyQualifiedName~VortexCrossValidationTests|FullyQualifiedName~VortexUpstreamCompatTests"
+          --logger "trx;LogFileName=vortex-interop-results.trx"
 
       - name: Upload test results
         if: always() && steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: vortex-validator-test-results
-          path: '**/vortex-validator-results.trx'
+          name: vortex-interop-test-results
+          path: '**/vortex-interop-results.trx'
