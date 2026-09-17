@@ -650,11 +650,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         }
     }
 
-    /// <summary>Whether a set member carries a scale the set's common type could round away.</summary>
+    /// <summary>Whether a set member could make the set's common type round a value away.</summary>
     private static bool MemberMightRound(in SetMember member, IArrowType? declared) =>
         member.IsConstant
             ? member.Constant?.Type
-                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal
+                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float
             : MightRound(declared, member.PerRow);
 
     /// <summary>Whether a set member is a string, from its declared type or its value.</summary>
@@ -936,16 +936,26 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         return _literalPrecision.LiteralComparisonType(value, other);
     }
 
-    /// <summary>Whether an operand carries a scale that a common type could round away.</summary>
+    /// <summary>Whether an operand could make a comparison's common type round a value away.</summary>
     /// <remarks>
-    /// Only a decimal does. Asked before any type is resolved, from the declared type when there
-    /// is one and from the first populated value otherwise, so an integer-and-string-free
-    /// comparison of two <c>int</c> columns costs two field reads.
+    /// <para>
+    /// A decimal can, because the common type gives up scale (#280). So can a FLOAT: the legacy
+    /// dialect compares an integral with one as a float, rounding the integral onto it, where
+    /// ANSI compares both as doubles (#299). Which of those applies is the registry's decision
+    /// -- this only decides whether to ask, and a registry with no rule for the pair answers no
+    /// target and nothing is cast.
+    /// </para>
+    /// <para>
+    /// Asked before any type is resolved, from the declared type when there is one and from the
+    /// first populated value otherwise, so an integer-and-string-free comparison of two
+    /// <c>int</c> columns costs two field reads.
+    /// </para>
     /// </remarks>
     private static bool MightRound(IArrowType? declared, LiteralValue?[] values) =>
         declared is not null
-            ? declared is Decimal128Type or Decimal256Type
-            : FirstKind(values) is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal;
+            ? declared is Decimal128Type or Decimal256Type or FloatType
+            : FirstKind(values)
+                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float;
 
     private LiteralValue?[] Rounded(
         LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>

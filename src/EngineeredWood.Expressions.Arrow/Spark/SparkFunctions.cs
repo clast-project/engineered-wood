@@ -382,8 +382,8 @@ internal static class SparkFunctions
             var floats = new FloatArray.Builder();
             for (var i = 0; i < rowCount; i++)
             {
-                var value = choice[i] < 0 ? null : SparkArrays.ReadDouble(sources[choice[i]], i);
-                if (value is null) floats.AppendNull(); else floats.Append((float)value.Value);
+                var value = choice[i] < 0 ? null : SparkArrays.ReadFloat(sources[choice[i]], i);
+                if (value is null) floats.AppendNull(); else floats.Append(value.Value);
             }
 
             return floats.Build();

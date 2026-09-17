@@ -175,7 +175,10 @@ LEGACY_GROUPS = (
     "decimal-to-string",
     # #370. The position and length are CAST to int in the session dialect, so overflow raises
     # under ANSI and wraps under legacy, and a malformed string refuses or reads as null.
-    "substring-arguments")
+    "substring-arguments",
+    # #299. THE LEGACY COLUMN IS THE MEASUREMENT: an integral against a float resolves FLOAT there
+    # and DOUBLE under ANSI, at every site that unifies, and one harvest would record half of it.
+    "integral-float")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3361,6 +3364,53 @@ GROUPS = {
 
         # --- and the ANSI cast is the INNER one, so try_cast outside does not rescue it.
         "try_cast(substring('abcdef', 3000000000, 2) AS STRING)",
+    ],
+
+    # AN INTEGRAL AGAINST A FLOAT. #299. ANSI widens the pair to DOUBLE, because int to float
+    # loses bits; the legacy dialect takes the tightest common type, FLOAT, and rounds the
+    # integral onto it first. 16777217 is the first integer a float cannot hold, so it is the
+    # value that tells the two apart. The issue named comparisons; arithmetic and every
+    # unifying function split the same way, and `/` alone stays double in both.
+    "integral-float": [
+        # --- COMPARISON, in every spelling.
+        "16777217 = CAST(16777216 AS FLOAT)", "16777217 < CAST(16777216 AS FLOAT)",
+        "CAST(16777217 AS BIGINT) >= CAST(16777216 AS FLOAT)",
+        "16777217L = CAST(16777216 AS FLOAT)", "CAST(16777216 AS FLOAT) = 16777217",
+        "16777217 IN (CAST(16777216 AS FLOAT))", "16777217 IN (CAST(16777216 AS FLOAT), 1)",
+        "16777217 BETWEEN CAST(16777216 AS FLOAT) AND CAST(16777216 AS FLOAT)",
+        "CAST(16777216 AS FLOAT) BETWEEN 16777217 AND 16777217",
+        "CASE 16777217 WHEN CAST(16777216 AS FLOAT) THEN 'eq' ELSE 'ne' END",
+        "a = f", "b = f", "sh = f", "f IN (a, b)", "3 = CAST(3 AS FLOAT)",
+
+        # --- UNIFICATION, at every integral width.
+        "coalesce(16777217, CAST(16777216 AS FLOAT))",
+        "coalesce(CAST(16777217 AS BIGINT), CAST(16777216 AS FLOAT))",
+        "coalesce(CAST(3 AS TINYINT), CAST(1.5 AS FLOAT))", "coalesce(sh, f)",
+        "if(true, 16777217, CAST(16777216 AS FLOAT))",
+        "CASE WHEN true THEN 16777217 ELSE CAST(16777216 AS FLOAT) END",
+        "nvl2(a, 16777217, CAST(16777216 AS FLOAT))",
+        "least(16777217, CAST(16777216 AS FLOAT))",
+        "greatest(16777217, CAST(16777216 AS FLOAT), 1)",
+        "greatest(CAST(3 AS TINYINT), f)", "coalesce(CAST(NULL AS INT), f)", "coalesce(a, f)",
+
+        # --- ARITHMETIC, which the issue did not name. `/` stays double in both dialects.
+        "16777217 + CAST(16777216 AS FLOAT)", "CAST(16777217 AS BIGINT) - CAST(16777216 AS FLOAT)",
+        "CAST(3 AS TINYINT) * CAST(16777216 AS FLOAT)", "16777217 / CAST(16777216 AS FLOAT)",
+        "16777217 % CAST(16777216 AS FLOAT)", "a + f", "f * b", "sh - f", "a / f",
+
+        # --- WHAT DOES NOT SPLIT: a decimal or a double against the integral, and two floats.
+        "CAST(3 AS DECIMAL(10,2)) = CAST(16777216 AS FLOAT)",
+        "coalesce(CAST(3 AS DECIMAL(10,2)), CAST(1.5 AS FLOAT))",
+        "CAST(3 AS DECIMAL(10,2)) + CAST(1.5 AS FLOAT)",
+        "16777217 = CAST(16777216 AS DOUBLE)", "coalesce(16777217, CAST(16777216 AS DOUBLE))",
+        "f + f", "coalesce(f, f)",
+
+        # --- A BIGINT IS ROUNDED ONCE. 2^60 + 2^36 + 1 is 2^60 + 2^37 as a float, and 2^60 by
+        # way of a double. Read back as a double so the answer is exact.
+        "CAST(CAST(1152921573326323713 AS FLOAT) AS DOUBLE)",
+        "CAST(1152921573326323713 + CAST(0 AS FLOAT) AS DOUBLE)",
+        "CAST(coalesce(1152921573326323713, CAST(0 AS FLOAT)) AS DOUBLE)",
+        "1152921573326323713 = CAST(1152921642045800448 AS FLOAT)",
     ],
 
     "malformed": [

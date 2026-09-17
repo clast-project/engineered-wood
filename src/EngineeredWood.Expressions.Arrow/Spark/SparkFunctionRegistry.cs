@@ -397,7 +397,8 @@ public sealed class SparkFunctionRegistry
         if (left.Data.DataType is StringType || right.Data.DataType is StringType)
             (left, right) = CoerceStringOperand(op, left, right, rowCount);
 
-        var result = SparkNumericTypes.ArithmeticResult(op, left.Data.DataType, right.Data.DataType);
+        var result = SparkNumericTypes.ArithmeticResult(
+            op, left.Data.DataType, right.Data.DataType, legacy: !_options.Ansi);
 
         return result switch
         {
@@ -680,8 +681,8 @@ public sealed class SparkFunctionRegistry
 
         for (var i = 0; i < rowCount; i++)
         {
-            var a = SparkArrays.ReadDouble(left, i);
-            var b = SparkArrays.ReadDouble(right, i);
+            var a = SparkArrays.ReadFloat(left, i);
+            var b = SparkArrays.ReadFloat(right, i);
 
             if (a is null || b is null)
             {
@@ -689,8 +690,8 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            var x = (float)a.Value;
-            var y = (float)b.Value;
+            var x = a.Value;
+            var y = b.Value;
 
             if (op is "/" or "%" && y == 0f)
             {
@@ -976,6 +977,12 @@ public sealed class SparkFunctionRegistry
 
         if (operand is BooleanType)
             return BooleanEqualityTarget(op, other);
+
+        // #299. The legacy dialect compares an integral with a FLOAT as a float, rounding the
+        // integral first -- `16777217 = CAST(16777216 AS FLOAT)` is true there -- where ANSI
+        // compares both as doubles, which is what an untargeted pair already does.
+        if (!_options.Ansi && SparkNumericTypes.IsIntegral(operand) && other is FloatType)
+            return FloatType.Default;
 
         return LossyDecimalTarget(operand, other);
     }
@@ -1381,6 +1388,20 @@ public sealed class SparkFunctionRegistry
 
         if (!anyString)
         {
+            // #299, as for a binary comparison: under the legacy dialect a set holding a float and
+            // an integral resolves FLOAT, so every member is rounded onto it. `CommonType` already
+            // answers float for exactly that set; it is only returned when some member moves.
+            if (common is FloatType)
+            {
+                foreach (var type in memberTypes)
+                {
+                    if (type is not (FloatType or NullType))
+                        return common;
+                }
+
+                return null;
+            }
+
             // #280. No string to promote, but a set of exact numerics still resolves through one
             // type, and that type can give up scale. Measured,
             // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))` is TRUE -- the same
@@ -1432,7 +1453,7 @@ public sealed class SparkFunctionRegistry
     /// booleans out of <see cref="SparkNumericTypes.CommonType"/> — it speaks for numbers, and
     /// refuses everything else by design.
     /// </remarks>
-    private static IArrowType? CommonTypeOfNonStrings(
+    private IArrowType? CommonTypeOfNonStrings(
         IReadOnlyList<IArrowType> memberTypes, out bool anyString)
     {
         anyString = false;
@@ -1457,7 +1478,7 @@ public sealed class SparkFunctionRegistry
 
             try
             {
-                common = SparkNumericTypes.CommonType(common, type);
+                common = SparkNumericTypes.CommonType(common, type, legacy: !_options.Ansi);
             }
             catch (NotSupportedException)
             {
@@ -1949,7 +1970,15 @@ public sealed class SparkFunctionRegistry
             }
 
             doubles?.Append(value.Value.AsDouble);
-            floats?.Append((float)value.Value.AsDouble);
+
+            // Rounded ONCE from an integral source: a bigint reaches a float in one step in Spark,
+            // and two steps through double can land on the other side of a tie. #299.
+            if (floats is not null)
+            {
+                floats.Append(SparkNumericTypes.IsIntegral(source.Data.DataType)
+                    ? SparkArrays.ReadFloat(source, i)!.Value
+                    : (float)value.Value.AsDouble);
+            }
         }
 
         return (IArrowArray?)doubles?.Build() ?? floats!.Build();
@@ -2726,7 +2755,7 @@ public sealed class SparkFunctionRegistry
                     $"no common type for {left.Name} and {right.Name}");
         }
 
-        return SparkNumericTypes.CommonType(left, right);
+        return SparkNumericTypes.CommonType(left, right, legacy: !_options.Ansi);
     }
 
     /// <summary>
@@ -2836,14 +2865,14 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>The type a set of branches unifies to.</summary>
-    private static IArrowType UnifiedType(IEnumerable<IArrowArray> branches)
+    private IArrowType UnifiedType(IEnumerable<IArrowArray> branches)
     {
         IArrowType? type = null;
         foreach (var branch in branches)
         {
             type = type is null
                 ? branch.Data.DataType
-                : SparkNumericTypes.CommonType(type, branch.Data.DataType);
+                : SparkNumericTypes.CommonType(type, branch.Data.DataType, legacy: !_options.Ansi);
         }
 
         return type ?? NullType.Default;
@@ -3241,7 +3270,7 @@ public sealed class SparkFunctionRegistry
     /// the obvious reading.
     /// </para>
     /// </remarks>
-    private static IArrowArray Extreme(string name, IReadOnlyList<IArrowArray> args, int rowCount)
+    private IArrowArray Extreme(string name, IReadOnlyList<IArrowArray> args, int rowCount)
     {
         if (args.Count < 2)
             throw new ArgumentException($"{name} needs at least two arguments", nameof(args));

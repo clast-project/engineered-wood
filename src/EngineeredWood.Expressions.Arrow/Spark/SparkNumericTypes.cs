@@ -68,7 +68,8 @@ internal static class SparkNumericTypes
     /// </para>
     /// </remarks>
     /// <exception cref="NotSupportedException">Either operand is not a supported numeric type.</exception>
-    public static IArrowType ArithmeticResult(string op, IArrowType left, IArrowType right)
+    public static IArrowType ArithmeticResult(
+        string op, IArrowType left, IArrowType right, bool legacy = false)
     {
         if (left is NullType || right is NullType)
         {
@@ -76,7 +77,7 @@ internal static class SparkNumericTypes
                 return DoubleType.Default;
 
             var typed = left is NullType ? right : left;
-            return ArithmeticResult(op, typed, typed);
+            return ArithmeticResult(op, typed, typed, legacy);
         }
 
         // Decimal is contagious over the INTEGRAL types only: an int is read as the decimal that
@@ -94,7 +95,7 @@ internal static class SparkNumericTypes
             return DoubleType.Default;
 
         if (IsFloatingPoint(left) || IsFloatingPoint(right))
-            return DoubleOrFloat(left, right);
+            return DoubleOrFloat(left, right, legacy);
 
         return WiderIntegral(left, right);
     }
@@ -156,7 +157,7 @@ internal static class SparkNumericTypes
     /// because unifying rounded 0.5 up at scale 0 before the comparison ever ran.
     /// </para>
     /// </remarks>
-    public static IArrowType CommonType(IArrowType left, IArrowType right)
+    public static IArrowType CommonType(IArrowType left, IArrowType right, bool legacy = false)
     {
         // `void` constrains nothing, so the other side IS the common type -- and two voids stay
         // void, which is what Spark answers for `greatest(NULL, NULL)`. Unlike arithmetic, which
@@ -190,7 +191,7 @@ internal static class SparkNumericTypes
         // Floating point is checked BEFORE decimal for the same reason it is in
         // `ArithmeticResult`: a decimal unified with a double is a double, not a decimal.
         if (IsFloatingPoint(left) || IsFloatingPoint(right))
-            return DoubleOrFloat(left, right);
+            return DoubleOrFloat(left, right, legacy);
 
         if (IsDecimal(left) || IsDecimal(right))
         {
@@ -376,12 +377,33 @@ internal static class SparkNumericTypes
             "mixing it with a decimal would need a lossy conversion"),
     };
 
-    private static IArrowType DoubleOrFloat(IArrowType left, IArrowType right)
+    /// <summary>The floating-point type a pair with at least one float or double resolves to.</summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The dialects disagree about a FLOAT against an INTEGRAL</b>, and nowhere else here. #299,
+    /// measured on 4.0.3 at every integral width: ANSI widens the pair to <c>double</c>, because
+    /// int to float loses bits and ANSI's coercion will not; the legacy dialect takes the tightest
+    /// common type, which is <c>float</c>, and rounds the integral onto it first. So
+    /// <c>16777217 = CAST(16777216 AS FLOAT)</c> is false under ANSI and TRUE under legacy, and
+    /// <c>i + f</c>, <c>coalesce(i, f)</c> and <c>greatest(i, f)</c> are all floats there.
+    /// </para>
+    /// <para>
+    /// Everything else agrees across dialects: two floats stay float, anything against a double
+    /// is double, and a DECIMAL against a float is double in both -- the legacy exception is for
+    /// integrals only. <c>/</c> never reaches here; it is double before the operands are asked.
+    /// </para>
+    /// </remarks>
+    private static IArrowType DoubleOrFloat(IArrowType left, IArrowType right, bool legacy)
     {
-        // Only float combined with float stays float. Anything wider on either side — including
-        // an integer, which float cannot hold exactly — goes to double.
         if (left is FloatType && right is FloatType)
             return FloatType.Default;
+
+        if (legacy
+            && (left is FloatType || right is FloatType)
+            && (IsIntegral(left) || IsIntegral(right)))
+        {
+            return FloatType.Default;
+        }
 
         return DoubleType.Default;
     }
