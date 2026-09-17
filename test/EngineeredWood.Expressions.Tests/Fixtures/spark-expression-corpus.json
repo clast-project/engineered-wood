@@ -2257,9 +2257,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-16",
-      "2026-09-16",
-      "2026-09-16"
+      "2026-09-17",
+      "2026-09-17",
+      "2026-09-17"
      ]
     }
    },
@@ -2277,9 +2277,9 @@
     "eval": {
      "ok": true,
      "values": [
-      "2026-09-16 01:19:30.327083",
-      "2026-09-16 01:19:30.327083",
-      "2026-09-16 01:19:30.327083"
+      "2026-09-17 11:38:03.714061",
+      "2026-09-17 11:38:03.714061",
+      "2026-09-17 11:38:03.714061"
      ]
     }
    },
@@ -44635,6 +44635,891 @@
     }
    }
   ],
+  "negative-literal-fold": [
+   {
+    "expression": "-2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483648"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483648,
+      -2147483648,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "-2147483647",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483647"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483647,
+      -2147483647,
+      -2147483647
+     ]
+    }
+   },
+   {
+    "expression": "-2147483649",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483649L"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483649,
+      -2147483649,
+      -2147483649
+     ]
+    }
+   },
+   {
+    "expression": "2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "2147483648L"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2147483648,
+      2147483648,
+      2147483648
+     ]
+    }
+   },
+   {
+    "expression": "-9223372036854775808",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-9223372036854775808L"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -9223372036854775808,
+      -9223372036854775808,
+      -9223372036854775808
+     ]
+    }
+   },
+   {
+    "expression": "-9223372036854775809",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-9223372036854775809BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(19,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-9223372036854775809",
+      "-9223372036854775809",
+      "-9223372036854775809"
+     ]
+    }
+   },
+   {
+    "expression": "-9223372036854775808L",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-9223372036854775808L"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -9223372036854775808,
+      -9223372036854775808,
+      -9223372036854775808
+     ]
+    }
+   },
+   {
+    "expression": "-2147483648L",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483648L"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483648,
+      -2147483648,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "- 2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483648"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483648,
+      -2147483648,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "-/* c */2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-2147483648"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483648,
+      -2147483648,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "-(2147483648)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- 2147483648L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483648,
+      -2147483648,
+      -2147483648
+     ]
+    }
+   },
+   {
+    "expression": "-(9223372036854775808)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- 9223372036854775808BD)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(19,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-9223372036854775808",
+      "-9223372036854775808",
+      "-9223372036854775808"
+     ]
+    }
+   },
+   {
+    "expression": "- -2147483648",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "-(-2147483648)",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003"
+    }
+   },
+   {
+    "expression": "- -2",
+    "parse": {
+     "ok": true,
+     "node": "UnaryMinus",
+     "sql": "(- -2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      2,
+      2,
+      2
+     ]
+    }
+   },
+   {
+    "expression": "round(-2147483648, -1)",
+    "parse": {
+     "ok": true,
+     "node": "UnresolvedFunction",
+     "sql": "round(-2147483648, -1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] Overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(round(-2147483648, -1)) AS r\n ^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-2147483648 - 1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(-2147483648 - 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. Use 'try_subtract' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-2147483648 - 1) AS r\n ^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "1 - -2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(1 - -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. Use 'try_subtract' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(1 - -2147483648) AS r\n ^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-2147483648 + a",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(-2147483648 + a)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. Use 'try_add' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-2147483648 + a) AS r\n ^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-9223372036854775808 - 1",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(-9223372036854775808L - 1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] long overflow. Use 'try_subtract' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-9223372036854775808 - 1) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "-2147483648 * -1",
+    "parse": {
+     "ok": true,
+     "node": "Multiply",
+     "sql": "(-2147483648 * -1)"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow. Use 'try_multiply' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-2147483648 * -1) AS r\n ^^^^^^^^^^^^^^^^\n"
+    }
+   },
+   {
+    "expression": "a - 2147483648",
+    "parse": {
+     "ok": true,
+     "node": "Subtract",
+     "sql": "(a - 2147483648L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "bigint"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -2147483647,
+      null,
+      -4294967296
+     ]
+    }
+   },
+   {
+    "expression": "a >= -2147483648",
+    "parse": {
+     "ok": true,
+     "node": "GreaterThanOrEqual",
+     "sql": "(a >= -2147483648)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      true,
+      null,
+      true
+     ]
+    }
+   },
+   {
+    "expression": "b = -9223372036854775808",
+    "parse": {
+     "ok": true,
+     "node": "EqualTo",
+     "sql": "(b = -9223372036854775808L)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      null,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "-2147483648 IS NULL",
+    "parse": {
+     "ok": true,
+     "node": "IsNull",
+     "sql": "(-2147483648 IS NULL)"
+    },
+    "type": {
+     "ok": true,
+     "type": "boolean"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      false,
+      false,
+      false
+     ]
+    }
+   },
+   {
+    "expression": "-5::string",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-5 AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-5",
+      "-5",
+      "-5"
+     ]
+    }
+   },
+   {
+    "expression": "-2147483648::string",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-2147483648 AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-2147483648",
+      "-2147483648",
+      "-2147483648"
+     ]
+    }
+   },
+   {
+    "expression": "-1.5::string",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-1.5BD AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "-1e0::string",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(-1.0D AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.0",
+      "-1.0",
+      "-1.0"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + -2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + -2)"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(11,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.34",
+      null,
+      "-2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + - -2",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + (- -2))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "14.34",
+      null,
+      "2.00"
+     ]
+    }
+   },
+   {
+    "expression": "d1 + -(2)",
+    "parse": {
+     "ok": true,
+     "node": "Add",
+     "sql": "(d1 + (- 2))"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(13,2)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "10.34",
+      null,
+      "-2.00"
+     ]
+    }
+   },
+   {
+    "expression": "-1.5",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-1.5BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "-.5",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-0.5BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(1,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.5",
+      "-0.5",
+      "-0.5"
+     ]
+    }
+   },
+   {
+    "expression": "-1.",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-1BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(1,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1",
+      "-1",
+      "-1"
+     ]
+    }
+   },
+   {
+    "expression": "-1e3BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-1000BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(4,0)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1000",
+      "-1000",
+      "-1000"
+     ]
+    }
+   },
+   {
+    "expression": "-1.5BD",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-1.5BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(2,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-1.5",
+      "-1.5",
+      "-1.5"
+     ]
+    }
+   },
+   {
+    "expression": "-0",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0"
+    },
+    "type": {
+     "ok": true,
+     "type": "int"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      0,
+      0,
+      0
+     ]
+    }
+   },
+   {
+    "expression": "-0.0",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "0.0BD"
+    },
+    "type": {
+     "ok": true,
+     "type": "decimal(1,1)"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "0.0",
+      "0.0",
+      "0.0"
+     ]
+    }
+   },
+   {
+    "expression": "-0.0D",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "-0.0F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('-0.0' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "CAST(-0.0F AS STRING)",
+    "parse": {
+     "ok": true,
+     "node": "Cast",
+     "sql": "CAST(CAST('-0.0' AS FLOAT) AS STRING)"
+    },
+    "type": {
+     "ok": true,
+     "type": "string"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      "-0.0",
+      "-0.0",
+      "-0.0"
+     ]
+    }
+   },
+   {
+    "expression": "-1e-400",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-0.0D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -0.0,
+      -0.0,
+      -0.0
+     ]
+    }
+   },
+   {
+    "expression": "-3.4028234663852886e38F",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "CAST('-3.4028235E38' AS FLOAT)"
+    },
+    "type": {
+     "ok": true,
+     "type": "float"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -3.4028234663852886e+38,
+      -3.4028234663852886e+38,
+      -3.4028234663852886e+38
+     ]
+    }
+   },
+   {
+    "expression": "-1.7976931348623157e308",
+    "parse": {
+     "ok": true,
+     "node": "Literal",
+     "sql": "-1.7976931348623157E308D"
+    },
+    "type": {
+     "ok": true,
+     "type": "double"
+    },
+    "eval": {
+     "ok": true,
+     "values": [
+      -1.7976931348623157e+308,
+      -1.7976931348623157e+308,
+      -1.7976931348623157e+308
+     ]
+    }
+   },
+   {
+    "expression": "-1.79769313486231575e308",
+    "parse": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n-1.79769313486231575e308\n^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "type": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    },
+    "eval": {
+     "ok": false,
+     "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    }
+   }
+  ],
   "malformed": [
    {
     "expression": "a +",
@@ -78832,6 +79717,923 @@
        null,
        "1970-01-01"
       ]
+     }
+    }
+   ],
+   "negative-literal-fold": [
+    {
+     "expression": "-2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483648"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-2147483647",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483647"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483647,
+       -2147483647,
+       -2147483647
+      ]
+     }
+    },
+    {
+     "expression": "-2147483649",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483649L"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483649,
+       -2147483649,
+       -2147483649
+      ]
+     }
+    },
+    {
+     "expression": "2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "2147483648L"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483648,
+       2147483648,
+       2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-9223372036854775808",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-9223372036854775808L"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -9223372036854775808,
+       -9223372036854775808,
+       -9223372036854775808
+      ]
+     }
+    },
+    {
+     "expression": "-9223372036854775809",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-9223372036854775809BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(19,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-9223372036854775809",
+       "-9223372036854775809",
+       "-9223372036854775809"
+      ]
+     }
+    },
+    {
+     "expression": "-9223372036854775808L",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-9223372036854775808L"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -9223372036854775808,
+       -9223372036854775808,
+       -9223372036854775808
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648L",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483648L"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "- 2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483648"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-/* c */2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-2147483648"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-(2147483648)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- 2147483648L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-(9223372036854775808)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- 9223372036854775808BD)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(19,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-9223372036854775808",
+       "-9223372036854775808",
+       "-9223372036854775808"
+      ]
+     }
+    },
+    {
+     "expression": "- -2147483648",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "-(-2147483648)",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "- -2",
+     "parse": {
+      "ok": true,
+      "node": "UnaryMinus",
+      "sql": "(- -2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2,
+       2,
+       2
+      ]
+     }
+    },
+    {
+     "expression": "round(-2147483648, -1)",
+     "parse": {
+      "ok": true,
+      "node": "UnresolvedFunction",
+      "sql": "round(-2147483648, -1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483646,
+       2147483646,
+       2147483646
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648 - 1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(-2147483648 - 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       2147483647,
+       2147483647,
+       2147483647
+      ]
+     }
+    },
+    {
+     "expression": "1 - -2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(1 - -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483647,
+       -2147483647,
+       -2147483647
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648 + a",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(-2147483648 + a)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483647,
+       null,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "-9223372036854775808 - 1",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(-9223372036854775808L - 1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       9223372036854775807,
+       9223372036854775807,
+       9223372036854775807
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648 * -1",
+     "parse": {
+      "ok": true,
+      "node": "Multiply",
+      "sql": "(-2147483648 * -1)"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483648,
+       -2147483648,
+       -2147483648
+      ]
+     }
+    },
+    {
+     "expression": "a - 2147483648",
+     "parse": {
+      "ok": true,
+      "node": "Subtract",
+      "sql": "(a - 2147483648L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "bigint"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -2147483647,
+       null,
+       -4294967296
+      ]
+     }
+    },
+    {
+     "expression": "a >= -2147483648",
+     "parse": {
+      "ok": true,
+      "node": "GreaterThanOrEqual",
+      "sql": "(a >= -2147483648)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       true,
+       null,
+       true
+      ]
+     }
+    },
+    {
+     "expression": "b = -9223372036854775808",
+     "parse": {
+      "ok": true,
+      "node": "EqualTo",
+      "sql": "(b = -9223372036854775808L)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       null,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648 IS NULL",
+     "parse": {
+      "ok": true,
+      "node": "IsNull",
+      "sql": "(-2147483648 IS NULL)"
+     },
+     "type": {
+      "ok": true,
+      "type": "boolean"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       false,
+       false,
+       false
+      ]
+     }
+    },
+    {
+     "expression": "-5::string",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-5 AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-5",
+       "-5",
+       "-5"
+      ]
+     }
+    },
+    {
+     "expression": "-2147483648::string",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-2147483648 AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-2147483648",
+       "-2147483648",
+       "-2147483648"
+      ]
+     }
+    },
+    {
+     "expression": "-1.5::string",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-1.5BD AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.5",
+       "-1.5",
+       "-1.5"
+      ]
+     }
+    },
+    {
+     "expression": "-1e0::string",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(-1.0D AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.0",
+       "-1.0",
+       "-1.0"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + -2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + -2)"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(11,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.34",
+       null,
+       "-2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + - -2",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + (- -2))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "14.34",
+       null,
+       "2.00"
+      ]
+     }
+    },
+    {
+     "expression": "d1 + -(2)",
+     "parse": {
+      "ok": true,
+      "node": "Add",
+      "sql": "(d1 + (- 2))"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(13,2)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "10.34",
+       null,
+       "-2.00"
+      ]
+     }
+    },
+    {
+     "expression": "-1.5",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-1.5BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(2,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.5",
+       "-1.5",
+       "-1.5"
+      ]
+     }
+    },
+    {
+     "expression": "-.5",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-0.5BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(1,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.5",
+       "-0.5",
+       "-0.5"
+      ]
+     }
+    },
+    {
+     "expression": "-1.",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-1BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(1,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1",
+       "-1",
+       "-1"
+      ]
+     }
+    },
+    {
+     "expression": "-1e3BD",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-1000BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(4,0)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1000",
+       "-1000",
+       "-1000"
+      ]
+     }
+    },
+    {
+     "expression": "-1.5BD",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-1.5BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(2,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-1.5",
+       "-1.5",
+       "-1.5"
+      ]
+     }
+    },
+    {
+     "expression": "-0",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "0"
+     },
+     "type": {
+      "ok": true,
+      "type": "int"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    {
+     "expression": "-0.0",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "0.0BD"
+     },
+     "type": {
+      "ok": true,
+      "type": "decimal(1,1)"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "0.0",
+       "0.0",
+       "0.0"
+      ]
+     }
+    },
+    {
+     "expression": "-0.0D",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-0.0D"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "-0.0F",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "CAST('-0.0' AS FLOAT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "CAST(-0.0F AS STRING)",
+     "parse": {
+      "ok": true,
+      "node": "Cast",
+      "sql": "CAST(CAST('-0.0' AS FLOAT) AS STRING)"
+     },
+     "type": {
+      "ok": true,
+      "type": "string"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       "-0.0",
+       "-0.0",
+       "-0.0"
+      ]
+     }
+    },
+    {
+     "expression": "-1e-400",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-0.0D"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -0.0,
+       -0.0,
+       -0.0
+      ]
+     }
+    },
+    {
+     "expression": "-3.4028234663852886e38F",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "CAST('-3.4028235E38' AS FLOAT)"
+     },
+     "type": {
+      "ok": true,
+      "type": "float"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -3.4028234663852886e+38,
+       -3.4028234663852886e+38,
+       -3.4028234663852886e+38
+      ]
+     }
+    },
+    {
+     "expression": "-1.7976931348623157e308",
+     "parse": {
+      "ok": true,
+      "node": "Literal",
+      "sql": "-1.7976931348623157E308D"
+     },
+     "type": {
+      "ok": true,
+      "type": "double"
+     },
+     "eval": {
+      "ok": true,
+      "values": [
+       -1.7976931348623157e+308,
+       -1.7976931348623157e+308,
+       -1.7976931348623157e+308
+      ]
+     }
+    },
+    {
+     "expression": "-1.79769313486231575e308",
+     "parse": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 1) ==\n-1.79769313486231575e308\n^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "type": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+     },
+     "eval": {
+      "ok": false,
+      "error": "ParseException: \n[INVALID_NUMERIC_LITERAL_RANGE] Numeric literal -1.79769313486231575e308 is outside the valid range for double with minimum value of -1.7976931348623157E+308 and maximum value of 1.7976931348623157E+308. Please adjust the value accordingly. SQLSTATE: 22003\n== SQL (line 1, position 2) ==\n(-1.79769313486231575e308) AS r\n ^^^^^^^^^^^^^^^^^^^^^^^^\n"
      }
     }
    ]

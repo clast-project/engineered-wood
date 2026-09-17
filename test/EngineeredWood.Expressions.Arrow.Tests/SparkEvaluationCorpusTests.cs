@@ -501,6 +501,9 @@ public sealed class SparkEvaluationCorpusTests
     // values -- and the evaluation gate below cannot tell a date from a timestamp holding the
     // same midnight, which is the answer a fold that truncated the other way would give.
     [InlineData("date-timestamp-fold")]
+    // #303, and a gate the value comparison cannot replace: `-2147483648` is the same number as
+    // an `int` and as a `bigint`, and the whole defect was that we resolved the wider one.
+    [InlineData("negative-literal-fold")]
     public void TheTypeWeProduceIsTheTypeSparkResolved(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("groups"), group, Ansi, Excluded, KnownDifferences);
@@ -534,6 +537,9 @@ public sealed class SparkEvaluationCorpusTests
     // opposite directions: `coalesce(ts, s)` is a `timestamp` under ANSI and a `string` here.
     // Only this theory sees that second half at all.
     [InlineData("date-timestamp-fold")]
+    // ...and #303 here because the fold is the parser's and so cannot differ by dialect -- which
+    // is a claim until this theory checks it, while the VALUES it leads to plainly do differ.
+    [InlineData("negative-literal-fold")]
     public void TheTypeWeProduceIsTheTypeSparkResolvedUnderTheLegacyDialect(string group) =>
         AssertTypesMatchSpark(
             Corpus.RootElement.GetProperty("legacy").GetProperty("groups"), group, Legacy,

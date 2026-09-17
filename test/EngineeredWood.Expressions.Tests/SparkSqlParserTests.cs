@@ -810,6 +810,76 @@ public sealed class SparkSqlParserTests
             Assert.IsType<LiteralExpression>(Parse("9223372036854775808")).Value.Type);
     }
 
+    /// <summary>
+    /// A minus before a number is part of the literal, and the SIGNED text is what gets typed.
+    /// </summary>
+    /// <remarks>
+    /// #303, measured against Spark 4.0.3: <c>-2147483648</c> is an <c>int</c> and
+    /// <c>-9223372036854775808</c> a <c>bigint</c>, though neither magnitude fits. The fold is
+    /// by token, so whitespace and a comment do not stop it; parentheses do.
+    /// </remarks>
+    [Theory]
+    [InlineData("-2147483648", LiteralValue.Kind.Int32)]
+    [InlineData("- 2147483648", LiteralValue.Kind.Int32)]
+    [InlineData("-/* c */2147483648", LiteralValue.Kind.Int32)]
+    [InlineData("-2147483649", LiteralValue.Kind.Int64)]
+    [InlineData("-9223372036854775808", LiteralValue.Kind.Int64)]
+    [InlineData("-9223372036854775808L", LiteralValue.Kind.Int64)]
+    [InlineData("-9223372036854775809", LiteralValue.Kind.Decimal)]
+    [InlineData("-1.5", LiteralValue.Kind.Decimal)]
+    [InlineData("-1e3BD", LiteralValue.Kind.Decimal)]
+    public void AMinusBeforeANumberIsTypedWithTheLiteral(string sql, LiteralValue.Kind expected)
+    {
+        var literal = Assert.IsType<LiteralExpression>(Parse(sql));
+        Assert.Equal(expected, literal.Value.Type);
+        Assert.StartsWith("-", literal.Value.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParenthesesStopTheFoldAndOnlyOneSignFolds()
+    {
+        // `-(2147483648)` negates a bigint...
+        var parenthesised = Assert.IsType<FunctionCall>(Parse("-(2147483648)"));
+        Assert.Equal("negative", parenthesised.Name);
+        Assert.Equal(LiteralValue.Kind.Int64,
+            Assert.IsType<LiteralExpression>(parenthesised.Arguments[0]).Value.Type);
+
+        // ...and `- -2147483648` negates an int, which is what makes it overflow in Spark.
+        var doubled = Assert.IsType<FunctionCall>(Parse("- -2147483648"));
+        Assert.Equal("negative", doubled.Name);
+        Assert.Equal(LiteralValue.Of(int.MinValue),
+            Assert.IsType<LiteralExpression>(doubled.Arguments[0]).Value);
+
+        // A binary minus is not a sign: `a - 2147483648` subtracts a bigint.
+        var subtraction = Assert.IsType<FunctionCall>(Parse("a - 2147483648"));
+        Assert.Equal(LiteralValue.Kind.Int64,
+            Assert.IsType<LiteralExpression>(subtraction.Arguments[1]).Value.Type);
+    }
+
+    /// <summary>
+    /// The fold binds tighter than postfix, so <c>-5::string</c> casts the literal -5.
+    /// </summary>
+    /// <remarks>
+    /// Measured, Spark answers the string <c>'-5'</c>. Negating after the cast would negate the
+    /// string <c>'5'</c>, which is the double <c>-5.0</c>. #303.
+    /// </remarks>
+    [Fact]
+    public void TheFoldedLiteralIsWhatAPostfixCastApplies()
+    {
+        var cast = Assert.IsType<FunctionCall>(Parse("-5::string"));
+        Assert.Equal("cast", cast.Name);
+        Assert.Equal(LiteralValue.Of(-5), Assert.IsType<LiteralExpression>(cast.Arguments[0]).Value);
+    }
+
+    [Theory]
+    [InlineData("-0.0D")]
+    [InlineData("-1e-400")]
+    public void AFoldedFloatingPointZeroKeepsItsSign(string sql)
+    {
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+        Assert.Equal(BitConverter.DoubleToInt64Bits(-0.0), BitConverter.DoubleToInt64Bits(value.AsDouble));
+    }
+
     [Fact]
     public void ASubqueryIsRefusedForBeingASubqueryRatherThanForAStrayParenthesis()
     {

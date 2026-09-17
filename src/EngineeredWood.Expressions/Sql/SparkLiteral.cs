@@ -26,8 +26,16 @@ internal static class SparkLiteral
     /// <c>decimal(1,0)</c> — only an exponent makes it a double, so <c>1e3</c> is
     /// <c>double</c>. Integers take the narrowest of int then bigint, so <c>1</c> is an
     /// <c>int</c> while <c>1000000000000</c> is a <c>bigint</c>.
+    /// <para>
+    /// <paramref name="negative"/> is a minus sign the parser folded into the literal, and it is
+    /// applied BEFORE the ladder, because Spark types the signed text: <c>-2147483648</c> is an
+    /// <c>int</c> and <c>-9223372036854775808</c> a <c>bigint</c>, though neither magnitude fits
+    /// the type its negation does. #303. A floating-point literal is the exception: it is negated
+    /// after parsing, so the range check keeps reading an unsigned mantissa, and a zero keeps
+    /// its sign -- <c>-1e-400</c> is <c>-0.0</c> to Spark. #282.
+    /// </para>
     /// </remarks>
-    public static LiteralValue Number(string text, string sql, int position)
+    public static LiteralValue Number(string text, bool negative, string sql, int position)
     {
         var digits = text;
         var suffix = string.Empty;
@@ -43,16 +51,19 @@ internal static class SparkLiteral
             digits = digits.Substring(0, digits.Length - 1);
         }
 
+        var signed = negative ? "-" + digits : digits;
+
         switch (suffix)
         {
             case "L":
-                return LiteralValue.Of(ParseLong(digits, sql, position));
+                return LiteralValue.Of(ParseLong(signed, sql, position));
             case "F":
-                return LiteralValue.Of(ParseFloat(digits, sql, position));
+                var asFloat = ParseFloat(digits, sql, position);
+                return LiteralValue.Of(negative ? -asFloat : asFloat);
             case "D":
-                return LiteralValue.Of(ParseDouble(digits, sql, position));
+                return LiteralValue.Of(Double(digits, negative, sql, position));
             case "BD":
-                return Decimal(digits, sql, position);
+                return Decimal(signed, sql, position);
 
             // LiteralValue has no 8- or 16-bit integer kind, and silently widening to int would
             // change how the value coerces and overflows. Refusing is the honest answer.
@@ -65,20 +76,26 @@ internal static class SparkLiteral
 
         var hasExponent = digits.IndexOf('e') >= 0 || digits.IndexOf('E') >= 0;
         if (hasExponent)
-            return LiteralValue.Of(ParseDouble(digits, sql, position));
+            return LiteralValue.Of(Double(digits, negative, sql, position));
 
         if (digits.IndexOf('.') >= 0)
-            return Decimal(digits, sql, position);
+            return Decimal(signed, sql, position);
 
-        if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asInt))
+        if (int.TryParse(signed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asInt))
             return LiteralValue.Of(asInt);
 
-        if (long.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asLong))
+        if (long.TryParse(signed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var asLong))
             return LiteralValue.Of(asLong);
 
         // Spark's ladder does not stop at bigint: an integral literal too wide for one becomes a
         // DECIMAL, which is why a 38-digit literal is a decimal(38,0) rather than an error. #173.
-        return Decimal(digits, sql, position);
+        return Decimal(signed, sql, position);
+    }
+
+    private static double Double(string digits, bool negative, string sql, int position)
+    {
+        var value = ParseDouble(digits, sql, position);
+        return negative ? -value : value;
     }
 
     /// <summary>
@@ -430,7 +447,8 @@ internal static class SparkLiteral
         }
 
         // The tokenizer has already established that what is left is digits, possibly none of
-        // them — `.5` and `1.` are both literals Spark accepts.
+        // them — `.5` and `1.` are both literals Spark accepts — behind the sign the parser may
+        // have folded in, which the parse reads.
         var unscaled = text.Length == 0
             ? BigInteger.Zero
             : BigInteger.Parse(text, NumberStyles.Integer, CultureInfo.InvariantCulture);
