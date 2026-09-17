@@ -40,7 +40,7 @@ public class VortexUpstreamCompatTests
     /// </summary>
     private static readonly Dictionary<string, string> KnownGaps = new(StringComparer.Ordinal)
     {
-        ["map.vortex"] = "the Map dtype (vortex 0.86) is not supported yet",
+        ["map.vortex"] = "the Map dtype (vortex 0.86) is not supported yet (#366)",
     };
 
     /// <summary>The release the committed samples were copied from.</summary>
