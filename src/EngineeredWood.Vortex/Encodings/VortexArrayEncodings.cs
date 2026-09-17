@@ -19,6 +19,7 @@ internal static class VortexArrayEncodings
     public const string Struct_ = "vortex.struct";
     public const string List = "vortex.list";
     public const string ListView = "vortex.listview";
+    public const string Map = "vortex.map";
     public const string VarBin = "vortex.varbin";
     public const string VarBinView = "vortex.varbinview";
     public const string FixedSizeList = "vortex.fixed_size_list";

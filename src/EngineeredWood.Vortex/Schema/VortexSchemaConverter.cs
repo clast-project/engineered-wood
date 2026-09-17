@@ -116,6 +116,19 @@ internal static class VortexSchemaConverter
                     return (new FixedSizeListType(item, checked((int)f.Size)), f.Nullable);
                 }
 
+            case DTypeKind.Map:
+                {
+                    var m = d.AsMap();
+                    // Arrow's map is List<Struct{key, value}> with i32 offsets: the entries struct
+                    // is non-nullable, the value takes its own dtype's nullability. Keys are
+                    // non-nullable in both models, so a nullable one is a malformed file.
+                    var key = ToField("key", m.KeyType, useLargeList);
+                    if (key.IsNullable)
+                        throw new VortexFormatException("Vortex Map dtype has a nullable key; map keys cannot be null.");
+                    var value = ToField("value", m.ValueType, useLargeList);
+                    return (new MapType(key, value, m.KeysSorted), m.Nullable);
+                }
+
             case DTypeKind.Extension:
                 {
                     var ext = d.AsExtension();
@@ -129,6 +142,10 @@ internal static class VortexSchemaConverter
             case DTypeKind.Variant:
                 throw new NotSupportedException(
                     "The Vortex 'variant' dtype is not yet supported by EngineeredWood.Vortex.");
+
+            case DTypeKind.Union:
+                throw new NotSupportedException(
+                    "The Vortex 'union' dtype is not yet supported by EngineeredWood.Vortex.");
 
             case DTypeKind.None:
                 throw new VortexFormatException(

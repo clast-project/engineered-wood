@@ -40,7 +40,8 @@ public class VortexUpstreamCompatTests
     /// </summary>
     private static readonly Dictionary<string, string> KnownGaps = new(StringComparer.Ordinal)
     {
-        ["map.vortex"] = "the Map dtype (vortex 0.86) is not supported yet (#366)",
+        // Empty: every pinned fixture reads correctly. An entry is one fixture file name mapped
+        // to the reason, e.g. ["map.vortex"] = "the Map dtype is not supported yet (#366)".
     };
 
     /// <summary>The release the committed samples were copied from.</summary>

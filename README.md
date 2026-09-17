@@ -551,7 +551,8 @@ release since 0.64 — to the same values upstream does.
 | FixedSizeList | yes | yes |
 | List | yes | yes (i32 offsets; LargeList deferred) |
 | Struct (recursive, including nested struct/list/FSL) | yes | yes |
-| Map, LargeString, LargeBinary, Union | not yet | not yet |
+| Map (`keys_sorted`, duplicate keys, null maps) | yes | not yet |
+| LargeString, LargeBinary, Union | not yet | not yet |
 
 ### Encoding coverage
 
@@ -563,7 +564,7 @@ release since 0.64 — to the same values upstream does.
 `vortex.constant`, `vortex.chunked`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
 `vortex.null`, `vortex.varbin`, `vortex.varbinview`, `vortex.fsst`,
 `vortex.onpair`, `vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
-`vortex.list`, `vortex.listview`, `vortex.fixed_size_list`,
+`vortex.list`, `vortex.listview`, `vortex.map`, `vortex.fixed_size_list`,
 `vortex.struct`, `vortex.decimal`, `vortex.decimal_byte_parts`,
 `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.datetimeparts`,
 `vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
