@@ -37,9 +37,43 @@ public class SpecialDatetimeValuesTests
 
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    /// <summary>Today in the session zone, which is the answer four of the five words move with.</summary>
-    private static DateTimeOffset Today =>
-        new(DateTimeOffset.UtcNow.UtcDateTime.Date, TimeSpan.Zero);
+    /// <summary>UTC midnight of the day <paramref name="instant"/> falls in, shifted by days.</summary>
+    private static DateTimeOffset Day(DateTimeOffset instant, int offsetDays = 0) =>
+        new(instant.UtcDateTime.Date.AddDays(offsetDays), TimeSpan.Zero);
+
+    /// <summary>
+    /// Asserts that <paramref name="read"/> answers today shifted by
+    /// <paramref name="offsetDays"/>, plus <paramref name="timeOfDay"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The clock is sampled ACROSS the call, not beside it.</b> Four of the five words are a
+    /// function of the clock, so an expected value read from a second `UtcNow` is a different
+    /// reading from the one the call made — and once a day, for however long the call takes,
+    /// those two readings name different days. Bracketing the call and accepting either day is
+    /// exact: the call happened between the two samples, so whichever day it saw is one of them.
+    /// </para>
+    /// <para>
+    /// <b>Bracketing rather than a frozen clock</b>, which is what a review asked for. Freezing
+    /// means a clock seam, and it would have to reach <c>SparkTemporalText</c> — which reads
+    /// <c>UtcNow</c> for the time-alone form and has no options object to carry one, that being
+    /// the constraint #341 recorded. It also would not help the one assertion that compares two
+    /// INDEPENDENT clock readings against each other, which is what
+    /// <see cref="TheLiteralAndTheCastAgree"/> is for. Two samples cost nothing and are sound
+    /// for both.
+    /// </para>
+    /// </remarks>
+    private static void AssertNamesDay(
+        Func<DateTimeOffset> read, int offsetDays = 0, TimeSpan timeOfDay = default)
+    {
+        var before = DateTimeOffset.UtcNow;
+        var answer = read();
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.Contains(
+            answer,
+            new[] { Day(before, offsetDays) + timeOfDay, Day(after, offsetDays) + timeOfDay });
+    }
 
     /// <summary>One row carrying an int to branch on and a string column holding <c>'epoch'</c>.</summary>
     /// <remarks>
@@ -91,11 +125,13 @@ public class SpecialDatetimeValuesTests
     {
         foreach (var registry in new[] { Ansi, Legacy })
         {
-            Assert.Equal(Epoch, Date(registry, "CAST('epoch' AS DATE)"));
-            Assert.Equal(Today, Date(registry, "CAST('today' AS DATE)"));
-            Assert.Equal(Today, Date(registry, "CAST('now' AS DATE)"));
-            Assert.Equal(Today.AddDays(-1), Date(registry, "CAST('yesterday' AS DATE)"));
-            Assert.Equal(Today.AddDays(1), Date(registry, "CAST('tomorrow' AS DATE)"));
+            var r = registry;
+
+            Assert.Equal(Epoch, Date(r, "CAST('epoch' AS DATE)"));
+            AssertNamesDay(() => Date(r, "CAST('today' AS DATE)"));
+            AssertNamesDay(() => Date(r, "CAST('now' AS DATE)"));
+            AssertNamesDay(() => Date(r, "CAST('yesterday' AS DATE)"), -1);
+            AssertNamesDay(() => Date(r, "CAST('tomorrow' AS DATE)"), 1);
         }
     }
 
@@ -109,10 +145,12 @@ public class SpecialDatetimeValuesTests
     {
         foreach (var registry in new[] { Ansi, Legacy })
         {
-            Assert.Equal(Epoch, Instant(registry, "CAST('epoch' AS TIMESTAMP)"));
-            Assert.Equal(Today, Instant(registry, "CAST('today' AS TIMESTAMP)"));
-            Assert.Equal(Today.AddDays(-1), Instant(registry, "CAST('yesterday' AS TIMESTAMP)"));
-            Assert.Equal(Today.AddDays(1), Instant(registry, "CAST('tomorrow' AS TIMESTAMP)"));
+            var r = registry;
+
+            Assert.Equal(Epoch, Instant(r, "CAST('epoch' AS TIMESTAMP)"));
+            AssertNamesDay(() => Instant(r, "CAST('today' AS TIMESTAMP)"));
+            AssertNamesDay(() => Instant(r, "CAST('yesterday' AS TIMESTAMP)"), -1);
+            AssertNamesDay(() => Instant(r, "CAST('tomorrow' AS TIMESTAMP)"), 1);
 
             // Bounded rather than compared, because the clock is read inside the call. The low
             // bound gives back one MICROSECOND: the folded instant is materialised into a
@@ -283,7 +321,7 @@ public class SpecialDatetimeValuesTests
     [Fact]
     public void NowRefusesATimezoneWhereTheOtherWordsAcceptOne()
     {
-        Assert.Equal(Today, Date(Ansi, "CAST('today UTC' AS DATE)"));
+        AssertNamesDay(() => Date(Ansi, "CAST('today UTC' AS DATE)"));
         Assert.Throws<SparkEvaluationException>(() => Evaluate(Ansi, "CAST('now UTC' AS DATE)"));
     }
 
@@ -342,8 +380,8 @@ public class SpecialDatetimeValuesTests
     {
         Assert.Equal(Epoch, Date(Ansi, "DATE'epoch'"));
         Assert.Equal(Epoch, Date(Ansi, "DATE'  EPOCH  '"));
-        Assert.Equal(Today, Date(Ansi, "DATE'today'"));
-        Assert.Equal(Today, Date(Ansi, "DATE'today UTC'"));
+        AssertNamesDay(() => Date(Ansi, "DATE'today'"));
+        AssertNamesDay(() => Date(Ansi, "DATE'today UTC'"));
         Assert.Equal(Epoch, Instant(Ansi, "TIMESTAMP'epoch'"));
 
         Assert.Throws<SparkSqlParseException>(
@@ -362,8 +400,39 @@ public class SpecialDatetimeValuesTests
     [Fact]
     public void TheLiteralAndTheCastAgree()
     {
-        Assert.Equal(Date(Ansi, "DATE'today'"), Date(Ansi, "CAST('today' AS DATE)"));
-        Assert.Equal(Date(Ansi, "DATE'yesterday'"), Date(Ansi, "CAST('yesterday' AS DATE)"));
+        AssertAgree("DATE'today'", "CAST('today' AS DATE)", 0);
+        AssertAgree("DATE'yesterday'", "CAST('yesterday' AS DATE)", -1);
+    }
+
+    /// <summary>
+    /// Two expressions that each read the clock name the same day.
+    /// </summary>
+    /// <remarks>
+    /// The pair is bracketed rather than each half, because the claim is about the two AGREEING
+    /// and equality is what a midnight between them would break. Both halves are held to the
+    /// bracket unconditionally -- neither may name a day the clock did not show -- and equality
+    /// is asserted on the runs where the bracket did not cross a day, which is every run but at
+    /// most one a year. The other arm is not a let-off: across midnight the two readings must be
+    /// the two ADJACENT days, in that order, which is a statement about them the loose form
+    /// would not make.
+    /// </remarks>
+    private static void AssertAgree(string left, string right, int offsetDays)
+    {
+        var before = DateTimeOffset.UtcNow;
+        var first = Date(Ansi, left);
+        var second = Date(Ansi, right);
+        var after = DateTimeOffset.UtcNow;
+
+        var opened = Day(before, offsetDays);
+        var closed = Day(after, offsetDays);
+
+        Assert.Contains(first, new[] { opened, closed });
+        Assert.Contains(second, new[] { opened, closed });
+
+        if (opened == closed)
+            Assert.Equal(first, second);
+        else
+            Assert.True(first <= second, $"{left} read {first} after {right} read {second}");
     }
 
     // ── What the rule must NOT reach ──
@@ -410,9 +479,9 @@ public class SpecialDatetimeValuesTests
         // A time alone starts with a letter and is three characters or more, so it reaches
         // extractSpecialValue and must come back out of it: 'T' is not the vocabulary, and the
         // tail '12:30:00' is not a zone.
-        Assert.Equal(
-            Today.AddHours(12).AddMinutes(30),
-            Instant(Ansi, "CAST('T12:30:00' AS TIMESTAMP)"));
+        AssertNamesDay(
+            () => Instant(Ansi, "CAST('T12:30:00' AS TIMESTAMP)"),
+            timeOfDay: new TimeSpan(12, 30, 0));
     }
 
     /// <summary>
