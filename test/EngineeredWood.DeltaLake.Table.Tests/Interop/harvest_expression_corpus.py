@@ -164,7 +164,11 @@ LEGACY_GROUPS = (
     # two dialects are known to choose OPPOSITE directions. So half the group cannot be read off
     # one harvest at all, and the other half is a claim until a second one says so, exactly as
     # for `decimal-common-type`.
-    "date-timestamp-fold")
+    "date-timestamp-fold",
+    # #303. The TYPES are dialect-independent -- the fold is the parser's -- and the reason the
+    # group exists is what they do next: an `int` at its minimum overflows, raising under ANSI and
+    # wrapping under legacy, where the `bigint` we used to type it had room for both.
+    "negative-literal-fold")
 
 # One schema wide enough for every expression below. Names are terse because they appear in
 # hundreds of expressions and the corpus is read as a table.
@@ -3200,6 +3204,39 @@ GROUPS = {
         # the temporal branch above is shown not to have moved it.
         "CAST(coalesce(ts, s) AS STRING)", "CAST(coalesce(dt, s) AS STRING)",
         "coalesce(ts, s)", "coalesce(dt, s)",
+    ],
+
+    # A MINUS BEFORE A NUMBER IS PART OF THE LITERAL. #303. Spark's grammar spells a number
+    # `MINUS? INTEGER_VALUE` and types the SIGNED text, so `-2147483648` is an `int` although its
+    # magnitude is not -- and at each type's minimum, typing the magnitude first lands one width
+    # too wide, which is what moved every overflow check there.
+    "negative-literal-fold": [
+        # --- THE ISSUE AS FILED: the two minimums, and a step either side of the first.
+        "-2147483648", "-2147483647", "-2147483649", "2147483648",
+        "-9223372036854775808", "-9223372036854775809", "-9223372036854775808L", "-2147483648L",
+
+        # --- THE FOLD IS BY TOKEN. Whitespace and a comment between the two still fold; only
+        # parentheses stop it, and then the magnitude is typed alone. A second sign is a real
+        # negation of an `int` -- which overflows.
+        "- 2147483648", "-/* c */2147483648", "-(2147483648)", "-(9223372036854775808)",
+        "- -2147483648", "-(-2147483648)", "- -2",
+
+        # --- WHAT THE WIDTH DECIDES: the overflow at the minimum, which a bigint had room for.
+        "round(-2147483648, -1)", "-2147483648 - 1", "1 - -2147483648", "-2147483648 + a",
+        "-9223372036854775808 - 1", "-2147483648 * -1", "a - 2147483648",
+        "a >= -2147483648", "b = -9223372036854775808", "-2147483648 IS NULL",
+
+        # --- THE FOLD BINDS TIGHTER THAN POSTFIX: `-5::string` is the string '-5', where a
+        # negation of the string '5' would be the double -5.0.
+        "-5::string", "-2147483648::string", "-1.5::string", "-1e0::string",
+
+        # --- #281's precision rule reads a folded literal and nothing else: `- -2` is an operator.
+        "d1 + -2", "d1 + - -2", "d1 + -(2)",
+
+        # --- THE OTHER KINDS carry the sign too, and a zero keeps it only where the type has one.
+        "-1.5", "-.5", "-1.", "-1e3BD", "-1.5BD", "-0", "-0.0", "-0.0D", "-0.0F",
+        "CAST(-0.0F AS STRING)", "-1e-400", "-3.4028234663852886e38F", "-1.7976931348623157e308",
+        "-1.79769313486231575e308",
     ],
 
     "malformed": [

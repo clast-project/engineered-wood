@@ -342,18 +342,38 @@ public static class SparkSqlParser
             if (TakeToken(TokenKind.Plus))
                 return new FunctionCall("positive", new[] { ParseUnary() });
 
+            // A MINUS BEFORE A NUMBER IS PART OF THE LITERAL. Spark's grammar spells a number as
+            // `MINUS? INTEGER_VALUE` and so on, and types the signed text, so `-2147483648` is an
+            // `int` there -- typing the magnitude first made it a `bigint` here, one width too
+            // generous for every overflow check at the minimum. Measured: the fold is by TOKEN,
+            // so `- 2147483648` and `-/* c */2147483648` fold too, while `-(2147483648)` does
+            // not and is a `bigint`. It also binds tighter than postfix, so `-5::string` is
+            // `'-5'`, not the double `-5.0` a negated string gives. Only one sign folds:
+            // `- -2147483648` negates an `int`. #303.
+            if (Current.Kind == TokenKind.Minus && Peek(1).Kind == TokenKind.Number)
+            {
+                var start = Current.Start;
+                Advance();
+                return ParsePostfix(ParseNumber(start, negative: true));
+            }
+
             if (TakeToken(TokenKind.Minus))
                 return new FunctionCall("negative", new[] { ParseUnary() });
 
-            return ParsePostfix();
+            return ParsePostfix(ParsePrimary());
+        }
+
+        private Expression ParseNumber(int start, bool negative)
+        {
+            var text = TextOf(Current);
+            Advance();
+            return new LiteralExpression(SparkLiteral.Number(text, negative, _sql, start));
         }
 
         // ── Postfix: field access, subscript, cast shorthand ───────────────────────────
 
-        private Expression ParsePostfix()
+        private Expression ParsePostfix(Expression expression)
         {
-            var expression = ParsePrimary();
-
             while (true)
             {
                 if (TakeToken(TokenKind.Dot))
@@ -392,8 +412,7 @@ public static class SparkSqlParser
             switch (token.Kind)
             {
                 case TokenKind.Number:
-                    Advance();
-                    return new LiteralExpression(SparkLiteral.Number(TextOf(token), _sql, token.Start));
+                    return ParseNumber(token.Start, negative: false);
 
                 case TokenKind.String:
                     return new LiteralExpression(LiteralValue.Of(ConcatenatedString()));

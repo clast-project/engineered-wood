@@ -1479,49 +1479,25 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// null when it is anything else.
     /// </summary>
     /// <remarks>
-    /// <b>A negated literal is one.</b> Spark's parser folds the sign into the literal, so
-    /// <c>-2</c> is a <c>Literal</c> there and a <c>negative</c> call here — and the rule reads a
-    /// PRECISION, which a sign never changes, so unwrapping one level answers the same
-    /// <c>decimal(1,0)</c> Spark's folded literal gets. Measured: <c>d1 + -2</c> is
-    /// decimal(11,2), the same as <c>d1 + 2</c>. Exactly one level, because Spark folds exactly
-    /// one: <c>- -2</c> is a UnaryMinus over a literal there too, and takes no cast.
-    /// <para>
-    /// The sign is applied to the value returned, because the caller builds the operand's column
-    /// from it rather than from the array the negation produced.
-    /// <see cref="long.MinValue"/> cannot arrive under a negation — its magnitude is one past
-    /// <see cref="long.MaxValue"/>, so <c>SparkLiteral</c> reads that token as a DECIMAL literal,
-    /// which is not integral and never reaches here — and the guard says so rather than trusting
-    /// it, since an expression tree built in code is not bound by the parser's ladder.
-    /// </para>
-    /// <para>
-    /// This is also why the depth of #303 does not reach here. That issue is about a negative
-    /// literal at a type's minimum being an <c>int</c> to Spark and a <c>bigint</c> to us; both
-    /// spell <c>-2147483648</c> with ten digits, so both give <c>decimal(10,0)</c>.
-    /// </para>
+    /// <b>A negated literal is one only when the PARSER folded it.</b> Spark's grammar makes
+    /// <c>-2</c> a single literal and <c>SparkSqlParser</c> now does the same (#303),
+    /// so a <c>negative</c> call here is a real operator and is not unwrapped: <c>- -2</c> is a
+    /// UnaryMinus over a literal in Spark and takes no cast. Measured: <c>d1 + -2</c> is
+    /// decimal(11,2), the same as <c>d1 + 2</c> -- the rule reads a PRECISION, which a sign never
+    /// changes, and <see cref="long.MinValue"/> is a bigint literal Spark's rule reads as
+    /// decimal(19,0).
     /// </remarks>
     private static long? IntegralLiteral(Expression expression)
     {
-        var negated = false;
-        if (expression is FunctionCall { Name: "negative", Arguments.Count: 1 } negate)
-        {
-            negated = true;
-            expression = negate.Arguments[0];
-        }
-
         if (expression is not LiteralExpression literal
             || literal.Value.Type is not (LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64))
         {
             return null;
         }
 
-        var value = literal.Value.Type == LiteralValue.Kind.Int32
+        return literal.Value.Type == LiteralValue.Kind.Int32
             ? literal.Value.AsInt32
             : literal.Value.AsInt64;
-
-        if (!negated)
-            return value;
-
-        return value == long.MinValue ? null : -value;
     }
 
     // -- Evaluating over a selection of rows --
