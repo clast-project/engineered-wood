@@ -458,3 +458,109 @@ jobs:
         with:
           name: cloud-io-test-results
           path: '**/cloud-io-results.trx'
+
+  # Upstream vortex reads what VortexFileWriter writes. The Vortex test suite's round trips prove
+  # EW agrees with itself, and VortexWriterEditionTests proves the writer names only frozen
+  # encodings; neither proves the reference reader can decode the result. VortexCrossValidationTests
+  # does, by handing each file to `vortex-validator`, a small Rust binary built against the same
+  # pinned vortex crates as the fixture generator (test/EngineeredWood.Vortex.Tests/Rust).
+  #
+  # WHY A SEPARATE JOB. Until this job existed nothing in CI built that binary, and the tests
+  # returned early without it — a PASS — so all of them reported green on every run having
+  # validated nothing. The only real check was on a dev box that happened to have the binary.
+  # Building vortex needs a Rust toolchain and several minutes of compilation that the Windows
+  # `build` job should not pay for every change; on Linux, cached, it is cheap after the first run.
+  #
+  # ONLY WHEN IT CAN MATTER. It runs when the project selection includes the Vortex tests, which
+  # covers changes to the writer, to the Rust crate, and to anything Vortex depends on. Like
+  # cloud-io it is not a required check.
+  vortex-validator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the project selection can diff against the base commit.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Select affected projects
+        id: select
+        shell: bash
+        run: |
+          python .github/scripts/select_projects.py \
+            --base "${{ github.event.pull_request.base.sha || github.event.before }}" \
+            --head "${{ github.sha }}" \
+            --slnf /dev/null \
+            ${{ github.event_name == 'push' && '--full' || '' }} \
+          || echo "scope=full" >> "$GITHUB_OUTPUT"
+          echo "::group::vortex-validator relevance"
+          if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
+             || grep -q '^tests=.*EngineeredWood\.Vortex\.Tests\.csproj' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "EngineeredWood.Vortex.Tests is not affected; skipping the Rust validator."
+          fi
+          echo "::endgroup::"
+
+      # Pinned, like the other oracles: the toolchain is part of what built the validator. 1.96.0
+      # is what the fixtures were last generated with; vortex 0.86.1 needs 1.95 or later.
+      - name: Setup Rust
+        if: steps.select.outputs.run == 'true'
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Cache Rust build
+        if: steps.select.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/EngineeredWood.Vortex.Tests/Rust
+
+      # --locked: the vortex versions are pinned in Cargo.lock, and a validator resolved afresh
+      # would be a different oracle from the one the fixtures were generated with.
+      - name: Build vortex-validator
+        if: steps.select.outputs.run == 'true'
+        working-directory: test/EngineeredWood.Vortex.Tests/Rust
+        run: cargo build --release --locked --bin vortex-validator
+
+      - name: Setup .NET
+        if: steps.select.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        if: steps.select.outputs.run == 'true'
+        run: dotnet restore test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj
+
+      - name: Build
+        if: steps.select.outputs.run == 'true'
+        run: >
+          dotnet build test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj
+          --no-restore --configuration Release --framework net10.0
+
+      # EW_REQUIRE_VORTEX_VALIDATOR=1 turns a missing binary into a failure rather than 42 skips,
+      # which is the difference between this job checking something and merely reporting green.
+      - name: Test against the Rust reader
+        if: steps.select.outputs.run == 'true'
+        env:
+          EW_REQUIRE_VORTEX_VALIDATOR: '1'
+        run: >
+          dotnet test test/EngineeredWood.Vortex.Tests/EngineeredWood.Vortex.Tests.csproj
+          --no-build --configuration Release --framework net10.0
+          --filter "FullyQualifiedName~VortexCrossValidationTests"
+          --logger "trx;LogFileName=vortex-validator-results.trx"
+
+      - name: Upload test results
+        if: always() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vortex-validator-test-results
+          path: '**/vortex-validator-results.trx'
