@@ -39,6 +39,30 @@ public class VortexCrossValidationTests
         return null;
     }
 
+    /// <summary>Set to <c>1</c> in a job that builds the validator, so a missing binary fails
+    /// rather than quietly skipping every check that upstream can read what this writer emits.</summary>
+    private const string RequireEnvVar = "EW_REQUIRE_VORTEX_VALIDATOR";
+
+    /// <summary>
+    /// The validator's path. Skips the calling test when it isn't built — or throws, when
+    /// <see cref="RequireEnvVar"/> says this job built it. These tests used to <c>return</c>
+    /// instead, which xUnit counts as a pass, so a run without the binary reported every
+    /// cross-validation green having validated nothing.
+    /// </summary>
+    private static string RequireValidator()
+    {
+        var validator = FindValidator();
+        if (validator is not null)
+            return validator;
+
+        const string build = "cd test/EngineeredWood.Vortex.Tests/Rust && cargo build --release --bin vortex-validator";
+        if (Environment.GetEnvironmentVariable(RequireEnvVar) == "1")
+            throw new InvalidOperationException($"{RequireEnvVar}=1 but vortex-validator is not built ({build}).");
+
+        Skip.If(true, $"vortex-validator is not built ({build}).");
+        return null!;
+    }
+
     private static (int ExitCode, string Stdout, string Stderr) RunValidator(string validator, string fileArg)
     {
         var psi = new ProcessStartInfo
@@ -61,17 +85,10 @@ public class VortexCrossValidationTests
         return (p.ExitCode, stdout, stderr);
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenPrimitiveFile()
     {
-        var validator = FindValidator();
-        if (validator is null)
-        {
-            // Soft-skip: the Rust validator wasn't built. CI/dev machines
-            // without a Rust toolchain still get green; this test only
-            // signals when the validator IS available and disagrees.
-            return;
-        }
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -110,11 +127,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenMultiBatchFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -154,11 +170,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenBitPackedFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -197,11 +212,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenListOfStructFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // List<Struct<id: int32, name: string>> — exercises both list and
         // struct array-level encodings cascading.
@@ -257,11 +271,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenStructOfStructFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var innerType = new StructType(new[]
         {
@@ -307,11 +320,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenBitPackedWithPatchesFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -344,11 +356,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenRleFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Repetitive doubles → fastlanes.rle dispatches.
         var schema = new Apache.Arrow.Schema(new[]
@@ -379,11 +390,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDictFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Mixed: a non-nullable dict-friendly column AND a nullable one to
         // exercise both is_nullable_codes flag values + the codes-validity
@@ -423,11 +433,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDeltaFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // A large base per 64-row block plus i % 8 selects fastlanes.delta
         // once the writer opts in (see VortexFileWriterTests.DeltaFriendly).
@@ -458,11 +467,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenForFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -501,11 +509,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenConstantFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -537,11 +544,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDecimalFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var d128 = new Decimal128Type(18, 4);
         var d256 = new Decimal256Type(50, 6);
@@ -584,11 +590,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenSlicedDictFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Build a 400-row repetitive nullable string column then slice off
         // the first 47 rows (odd offset → bit-level validity copy). Both the
@@ -628,11 +633,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenRunEndFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // 6 distinct Int32 values × 200-row runs → vortex.runend dispatches
         // (no nulls, no slicing — matches writer's current scope).
@@ -665,11 +669,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenFsstFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // 500-row column of URL-shaped strings — dict rejects (all distinct),
         // FSST trains a symbol table on the shared scheme/host/path prefix
@@ -702,11 +705,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenSparseFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // 5 000-row Int32 column where most rows are 0 with sprinkles of
         // non-zero values. Tests the full sparse round-trip through vortex's
@@ -739,11 +741,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenNullableRunEndFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Mix of value runs and null runs. Leading + trailing null runs
         // exercise the boundary handling at i=0 (seed) and i=n-1 (final
@@ -787,11 +788,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenNullableSparseFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Nullable Int32 sparse: mode = 0, scattered non-zero patches and
         // null patches. The validity of patch_values rides as a vortex.bool
@@ -828,11 +828,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenNullableFsstFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Nullable URL-shaped FSST column. Validity bitmap rides as a
         // vortex.bool node at children[2], after uncompressed_lengths and
@@ -868,11 +867,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenZonedStatsFloatFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Float column with Phase C's full stat set: max, max_is_truncated,
         // min, min_is_truncated, sum, null_count, nan_count. Cross-val is
@@ -923,11 +921,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenZonedStatsFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Multi-batch file with preserveStats: each column wrapped in
         // vortex.stats(data, zones) carrying per-zone null_count. The
@@ -978,11 +975,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenVarBinViewFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Mixed inline (≤ 12 bytes) and referenced (> 12 bytes) strings,
         // with nulls. Tests the views buffer + data buffer split + validity
@@ -1019,11 +1015,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenAlpRdFloatFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // f32 ALP-RD: bounded magnitudes around three pivots. ALP rejects,
         // ALP-RD applies with right_parts as u32.
@@ -1059,11 +1054,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenAlpRdFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Doubles where ALP can't find a profitable (e, f) — bounded
         // magnitudes around three pivots. ALP rejects, ALP-RD applies.
@@ -1099,11 +1093,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenAlpFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Decimal-like f64 column → vortex.alp dispatches. Mix in a couple of
         // non-decimal values (PI, NaN) to exercise the patches path.
@@ -1142,11 +1135,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenPcoDoubleFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Doubles compressed via vortex.pco. Pco is opt-in via preferPco=true,
         // so only triggers when the user explicitly requests it. Bounded
@@ -1179,11 +1171,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenPcoNullableInt64File()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Nullable i64 — vortex.pco with a validity child. Exercises the
         // dense-buffer compaction path on the writer side and the
@@ -1219,11 +1210,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenTimestampPrimitiveFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Default Timestamp path: vortex.timestamp Extension wrapping
         // vortex.ext { vortex.primitive } i64 storage. Validates that the
@@ -1260,11 +1250,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDateTimePartsFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // preferDateTimeParts: vortex.timestamp Extension wrapping vortex.ext
         // { vortex.datetimeparts(days, seconds, subseconds) }. Each part is
@@ -1329,11 +1318,10 @@ public class VortexCrossValidationTests
             n, nullCount, 0);
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDate32File()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -1364,11 +1352,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDate64File()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
@@ -1407,11 +1394,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenTime32File()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var type = new Time32Type(TimeUnit.Millisecond);
         var schema = new Apache.Arrow.Schema(new[]
@@ -1443,11 +1429,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenTime64File()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var type = new Time64Type(TimeUnit.Nanosecond);
         var schema = new Apache.Arrow.Schema(new[]
@@ -1479,11 +1464,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenUuidFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var type = new FixedSizeBinaryType(16);
         var schema = new Apache.Arrow.Schema(new[]
@@ -1520,11 +1504,10 @@ public class VortexCrossValidationTests
     }
 
 #if NET6_0_OR_GREATER
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenHalfFloatFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // F16 column: 2 bytes/row, no Extension wrap (just plain
         // vortex.primitive). Apache.Arrow's HalfFloatArray needs System.Half
@@ -1564,11 +1547,10 @@ public class VortexCrossValidationTests
     }
 #endif
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenNullableAlpRdFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Nullable f64 ALP-RD column. Validates that the writer's null
         // handling on left_parts (validity bitmap rebased to offset 0) and
@@ -1610,11 +1592,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenFsstBinaryFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Repetitive binary column → FSST. Validates the symbol-table +
         // codes wire shape works for BinaryType the same way it does for
@@ -1657,11 +1638,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenVarBinViewBinaryFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // BinaryArray under preferVarBinView. Mix of inline + referenced
         // payloads exercises both view-format branches.
@@ -1700,11 +1680,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDictLayoutFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // Multi-batch low-cardinality string column under preferDictLayout:
         // the file uses a vortex.dict layout sharing one global values
@@ -1749,11 +1728,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenDictLayoutWithStatsFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // preferDictLayout AND preserveStats: each column's data layout is
         // wrapped in vortex.stats(vortex.dict(values, codes-chunked), zones).
@@ -1797,11 +1775,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenStringStatsFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         // String column with preserveStats=true exercises our StringFull
         // zone-stats scheme: per-zone min/max emitted as nullable Utf8
@@ -1836,11 +1813,10 @@ public class VortexCrossValidationTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
-        var validator = FindValidator();
-        if (validator is null) return;
+        var validator = RequireValidator();
 
         var schema = new Apache.Arrow.Schema(new[]
         {
