@@ -12,7 +12,8 @@ namespace EngineeredWood.Vortex.Tests;
 /// <summary>
 /// Upstream vortex only promises that later readers accept a file whose encodings all belong to
 /// a frozen edition (<c>docs/specs/editions.md</c>). Unless a caller opts into
-/// <c>preferDelta</c>, everything this writer emits must be in a frozen <c>core</c> edition.
+/// <c>preferDelta</c>, everything this writer emits must be in a frozen <c>core</c> edition, and
+/// only a map column reaches past the 2025 editions.
 /// </summary>
 public class VortexWriterEditionTests
 {
@@ -75,12 +76,46 @@ public class VortexWriterEditionTests
             await using var reader = await VortexFileReader.OpenAsync(path);
             foreach (var layout in Layouts(reader.RootLayout))
                 Assert.True(CoreLayouts.Contains(layout), $"{name}: layout {layout} is not in core2025.05.0");
+            // Registered only when a map needs them, so a file without one lists what it always has.
+            Assert.DoesNotContain("vortex.map", reader.ArraySpecs);
+            Assert.DoesNotContain("vortex.listview", reader.ArraySpecs);
         }
         finally
         {
             try { File.Delete(path); } catch { }
         }
     }
+
+    /// <summary>
+    /// A map is the one thing this writer emits from a 2026 edition: the <c>Map</c> dtype and
+    /// <c>vortex.map</c> joined <c>core2026.08.2</c> (vortex 0.85), and no earlier encoding can
+    /// carry that dtype. Everything under the map still comes from the 2025 editions.
+    /// </summary>
+    [Fact]
+    public async Task MapColumn_AddsOnlyVortexMap()
+    {
+        var path = VortexMapWriterTests.Write(
+            new[] { new RecordBatch(MapSchema, new IArrowArray[] { VortexMapWriterTests.BuildAttrs(0, Rows) }, Rows) },
+            compress: true);
+        try
+        {
+            var arrays = (await FixtureArrayNodes.ReadAsync(path)).Select(n => n.Encoding).Distinct().ToList();
+            Assert.Contains("vortex.map", arrays);
+            Assert.All(arrays.Where(e => e != "vortex.map"),
+                e => Assert.True(CoreArrays.Contains(e), $"{e} is in no frozen core edition"));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    private static readonly Apache.Arrow.Schema MapSchema = new(new[]
+    {
+        new Field("attrs", new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int64Type.Default, nullable: true)), nullable: true),
+    }, metadata: null);
 
     public sealed record WriterOptions(
         bool Compress = false, bool PreferVarBinView = false, bool PreserveStats = false,

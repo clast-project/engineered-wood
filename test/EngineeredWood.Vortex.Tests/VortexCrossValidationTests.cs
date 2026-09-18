@@ -1795,4 +1795,65 @@ public class VortexCrossValidationTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    /// <summary>
+    /// A map (#383) is the Map dtype over <c>vortex.map</c>, whose child upstream insists is a
+    /// <c>vortex.listview</c>. Beyond opening and scanning it, vortex's own reader must decode the
+    /// same values EW does: <c>vortex-oracle</c> writes what it reads as Arrow IPC, compared cell by
+    /// cell. Covers null maps, empty maps, null values, a duplicate key and both keys_sorted
+    /// settings, compressed and not.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RustReader_ReadsDotNetWrittenMapFile(bool compress)
+    {
+        var validator = RequireValidator();
+        var oracle = RustTools.Require("vortex-oracle", RequireEnvVar);
+
+        var unsorted = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int64Type.Default, nullable: true));
+        var sorted = new MapType(
+            new Field("key", Int32Type.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: false),
+            keySorted: true);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("attrs", unsorted, nullable: true),
+            new Field("sorted", sorted, nullable: false),
+        }, metadata: null);
+
+        var sortedB = new MapArray.Builder(sorted);
+        for (int i = 0; i < 200; i++)
+        {
+            sortedB.Append();
+            for (int j = 0; j < i % 3; j++)
+            {
+                ((Int32Array.Builder)sortedB.KeyBuilder).Append(j);
+                ((Int32Array.Builder)sortedB.ValueBuilder).Append(i + j);
+            }
+        }
+        var batch = new RecordBatch(schema,
+            new IArrowArray[] { VortexMapWriterTests.BuildAttrs(0, 200), sortedB.Build() }, 200);
+
+        var path = VortexMapWriterTests.Write(new[] { batch }, compress);
+        var expectedPath = Path.GetTempFileName();
+        try
+        {
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains("DONE total=200", stdout);
+
+            (code, stdout, stderr) = RustTools.Run(oracle, path, expectedPath);
+            Assert.True(code == 0, $"vortex-oracle failed (exit {code}): {stderr}{stdout}");
+            await VortexUpstreamCompatTests.CompareAsync(expectedPath, path);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+            try { File.Delete(expectedPath); } catch { }
+        }
+    }
 }

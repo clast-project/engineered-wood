@@ -532,7 +532,11 @@ release since 0.64 — to the same values upstream does.
   promise that later readers accept it. The writer only uses it under
   `preferDelta`. A `FixedSizeBinary(16)` column is written as the
   `vortex.uuid` extension, which vortex has read since before 0.70 but
-  only froze in `core2026.08.3` (0.85).
+  only froze in `core2026.08.3` (0.85). A Map column is written as the Map
+  dtype over `vortex.map`, both from `core2026.08.2`: a file containing
+  one needs vortex 0.85 or later to read it, as it would from vortex's own
+  writer. No earlier encoding can carry the Map dtype, and files without
+  a map are unaffected.
 - `preferDictLayout && preserveStats` emits
   `vortex.stats(vortex.dict(...), zones-flat)` so predicate pruning
   works against dict-layout files too.
@@ -551,7 +555,7 @@ release since 0.64 — to the same values upstream does.
 | FixedSizeList | yes | yes |
 | List | yes | yes (i32 offsets; LargeList deferred) |
 | Struct (recursive, including nested struct/list/FSL) | yes | yes |
-| Map (`keys_sorted`, duplicate keys, null maps) | yes | not yet |
+| Map (`keys_sorted`, duplicate keys, null maps) | yes | yes (vortex 0.85+ readers) |
 | LargeString, LargeBinary, Union | not yet | not yet |
 
 ### Encoding coverage
@@ -577,7 +581,8 @@ release since 0.64 — to the same values upstream does.
 `vortex.dict` (string), `vortex.fsst` (string + binary, nullable),
 `vortex.runend` (nullable), `vortex.sparse` (nullable),
 `vortex.alp` (f32 + f64), `vortex.alprd` (f32 + f64, nullable),
-`vortex.list`, `vortex.fixed_size_list`, `vortex.struct`,
+`vortex.list`, `vortex.listview` and `vortex.map` (map columns),
+`vortex.fixed_size_list`, `vortex.struct`,
 `vortex.decimal`, `vortex.datetimeparts`, `vortex.ext` (Date / Time /
 Timestamp / UUID), `fastlanes.bitpacked` (with best-bit-width selection
 and patches), `fastlanes.for`, `fastlanes.delta` (under `preferDelta`), `fastlanes.rle`
