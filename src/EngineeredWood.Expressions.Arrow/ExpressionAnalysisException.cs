@@ -9,18 +9,16 @@ namespace EngineeredWood.Expressions.Arrow;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Separate from the registry's own evaluation failures, and deliberately so. A refusal here is a
-/// property of the expression and its operand TYPES: it does not depend on a value, it is the same
-/// for an empty batch as for a full one, and it would be reported identically by a
-/// definition-time pass that has no batch at all. <c>SparkEvaluationException</c> reports the
-/// other kind — a value this row could not be converted, added or divided — and those two are
-/// worth telling apart at a catch site that decides whether a write can be retried with different
-/// data.
+/// A refusal here is a property of the expression and its operand types: it does not depend on a
+/// value, is the same for an empty batch as for a full one, and would be reported identically by
+/// a definition-time pass with no batch at all. A registry's evaluation failures (such as
+/// <c>SparkEvaluationException</c>) are the other kind — a value this row could not be
+/// converted, added or divided — and a catch site deciding whether a write can be retried with
+/// different data needs to tell the two apart.
 /// </para>
 /// <para>
-/// Dialect-neutral, because <see cref="ArrowRowEvaluator"/> is. The registry has already decided,
-/// under whatever dialect it implements, that the expression is refused; the evaluator only
-/// carries the answer out, and names the condition with the
+/// Dialect-neutral, because <see cref="ArrowRowEvaluator"/> is: the registry decided the refusal
+/// under its own dialect, and the evaluator only raises it with the
 /// <see cref="AnalysisDiagnostic.ErrorClass"/> the registry supplied.
 /// </para>
 /// </remarks>

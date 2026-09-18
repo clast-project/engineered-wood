@@ -10,54 +10,40 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// A <c>date_format</c> pattern, compiled from Java's pattern language and rendered here.
 /// </summary>
 /// <remarks>
-/// <b>The pattern is NOT handed to .NET's formatter.</b> It used to be, on the grounds that the
-/// two languages agree for the fields Delta expressions use — <c>y M d H m s</c> — and they do
-/// agree for a run of two or more of those letters and for the punctuation between them. They
-/// agree for nothing else, and what a pass-through did with the rest was not a near miss but a
-/// different string, because .NET's custom-format language has three constructs Java's does not
-/// and one rule that changes the meaning of the whole pattern. Measured on Spark 4.0.3 / JDK 17
-/// with <c>spark.sql.session.timeZone=UTC</c>, against <c>2026-08-11 12:30:45</c>:
+/// The pattern is not handed to .NET's formatter. The two languages agree for a run of two or
+/// more of <c>y M d H m s</c> and the punctuation between them, and for nothing else. On Spark
+/// 4.0.3 / JDK 17 with <c>spark.sql.session.timeZone=UTC</c>, against
+/// <c>2026-08-11 12:30:45</c>:
 /// <list type="bullet">
 /// <item><description>
-/// <b>An empty pattern.</b> Spark formats no fields and answers <c>''</c>; .NET reads an empty
-/// format string as a request for the GENERAL format and answers
-/// <c>'08/11/2026 12:30:00 +00:00'</c> — a whole timestamp where Spark produced nothing. #284.
+/// An empty pattern is <c>''</c> to Spark; .NET reads an empty format string as the general
+/// format and answers a whole timestamp.
 /// </description></item>
 /// <item><description>
-/// <b>A pattern of exactly one character.</b> .NET reads a one-character format string as a
-/// STANDARD specifier rather than a custom one, so the single most natural way to ask for a field
-/// is the one spelling that cannot mean the field: <c>'d'</c> is Spark's day-of-month <c>11</c>
-/// and .NET's short date <c>08/11/2026</c>, <c>'s'</c> is Spark's second <c>45</c> and .NET's
-/// sortable <c>2026-08-11T12:30:45</c>, <c>'M'</c> is Spark's <c>8</c> and .NET's
-/// <c>August 11</c>, and <c>'H'</c> is Spark's <c>12</c> and no .NET standard specifier at all —
-/// it threw <see cref="FormatException"/> out of the evaluator.
+/// .NET reads a one-character format string as a standard specifier: <c>'d'</c> is Spark's
+/// day-of-month <c>11</c> and .NET's short date <c>08/11/2026</c>, <c>'s'</c> is Spark's second
+/// <c>45</c> and .NET's sortable <c>2026-08-11T12:30:45</c>, and <c>'H'</c> is Spark's <c>12</c>
+/// and a <see cref="FormatException"/> in .NET.
 /// </description></item>
 /// <item><description>
-/// <b>A single <c>y</c>.</b> Java's count-1 year is the year in as many digits as it needs, so
-/// <c>'y'</c> is <c>2026</c> and year 999 is <c>999</c>. .NET's <c>y</c> is the last TWO digits.
-/// There is no .NET spelling that agrees at every year: <c>yyyy</c> matches 2026 and pads year
-/// 999 to <c>0999</c>, which is what Java's <c>yyyy</c> does and not what its <c>y</c> does. This
-/// is the one divergence a translation could not have closed, and the reason this renders the
-/// fields itself rather than rewriting the pattern into .NET's language.
+/// Java's single <c>y</c> is the year in as many digits as it needs (<c>2026</c>, and <c>999</c>
+/// for year 999); .NET's <c>y</c> is the last two digits. No .NET spelling agrees at every year
+/// — <c>yyyy</c> pads 999 to <c>0999</c> — which is why this renders the fields itself rather
+/// than rewriting the pattern into .NET's language.
 /// </description></item>
 /// <item><description>
-/// <b><c>\</c>, <c>%</c> and <c>"</c>.</b> Each is a literal to Java and a construct to .NET —
-/// the escape, the single-custom-specifier prefix, and the other literal delimiter. So
-/// <c>'\d'</c> is <c>\11</c> to Spark and the letter <c>d</c> to .NET, <c>'%d'</c> is <c>%11</c>
-/// to Spark and <c>11</c> to .NET, and <c>'"yy"'</c> is <c>"26"</c> to Spark and <c>yy</c> to
-/// .NET. A lone trailing <c>\</c> is a backslash to Spark and a <see cref="FormatException"/> to
-/// .NET.
+/// <c>\</c>, <c>%</c> and <c>"</c> are literals to Java and constructs to .NET: <c>'\d'</c> is
+/// <c>\11</c> to Spark and <c>d</c> to .NET, <c>'%d'</c> is <c>%11</c> to Spark and <c>11</c> to
+/// .NET, and <c>'"yy"'</c> is <c>"26"</c> to Spark and <c>yy</c> to .NET.
 /// </description></item>
 /// </list>
 /// <para>
-/// The refusals are as deliberate as the answers. Spark supports many more pattern letters than
-/// this does — <c>D E a h S G q L Z z X</c> all answer — and every one of them means something
-/// else in .NET, so an unimplemented letter is refused rather than reinterpreted. Spark ALSO
-/// refuses: a run too long for its letter (<c>ddd</c>, <c>HHH</c>, <c>mmm</c>, <c>sss</c> and
-/// <c>MMMMM</c> are all <c>SparkUpgradeException</c>, not a wider field), the reserved characters
-/// <c>#</c>, <c>{</c> and <c>}</c>, and a pattern ending inside a quoted literal. Refusing those
-/// keeps the property that matters: where Spark refuses, so do we, and where Spark answers we
-/// answer the same string.
+/// Spark supports many more pattern letters than this does (<c>D E a h S G q L Z z X</c> all
+/// answer); an unimplemented letter is refused rather than reinterpreted. Spark itself refuses a
+/// run too long for its letter (<c>ddd</c>, <c>HHH</c>, <c>mmm</c>, <c>sss</c> and <c>MMMMM</c>
+/// are <c>SparkUpgradeException</c>, not a wider field), the reserved characters <c>#</c>,
+/// <c>{</c> and <c>}</c>, and a pattern ending inside a quoted literal, and so does this. Where
+/// Spark answers, this answers the same string or refuses.
 /// </para>
 /// </remarks>
 internal sealed class SparkDatePattern
@@ -105,7 +91,7 @@ internal sealed class SparkDatePattern
             if (!IsPatternLetter(c))
             {
                 // Java reserves these for future use and throws on them; Spark passes the throw
-                // through. `[` and `]` it does NOT throw on -- they open and close an optional
+                // through. `[` and `]` it does not throw on -- they open and close an optional
                 // section, and `date_format(ts, '[yyyy]')` answers 2026 -- but an optional section
                 // is a parse-side construct with no counterpart here, so it is refused with them.
                 if (c is '#' or '{' or '}' or '[' or ']')
@@ -169,11 +155,10 @@ internal sealed class SparkDatePattern
     /// Consumes a <c>'…'</c> section, which is Java's only way to write a literal.
     /// </summary>
     /// <remarks>
-    /// Java's own parse, reproduced rather than approximated, because its two special cases are
-    /// both reachable from SQL and neither is what a reader would guess. An EMPTY section is not
-    /// an empty literal but a literal apostrophe — measured, <c>date_format(ts, '\'\'')</c> is
-    /// <c>'</c> — and a doubled quote INSIDE a section is one apostrophe rather than the end of
-    /// the section followed by the start of another.
+    /// Java's own parse, including its two special cases: an empty section is a literal
+    /// apostrophe rather than an empty literal (<c>date_format(ts, '\'\'')</c> is <c>'</c>), and
+    /// a doubled quote inside a section is one apostrophe rather than the end of the section
+    /// followed by the start of another.
     /// </remarks>
     private static void AppendQuoted(string pattern, ref int index, StringBuilder literal)
     {
@@ -205,16 +190,15 @@ internal sealed class SparkDatePattern
     private static Token Field(char letter, int count)
     {
         // The maximum run per letter is Spark's, not Java's. Java widens a field to the count it
-        // is given, so `ddd` would be a three-digit day -- but Spark refuses every one of these
-        // with SparkUpgradeException.DATETIME_PATTERN_RECOGNITION, because the meaning changed
-        // when it moved to java.time in 3.0. Measured on 4.0.3: ddd, dddd, HHH, mmm, sss and
-        // MMMMM all refuse, while MMM and MMMM answer `Aug` and `August`.
+        // is given, so `ddd` would be a three-digit day, but Spark refuses ddd, dddd, HHH, mmm,
+        // sss and MMMMM with SparkUpgradeException.DATETIME_PATTERN_RECOGNITION, because the
+        // meaning changed when it moved to java.time in 3.0. MMM and MMMM answer `Aug` and
+        // `August`.
         var maximum = letter switch
         {
-            // 19 is Java's own ceiling on a numeric field -- `appendValue(field, count, 19, …)`,
-            // past which it throws "Too many pattern letters" -- rather than a measured Spark
-            // answer. It is here so a pattern of a thousand `y` refuses instead of rendering a
-            // thousand characters; no year needs more than four.
+            // 19 is Java's own ceiling on a numeric field (`appendValue(field, count, 19, …)`,
+            // past which it throws "Too many pattern letters"), not a measured Spark answer. It
+            // stops a pattern of a thousand `y` rendering a thousand characters.
             'y' => 19,
             'M' => 4,
             'd' or 'H' or 'm' or 's' => 2,
@@ -263,7 +247,7 @@ internal sealed class SparkDatePattern
     /// </summary>
     /// <remarks>
     /// Count 1 is the year in its own width, count 2 is the last two digits, and count 3 or more
-    /// is zero-padded to the count. Measured across the boundary that tells them apart, year 999:
+    /// is zero-padded to the count. At year 999, the boundary that tells them apart:
     /// <c>y</c> is <c>999</c>, <c>yy</c> is <c>99</c>, <c>yyy</c> is <c>999</c>, <c>yyyy</c> is
     /// <c>0999</c> and <c>yyyyy</c> is <c>00999</c>.
     /// <para>

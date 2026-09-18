@@ -54,18 +54,17 @@ internal static class SparkFunctions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Measured, and none of it is the obvious reading: positions are 1-based, position 0 behaves
-    /// as 1, a negative position counts back from the end (<c>-2</c> starts at the second-to-last
-    /// character), a length past the end clamps rather than failing, and a start past the end
-    /// gives an empty string rather than null.
+    /// Positions are 1-based, position 0 behaves as 1, a negative position counts back from the
+    /// end (<c>-2</c> starts at the second-to-last character), a length past the end clamps
+    /// rather than failing, and a start past the end gives an empty string rather than null.
     /// </para>
     /// <para>
-    /// <b>The end is taken from the UNCLAMPED start.</b> This is Spark's
-    /// <c>UTF8String.substringSQL</c>: a negative position before the beginning still spends its
-    /// length from where it would have started, so <c>substring('abcdef', -8, 3)</c> is <c>a</c>
-    /// and <c>substring('abcdef', -7, 1)</c> is empty. Clamping first answered <c>abc</c> and
-    /// <c>a</c>. The sum is taken in 64 bits and clamped to an int, as Spark does, so
-    /// <c>substring('abcdef', -2147483648, 2147483647)</c> is <c>abcde</c>. #370.
+    /// The end is taken from the unclamped start, as in Spark's <c>UTF8String.substringSQL</c>: a
+    /// negative position before the beginning still spends its length from where it would have
+    /// started, so <c>substring('abcdef', -8, 3)</c> is <c>a</c> and
+    /// <c>substring('abcdef', -7, 1)</c> is empty (clamping first would give <c>abc</c> and
+    /// <c>a</c>). The sum is taken in 64 bits and clamped to an int, as Spark does, so
+    /// <c>substring('abcdef', -2147483648, 2147483647)</c> is <c>abcde</c>.
     /// </para>
     /// <para>
     /// The position and length arrive as <c>int</c>: the registry casts them first, because the
@@ -145,8 +144,7 @@ internal static class SparkFunctions
     /// <remarks>
     /// <c>RLIKE</c> is a regular expression and is passed through. <c>LIKE</c> is translated:
     /// <c>%</c> matches any run, <c>_</c> matches one character, everything else is literal, and
-    /// a backslash escapes the next character — measured, <c>'100%' LIKE '100\%'</c> is true, so
-    /// the escape has to be honoured rather than treated as a literal backslash.
+    /// a backslash escapes the next character, so <c>'100%' LIKE '100\%'</c> is true.
     /// </remarks>
     public static IArrowArray Match(string name, IReadOnlyList<IArrowArray> args, int rowCount)
     {
@@ -251,22 +249,18 @@ internal static class SparkFunctions
     /// </summary>
     /// <remarks>
     /// The pattern is compiled here rather than handed to .NET's formatter; see
-    /// <see cref="SparkDatePattern"/> for the four ways that pass-through answered differently
-    /// from Spark. #284.
+    /// <see cref="SparkDatePattern"/> for why.
     /// <para>
-    /// A NULL ROW IS ANSWERED WITHOUT LOOKING AT THE PATTERN, which is measured rather than
-    /// assumed — the obvious reading, that Spark resolves the pattern at analysis and so refuses
-    /// an invalid one whatever the values are, is wrong for the case that matters. Measured on
-    /// 4.0.3: <c>date_format(NULL, 'ddd')</c> and <c>date_format(CAST(NULL AS TIMESTAMP),
-    /// 'ddd')</c> both answer NULL, because a null-literal argument folds the whole expression
-    /// away before the formatter is ever built, while <c>date_format(ts, 'ddd')</c> over a column
-    /// refuses. The residual, unmeasured because the corpus has no all-null timestamp column:
-    /// Spark would refuse a bad pattern over a column whose every row is null, where this
-    /// answers nulls.
+    /// A null row is answered without looking at the pattern. <c>date_format(NULL, 'ddd')</c>
+    /// and <c>date_format(CAST(NULL AS TIMESTAMP), 'ddd')</c> both answer NULL in Spark, because
+    /// a null-literal argument folds the whole expression away before the formatter is built,
+    /// while <c>date_format(ts, 'ddd')</c> over a column refuses. Unmeasured, because the corpus
+    /// has no all-null timestamp column: Spark would presumably refuse a bad pattern over a
+    /// column whose every row is null, where this answers nulls.
     /// </para>
     /// <para>
-    /// The compiled pattern is cached across the batch because the pattern is an ARRAY here —
-    /// nothing stops it varying per row, and almost nothing ever does.
+    /// The pattern is an array, so nothing stops it varying per row; the compiled form is reused
+    /// while it does not.
     /// </para>
     /// </remarks>
     public static IArrowArray DateFormat(IReadOnlyList<IArrowArray> args, int rowCount)
@@ -309,7 +303,7 @@ internal static class SparkFunctions
         IArrowType type, IReadOnlyList<IArrowArray> sources, int[] choice, int rowCount)
     {
         // Every branch was `void`, so there is no value to pick and no type to build one at:
-        // Spark types `coalesce(NULL, NULL)` and `if(c, NULL, NULL)` as void too. #293.
+        // Spark types `coalesce(NULL, NULL)` and `if(c, NULL, NULL)` as void too.
         if (type is NullType)
             return new NullArray(rowCount);
 
@@ -326,8 +320,9 @@ internal static class SparkFunctions
         }
 
         // Order does not matter here, unlike everywhere else binary appears: these branches are
-        // selected by the unified TYPE, and BinaryType and StringType are disjoint. It is
-        // `ReadBytes` that has to know a StringArray is also a BinaryArray. #295.
+        // selected by the unified type, and BinaryType and StringType are disjoint. A string
+        // branch is read by `AppendBytes` as its UTF-8 bytes, since a StringArray is also a
+        // BinaryArray.
         if (type is BinaryType)
         {
             var bytes = new BinaryArray.Builder();
@@ -358,20 +353,16 @@ internal static class SparkFunctions
             for (var i = 0; i < rowCount; i++)
                 instants[i] = choice[i] < 0 ? null : SparkArrays.ReadInstant(sources[choice[i]], i);
 
-            // AT A CANONICAL INSTANCE CHOSEN BY THE ZONE, and emphatically not at `type` itself.
+            // Built at the canonical type for the zone, not at `type` itself. The zone must come
+            // from `type` -- `BuildTimestamp`'s no-zone overload labels every result UTC, which
+            // would turn a `timestamp_ntz` fold into a zoned array.
             //
-            // The zone is what #349 gap 1 was about: `BuildTimestamp`'s no-zone overload labels
-            // every result UTC whatever it read, so a fold that resolved `timestamp_ntz` handed
-            // back a zoned array. The micros were the same either way; the NAME was the defect.
-            //
-            // But `type` IS NOT ALWAYS CANONICAL, which is why it is read for its zone rather
-            // than passed through. `NullIf` hands over `args[0].Data.DataType` directly and
-            // `ConditionalType` keeps a sole surviving branch's own type, so a millisecond
-            // column -- which is what Parquet writes -- arrives here as `timestamp(ms, UTC)`.
-            // Passing that on rebuilt the very promise #311 removed, one type over: measured on
-            // this branch before the fix, `coalesce(tsms)`, `coalesce(tsms, NULL)` and
-            // `nullif(tsms, ts)` all came back MILLISECOND where every other route produces
-            // microseconds. Caught on review.
+            // But `type` is not always canonical: `NullIf` hands over `args[0].Data.DataType`
+            // directly and `ConditionalType` keeps a sole surviving branch's own type, so a
+            // millisecond column (which is what Parquet writes) arrives here as
+            // `timestamp(ms, UTC)`. Passing that through would make `coalesce(tsms)` and
+            // `nullif(tsms, ts)` answer in milliseconds where every other route produces
+            // microseconds.
             if (SparkArrays.IsDateType(type))
                 return SparkArrays.BuildDate32(instants, rowCount);
 
@@ -428,9 +419,7 @@ internal static class SparkFunctions
     /// <summary>Whether a cell is null, for the conditional functions.</summary>
     public static bool IsNull(IArrowArray array, int index) => array switch
     {
-        // A `void` column is null at every row. Named rather than left to the numeric fallback,
-        // which reached the same answer by catching the NotSupportedException ReadDouble raises --
-        // an exception per row on a path a conditional walks for every branch. #293.
+        // A `void` column is null at every row.
         NullArray => true,
         StringArray a => a.IsNull(index),
         BooleanArray a => a.IsNull(index),
@@ -452,23 +441,12 @@ internal static class SparkFunctions
     }
 
     /// <summary>
-    /// Whether two cells hold the same value, compared in their own terms.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately not a comparison of rendered text. A <c>decimal(10,2)</c> holding 1.00 and an
-    /// <c>int</c> holding 1 render as "1.00" and "1" but are equal, and Spark agrees —
-    /// <c>nullif(CAST(1.00 AS DECIMAL(10,2)), 1)</c> is null. Comparing the renderings would have
-    /// returned the value instead.
-    /// </remarks>
-    /// <summary>
-    /// Orders two cells of the SAME Arrow type, for <c>greatest</c> and <c>least</c>.
+    /// Orders two cells of the same Arrow type, for <c>greatest</c> and <c>least</c>.
     /// </summary>
     /// <remarks>
     /// Same type on both sides by construction — the caller unifies first — so this never has to
     /// promote, and a decimal can be compared on its unscaled integer alone because the scales
-    /// already match. A decimal goes through <see cref="SparkWideDecimals.Compare"/>, which orders
-    /// the unscaled integers by their two halves and allocates nothing — this runs once per
-    /// argument per ROW, where reading a BigInteger copied sixteen bytes and allocated each time.
+    /// already match (see <see cref="SparkWideDecimals.Compare"/>).
     /// </remarks>
     public static int CompareAt(IArrowArray left, IArrowArray right, int index) => left switch
     {
@@ -482,11 +460,10 @@ internal static class SparkFunctions
 
         StringArray a => string.CompareOrdinal(a.GetString(index), ((StringArray)right).GetString(index)),
 
-        // AFTER the string case, which is not optional: a StringArray IS a BinaryArray, and
-        // matching it here would order two strings by their UTF-8 bytes instead of by their
-        // ordinals. Only greatest/least reach this, and only over a binary/binary pair -- a
-        // binary against a STRING is refused by both dialects, unlike coalesce, which coerces it.
-        // #295.
+        // Must stay after the string case: a StringArray is a BinaryArray, and matching it here
+        // would order two strings by their UTF-8 bytes instead of by their ordinals. Only a
+        // binary/binary pair reaches this -- greatest/least refuse a binary against a string in
+        // both dialects, unlike coalesce, which coerces it.
         BinaryArray => SparkArrays.CompareBytes(left, right, index),
 
         BooleanArray a => a.GetValue(index)!.Value.CompareTo(((BooleanArray)right).GetValue(index)!.Value),
@@ -501,22 +478,15 @@ internal static class SparkFunctions
 
     /// <summary>Orders two floating-point values the way Spark does, which is not .NET's way.</summary>
     /// <remarks>
-    /// Spark's <c>SQLOrderingUtil.compareDoubles</c> puts <b>NaN above everything</b>, +Infinity
+    /// Spark's <c>SQLOrderingUtil.compareDoubles</c> puts NaN above everything, +Infinity
     /// included, and treats <c>-0.0</c> and <c>0.0</c> as equal. <see cref="double.CompareTo(double)"/>
-    /// does the opposite on both counts: NaN sorts below everything and -0.0 below 0.0. Measured
-    /// against Spark 4.0.3: <c>greatest(NaN, 2.0)</c> is NaN, <c>greatest(NaN, Infinity)</c> is
-    /// NaN, <c>least(NaN, -Infinity)</c> is -Infinity, and NaN against itself is equal.
+    /// does the opposite on both counts: NaN sorts below everything and -0.0 below 0.0. So
+    /// <c>greatest(NaN, 2.0)</c> is NaN, <c>greatest(NaN, Infinity)</c> is NaN,
+    /// <c>least(NaN, -Infinity)</c> is -Infinity, and NaN against itself is equal.
     /// <para>
-    /// This surfaced only once #277 stopped refusing a decimal mixed with a double: before that,
-    /// <c>greatest(CAST('NaN' AS DOUBLE), -1.5BD)</c> threw, and afterwards it quietly answered
-    /// -1.5 where Spark answers NaN. Trading a loud refusal for a silent wrong answer is worse
-    /// than either, so the ordering is corrected in the same change.
-    /// </para>
-    /// <para>
-    /// <c>greatest</c>, <c>least</c> and — since #290 — the double fallback in
-    /// <see cref="AreEqual"/> reach this. The comparison operators answer their own way and are
-    /// untouched; measured, they already hold NaN equal to itself, which is what makes reusing
-    /// this rule here agreement rather than a second opinion.
+    /// <c>greatest</c>, <c>least</c> and the double fallback in <see cref="AreEqual"/> use this.
+    /// The comparison operators have their own implementation, and they too hold NaN equal to
+    /// itself.
     /// </para>
     /// </remarks>
     private static int CompareDoubles(double x, double y)
@@ -524,7 +494,7 @@ internal static class SparkFunctions
         if (x < y) return -1;
         if (x > y) return 1;
 
-        // Settles -0.0 against 0.0 as EQUAL, which is the half `CompareTo` gets wrong quietly.
+        // Settles -0.0 against 0.0 as equal, which `CompareTo` does not.
         if (x == y) return 0;
 
         // Nothing but a NaN reaches here: it is false against every comparison, itself included.
@@ -534,6 +504,14 @@ internal static class SparkFunctions
         return leftIsNaN ? 1 : -1;
     }
 
+    /// <summary>
+    /// Whether two cells hold the same value, compared in their own terms.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not a comparison of rendered text. A <c>decimal(10,2)</c> holding 1.00 and an
+    /// <c>int</c> holding 1 render as "1.00" and "1" but are equal, and Spark agrees —
+    /// <c>nullif(CAST(1.00 AS DECIMAL(10,2)), 1)</c> is null.
+    /// </remarks>
     public static bool AreEqual(IArrowArray left, IArrowArray right, int index)
     {
         if (SparkArrays.IsTemporal(left.Data.DataType) || SparkArrays.IsTemporal(right.Data.DataType))
@@ -542,12 +520,11 @@ internal static class SparkFunctions
         if (left is StringArray || right is StringArray)
             return ReadString(left, index) == ReadString(right, index);
 
-        // AFTER the string case, and the two really do answer differently. A binary against a
-        // BINARY compares BYTES: measured, `nullif(X'FF', X'FE')` is X'FF', though both bytes
-        // decode to the same U+FFFD and the string route above would have called them equal. A
-        // binary against a STRING keeps that string route, and that is Spark's answer too --
-        // measured, `nullif(X'FF', CAST(X'FF' AS STRING))` is NULL, because there it is the
-        // binary that is rendered as text (#262) rather than the string that is encoded. #295.
+        // After the string case, and the two answer differently. A binary against a binary
+        // compares bytes: `nullif(X'FF', X'FE')` is X'FF', though both decode to the same U+FFFD
+        // and the string route above would call them equal. A binary against a string keeps the
+        // string route, which is Spark's answer too: `nullif(X'FF', CAST(X'FF' AS STRING))` is
+        // NULL, because the binary is rendered as text rather than the string encoded.
         if (left is BinaryArray leftBytes && right is BinaryArray rightBytes)
         {
             return leftBytes.IsNull(index) || rightBytes.IsNull(index)
@@ -577,17 +554,13 @@ internal static class SparkFunctions
         catch (NotSupportedException)
         {
             // Reached when a value has no exact System.Decimal form: a magnitude past decimal's
-            // ceiling near 7.9e28, or a NaN or an infinity. Until #290 that was true of the
-            // Decimal128 side ONLY -- a wide FLOAT or DOUBLE threw OverflowException instead and
-            // escaped the evaluator, so `nullif(1, 1e29)` crashed while
-            // `nullif(CAST(1e29 AS DECIMAL(38,0)), 1e29)` answered. The same pair, and which side
-            // was written first decided it.
+            // ceiling near 7.9e28, or a NaN or an infinity. ReadDecimal must keep signalling that
+            // with NotSupportedException for a float or double as well as for a Decimal128, or
+            // it escapes the evaluator instead of landing here.
             //
-            // COMPARED WITH SPARK'S NaN RULE, NOT IEEE'S, and this half is only reachable now that
-            // the crash is not. Measured: `nullif(CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE))` is
-            // NULL, so Spark holds NaN equal to itself here exactly as `=`, `<=>` and `IN` do --
-            // `==` on two NaNs is false, and fixing the crash with it would have traded a loud
-            // error for a silent wrong answer.
+            // Compared with Spark's NaN rule, not IEEE's: `nullif(CAST('NaN' AS DOUBLE),
+            // CAST('NaN' AS DOUBLE))` is NULL, so Spark holds NaN equal to itself here exactly as
+            // `=`, `<=>` and `IN` do, where `==` on two NaNs is false.
             var first = SparkArrays.ReadDouble(left, index);
             var second = SparkArrays.ReadDouble(right, index);
 
@@ -612,8 +585,8 @@ internal static class SparkFunctions
     private static bool? ReadBoolean(IArrowArray array, int index) =>
         array switch
         {
-            // Reachable wherever the OTHER branch made the unified type boolean, as in
-            // `if(c, bl, NULL)`. #293.
+            // Reachable wherever the other branch made the unified type boolean, as in
+            // `if(c, bl, NULL)`.
             NullArray => null,
             BooleanArray booleans => booleans.IsNull(index) ? null : booleans.GetValue(index),
             _ => throw new NotSupportedException($"{array.Data.DataType.Name} is not boolean"),

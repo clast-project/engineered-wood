@@ -13,11 +13,9 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Measured, and every row of the corpus's <c>float-to-string</c> group is exactly
-/// <c>Double.toString</c> or <c>Float.toString</c>: Spark hands the value straight to Java. That
-/// makes <c>CAST(&lt;a double&gt; AS STRING)</c> a different question from casting one to a
-/// decimal, where only the value survives and the spelling does not. Three conventions have to
-/// be reproduced, and .NET shares none of them:
+/// Every row of the corpus's <c>float-to-string</c> group is exactly <c>Double.toString</c> or
+/// <c>Float.toString</c>: Spark hands the value straight to Java. Three conventions have to be
+/// reproduced, and .NET shares none of them:
 /// </para>
 /// <list type="bullet">
 /// <item><description>
@@ -36,20 +34,20 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </description></item>
 /// </list>
 /// <para>
-/// <b>A float prints as a float.</b> <c>Float.toString(0.3333333f)</c> is <c>0.3333333</c>, not
-/// the widened double's <c>0.3333333134651184</c> — which is the opposite of the cast to a
-/// decimal, where the widened double is exactly what Spark converts. The two widths therefore
-/// decompose separately, even though one routine picks the digits for both.
+/// A float prints as a float: <c>Float.toString(0.3333333f)</c> is <c>0.3333333</c>, not the
+/// widened double's <c>0.3333333134651184</c> — the opposite of the cast to a decimal, where the
+/// widened double is exactly what Spark converts. The two widths therefore decompose separately,
+/// even though one routine picks the digits for both.
 /// </para>
 /// <para>
-/// The JDK band from #244 reaches here too, because this is the same <c>Double.toString</c>: the
-/// digits are the shortest round-trip form on JDK 19 and later, and can be one longer before it.
-/// The corpus records <c>java_version</c> beside <c>conf</c>, and the two rows that land in the
-/// band are declared differences.
+/// The digits are the shortest round-trip form, which is what <c>Double.toString</c> produces on
+/// JDK 19 and later; before that it can be one digit longer. The corpus records
+/// <c>java_version</c> beside <c>conf</c>, and the two rows that land in that band are declared
+/// differences.
 /// </para>
 /// <para>
-/// <b>Nothing here asks the platform for a digit.</b> Not the formatter, not the parser — see
-/// <see cref="ShortestDigits"/>. #288, #337, #338.
+/// Nothing here asks the platform's formatter or parser for a digit — see
+/// <see cref="ShortestDigits"/>.
 /// </para>
 /// </remarks>
 internal static class SparkFloatText
@@ -77,24 +75,20 @@ internal static class SparkFloatText
     /// The shortest decimal text that round-trips <paramref name="value"/>, in Java's shape.
     /// </summary>
     /// <remarks>
-    /// <b>Deliberately not <c>ToString("R")</c></b>, which is the shortest form only on .NET Core
-    /// — and not even reliably there: <c>(2^-25).ToString("R")</c> is
-    /// <c>2.980232238769531E-08</c>, which reads back as a DIFFERENT double. It is also
-    /// deliberately not a ladder of <c>G15</c>/<c>G16</c>/<c>G17</c> round-trip probes, which is
-    /// what this was until #337 and #338; see <see cref="ShortestDigits"/> for why both halves of
-    /// that had to go.
+    /// Deliberately not <c>ToString("R")</c>, which is the shortest form only on .NET Core — and
+    /// not reliably there: <c>(2^-25).ToString("R")</c> is <c>2.980232238769531E-08</c>, which
+    /// reads back as a different double. Nor a ladder of <c>G15</c>/<c>G16</c>/<c>G17</c>
+    /// round-trip probes; see <see cref="ShortestDigits"/> for why.
     /// <para>
-    /// This is also what Spark's <c>BigDecimal.valueOf(d)</c> reads — up to the JVM's own version
-    /// of the question, since <c>Double.toString</c> did not produce the shortest form before
-    /// JDK 19. See <c>SparkFunctionRegistry.CastFloatingToDecimal</c> and #244.
+    /// This is also what Spark's <c>BigDecimal.valueOf(d)</c> reads, subject to the same JDK 19
+    /// caveat as <c>Double.toString</c>. See <c>SparkFunctionRegistry.CastFloatingToDecimal</c>.
     /// </para>
     /// </remarks>
     internal static string ShortestRoundTrip(double value)
     {
-        // BEFORE the bits are read, not after: an all-ones exponent decodes as a perfectly
-        // ordinary finite mantissa, so without this NaN renders as -2.696539702293474E308 and an
-        // infinity as the largest double. The old ladder got the spellings from the platform's
-        // formatter and so never had to say this; reading the bits means owning it.
+        // Before the bits are read: an all-ones exponent decodes as an ordinary finite mantissa,
+        // so without this NaN renders as -2.696539702293474E308 and an infinity as the largest
+        // double.
         if (double.IsNaN(value)) return "NaN";
         if (double.IsPositiveInfinity(value)) return "Infinity";
         if (double.IsNegativeInfinity(value)) return "-Infinity";
@@ -130,7 +124,7 @@ internal static class SparkFloatText
         if (float.IsNegativeInfinity(value)) return "-Infinity";
 
         // Through the bits rather than through `(double)value`, because the question is which
-        // FLOATS a decimal can land between: the widened double's neighbours are 2^29 times closer.
+        // floats a decimal can land between: the widened double's neighbours are 2^29 times closer.
         var bits = SingleToInt32Bits(value);
         var negative = bits < 0;
         var magnitude = bits & int.MaxValue;
@@ -154,15 +148,13 @@ internal static class SparkFloatText
     /// Whether the gap below the value is half the gap above it, which only a power of two has.
     /// </summary>
     /// <remarks>
-    /// <b>This is #337.</b> A value whose mantissa bits are all zero sits at the bottom of its
-    /// binade, so its predecessor comes from the binade below where the step is half as long. Its
-    /// rounding interval is therefore <c>[v - ulp/4, v + ulp/2]</c> and not
-    /// <c>[v - ulp/2, v + ulp/2]</c> — and a lopsided interval can contain a k-digit decimal
-    /// while excluding the CLOSEST k-digit decimal, which is the one a rounding ladder tests.
-    /// Measured: 46 of the 2,046 normal double powers of two and 3 of the 254 normal float ones
-    /// rendered one digit longer than Java's for exactly that reason. A non-zero mantissa makes
-    /// the interval symmetric, so nothing else can be affected, and a sweep of all 2,130,706,432
-    /// normal floats turns up no case that is not a power of two.
+    /// A value whose mantissa bits are all zero sits at the bottom of its binade, so its
+    /// predecessor comes from the binade below where the step is half as long. Its rounding
+    /// interval is therefore <c>[v - ulp/4, v + ulp/2]</c> and not <c>[v - ulp/2, v + ulp/2]</c>
+    /// — and a lopsided interval can contain a k-digit decimal while excluding the closest k-digit
+    /// decimal. Ignoring this renders 46 of the 2,046 normal double powers of two and 3 of the 254
+    /// normal float ones one digit longer than Java does. A non-zero mantissa makes the interval
+    /// symmetric, so nothing else is affected.
     /// <para>
     /// The smallest normal value is the exception the raw exponent catches: its predecessor is the
     /// largest subnormal, one ordinary step below, so its interval is symmetric after all.
@@ -176,58 +168,51 @@ internal static class SparkFloatText
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Neither the platform's formatter nor its parser may be asked any part of this.</b> Both
-    /// are wrong on .NET Framework and right on .NET Core, which is the one thing a cast may not
-    /// depend on. Measured: <c>double.Parse("2.12E-322")</c> returns the wrong double there, so a
-    /// round-trip probe answers falsely and a ladder stops a rung early; <c>ToString("G16")</c> of
-    /// bits 3109743661010044618 ends <c>...729E-101</c> against .NET Core's <c>...728E-101</c>, so
-    /// the digits it hands over are not the value's. Over a 200,000-value sweep against JDK 21 the
-    /// old ladder disagreed with itself across target frameworks on 6,428 doubles and 5,957
-    /// floats. #338.
+    /// Neither the platform's formatter nor its parser may be asked any part of this: both are
+    /// wrong on .NET Framework and right on .NET Core, and a cast may not depend on the target
+    /// framework. <c>double.Parse("2.12E-322")</c> returns the wrong double on .NET Framework, so
+    /// a round-trip probe answers falsely; <c>ToString("G16")</c> of bits 3109743661010044618 ends
+    /// <c>...729E-101</c> there against .NET Core's <c>...728E-101</c>, so the digits it hands
+    /// over are not the value's.
     /// </para>
     /// <para>
     /// So the digits are computed. Writing the value as <c>mantissa x scale x 10^shift</c> —
     /// <c>scale = 5^-exponent, shift = exponent</c> when the exponent is negative, and
     /// <c>scale = 2^exponent, shift = 0</c> when it is not — makes <c>mantissa x scale</c> an
-    /// integer whose digits ARE the value's, exactly and in full. One big multiplication per
-    /// value, and the answer is a prefix of it.
+    /// integer whose digits are the value's, exactly and in full. One big multiplication per
+    /// value, and the answer is a prefix of it. That is <see cref="ExactDigits"/>;
+    /// <see cref="SparkFloatScaling.TryShortestDigits"/> answers the same question in machine
+    /// words first, and declines rather than guessing where it cannot.
     /// </para>
     /// <para>
-    /// <b>Both neighbours are tested at every length, not just the rounded one.</b> That is the
-    /// other half of #337: rounding to k digits finds the CLOSEST k-digit decimal, which is the
-    /// right candidate only while the rounding interval is symmetric. Truncating the expansion
-    /// gives the k-digit decimal below and one more unit in its last place gives the one above;
-    /// those two are the only candidates there can be at that length, so asking about both settles
-    /// the length whatever shape the interval has.
+    /// Both neighbours are tested at every length, not just the rounded one: rounding to k digits
+    /// finds the closest k-digit decimal, which is the right candidate only while the rounding
+    /// interval is symmetric (see <see cref="NarrowBelow"/>). Truncating the expansion gives the
+    /// k-digit decimal below and one more unit in its last place gives the one above; those are
+    /// the only candidates at that length, so asking about both settles the length whatever shape
+    /// the interval has. Where both read back, Java takes the closer, and the even significand
+    /// where they are equally close.
     /// </para>
     /// <para>
-    /// Where both read back, Java takes the closer, and the even significand where they are
-    /// equally close.
+    /// A length of one is never asked for, deliberately. The JDK 19+ specification widens the
+    /// field to the one- and two-digit decimals before choosing whenever a single digit would do,
+    /// which is why <c>Double.toString(Double.MIN_VALUE)</c> is <c>4.9E-324</c> and not
+    /// <c>5E-324</c>. Starting at two and letting <see cref="Trim"/> drop a trailing zero is that
+    /// rule: every one-digit decimal sits on the two-digit grid, so the nearer two-digit decimal
+    /// is never further from the value, and the interval is convex — if the one-digit decimal is
+    /// inside it then so is anything between that and the value.
     /// </para>
     /// <para>
-    /// <b>A length of one is never asked for, and that is deliberate.</b> The JDK 19+
-    /// specification widens the field to the one- AND two-digit decimals before choosing whenever
-    /// a single digit would do, which is why <c>Double.toString(Double.MIN_VALUE)</c> is
-    /// <c>4.9E-324</c> and not <c>5E-324</c>. Starting at two and letting <see cref="Trim"/> drop a
-    /// trailing zero IS that rule: every one-digit decimal sits on the two-digit grid, so the
-    /// nearer two-digit decimal is never further from the value, and the interval is convex — if
-    /// the one-digit decimal is inside it then so is anything between that and the value. The
-    /// answer comes back one digit long exactly when the closest two-digit decimal ends in a zero.
-    /// </para>
-    /// <para>
-    /// <b>The length is found by bisection, which is what makes this affordable.</b> Reading back
-    /// is monotone in length — a decimal that fits at k digits is still there at k+1 with a zero
-    /// after it — so the shortest length can be bisected rather than walked up to. Four probes
-    /// instead of up to seventeen, and each probe is one division rather than a digit's worth of
-    /// bookkeeping. This runs for every row of every cast, which is what #337 and #338 both
-    /// deferred over.
+    /// The length is found by bisection. Reading back is monotone in length — a decimal that fits
+    /// at k digits is still there at k+1 with a zero after it — so four probes replace up to
+    /// seventeen, and each probe is one division. This runs for every row of every cast.
     /// </para>
     /// </remarks>
     private static (string Digits, int PointAt) ShortestDigits(
         long mantissa, int exponent, bool narrowBelow, int maxDigits)
     {
         // The same question in machine words, which answers it for all but a handful of values
-        // and declines rather than guessing on those. Everything below is what it declines to.
+        // and declines rather than guessing on those.
         if (SparkFloatScaling.TryShortestDigits(
                 mantissa, exponent, narrowBelow, maxDigits, out var fast, out var fastPoint))
         {
@@ -273,13 +258,12 @@ internal static class SparkFloatText
     /// From the logarithm of the factors rather than of the product, because the factors are a
     /// <c>long</c> and a power: <c>log10(m x 5^k)</c> is <c>log10 m + k log10 5</c>, and a double
     /// carries that to about fourteen places over the whole exponent range. The estimate is then
-    /// corrected against the powers themselves, which matters because the product IS an exact
+    /// corrected against the powers themselves, which matters because the product is an exact
     /// power of ten for some values — <c>1.0</c> is <c>2^52 x 5^52</c>.
     /// <para>
-    /// Asking <c>product.ToString().Length</c> instead would be exact, and would also be the
-    /// single most expensive thing on this path: formatting the 767-digit expansion of a subnormal
-    /// double costs more than every other step of the render put together, and at most seventeen
-    /// of those digits are ever read.
+    /// Not <c>product.ToString().Length</c>, which would be exact but is the most expensive thing
+    /// on this path: formatting the 767-digit expansion of a subnormal double costs more than the
+    /// rest of the render, and at most seventeen of those digits are ever read.
     /// </para>
     /// </remarks>
     private static int DigitCount(long mantissa, int exponent, BigInteger product)
@@ -306,7 +290,7 @@ internal static class SparkFloatText
     /// A candidate reads back when it sits within half a step of the value, and the arithmetic
     /// stays small because candidates are measured against the value's own exact expansion rather
     /// than against the value. Writing the expansion as <c>0.&lt;product&gt; x 10^pointAt</c>, its
-    /// last place is worth <c>10^(pointAt - length)</c>, and in THOSE units half a step up is
+    /// last place is worth <c>10^(pointAt - length)</c>, and in those units half a step up is
     /// exactly <c>scale / 2</c> whichever sign the exponent had:
     /// </para>
     /// <code>
@@ -319,13 +303,11 @@ internal static class SparkFloatText
     /// discards.
     /// </para>
     /// <para>
-    /// <b>The halving is done once, to the bound, and not per candidate to the distance.</b>
+    /// The halving is done once, to the bound, and not per candidate to the distance.
     /// <c>4d &lt; scale</c> would be the direct spelling, but it allocates a shifted copy of a
-    /// number that reaches 750 digits, and a probe would pay for two of them. Writing
-    /// <c>scale = 4q + r</c> instead makes it <c>d &lt; q</c>, or <c>d == q</c> while <c>r</c> is
-    /// non-zero — a comparison, which allocates nothing. Measured: the shift and the subtraction
-    /// are the two most expensive operations on this path at 0.37us each against 0.008us for a
-    /// comparison, and dropping the pair of shifts is most of what makes bisection worth having.
+    /// number that reaches 750 digits, twice per probe. Writing <c>scale = 4q + r</c> instead
+    /// makes it <c>d &lt; q</c>, or <c>d == q</c> while <c>r</c> is non-zero — a comparison,
+    /// which allocates nothing and costs about a fiftieth of a shift.
     /// </para>
     /// <para>
     /// The boundary itself counts only for an even mantissa, which is where round-half-to-even
@@ -338,7 +320,7 @@ internal static class SparkFloatText
     /// </remarks>
     private readonly struct Interval
     {
-        /// <summary>Half a step down, which is a QUARTER of a step at a power of two.</summary>
+        /// <summary>Half a step down, which is a quarter of a step at a power of two.</summary>
         private readonly BigInteger _below;
 
         /// <summary>Half a step up, which the value always has in full.</summary>
@@ -354,10 +336,9 @@ internal static class SparkFloatText
 
         internal Interval(BigInteger scale, int exponent, bool narrowBelow, bool evenMantissa)
         {
-            // Off the table, because halving a 750-digit number costs as much as any other step
-            // here and every value at a given exponent wants the same answer. The QUARTER is not
-            // worth a row of its own: only a power of two asks for one, and there are 2,046 of
-            // those against every double there is.
+            // From the table, because halving a 750-digit number costs as much as any other step
+            // here and every value at a given exponent wants the same answer. The quarter is not
+            // worth a row of its own: only a power of two asks for one.
             _above = Powers.Half(exponent);
             _aboveIsExact = scale.IsEven;
 
@@ -475,22 +456,18 @@ internal static class SparkFloatText
     /// <remarks>
     /// <c>5^1074</c> is a 751-digit number and only a subnormal double wants it, so the table is
     /// held by a nested class: a caller that never renders one never builds it, which a plain
-    /// <c>static readonly</c> on <see cref="SparkFloatText"/> could not promise. The same reason
-    /// <see cref="SparkIntegralCasts"/> holds its powers of ten.
+    /// <c>static readonly</c> on <see cref="SparkFloatText"/> could not promise.
     /// <para>
     /// Boxed rather than a <c>BigInteger[]</c> because the slots are published without a lock: a
     /// reference assignment is atomic where a two-field struct is not, so a reader can never see a
     /// sign paired with another power's digits. Two threads racing on a cold slot compute the same
-    /// number and one of them wins, which costs nothing and is always correct.
+    /// number and one of them wins, which is always correct.
     /// </para>
     /// <para>
-    /// <b>Through <see cref="Volatile"/> on both sides, though, and atomicity is not the reason.</b>
-    /// A plain store publishes the reference with no ordering against the writes that filled the box,
-    /// so a reader on a weakly-ordered target — arm64 — may follow a non-null slot to a
+    /// Through <see cref="Volatile"/> on both sides for ordering, not atomicity: a plain store
+    /// could let a reader on a weakly-ordered target (arm64) follow a non-null slot to a
     /// <c>BigInteger</c> whose digit array it cannot yet see. The release on the write and the
-    /// acquire on the read are what forbid that. Neither is measurable here: on x64 both are ordinary
-    /// instructions the JIT merely declines to move, and a slot is written once however many values
-    /// read it.
+    /// acquire on the read forbid that, and cost nothing measurable.
     /// </para>
     /// </remarks>
     private static class Powers
@@ -556,9 +533,8 @@ internal static class SparkFloatText
         /// shift is a pass over a buffer it has to allocate each time.
         /// <para>
         /// The power asked for is at most the digit count of <c>mantissa x scale</c>, which is 767
-        /// for a subnormal double and 309 for the largest normal one, so both rows are inside a
-        /// table sized for <c>5^1074</c>. Neither fills up: a row is written only for an exponent
-        /// some value actually had.
+        /// for a subnormal double and 309 for the largest normal one, so it fits a table sized for
+        /// <c>5^1074</c>. A slot is written only for a power some value actually asked for.
         /// </para>
         /// </remarks>
         internal static BigInteger Ten(int power)

@@ -16,22 +16,19 @@ namespace EngineeredWood.Expressions.Sql;
 /// <see cref="SparkSqlTokenizer"/> for the scanner beneath it.
 /// </para>
 /// <para>
-/// <b>What it does not do.</b> It resolves no columns — every reference comes out as an
-/// <see cref="UnboundReference"/> for <see cref="ExpressionBinder"/> to bind against a schema —
-/// and it evaluates nothing. It also does not reject aggregates, window functions or
-/// subqueries on principle: Spark's own expression parser accepts all three and Delta rejects
-/// them afterwards with <c>DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT</c>, so refusing them
-/// here would be a validation decision wearing a grammar's clothes. They fail only because this
-/// tree cannot represent them, and they fail with a quotable reason.
+/// It resolves no columns — every reference comes out as an <see cref="UnboundReference"/> for
+/// <see cref="ExpressionBinder"/> to bind against a schema — and it evaluates nothing. It does
+/// not reject aggregates, window functions or subqueries on principle: Spark's expression parser
+/// accepts all three and Delta rejects them afterwards with
+/// <c>DELTA_UNSUPPORTED_EXPRESSION_CHECK_CONSTRAINT</c>. They fail here only because this tree
+/// cannot represent them, and they fail with a quotable reason.
 /// </para>
 /// <para>
-/// <b>Precedence</b>, tightest first, as measured from Spark rather than assumed: postfix
-/// (<c>.</c>, <c>[]</c>, <c>::</c>), unary <c>-</c>/<c>+</c>, <c>* / %</c>, <c>+ - ||</c>,
-/// comparison and the <c>IS</c>/<c>IN</c>/<c>BETWEEN</c>/<c>LIKE</c> suffixes, <c>NOT</c>,
-/// <c>AND</c>, <c>OR</c>. The corpus pins the two that are easy to get wrong:
-/// <c>1 + 2 * 3</c> is <c>(1 + (2 * 3))</c>, and <c>NOT a &gt; 0 AND b &gt; 0</c> is
-/// <c>((NOT (a &gt; 0)) AND (b &gt; 0))</c> — <c>NOT</c> binds looser than comparison but
-/// tighter than <c>AND</c>.
+/// Precedence, tightest first, matching Spark: postfix (<c>.</c>, <c>[]</c>, <c>::</c>), unary
+/// <c>-</c>/<c>+</c>, <c>* / %</c>, <c>+ - ||</c>, comparison and the
+/// <c>IS</c>/<c>IN</c>/<c>BETWEEN</c>/<c>LIKE</c> suffixes, <c>NOT</c>, <c>AND</c>, <c>OR</c>.
+/// Note that <c>NOT a &gt; 0 AND b &gt; 0</c> is <c>((NOT (a &gt; 0)) AND (b &gt; 0))</c> —
+/// <c>NOT</c> binds looser than comparison but tighter than <c>AND</c>.
 /// </para>
 /// </remarks>
 public static class SparkSqlParser
@@ -54,9 +51,8 @@ public static class SparkSqlParser
     /// <remarks>
     /// A boolean-valued expression that is not already a <see cref="Predicate"/> — a boolean
     /// column, or a call like <c>isnotnull(x)</c> — becomes <c>expr = TRUE</c>. That is exact
-    /// under three-valued logic rather than a convenience: both forms are true, false and null
-    /// on exactly the same inputs, so a null result still fails the constraint. Note this is
-    /// deliberately <em>not</em> what <c>IS TRUE</c> means; see the <c>IS</c> handling below.
+    /// under three-valued logic: both forms are true, false and null on the same inputs. This is
+    /// deliberately not what <c>IS TRUE</c> means; see the <c>IS</c> handling below.
     /// </remarks>
     /// <exception cref="SparkSqlParseException">
     /// The text is malformed, or uses a construct this parser does not support.
@@ -193,9 +189,8 @@ public static class SparkSqlParser
 
         /// <summary>Parses <c>IS [NOT] NULL | TRUE | FALSE</c>.</summary>
         /// <remarks>
-        /// <c>IS TRUE</c> becomes <c>x &lt;=&gt; TRUE</c>, not <c>x = TRUE</c>. The distinction is
-        /// the whole point of the form: a null operand makes <c>IS TRUE</c> <em>false</em>, while
-        /// <c>= TRUE</c> stays null. Null-safe equality has exactly the wanted behaviour.
+        /// <c>IS TRUE</c> becomes <c>x &lt;=&gt; TRUE</c>, not <c>x = TRUE</c>: a null operand
+        /// makes <c>IS TRUE</c> false, while <c>= TRUE</c> stays null.
         /// </remarks>
         private Expression ParseIsSuffix(Expression left)
         {
@@ -219,12 +214,10 @@ public static class SparkSqlParser
 
         /// <summary>Parses <c>[NOT] IN (…)</c>.</summary>
         /// <remarks>
-        /// Always a <see cref="SetPredicate"/>, whatever the list holds. It used to expand a list
-        /// containing expressions into the disjunction of equalities SQL defines <c>IN</c> to
-        /// mean — which is true of the three-valued logic and false of the TYPES. Spark resolves
-        /// one type over the operand and the whole list, so <c>a IN ('01')</c> is false under the
-        /// legacy dialect where <c>a = '01'</c> is true, and a disjunction cannot express that.
-        /// #261.
+        /// Always a <see cref="SetPredicate"/>, whatever the list holds, never the disjunction of
+        /// equalities SQL defines <c>IN</c> to mean. That disjunction has the right three-valued
+        /// logic but the wrong types: Spark resolves one type over the operand and the whole list,
+        /// so <c>a IN ('01')</c> is false under the legacy dialect where <c>a = '01'</c> is true.
         /// </remarks>
         private Expression ParseInSuffix(Expression left, bool negated)
         {
@@ -333,23 +326,20 @@ public static class SparkSqlParser
 
         private Expression ParseUnary()
         {
-            // A LEADING `+` IS NOT THE IDENTITY, and dropping it was right for every numeric
-            // operand -- which is why it survived so long. Spark's `UnaryPositive` keeps a
-            // numeric operand's type and casts a STRING to double, the same target unary minus
-            // takes, so `+'1'` is the double 1.0 and `+'abc'` refuses where the bare string did
-            // neither. It types a bare NULL `double` as well, which a conditional then reads:
-            // `coalesce(a, +NULL)` is a double to Spark. #313, #340.
+            // A leading `+` is not the identity. Spark's `UnaryPositive` keeps a numeric
+            // operand's type but casts a STRING to double, as unary minus does, so `+'1'` is the
+            // double 1.0 and `+'abc'` refuses. It types a bare NULL as double too, which a
+            // conditional then reads: `coalesce(a, +NULL)` is a double to Spark.
             if (TakeToken(TokenKind.Plus))
                 return new FunctionCall("positive", new[] { ParseUnary() });
 
-            // A MINUS BEFORE A NUMBER IS PART OF THE LITERAL. Spark's grammar spells a number as
-            // `MINUS? INTEGER_VALUE` and so on, and types the signed text, so `-2147483648` is an
-            // `int` there -- typing the magnitude first made it a `bigint` here, one width too
-            // generous for every overflow check at the minimum. Measured: the fold is by TOKEN,
-            // so `- 2147483648` and `-/* c */2147483648` fold too, while `-(2147483648)` does
-            // not and is a `bigint`. It also binds tighter than postfix, so `-5::string` is
-            // `'-5'`, not the double `-5.0` a negated string gives. Only one sign folds:
-            // `- -2147483648` negates an `int`. #303.
+            // A minus before a number is part of the literal. Spark's grammar spells a number as
+            // `MINUS? INTEGER_VALUE` and so on and types the signed text, so `-2147483648` is an
+            // `int`, not a `bigint` (typing the magnitude first would be one width too generous
+            // for overflow checks at the minimum). The fold is by token, so `- 2147483648` and
+            // `-/* c */2147483648` fold too, while `-(2147483648)` does not and is a `bigint`.
+            // It binds tighter than postfix, so `-5::string` is `'-5'`, not the double `-5.0` a
+            // negated string gives. Only one sign folds: `- -2147483648` negates an `int`.
             if (Current.Kind == TokenKind.Minus && Peek(1).Kind == TokenKind.Number)
             {
                 var start = Current.Start;
@@ -445,19 +435,18 @@ public static class SparkSqlParser
         /// <para>
         /// Spark's grammar for a string constant is <c>stringLit+</c> and its AST builder joins
         /// the pieces, so <c>'a' 'b'</c> is <c>ab</c>. That rule is also the answer to <c>'it''s'</c>:
-        /// a doubled quote closes one literal and opens the next, so the expression is
-        /// <c>'it'</c> followed by <c>'s'</c> and Spark evaluates it to <c>its</c>. #179.
+        /// a doubled quote closes one literal and opens the next, so Spark evaluates it to
+        /// <c>its</c>.
         /// </para>
         /// <para>
-        /// <b>The run is over TOKENS, not over adjacency.</b> Measured — whitespace, a newline, a
-        /// block comment and a line comment between the pieces all join, and so do two different
-        /// quote styles: <c>'a' /* c */ "b"</c> is <c>ab</c>. There is nothing to check for here
-        /// beyond the next token's kind, and checking positions instead would be wrong.
+        /// The run is over tokens, not adjacency: whitespace, newlines, comments and a change of
+        /// quote style between the pieces all join (<c>'a' /* c */ "b"</c> is <c>ab</c>), so only
+        /// the next token's kind matters, not its position.
         /// </para>
         /// <para>
-        /// <b>Each piece is unescaped before joining</b>, which is Spark's order and is not the
-        /// same function as joining first. Measured: <c>'\u00' '41'</c> is <c>u0041</c>, not
-        /// <c>A</c>, and <c>'\1' '01'</c> is <c>101</c>. An escape cannot span two literals.
+        /// Each piece is unescaped before joining, as Spark does, so an escape cannot span two
+        /// literals: <c>'\u00' '41'</c> is <c>u0041</c>, not <c>A</c>, and <c>'\1' '01'</c> is
+        /// <c>101</c>.
         /// </para>
         /// <para>
         /// Only a bare string primary concatenates. A typed literal takes exactly one piece —
@@ -527,15 +516,11 @@ public static class SparkSqlParser
 
                 var literal = new LiteralExpression(SparkLiteral.Typed(word, text, _sql, start));
 
-                // A DATE literal is LOWERED to a cast, the way BETWEEN is lowered to two
-                // comparisons and a bare boolean to `= TRUE`. The value it carries cannot say
-                // which it is: SparkLiteral.Typed makes a DATE and a TIMESTAMP the same
-                // DateTimeOffset, deliberately, so that a literal and a column value compare on
-                // one footing — and the alternative, a LiteralValue kind that distinguishes them,
-                // exists only on net6 and later, where construction, equality, hashing and
-                // ordering for it are all behind #if. Casting says the same thing in the tree
-                // instead of in the value, and reuses the DATE cast that is already measured.
-                // #254.
+                // A DATE literal is lowered to a cast, the way BETWEEN is lowered to two
+                // comparisons. The value cannot say it is a date: SparkLiteral.Typed makes a DATE
+                // and a TIMESTAMP the same DateTimeOffset, so a literal and a column value compare
+                // on one footing, and the DateOnly kind that could distinguish them exists only on
+                // net6 and later. The cast carries the type in the tree instead.
                 return Matches(word, "DATE")
                     ? new FunctionCall("cast", new Expression[] { literal, Lit("DATE") })
                     : literal;
@@ -664,10 +649,8 @@ public static class SparkSqlParser
         // most of them non-reserved — `value` and `year` are legal column names — and because
         // Delta stores constraints with their original casing, so `and` arrives lowercase.
         //
-        // Compared over the token's span rather than a substring of it. Every precedence level
-        // probes several keywords per operand, so materialising a string for each probe would
-        // allocate steadily through a parse — and would give up the reason Token stores a range
-        // into the source instead of its own copy.
+        // Compared over the token's span rather than a substring: every precedence level probes
+        // several keywords per operand, and a string per probe would allocate throughout a parse.
         private bool IsKeyword(string keyword) =>
             Current.Kind == TokenKind.Identifier
             && Current.Text(_sql).Equals(keyword.AsSpan(), StringComparison.OrdinalIgnoreCase);

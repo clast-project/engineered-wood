@@ -134,8 +134,8 @@ public static class StatisticsEvaluator
         long? nullCount = accessor.GetNullCount(stats, column);
         long? valueCount = accessor.GetValueCount(stats, column);
 
-        // All-null column: any non-null comparison is Unknown (Spark) or AlwaysFalse
-        // for NullSafeEqual unless the value is also null.
+        // All-null column: every comparison is NULL, so no row matches -- except
+        // NullSafeEqual against NULL, which every row matches.
         bool allNull = nullCount.HasValue && valueCount.HasValue && nullCount == valueCount;
         if (allNull)
         {
@@ -186,15 +186,14 @@ public static class StatisticsEvaluator
     /// Whether a NaN may sit in this column outside what its bounds say.
     /// </summary>
     /// <remarks>
-    /// The bounds of a floating column do not settle the question, because the producers disagree
-    /// about what they mean. Parquet's spec says NaN must NOT be written to min/max, and Vortex
-    /// does the same, so <c>[1.0, NaN]</c> presents as a perfectly ordinary <c>min = max = 1.0</c>.
-    /// Spark's Delta writer does the opposite and records the NaN as the maximum -- measured, the
-    /// JSON string <c>"NaN"</c> -- while delta-rs, writing the SAME format, drops it and leaves the
-    /// finite bound. A reader cannot tell those two files apart.
+    /// The bounds of a floating column do not settle the question, because producers disagree
+    /// about what they mean. Parquet's spec says NaN must not be written to min/max, and Vortex
+    /// does the same, so <c>[1.0, NaN]</c> presents as <c>min = max = 1.0</c>. Spark's Delta
+    /// writer records the NaN as the maximum (the JSON string <c>"NaN"</c>), while delta-rs,
+    /// writing the same format, drops it and leaves the finite bound.
     /// <para>
-    /// So the only thing that settles it is a separate count, which is exactly what
-    /// <see cref="INanCountAccessor{TStats}"/> carries. Absent one, assume a NaN may be there.
+    /// Only a separate count settles it, which is what <see cref="INanCountAccessor{TStats}"/>
+    /// carries. Absent one, assume a NaN may be there.
     /// </para>
     /// </remarks>
     private static bool MayContainNaN<TStats>(
@@ -213,15 +212,14 @@ public static class StatisticsEvaluator
     /// be compared against the answer the bounds gave.
     /// </summary>
     /// <remarks>
-    /// NaN sits at the TOP of SQL's order (#204), which is what makes this asymmetric rather than
-    /// simply fatal to pruning. <c>col &gt; 5.0</c> is TRUE of a NaN row, so an AlwaysFalse derived
-    /// from a finite maximum is wrong and the row group must be kept; <c>col &lt; 5.0</c> is FALSE
-    /// of it, so the same AlwaysFalse survives. Equality survives too -- a NaN equals nothing but
-    /// another NaN -- which is what keeps <c>=</c> and <c>IN</c> pruning on float columns.
+    /// NaN sits at the top of SQL's order, which makes this asymmetric rather than fatal to
+    /// pruning. <c>col &gt; 5.0</c> is true of a NaN row, so an AlwaysFalse derived from a finite
+    /// maximum is wrong and the row group must be kept; <c>col &lt; 5.0</c> is false of it, so the
+    /// same AlwaysFalse survives. Equality survives too -- a NaN equals nothing but another NaN --
+    /// which keeps <c>=</c> and <c>IN</c> pruning on float columns.
     /// <para>
     /// The order comes from <see cref="LiteralValue.CompareTo(LiteralValue, out bool)"/> rather
-    /// than being restated here, so the NaN a predicate names compares against the NaN a column
-    /// holds by exactly one rule.
+    /// than being restated here, so a NaN in the predicate and a NaN in the column follow one rule.
     /// </para>
     /// </remarks>
     private static FilterResult NaNRowAnswer(ComparisonOperator op, LiteralValue value)
@@ -517,7 +515,7 @@ public static class StatisticsEvaluator
         }
 
         // A list holding anything but literals says nothing about a file: `x IN (a, b)` is a
-        // claim about two other COLUMNS, whose values statistics do not pair up with x's.
+        // claim about two other columns, whose values statistics do not pair up with x's.
         if (!set.TryGetLiteralValues(out var values))
             return FilterResult.Unknown;
 
@@ -527,7 +525,7 @@ public static class StatisticsEvaluator
             return FilterResult.Unknown;
 
         // A hidden NaN matches nothing but a NaN, so an IN list of ordinary numbers still prunes a
-        // float column -- unlike `>`, which a NaN row satisfies. Only a NaN IN the list can be
+        // float column -- unlike `>`, which a NaN row satisfies. Only a NaN in the list can be
         // matched by the row the bounds do not describe.
         bool mayBeNaN = MayContainNaN(min.Value, max.Value, stats, accessor, column!);
 
@@ -536,11 +534,10 @@ public static class StatisticsEvaluator
         bool allOutside = true;
         foreach (var v in values)
         {
-            // A SET MEMBER IS WIDTHED BY ITS TYPE, NOT BY ITS DIGITS. Spark resolves one type over
+            // A set member is widened by its type, not its digits. Spark resolves one type over
             // all the members before the comparison rule runs, so `d IN (1)` goes through bigint
             // -- decimal(20,0) -- where `d = 1` goes through decimal(1,0). Twenty integral digits
-            // against a high-scale column forces the clamp that one digit does not, so the same
-            // pair that compares exactly on the left rounds on the right. #323.
+            // against a high-scale column can force a scale clamp that one digit does not.
             int cmpVMin = SafeCompare(v, min.Value, setMembership: true);
             int cmpVMax = SafeCompare(v, max.Value, setMembership: true);
             if (cmpVMin == int.MinValue || cmpVMax == int.MinValue)
@@ -628,30 +625,23 @@ public static class StatisticsEvaluator
     /// <summary>
     /// Returns the comparison result, or <c>int.MinValue</c> when the answer may not be trusted
     /// to skip data — sentinel for "treat as Unknown." For comparing a value against a column's
-    /// STATISTICS; constant folding uses <see cref="ConstantCompare"/> instead, for the reason
-    /// given there.
+    /// statistics; constant folding uses <see cref="ConstantCompare"/> instead.
     /// </summary>
     /// <remarks>
-    /// Two ways an answer cannot be trusted, and only one of them announces itself. A pair that
-    /// cannot be compared at all throws, which this has always caught. A pair that compares
-    /// LOSSILY does not throw — it returns a confident answer about the rounded values, which can
-    /// be the opposite of the answer about the real ones. Acting on that skips row groups that
-    /// contain matching rows.
-    /// <para>
-    /// Measured: a row group holding exactly 9007199254740993 (2^53+1) against the predicate
-    /// <c>&gt; 9007199254740992.0</c> compared AlwaysFalse, because both sides met in a double
-    /// that cannot hold the odd value. The row group was skipped and the matching row lost. See
-    /// #208.
-    /// </para>
+    /// A pair that cannot be compared at all throws, which is caught. One that compares lossily
+    /// does not — it returns a confident answer about the rounded values, which can be the
+    /// opposite of the answer about the real ones, and acting on it skips row groups that contain
+    /// matching rows. For example, a row group holding exactly 9007199254740993 (2^53+1) against
+    /// <c>&gt; 9007199254740992.0</c> would compare AlwaysFalse in a double that cannot hold the
+    /// odd value.
     /// </remarks>
     private static int SafeCompare(LiteralValue value, LiteralValue bound, bool setMembership = false)
     {
-        // A THIRD way an answer cannot be trusted, and it announces itself least of all: the
-        // comparison is exact, and Spark's is not. Two exact numerics meet in their least common
-        // type and are compared THERE, so once that type gives up scale the answer is about the
-        // rounded values -- and the exact answer can be its opposite, again in the direction that
-        // skips a file holding matching rows. #323, and see SparkDecimalRounding for why this
-        // needs neither the unification itself nor the column's declared width.
+        // A third way an answer cannot be trusted: the comparison here is exact and Spark's is
+        // not. Two exact numerics meet in their least common type and are compared there, so once
+        // that type gives up scale Spark answers about the rounded values, and the exact answer can
+        // be its opposite. See SparkDecimalRounding for why this needs neither the unification
+        // itself nor the column's declared width.
         if (SparkDecimalRounding.Rounds(value, bound, setMembership))
             return int.MinValue;
 
@@ -670,13 +660,11 @@ public static class StatisticsEvaluator
     /// Compares two constants, or <c>int.MinValue</c> when they cannot be compared at all.
     /// </summary>
     /// <remarks>
-    /// Deliberately NOT <see cref="SafeCompare"/>, and the difference is the whole point of the
-    /// split. This folds a constant expression: no row group is being skipped on the strength of a
-    /// value's RANGE, so the answer must be whatever the row-level evaluator will produce for the
-    /// same two constants -- lossy widening included, because that is the dialect's own semantics.
-    /// Refusing a lossy answer here would not be conservative, it would be WRONG in the dangerous
-    /// direction: a constant comparison folds straight to AlwaysTrue or AlwaysFalse, and
-    /// AlwaysFalse skips everything.
+    /// Deliberately not <see cref="SafeCompare"/>. This folds a constant expression, where no row
+    /// group is skipped on the strength of a range, so the answer must be whatever the row-level
+    /// evaluator produces for the same two constants -- lossy widening included, since that is the
+    /// dialect's semantics. Refusing a lossy answer here would not be conservative: the fold goes
+    /// straight to AlwaysTrue or AlwaysFalse either way.
     /// </remarks>
     private static int ConstantCompare(LiteralValue a, LiteralValue b)
     {
@@ -692,15 +680,13 @@ public static class StatisticsEvaluator
 
     private static bool CompareLiterals(LiteralValue a, ComparisonOperator op, LiteralValue b)
     {
-        // Spark's <=>, which is SQL equality plus NULL <=> NULL. It asks the COMPARISON, not
-        // Equals: equality is representation-based (#206) and would answer false for 1 <=> 1.0d,
+        // Spark's <=>, which is SQL equality plus NULL <=> NULL. It uses the comparison, not
+        // Equals: equality is representation-based and would answer false for 1 <=> 1.0d,
         // diverging from the row evaluator, which reaches CompareTo through ValueEqual.
         //
-        // No null branch of its own -- CompareTo already orders null before every value and gives
-        // two nulls 0, so <=>'s whole contract falls out of == 0. Reading a.Equals(b) here also
-        // THREW for a null against a value and for any pair the comparison declines, measured, so
-        // `col <=> NULL` folded over two literals raised out of a pruning entry point rather than
-        // answering; ConstantCompare's int.MinValue turns that pair into false.
+        // No null branch of its own -- CompareTo orders null before every value and gives two
+        // nulls 0, so <=>'s contract falls out of == 0, and ConstantCompare's int.MinValue turns
+        // an incomparable pair into false rather than an exception.
         if (op == ComparisonOperator.NullSafeEqual)
             return ConstantCompare(a, b) == 0;
 

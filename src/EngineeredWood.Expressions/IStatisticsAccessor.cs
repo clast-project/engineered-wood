@@ -10,7 +10,7 @@ namespace EngineeredWood.Expressions;
 /// </summary>
 /// <typeparam name="TStats">
 /// The format-specific statistics type — e.g. <c>RowGroup</c> for Parquet,
-/// <c>DataFileStats</c> for Iceberg, <c>ColumnStats</c> for Delta Lake.
+/// <c>DataFileStats</c> for Iceberg, <c>DeltaFileStats</c> for Delta Lake.
 /// </typeparam>
 /// <remarks>
 /// All accessors return <c>null</c> when the requested statistic is not

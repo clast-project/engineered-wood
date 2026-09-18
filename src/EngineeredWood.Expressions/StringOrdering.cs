@@ -4,15 +4,15 @@
 namespace EngineeredWood.Expressions;
 
 /// <summary>
-/// Ordinal string comparison in CODE POINT order, which is the same order as a
+/// Ordinal string comparison in code point order, which is the same order as a
 /// byte-wise comparison of the UTF-8 encoding.
 /// </summary>
 /// <remarks>
 /// Every columnar format this library reads specifies its string min/max sort order over
 /// UTF-8 bytes — Parquet (<c>UTF8</c> logical type: unsigned byte-wise), Delta, Iceberg and
 /// Vortex all agree. .NET's <see cref="string.CompareOrdinal(string, string)"/> compares
-/// UTF-16 code UNITS instead, and the two disagree: surrogates (U+D800..U+DFFF) encode
-/// supplementary characters at U+10000 and above, yet as raw code units they sort BELOW
+/// UTF-16 code units instead, and the two disagree: surrogates (U+D800..U+DFFF) encode
+/// supplementary characters at U+10000 and above, yet as raw code units they sort below
 /// U+E000..U+FFFF. U+FFFD, for instance, compares greater than an emoji as code units but
 /// less than it over UTF-8 bytes.
 ///
@@ -52,7 +52,7 @@ internal static class StringOrdering
             char ca = a[i], cb = b[i];
             if (ca == cb)
                 continue;
-            // Fast path: below the surrogate block, code-unit order already IS code point order.
+            // Fast path: below the surrogate block, code-unit order already is code point order.
             if (ca < SurrogateStart && cb < SurrogateStart)
                 return ca < cb ? -1 : 1;
             int fa = Fold(ca), fb = Fold(cb);
@@ -64,7 +64,7 @@ internal static class StringOrdering
 
     /// <summary>
     /// Maps a UTF-16 code unit into a space whose numeric order equals code point order.
-    /// Comparing only the FIRST differing code unit is sufficient: order is preserved within
+    /// Comparing only the first differing code unit is sufficient: order is preserved within
     /// each block, and two supplementary characters differ at whichever surrogate half differs
     /// first — high halves order by the code point's upper bits, low halves by its lower bits.
     /// </summary>

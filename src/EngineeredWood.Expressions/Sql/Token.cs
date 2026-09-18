@@ -9,7 +9,7 @@ namespace EngineeredWood.Expressions.Sql;
 /// <remarks>
 /// The tokenizer does not interpret what it reads: a <see cref="TokenKind.String"/> keeps its
 /// quotes and escapes, and a <see cref="TokenKind.Number"/> keeps its exponent and type suffix.
-/// Turning <c>'it''s'</c> into <c>it's</c>, or deciding that <c>1.5</c> is a
+/// Turning <c>'it\'s'</c> into <c>it's</c>, or deciding that <c>1.5</c> is a
 /// <c>decimal(2,1)</c> while <c>1e3</c> is a <c>double</c>, is lowering — it needs Spark's
 /// typing rules, and it belongs with them rather than in the scanner.
 /// </remarks>

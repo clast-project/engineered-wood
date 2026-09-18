@@ -10,13 +10,11 @@ namespace EngineeredWood.Expressions;
 /// <see cref="double"/>.
 /// </summary>
 /// <remarks>
-/// Shared rather than written twice: the literal side (<see cref="LiteralValue"/>) and the column
-/// side (<c>SparkArrays</c>) both convert a decimal to a double, and #171 fixed the rounding on
-/// the first while #202 found the identical defect still sitting in the second. One conversion is
-/// one answer.
+/// Shared by the literal side (<see cref="LiteralValue"/>) and the column side
+/// (<c>SparkArrays</c>) so that both convert a decimal to a double by one rule.
 /// <para>
 /// Spark reaches a double from a decimal through Java's <c>BigDecimal.doubleValue</c>, which is
-/// correctly rounded — so "round to nearest, ties to even" is not a nicety here, it is the oracle.
+/// correctly rounded, so round-to-nearest, ties-to-even is required, not a nicety.
 /// </para>
 /// </remarks>
 internal static class ScaledDecimal
@@ -71,19 +69,18 @@ internal static class ScaledDecimal
 
     /// <summary>A <see cref="decimal"/> as the nearest <see cref="double"/>.</summary>
     /// <remarks>
-    /// Not the built-in <c>(double)value</c> cast, for the reason recorded on
-    /// <see cref="ToDouble(BigInteger, int)"/>: that cast double-rounds and is an ulp off on
-    /// 17.4% of decimals. Taking the value apart with <see cref="decimal.GetBits(decimal)"/>
-    /// hands over the same unscaled-and-scale pair the rest of this class works in, so both
-    /// widths of decimal answer with one rule.
+    /// Not the built-in <c>(double)value</c> cast, which double-rounds; see
+    /// <see cref="ToDouble(BigInteger, int)"/>. <see cref="decimal.GetBits(decimal)"/> yields the
+    /// unscaled-and-scale pair the rest of this class works in, so both widths of decimal answer
+    /// by one rule.
     /// </remarks>
     internal static double ToDouble(decimal value)
     {
         var bits = decimal.GetBits(value);
         var scale = (bits[3] >> 16) & 0xFF;
 
-        // The mantissa is 96 bits across three ints, low word first, and every one of them is
-        // UNSIGNED -- the sign lives in bits[3] alone.
+        // The mantissa is 96 bits across three ints, low word first, each unsigned -- the sign
+        // lives in bits[3] alone.
         var unscaled = ((BigInteger)(uint)bits[2] << 64)
             + ((BigInteger)(uint)bits[1] << 32)
             + (uint)bits[0];
@@ -93,25 +90,18 @@ internal static class ScaledDecimal
 
     /// <summary>An unscaled integer and a scale as the nearest <see cref="double"/>.</summary>
     /// <remarks>
-    /// <para>Three routes to this answer are wrong, and all three were in the codebase:</para>
+    /// <para>Three simpler routes to this answer are wrong:</para>
     /// <list type="bullet">
     /// <item><c>(double)unscaled / Math.Pow(10, scale)</c> — BigInteger's conversion to double
-    /// TRUNCATES rather than rounding to nearest (measured, <c>(double)10^30</c> is
-    /// 9.999999999999999e29, one ulp below the 1e30 Spark produces) and the division then rounds
-    /// a second time. This was <c>SparkArrays</c>, and is #202.</item>
-    /// <item><c>(double)(decimal)value</c> — no better despite staying inside a type built for
-    /// decimals. Measured over 250,000 decimals that fit <see cref="decimal"/> exactly, it lands
-    /// an ulp off on <b>17.4%</b> of them, and the failures are not spread evenly: at scale 0 it
-    /// is right (0.2% wrong), and from the first fractional digit onwards it is wrong on 12%
-    /// rising past 25% by scale 16. #202 scoped itself to values past decimal's ~7.9e28 ceiling
-    /// on the assumption that the narrow path was safe; only its INTEGRAL part is.</item>
-    /// <item>Formatting the value and parsing it back once — correct on .NET Core, and what #171
-    /// put in <see cref="LiteralValue"/>. It does not survive netstandard2.0: .NET Framework's
-    /// parser is not correctly rounded, and on net472 it reads
-    /// <c>419659064020406523871147E-10</c> an ulp away from the nearest double. A
-    /// Spark-compatibility layer that answers differently on .NET Framework than on .NET is the
-    /// same defect as #202 wearing a different hat, so this rounds in exact integer arithmetic
-    /// instead and every target agrees.</item>
+    /// truncates rather than rounding to nearest (<c>(double)10^30</c> is 9.999999999999999e29,
+    /// one ulp below the 1e30 Spark produces), and the division then rounds a second time.</item>
+    /// <item><c>(double)(decimal)value</c> — an ulp off on about 17% of decimals that fit
+    /// <see cref="decimal"/> exactly. It is right at scale 0, but from the first fractional digit
+    /// onwards it is wrong on 12%, rising past 25% by scale 16.</item>
+    /// <item>Formatting the value and parsing it back — correct on .NET Core, but .NET Framework's
+    /// parser is not correctly rounded (on net472 it reads <c>419659064020406523871147E-10</c> an
+    /// ulp away from the nearest double). Rounding in exact integer arithmetic makes every target
+    /// agree.</item>
     /// </list>
     /// </remarks>
     internal static double ToDouble(BigInteger unscaled, int scale)
@@ -119,10 +109,9 @@ internal static class ScaledDecimal
         if (unscaled.IsZero)
             return 0d;
 
-        // Both operands exact, so IEEE division rounds ONCE and lands on the correctly rounded
-        // quotient. Measured over 2,000,000 values: this path accepts 99.3% of them and is
-        // bit-exact against the exact route below on every one. It is what keeps the ordinary
-        // decimal -- a decimal(12,2) column, say -- off the BigInteger path entirely.
+        // Both operands exact, so IEEE division rounds once and lands on the correctly rounded
+        // quotient. This keeps the ordinary decimal -- a decimal(12,2) column, say -- off the
+        // BigInteger path entirely.
         if (scale >= 0 && scale <= LargestExactPowerOfTen
             && unscaled >= -ExactIntegerLimit && unscaled <= ExactIntegerLimit)
         {
@@ -140,13 +129,11 @@ internal static class ScaledDecimal
     /// <summary>An unscaled integer and a scale as the nearest <see cref="float"/>.</summary>
     /// <remarks>
     /// <para>
-    /// <b>Rounded ONCE, from the exact value.</b> Spark reaches a float from a decimal through
-    /// Java's <c>BigDecimal.floatValue</c> and from text through <c>Float.parseFloat</c>, and both
-    /// are correctly rounded: measured on 4.0.3 over 2,253 decimals and 8,400 strings placed
-    /// beside a float's rounding ties, not one differed from the exact answer. Going through
-    /// <see cref="ToDouble(BigInteger, int)"/> and narrowing rounds twice, and the first rounding
-    /// can land exactly on a tie the value itself was not on -- a third of those cases came back
-    /// as the float next door that way. #372.
+    /// Rounded once, from the exact value. Spark reaches a float from a decimal through Java's
+    /// <c>BigDecimal.floatValue</c> and from text through <c>Float.parseFloat</c>, and both are
+    /// correctly rounded. Going through <see cref="ToDouble(BigInteger, int)"/> and narrowing
+    /// rounds twice, and the first rounding can land exactly on a tie the value itself was not on,
+    /// giving the adjacent float.
     /// </para>
     /// <para>
     /// The fast path is Java's own: an unscaled value below 2^24 and a scale up to 10 are both

@@ -15,17 +15,16 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Arithmetic used to be computed in <see cref="decimal"/>, which holds roughly 7.9e28 where Spark
-/// decimals reach precision 38, so the top of the range was refused rather than evaluated. The
-/// values are stored in the Arrow buffer as an unscaled two's complement integer and a scale
-/// anyway, so working on those directly removes the ceiling instead of moving it.
+/// <see cref="decimal"/> holds only about 7.9e28 where Spark decimals reach precision 38. The
+/// Arrow buffer already stores an unscaled two's complement integer and a scale, so working on
+/// those directly covers the whole range.
 /// </para>
 /// <para>
 /// The arithmetic itself is database-decimal's. Every operation goes through the widening kernel
 /// rather than the same-width one, so the exact result is formed in 256 bits and rounded once to
-/// the result type <see cref="SparkNumericTypes"/> produced. That ordering is the point: Spark
-/// computes the exact result and then rounds it, so rounding in the middle — which is what a
-/// same-width kernel has to do when an intermediate will not fit — is a different function.
+/// the result type <see cref="SparkNumericTypes"/> produced. Spark computes the exact result and
+/// then rounds it, so rounding in the middle — which a same-width kernel has to do when an
+/// intermediate will not fit — would be a different function.
 /// </para>
 /// </remarks>
 internal static class SparkWideDecimals
@@ -34,7 +33,7 @@ internal static class SparkWideDecimals
     /// Spark rounds a discarded half away from zero.
     /// </summary>
     /// <remarks>
-    /// Measured: <c>CAST(2.5 AS DECIMAL(3,0))</c> is 3 and <c>CAST(1.45 AS DECIMAL(3,1))</c> is
+    /// <c>CAST(2.5 AS DECIMAL(3,0))</c> is 3 and <c>CAST(1.45 AS DECIMAL(3,1))</c> is
     /// 1.5. Passed explicitly at every call because database-decimal defaults to
     /// <see cref="DecimalRounding.HalfEven"/>, which would give 2 and 1.4.
     /// </remarks>
@@ -44,11 +43,8 @@ internal static class SparkWideDecimals
     /// Overflow of the declared precision is reported rather than thrown.
     /// </summary>
     /// <remarks>
-    /// Not a claim that the result always fits — <see cref="DecimalRange"/> checks that below.
-    /// The two dialects disagree on what an overflow *is*: ANSI raises <c>ARITHMETIC_OVERFLOW</c>
-    /// and the legacy dialect yields null, so the decision belongs to the caller holding the
-    /// <see cref="SparkDialectOptions"/>. An exception per overflowing row would be both costly
-    /// and wrong for the dialect that treats it as routine.
+    /// The result is still range-checked, through <see cref="DecimalRange"/>, and reported as
+    /// null; see <see cref="Evaluate"/> for why the caller decides what an overflow means.
     /// </remarks>
     private const DecimalOverflow Overflow = DecimalOverflow.Ignore;
 
@@ -75,13 +71,12 @@ internal static class SparkWideDecimals
     /// Integral arrays appear here because decimal is contagious in Spark's type rules: an
     /// <c>int</c> mixed with a decimal is read as the <c>decimal(10,0)</c> that holds it exactly,
     /// so the operand arriving at a decimal operation may still be an <see cref="Int32Array"/>.
-    /// Floating point never arrives — <see cref="SparkNumericTypes.AsDecimal"/> refuses it, because
-    /// mixing it in would need a lossy conversion rather than a widening one.
+    /// Floating point never arrives: a decimal mixed with a float or double is typed double.
     /// </remarks>
     internal static Operand? Read(IArrowArray array, int index) => array switch
     {
         // A bare NULL, typed `void`: no value at any row, and reachable wherever the other
-        // operand made the result a decimal -- `d1 + NULL`, `if(c, d1, NULL)`. #293.
+        // operand made the result a decimal -- `d1 + NULL`, `if(c, d1, NULL)`.
         NullArray => null,
 
         // The precisions are the ones SparkNumericTypes.AsDecimal assigns, so an operand carries
@@ -197,22 +192,14 @@ internal static class SparkWideDecimals
     }
 
     /// <summary>
-    /// Whether two operands denote the same number, whatever scales they carry.
-    /// </summary>
-    /// <remarks>
-    /// Compared at the wider of the two scales, so a <c>decimal(10,2)</c> holding 1.00 equals an
-    /// <c>int</c> holding 1 — which is what Spark says, and what comparing renderings would not.
-    /// </remarks>
-    /// <summary>
     /// Rounds to a multiple of 10^<paramref name="places"/>, half away from zero, at scale 0.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>ONE rounding, not two</b>, and the difference is visible on ordinary values. Declaring
-    /// the operand's scale to be <c>Scale + places</c> is the same as dividing it by
-    /// 10^<paramref name="places"/>, so a single rescale to 0 rounds at the place that matters.
-    /// Rounding to an integer first and to the multiple second would answer 20 for
-    /// <c>round(14.6, -1)</c>, by way of 15; measured, Spark answers 10.
+    /// One rounding, not two. Declaring the operand's scale to be <c>Scale + places</c> is the
+    /// same as dividing it by 10^<paramref name="places"/>, so a single rescale to 0 rounds at the
+    /// place that matters. Rounding to an integer first and to the multiple second would answer
+    /// 20 for <c>round(14.6, -1)</c>, by way of 15; Spark answers 10.
     /// </para>
     /// <para>
     /// Null means the result does not fit <paramref name="target"/> — the caller decides what
@@ -250,6 +237,13 @@ internal static class SparkWideDecimals
 
     private static readonly Int256 Ten = (Int256)10;
 
+    /// <summary>
+    /// Whether two operands denote the same number, whatever scales they carry.
+    /// </summary>
+    /// <remarks>
+    /// Compared at the wider of the two scales, so a <c>decimal(10,2)</c> holding 1.00 equals an
+    /// <c>int</c> holding 1, as Spark says.
+    /// </remarks>
     internal static bool AreEqual(Operand left, Operand right)
     {
         // Raising a scale multiplies and is exact, so the rounding mode never comes up here.
@@ -265,8 +259,7 @@ internal static class SparkWideDecimals
     /// <remarks>
     /// A reinterpret rather than a copy. Arrow stores a decimal128 as 16 bytes of little-endian
     /// two's complement, which is <see cref="Int128"/>'s own layout, so the whole column is already
-    /// an <c>Int128</c> array — no per-cell allocation, where reading through
-    /// <c>BigInteger</c> copied 16 bytes and allocated for every value.
+    /// an <c>Int128</c> array and no cell needs an allocation.
     /// </remarks>
     private static Int128 Unscaled(Decimal128Array array, int index)
     {
@@ -283,9 +276,8 @@ internal static class SparkWideDecimals
     /// <summary>Builds a Decimal128 column from unscaled integers, null where the value is null.</summary>
     /// <remarks>
     /// Built as a buffer rather than through <c>Decimal128Array.Builder</c>, whose only exact entry
-    /// points are <see cref="decimal"/> — the ceiling this file exists to remove — and a string,
-    /// which would mean formatting and reparsing every value to get back to the integer we are
-    /// already holding.
+    /// points are <see cref="decimal"/>, whose range is too small, and a string, which would mean
+    /// formatting and reparsing every value.
     /// </remarks>
     internal static Decimal128Array Build(Int128?[] values, Decimal128Type type, int rowCount)
     {
@@ -321,10 +313,10 @@ internal static class SparkWideDecimals
     /// <remarks>
     /// Same scale by construction — the caller unifies first — so the unscaled integers order the
     /// values directly. Compared as two 64-bit halves rather than through
-    /// <see cref="System.Numerics.BigInteger"/>, which copies sixteen bytes and allocates for
-    /// every comparison: <c>greatest</c> and <c>least</c> call this once per argument per ROW.
-    /// Halves rather than <see cref="Int128"/>'s own operators because the netstandard2.0 build
-    /// takes that type from database-decimal's polyfill, which carries no ordering.
+    /// <see cref="System.Numerics.BigInteger"/>, which allocates, because <c>greatest</c> and
+    /// <c>least</c> call this once per argument per row; and rather than through
+    /// <see cref="Int128"/>'s own operators because the netstandard2.0 build takes that type from
+    /// database-decimal's polyfill, which carries no ordering.
     /// </remarks>
     internal static int Compare(Decimal128Array left, Decimal128Array right, int index)
     {
@@ -352,29 +344,27 @@ internal static class SparkWideDecimals
         return halves;
     }
 
-    /// <summary>How Spark prints a decimal, which a decimal past 7.9e28 could not be asked before.</summary>
+    /// <summary>How Spark prints a decimal, across the whole precision range.</summary>
     internal static string Render(Operand value) =>
         new Decimal128(value.Unscaled).ToString(value.Type.Scale);
 
     /// <summary>
-    /// How the LEGACY dialect prints a decimal: Java's <c>BigDecimal.toString</c>, which goes
+    /// How the legacy dialect prints a decimal: Java's <c>BigDecimal.toString</c>, which goes
     /// scientific once the adjusted exponent drops below -6.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #325. The adjusted exponent is the coefficient's digit count, less one, less the scale. It
+    /// The adjusted exponent is the coefficient's digit count, less one, less the scale. It
     /// depends on the value as well as the scale, so a zero at scale 7 is <c>0E-7</c> while
     /// <c>0.0000010</c> at the same scale stays plain. The coefficient keeps every digit it has,
-    /// trailing zeros included: <c>-0.000000120</c> at scale 9 is <c>-1.20E-7</c>. Measured against
-    /// Spark 4.0.3, where the ANSI dialect and <c>try_cast</c> in either dialect use
-    /// <c>toPlainString</c> instead, which is <see cref="Render"/>.
+    /// trailing zeros included: <c>-0.000000120</c> at scale 9 is <c>-1.20E-7</c>. The ANSI
+    /// dialect, and <c>try_cast</c> in either dialect, use <c>toPlainString</c> instead, which is
+    /// <see cref="Render"/>.
     /// </para>
     /// <para>
     /// A Spark decimal never has a negative scale, so the exponent here is always negative and
-    /// Java's <c>E+</c> spelling never arises. The coefficient comes from the exact plain
-    /// rendering rather than from a second conversion of the unscaled value, so both spellings
-    /// read the same digits, and it is read in place, so a value that stays plain allocates
-    /// nothing beyond that rendering.
+    /// Java's <c>E+</c> spelling never arises. The coefficient is read from the plain rendering,
+    /// so both spellings share the same digits.
     /// </para>
     /// </remarks>
     internal static string RenderScientific(Operand value)
@@ -440,9 +430,8 @@ internal static class SparkWideDecimals
     /// <remarks>
     /// Every reinterpret here assumes the little-endian layout Arrow's decimal buffers are defined
     /// to use and that <see cref="Int128"/> and <see cref="Int256"/> happen to share. .NET does not
-    /// currently ship a big-endian runtime, so this is a guard against a future that may never
-    /// arrive rather than a supported path — but a wrong number on table data is worse than a
-    /// refusal, which is the same reason the ceiling this file removes was a refusal.
+    /// currently ship a big-endian runtime, so this is a guard rather than a supported path — a
+    /// wrong number on table data is worse than a refusal.
     /// </remarks>
     private static void RequireLittleEndian()
     {
