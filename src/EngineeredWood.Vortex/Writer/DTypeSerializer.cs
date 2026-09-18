@@ -85,6 +85,7 @@ internal static class DTypeSerializer
             StringType => WrapDType(b, DTypeKind.Utf8, EmitNullableTaggedTable(b, nullable)),
             BinaryType => WrapDType(b, DTypeKind.Binary, EmitNullableTaggedTable(b, nullable)),
             StructType st => EmitStructDType(b, st.Fields, nullable),
+            MapType map => WrapDType(b, DTypeKind.Map, EmitMapDType(b, map, field.Name, nullable)),
             ListType lst => WrapDType(b, DTypeKind.List, EmitListDType(b, lst.ValueField, nullable)),
             FixedSizeListType fsl => WrapDType(b, DTypeKind.FixedSizeList, EmitFixedSizeListDType(b, fsl.ValueField, fsl.ListSize, nullable)),
             TimestampType ts => WrapDType(b, DTypeKind.Extension, EmitTimestampExtension(b, ts, nullable)),
@@ -155,6 +156,30 @@ internal static class DTypeSerializer
         return b.StartTable(alignment: 4, inlineSize: 9)
             .EmitBool(nullable)
             .EmitUOffset(elementTicket)
+            .EmitSOffsetTo(vt);
+    }
+
+    /// <summary>
+    /// Map inner table (vortex 0.85+, <c>core2026.08.2</c>): { key_type: DType (slot 0),
+    /// value_type: DType (slot 1), keys_sorted: bool (slot 2), nullable: bool (slot 3) }.
+    /// vt_size=12, inline=14 (soffset(4) + key_uoff(4@4) + value_uoff(4@8) + keys_sorted(1@12)
+    /// + nullable(1@13)). The entry struct's field names are not stored: Vortex always calls
+    /// them <c>key</c> and <c>value</c>.
+    /// </summary>
+    private static int EmitMapDType(BackwardsFlatBufferBuilder b, MapType map, string fieldName, bool nullable)
+    {
+        // Neither model allows a null key, and the reader refuses a file whose Map dtype has one.
+        if (map.KeyField.IsNullable)
+            throw new NotSupportedException(
+                $"Vortex map keys cannot be null, but field '{fieldName}' declares a nullable key.");
+        var keyTicket = EmitDType(b, map.KeyField);
+        var valueTicket = EmitDType(b, map.ValueField);
+        var vt = b.WriteUInt16s(new ushort[] { 12, 14, 4, 8, 12, 13 });
+        return b.StartTable(alignment: 4, inlineSize: 14)
+            .EmitBool(nullable)
+            .EmitBool(map.KeySorted)
+            .EmitUOffset(valueTicket)
+            .EmitUOffset(keyTicket)
             .EmitSOffsetTo(vt);
     }
 

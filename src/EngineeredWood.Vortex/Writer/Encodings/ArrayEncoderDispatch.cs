@@ -19,7 +19,7 @@ internal readonly record struct EncodingIndices(
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
     ushort FsstString, ushort AlpRd, ushort VarBinView, ushort Pco,
-    ushort DateTimeParts, ushort Ext)
+    ushort DateTimeParts, ushort Ext, ushort ListView, ushort Map)
 {
     /// <summary>
     /// Whether the compressing chain may choose <c>fastlanes.delta</c>, which belongs to no
@@ -158,6 +158,9 @@ internal static class ArrayEncoderDispatch
         return array switch
         {
             StructArray => StructArrayEncoder.Emit(sb, array, idx, statsTicket),
+            // MapArray derives from ListArray, so it must be matched first (CS8120 enforces the
+            // order): a map written as a plain vortex.list would contradict its Map dtype.
+            MapArray => MapArrayEncoder.Emit(sb, array, idx, statsTicket),
             ListArray => ListArrayEncoder.Emit(sb, array, idx, statsTicket),
             FixedSizeListArray => FixedSizeListArrayEncoder.Emit(sb, array, idx, statsTicket),
             // Decimal128/256Array inherit from FixedSizeBinaryArray, so they MUST

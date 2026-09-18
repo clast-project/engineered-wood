@@ -60,6 +60,9 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort PcoEncodingIdx = 19;
     private const ushort DateTimePartsEncodingIdx = 20;
     private const ushort ExtEncodingIdx = 21;
+    // Registered only in a file whose schema holds a map; see ArraySpecs.
+    private const ushort ListViewEncodingIdx = 22;
+    private const ushort MapEncodingIdx = 23;
     private static readonly EncodingIndices DefaultIndices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -82,7 +85,9 @@ public sealed class VortexFileWriter : IDisposable
         VarBinView: VarBinViewEncodingIdx,
         Pco: PcoEncodingIdx,
         DateTimeParts: DateTimePartsEncodingIdx,
-        Ext: ExtEncodingIdx);
+        Ext: ExtEncodingIdx,
+        ListView: ListViewEncodingIdx,
+        Map: MapEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -1395,31 +1400,7 @@ public sealed class VortexFileWriter : IDisposable
 
         // 3. Footer.
         var footerBytes = FooterSerializer.Serialize(
-            arraySpecs: new[]
-            {
-                VortexArrayEncodings.Primitive,
-                VortexArrayEncodings.Bool,
-                VortexArrayEncodings.VarBin,
-                VortexArrayEncodings.List,
-                VortexArrayEncodings.FixedSizeList,
-                VortexArrayEncodings.FastlanesBitPacked,
-                VortexArrayEncodings.Decimal,
-                VortexArrayEncodings.Constant,
-                VortexArrayEncodings.FastlanesFor,
-                VortexArrayEncodings.FastlanesDelta,
-                VortexArrayEncodings.Dict,
-                VortexArrayEncodings.FastlanesRle,
-                VortexArrayEncodings.Struct_,
-                VortexArrayEncodings.Alp,
-                VortexArrayEncodings.RunEnd,
-                VortexArrayEncodings.Sparse,
-                VortexArrayEncodings.FsstString,
-                VortexArrayEncodings.AlpRD,
-                VortexArrayEncodings.VarBinView,
-                VortexArrayEncodings.Pco,
-                VortexArrayEncodings.DateTimeParts,
-                VortexArrayEncodings.Extension,
-            },
+            arraySpecs: ArraySpecs(_schema),
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats, VortexLayoutEncodings.Dictionary },
             segmentSpecs: _sw.SegmentSpecs);
         var footerBlock = _sw.AppendPostscriptBlock(footerBytes);
@@ -1447,6 +1428,55 @@ public sealed class VortexFileWriter : IDisposable
         try { Close(); }
         catch { _closed = true; }
     }
+
+    /// <summary>
+    /// The file's <c>array_specs</c> registry, in the order the <c>*EncodingIdx</c> constants
+    /// index. <c>vortex.listview</c> and <c>vortex.map</c> are appended only when the schema holds a
+    /// map, so a file without one lists exactly what it always has: <c>vortex.map</c> joined
+    /// <c>core2026.08.2</c> (vortex 0.85), and the Map dtype itself is as new, so only a file that
+    /// contains a map should need a reader that recent.
+    /// </summary>
+    private static string[] ArraySpecs(Apache.Arrow.Schema schema)
+    {
+        var specs = new List<string>
+        {
+            VortexArrayEncodings.Primitive,
+            VortexArrayEncodings.Bool,
+            VortexArrayEncodings.VarBin,
+            VortexArrayEncodings.List,
+            VortexArrayEncodings.FixedSizeList,
+            VortexArrayEncodings.FastlanesBitPacked,
+            VortexArrayEncodings.Decimal,
+            VortexArrayEncodings.Constant,
+            VortexArrayEncodings.FastlanesFor,
+            VortexArrayEncodings.FastlanesDelta,
+            VortexArrayEncodings.Dict,
+            VortexArrayEncodings.FastlanesRle,
+            VortexArrayEncodings.Struct_,
+            VortexArrayEncodings.Alp,
+            VortexArrayEncodings.RunEnd,
+            VortexArrayEncodings.Sparse,
+            VortexArrayEncodings.FsstString,
+            VortexArrayEncodings.AlpRD,
+            VortexArrayEncodings.VarBinView,
+            VortexArrayEncodings.Pco,
+            VortexArrayEncodings.DateTimeParts,
+            VortexArrayEncodings.Extension,
+        };
+        if (schema.FieldsList.Any(f => ContainsMap(f.DataType)))
+        {
+            specs.Add(VortexArrayEncodings.ListView);
+            specs.Add(VortexArrayEncodings.Map);
+        }
+        return specs.ToArray();
+    }
+
+    private static bool ContainsMap(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.MapType => true,
+        Apache.Arrow.Types.NestedType nested => nested.Fields.Any(f => ContainsMap(f.DataType)),
+        _ => false,
+    };
 
     /// <summary>One-shot convenience: writes <paramref name="batch"/> as a single-batch file.</summary>
     public static void Write(
