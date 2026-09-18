@@ -52,8 +52,9 @@ async fn main() -> std::io::Result<()> {
     let session = <VortexSession as VortexSessionDefault>::default().with_tokio();
     // Default writes target the newest core edition the .NET reader fully
     // understands. core2026.08.0 adds vortex.zoned and 08.1 vortex.onpair; the
-    // later August editions add vortex.map (08.2) and vortex.variant (08.3),
-    // which the reader can't decode yet.
+    // later August editions add vortex.map (08.2), read since #366 and written
+    // only by write_map_noncontiguous, and vortex.variant (08.3), which the
+    // reader can't decode yet.
     session
         .enable_edition(CORE_2026_08_1)
         .expect("core2026.08.1 is registered by the default session");
@@ -120,6 +121,8 @@ async fn main() -> std::io::Result<()> {
     write_zstd_single_frame(&session, &out_dir.join("zstd_string_64rows.vortex")).await?;
     write_zstd_framed(&session, &out_dir.join("zstd_framed_2000rows.vortex")).await?;
     write_zstd_compact(&session, &out_dir.join("zstd_compact_20000rows.vortex")).await?;
+    write_listview_noncontiguous(&session, &out_dir.join("listview_noncontiguous_7rows.vortex")).await?;
+    write_map_noncontiguous(&out_dir.join("map_noncontiguous_7rows.vortex")).await?;
 
     Ok(())
 }
@@ -1998,4 +2001,94 @@ async fn write_zstd_compact(session: &VortexSession, path: &PathBuf) -> std::io:
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
         .build();
     write_bytes(session, path, data, strategy).await
+}
+
+/// The views of the non-contiguous list-view fixtures, over 10 elements: out of
+/// order, overlapping, repeated, empty, null, and leaving elements 4 and 5 unused.
+/// Row 3 is null with a nonzero size, which an honest reader must not show.
+const LISTVIEW_OFFSETS: [u32; 7] = [6, 0, 1, 4, 9, 2, 6];
+const LISTVIEW_SIZES: [u32; 7] = [3, 2, 3, 2, 0, 1, 3];
+const LISTVIEW_VALID: [bool; 7] = [true, true, true, false, true, true, true];
+
+fn listview_of(elements: vortex_array::ArrayRef) -> vortex_array::ArrayRef {
+    use vortex_array::arrays::ListViewArray;
+    ListViewArray::try_new(
+        elements,
+        PrimitiveArray::from_iter(LISTVIEW_OFFSETS).into_array(),
+        PrimitiveArray::from_iter(LISTVIEW_SIZES).into_array(),
+        Validity::from_iter(LISTVIEW_VALID),
+    )
+    .expect("ListViewArray::try_new")
+    .into_array()
+}
+
+fn listview_string_elements() -> vortex_array::ArrayRef {
+    VarBinViewArray::from_iter_nullable_str([
+        Some("zero"), Some("one, which is longer than twelve bytes"), None, Some("three"),
+        Some("four (unused)"), Some("five (unused)"), Some("six"),
+        Some("seven, also longer than twelve bytes"), Some(""), Some("nine"),
+    ])
+    .into_array()
+}
+
+/// A list-view kept as a view — its offsets not contiguous — over primitive,
+/// string and struct elements, each with nulls among them (#382).
+async fn write_listview_noncontiguous(session: &VortexSession, path: &PathBuf) -> std::io::Result<()> {
+    let ints = || PrimitiveArray::from_option_iter(
+        (0..10i32).map(|i| (i != 2 && i != 7).then_some(i * 10))).into_array();
+    let structs = StructArray::from_fields(&[
+        ("a", ints()),
+        ("s", listview_string_elements()),
+    ])
+    .expect("from_fields")
+    .into_array();
+    let data = StructArray::from_fields(&[
+        ("ints", listview_of(ints())),
+        ("strings", listview_of(listview_string_elements())),
+        ("structs", listview_of(structs)),
+    ])
+    .expect("from_fields")
+    .into_array();
+    write_bytes(session, path, data, flat_strategy()).await
+}
+
+/// A map whose entries list-view is not contiguous (#382). Map exists only
+/// from core2026.08.2, so this one is written under that edition.
+async fn write_map_noncontiguous(path: &PathBuf) -> std::io::Result<()> {
+    use vortex_array::arrays::ListViewArray;
+    use vortex_array::arrays::MapArray;
+    use vortex_array::dtype::MapDType;
+
+    let session = <VortexSession as VortexSessionDefault>::default().with_tokio();
+    session
+        .enable_edition(vortex::editions::CORE_2026_08_2)
+        .expect("core2026.08.2 is registered by the default session");
+
+    let keys = VarBinViewArray::from_iter_str([
+        "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9",
+    ]);
+    let values = PrimitiveArray::from_option_iter(
+        (0..10i64).map(|i| (i != 2).then_some(i * 100)));
+    let entries = StructArray::from_fields(&[
+        ("key", keys.into_array()),
+        ("value", values.into_array()),
+    ])
+    .expect("from_fields")
+    .into_array();
+    let view = ListViewArray::try_new(
+        entries,
+        PrimitiveArray::from_iter(LISTVIEW_OFFSETS).into_array(),
+        PrimitiveArray::from_iter(LISTVIEW_SIZES).into_array(),
+        Validity::from_iter(LISTVIEW_VALID),
+    )
+    .expect("ListViewArray::try_new");
+    let map_dtype = MapDType::try_new(
+        DType::Utf8(Nullability::NonNullable),
+        DType::Primitive(PType::I64, Nullability::Nullable),
+        false,
+    )
+    .expect("MapDType::try_new");
+    let map = MapArray::try_new(map_dtype, view).expect("MapArray::try_new").into_array();
+    let data = StructArray::from_fields(&[("m", map)]).expect("from_fields").into_array();
+    write_bytes(&session, path, data, flat_strategy()).await
 }
