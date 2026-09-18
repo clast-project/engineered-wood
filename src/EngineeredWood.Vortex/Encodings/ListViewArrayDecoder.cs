@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.Format;
 
@@ -97,7 +98,7 @@ internal static class ListViewArrayDecoder
         if (!contiguous)
         {
             // Materialize: copy each row's slice into a fresh contiguous element array.
-            elementsData = MaterializeContiguous(elements, offsets, sizes, rowCount, elementType, total);
+            elementsData = MaterializeContiguous(elements, offsets, sizes, rowCount, total);
         }
 
         var data = new ArrayData(
@@ -116,43 +117,25 @@ internal static class ListViewArrayDecoder
     }
 
     /// <summary>
-    /// Re-packs the elements into a contiguous Arrow array. Limited to primitive
-    /// element types in phase 1.
+    /// Re-packs the elements into a contiguous Arrow array: one gather of every row's
+    /// view, in row order, so it serves any element type <see cref="ArrowCompute"/>
+    /// can take from and carries the elements' nulls with them.
     /// </summary>
     private static ArrayData MaterializeContiguous(
         IArrowArray elements, IArrowArray offsets, IArrowArray sizes,
-        int rowCount, IArrowType elementType, long totalElements)
+        int rowCount, long totalElements)
     {
-        // For primitive element types we can copy fixed-size slices.
-        var elemSize = ElementByteSize(elementType);
-        if (elemSize == 0)
-            throw new NotSupportedException(
-                $"vortex.listview: re-packing non-primitive elements ({elementType}) is not yet supported.");
-
-        var src = ((Apache.Arrow.Array)elements).Data.Buffers[1].Span;
-        var dst = new byte[checked((int)totalElements * elemSize)];
-        long pos = 0;
+        var indices = new int[checked((int)totalElements)];
+        int pos = 0;
         for (int i = 0; i < rowCount; i++)
         {
-            int srcStart = checked((int)GetLongAtIndex(offsets, i)) * elemSize;
-            int srcLen = checked((int)GetLongAtIndex(sizes, i)) * elemSize;
-            src.Slice(srcStart, srcLen).CopyTo(dst.AsSpan(checked((int)pos), srcLen));
-            pos += srcLen;
+            int start = checked((int)GetLongAtIndex(offsets, i));
+            int size = checked((int)GetLongAtIndex(sizes, i));
+            for (int j = 0; j < size; j++)
+                indices[pos++] = start + j;
         }
-
-        return new ArrayData(
-            elementType, checked((int)totalElements), 0, 0,
-            new[] { ArrowBuffer.Empty, new ArrowBuffer(dst) });
+        return ArrowCompute.Take(elements, indices).Data;
     }
-
-    private static int ElementByteSize(IArrowType type) => type switch
-    {
-        Int8Type or UInt8Type => 1,
-        Int16Type or UInt16Type => 2,
-        Int32Type or UInt32Type or FloatType => 4,
-        Int64Type or UInt64Type or DoubleType => 8,
-        _ => 0,
-    };
 
     private static (ulong ElementsLen, int OffsetPtype, int SizePtype) ParseMetadata(ReadOnlySpan<byte> bytes)
     {

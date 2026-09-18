@@ -134,7 +134,7 @@ public class VortexUpstreamCompatTests
     /// Asserts EW reads <paramref name="path"/> as the same schema and values as the Arrow IPC file
     /// the oracle wrote for it.
     /// </summary>
-    private static async Task CompareAsync(string expectedPath, string path)
+    internal static async Task CompareAsync(string expectedPath, string path)
     {
         List<RecordBatch> expected;
         Apache.Arrow.Schema expectedSchema;

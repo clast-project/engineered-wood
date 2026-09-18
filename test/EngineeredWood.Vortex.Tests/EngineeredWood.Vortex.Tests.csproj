@@ -32,7 +32,7 @@
 
   <ItemGroup>
     <None Update="TestData\**\*.vortex" CopyToOutputDirectory="PreserveNewest" />
-    <None Update="TestData\upstream-compat\*.arrow" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="TestData\**\*.arrow" CopyToOutputDirectory="PreserveNewest" />
     <!-- The pins, not the fixtures: the tests enumerate their cases from this file. The
          downloaded fixtures stay out of the project; the tests read them in place. -->
     <None Remove="UpstreamCompat\fixtures\**" />
