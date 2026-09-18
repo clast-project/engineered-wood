@@ -221,6 +221,61 @@ public class VortexMapWriterTests
         Assert.Contains("nullable key", e.Message);
     }
 
+    /// <summary>
+    /// The schema can say keys are non-nullable while the key array still holds a null, which
+    /// Apache.Arrow's builder allows. Vortex refuses such a file, so the writer must too.
+    /// </summary>
+    [Fact]
+    public void NullKeyInData_IsRefused()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            using var fs = File.Create(path);
+            var e = Assert.Throws<NotSupportedException>(() => VortexFileWriter.Write(fs, NullKeyBatch(out _)));
+            Assert.Contains("keys cannot be null", e.Message);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    /// <summary>Only the entries being written count: a slice past the null key writes fine.</summary>
+    [Fact]
+    public async Task NullKeyOutsideTheSlice_IsWritten()
+    {
+        var batch = NullKeyBatch(out var map);
+        var sliced = ArrowArrayFactory.Slice(map, 1, 2);
+        var path = Write(new[] { new RecordBatch(batch.Schema, new[] { sliced }, 2) });
+        try
+        {
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.Equal(new[] { "{\"c\": 3}", "{}" }, Rows(new[] { await reader.ReadColumnAsync(0) }));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    /// <summary>Three maps; the first holds a null key despite the non-nullable key field.</summary>
+    private static RecordBatch NullKeyBatch(out MapArray map)
+    {
+        var type = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true));
+        var b = new MapArray.Builder(type);
+        var keys = (StringArray.Builder)b.KeyBuilder;
+        var values = (Int32Array.Builder)b.ValueBuilder;
+        b.Append(); keys.Append("a"); values.Append(1); keys.AppendNull(); values.Append(2);
+        b.Append(); keys.Append("c"); values.Append(3);
+        b.Append();
+        map = b.Build();
+        var schema = new Apache.Arrow.Schema(new[] { new Field("m", type, nullable: false) }, null);
+        return new RecordBatch(schema, new IArrowArray[] { map }, 3);
+    }
+
     internal static string Write(
         IReadOnlyList<RecordBatch> batches, bool compress = false, bool preferVarBinView = false, bool preserveStats = false)
     {

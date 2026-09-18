@@ -72,6 +72,13 @@ internal static class MapArrayEncoder
         if (entries.Data.GetNullCount() > 0)
             throw new NotSupportedException(
                 "vortex.map entries cannot be null; the MapArray's entries struct has null slots.");
+        // The key dtype is always non-nullable, but Apache.Arrow's key builder still accepts a
+        // null. Written under that dtype, vortex refuses the file ("incorrect validity ... for
+        // dtype utf8") while EW's own reader would hand the null key back, so refuse it here.
+        // Only the visible entries count: a slice may leave a null key behind.
+        if (entries.Fields[0].Data.GetNullCount() > 0)
+            throw new NotSupportedException(
+                "vortex.map keys cannot be null; the MapArray has a null key among the entries being written.");
         int elementsTicket = ArrayEncoderDispatch.Emit(sb, entries, idx);
 
         ushort offsetsBufIdx = sb.AddBuffer(offsetBytes, alignmentExponent: 2);
