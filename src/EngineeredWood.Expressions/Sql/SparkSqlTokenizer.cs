@@ -15,8 +15,7 @@ namespace EngineeredWood.Expressions.Sql;
 /// The scanner recognises shapes, never meaning. It does not know that <c>AND</c> is an
 /// operator, that <c>DATE</c> may precede a string to form a typed literal, or that <c>1.5</c>
 /// is a decimal while <c>1e3</c> is a double. Everything it produces is a category and a range;
-/// the parser and its lowering step supply the rest. That split is what lets the same token
-/// stream serve constructs the parser has not learned yet.
+/// the parser and its lowering step supply the rest.
 /// </para>
 /// <para>
 /// Two input shapes are worth knowing about because Delta produces them. Constraint text is
@@ -275,24 +274,21 @@ internal static class SparkSqlTokenizer
     /// not escaped.
     /// </summary>
     /// <remarks>
-    /// <b>The two kinds escape their delimiter differently, and conflating them was #179.</b>
-    /// A string escapes with a BACKSLASH and a quoted identifier escapes by DOUBLING, and neither
-    /// accepts the other's spelling:
+    /// The two kinds escape their delimiter differently: a string escapes with a backslash and a
+    /// quoted identifier by doubling, and neither accepts the other's spelling.
     /// <list type="bullet">
     /// <item><description>
-    ///   <c>'it''s'</c> is TWO string tokens, not one. Spark's <c>STRING_LITERAL</c> ends at the
+    ///   <c>'it''s'</c> is two string tokens, not one. Spark's <c>STRING_LITERAL</c> ends at the
     ///   first unescaped quote and the grammar's <c>stringLit+</c> then concatenates the pieces,
-    ///   which is why Spark evaluates it to <c>its</c> rather than to <c>it's</c>. Reading
-    ///   <c>''</c> as an escape here is what produced the wrong answer.
+    ///   so Spark evaluates it to <c>its</c>, not <c>it's</c>.
     /// </description></item>
     /// <item><description>
-    ///   <c>`a``b`</c> is ONE identifier token, because doubling is the only escape a quoted
-    ///   identifier has — it takes no backslash escape at all.
+    ///   <c>`a``b`</c> is one identifier token; doubling is the only escape a quoted identifier
+    ///   has.
     /// </description></item>
     /// </list>
-    /// Escaping is handled here rather than left to lowering because it decides where the token
-    /// ENDS: <c>'a\'b'</c> is one string and not two. Unescaping is still lowering's job — this
-    /// keeps the text as written.
+    /// Escaping is handled here because it decides where the token ends: <c>'a\'b'</c> is one
+    /// string, not two. Unescaping is still lowering's job — this keeps the text as written.
     /// </remarks>
     private static Token ScanQuoted(string source, ref int position, char quote, TokenKind kind, string what)
     {

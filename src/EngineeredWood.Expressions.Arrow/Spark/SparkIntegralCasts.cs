@@ -12,18 +12,17 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Under ANSI an overflowing integral cast raises <c>CAST_OVERFLOW</c> and there is nothing to
-/// decide. With <see cref="SparkDialectOptions.Ansi"/> false Spark ANSWERS, and #243 was filed
-/// on the belief that it answers with one rule — the wrap that <see cref="SparkArrays.Truncate"/>
-/// already applies to arithmetic overflow. It does not. Measured into the corpus's
-/// <c>integral-cast-overflow</c> group, harvested under both configurations, there are FOUR
-/// source families and no two of them agree:
+/// Under ANSI an overflowing integral cast raises <c>CAST_OVERFLOW</c>. With
+/// <see cref="SparkDialectOptions.Ansi"/> false Spark answers, with a different rule for each of
+/// four source families (the corpus's <c>integral-cast-overflow</c> group, harvested under both
+/// configurations). The wrap that <see cref="SparkArrays.Truncate"/> applies to arithmetic
+/// overflow is only one of them:
 /// </para>
 /// <list type="table">
 /// <item>
 ///   <term>decimal or integral</term>
 ///   <description>
-///     WRAPS. <c>CAST(<i>10^30 as decimal(38,0)</i> AS INT)</c> is 1073741824, which is
+///     Wraps. <c>CAST(<i>10^30 as decimal(38,0)</i> AS INT)</c> is 1073741824, which is
 ///     10^30 mod 2^32, and the same value as a BIGINT is 5076944270305263616, which is
 ///     10^30 mod 2^64. A fraction truncates toward zero first.
 ///   </description>
@@ -31,14 +30,14 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <item>
 ///   <term>float or double</term>
 ///   <description>
-///     SATURATES, because Scala's <c>toInt</c> does. <c>CAST(1e30 AS INT)</c> is
+///     Saturates, because Scala's <c>toInt</c> does. <c>CAST(1e30 AS INT)</c> is
 ///     <c>int.MaxValue</c> where the decimal of the same value wraps to 1073741824.
 ///   </description>
 /// </item>
 /// <item>
 ///   <term>string</term>
 ///   <description>
-///     NULLS. <c>CAST('4294967298' AS INT)</c> is null rather than 2 — the parser simply fails,
+///     Nulls. <c>CAST('4294967298' AS INT)</c> is null rather than 2 because the parse fails,
 ///     which is also why every string failure is <c>CAST_INVALID_INPUT</c> under ANSI and never
 ///     <c>CAST_OVERFLOW</c>, whether the text was malformed or merely too large.
 ///   </description>
@@ -46,10 +45,9 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <item>
 ///   <term>timestamp</term>
 ///   <description>
-///     NULLS, on a round-trip check rather than a range one.
+///     Nulls, on a round-trip check rather than a range one.
 ///     <c>CAST(TIMESTAMP'9999-12-31 23:59:59' AS INT)</c> is null while the same value as a
-///     BIGINT is 253402300799. This needs no code here — refusing is what the evaluator already
-///     did — but it is the family that would have been wrong had the wrap been generalised.
+///     BIGINT is 253402300799. This is the family a generalised wrap would get wrong.
 ///   </description>
 /// </item>
 /// </list>
@@ -71,40 +69,35 @@ internal static class SparkIntegralCasts
 
     /// <summary>
     /// Reads <paramref name="text"/> as Spark's integral parse does: a sign, digits, and an
-    /// optional decimal point with digits. NO exponent, in either dialect.
+    /// optional decimal point with digits. No exponent, in either dialect.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Measured, and not what .NET's parse accepts. <c>CAST('1e3' AS BIGINT)</c> is
-    /// CAST_INVALID_INPUT under ANSI and NULL under the legacy dialect, where
-    /// <c>double.TryParse</c> reads 1000 and we answered it — the fail-open half of #258. The
-    /// floating and decimal targets DO take an exponent, which is why this rule belongs to the
+    /// Stricter than .NET's parse: <c>CAST('1e3' AS BIGINT)</c> is CAST_INVALID_INPUT under ANSI
+    /// and NULL under the legacy dialect, where <c>double.TryParse</c> would read 1000. The
+    /// floating and decimal targets do take an exponent, which is why this rule belongs to the
     /// integral cast rather than to the value that reaches it.
     /// </para>
     /// <para>
-    /// The <see cref="TextForm.Fractional"/> case is syntactic, and deliberately: measured,
-    /// ANSI refuses <c>'1.0'</c>, <c>'0.0'</c> and <c>'10.'</c> as readily as <c>'1.5'</c>, so
-    /// the point itself is what it objects to and not a non-zero fraction. Testing the VALUE
-    /// instead — whether it survives truncation — accepted all three. The legacy dialect
-    /// truncates every one of them.
+    /// <see cref="TextForm.Fractional"/> is syntactic on purpose: ANSI refuses <c>'1.0'</c>,
+    /// <c>'0.0'</c> and <c>'10.'</c> as readily as <c>'1.5'</c>, so it objects to the point
+    /// itself and not to a non-zero fraction. Testing whether the value survives truncation would
+    /// accept all three. The legacy dialect truncates every one of them.
     /// </para>
     /// <para>
-    /// <b>The digit test below is ASCII on purpose</b>, and diverges from
-    /// <c>SparkDecimalText.DigitValue</c> for a measured reason rather than an oversight: Spark's
-    /// integral parse is <c>UTF8String.toLong</c>, which compares BYTES against <c>'0'</c>..
+    /// The digit test is ASCII on purpose, unlike <c>SparkDecimalText.DigitValue</c>: Spark's
+    /// integral parse is <c>UTF8String.toLong</c>, which compares bytes against <c>'0'</c>..
     /// <c>'9'</c>, where the decimal parse is <c>BigDecimal</c> and reads any Unicode Nd digit. So
     /// an ARABIC-INDIC DIGIT THREE is 3 as a DECIMAL and CAST_INVALID_INPUT as an INT, BIGINT,
-    /// SMALLINT or TINYINT. #283.
+    /// SMALLINT or TINYINT.
     /// </para>
     /// </remarks>
     public static TextForm Classify(string text)
     {
         // Read between indices rather than over a trimmed copy: this runs once per row of a
         // string-to-integral cast, and trimming allocates whenever there is anything to trim.
-        // Which is also why SparkText hands back bounds rather than a span.
         //
-        // `char.IsWhiteSpace` was the wrong set here, the same way it was everywhere else: it
-        // keeps U+001F, which Spark trims, and removes U+00A0, which Spark does not. #316.
+        // Spark's whitespace set, not `char.IsWhiteSpace`: Spark trims U+001F and keeps U+00A0.
         var (index, end) = SparkText.TrimBounds(text.AsSpan());
 
         if (index < end && (text[index] == '+' || text[index] == '-'))
@@ -141,10 +134,10 @@ internal static class SparkIntegralCasts
 
     /// <summary>10^0 through 10^38, so the divisor below is not rebuilt for every row.</summary>
     /// <remarks>
-    /// Unlike the parse-time work in <see cref="SparkDecimalText"/>, this really is a per-row
-    /// path: a wide decimal column cast to an <c>int</c> overflows on every row it holds. 38 is
-    /// Spark's largest decimal scale, so the fallback past the end of the table is unreachable
-    /// through a Spark type — it is there because the Arrow type is not ours to constrain.
+    /// This is a per-row path: a wide decimal column cast to an <c>int</c> can overflow on every
+    /// row. 38 is Spark's largest decimal scale, so the fallback past the end of the table is
+    /// unreachable through a Spark type; it is there because the Arrow type is not ours to
+    /// constrain.
     /// </remarks>
     private static readonly BigInteger[] PowersOfTen = BuildPowersOfTen();
 
@@ -228,11 +221,11 @@ internal static class SparkIntegralCasts
     /// A floating-point source clamped the way Scala's <c>toInt</c> and <c>toLong</c> clamp it.
     /// </summary>
     /// <remarks>
-    /// <b>The saturation happens at INT even for a narrower target, and the narrowing after it
-    /// wraps.</b> Spark casts a double to a byte as <c>numeric.toInt(d).toByte</c>, and the
-    /// corpus separates the two possibilities: <c>CAST(300.0 AS TINYINT)</c> is 44, so the
-    /// narrowing is not a clamp, and <c>CAST(4294967298.5 AS TINYINT)</c> is -1 rather than 127,
-    /// so the clamp before it is at <c>int</c> and not at the target.
+    /// The saturation happens at INT even for a narrower target, and the narrowing after it
+    /// wraps: Spark casts a double to a byte as <c>numeric.toInt(d).toByte</c>.
+    /// <c>CAST(300.0 AS TINYINT)</c> is 44, so the narrowing is not a clamp, and
+    /// <c>CAST(4294967298.5 AS TINYINT)</c> is -1 rather than 127, so the clamp is at <c>int</c>
+    /// and not at the target.
     /// </remarks>
     internal static long Saturate(double value, IArrowType target) =>
         target is Int64Type ? ToInt64(value) : SparkArrays.Truncate(ToInt32(value), target);

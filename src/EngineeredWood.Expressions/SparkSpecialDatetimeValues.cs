@@ -5,16 +5,15 @@ namespace EngineeredWood.Expressions;
 
 /// <summary>
 /// The five words Spark reads as a date or a timestamp — <c>epoch</c>, <c>today</c>,
-/// <c>yesterday</c>, <c>tomorrow</c>, <c>now</c> — over a CONSTANT and nowhere else.
+/// <c>yesterday</c>, <c>tomorrow</c>, <c>now</c> — over a constant and nowhere else.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>This is not part of the grammar, and keeping it out of <see cref="SparkTemporalText"/> is
-/// the point of the issue.</b> Spark reads the words in exactly two places: <c>AstBuilder</c>'s
-/// typed literal, and <c>SpecialDatetimeValues</c> — an optimizer rule that rewrites a cast to
-/// DATE or TIMESTAMP whose operand is <c>foldable</c> into a literal. <c>stringToDate</c> itself
-/// does not know them, so the same word arriving in a ROW is refused. Measured on Spark 4.0.3 /
-/// JDK 17.0.20, session zone UTC, on 2026-09-17, in BOTH dialects:
+/// This is deliberately not part of <see cref="SparkTemporalText"/>'s grammar. Spark reads the
+/// words in exactly two places: <c>AstBuilder</c>'s typed literal, and
+/// <c>SpecialDatetimeValues</c> — an optimizer rule that rewrites a cast to DATE or TIMESTAMP
+/// whose operand is <c>foldable</c> into a literal. <c>stringToDate</c> itself does not know
+/// them, so the same word arriving in a row is refused. In both dialects:
 /// </para>
 /// <list type="bullet">
 /// <item><description>
@@ -22,31 +21,22 @@ namespace EngineeredWood.Expressions;
 /// <c>'epoch'</c> is <c>CAST_INVALID_INPUT</c> under ANSI and null without it.
 /// </description></item>
 /// <item><description>
-/// <b>Foldable, not literal.</b> <c>CAST(concat('epo','ch') AS DATE)</c>,
-/// <c>CAST(upper('epoch') AS DATE)</c> and <c>CAST(substring('epochal',1,5) AS DATE)</c> all
-/// answer 1970-01-01 — the rule calls <c>e.eval()</c> itself rather than waiting for constant
-/// folding — while <c>CAST(concat(s,'') AS DATE)</c> and
-/// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> are refused, each of
-/// them a string that is <c>'epoch'</c> in every row.
+/// Foldable, not literal: <c>CAST(concat('epo','ch') AS DATE)</c> and
+/// <c>CAST(upper('epoch') AS DATE)</c> answer 1970-01-01 — the rule calls <c>e.eval()</c> itself
+/// rather than waiting for constant folding — while <c>CAST(concat(s,'') AS DATE)</c> and
+/// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> are refused, though
+/// each is <c>'epoch'</c> in every row.
 /// </description></item>
 /// <item><description>
-/// <b>The dialect does not reach it.</b> An optimizer rule runs before either cast does, so both
-/// dialects fold the word and only the REFUSAL of a word outside the vocabulary differs.
-/// <c>try_cast</c> folds too: <c>try_cast('epoch' AS DATE)</c> is 1970-01-01, not null.
+/// The optimizer rule runs before either cast does, so both dialects fold the word and differ
+/// only in how they refuse a word outside the vocabulary. <c>try_cast('epoch' AS DATE)</c> is
+/// 1970-01-01, not null.
 /// </description></item>
 /// </list>
 /// <para>
-/// <b>The word is not simply matched.</b> Spark's <c>extractSpecialValue</c> reads
-/// <c>(\p{Alpha}+)\p{Blank}*(.*)</c> over the trimmed text and treats the tail as a TIMEZONE,
-/// which has to RESOLVE for the word to count — so <c>'epoch UTC'</c> is 1970-01-01 while
-/// <c>'epoch extra'</c> is refused, and <c>'epochUTC'</c> is refused because the alpha run is
-/// greedy. <c>now</c> alone refuses a zone outright. All measured.
-/// </para>
-/// <para>
-/// <b>Four of the five are a function of the clock</b>, which is why the corpus can pin only
-/// <c>epoch</c> and the SHAPES around the others (<c>CAST('yesterday' AS DATE) &lt;
-/// CAST('today' AS DATE)</c>). That is Spark's non-determinism rather than ours: a generated
-/// column defined as <c>CAST('today' AS DATE)</c> names a different day on every write. #342.
+/// The word is not simply matched: see <see cref="ExtractSpecialValue"/>. Four of the five
+/// depend on the clock, so a generated column defined as <c>CAST('today' AS DATE)</c> names a
+/// different day on every write — in Spark too.
 /// </para>
 /// </remarks>
 internal static class SparkSpecialDatetimeValues
@@ -59,8 +49,8 @@ internal static class SparkSpecialDatetimeValues
     /// of the day it names.
     /// </summary>
     /// <remarks>
-    /// <c>convertSpecialDate</c>, where <b><c>now</c> is a DATE as well as a timestamp</b> — it is
-    /// today, not the current instant, since a date has no time to carry it.
+    /// Spark's <c>convertSpecialDate</c>, where <c>now</c> is today, since a date has no time to
+    /// carry the current instant.
     /// </remarks>
     public static bool TryReadDate(ReadOnlySpan<char> text, out DateTimeOffset value)
     {
@@ -79,7 +69,7 @@ internal static class SparkSpecialDatetimeValues
     /// instant.
     /// </summary>
     /// <remarks>
-    /// <c>convertSpecialTimestamp</c>. <b><c>now</c> is the current INSTANT here</b> and today's
+    /// Spark's <c>convertSpecialTimestamp</c>. <c>now</c> is the current instant here and today's
     /// date in <see cref="TryReadDate"/> — the one word the two conversions disagree about.
     /// </remarks>
     public static bool TryReadTimestamp(ReadOnlySpan<char> text, out DateTimeOffset value)
@@ -98,9 +88,9 @@ internal static class SparkSpecialDatetimeValues
     /// <summary>Midnight of the current day in the session zone, as an instant.</summary>
     /// <remarks>
     /// Spark's <c>today(zoneId)</c> is <c>Instant.now().atZone(zoneId).with(MIDNIGHT)</c>, so the
-    /// day is the one the SESSION zone is having and the instant is that day's midnight there.
-    /// With <see cref="SparkTemporalText.SessionTimeZone"/> at UTC the two spellings coincide, and
-    /// writing it out is what keeps this right if #133 ever makes the zone configurable.
+    /// day is the one the session zone is having and the instant is that day's midnight there.
+    /// With <see cref="SparkTemporalText.SessionTimeZone"/> fixed at UTC the two spellings
+    /// coincide; writing it out keeps this right if #133 makes the zone configurable.
     /// </remarks>
     private static DateTimeOffset Today()
     {
@@ -125,39 +115,35 @@ internal static class SparkSpecialDatetimeValues
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The regex is <c>(\p{Alpha}+)\p{Blank}*(.*)</c> against the WHOLE string, guarded by
-    /// <c>isValid</c>. Four properties of it do not follow from the description, and each is
-    /// measured:
+    /// The regex is <c>(\p{Alpha}+)\p{Blank}*(.*)</c> against the whole string, guarded by
+    /// <c>isValid</c>. Four properties of it do not follow from the description:
     /// </para>
     /// <list type="number">
     /// <item><description>
-    /// <b>The alpha run is greedy and the match must cover the string</b>, so <c>'epochUTC'</c>
-    /// yields the word <c>epochutc</c> and is refused rather than backtracking to <c>epoch</c>.
+    /// The alpha run is greedy and the match must cover the string, so <c>'epochUTC'</c> yields
+    /// the word <c>epochutc</c> and is refused rather than backtracking to <c>epoch</c>.
     /// </description></item>
     /// <item><description>
-    /// <b><c>\p{Alpha}</c> and <c>\p{Blank}</c> are ASCII</b> in Java without
+    /// <c>\p{Alpha}</c> and <c>\p{Blank}</c> are ASCII in Java without
     /// <c>UNICODE_CHARACTER_CLASS</c> — letters, and space or tab. The separate
-    /// <c>input(0).isLetter</c> guard above the regex is Unicode-aware but cannot admit anything
-    /// the regex then refuses, so the ASCII test below stands for both.
+    /// <c>input(0).isLetter</c> guard is Unicode-aware but cannot admit anything the regex then
+    /// refuses, so the ASCII test below stands for both.
     /// </description></item>
     /// <item><description>
-    /// <b><c>.</c> does not match a line terminator</b>, so a newline anywhere past the word fails
-    /// the match outright — <c>'today', LF, 'UTC'</c> is refused even though the zone would
-    /// resolve. A line terminator at either END is already gone, because the text is trimmed.
+    /// <c>.</c> does not match a line terminator, so a newline anywhere past the word fails the
+    /// match even when the zone would resolve. One at either end is already trimmed away.
     /// </description></item>
     /// <item><description>
-    /// <b>A tail must resolve as a timezone, and <c>now</c> refuses one at all.</b> The zone is
-    /// never USED: measured, <c>'epoch America/Los_Angeles'</c> is still 1970-01-01, and
-    /// <c>'today America/Los_Angeles'</c> is today in the SESSION zone.
+    /// A tail must resolve as a timezone (<c>'epoch UTC'</c> is 1970-01-01, <c>'epoch extra'</c>
+    /// is refused), and <c>now</c> refuses one at all. The zone is never used:
+    /// <c>'today America/Los_Angeles'</c> is today in the session zone.
     /// </description></item>
     /// </list>
     /// <para>
-    /// <b>One divergence, and it is #318's.</b> The tail is checked with
-    /// <see cref="SparkTemporalText.IsResolvableZone"/>, which refuses a REGION id because the tz
-    /// database is not the same on every target framework. So
-    /// <c>CAST('epoch America/Los_Angeles' AS DATE)</c> is refused here and is 1970-01-01 to
-    /// Spark — the known difference a region zone inside a timestamp already carries, reaching
-    /// the one shape where the zone does not even change the answer.
+    /// One divergence: the tail is checked with <see cref="SparkTemporalText.IsResolvableZone"/>,
+    /// which refuses a region id because the tz database is not the same on every target
+    /// framework. So <c>CAST('epoch America/Los_Angeles' AS DATE)</c> is refused here and is
+    /// 1970-01-01 to Spark.
     /// </para>
     /// </remarks>
     private static Word ExtractSpecialValue(ReadOnlySpan<char> text)

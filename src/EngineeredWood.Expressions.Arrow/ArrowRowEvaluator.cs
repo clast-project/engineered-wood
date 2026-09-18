@@ -79,9 +79,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     {
         var result = EvalExpressionAsArray(expression, batch);
 
-        // A literal is built at least one row long even over an empty batch -- see
-        // <see cref="ConstantArray"/> for why -- so trim it back here. The invariant a caller is
-        // owed is that the answer has the batch's length; the extra row is an internal device.
+        // A literal is built at least one row long even over an empty batch (see ConstantArray),
+        // so trim the answer back to the batch's length.
         return result.Length == batch.Length
             ? result
             : ArrowArrayFactory.Slice(result, 0, batch.Length);
@@ -118,17 +117,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Short-circuiting per ROW, because Spark's is.</b> Spark's <c>And</c> returns false
-    /// without touching its right operand as soon as the left is false, so an error on a row the
-    /// left already decided never happens. Measured on 4.0.1 over <c>z = [0, 1, 2]</c>:
-    /// <c>z &lt;&gt; 0 AND 1/z &gt; 0</c> answers <c>[false, true, true]</c>, where evaluating
-    /// both operands whole raises DIVIDE_BY_ZERO and loses the other two rows with it. #306.
+    /// Short-circuiting is per row, because Spark's is: its <c>And</c> skips the right operand
+    /// once the left is false, so an error on a row the left already decided never happens. Over
+    /// <c>z = [0, 1, 2]</c>, <c>z &lt;&gt; 0 AND 1/z &gt; 0</c> answers
+    /// <c>[false, true, true]</c> rather than raising DIVIDE_BY_ZERO.
     /// </para>
     /// <para>
-    /// <b>NULL does not short-circuit.</b> The skip is keyed on false, not on "decided": measured,
-    /// <c>n &gt; 0 AND 1/z &gt; 0</c> over an all-null <c>n</c> DOES raise on the row where
-    /// <c>z</c> is zero, while the <c>z &lt;&gt; 0</c> form above does not. So a row whose answer
-    /// so far is null stays live and the next operand is evaluated for it.
+    /// NULL does not short-circuit: <c>n &gt; 0 AND 1/z &gt; 0</c> over an all-null <c>n</c>
+    /// raises on the row where <c>z</c> is zero. So a row whose answer so far is null stays live.
     /// </para>
     /// <para>
     /// Every operand is evaluated even once no row is live, over an empty selection. That reads no
@@ -162,8 +158,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 }
                 else if (childResult[i] is null)
                 {
-                    // No false yet and an unknown: the answer is unknown, but a LATER operand can
-                    // still turn it false, so the row stays live.
+                    // Unknown so far, but a later operand can still make it false, so the row
+                    // stays live.
                     result[i] = null;
                 }
 
@@ -179,10 +175,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// the rows no earlier one made true.
     /// </summary>
     /// <remarks>
-    /// Measured the same way, and the shape a CHECK constraint that has to tolerate a zero or a
-    /// null is actually written in: <c>z = 0 OR 1/z &gt; 0</c> answers <c>[true, true, true]</c>
-    /// over <c>z = [0, 1, 2]</c>. NULL does not short-circuit here either -- the skip is keyed on
-    /// true, and <c>n &gt; 0 OR 1/z &gt; 0</c> raises.
+    /// <c>z = 0 OR 1/z &gt; 0</c> answers <c>[true, true, true]</c> over <c>z = [0, 1, 2]</c>.
+    /// NULL does not short-circuit here either: <c>n &gt; 0 OR 1/z &gt; 0</c> raises.
     /// </remarks>
     private bool?[] EvalOr(OrPredicate or, RecordBatch batch)
     {
@@ -226,10 +220,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalComparison(ComparisonPredicate cmp, RecordBatch batch)
     {
-        // ASKED BEFORE EITHER OPERAND IS EVALUATED, so that an operand which raises cannot
-        // decide the analysis. `CAST(s AS INT) = bl` over a row holding 'abc' would otherwise
-        // report CAST_INVALID_INPUT and never reach the refusal -- an analysis answer chosen by
-        // the data, which is the defect this seam exists to remove.
+        // Asked before either operand is evaluated, so that an operand which raises cannot
+        // decide the analysis: `CAST(s AS INT) = bl` over a row holding 'abc' would otherwise
+        // report CAST_INVALID_INPUT and never reach the refusal.
         bool asked = CheckComparableFromTree(cmp, batch);
 
         var (left, leftType) = EvalOperand(cmp.Left, batch);
@@ -280,11 +273,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             }
             catch (InvalidOperationException)
             {
-                // A pair with no comparison between them at all -- a boolean against a number, or
-                // anything at all when no registry was supplied to coerce with. Not a string
-                // against a number, a boolean, an instant or a binary any more: those are cast
-                // before the loop, and under ANSI a malformed value raises out of the cast
-                // rather than arriving here.
+                // A pair with no comparison between them -- e.g. a boolean against a number the
+                // registry did not coerce, or any mixed pair when no registry was supplied. A
+                // string against a number, boolean, instant or binary is cast before the loop.
                 result[i] = null;
             }
         }
@@ -297,12 +288,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>This is the site that makes a refusal independent of the data</b>, and the reason
-    /// <see cref="CheckComparable"/> below it is a fallback rather than the rule. An analysis
-    /// refusal is a property of two types: it cannot become an acceptance over different rows,
-    /// and it must not be displaced by an operand that happens to raise first. Reading both types
-    /// before either operand runs is what delivers that, and it is the ordering Spark itself has —
-    /// the analyzer refuses before the plan executes at all.
+    /// This is what makes a refusal independent of the data; <see cref="CheckComparable"/> is
+    /// only a fallback. An analysis refusal is a property of two types, so it must not be
+    /// displaced by an operand that happens to raise first. Reading both types before either
+    /// operand runs matches Spark, whose analyzer refuses before the plan executes.
     /// </para>
     /// <para>
     /// False when the types could not both be read, which leaves the question to the fallback. A
@@ -330,22 +319,18 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// ONE question over the whole list, not one per member. <c>IN</c> resolves a single type over
+    /// One question over the whole list, not one per member. <c>IN</c> resolves a single type over
     /// the operand and every member, so a list can be refused although each pair in it would be
-    /// accepted — measured, <c>a = bl</c> answers under the legacy dialect and <c>a IN (bl)</c>
-    /// is refused under both. See <see cref="IAnalysisRules.CheckSetComparison"/>.
+    /// accepted: <c>a = bl</c> answers under the legacy dialect and <c>a IN (bl)</c> is refused
+    /// under both. See <see cref="IAnalysisRules.CheckSetComparison"/>.
     /// </para>
     /// <para>
     /// All or nothing: a member that cannot be typed from the tree leaves the whole list to the
     /// fallback, because a list asked about with one of its members missing is a different list.
-    /// A bare <c>NULL</c> is not missing, though — it is left OUT, since Spark types one
-    /// <c>void</c> and a void constrains the resolution no more than it constrains a comparison.
-    /// </para>
-    /// <para>
-    /// <b>That applies to the OPERAND as well as to a member</b>, and reading it as "cannot be
-    /// typed, so give up" was a hole: measured on 4.0.3, <c>NULL IN (1, TRUE)</c> is refused in
-    /// both dialects — the void operand does not excuse the members from agreeing with each other
-    /// — while giving up left it unasked and answering. Caught by the Copilot reviewer on #346.
+    /// A bare <c>NULL</c> is not missing, though — it is left out, since Spark types one
+    /// <c>void</c> and a void constrains nothing. That applies to the operand too:
+    /// <c>NULL IN (1, TRUE)</c> is refused in both dialects, because the members must still agree
+    /// with each other.
     /// </para>
     /// </remarks>
     private bool CheckSetFromTree(SetPredicate set, RecordBatch batch)
@@ -382,33 +367,30 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>Whether an expression is a bare <c>NULL</c> literal, structurally.</summary>
     /// <remarks>
-    /// Read from the TREE rather than from a column that came back all null, which is the
-    /// discipline <see cref="IConditionalArguments.IsNullLiteral"/> records: a string column
-    /// holding nothing in this batch is not a void, and treating it as one retypes the answer.
+    /// Read from the tree rather than from a column that came back all null (as in
+    /// <see cref="IConditionalArguments.IsNullLiteral"/>): a string column holding nothing in this
+    /// batch is not a void, and treating it as one retypes the answer.
     /// </remarks>
     private static bool IsNullLiteral(Expression expression) =>
         expression is LiteralExpression literal && literal.Value.IsNull;
 
     /// <summary>
-    /// The type an expression produces, read WITHOUT reading any of its values, or null when that
+    /// The type an expression produces, read without reading any of its values, or null when that
     /// cannot be done.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Three tiers, cheapest first. A reference takes its type from the batch's SCHEMA, which is
-    /// where a column's type lives whether or not the batch has rows. A literal takes its own,
-    /// which lives in the TREE — reading it from a value instead leaves an expression made only of
-    /// literals unanalysed exactly when there is no data, which is the case a definition-time pass
-    /// consists of. Anything else is evaluated over NO ROWS, the device <see cref="TypeOver"/>
-    /// already uses: over an empty selection a cast reads no value, so it produces its type
-    /// without being able to raise on one.
+    /// Three tiers, cheapest first. A reference takes its type from the batch's schema, which
+    /// holds whether or not the batch has rows. A literal takes its own type from the tree, so an
+    /// expression made only of literals is still analysed when there is no data (as in a
+    /// definition-time pass). Anything else is evaluated over no rows, as
+    /// <see cref="TypeOver"/> does: over an empty selection a cast reads no value, so it produces
+    /// its type without being able to raise on one.
     /// </para>
     /// <para>
-    /// <b>The probe does not retry over the batch</b>, which is the difference from
-    /// <see cref="TypeOver"/>. This asks a question it is allowed not to answer: a registry that
-    /// cannot type something over an empty selection leaves the comparison to the fallback, which
-    /// is where it would have been without the probe at all. Retrying over rows to answer it
-    /// would read the values this exists not to read.
+    /// Unlike <see cref="TypeOver"/>, this does not retry over the batch: a registry that cannot
+    /// type something over an empty selection leaves the comparison to the fallback, and retrying
+    /// over rows would read the values this exists not to read.
     /// </para>
     /// <para>
     /// A bare <c>NULL</c> literal answers null rather than a type, because Spark types one
@@ -439,16 +421,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         }
         catch (ExpressionAnalysisException)
         {
-            // A refusal from further down the tree is an ANSWER, not a failure to produce one.
-            // Swallowing it here would hide a refused sub-expression behind the fallback, and the
-            // values it refuses would be read after all.
+            // A refusal from further down the tree is an answer, not a failure to produce one.
+            // Swallowing it would hide a refused sub-expression behind the fallback.
             throw;
         }
         catch (Exception)
         {
             // Deliberately broad, as in TypeOver: the ways of failing to produce a type over no
-            // rows are the registry's business. Unlike TypeOver this does not retry — see the
-            // remarks.
+            // rows are the registry's business.
             return null;
         }
     }
@@ -461,21 +441,15 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <para>
     /// The fallback behind <see cref="CheckComparableFromTree"/>, reached only where that could
     /// not read a type without evaluating — a registry whose function cannot be typed over an
-    /// empty selection. It is kept because a question asked late is better than one not asked,
-    /// and it carries the weakness of being asked late: an operand that raises during evaluation
-    /// reports its own failure and this is never reached.
+    /// empty selection. Being asked late, it is never reached when an operand raises during
+    /// evaluation. A no-op without a registry that implements <see cref="IAnalysisRules"/>.
     /// </para>
     /// <para>
-    /// Nothing at all without a registry that implements <see cref="IAnalysisRules"/>, which is
-    /// every caller that supplies no registry.
-    /// </para>
-    /// <para>
-    /// <b>An operand whose type cannot be read is not asked about</b>, rather than being given
-    /// <see cref="OperandType"/>'s string fallback. That fallback is right where it is — a string
-    /// is the type with no coercion rule, so an unresolvable operand is left as it stands — and
-    /// would be wrong here: it presents a bare <c>NULL</c> as a string, and <c>bin = NULL</c>
-    /// would be refused as a binary against a string where Spark types the NULL <c>void</c> and
-    /// compares it with anything.
+    /// An operand whose type cannot be read is not asked about, rather than being given
+    /// <see cref="OperandType"/>'s string fallback. That fallback suits coercion, where a string
+    /// has no rule and is left as it stands, but here it would present a bare <c>NULL</c> as a
+    /// string, and <c>bin = NULL</c> would be refused as a binary against a string where Spark
+    /// types the NULL <c>void</c> and compares it with anything.
     /// </para>
     /// </remarks>
     private void CheckComparable(
@@ -511,7 +485,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             return;
 
         // An operand with no readable type is the value-side spelling of a bare NULL, and is left
-        // OUT rather than abandoning the check -- see CheckSetFromTree for the measurement.
+        // out rather than abandoning the check -- see CheckSetFromTree.
         var types = new List<IArrowType>(members.Length + 1);
         if (ReadType(operandType, operand) is { } type)
             types.Add(type);
@@ -536,13 +510,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// The type an operand carries, or null when it carries none — every row null, and no type
-    /// declared to say what they are null OF.
+    /// The type an operand carries, or null when every row is null and no type is declared.
     /// </summary>
     /// <remarks>
-    /// Deliberately not <see cref="OperandType"/>, which answers the same question for the
-    /// coercion path and substitutes a string where this one declines to answer. See
-    /// <see cref="CheckComparable"/> for why the substitution cannot be shared.
+    /// Not <see cref="OperandType"/>, which substitutes a string where this declines to answer;
+    /// see <see cref="CheckComparable"/> for why.
     /// </remarks>
     private static IArrowType? ReadType(IArrowType? declared, LiteralValue?[] values)
     {
@@ -570,16 +542,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <c>IN</c> is not the disjunction of equalities it resembles. Spark resolves ONE type over
-    /// the operand and the whole list, so <c>a IN ('01')</c> is FALSE under the legacy dialect —
+    /// <c>IN</c> is not the disjunction of equalities it resembles. Spark resolves one type over
+    /// the operand and the whole list, so <c>a IN ('01')</c> is false under the legacy dialect —
     /// the list resolves to text, and <c>'1'</c> is not <c>'01'</c> — while <c>a = '01'</c> is
     /// true. Which type is the registry's answer; see <see cref="IComparisonCoercion"/>.
-    /// </para>
-    /// <para>
-    /// Without this the set compared through <see cref="LiteralValue.CompareTo(LiteralValue)"/>,
-    /// which has no cross-kind branch for a string, so every mixed set answered false — not only
-    /// where Spark refuses, but <c>ns IN (1, 2)</c> over the string <c>'1'</c>, which Spark
-    /// answers TRUE in both dialects. #259.
     /// </para>
     /// <para>
     /// The kinds are checked before any type is resolved, because resolving one allocates and
@@ -607,8 +573,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         // A string mixed with anything else takes the promotion rule; a set with no string at
         // all takes it only when a decimal is present, because that is the one case where the
-        // type the set resolves through can round a member away. #280. Everything else is one
-        // kind throughout, or exact, and is compared as it stands.
+        // type the set resolves through can round a member away. Everything else is one kind
+        // throughout, or exact, and is compared as it stands.
         if (anyString ? !anyOther : !anyDecimal)
             return;
 
@@ -618,14 +584,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         var operandResolved = OperandType(operandType, operand);
         var resolved = new IArrowType[members.Length];
 
-        // A BARE NULL MEMBER CONSTRAINS NOTHING and is left out of the resolution. Spark types it
-        // `void`, and `MemberType` has to call it a string because it has no value to read a type
-        // from — which would otherwise make `d IN (wide, NULL)` look like a set with a string in
-        // it and send it down the promotion rule. Measured, Spark answers TRUE for
-        // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)` — the same rounding
-        // match it gives without the NULL — where promoting the set answered null. #280.
-        // It is not cast either: a null is null at every type, and the members that are left are
-        // what the target has to hold.
+        // A bare NULL member constrains nothing and is left out of the resolution. Spark types it
+        // `void`, but `MemberType` calls it a string for want of a value, which would make
+        // `d IN (wide, NULL)` look like a set with a string in it. Spark answers true for
+        // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)), NULL)`, the same rounding
+        // match it gives without the NULL. It is not cast either: a null is null at every type.
         var untypedNull = new bool[members.Length];
         var types = new List<IArrowType>(members.Length + 1) { operandResolved };
         for (var k = 0; k < members.Length; k++)
@@ -739,16 +702,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Spark resolves a string against a non-string by CASTING — it does not refuse, and it
-    /// does not always cast the string. Without this the comparison reached
-    /// <see cref="LiteralValue.CompareTo(LiteralValue)"/>, which has no cross-kind branch for a
-    /// string, and every such comparison answered null: not only <c>s = a</c> over a malformed
-    /// string, where Spark refuses under ANSI, but <c>'1' = a</c> over a valid one, where Spark
-    /// answers true. The wrong answer was the larger half. #180.
-    /// </para>
-    /// <para>
-    /// A string against a BINARY is the pair where the other operand moves: the binary is
-    /// rendered as text and two strings are compared. #259.
+    /// Spark resolves a string against a non-string by casting — it does not refuse, and it does
+    /// not always cast the string: against a binary, the binary is rendered as text and two
+    /// strings are compared. <see cref="LiteralValue.CompareTo(LiteralValue)"/> has no cross-kind
+    /// branch for a string, so without this such a comparison answers null.
     /// </para>
     /// <para>
     /// The target is dialect-dependent, so the registry chooses it — see
@@ -756,13 +713,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// the comparison is left as it was.
     /// </para>
     /// <para>
-    /// <b>A row whose other operand is null is not cast, and <c>&lt;=&gt;</c> is the exception.</b>
-    /// Spark's relational operators evaluate nothing once an operand is null, so a malformed
-    /// string sitting opposite a null is never read and never refused; null-safe equality has no
-    /// such short-circuit and does refuse. Measured over a row of <c>(a = NULL, s = 'abc')</c>:
-    /// <c>s = a</c> is null under ANSI, in both operand orders, while <c>s &lt;=&gt; a</c> raises
-    /// CAST_INVALID_INPUT. Without the mask a batch mixing one such row with an ordinary one
-    /// would refuse a write Spark accepts.
+    /// A row whose other operand is null is not cast, except under <c>&lt;=&gt;</c>. Spark's
+    /// relational operators evaluate nothing once an operand is null, so a malformed string
+    /// opposite a null is never read and never refused; null-safe equality has no such
+    /// short-circuit. Over a row of <c>(a = NULL, s = 'abc')</c>, <c>s = a</c> is null under
+    /// ANSI in both operand orders, while <c>s &lt;=&gt; a</c> raises CAST_INVALID_INPUT.
     /// </para>
     /// </remarks>
     private void CoerceOperands(
@@ -783,12 +738,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         if (!leftIsString && !rightIsString)
         {
-            // A BOOLEAN against something that is not one is the second pair where a single
-            // operand moves, and the registry decides whether it does: under the legacy dialect
-            // Spark casts the boolean to the numeric opposite it and compares them as numbers,
-            // and under ANSI it refuses the comparison outright. #333. The cheap kind test comes
-            // first for the same reason the string one does — an operand's type is not resolved
-            // until the path that needs it is the path being taken.
+            // A boolean against a non-boolean is the other pair where a single operand moves, and
+            // the registry decides whether it does: under the legacy dialect Spark casts the
+            // boolean to the numeric opposite it, and under ANSI it refuses the comparison. The
+            // cheap kind test comes first, as for strings.
             bool leftIsBoolean = IsBoolean(leftType, left);
             if (leftIsBoolean != IsBoolean(rightType, right)
                 && CoerceOneSide(cmp, leftIsBoolean, leftType, rightType, ref left, ref right))
@@ -808,15 +761,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Which operand moves is the registry's answer, not an assumption here: a string against a
-    /// number is cast to the number, while a string against a binary stays and the BINARY is
-    /// rendered as text. At most one side moves, so the second question is only asked when the
-    /// first declines.
+    /// Which operand moves is the registry's answer: a string against a number is cast to the
+    /// number, while a string against a binary stays and the binary is rendered as text. At most
+    /// one side moves, so the second question is only asked when the first declines.
     /// </para>
     /// <para>
-    /// <paramref name="leftIsCandidate"/> says which side to offer FIRST, not which one moves.
-    /// It is the operand whose kind selected this path — the string, or the boolean of #333 —
-    /// and asking about it first is what lets a registry answer the common case in one call.
+    /// <paramref name="leftIsCandidate"/> says which side to offer first, not which one moves:
+    /// the operand whose kind selected this path (the string or the boolean), so a registry can
+    /// answer the common case in one call.
     /// </para>
     /// </remarks>
     private bool CoerceOneSide(
@@ -858,23 +810,22 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// Rounds two exact numeric operands to the type they compare through, where that type gives
-    /// up scale.
+    /// Rounds two numeric operands to the type they compare through, where that type can round a
+    /// value away.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #280, and the one comparison rule where BOTH operands can move — which is why it does not
-    /// reuse the "at most one side moves" shape above. Spark compares a decimal against a
-    /// decimal by casting each to their least common type, and that type gives up scale once the
-    /// natural precision passes 38, so the comparison is made on rounded values. Measured,
-    /// <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c> is TRUE.
+    /// The one comparison rule where both operands can move, so it does not reuse
+    /// <see cref="CoerceOneSide"/>. Spark compares a decimal against a decimal by casting each to
+    /// their least common type, and that type gives up scale once the natural precision passes
+    /// 38, so the comparison is made on rounded values:
+    /// <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c> is true. A float can round
+    /// an integral too; see <see cref="MightRound"/>.
     /// </para>
     /// <para>
-    /// The registry answers null for both operands in every ordinary case — the common type
-    /// keeps their scales, and rounding to it would change no answer — so a comparison between a
-    /// column and a literal of its own type resolves two types and casts nothing. The types
-    /// still have to be resolved to ask, which is the cost this path adds and the reason the
-    /// string tests above it are kind tests rather than type tests.
+    /// In every ordinary case the registry answers null for both operands — the common type keeps
+    /// their scales — so nothing is cast. The types still have to be resolved to ask, which is
+    /// why the tests that choose a path are kind tests rather than type tests.
     /// </para>
     /// </remarks>
     private void CoerceExactNumerics(
@@ -882,8 +833,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         IArrowType? leftType, IArrowType? rightType,
         ref LiteralValue?[] left, ref LiteralValue?[] right)
     {
-        // A bare NULL literal types as string here and is excluded by the caller; anything else
-        // untyped in every row cannot round differently either, since it has no value to round.
+        // An operand untyped and null in every row (a bare NULL literal) has no value to round.
         // A decimal on one side is what the minimum-precision rule below needs too, so nothing
         // it applies to is skipped here.
         if (!MightRound(leftType, left) && !MightRound(rightType, right))
@@ -892,15 +842,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         var resolvedLeft = OperandType(leftType, left);
         var resolvedRight = OperandType(rightType, right);
 
-        // #281. An integral LITERAL against a decimal is read as the narrowest decimal holding
-        // its value, not as the one holding its type, and only the resolved TYPE moves: the
-        // literal's own values never round -- a scale-0 operand cannot -- so the common type
-        // this changes is what the other operand rounds to. Measured, that is the difference
-        // between `CAST(4E-32 AS DECIMAL(38,38)) = 0`, which compares at decimal(38,37) and is
-        // FALSE, and `= CAST(0 AS INT)`, which compares at decimal(38,28) and is TRUE. See
-        // PickMinimumPrecision for where the same rule reaches arithmetic, and for the calls
-        // that deliberately do not take it -- an IN list among them, measured one expression
-        // away: `CAST(4E-32 AS DECIMAL(38,38)) IN (0)` is TRUE.
+        // An integral literal against a decimal is read as the narrowest decimal holding its
+        // value, not its type. Only the resolved type moves -- a scale-0 operand never rounds --
+        // so what changes is the common type the other operand rounds to:
+        // `CAST(4E-32 AS DECIMAL(38,38)) = 0` compares at decimal(38,37) and is false, while
+        // `= CAST(0 AS INT)` compares at decimal(38,28) and is true. See PickMinimumPrecision for
+        // the same rule in arithmetic and for the calls that do not take it -- an IN list among
+        // them: `CAST(4E-32 AS DECIMAL(38,38)) IN (0)` is true.
         var minimumLeft = MinimumPrecision(cmp.Left, resolvedRight);
         var minimumRight = MinimumPrecision(cmp.Right, resolvedLeft);
         resolvedLeft = minimumLeft ?? resolvedLeft;
@@ -911,14 +859,12 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         if (leftTarget is null && rightTarget is null)
             return;
 
-        // The null mask the string path applies is deliberately absent, because this cast cannot
-        // fail and so has no refusal for a null on the other side to suppress. The common type
-        // leaves max(p1 - s1, p2 - s2) integer digits, and an operand that ROUNDS always has
-        // strictly fewer than that: rounding needs its scale to be the wider one, and if its
-        // integer digits were also the widest, the natural precision would come to its own
-        // precision and never pass 38 -- so nothing would be clamped and nothing would round.
-        // The spare digit is what absorbs a carry, which is the case that would otherwise
-        // overflow: decimal(38,2) at 36 nines rounds to 10^36 against a decimal(38,0).
+        // No null mask as on the string path: this cast cannot fail, so there is no refusal for
+        // a null on the other side to suppress. The common type leaves max(p1 - s1, p2 - s2)
+        // integer digits, and an operand that rounds always has strictly fewer: rounding needs
+        // its scale to be the wider one, and if its integer digits were also the widest the
+        // natural precision would be its own and never pass 38. That spare digit absorbs a
+        // carry: decimal(38,2) at 36 nines rounds to 10^36 against a decimal(38,0).
         int rowCount = left.Length;
         if (leftTarget is not null)
             left = Rounded(left, resolvedLeft, leftTarget, rowCount);
@@ -930,7 +876,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// The decimal an integral literal compares as, or null when the rule does not apply.
     /// </summary>
     /// <remarks>
-    /// Guarded on the OTHER operand being a decimal, which is Spark's own guard: the cast is
+    /// Guarded on the other operand being a decimal, which is Spark's own guard: the cast is
     /// inserted only where the literal meets one, so <c>a = 2</c> stays an integral comparison.
     /// Asked of each side in turn — <c>1.5BD = 2</c> and <c>2 = 1.5BD</c> both resolve through
     /// decimal(2,1) — and at most one side can answer, since the other must already be a decimal.
@@ -946,16 +892,15 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <summary>Whether an operand could make a comparison's common type round a value away.</summary>
     /// <remarks>
     /// <para>
-    /// A decimal can, because the common type gives up scale (#280). So can a FLOAT: the legacy
-    /// dialect compares an integral with one as a float, rounding the integral onto it, where
-    /// ANSI compares both as doubles (#299). Which of those applies is the registry's decision
-    /// -- this only decides whether to ask, and a registry with no rule for the pair answers no
-    /// target and nothing is cast.
+    /// A decimal can, because the common type gives up scale. So can a float: the legacy dialect
+    /// compares an integral with one as a float, rounding the integral onto it, where ANSI
+    /// compares both as doubles. Which applies is the registry's decision; this only decides
+    /// whether to ask.
     /// </para>
     /// <para>
     /// Asked before any type is resolved, from the declared type when there is one and from the
-    /// first populated value otherwise, so an integer-and-string-free comparison of two
-    /// <c>int</c> columns costs two field reads.
+    /// first populated value otherwise, so a comparison of two <c>int</c> columns costs two field
+    /// reads.
     /// </para>
     /// </remarks>
     private static bool MightRound(IArrowType? declared, LiteralValue?[] values) =>
@@ -975,18 +920,18 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// Evaluates a comparison operand, keeping the Arrow type when the operand declares one.
     /// </summary>
     /// <remarks>
-    /// The same calls <see cref="EvalExpression"/> makes for these three cases, with the array
-    /// KEPT rather than discarded — no operand is evaluated twice. The type is what a
-    /// <see cref="LiteralValue"/> array cannot carry and what the coercion turns on: a decimal's
-    /// precision and scale, a date against a timestamp, and the type of an operand whose every
-    /// row is null. All three are reachable through a cast, whose result carries exactly the type
-    /// the cast was asked for — measured, <c>'2026-08-11 12:30:00' = CAST(ts AS DATE)</c> is true
-    /// in Spark, and reading that operand as the instant its values look like would compare the
-    /// string against midnight instead of truncating it.
     /// <para>
-    /// A literal is deliberately not routed through an array. It is typed from its own value,
-    /// which is what Spark does with one, and materialising a constant array per comparison would
-    /// put an allocation on the hot path for the sake of a type already known.
+    /// The same calls <see cref="EvalExpression"/> makes for these three cases, with the array
+    /// kept rather than discarded. The type is what a <see cref="LiteralValue"/> array cannot
+    /// carry and what the coercion turns on: a decimal's precision and scale, a date against a
+    /// timestamp, and the type of an operand whose every row is null. A cast's result carries
+    /// exactly the type asked for: <c>'2026-08-11 12:30:00' = CAST(ts AS DATE)</c> is true in
+    /// Spark, and reading that operand as an instant would compare the string against midnight
+    /// instead of truncating it.
+    /// </para>
+    /// <para>
+    /// A literal is not routed through an array. It is typed from its own value, as Spark does,
+    /// and materialising a constant array per comparison would allocate on the hot path.
     /// </para>
     /// </remarks>
     private (LiteralValue?[] Values, IArrowType? Type) EvalOperand(
@@ -1006,11 +951,10 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>Whether an operand is a string: from its declared type, or from its values.</summary>
     /// <remarks>
-    /// The declared type answers even for an all-null operand, where the values cannot, and that
-    /// matters in both directions. An all-null string casts to null under every target and so
-    /// cannot change an answer; an all-null operand on the OTHER side still types the cast, and
-    /// <c>&lt;=&gt;</c> reads it — measured, <c>s &lt;=&gt; CAST(NULL AS INT)</c> raises under
-    /// ANSI rather than answering false.
+    /// The declared type answers even for an all-null operand, where the values cannot. An
+    /// all-null string casts to null under every target and so cannot change an answer, but an
+    /// all-null operand on the other side still types the cast, and <c>&lt;=&gt;</c> reads it:
+    /// <c>s &lt;=&gt; CAST(NULL AS INT)</c> raises under ANSI rather than answering false.
     /// </remarks>
     private static bool IsString(IArrowType? declared, LiteralValue?[] values) =>
         declared is not null
@@ -1019,10 +963,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>Whether an operand is a boolean, without resolving its type.</summary>
     /// <remarks>
-    /// The <see cref="IsString"/> shape, for the same reason: it decides which coercion path a
-    /// comparison takes, and resolving a type to find out costs an allocation on the path that
-    /// turns out not to need one. An operand null in every row with no declared type answers
-    /// false and takes neither path.
+    /// The <see cref="IsString"/> shape, for the same reason: it picks the coercion path without
+    /// the allocation of resolving a type. An operand null in every row with no declared type
+    /// answers false.
     /// </remarks>
     private static bool IsBoolean(IArrowType? declared, LiteralValue?[] values) =>
         declared is not null
@@ -1091,24 +1034,21 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private bool?[] EvalUnary(UnaryPredicate unary, RecordBatch batch)
     {
-        // AN OPERAND THAT CAN NEVER BE NULL IS NOT EVALUATED, so an error inside it never happens.
-        // Spark discards it at analysis -- `NullPropagation` rewrites the whole predicate to a
-        // constant -- and measured on 4.0.3 under ANSI that is the difference between
-        // `CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL`, which answers false, and
-        // the same CASE on its own, which raises CAST_INVALID_INPUT. #319.
+        // An operand that can never be null is not evaluated, so an error inside it never
+        // happens. Spark's `NullPropagation` rewrites the whole predicate to a constant, so under
+        // ANSI `CASE WHEN (CAST('abc' AS INT) > 1) THEN 1 ELSE 2 END IS NULL` answers false while
+        // the same CASE on its own raises CAST_INVALID_INPUT.
         //
-        // Not the per-row laziness of #279/#306: this fires before a row is read, and it fires on
-        // an operand every row of which WOULD be evaluated. The two are independent, and the
-        // conditional family needs both -- laziness already answers
-        // `coalesce(1, CAST('abc' AS INT)) IS NULL` by reaching the second argument over no rows,
-        // while nothing about laziness reaches `(2147483647 + 1) IS NULL`.
+        // This is independent of per-row short-circuiting: it fires before a row is read, on an
+        // operand every row of which would be evaluated. Short-circuiting answers
+        // `coalesce(1, CAST('abc' AS INT)) IS NULL`, but only this reaches
+        // `(2147483647 + 1) IS NULL`.
         if ((unary.Op is UnaryOperator.IsNull or UnaryOperator.IsNotNull)
             && NeverNull(unary.Operand))
         {
-            // Typed and discarded, exactly as an unreached branch is. Spark ANALYSES the operand
-            // before the optimizer ever folds it, so `if(a > 0, a, bin) IS NOT NULL` is still
-            // refused for having no common type; over no rows this reads no value and so cannot
-            // raise on one.
+            // Typed and discarded, as an unreached branch is. Spark analyses the operand before
+            // the optimizer folds it, so `if(a > 0, a, bin) IS NOT NULL` is still refused for
+            // having no common type; over no rows this cannot raise on a value.
             TypeOver(unary.Operand, batch);
             return Constant(unary.Op == UnaryOperator.IsNotNull, batch.Length);
         }
@@ -1138,31 +1078,27 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <para>
     /// Spark's <c>Expression.nullable</c>, for the subset that can be answered without types.
     /// Only <see cref="EvalUnary"/> asks, and only so that it can skip an operand Spark skips;
-    /// the judgement is never allowed to change a VALUE.
+    /// the judgement never changes a value.
     /// </para>
     /// <para>
-    /// <b>A COLUMN REFERENCE IS ALWAYS NULLABLE HERE, even one whose field says otherwise.</b>
-    /// Spark reads nullability from the TABLE's schema, and the only schema this can see is the
-    /// batch the caller happened to build — <c>DeltaConstraintEnforcer</c> is handed the caller's
-    /// rows, not the snapshot's. A batch declaring a field non-nullable that the table declares
+    /// A column reference is always nullable here, even one whose field says otherwise. Spark
+    /// reads nullability from the table's schema, but the only schema visible here is the batch
+    /// the caller built — <c>DeltaConstraintEnforcer</c> is handed the caller's rows, not the
+    /// snapshot's. Trusting a batch that declares non-nullable a field the table declares
     /// nullable would make <c>x IS NOT NULL</c> a constant <c>true</c> and admit a row Spark
-    /// rejects, which is the one direction a constraint validator must not fail in. Refusing to
-    /// read the flag at all removes that direction rather than guarding it, and what it costs is
-    /// only that <c>(a + b) IS NOT NULL</c> over two NOT NULL columns keeps raising where Spark
-    /// answers — the divergence #319 already had, in the safe direction.
+    /// rejects. The cost is only that <c>(a + b) IS NOT NULL</c> over two NOT NULL columns can
+    /// raise where Spark answers — the safe direction.
     /// </para>
     /// <para>
-    /// <b>Everything unrecognised is nullable.</b> Under-claiming costs a fold; over-claiming
-    /// yields a wrong answer. So this is an allow-list of shapes measured against Spark 4.0.3,
-    /// and a shape not on it — <c>IS NAN</c>, a cast, <c>nullif</c>, <c>round</c>, a division,
-    /// <c>IN</c>, and every comparison but <c>&lt;=&gt;</c> — answers false whether or not it
-    /// could be null.
+    /// Everything unrecognised is nullable: under-claiming costs a fold, over-claiming yields a
+    /// wrong answer. So this is an allow-list of shapes measured against Spark, and a shape not
+    /// on it — <c>IS NAN</c>, a cast, <c>nullif</c>, <c>round</c>, a division, <c>IN</c>, and
+    /// every comparison but <c>&lt;=&gt;</c> — answers false.
     /// </para>
     /// <para>
-    /// <b>The rule is STRUCTURAL: it never reads a type, so any shape whose nullability depends
-    /// on one is off the list.</b> That is the boundary the arithmetic and comparison families
-    /// are outside of — both look positional and are not, because an implicit cast appears
-    /// between operands this cannot see the types of.
+    /// The rule is structural: it never reads a type, so any shape whose nullability depends on
+    /// one is off the list. That excludes the arithmetic and comparison families, where an
+    /// implicit cast can appear between operands whose types this cannot see.
     /// </para>
     /// </remarks>
     private bool NeverNull(Expression expression)
@@ -1175,10 +1111,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             case TruePredicate or FalsePredicate:
                 return true;
 
-            // Measured: `CAST(s AS INT) IS NULL` is itself non-nullable, so a doubled
-            // `IS NULL` folds where the inner one alone raises. IS NAN is deliberately absent --
-            // Spark answers false for a null operand where we answer null, and settling that
-            // difference is not this change's job.
+            // `CAST(s AS INT) IS NULL` is itself non-nullable, so a doubled `IS NULL` folds where
+            // the inner one alone raises. IS NAN is absent: Spark answers false for a null
+            // operand where this evaluator answers null.
             case UnaryPredicate unary:
                 return unary.Op is UnaryOperator.IsNull or UnaryOperator.IsNotNull;
 
@@ -1191,25 +1126,21 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             case OrPredicate or:
                 return AllNeverNull(or.Children);
 
-            // ONLY `<=>`, and the rest of the comparison family is deliberately absent for the
-            // same reason arithmetic is. A comparison that needs COERCION inserts a cast, and a
-            // cast is nullable: measured in BOTH dialects, `1 = 1` and `'a' = 'b'` are
-            // non-nullable while `'abc' = 1` and `'abc' > 1` are NULLABLE, because the string is
-            // cast to the number's type first. Two non-null literals compared in every case, so
-            // no rule phrased in terms of the operands' nullability can separate them -- this has
-            // no types, and asking `IComparisonCoercion` for one needs the Arrow types the
-            // operands have not been evaluated into yet. `IN` is worse still: `'abc' IN (1)` is
-            // nullable under ANSI and NON-nullable under legacy.
+            // Only `<=>`; the rest of the comparison family is absent for the same reason
+            // arithmetic is. A comparison that needs coercion inserts a cast, and a cast is
+            // nullable: in both dialects `1 = 1` and `'a' = 'b'` are non-nullable while
+            // `'abc' = 1` and `'abc' > 1` are nullable. No rule phrased in terms of the operands'
+            // nullability can separate them, and the operands' types are not known yet. `IN` is
+            // worse still: `'abc' IN (1)` is nullable under ANSI and non-nullable under legacy.
             //
-            // Nothing is lost by leaving them out. A comparison folds only when both operands are
-            // non-nullable, and an operand that could RAISE is a cast or an arithmetic node,
-            // which is nullable anyway -- so the shapes this gives up (`(1 = 1) IS NULL`) are
-            // exactly the ones that evaluate to the same answer without the fold.
+            // Nothing is lost by leaving them out. A comparison could fold only when both operands
+            // are non-nullable, and an operand that could raise is a cast or an arithmetic node,
+            // which is nullable anyway -- so the shapes given up (`(1 = 1) IS NULL`) evaluate to
+            // the same answer without the fold.
             //
-            // `<=>` stays because its non-nullability is STRUCTURAL: it answers for a null pair,
-            // coercion or not. Measured, `'abc' <=> 1` is non-nullable and
-            // `('abc' <=> 1) IS NULL` is false in both dialects, where the `=` spelling of the
-            // same comparison raises under ANSI.
+            // `<=>` stays because its non-nullability is structural: it answers for a null pair,
+            // coercion or not. `('abc' <=> 1) IS NULL` is false in both dialects, where the `=`
+            // spelling raises under ANSI.
             case ComparisonPredicate comparison:
                 return comparison.Op == ComparisonOperator.NullSafeEqual;
 
@@ -1248,15 +1179,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private bool?[] EvalSet(SetPredicate set, RecordBatch batch)
     {
         // Before any member is evaluated, for the reason EvalComparison gives: a member that
-        // raises must not displace the refusal of a member whose TYPE is already wrong.
+        // raises must not displace the refusal of a member whose type is already wrong.
         bool askedFromTree = CheckSetFromTree(set, batch);
 
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 
         // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
-        // of b. A LITERAL member stays a single value rather than being repeated per row --
-        // `x IN (1, 2)` is most of them, and repeating each one would cost an array the length
-        // of the batch for a value that does not vary.
+        // of b. A literal member stays a single value rather than being repeated per row (see
+        // SetMember).
         var members = new SetMember[set.Values.Count];
         var memberTypes = new IArrowType?[set.Values.Count];
         for (var k = 0; k < set.Values.Count; k++)
@@ -1348,10 +1278,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// This exists because a <see cref="LiteralValue"/> cannot carry a declared type. A
     /// <c>decimal(10,2)</c> column round-tripped through one arrives as a bare
     /// <see cref="decimal"/>, and the Arrow array rebuilt from it has lost the precision and
-    /// scale — which is exactly what Spark's promotion rules are computed from. A function
-    /// receiving two such arguments cannot know that <c>d1 + d2</c> should produce
-    /// <c>decimal(13,4)</c>. Worse, the type-inferring materializer has no decimal case at all,
-    /// so a decimal argument threw before the registry was ever consulted.
+    /// scale that Spark's promotion rules are computed from (and the type-inferring materializer
+    /// has no decimal case at all).
     ///
     /// Column references therefore pass through as the batch's own arrays, and a nested call's
     /// result travels on as whatever the registry returned. Only literals are built here, and
@@ -1375,9 +1303,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 $"No function registered for '{call.Name}'. " +
                 "Provide an IFunctionRegistry to ArrowRowEvaluator.");
 
-        // A short-circuiting function is handed its arguments UNEVALUATED, because which of them
+        // A short-circuiting function is handed its arguments unevaluated, because which of them
         // to evaluate -- and over which rows -- is part of what the function means. Everything
-        // else is evaluated first and invoked with the answers, as it always was.
+        // else is evaluated first and invoked with the answers.
         if (_shortCircuiting is not null && _shortCircuiting.ShortCircuits(call.Name))
             return _shortCircuiting.Invoke(call.Name, new CallArguments(this, call, batch), batch.Length);
 
@@ -1386,9 +1314,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
 
         // A call whose every argument is constant may mean something the same call over a column
-        // does not -- see IConstantFoldedFunctions. Asked before PickMinimumPrecision, which is a
-        // rule about the types a call's operands take and has nothing to say about one that is
-        // answered without invoking the call at all.
+        // does not -- see IConstantFoldedFunctions. Asked before PickMinimumPrecision, which has
+        // nothing to say about a call answered without being invoked.
         if (_constantFolded is not null && AllConstant(call.Arguments))
         {
             var folded = _constantFolded.InvokeOverConstants(call.Name, arguments, batch.Length);
@@ -1418,21 +1345,17 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Structural, and it has to be.</b> The question is whether the expression reads a
-    /// COLUMN, not whether the column happens to hold one value in this batch: measured on 4.0.3,
-    /// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> is refused by Spark
-    /// although every row of it is the string <c>'epoch'</c>, and a content test would have
-    /// answered 1970-01-01 for it -- and, worse, would have answered differently for the same
-    /// CHECK constraint over the next batch. It is the same reasoning that makes
-    /// <see cref="IConditionalArguments.IsNullLiteral"/> read the tree rather than the values.
+    /// Structural: the question is whether the expression reads a column, not whether the column
+    /// holds one value in this batch. Spark refuses
+    /// <c>CAST(CASE WHEN a &gt; 0 THEN 'epoch' ELSE 'epoch' END AS DATE)</c> although every row
+    /// of it is <c>'epoch'</c>; a content test would answer 1970-01-01, and could answer
+    /// differently for the same CHECK constraint over the next batch.
     /// </para>
     /// <para>
-    /// <b>A reference is the only thing this refuses</b>, because every function a registry may
-    /// hold here is deterministic: Spark's <c>foldable</c> also excludes <c>rand()</c>,
+    /// A reference is the only thing this rejects, because every function a registry may hold
+    /// here is deterministic: Spark's <c>foldable</c> also excludes <c>rand()</c>,
     /// <c>current_date()</c> and the rest of its non-deterministic family, and none of them is
-    /// registered. A registry that adds one must state it here rather than leave this to infer
-    /// it, exactly as <see cref="INullabilityRules"/> requires of a function that can never be
-    /// null.
+    /// registered. A registry that adds one must be accounted for here.
     /// </para>
     /// </remarks>
     private static bool IsConstant(Expression expression)
@@ -1479,41 +1402,33 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #281, and the whole of it: the rule is a CAST on one operand, so reproducing it as one
-    /// leaves every type and value rule downstream untouched.
-    /// <c>SparkNumericTypes.ArithmeticResult</c> then answers Spark's
-    /// <c>decimal(7,6)</c> for <c>1.5BD / 2</c> from the rules it already had, rather than
-    /// growing a literal case of its own. Spark's analyzed plan for <c>d1 + 2</c> is literally
-    /// <c>(d1 + cast(2 as decimal(1,0)))</c>.
+    /// The rule is a cast on one operand — Spark's analyzed plan for <c>d1 + 2</c> is
+    /// <c>(d1 + cast(2 as decimal(1,0)))</c> — so reproducing it as one leaves every type and
+    /// value rule downstream untouched: <c>SparkNumericTypes.ArithmeticResult</c> answers
+    /// <c>decimal(7,6)</c> for <c>1.5BD / 2</c> without a literal case of its own.
     /// </para>
     /// <para>
-    /// <b>Which calls take it is measured, and it is fewer than the name suggests.</b>
-    /// Arithmetic does. <c>nullif</c> takes it on its SECOND argument ONLY — asymmetric, and
-    /// measured from the optimized plans rather than guessed:
-    /// <c>nullif(d5, 0)</c> becomes <c>if (cast(d5 as decimal(38,37)) = cast(cast(0 as
-    /// decimal(1,0)) as decimal(38,37))) null else d5</c>, while <c>nullif(0, d5)</c> becomes
-    /// <c>if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0</c>, where the
-    /// literal took the pair's common type instead. So the two answer DIFFERENTLY over the same
-    /// values: against <c>CAST(4E-32 AS DECIMAL(38,38))</c>, the first keeps the value and the
-    /// second is NULL.
+    /// Fewer calls take it than the name suggests. Arithmetic does. <c>nullif</c> takes it on its
+    /// second argument only, per the optimized plans: <c>nullif(d5, 0)</c> becomes
+    /// <c>if (cast(d5 as decimal(38,37)) = cast(cast(0 as decimal(1,0)) as decimal(38,37))) null
+    /// else d5</c>, while <c>nullif(0, d5)</c> becomes
+    /// <c>if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0</c>. So against
+    /// <c>CAST(4E-32 AS DECIMAL(38,38))</c> the first keeps the value and the second is NULL.
     /// </para>
     /// <para>
     /// <c>greatest</c>, <c>least</c>, <c>coalesce</c>, <c>if</c>, <c>CASE</c> and <c>round</c>
-    /// do NOT take it — they are not binary operators, and <c>round</c>'s second argument is an
-    /// integer it needs as one. The comparison operators do, and reach it through
-    /// <see cref="CoerceExactNumerics"/> rather than here, since a comparison resolves its
-    /// operands' types rather than evaluating a function over them.
+    /// do not take it — they are not binary operators, and <c>round</c>'s second argument must
+    /// stay an integer. The comparison operators do, through <see cref="CoerceExactNumerics"/>.
     /// </para>
     /// </remarks>
     private void PickMinimumPrecision(FunctionCall call, IArrowArray[] arguments)
     {
-        // Two arguments, because the rule is Spark's for a BINARY operator. A registry with no
-        // rule leaves every literal as it was.
+        // Two arguments, because the rule is Spark's for a binary operator.
         if (_literalPrecision is null || arguments.Length != 2)
             return;
 
         // The two positions are independent even though the second reads an argument the first
-        // may have rebuilt: an argument is only rebuilt when the OTHER one is a decimal, and an
+        // may have rebuilt: an argument is only rebuilt when the other one is a decimal, and an
         // integral literal is not one, so no call can narrow both.
         for (var i = 0; i < 2; i++)
         {
@@ -1524,23 +1439,19 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     call.Name, i, value, arguments[1 - i].Data.DataType) is not Decimal128Type target)
                 continue;
 
-            // Built from the VALUE rather than by reading the array back: the array the literal
-            // already materialised into holds the same constant in every row, so converting it to
-            // `LiteralValue?[]` and re-materialising would put an O(batch) scan and a temporary
-            // array of the batch's length on every arithmetic call carrying a literal. The
-            // replacement is at the array's own length, not the batch's, because a literal
-            // evaluated over no rows carries the extra row ConstantArray adds so that a type
-            // survives an empty selection.
+            // Built from the value rather than by reading the array back, which would cost an
+            // O(batch) scan and a temporary array. The replacement is at the array's own length,
+            // not the batch's, because a literal evaluated over no rows carries the extra row
+            // ConstantArray adds so that a type survives an empty selection.
             arguments[i] = ConstantDecimalArray(value, target, arguments[i].Length);
         }
     }
 
     /// <summary>A decimal column holding one integral value in every row.</summary>
     /// <remarks>
-    /// The general <see cref="BuildDecimalArray"/> reaches <see cref="BigInteger"/> per row to
-    /// rescale a value that may differ each time. Neither applies here: the value is constant and
-    /// its scale is zero, so the unscaled value IS the value, and the sixteen bytes it occupies
-    /// are laid out once and copied. Nothing is allocated per row.
+    /// Unlike the general <see cref="BuildDecimalArray"/>, which goes through
+    /// <see cref="BigInteger"/> per row, the value here is constant with scale zero, so its
+    /// sixteen bytes are laid out once and copied. Nothing is allocated per row.
     /// </remarks>
     private static IArrowArray ConstantDecimalArray(long value, Decimal128Type type, int length)
     {
@@ -1548,9 +1459,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         var bytes = new byte[length * ByteWidth];
 
-        // Zero rows is a real case, not a degenerate one: it is how a branch nothing selected
-        // gets its TYPE, so the answer is an empty column of the target type and there is no
-        // first row to lay out.
+        // Zero rows is a real case: it is how a branch nothing selected gets its type.
         if (length > 0)
         {
             var first = bytes.AsSpan(0, ByteWidth);
@@ -1575,17 +1484,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     }
 
     /// <summary>
-    /// The value of the integral literal an operand IS, for Spark's minimum-precision rule, or
+    /// The value of the integral literal an operand is, for Spark's minimum-precision rule, or
     /// null when it is anything else.
     /// </summary>
     /// <remarks>
-    /// <b>A negated literal is one only when the PARSER folded it.</b> Spark's grammar makes
-    /// <c>-2</c> a single literal and <c>SparkSqlParser</c> now does the same (#303),
-    /// so a <c>negative</c> call here is a real operator and is not unwrapped: <c>- -2</c> is a
-    /// UnaryMinus over a literal in Spark and takes no cast. Measured: <c>d1 + -2</c> is
-    /// decimal(11,2), the same as <c>d1 + 2</c> -- the rule reads a PRECISION, which a sign never
-    /// changes, and <see cref="long.MinValue"/> is a bigint literal Spark's rule reads as
-    /// decimal(19,0).
+    /// A negated literal is one only when the parser folded it. Spark's grammar makes <c>-2</c> a
+    /// single literal and <c>SparkSqlParser</c> does the same, so a <c>negative</c> call here is a
+    /// real operator and is not unwrapped: <c>- -2</c> is a UnaryMinus over a literal in Spark and
+    /// takes no cast. <c>d1 + -2</c> is decimal(11,2), the same as <c>d1 + 2</c>, since the rule
+    /// reads a precision, and <see cref="long.MinValue"/> is a bigint literal Spark's rule reads
+    /// as decimal(19,0).
     /// </remarks>
     private static long? IntegralLiteral(Expression expression)
     {
@@ -1611,40 +1519,36 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The three cases are deliberately distinct rather than one general path, because two of them
-    /// are the common ones and cost nothing. A selection covering every row -- a first operand, or
-    /// a batch that takes the same branch throughout -- is evaluated against the batch itself with
-    /// nothing copied. An empty one evaluates over no rows at all, which reads no value and so
-    /// cannot raise, and exists to answer what type the expression WOULD have produced: Spark
-    /// types a conditional from every branch, including one nothing selected, and refuses one
-    /// whose branches share no type however few rows reach it.
+    /// Three cases rather than one general path, because two of them are common and cost
+    /// nothing. A selection covering every row is evaluated against the batch itself with nothing
+    /// copied. An empty one evaluates over no rows, which reads no value and so cannot raise, to
+    /// answer what type the expression would have produced: Spark types a conditional from every
+    /// branch, including one nothing selected, and refuses one whose branches share no type.
     /// </para>
     /// <para>
-    /// Only a genuinely mixed batch gathers. The columns are gathered, not the answers: the
-    /// expression is then evaluated over a short batch exactly as it would be over a whole one,
-    /// so nothing has to know it is running over a selection -- which is what makes a nested
-    /// conditional come out right, since it short-circuits again over the rows it was given.
+    /// Only a mixed selection gathers. The columns are gathered, not the answers, so the
+    /// expression is evaluated over a short batch exactly as over a whole one, and a nested
+    /// conditional short-circuits again over the rows it was given.
     /// </para>
     /// <para>
-    /// <b>Gathering, not masking.</b> Nulling the unselected rows of the input columns and
-    /// evaluating whole would be cheaper and is WRONG: null-propagation is not universal, and the
-    /// counter-example is the family being fixed. In <c>coalesce(a, coalesce(z, 1/0))</c> a nulled
-    /// <c>z</c> makes the inner conditional choose <c>1/0</c> on exactly the rows the outer one
-    /// had already decided, so the masking reintroduces the error it was meant to avoid.
+    /// Gathering, not masking: nulling the unselected rows of the input columns and evaluating
+    /// whole would be cheaper but wrong, because null-propagation is not universal. In
+    /// <c>coalesce(a, coalesce(z, 1/0))</c> a nulled <c>z</c> makes the inner conditional choose
+    /// <c>1/0</c> on exactly the rows the outer one had already decided.
     /// </para>
     /// </remarks>
     private IArrowArray EvaluateOver(Expression expression, RecordBatch batch, ReadOnlySpan<bool> rows)
     {
         var selected = Selected(rows);
 
-        // Tested BEFORE the full-selection case, which it would otherwise be swallowed by over an
-        // empty batch -- where both are true and the answer has to be the empty one, or a literal
-        // would hand a caller the one-row array ConstantArray builds internally.
+        // Must stay before the full-selection test: over an empty batch both are true, and the
+        // full-selection path would hand a caller the one-row array ConstantArray builds for a
+        // literal.
         if (selected == 0)
             return ArrowCompute.MakeNullArray(TypeOver(expression, batch), batch.Length);
 
-        // Every row wants it, which is the ordinary case for a first operand and for a batch that
-        // takes the same branch throughout. Nothing is copied and nothing is rebuilt.
+        // Every row wants it: the ordinary case for a first operand and for a batch that takes
+        // the same branch throughout.
         if (selected == batch.Length)
             return EvalExpressionAsArray(expression, batch);
 
@@ -1686,31 +1590,25 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Over no rows nothing can be READ, so an error in a branch nobody selected cannot happen --
-    /// which is the whole point -- and what comes back still carries the type Spark would have
-    /// typed the conditional from.
+    /// Over no rows nothing can be read, so an error in a branch nobody selected cannot happen,
+    /// and what comes back still carries the type Spark would have typed the conditional from.
     /// </para>
     /// <para>
-    /// <b>With rows, if it has to be.</b> A few functions take a SCALAR argument whose value
-    /// decides the result type, and read it out of row 0: <c>round</c>'s scale is the one that
-    /// bites, since the scale may itself be computed. A literal survives an empty batch --
-    /// <see cref="ConstantArray"/> keeps one row for exactly this reason -- but
-    /// <c>round(f, 1 + 1)</c> hands <c>round</c> a zero-length array to read a scale from, and it
-    /// throws rather than answering DOUBLE. So the empty evaluation is a QUESTION: when it cannot
-    /// be answered without rows, it is asked again with them.
+    /// With rows, if it has to be. A few functions read a scalar argument whose value decides the
+    /// result type out of row 0 — <c>round</c>'s scale, which may itself be computed. A literal
+    /// survives an empty batch (<see cref="ConstantArray"/> keeps one row for this), but
+    /// <c>round(f, 1 + 1)</c> hands <c>round</c> a zero-length scale and it throws. So when the
+    /// empty evaluation fails, it is retried over the batch.
     /// </para>
     /// <para>
-    /// Trying the empty one first is what keeps this correct rather than merely working. The
-    /// retry evaluates a branch no row selected, which is the thing that raises, so it must stay
-    /// the fallback and never the first attempt. And it never makes an outcome worse: without it
-    /// the first failure propagated, and with it the second does -- so the only expressions that
-    /// still fail are ones that failed before, with a different message.
+    /// The empty attempt must stay first: the retry evaluates a branch no row selected, which is
+    /// what can raise. A failing retry throws in place of the first failure, so it never turns an
+    /// answer into an error.
     /// </para>
     /// <para>
-    /// The residual is an expression that needs BOTH -- a value-dependent result type and a
-    /// branch that raises over real rows, as in <c>round(CAST('x' AS DOUBLE), 1 + 1)</c> inside a
-    /// branch nothing reaches. Answering that needs the type inferred rather than evaluated, which
-    /// is a different design.
+    /// The residual gap is an expression with both a value-dependent result type and a branch that
+    /// raises over real rows, as in <c>round(CAST('x' AS DOUBLE), 1 + 1)</c> inside a branch
+    /// nothing reaches. That needs the type inferred rather than evaluated.
     /// </para>
     /// </remarks>
     private IArrowType TypeOver(Expression expression, RecordBatch batch)
@@ -1722,19 +1620,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         }
         catch (ExpressionAnalysisException)
         {
-            // AN ANALYSIS REFUSAL IS THE ANSWER, so it is not retried. The retry below exists for
-            // a registry that could not type something over no rows, and a refusal is not that:
-            // it is a property of the operand types, it answers the same over any number of rows,
-            // and retrying replaces it with whatever the first value raises. Measured while
-            // building this, `false AND CAST(s AS INT) = bl` over a row holding 'abc' reported
-            // CAST_INVALID_INPUT in place of the type refusal the probe had already reached.
+            // An analysis refusal is the answer, so it is not retried: it is a property of the
+            // operand types, and retrying would replace it with whatever the first value raises
+            // (`false AND CAST(s AS INT) = bl` over a row holding 'abc' would report
+            // CAST_INVALID_INPUT instead of the type refusal).
             throw;
         }
         catch (Exception)
         {
-            // Deliberately broad: the question is whether an ANSWER came back, and the ways of
-            // failing to answer it are the registry's business rather than this method's. Nothing
-            // is swallowed -- a retry that fails throws in place of what was caught.
+            // Deliberately broad: the ways of failing to answer are the registry's business.
+            // Nothing is swallowed -- a retry that fails throws in place of what was caught.
             return EvalExpressionAsArray(expression, batch).Data.DataType;
         }
     }
@@ -1768,16 +1663,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Only the named columns, for two reasons. It is the cheaper half of the work on a wide
-    /// batch, and it keeps a column the expression never mentions from deciding whether the
-    /// expression can be evaluated at all -- a type <c>ArrowCompute.Take</c> declines to
-    /// gather would otherwise fail a branch that does not read it.
+    /// Only the named columns: it is cheaper on a wide batch, and a column of a type
+    /// <c>ArrowCompute.Take</c> declines to gather would otherwise fail a branch that does not
+    /// read it.
     /// </para>
     /// <para>
-    /// <b>Every column matching a name is kept, not the first.</b> <see cref="GetColumn"/>
-    /// resolves case-insensitively and refuses an ambiguous match, and dropping the second of a
-    /// colliding pair here would turn that refusal into an answer -- the wrong one, and only on
-    /// the batches that happened to take this path.
+    /// Every column matching a name is kept, not the first. <see cref="GetColumn"/> resolves
+    /// case-insensitively and refuses an ambiguous match, and dropping the second of a colliding
+    /// pair here would turn that refusal into a wrong answer.
     /// </para>
     /// </remarks>
     private static RecordBatch Restrict(Expression expression, RecordBatch batch, int[] rows)
@@ -1814,10 +1707,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>Collects every column name <paramref name="expression"/> reads, duplicates and all.</summary>
     /// <remarks>
-    /// Exhaustive on purpose, with no catch-all arm. A node kind that went unlisted would be read
-    /// as naming no columns, and the batch built for it would then be missing a column it reads --
-    /// so the default throws, and a new node kind fails loudly here rather than somewhere further
-    /// down that cannot explain itself.
+    /// Exhaustive on purpose: an unlisted node kind would be read as naming no columns and the
+    /// restricted batch would be missing a column it reads, so the default throws.
     /// </remarks>
     private static void CollectReferences(Expression expression, List<string> names)
     {
@@ -1891,10 +1782,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         public int Count => _call.Arguments.Count;
 
         /// <remarks>
-        /// Read off the TREE, which is the whole point of asking here rather than of the evaluated
-        /// array: a bare <c>NULL</c> is a null literal, and <c>CAST(NULL AS INT)</c> -- a call,
-        /// carrying a type that Spark does let constrain the result -- is not, however identical
-        /// the two look once they are columns.
+        /// Read off the tree rather than the evaluated array: a bare <c>NULL</c> is a null
+        /// literal, and <c>CAST(NULL AS INT)</c> -- a call carrying a type that Spark lets
+        /// constrain the result -- is not, however alike the two look once they are columns.
         /// </remarks>
         public bool IsNullLiteral(int index) =>
             _call.Arguments[index] is LiteralExpression literal && literal.Value.IsNull;
@@ -1905,17 +1795,16 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>Builds a constant array of <paramref name="value"/>, repeated.</summary>
     /// <remarks>
-    /// <b>At least one row long, even over an empty batch.</b> A literal does not vary by row, and
-    /// the registry reads a SCALAR argument out of row 0 -- a cast's target type, the scale
-    /// <c>round</c> was asked for -- so over no rows there would be nothing to read: measured,
-    /// <c>CAST('x' AS DOUBLE)</c> failed with "cast expects its target type as a string literal"
-    /// rather than answering DOUBLE, and <c>1 + 1</c> with "arithmetic is not defined for utf8",
-    /// because a zero-length literal cannot be typed from its values either.
     /// <para>
-    /// That matters because evaluating over zero rows is how <see cref="EvaluateOver"/> learns the
-    /// type of a branch no row selected. The extra row is internal: it is never read, since every
-    /// function is bounded by the row count rather than by its arguments' lengths, and
-    /// <see cref="EvaluateExpression(Expression, RecordBatch)"/> trims it off at the boundary.
+    /// At least one row long, even over an empty batch. The registry reads a scalar argument out
+    /// of row 0 -- a cast's target type, the scale <c>round</c> was asked for -- so over no rows
+    /// there would be nothing to read, and evaluating over zero rows is how
+    /// <see cref="EvaluateOver"/> learns the type of a branch no row selected.
+    /// </para>
+    /// <para>
+    /// The extra row is internal: every function is bounded by the row count rather than by its
+    /// arguments' lengths, and <see cref="EvaluateExpression(Expression, RecordBatch)"/> trims it
+    /// off at the boundary.
     /// </para>
     /// </remarks>
     private static IArrowArray ConstantArray(LiteralValue value, int length)
@@ -1934,9 +1823,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 Repeat(value, length), length, new Decimal128Type(precision, scale));
         }
 
-        // ...and the same for one too wide for System.Decimal, which the parser now reads (#173).
-        // Without this the literal parses and then cannot be turned into a column, which is the
-        // same seam one method further along: `d4 + <38 digits>` failed here rather than there.
+        // ...and the same for one too wide for System.Decimal.
         if (value.Type == LiteralValue.Kind.HighPrecisionDecimal)
         {
             var (unscaled, wideScale) = value.AsHighPrecisionDecimal;
@@ -1950,18 +1837,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     /// <summary>The column a bare <c>NULL</c> literal becomes.</summary>
     /// <remarks>
-    /// <b>Arrow's <see cref="NullType"/>, which is Spark's <c>void</c>.</b> Until #293 this was an
-    /// all-null <see cref="StringArray"/>, and the type was a lie that nothing downstream could
-    /// see through: a real string column holding nothing in this batch was the same array, so
-    /// <c>greatest(a, s)</c> answered an int over such a batch where Spark refuses, and the
-    /// conditional family needed the expression tree to tell the two apart at all. Worse, the lie
-    /// was not only a typing one — every arithmetic operator refused a bare NULL outright, since
-    /// <c>a + NULL</c> arrived as <c>int + utf8</c>: measured, "arithmetic is not defined for
-    /// utf8" where Spark answers an <c>int</c> null.
     /// <para>
-    /// The blast radius is real and is paid for in the readers rather than at each call site:
+    /// Arrow's <see cref="NullType"/>, which is Spark's <c>void</c> — not an all-null string
+    /// column, which a real string column holding nothing in this batch would be
+    /// indistinguishable from.
+    /// </para>
+    /// <para>
     /// <c>SparkArrays</c> and <c>SparkFunctions</c> read a void cell as null, and
-    /// <c>SparkNumericTypes</c> gives the type rules. A function that reads its arguments
+    /// <c>SparkNumericTypes</c> gives the type rules, so a function that reads its arguments
     /// through those needs no case of its own.
     /// </para>
     /// </remarks>
@@ -1981,15 +1864,14 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// The number of decimal digits in a value, counted exactly.
     /// </summary>
     /// <remarks>
-    /// <b>Not <c>BigInteger.Log10</c>, which is a double and gets the boundaries wrong in both
-    /// directions.</b> Measured: it types 10^30 as thirty digits, because its logarithm comes back
-    /// as 29.999999999999996 rather than 30 — and 10^38-1 as thirty-nine, because that one rounds
-    /// UP to 38.0. The first made <c>-1000000000000000000000000000000</c> evaluate to null, since
-    /// a value needing thirty-one digits was given a decimal(30,0) to live in and overflowed it;
-    /// the second built a decimal(39,0), which is wider than any Spark decimal.
     /// <para>
-    /// Repeated division is exact and costs nothing that matters: this runs once per literal, not
-    /// once per row.
+    /// Not <c>BigInteger.Log10</c>, which is a double and gets the boundaries wrong in both
+    /// directions: it counts 10^30 as thirty digits (its logarithm is 29.999999999999996) and
+    /// 10^38-1 as thirty-nine (it rounds up to 38.0), giving a type too narrow for the value or
+    /// wider than any Spark decimal.
+    /// </para>
+    /// <para>
+    /// Repeated division is exact, and this runs once per literal, not once per row.
     /// </para>
     /// </remarks>
     private static int DigitCount(BigInteger value)
@@ -2028,32 +1910,20 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <summary>Finds the column a reference names, the way Spark resolves an identifier.</summary>
     /// <remarks>
     /// <para>
-    /// <b>Case-insensitively, because Spark is.</b> <c>spark.sql.caseSensitive</c> defaults to
-    /// false, so a session that writes <c>A</c> against a schema declaring <c>a</c> is answered
-    /// rather than refused -- and a Delta CHECK constraint or generation expression is stored as
-    /// TEXT and re-evaluated later, so a table Spark created can carry an expression whose
-    /// identifiers are spelled in a case its schema does not use. Matching exactly refused the
-    /// whole write on a table we did not create. #181.
+    /// Case-insensitively, because Spark is: <c>spark.sql.caseSensitive</c> defaults to false,
+    /// and a Delta CHECK constraint or generation expression is stored as text, so a table Spark
+    /// created can carry an expression whose identifiers are spelled in a case its schema does
+    /// not use.
     /// </para>
     /// <para>
-    /// <b>An ambiguous match refuses, and the exactly-spelled name does not win it.</b> Measured
-    /// against Spark 4.0.1 with <c>a</c> and <c>A</c> in one schema: all four of <c>a</c>,
-    /// <c>A</c>, <c>`a`</c> and <c>`A`</c> raise AMBIGUOUS_REFERENCE. An exact-match-first rule
-    /// would have answered every one of them, so the fast path it offers is the wrong answer
-    /// rather than a shortcut to the right one.
+    /// An ambiguous match refuses, and the exactly-spelled name does not win it: with <c>a</c>
+    /// and <c>A</c> in one schema, all four of <c>a</c>, <c>A</c>, <c>`a`</c> and <c>`A`</c>
+    /// raise AMBIGUOUS_REFERENCE in Spark. Backticks do not make a name case-sensitive either:
+    /// <c>`WEIRD NAME`</c> resolves to a column named <c>weird name</c>.
     /// </para>
     /// <para>
-    /// <b>Backticks are not an escape hatch.</b> Measured the same way: <c>`WEIRD NAME`</c>
-    /// resolves to a column named <c>weird name</c>. Quoting decides which CHARACTERS an
-    /// identifier may contain, not whether its case is honoured -- which is why this looks at the
-    /// name and not at how it was spelled in the SQL.
-    /// </para>
-    /// <para>
-    /// <b>The scan is a scan on purpose.</b> A dictionary keyed case-insensitively would have to
-    /// carry an ambiguity sentinel and be rebuilt per batch, and it buys nothing: this runs once
-    /// per reference per BATCH, never per row. Measured over a 1000-column batch, resolving at the
-    /// last field rather than the first costs 4 microseconds -- 1.8% of a 4096-row evaluation, and
-    /// visible only on a one-row batch, which is not a shape anything writes in bulk.
+    /// A linear scan on purpose: this runs once per reference per batch, never per row, and a
+    /// case-insensitive dictionary would need an ambiguity sentinel and a rebuild per batch.
     /// </para>
     /// </remarks>
     private static IArrowArray GetColumn(RecordBatch batch, string name)
@@ -2100,7 +1970,6 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         {
             // A `void` column -- a bare NULL literal, or a conditional every branch of which was
             // one. Every row is null, which is what the freshly-allocated array already holds.
-            // #293.
             case NullArray:
                 break;
             case BooleanArray a:
@@ -2158,7 +2027,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     else result[i] = LiteralValue.Of(a.GetBytes(i).ToArray());
                 }
                 break;
-            // Temporal + decimal columns map to the SAME LiteralValue kinds a stats/JSON decoder would
+            // Temporal + decimal columns map to the same LiteralValue kinds a stats/JSON decoder would
             // produce for the corresponding logical types (DateTimeOffset for date and timestamp; decimal
             // or high-precision decimal for decimal), so a predicate literal compares identically whether
             // it is tested against a per-row column value here or against file statistics elsewhere.
@@ -2208,8 +2077,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private static IArrowArray MaterializeAsArray(LiteralValue?[] values, int length)
     {
-        // Choose an Arrow type from the first non-null value; default to string
-        // if everything is null.
+        // Choose an Arrow type from the first non-null value.
         LiteralValue.Kind? kind = null;
         for (int i = 0; i < length; i++)
         {
@@ -2217,7 +2085,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         }
 
         // Nothing to infer a type from. That is a bare NULL by any other name, so it takes the
-        // same `void` column one does rather than a string one. #293.
+        // same `void` column one does.
         if (kind is null) return NullLiteralArray(length);
 
         switch (kind.Value)
@@ -2270,10 +2138,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                     else sb.AppendNull();
                 }
                 return sb.Build();
-            // A timestamp literal, and the instant a DATE literal carries before its cast. The
-            // type-inferring path could not build either, so `TIMESTAMP'…'` parsed and resolved
-            // and then failed at materialisation. Microseconds in UTC, matching what the readers
-            // produce and what SparkLiteral resolves a zone-less literal to. #254.
+            // A timestamp literal, and the instant a DATE literal carries before its cast.
+            // Microseconds in UTC, matching what the readers produce and what SparkLiteral
+            // resolves a zone-less literal to.
             case LiteralValue.Kind.DateTimeOffset:
                 return BuildTimestampArray(
                     values, length, new TimestampType(TimeUnit.Microsecond, "UTC"));
@@ -2296,18 +2163,18 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// Materializes against a caller-supplied Arrow type, which the answer always carries.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The decimal and temporal cases need metadata a bare <see cref="LiteralValue"/> cannot
     /// carry — precision/scale/width, unit/timezone, date-vs-timestamp — and every other type is
     /// inferrable from a value, so those fall through to the type-inferring overload.
+    /// </para>
     /// <para>
-    /// <b>Except when there is no value to infer from.</b> An expression that is null in every
-    /// row tells the inferring overload nothing, and it answered with whatever it uses for "no
-    /// type" — a string column before #293 and a <c>void</c> one after — so a generated
-    /// <c>INT</c> column defined as <c>NULL</c> came back <c>utf8</c>. That breaks this
-    /// overload's whole contract: its callers are <c>DeltaGeneratedColumns</c> and the Lance
-    /// writer, which put the array straight into a batch whose schema declares
-    /// <paramref name="targetType"/>. A null is null at every type, so the target simply decides
-    /// which one it is.
+    /// Except when there is no value to infer from: an all-null input would otherwise come back
+    /// <c>void</c>, where the callers of the public
+    /// <see cref="EvaluateExpression(Expression, RecordBatch, IArrowType)"/> overload
+    /// (<c>DeltaGeneratedColumns</c>, the Lance writer) put the array straight into a batch
+    /// whose schema declares <paramref name="targetType"/>. A null is null at every type, so the
+    /// target decides which one it is.
     /// </para>
     /// </remarks>
     private static IArrowArray MaterializeAsArray(LiteralValue?[] values, int length, IArrowType targetType) =>
@@ -2485,7 +2352,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// <summary>The widest precision and scale <see cref="decimal"/> represents without loss.</summary>
     /// <remarks>
     /// Its mantissa is 96 bits, so it tops out near 7.9228e28 — 29 digits, but not all 29-digit
-    /// values — and its scale runs 0 to 28. A column declared no wider than this in BOTH holds no
+    /// values — and its scale runs 0 to 28. A column declared no wider than this in both holds no
     /// value it cannot carry exactly; one declared wider holds values it cannot, so the whole
     /// column takes the exact path.
     /// </remarks>
@@ -2496,16 +2363,15 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     // exact unscaled BigInteger plus the column's scale, read straight from the fixed-width
     // little-endian value buffer — the same raw layout the format writers use.
     //
-    // DECIDED FROM THE DECLARED TYPE, NOT FROM AN EXCEPTION. Decimal128Array.GetValue raises
-    // OverflowException only for excess MAGNITUDE; for excess significant DIGITS it silently rounds
-    // to 28 and reports success. Keying the fallback on the exception therefore missed exactly the
-    // values it existed to protect — a decimal(38,38) is under 1, never overflows, and arrived
-    // already rounded — so the cell was wrong before any comparison touched it. See #205, and #175
-    // for the same rounding surfacing in rendering.
+    // Decided from the declared type, not from an exception. Decimal128Array.GetValue raises
+    // OverflowException only for excess magnitude; for excess significant digits it silently rounds
+    // to 28 and reports success. So keying the fallback on the exception would miss exactly the
+    // values it exists to protect: a decimal(38,38) is under 1, never overflows, and would arrive
+    // already rounded.
     //
     // Conservative on purpose: a small value in a wide-declared column takes the exact path it does
-    // not strictly need. That costs a BigInteger and is the side to err on, because the alternative
-    // is a per-cell test that has to be right about every corner of decimal's 96-bit mantissa.
+    // not strictly need, which costs a BigInteger but avoids a per-cell test that has to be right
+    // about every corner of decimal's 96-bit mantissa.
     private static LiteralValue DecimalLiteral(Decimal128Array a, int index)
     {
         var type = (Decimal128Type)a.Data.DataType;

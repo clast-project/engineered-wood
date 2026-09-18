@@ -73,9 +73,8 @@ public sealed class ExpressionBinder
 
     /// <summary>Binds every member of a list, returning the original when none moved.</summary>
     /// <remarks>
-    /// Identity is what tells the caller whether to rebuild its node, and it matters: an
-    /// expression tree is rebuilt from the leaves up, so an allocation here is one per list per
-    /// bind even when nothing resolved.
+    /// Identity tells the caller whether to rebuild its node, so a bind that changes nothing
+    /// allocates nothing.
     /// </remarks>
     private IReadOnlyList<Expression> BindAll(IReadOnlyList<Expression> expressions)
     {

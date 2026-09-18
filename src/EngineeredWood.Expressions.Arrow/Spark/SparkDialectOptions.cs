@@ -11,12 +11,11 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// evaluation — see "Where the dialect configuration lives" in
 /// <c>doc/predicate-pushdown-design.md</c>.
 ///
-/// There is no upstream contract to match here. Delta pins no configuration when it validates a
-/// CHECK constraint: <c>CheckDeltaInvariant</c> carries no <c>SQLConf</c> reference, and the same
-/// constraint accepts or rejects the same row depending on the writing session — measured,
-/// <c>a + b &lt; 0</c> over <c>(2147483647, 1)</c> is accepted with ANSI off and raises
-/// <c>ARITHMETIC_OVERFLOW</c> with it on. EngineeredWood has no session to inherit from, so it
-/// chooses and documents one instead.
+/// There is no upstream contract to match. Delta pins no configuration when it validates a CHECK
+/// constraint (<c>CheckDeltaInvariant</c> carries no <c>SQLConf</c>), so the same constraint
+/// accepts or rejects the same row depending on the writing session: <c>a + b &lt; 0</c> over
+/// <c>(2147483647, 1)</c> is accepted with ANSI off and raises <c>ARITHMETIC_OVERFLOW</c> with it
+/// on. EngineeredWood has no session to inherit from, so it chooses and documents one.
 /// </remarks>
 public sealed record SparkDialectOptions
 {
@@ -35,29 +34,23 @@ public sealed record SparkDialectOptions
     public bool Ansi { get; init; } = true;
 
     /// <summary>
-    /// The timezone temporal conversions resolve against. Always UTC, deliberately.
+    /// The timezone temporal conversions resolve against. Always UTC.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Why this is settled rather than configurable.</b> Spark resolves a timestamp against
-    /// <c>spark.sql.session.timeZone</c>, and it changes answers: measured, the instant
-    /// 2026-08-11T03:00Z casts to the date <c>2026-08-11</c> under UTC and <c>2026-08-10</c>
-    /// under <c>America/Los_Angeles</c>. A generated column defined as
-    /// <c>CAST(ts AS DATE)</c> therefore stores a different value depending on which session
-    /// wrote the row — the same unspecified-by-omission problem as ANSI, and Delta pins neither.
+    /// Spark resolves a timestamp against <c>spark.sql.session.timeZone</c>, and it changes
+    /// answers: the instant 2026-08-11T03:00Z casts to the date <c>2026-08-11</c> under UTC and
+    /// <c>2026-08-10</c> under <c>America/Los_Angeles</c>. A generated column defined as
+    /// <c>CAST(ts AS DATE)</c> therefore stores a value that depends on the writing session, and
+    /// Delta pins the zone no more than it pins ANSI. EngineeredWood has no session, so it fixes
+    /// UTC: the harvested corpus is pinned to it, and <c>ArrowRowEvaluator</c> already reads a
+    /// Date32 as UTC midnight of that day.
     /// </para>
     /// <para>
-    /// EngineeredWood has no session to inherit from, so it fixes one. UTC is chosen because it
-    /// is what the harvested corpus is pinned to, and because the rest of the library already
-    /// assumes it: <c>ArrowRowEvaluator</c> reads a Date32 as UTC midnight of that day, so a
-    /// literal and a column value already compare on UTC footing.
-    /// </para>
-    /// <para>
-    /// It is a fixed property rather than a settable one because honouring another zone needs
-    /// more than this option. The parser resolves a zone-less <c>TIMESTAMP'…'</c> literal to an
-    /// instant in <c>EngineeredWood.Expressions</c>, which cannot see these options at all -- so
-    /// the zone is defined there, beside the grammar both the parser and the casts read text with,
-    /// and this property only reports it (#341). Making the zone configurable means carrying a
+    /// It is not settable because honouring another zone needs more than this option. The parser
+    /// resolves a zone-less <c>TIMESTAMP'…'</c> literal to an instant in
+    /// <c>EngineeredWood.Expressions</c>, which cannot see these options, so the zone is defined
+    /// there and this property only reports it. A configurable zone (#133) means carrying a
     /// setting to the parser as well.
     /// </para>
     /// </remarks>

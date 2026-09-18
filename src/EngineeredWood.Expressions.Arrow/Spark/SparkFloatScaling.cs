@@ -12,38 +12,33 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="SparkFloatText"/> answers this exactly by expanding the value in full: a value is
-/// <c>mantissa x scale x 10^shift</c>, and the digits of <c>mantissa x scale</c> ARE the value's.
-/// That is correct for every input and it is why it is still there, but the expansion reaches 767
-/// digits for a subnormal double, and even an ordinary magnitude costs a handful of big-integer
-/// divisions per row — 0.32us against the 0.14us of the round-and-probe ladder it replaced
-/// (#337, #338), and 1.42us where the exponent is far from zero. This runs for every row of every
-/// cast to a string or a wide decimal.
-/// <para>
-/// Those are per-process measurements. #351 published 0.86us and 0.22us for the same two, taken by
-/// interleaving the implementations in ONE process, where tiering and the shared heap move a
-/// number by up to 4x — reversing the order changed the answers. Measure one implementation per
-/// process.
-/// </para>
+/// <see cref="SparkFloatText"/> answers this exactly by expanding the value in full, which is
+/// correct for every input but reaches 767 digits for a subnormal double, and even an ordinary
+/// magnitude costs a handful of big-integer divisions. This runs for every row of every
+/// floating-point cast to a string or a decimal, so it answers in machine words where it can and
+/// leaves the rest to the exact path.
 /// </para>
 /// <para>
-/// <b>The whole question fits in machine words once both sides are scaled into the same
-/// domain.</b> A candidate <c>s x 10^k</c> reads back as <c>c x 2^q</c> exactly when it lands
+/// To compare the two paths, benchmark one implementation per process: interleaved in one
+/// process, tiering and the shared heap move the numbers by up to 4x, and the order they run in
+/// changes the result.
+/// </para>
+/// <para>
+/// The whole question fits in machine words once both sides are scaled into the same domain.
+/// A candidate <c>s x 10^k</c> reads back as <c>c x 2^q</c> exactly when it lands
 /// inside the value's rounding interval, and dividing that interval's ends by <c>10^k</c> turns
 /// the test into <c>low &lt;= s &lt;= high</c> — a comparison between an integer and two
 /// fixed-point numbers. Both ends come from one multiplication by a stored power of five, so the
 /// cost no longer depends on how far the exponent is from zero.
 /// </para>
 /// <para>
-/// <b>It answers only when the answer is unambiguous, and says so when it is not.</b> The stored
-/// power is an approximation, so every comparison carries an error bar; whenever an operand falls
-/// inside it — which is also exactly where a candidate lands ON a boundary and Java's
-/// round-half-even tie rule has to decide — this declines, and the exact path answers instead.
-/// Correctness therefore rests on the error bar being conservative rather than on the
-/// approximation being good enough, which is a far smaller thing to have to get right, and it is
-/// checked by differential sweep rather than argued: every one of the 2,139,095,040 finite
-/// non-negative floats agrees with the exact path — exhaustively, not sampled — and so does every
-/// double tried.
+/// It answers only when the answer is unambiguous. The stored power is an approximation, so
+/// every comparison carries an error bar; whenever an operand falls inside it — which is also
+/// where a candidate lands on a boundary and Java's round-half-even tie rule has to decide —
+/// this declines, and the exact path answers instead. Correctness therefore rests on the error
+/// bar being conservative rather than on the approximation being good enough, and it is checked
+/// by differential sweep: all 2,139,095,040 finite non-negative floats agree with the exact
+/// path, and so does every double tried.
 /// </para>
 /// <para>
 /// One routine serves both widths. A float's nine digits would fit in narrower arithmetic, but
@@ -199,7 +194,7 @@ internal static class SparkFloatScaling
             return true;
         }
 
-        // Halfway between the two candidates. The half goes in the FRACTION rather than into an
+        // Halfway between the two candidates. The half goes in the fraction rather than into an
         // integer division of the sum, which would throw it away whenever the two are adjacent —
         // that is every candidate at full length, and it would tip all of them upward.
         var middle = new Scaled((below + above) >> 1, ((below + above) & 1) != 0 ? 1UL << 63 : 0);
@@ -219,7 +214,7 @@ internal static class SparkFloatScaling
         below = centre.High - (centre.High % step);
         above = below + step;
 
-        // Only the TOP end is ambiguous. The scaling never lands above the true value and is
+        // Only the top end is ambiguous. The scaling never lands above the true value and is
         // never a whole unit below it, so a fraction near zero means the integer part is right —
         // whereas a fraction near one means the true value may have carried into the next
         // integer and this one is short by one.
@@ -450,7 +445,7 @@ internal static class SparkFloatScaling
 
             var index = power - Lowest;
 
-            // ACQUIRE, to pair with the release at the end of Fill. A plain read here would let
+            // Acquire, to pair with the release at the end of Fill. A plain read here would let
             // the three array reads below be hoisted above it on a weakly-ordered target, so a
             // thread could see the row marked built and still read the zeros it was born with.
             if (!Volatile.Read(ref Built[index]))
@@ -485,13 +480,12 @@ internal static class SparkFloatScaling
                 exponent++;
             }
 
-            // TRUNCATED, not rounded to nearest, and the direction is the point. The shift that
-            // places the product truncates too, so leaving this one downward as well makes the
-            // whole computation err in ONE direction and never above the true value. That is what
-            // lets the integer part be trusted when the fraction comes out at zero — which is not
-            // a marginal case but the commonest one there is, since every value that IS a short
-            // decimal scales to an exact integer. Rounding up instead cost a 21% hand-off rate on
-            // ordinary rounded magnitudes.
+            // Truncated, not rounded to nearest, and the direction matters. The shift that places
+            // the product truncates too, so leaving this one downward as well makes the whole
+            // computation err in one direction, never above the true value. That is what lets
+            // the integer part be trusted when the fraction comes out at zero, which is the
+            // commonest case: every value that is a short decimal scales to an exact integer.
+            // Rounding up instead raised the hand-off rate to 21% on ordinary magnitudes.
             var quotient = numerator / denominator;
 
             Highs[index] = (ulong)(quotient >> 64);

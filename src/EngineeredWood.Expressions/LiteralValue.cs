@@ -14,28 +14,23 @@ namespace EngineeredWood.Expressions;
 /// values (string, byte[], BigInteger) and types larger than 8 bytes are stored
 /// in an object slot; primitive scalars are stored in an inline 16-byte union.
 /// <para>
-/// Carries TWO relations, and they are not the same one.
-/// <see cref="CompareTo(LiteralValue)"/> is SQL's, with cross-type numeric promotion
-/// (<c>int</c> against <c>long</c>, <c>decimal</c> against <c>double</c>) measured against Spark.
-/// <see cref="Equals(LiteralValue)"/> is .NET's, comparing representation, so it is an
-/// equivalence relation with a consistent <see cref="GetHashCode"/>. Ask the first when
-/// evaluating a predicate; ask the second when using a literal as a key or comparing two
-/// expression trees.
+/// Carries two different relations. <see cref="CompareTo(LiteralValue)"/> is SQL's, with
+/// cross-type numeric promotion (<c>int</c> against <c>long</c>, <c>decimal</c> against
+/// <c>double</c>) matching Spark. <see cref="Equals(LiteralValue)"/> is .NET's, comparing
+/// representation, so it is an equivalence relation with a consistent
+/// <see cref="GetHashCode"/>. Use the first when evaluating a predicate, and the second when
+/// using a literal as a key or comparing two expression trees.
 /// </para>
 /// <para>
-/// WARNING: <see cref="CompareTo(LiteralValue)"/> is not a total order, so this type must not go
+/// Warning: <see cref="CompareTo(LiteralValue)"/> is not a total order, so this type must not go
 /// into a sorted collection whose elements span kinds -- <see cref="SortedSet{T}"/>,
 /// <see cref="SortedDictionary{TKey, TValue}"/>, <c>List.Sort</c>, <c>OrderBy</c>. It implements
 /// <see cref="IComparable{T}"/> for the evaluators, which compare two values at a time and can
-/// take an answer of "these kinds do not compare"; a sort cannot. Measured, both ways it breaks:
-/// a <see cref="SortedSet{T}"/> holding an int THROWS when a string is added, and sorting a list
-/// of the two raises "Failed to compare two elements in the array"; and where the comparison does
-/// answer, the answers are pairwise, so a set built from the decimal 9007199254740993, the double
-/// 9007199254740992 and the long 9007199254740992 -- three values, all distinct under
-/// <see cref="Equals(LiteralValue)"/> -- silently DROPS one, and reports Contains for a value it
-/// does not hold. How many it drops is not worth stating: a sorted container given an
-/// intransitive comparison has no defined behaviour at all, which is the point. Group by
-/// <see cref="Type"/> first, or sort with a comparer of your own.
+/// handle "these kinds do not compare"; a sort cannot. Kinds that do not compare (an int and a
+/// string) throw, and kinds that do compare pairwise and intransitively: the decimal
+/// 9007199254740993, the double 9007199254740992 and the long 9007199254740992 are distinct
+/// under <see cref="Equals(LiteralValue)"/>, yet a <see cref="SortedSet{T}"/> of the three
+/// silently drops one. Group by <see cref="Type"/> first, or sort with a comparer of your own.
 /// </para>
 /// </remarks>
 public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<LiteralValue>
@@ -142,8 +137,9 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         null);
 
     /// <summary>
-    /// Creates a high-precision decimal value for Decimal128/256 columns whose
-    /// precision exceeds System.decimal's 28-29 digit limit.
+    /// Creates a decimal value from an unscaled integer and a scale, for values
+    /// <see cref="decimal"/> cannot hold exactly — such as Decimal128/256 columns whose
+    /// precision exceeds its 28-29 digit limit.
     /// </summary>
     public static LiteralValue HighPrecisionDecimalOf(BigInteger unscaledValue, int scale) =>
         new(Kind.HighPrecisionDecimal, new InlineStorage { Int32 = scale }, unscaledValue);
@@ -274,23 +270,18 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// Whether two literals hold the same value in the same representation.
     /// </summary>
     /// <remarks>
-    /// A .NET equivalence relation, deliberately NOT SQL's <c>=</c>. Two values of different
+    /// A .NET equivalence relation, deliberately not SQL's <c>=</c>. Two values of different
     /// <see cref="Kind"/>s are never equal here, so <c>Of(1)</c> does not equal <c>Of(1.0d)</c>
     /// even though the SQL comparison says they match. For the SQL answer ask
     /// <see cref="CompareTo(LiteralValue)"/> and test for zero, which is what the evaluators do.
+    /// This method never throws.
     /// <para>
-    /// The split exists because the two relations cannot be the same method. SQL's cross-type
-    /// comparison is pairwise: which pairs compare equal depends on the types involved, so the
-    /// relation is neither transitive nor consistent with any hash. Measured, all three of these
-    /// answers match Spark and all three cannot be an <c>Equals</c>: a <c>decimal(20,0)</c>
+    /// The two relations cannot be the same method. SQL's cross-type comparison is pairwise, so it
+    /// is neither transitive nor consistent with any hash. Matching Spark, a <c>decimal(20,0)</c>
     /// holding 9007199254740993 compares equal to the double 9007199254740992 (both widen to
     /// double, where 2^53+1 does not exist), that double compares equal to the long
     /// 9007199254740992, and the decimal does not compare equal to that long, because
-    /// decimal-against-integer stays exact. Routing that through <c>Equals</c> also made
-    /// <c>Of(1)</c> and <c>Of(1.0d)</c> equal while hashing differently, so a hash lookup missed
-    /// them, and made <c>Equals</c> THROW for any pair SQL cannot compare at all --
-    /// <c>Of(1).Equals(Of("x"))</c> and <c>Null.Equals(Of(1))</c> both raised
-    /// <see cref="InvalidOperationException"/>. This method never throws.
+    /// decimal-against-integer stays exact.
     /// </para>
     /// </remarks>
     public bool Equals(LiteralValue other)
@@ -332,22 +323,13 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// <summary>A hash consistent with <see cref="Equals(LiteralValue)"/>.</summary>
     /// <remarks>
     /// Representation-based, matching the equality above: no kind is folded into another, because
-    /// values of two kinds are never equal. The kind is mixed in for the same reason -- once two
-    /// kinds can never be equal, separating them costs nothing and every value they shared a
-    /// bucket with was a pure collision.
+    /// values of two kinds are never equal. The kind is mixed in so that equal payloads of
+    /// different kinds (every numeric zero, the null literal, <c>false</c> and midnight all hash
+    /// to 0 unmixed) do not collide.
     /// <para>
-    /// Worth doing rather than nominal. Measured over 64 small values in each of the eight numeric
-    /// kinds plus the string, binary, date and time kinds -- 596 values, all distinct under
-    /// <see cref="Equals(LiteralValue)"/> -- the unmixed hash gave 268 distinct codes with a worst
-    /// bucket of ELEVEN: every numeric zero landed on 0, and so did the null literal, <c>false</c>
-    /// and midnight. Mixing gives 596 distinct codes and a worst bucket of one.
-    /// </para>
-    /// <para>
-    /// Deliberately NOT <see cref="CombineHash"/>, the file's own helper, which measured WORST of
-    /// the four mixes tried: 468 distinct and 256 values still sharing a bucket with another kind.
-    /// It is <c>33 * kind ^ hash</c>, and a kind is 0-16, so the XOR barely moves a small hash
-    /// and the two operands alias. Spreading the hash first and adding the small discriminator
-    /// after does not, which is why the multiply comes first here.
+    /// Deliberately not <see cref="CombineHash"/>, which would give <c>33 * kind ^ hash</c>: a kind
+    /// is 0-16, so the XOR barely moves a small hash and the operands alias. Spreading the hash
+    /// first and adding the small discriminator after does not.
     /// </para>
     /// </remarks>
     public override int GetHashCode()
@@ -394,15 +376,14 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// </summary>
     /// <param name="exact">
     /// False when the two values had to meet in a type that cannot hold one of them exactly, so
-    /// the ordering is the ordering of the ROUNDED values and may not be the ordering of the real
+    /// the ordering is the ordering of the rounded values and may not be the ordering of the real
     /// ones. True otherwise, including for every same-type comparison.
     /// </param>
     /// <remarks>
-    /// The distinction exists because two different questions share this comparison. Evaluating a
-    /// row under a SQL dialect wants the lossy answer — it is what the dialect specifies. Deciding
-    /// whether a row group can be SKIPPED may only act on an exact one: a lossy comparison is not
-    /// an error, it is a confident wrong answer, and acting on it drops rows that match. See
-    /// StatisticsEvaluator, whose contract is that callers must not skip data on Unknown.
+    /// Two different questions share this comparison. Evaluating a row under a SQL dialect wants
+    /// the lossy answer, because the dialect specifies it. Deciding whether a row group can be
+    /// skipped may only act on an exact one: a lossy comparison is a confident wrong answer, and
+    /// acting on it drops rows that match. See <see cref="StatisticsEvaluator"/>.
     /// </remarks>
     public int CompareTo(LiteralValue other, out bool exact)
     {
@@ -424,7 +405,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
                 Kind.Float => CompareFloating(_inline.Float, other._inline.Float),
                 Kind.Double => CompareFloating(_inline.Double, other._inline.Double),
                 Kind.Decimal => ((decimal)_ref!).CompareTo((decimal)other._ref!),
-                // Code point (== UTF-8 byte) order, NOT UTF-16 code-unit order — every format's
+                // Code point (== UTF-8 byte) order, not UTF-16 code-unit order — every format's
                 // string stats are ordered over UTF-8 bytes. See StringOrdering.
                 Kind.String => StringOrdering.Compare((string?)_ref, (string?)other._ref),
                 Kind.Binary => BinaryCompare((byte[]?)_ref, (byte[]?)other._ref),
@@ -452,13 +433,10 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 
         // Exact decimal comparison across Decimal / HighPrecisionDecimal (and integers), so a plain
         // decimal literal compares against a high-precision decimal column value, and vice versa, without
-        // going through lossy double. Two same-kind values never reach here (handled above); this path is
-        // for the mixed pairs. Float/double are deliberately excluded — that would be a lossy compare.
+        // going through lossy double. Float/double are deliberately excluded.
         //
-        // ORDERED BEFORE the double widening below, and the order is load-bearing. Both branches
-        // can accept a decimal-against-integer pair, and only this one is exact; measured, Spark
-        // agrees -- `d1 = 0.1` over decimal(10,2) 0.10 is TRUE, which a double compare also gives,
-        // but decimal-against-integer stays exact where a double could not.
+        // Must stay before the double widening below: both branches accept a decimal-against-integer
+        // pair, and only this one is exact, as Spark's comparison is.
         // The floating check comes first so a decimal-against-double row does not pay for
         // TryAsScaledInteger before it declines: that call reaches DecimalToUnscaled, which runs
         // decimal.GetBits and allocates a BigInteger, on the evaluator's per-row path.
@@ -470,9 +448,9 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         // Float widening (any numeric → double), which a decimal reaches only when the other side
         // is floating point and nothing exact is possible.
         //
-        // LOSSY ON PURPOSE, because Spark is. Measured: a decimal(20,0) holding 9007199254740993
-        // compares EQUAL to the double 9007199254740992, because the decimal goes to double and
-        // 2^53+1 is not representable there. Comparing exactly would answer false and disagree.
+        // Lossy on purpose, because Spark is: a decimal(20,0) holding 9007199254740993 compares
+        // equal to the double 9007199254740992, because the decimal goes to double and 2^53+1 is
+        // not representable there. Comparing exactly would answer false and disagree.
         if (TryAsDouble(a, out double ad) && TryAsDouble(b, out double bd))
         {
             // The one branch that can lose information, so the one that reports it.
@@ -573,16 +551,14 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 
     /// <summary>Orders two floating values the way SQL does, which is not the way .NET does.</summary>
     /// <remarks>
-    /// NaN sits at the TOP of the order: measured against Spark 4.0,
-    /// <c>-Infinity &lt; finite &lt; +Infinity &lt; NaN</c>, confirmed by <c>sort_array</c>
-    /// returning <c>[-inf, 1.0, inf, nan]</c>. .NET's <see cref="double.CompareTo(double)"/> puts
-    /// NaN at the BOTTOM instead, so every relational operator involving one came out inverted —
-    /// <c>1.0 &gt; NaN</c> answered true where Spark answers false.
+    /// NaN sits at the top of Spark's order: <c>-Infinity &lt; finite &lt; +Infinity &lt; NaN</c>
+    /// (<c>sort_array</c> returns <c>[-inf, 1.0, inf, nan]</c>). .NET's
+    /// <see cref="double.CompareTo(double)"/> puts NaN at the bottom, which would invert every
+    /// relational operator involving one — <c>1.0 &gt; NaN</c> is false in Spark.
     /// <para>
-    /// Two things .NET already agrees on, and this does not disturb either. NaN equals itself:
-    /// both return 0 for that pair, and Spark's <c>NaN = NaN</c> is true. And -0.0 equals 0.0,
-    /// because <see cref="double.CompareTo(double)"/> compares by value rather than by total
-    /// order — verified rather than assumed, since the two differ on exactly this point.
+    /// Two things .NET already agrees on: NaN equals itself (Spark's <c>NaN = NaN</c> is true), and
+    /// -0.0 equals 0.0, because <see cref="double.CompareTo(double)"/> compares by value rather
+    /// than by total order.
     /// </para>
     /// </remarks>
     private static int CompareFloating(double a, double b)
@@ -603,8 +579,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// <para>
     /// Decimals are reported inexact without inspection. Deciding precisely means asking whether a
     /// value with up to 38 digits lands on a binary fraction, which costs more than the pruning it
-    /// would buy — and Unknown here is exactly what this comparison did before #171, when the pair
-    /// threw instead, so nothing regresses by saying so.
+    /// would buy.
     /// </para>
     /// </remarks>
     private static bool ExactAsDouble(LiteralValue v) => v._kind switch

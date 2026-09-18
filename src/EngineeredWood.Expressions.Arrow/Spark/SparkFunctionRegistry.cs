@@ -24,13 +24,8 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// parser decision or a per-call parameter.
 /// </para>
 /// <para>
-/// This paragraph listed temporal casts and the named functions — <c>substring</c>,
-/// <c>date_format</c>, <c>year</c>, <c>concat</c>, <c>coalesce</c>, <c>case</c>, <c>like</c> — as
-/// not yet implemented. All of them are, and the corpus covers each; the timezone policy the
-/// temporal casts were waiting on is settled in <see cref="SparkDialectOptions.TimeZone"/>. What
-/// survives from it is the rule that outlasted the list: <b>a function this registry does not
-/// implement refuses BY NAME</b> rather than silently producing nothing, so a gap is a message
-/// naming the function and never a wrong answer.
+/// A function this registry does not implement refuses by name rather than silently producing
+/// nothing, so a gap is a message naming the function and never a wrong answer.
 /// </para>
 /// </remarks>
 public sealed class SparkFunctionRegistry
@@ -43,11 +38,10 @@ public sealed class SparkFunctionRegistry
     /// The epoch seconds <see cref="DateTimeOffset"/> can represent — years 1 through 9999.
     /// </summary>
     /// <remarks>
-    /// Outside this, a cast is refused rather than approximated. Spark does not refuse: measured,
-    /// it accepts an arbitrarily large epoch second and its microsecond field silently overflows,
-    /// landing near year 294247 — a value PySpark itself cannot then convert back. Reproducing
-    /// that would put a meaningless instant into a generated column, so this deliberately differs
-    /// and fails closed instead.
+    /// Outside this, a cast is refused rather than approximated. Spark accepts an arbitrarily
+    /// large epoch second and its microsecond field silently overflows, landing near year 294247
+    /// — a value PySpark itself cannot convert back. Reproducing that would put a meaningless
+    /// instant into a generated column, so this deliberately differs and fails closed.
     /// </remarks>
     private const decimal MinEpochSecond = -62135596800m;
 
@@ -105,10 +99,9 @@ public sealed class SparkFunctionRegistry
                 Expect(name, args, 1);
                 return Positive(args[0], rowCount);
 
-            // try_cast is a cast that never raises. It is NOT the legacy dialect, though one flag
-            // covered both for as long as every non-raising answer was null: the legacy dialect
-            // ANSWERS an overflowing integral cast — 300 as a TINYINT is 44 — where try_cast
-            // yields null under either dialect. Measured; see SparkIntegralCasts and #243.
+            // try_cast is a cast that never raises, but it is not the legacy dialect: legacy
+            // answers an overflowing integral cast (300 as a TINYINT is 44) where try_cast yields
+            // null under either dialect. See SparkIntegralCasts.
             case "cast":
                 Expect(name, args, 2);
                 return Cast(
@@ -131,15 +124,14 @@ public sealed class SparkFunctionRegistry
                 Expect(name, args, 1);
                 return SparkFunctions.MapString(AsText(args[0]), rowCount, t => t.ToLowerInvariant());
 
-            // A THIRD whitespace rule, and the one the name makes hardest to guess: Spark's
-            // one-argument `trim` removes the SPACE and nothing else. Not the CAST rule, which is
-            // every byte at or below 0x20 (SparkText.TrimBounds), and not .NET's `string.Trim`,
-            // which is Unicode whitespace. Measured on 4.0.3: `trim('\tx\t')` is unchanged, and so
-            // are the newline and no-break-space forms, while `trim('  x  ')` is "x". #316.
+            // Spark's one-argument `trim` removes the space and nothing else -- not the CAST rule
+            // (every byte at or below 0x20, SparkText.TrimBounds) and not .NET's `string.Trim`
+            // (Unicode whitespace). `trim('\tx\t')` is unchanged, as are the newline and
+            // no-break-space forms, while `trim('  x  ')` is "x".
             //
             // Through SparkText and not `t.Trim(' ')`: `string.Trim(char)` does not exist on
             // netstandard2.0, so that call binds to `Trim(params char[])` there and allocates a
-            // one-element array per row -- MapString runs the lambda for every row.
+            // one-element array per row.
             case "trim":
                 Expect(name, args, 1);
                 return SparkFunctions.MapString(AsText(args[0]), rowCount, SparkText.TrimSpaces);
@@ -207,11 +199,9 @@ public sealed class SparkFunctionRegistry
     /// The conditional family, and only it.
     /// </summary>
     /// <remarks>
-    /// <c>nullif</c>, <c>greatest</c> and <c>least</c> are measured raising over the very batches
-    /// where <c>coalesce</c> and <c>if</c> answer -- and they have no branch to skip in the first
-    /// place, since each needs every argument before it can decide anything. The
-    /// <c>short-circuit</c> corpus group carries all three, so the boundary of the family is
-    /// pinned rather than assumed.
+    /// <c>nullif</c>, <c>greatest</c> and <c>least</c> raise in Spark over the batches where
+    /// <c>coalesce</c> and <c>if</c> answer -- each needs every argument before it can decide
+    /// anything. The <c>short-circuit</c> corpus group pins that boundary.
     /// </remarks>
     public bool ShortCircuits(string name) => name switch
     {
@@ -224,56 +214,51 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Spark's <c>Expression.nullable</c> for the names this registry answers for, measured
-    /// against 4.0.3 by asking Spark for the schema of <c>SELECT (expr) AS r</c>. It is read only
-    /// by <see cref="ArrowRowEvaluator"/>'s <c>IS NULL</c> / <c>IS NOT NULL</c> fold, and an
-    /// over-claim there yields a wrong answer, so this is an ALLOW-LIST: a name missing from the
-    /// switch is nullable, and a name added to <see cref="IsRegistered"/> later stays nullable
-    /// until someone measures it and adds it here.
+    /// Spark's <c>Expression.nullable</c> for the names this registry answers for, taken from
+    /// the schema Spark reports for <c>SELECT (expr) AS r</c>. It is read only by
+    /// <see cref="ArrowRowEvaluator"/>'s <c>IS NULL</c> / <c>IS NOT NULL</c> fold, where an
+    /// over-claim yields a wrong answer, so this is an allow-list: a name missing from the switch
+    /// is nullable, including one added to <see cref="IsRegistered"/> later until it is measured
+    /// and added here.
     /// </para>
     /// <para>
-    /// <b>Every rule here is STRUCTURAL — it reads only which arguments can be null, never their
-    /// types.</b> That is not a simplification, it is the boundary: Spark's nullability is
-    /// structural for the conditional family and type-dependent everywhere else, and a
-    /// type-dependent rule cannot be answered from this seam at all.
+    /// Every rule here is structural — it reads only which arguments can be null, never their
+    /// types. Spark's nullability is structural for the conditional family and type-dependent
+    /// everywhere else, and a type-dependent rule cannot be answered from this seam.
     /// </para>
     /// <para>
-    /// <b>ARITHMETIC IS THE ONE THAT LOOKS STRUCTURAL AND IS NOT</b>, and it is deliberately
-    /// absent. Integral arithmetic is non-nullable in both dialects, so <c>2147483647 + 1</c> is
-    /// non-nullable and Spark answers <c>(2147483647 + 1) IS NULL</c> without adding. DECIMAL
-    /// arithmetic is not: its nullability follows the PROMOTED precision, and measured under ANSI
-    /// <c>CAST(1 AS DECIMAL(10,2)) + CAST(1 AS DECIMAL(10,2))</c> is NULLABLE (the sum wants
-    /// decimal(11,2)) while <c>CAST(1 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))</c> is not.
-    /// Both are two non-null literals added together, so no rule phrased in terms of the
-    /// arguments' nullability can separate them. Claiming non-nullable for the first would fold
-    /// <c>x IS NOT NULL</c> to a constant true over an expression that really can be null, which
-    /// is the direction a CHECK constraint must not fail in — so arithmetic stays evaluated, and
-    /// the corpus's <c>null-propagation</c> group declares what that costs.
+    /// Arithmetic looks structural but is not, so it is deliberately absent. Integral arithmetic
+    /// is non-nullable in both dialects, but DECIMAL nullability follows the promoted precision:
+    /// under ANSI <c>CAST(1 AS DECIMAL(10,2)) + CAST(1 AS DECIMAL(10,2))</c> is nullable (the sum
+    /// wants decimal(11,2)) while <c>CAST(1 AS DECIMAL(38,0)) + CAST(1 AS DECIMAL(38,0))</c> is
+    /// not. No rule phrased in terms of argument nullability can separate them, and claiming
+    /// non-nullable for the first would fold <c>x IS NOT NULL</c> to a constant true over an
+    /// expression that can be null — the direction a CHECK constraint must not fail in. The
+    /// corpus's <c>null-propagation</c> group declares what that costs.
     /// </para>
     /// <para>
-    /// <b>What else is absent.</b> A <c>cast</c> is nullable — measured, <c>CAST(s AS INT)</c> is
-    /// nullable even under ANSI over a NOT NULL column, because <c>Cast.forceNullable</c> is a
-    /// property of the type PAIR. <c>try_cast</c>, <c>nullif</c>, <c>round</c>, <c>/</c> and
-    /// <c>%</c> are nullable in Spark whatever their arguments (<c>1 / 0</c> and
-    /// <c>round(1.5, 0)</c> both are). The string and date functions propagate their arguments'
-    /// nullability, but nothing needs them: an argument of theirs is only ever non-nullable when
-    /// it is a literal, and a literal cannot raise, so folding them would suppress no error.
+    /// Also absent: <c>cast</c> is nullable — <c>CAST(s AS INT)</c> is nullable even under ANSI
+    /// over a NOT NULL column, because <c>Cast.forceNullable</c> is a property of the type pair.
+    /// <c>try_cast</c>, <c>nullif</c>, <c>round</c>, <c>/</c> and <c>%</c> are nullable whatever
+    /// their arguments. The string and date functions propagate their arguments' nullability, but
+    /// an argument of theirs is only non-nullable when it is a literal, and a literal cannot
+    /// raise, so folding them would suppress no error.
     /// </para>
     /// </remarks>
     public bool NeverNull(string name, ReadOnlySpan<bool> argumentsNeverNull)
     {
         switch (name)
         {
-            // Never null as soon as ONE argument is. Measured for all five: `coalesce(a, 1)` and
-            // `greatest(a, 1)` are non-nullable over a nullable `a`, while
-            // `coalesce(a, CAST(NULL AS INT))` and `greatest(a, CAST(NULL AS INT))` are not.
+            // Never null as soon as one argument is: `coalesce(a, 1)` and `greatest(a, 1)` are
+            // non-nullable over a nullable `a`, while `coalesce(a, CAST(NULL AS INT))` and
+            // `greatest(a, CAST(NULL AS INT))` are not.
             case "coalesce" or "nvl" or "ifnull" or "greatest" or "least":
                 return Any(argumentsNeverNull);
 
-            // The two RESULT arguments decide it, and the first one does not reach the answer at
-            // all: measured, `nvl2(NULL, 1, 2)` is non-nullable and `nvl2(1, a, 2)` is nullable.
-            // `if` is the same shape -- and note it has no `CASE`-style true-condition rule:
-            // `if(true, 1, NULL)` is NULLABLE where `CASE WHEN true THEN 1 ELSE NULL END` is not.
+            // The two result arguments decide it; the first does not: `nvl2(NULL, 1, 2)` is
+            // non-nullable and `nvl2(1, a, 2)` is nullable. `if` has the same shape and no
+            // CASE-style true-condition rule: `if(true, 1, NULL)` is nullable where
+            // `CASE WHEN true THEN 1 ELSE NULL END` is not.
             case "if" or "nvl2":
                 return argumentsNeverNull.Length == 3
                     && argumentsNeverNull[1]
@@ -293,13 +278,12 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Every result has to be non-nullable, ELSE included, and a CASE with no ELSE is nullable
-    /// because a row matching no branch yields null. Deliberately WEAKER than Spark, which stops
-    /// at the first literally-true condition and ignores everything after it —
+    /// because a row matching no branch yields null. Deliberately weaker than Spark, which stops
+    /// at the first literally-true condition —
     /// <c>CASE WHEN true THEN 1 ELSE CAST(NULL AS INT) END</c> is non-nullable there and nullable
-    /// here. Reproducing that rule would suppress no error that is not already suppressed: a
-    /// literal condition makes every later branch unreachable, and #307 evaluates an unreachable
-    /// branch over no rows, so `CASE WHEN true THEN 1 ELSE CAST('abc' AS INT) END IS NULL`
-    /// already answers.
+    /// here. Reproducing that would suppress no error: a literal condition makes every later
+    /// branch unreachable, and an unreachable branch is evaluated over no rows, so
+    /// <c>CASE WHEN true THEN 1 ELSE CAST('abc' AS INT) END IS NULL</c> already answers.
     /// </remarks>
     private static bool CaseNeverNull(ReadOnlySpan<bool> argumentsNeverNull)
     {
@@ -357,12 +341,11 @@ public sealed class SparkFunctionRegistry
     /// arrive already evaluated.
     /// </summary>
     /// <remarks>
-    /// One implementation of the conditional family serves both entry points, rather than two that
-    /// have to be kept saying the same thing. There is no expression left to look at here, only a
-    /// column -- and that is enough now that a bare <c>NULL</c> arrives as a <c>void</c> column
-    /// rather than as an all-null string one, because the answer travels WITH the array. #293.
-    /// Ignoring the row selection is safe for the same reason the arrays are usable at all: every
-    /// one of these algorithms reads a branch only at the rows that selected it.
+    /// One implementation of the conditional family serves both entry points. There is no
+    /// expression left to look at here, only a column, but a bare <c>NULL</c> arrives as a
+    /// <c>void</c> column, so <c>IsNullLiteral</c> can read it from the array. Ignoring the
+    /// row selection is safe because every one of these algorithms reads a branch only at the
+    /// rows that selected it.
     /// </remarks>
     private sealed class EagerArguments : IConditionalArguments
     {
@@ -414,59 +397,42 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #296, and the arithmetic half of what #180/#259 did for comparison. Spark casts the STRING
-    /// side — it never renders the number as text — and the two dialects pick different targets,
-    /// exactly as they do for a comparison:
+    /// Spark casts the string side — it never renders the number as text — and the two dialects
+    /// pick different targets, as they do for a comparison:
     /// </para>
     /// <list type="bullet">
-    ///   <item><b>The legacy dialect sends it to <c>double</c>, always.</b> Measured with the
-    ///     value discriminators, not read off a type: <c>'1000000000000000000000000000001' +
-    ///     CAST(0 AS DECIMAL(38,0))</c> is <c>1e30</c> rather than the exact sum, and
-    ///     <c>'0.1' + CAST(0 AS FLOAT)</c> is the double 0.1 rather than the float one.</item>
-    ///   <item><b>ANSI sends it to the OTHER operand's family</b> — <c>bigint</c> against any
-    ///     integral width, <c>double</c> against a float, a double or a decimal. The integral
-    ///     target is bigint whatever the other operand is: measured,
-    ///     <c>'32768' + CAST(0 AS SMALLINT)</c> is 32768 and not an overflow.</item>
+    ///   <item>The legacy dialect sends it to <c>double</c>, always:
+    ///     <c>'1000000000000000000000000000001' + CAST(0 AS DECIMAL(38,0))</c> is <c>1e30</c>
+    ///     rather than the exact sum, and <c>'0.1' + CAST(0 AS FLOAT)</c> is the double 0.1
+    ///     rather than the float one.</item>
+    ///   <item>ANSI sends it to the other operand's family — <c>bigint</c> against any integral
+    ///     width (so <c>'32768' + CAST(0 AS SMALLINT)</c> is 32768, not an overflow), and
+    ///     <c>double</c> against a float, a double or a decimal.</item>
     /// </list>
     /// <para>
-    /// <b>The target is the same for <c>/</c>, even though a division's RESULT is always a
-    /// double.</b> That is the rule the issue's table stated the other way round, and one
-    /// expression separates them: under ANSI <c>'1.5' / 3</c> raises CAST_INVALID_INPUT, because
-    /// the string is read as a bigint before the division widens anything, while
-    /// <c>'1.5' / g</c> answers 0.6. So the dialect decides which strings are ACCEPTED and not
-    /// only what type comes back — ANSI's integral target inherits #258's integral TEXT rule,
-    /// under which <c>'1.5'</c> and <c>'1e3'</c> are not integers at all.
+    /// The target is the same for <c>/</c>, even though a division's result is always a double:
+    /// under ANSI <c>'1.5' / 3</c> raises CAST_INVALID_INPUT, because the string is read as a
+    /// bigint before the division widens anything, while <c>'1.5' / g</c> answers 0.6. So the
+    /// dialect decides which strings are accepted, not only what type comes back.
     /// </para>
     /// <para>
-    /// <b>Two strings are not an arithmetic pair under ANSI</b>, for any of the five operators:
-    /// <c>'1' + '2'</c> is a DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE where the legacy dialect
-    /// answers the double 3.0. <b>Neither is a string against a bare <c>NULL</c></b> — measured,
-    /// <c>'1' + NULL</c> refuses under ANSI while <c>'1' + CAST(NULL AS INT)</c> is a perfectly
-    /// good bigint null, so it is the absence of a type that refuses rather than the nullness.
-    /// A refusal is spelled as a throw, which is what the pair already did.
+    /// Under ANSI two strings are not an arithmetic pair for any of the five operators
+    /// (<c>'1' + '2'</c> is DATATYPE_MISMATCH.BINARY_OP_WRONG_TYPE; legacy answers 3.0), and
+    /// neither is a string against a bare <c>NULL</c>: <c>'1' + NULL</c> refuses while
+    /// <c>'1' + CAST(NULL AS INT)</c> is a bigint null, so it is the absence of a type that
+    /// refuses. Boolean, date, timestamp and binary refuse in both dialects: no target, so the
+    /// pair throws.
     /// </para>
     /// <para>
-    /// Boolean, date, timestamp and binary refuse in BOTH dialects and reach that by the same
-    /// route: no target, so the pair throws as it did before.
-    /// </para>
-    /// <para>
-    /// <b>A ROW WHOSE OTHER OPERAND IS NULL IS NOT CAST</b>, which is the same short-circuit
-    /// <see cref="CastForEquality"/> reproduces for a comparison and the reason
-    /// <see cref="NulledWhereOtherIsNull"/> is reached from two places. Spark evaluates nothing
-    /// once an operand of a null-intolerant operator is null, so a malformed string sitting
-    /// opposite one is never read and never refused. <b>It is symmetric</b>, which is the part
-    /// worth measuring rather than deriving from "the left child goes first": over a batch of
-    /// <c>(a = 1, s = '1')</c> and <c>(a = NULL, s = 'abc')</c>, ANSI answers <c>[2, null]</c> for
-    /// <c>a + s</c> AND for <c>s + a</c>, and raises for both the moment the same <c>'abc'</c>
-    /// sits beside a non-null <c>a</c>. Every operator behaves this way, and <c>-s</c> does not,
-    /// having no other operand to be null.
-    /// </para>
-    /// <para>
-    /// Without the mask a batch mixing one such row with an ordinary one refuses arithmetic Spark
-    /// answers — fail-CLOSED, and inside a Delta CHECK constraint that is a rejected write rather
-    /// than a wrong value. <b>The corpus cannot see it</b>: its rows are ordinary or entirely
-    /// null, so no row ever puts a malformed string beside a null number. Asserted over a batch
-    /// built for it in <c>ArithmeticStringCoercionTests</c> instead.
+    /// A row whose other operand is null is not cast — the same short-circuit
+    /// <see cref="CastForEquality"/> reproduces for a comparison. Spark evaluates nothing once an
+    /// operand of a null-intolerant operator is null, so a malformed string opposite one is never
+    /// read. This is symmetric: over rows <c>(a = 1, s = '1')</c> and <c>(a = NULL, s = 'abc')</c>,
+    /// ANSI answers <c>[2, null]</c> for both <c>a + s</c> and <c>s + a</c>, and raises for both
+    /// once the <c>'abc'</c> sits beside a non-null <c>a</c>. Without the mask such a batch would
+    /// refuse arithmetic Spark answers — inside a Delta CHECK constraint, a rejected write. The
+    /// corpus cannot see this (its rows are ordinary or entirely null); it is asserted in
+    /// <c>ArithmeticStringCoercionTests</c>.
     /// </para>
     /// </remarks>
     private (IArrowArray Left, IArrowArray Right) CoerceStringOperand(
@@ -489,7 +455,7 @@ public sealed class SparkFunctionRegistry
             ?? throw new NotSupportedException(
                 $"arithmetic is not defined for utf8 and {other.Name}");
 
-        // Masked before it is cast, and in EITHER operand order -- see the remarks.
+        // Masked before it is cast, and in either operand order -- see the remarks.
         return leftIsString
             ? (CastForArithmetic(NulledWhereOtherIsNull(left, right, rowCount), target, rowCount),
                right)
@@ -503,23 +469,20 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Close to <see cref="StringComparisonTarget"/> and deliberately not it. The ANSI halves
-    /// agree — bigint for an integral, double for anything else numeric — and the legacy halves
-    /// do not: a comparison casts the string to the other operand's OWN type, where arithmetic
-    /// sends it to double whatever the other operand is. Measured one expression apart,
-    /// <c>'0.1' = CAST(0.1 AS FLOAT)</c> is true (compared as floats) while
+    /// agree — bigint for an integral, double for anything else numeric — but in the legacy
+    /// dialect a comparison casts the string to the other operand's own type, where arithmetic
+    /// sends it to double: <c>'0.1' = CAST(0.1 AS FLOAT)</c> is true (compared as floats) while
     /// <c>'0.1' + CAST(0 AS FLOAT)</c> is the double 0.1. The other difference is <c>void</c>,
     /// which a comparison has no case for and arithmetic must refuse under ANSI.
     /// </remarks>
     private IArrowType? ArithmeticStringTarget(IArrowType other)
     {
-        // PAST SPARK'S MAXIMUM PRECISION THERE IS NO RULE, so there is no target either -- the
-        // same line `LegacyTarget` draws for a comparison, and drawn here for a second reason.
-        // Parquet's decimal runs wider than Spark's, so `ArrowSchemaConverter` builds a
-        // Decimal256Type above precision 38, and no Spark expression can name such a type: nothing
-        // measured says what adding a string to one means. Declining also keeps the refusal at the
-        // coercion site, where it can name the pair, rather than leaving it to
-        // `SparkArrays.ReadDouble`, whose numeric cases stop at Decimal128Array. The pair threw
-        // before this method existed and still throws; only the message moves.
+        // Past Spark's maximum precision there is no rule, so no target -- the same line
+        // `LegacyTarget` draws for a comparison. Parquet's decimal runs wider than Spark's, so
+        // `ArrowSchemaConverter` builds a Decimal256Type above precision 38, a type no Spark
+        // expression can name. Declining here keeps the refusal at the coercion site, where it
+        // can name the pair, rather than in `SparkArrays.ReadDouble`, whose numeric cases stop
+        // at Decimal128Array.
         if (other is Decimal256Type)
             return null;
 
@@ -542,11 +505,10 @@ public sealed class SparkFunctionRegistry
     /// The cast an arithmetic operator inserts on its string operand.
     /// </summary>
     /// <remarks>
-    /// The SAME cast <c>CAST(...)</c> reaches, for the reason
-    /// <see cref="CastForComparison"/> is: a string arithmetic accepts is exactly a string the
-    /// explicit cast accepts, and under the legacy dialect one it refuses is a null rather than a
-    /// raise. Measured, <c>'abc' + 1</c> raises CAST_INVALID_INPUT under ANSI and is NULL without
-    /// it.
+    /// The same cast <c>CAST(...)</c> reaches, as for <see cref="CastForComparison"/>: a string
+    /// arithmetic accepts is exactly a string the explicit cast accepts, and under the legacy
+    /// dialect one it refuses is a null rather than a raise. <c>'abc' + 1</c> raises
+    /// CAST_INVALID_INPUT under ANSI and is NULL without it.
     /// </remarks>
     private IArrowArray CastForArithmetic(IArrowArray operand, IArrowType target, int rowCount) =>
         Cast(operand, target, rowCount, raising: _options.Ansi, legacy: !_options.Ansi);
@@ -652,9 +614,9 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            // A zero divisor raises under ANSI even here. Measured, and not what IEEE 754 alone
-            // would suggest: `g / 0.0` and `g / g2` where the column holds 0.0 both report
-            // DIVIDE_BY_ZERO rather than yielding infinity.
+            // A zero divisor raises under ANSI even here, not what IEEE 754 alone would suggest:
+            // `g / 0.0` and `g / g2` where the column holds 0.0 both report DIVIDE_BY_ZERO
+            // rather than yielding infinity.
             if (op is "/" or "%" && b.Value == 0d)
             {
                 if (!_options.Ansi) { builder.AppendNull(); continue; }
@@ -743,8 +705,8 @@ public sealed class SparkFunctionRegistry
                 if (!_options.Ansi) continue;
 
                 // Spark's own message names the exact result, which we no longer hold once it has
-                // been rejected. The operands are as informative and cost nothing to keep: the
-                // error CLASS is the part a caller matches on, not the wording.
+                // been rejected. The operands are as informative; the error class is the part a
+                // caller matches on, not the wording.
                 throw SparkEvaluationException.NumericValueOutOfRange(
                     $"{Show(a.Value)} {op} {Show(b.Value)}", resultType);
             }
@@ -760,37 +722,23 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Unary minus.</summary>
     /// <remarks>
-    /// <b>Floating point negates in place; everything else subtracts from zero.</b> The two agree
-    /// at every value except zero, where IEEE 754 has two of them and subtraction cannot reach
-    /// the negative one: <c>0.0 - 0.0</c> is <c>+0.0</c> under round-to-nearest, so routing a
-    /// double through subtraction answered <c>0.0</c> where Spark answers <c>-0.0</c>. Measured
-    /// on 4.0.3, with the control in the corpus beside it — <c>-(0.0D)</c> renders <c>-0.0</c>
-    /// and <c>0.0D - 0.0D</c> renders <c>0.0</c>, so the two spellings really are different
-    /// questions rather than one written twice. #282.
+    /// Floating point negates in place; everything else subtracts from zero. The two agree at
+    /// every value except zero: <c>0.0 - 0.0</c> is <c>+0.0</c> under round-to-nearest, so
+    /// subtraction cannot reach the <c>-0.0</c> Spark answers for <c>-(0.0D)</c>. The sign of a
+    /// zero is invisible to a value comparison (<see cref="SparkFunctions.CompareAt"/> treats them
+    /// as equal, as Spark does), so it matters only where the answer is rendered.
     /// <para>
-    /// The sign of a zero is invisible to a value comparison — <c>-0.0 == 0.0</c> holds in .NET
-    /// as it does in Spark, and <see cref="SparkFunctions.CompareAt"/> deliberately agrees — so
-    /// only the RENDERING channel can see this at all. It matters wherever the answer is printed
-    /// or kept as a sort key.
-    /// </para>
-    /// <para>
-    /// An integral operand keeps the subtraction, and that is load-bearing rather than merely
-    /// inherited: it is what makes <c>-(-2147483648)</c> raise instead of wrapping back to
-    /// itself, since the range check on the subtraction catches a result the operand's own width
-    /// cannot hold. A decimal keeps it for the same reason, and has no negative zero to lose.
-    /// </para>
-    /// <para>
-    /// It is also cheaper, which is not why it changed: the floating-point path no longer builds
-    /// a column of zeros to subtract from, and reads one value per row instead of two.
+    /// An integral operand must keep the subtraction: it is what makes <c>-(-2147483648)</c>
+    /// raise instead of wrapping back to itself, since the range check on the subtraction catches
+    /// a result the operand's own width cannot hold. A decimal keeps it for the same reason, and
+    /// has no negative zero to lose.
     /// </para>
     /// </remarks>
     private IArrowArray Negate(IArrowArray operand, int rowCount)
     {
-        // A string negates as a DOUBLE, in BOTH dialects -- which is the one place #296's two
-        // rules agree, and it disagrees with the binary operators in the dialect that has a rule
-        // of its own: measured, `-'1'` is the double -1.0 under ANSI while `'1' + 1` is a bigint.
-        // Spark reads it through the same non-integral cast in either case, so `-'1e3'` is -1000.0
-        // where `'1e3' + 1` refuses. #296.
+        // A string negates as a double in both dialects, unlike the binary operators under ANSI:
+        // `-'1'` is the double -1.0 while `'1' + 1` is a bigint, so `-'1e3'` is -1000.0 where
+        // `'1e3' + 1` refuses.
         if (operand.Data.DataType is StringType)
             operand = CastForArithmetic(operand, DoubleType.Default, rowCount);
 
@@ -811,18 +759,14 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Not the identity, which is the whole of #313 and #340.</b> It is the identity for every
-    /// NUMERIC operand — which is why the parser discarding the token went unnoticed, and why the
-    /// corpus carried one unary-plus row against fourteen for unary minus. A STRING is cast to
-    /// DOUBLE, the same target <see cref="Negate"/> takes and through the same dialect-aware cast,
-    /// so <c>+'1'</c> is 1.0 and <c>+'abc'</c> raises under ANSI and is null under legacy.
+    /// It is the identity only for a numeric operand. A string is cast to double, the same target
+    /// <see cref="Negate"/> takes and through the same dialect-aware cast, so <c>+'1'</c> is 1.0
+    /// and <c>+'abc'</c> raises under ANSI and is null under legacy.
     /// </para>
     /// <para>
-    /// A <c>void</c> operand resolves <c>double</c> rather than staying void, and that is
-    /// observable rather than cosmetic: <c>coalesce(a, +NULL)</c> is a double to Spark where a
-    /// void branch would have left it an int. It has to be MATERIALISED at that type — returning
-    /// the operand unchanged would keep the void — which is the one place this differs from the
-    /// identity it otherwise is.
+    /// A <c>void</c> operand resolves <c>double</c> and must be materialised at that type rather
+    /// than returned unchanged: <c>coalesce(a, +NULL)</c> is a double to Spark where a void branch
+    /// would have left it an int.
     /// </para>
     /// </remarks>
     private IArrowArray Positive(IArrowArray operand, int rowCount)
@@ -839,7 +783,7 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Unary minus over a float or a double, which is a flip of the sign bit.</summary>
     /// <remarks>
-    /// A <c>void</c> operand arrives here as a double — <c>-NULL</c> is a double in Spark, #293 —
+    /// A <c>void</c> operand arrives here as a double — <c>-NULL</c> is a double in Spark —
     /// and <see cref="SparkArrays.ReadDouble"/> reads a <see cref="NullArray"/> as null, so it
     /// falls out as a column of nulls without a case of its own.
     /// </remarks>
@@ -888,24 +832,21 @@ public sealed class SparkFunctionRegistry
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// #281. Arithmetic takes the rule on either operand; <c>nullif</c> takes it on its SECOND
-    /// argument only, and nothing else takes it at all. Every one of those three answers was
-    /// measured off Spark 4.0.3's own plans rather than reasoned about, and the middle one is the
-    /// surprise: the optimized plan for <c>nullif(d5, 0)</c> is
+    /// Arithmetic takes the rule on either operand; <c>nullif</c> takes it on its second argument
+    /// only, and nothing else takes it. All three were read off Spark's optimized plans, and
+    /// <c>nullif</c> is the surprise: <c>nullif(d5, 0)</c> is
     /// <c>if (cast(d5 as decimal(38,37)) = cast(cast(0 as decimal(1,0)) as decimal(38,37)))
     /// null else d5</c> — the literal narrowed — while <c>nullif(0, d5)</c> is
     /// <c>if (cast(0 as decimal(38,28)) = cast(d5 as decimal(38,28))) null else 0</c>, where the
-    /// literal instead took the pair's common type. So the two disagree over the same values:
-    /// against <c>CAST(4E-32 AS DECIMAL(38,38))</c> the first answers the value and the second
-    /// answers NULL.
+    /// literal took the pair's common type. Against <c>CAST(4E-32 AS DECIMAL(38,38))</c> the
+    /// first answers the value and the second answers NULL.
     /// </para>
     /// <para>
-    /// <b>The absences are measured too, and they are the reason this is asked per name.</b>
     /// <c>greatest</c>, <c>least</c>, <c>coalesce</c>, <c>nvl</c>, <c>if</c> and <c>CASE</c> all
-    /// resolve <c>(d1, 2)</c> to decimal(12,2), the answer the int WIDTH gives, where the rule
+    /// resolve <c>(d1, 2)</c> to decimal(12,2), the answer the int width gives, where the rule
     /// would say decimal(10,2); and <c>round</c>'s second argument is a scale it needs as an
-    /// integer. A name absent from this switch gets no rule, which is the safe default in the
-    /// same sense <see cref="NeverNull"/>'s allow-list is.
+    /// integer. A name absent from this switch gets no rule, the safe default in the same sense
+    /// as <see cref="NeverNull"/>'s allow-list.
     /// </para>
     /// </remarks>
     public IArrowType? LiteralArgumentType(
@@ -928,10 +869,9 @@ public sealed class SparkFunctionRegistry
 
     /// <inheritdoc />
     /// <remarks>
-    /// The rule proper, and it is one line: a literal met with a DECIMAL is read as the narrowest
-    /// decimal that holds its value. The guard is Spark's own — the cast is inserted only where
-    /// the other operand is a decimal, so <c>a = 2</c> stays an integral comparison and
-    /// <c>g = 2</c> a floating one.
+    /// A literal met with a DECIMAL is read as the narrowest decimal that holds its value. The
+    /// cast is inserted only where the other operand is a decimal, so <c>a = 2</c> stays an
+    /// integral comparison and <c>g = 2</c> a floating one.
     /// </remarks>
     public IArrowType? LiteralComparisonType(long value, IArrowType other)
     {
@@ -945,19 +885,21 @@ public sealed class SparkFunctionRegistry
 
     /// <inheritdoc />
     /// <remarks>
-    /// Two rules, and they move different operands.
+    /// The rules move different operands.
     /// <list type="bullet">
     ///   <item>A STRING against a number, a boolean or an instant is cast to it —
     ///     <see cref="StringComparisonTarget"/> for which type exactly, since the dialects
     ///     disagree.</item>
-    ///   <item>A BINARY against a string is rendered AS a string, and it is the binary that
-    ///     moves. Measured: <c>CAST(X'FF' AS STRING) = X'FF'</c> is true, which only holds if
-    ///     both sides became text — cast the other way, U+FFFD's three UTF-8 bytes are not
-    ///     <c>FF</c>. Both dialects agree, and so do <c>'A' = bin</c> (true against
-    ///     <c>X'41'</c>) and <c>'B' &gt; bin</c>.</item>
-    ///   <item>An EXACT NUMERIC against another — a decimal, or an integral read as one — is
-    ///     compared through their least common type, and <b>both</b> operands can move.
-    ///     <see cref="LossyDecimalTarget"/>; #280.</item>
+    ///   <item>A BINARY against a string is rendered as a string; the binary moves.
+    ///     <c>CAST(X'FF' AS STRING) = X'FF'</c> is true, which only holds if both sides became
+    ///     text — cast the other way, U+FFFD's three UTF-8 bytes are not <c>FF</c>. Both dialects
+    ///     agree.</item>
+    ///   <item>A BOOLEAN under equality in the legacy dialect is cast to the numeric; see
+    ///     <see cref="BooleanEqualityTarget"/>.</item>
+    ///   <item>An integral against a FLOAT in the legacy dialect is compared as a float.</item>
+    ///   <item>An exact numeric against another — a decimal, or an integral read as one — is
+    ///     compared through their least common type, and both operands can move; see
+    ///     <see cref="LossyDecimalTarget"/>.</item>
     /// </list>
     /// A pair with no rule gets null from both operands and is compared as it stands.
     /// </remarks>
@@ -978,7 +920,7 @@ public sealed class SparkFunctionRegistry
         if (operand is BooleanType)
             return BooleanEqualityTarget(op, other);
 
-        // #299. The legacy dialect compares an integral with a FLOAT as a float, rounding the
+        // The legacy dialect compares an integral with a FLOAT as a float, rounding the
         // integral first -- `16777217 = CAST(16777216 AS FLOAT)` is true there -- where ANSI
         // compares both as doubles, which is what an untargeted pair already does.
         if (!_options.Ansi && SparkNumericTypes.IsIntegral(operand) && other is FloatType)
@@ -993,46 +935,32 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Spark's <c>BooleanEquality</c> coercion, and the BOOLEAN is what moves: measured on 4.0.3
-    /// with ansi off, <c>sh = bl</c> over <c>sh smallint</c> = 2 and <c>bl</c> = true is FALSE.
-    /// Reading the number for truthiness would make it true; casting the boolean to smallint
-    /// gives 1, and 2 is not 1. That single row is what fixes the direction.
+    /// Spark's <c>BooleanEquality</c> coercion, and the boolean is what moves: with ANSI off,
+    /// <c>sh = bl</c> over <c>sh smallint</c> = 2 and <c>bl</c> = true is false. Reading the
+    /// number for truthiness would make it true; casting the boolean to smallint gives 1.
     /// </para>
     /// <para>
-    /// <b>EQUALITY ONLY.</b> <c>=</c>, <c>&lt;&gt;</c> and <c>&lt;=&gt;</c> take it; ordering does
-    /// not, and is refused at analysis in BOTH dialects — <c>a &lt; bl</c> is
-    /// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c>. Answering ordering here would be inventing a
-    /// rule rather than reproducing one.
+    /// Equality only: <c>=</c>, <c>&lt;&gt;</c> and <c>&lt;=&gt;</c> take it; ordering is refused
+    /// at analysis in both dialects (<c>a &lt; bl</c> is
+    /// <c>DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES</c>). Legacy only: under ANSI every one of these
+    /// is refused at analysis too, which <see cref="CheckComparison"/> reports. The
+    /// <c>boolean-equality</c> corpus group carries both dialects.
     /// </para>
     /// <para>
-    /// <b>LEGACY ONLY.</b> Under ANSI every one of these is refused at analysis too, so returning
-    /// null there leaves the comparison answering per-row nulls — which is the #286 gap and not
-    /// this rule's business. The <c>boolean-equality</c> group of
-    /// <c>Fixtures/spark-expression-corpus.json</c> carries both dialects for exactly that reason.
+    /// The target is the numeric's own type, so the cast can overflow: <c>d5 = bl</c> over
+    /// <c>decimal(38,38)</c> is NULL where <c>bl</c> is true, because 1 does not fit a type that
+    /// is all scale. The legacy cast answers null there, as Spark does.
     /// </para>
     /// <para>
-    /// The target is the numeric's OWN type, so the cast can overflow: measured,
-    /// <c>d5 = bl</c> over <c>decimal(38,38)</c> is NULL on the row where <c>bl</c> is true,
-    /// because 1 does not fit a type that is all scale. The legacy cast answers null there, which
-    /// is the answer Spark gives.
+    /// <c>IN</c> does not take this rule and must not be given it here: <c>a IN (bl)</c> is
+    /// <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c> in both dialects, as are <c>coalesce(a, bl)</c>
+    /// and <c>greatest(a, bl)</c>. A set resolves one type over its members, where an equality
+    /// coerces a pair. See <see cref="SetComparisonTarget"/>.
     /// </para>
     /// <para>
-    /// <c>IN</c> does NOT take this rule and must not be given it here: measured,
-    /// <c>a IN (bl)</c> is <c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c> in both dialects, as are
-    /// <c>coalesce(a, bl)</c> and <c>greatest(a, bl)</c>. A set resolves ONE type over its
-    /// members and there is no common type here, where an equality coerces a PAIR. See
-    /// <see cref="SetComparisonTarget"/>, which is asked separately and answers separately.
-    /// </para>
-    /// <para>
-    /// <b>A <see cref="Decimal256Type"/> is declined</b>, the same line
-    /// <see cref="ArithmeticStringTarget"/> draws and for the same two reasons. Nothing measured
-    /// says what this means: Spark's decimal stops at precision 38 and cannot name the type at
-    /// all — it reaches us only because Parquet's decimal runs wider, so
-    /// <c>ArrowSchemaConverter</c> builds one. And <see cref="Cast"/> cannot produce one, so a
-    /// target returned here would turn a comparison that answers null into a
-    /// <c>NotSupportedException</c>. Returning a target a caller cannot cast to is the failure
-    /// <c>Decimal256ComparisonTests</c> was written for on #305; this is the same shape reached
-    /// through a boolean.
+    /// A <see cref="Decimal256Type"/> is declined, as in <see cref="ArithmeticStringTarget"/>:
+    /// Spark cannot name the type, and <see cref="Cast"/> cannot produce one, so a target returned
+    /// here would turn a comparison that answers null into a <c>NotSupportedException</c>.
     /// </para>
     /// </remarks>
     private IArrowType? BooleanEqualityTarget(ComparisonOperator op, IArrowType other)
@@ -1054,16 +982,15 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// MEASURED, not read off Spark's source: the `comparison-families` group asks all 81 ordered
-    /// pairs of the nine types EW models, under `=`, `&lt;&gt;`, `&lt;=&gt;`, `&lt;` and `IN`, in
-    /// both dialects. The whole 405-expression matrix collapses to these four families plus the
-    /// string row and column, and it is the SAME table for every one of those operators.
+    /// Measured rather than read off Spark's source: the <c>comparison-families</c> corpus group
+    /// asks all 81 ordered pairs of the nine types EW models, under <c>=</c>, <c>&lt;&gt;</c>,
+    /// <c>&lt;=&gt;</c>, <c>&lt;</c> and <c>IN</c>, in both dialects. The matrix collapses to these
+    /// four families plus the string row and column, the same table for every operator.
     /// </para>
     /// <para>
     /// <see cref="Unknown"/> is every type this does not name — a struct, a list, a map, a time.
-    /// It accepts rather than refuses, which is the direction that cannot break a caller: this
-    /// answers only where Spark's analyzer would have refused, and a type the matrix never asked
-    /// about is one we have no measurement for.
+    /// It accepts rather than refuses: this answers only where Spark's analyzer would have
+    /// refused, and a type the matrix never asked about has no measurement.
     /// </para>
     /// </remarks>
     private enum Family
@@ -1091,17 +1018,15 @@ public sealed class SparkFunctionRegistry
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// The family rule, and the one exception to it: under the LEGACY dialect a boolean joins the
-    /// numeric family for equality — Spark's <c>BooleanEquality</c>, which
-    /// <see cref="BooleanEqualityTarget"/> then actually performs. The two must agree, and that is
-    /// not a tidiness point: a check that refused what the coercion goes on to cast would turn
-    /// #333's fixed answers straight back into refusals, which is exactly the 24 legacy rows a
-    /// naive family check over-refused when this was first measured.
+    /// The family rule, with one exception: under the legacy dialect a boolean joins the numeric
+    /// family for equality — Spark's <c>BooleanEquality</c>, which
+    /// <see cref="BooleanEqualityTarget"/> performs. The two must agree; a check that refused what
+    /// the coercion goes on to cast would turn answered comparisons into refusals.
     /// </para>
     /// <para>
-    /// A <c>void</c> operand is comparable with everything and is accepted here. It reaches this
-    /// method only as a typed null — <c>ArrowRowEvaluator</c> does not ask about a bare
-    /// <c>NULL</c> literal at all, having no type to ask with.
+    /// A <c>void</c> operand is comparable with everything and is accepted here.
+    /// <c>ArrowRowEvaluator</c> does not ask about a bare <c>NULL</c> literal at all, having no
+    /// type to ask with.
     /// </para>
     /// </remarks>
     public AnalysisDiagnostic? CheckComparison(
@@ -1112,10 +1037,9 @@ public sealed class SparkFunctionRegistry
         if (right is null)
             throw new ArgumentNullException(nameof(right));
 
-        // A VOID operand is comparable with everything, ORDERING INCLUDED. Measured on 4.0.3,
-        // `NULL = bl`, `NULL = a` and even `NULL < bl` all resolve `boolean` in both dialects,
-        // where the same expressions over a typed null do not: `CAST(NULL AS INT) = bl` is
-        // refused under ANSI. So it is the absence of a type that is permissive, not nullness.
+        // A void operand is comparable with everything, ordering included: `NULL = bl`,
+        // `NULL = a` and `NULL < bl` all resolve in both dialects, while `CAST(NULL AS INT) = bl`
+        // is refused under ANSI. The absence of a type is permissive, not nullness.
         if (left is NullType || right is NullType)
             return null;
 
@@ -1131,18 +1055,17 @@ public sealed class SparkFunctionRegistry
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// <b>A set is not the disjunction of its equalities, and the matrix says so twice.</b> Under
-    /// the legacy dialect <c>a = bl</c> answers and <c>a IN (bl)</c> is refused, so the boolean
-    /// exception above does NOT reach a set; and a set mixing a string with a boolean or a binary
-    /// is refused under legacy where ANSI resolves it, which no comparison does. Measured, those
-    /// four rows — <c>bl IN (s)</c>, <c>bin IN (s)</c>, <c>s IN (bl)</c>, <c>s IN (bin)</c> — are
-    /// the only ones where the two dialects disagree about a set.
+    /// A set is not the disjunction of its equalities. Under the legacy dialect <c>a = bl</c>
+    /// answers and <c>a IN (bl)</c> is refused, so the boolean exception does not reach a set;
+    /// and a set mixing a string with a boolean or a binary is refused under legacy where ANSI
+    /// resolves it, which no comparison does. Those four rows — <c>bl IN (s)</c>,
+    /// <c>bin IN (s)</c>, <c>s IN (bl)</c>, <c>s IN (bin)</c> — are the only ones where the
+    /// dialects disagree about a set.
     /// </para>
     /// <para>
-    /// So: every member must share one family, a string is compatible with every family under
-    /// ANSI, and under legacy a string is compatible with every family EXCEPT boolean and binary.
-    /// Spark's own name for the failure is <c>DATA_DIFF_TYPES</c> rather than the binary
-    /// operator's class, and the list it prints is the members in order.
+    /// So every member must share one family, and a string is compatible with every family
+    /// except, under legacy, boolean and binary. Spark names the failure <c>DATA_DIFF_TYPES</c>
+    /// and prints the members in order.
     /// </para>
     /// </remarks>
     public AnalysisDiagnostic? CheckSetComparison(IReadOnlyList<IArrowType> memberTypes)
@@ -1150,10 +1073,10 @@ public sealed class SparkFunctionRegistry
         if (memberTypes is null)
             throw new ArgumentNullException(nameof(memberTypes));
 
-        // A VOID MEMBER CONSTRAINS NOTHING and is dropped before anything is judged -- the same
+        // A void member constrains nothing and is dropped before anything is judged -- the same
         // rule `CoerceSet` applies when it resolves the set's cast target. What is left still has
-        // to agree: measured, `NULL IN (1, TRUE)` is refused in both dialects while
-        // `NULL IN (1, 2)` resolves, so dropping the void does not excuse the rest of the list.
+        // to agree: `NULL IN (1, TRUE)` is refused in both dialects while `NULL IN (1, 2)`
+        // resolves.
         if (memberTypes.Any(t => t is NullType))
         {
             var typed = new List<IArrowType>(memberTypes.Count);
@@ -1166,12 +1089,9 @@ public sealed class SparkFunctionRegistry
             memberTypes = typed;
         }
 
-        // SCANNED FOR UNKNOWNS FIRST, so the answer cannot depend on the ORDER of the members.
-        // Returning "no opinion" the moment one is met made `[INT, BOOLEAN, STRUCT]` a refusal
-        // and `[STRUCT, INT, BOOLEAN]` an acceptance -- the same set, two answers, decided by
-        // where the unmeasured type happened to sit. Since the promise this method makes is no
-        // opinion about a list containing a type the matrix never asked about, it has to look for
-        // one before judging anything.
+        // Scanned for unknowns first, so the answer cannot depend on the order of the members:
+        // returning "no opinion" only when one is met would make `[INT, BOOLEAN, STRUCT]` a
+        // refusal and `[STRUCT, INT, BOOLEAN]` an acceptance.
         foreach (var type in memberTypes)
         {
             if (FamilyOf(type) == Family.Unknown)
@@ -1196,7 +1116,7 @@ public sealed class SparkFunctionRegistry
                 return DataDiffTypes(memberTypes);
         }
 
-        // A string PROMOTES to the one family the rest of the list shares -- except in the legacy
+        // A string promotes to the one family the rest of the list shares -- except in the legacy
         // dialect, where Spark's string promotion excludes boolean and binary and the set is
         // refused instead. An all-string list resolves as text and needs no rule at all.
         if (anyText && !_options.Ansi && resolved is Family.Boolean or Family.Binary)
@@ -1208,28 +1128,20 @@ public sealed class SparkFunctionRegistry
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// <b>A DATE has no numeric reading in Spark, in either dialect.</b> ANSI refuses the cast and
-    /// the legacy dialect answers null — it does not convert. Measured on 4.0.1 with
-    /// <c>storeAssignmentPolicy=ANSI</c> over the corpus's <c>dt</c>: <c>CAST(dt AS INT)</c>,
+    /// A DATE has no numeric reading in Spark, in either dialect: <c>CAST(dt AS INT)</c>,
     /// <c>BIGINT</c>, <c>FLOAT</c>, <c>DOUBLE</c> and <c>DECIMAL(10,2)</c> are all
-    /// <c>CAST_WITH_FUNC_SUGGESTION</c> under ANSI and all null under legacy. #332.
+    /// <c>CAST_WITH_FUNC_SUGGESTION</c> under ANSI and all null under legacy. A TIMESTAMP is not
+    /// a DATE here: it casts to epoch seconds. The other direction, a number to a DATE, is
+    /// <c>CastToDate</c>.
     /// </para>
     /// <para>
-    /// <b>A TIMESTAMP is not a DATE here.</b> It casts to epoch seconds and always has; the two
-    /// share a family everywhere else in this registry and part company on exactly this question.
-    /// </para>
-    /// <para>
-    /// The other direction is untouched: a number casts to a DATE, and that is <c>CastToDate</c>.
-    /// </para>
-    /// <para>
-    /// <b>One rule, not the table.</b> #286's cast table is 17 ANSI rows and 25 legacy ones; this
-    /// is the pair #332 measured and nothing else. Every other cast is still accepted here, which
-    /// leaves it exactly as it was rather than half-refusing a table that has not been written.
+    /// This is one rule, not the whole of Spark's cast table (#286); every other cast is accepted
+    /// here.
     /// </para>
     /// </remarks>
     public AnalysisDiagnostic? CheckCast(IArrowType source, IArrowType target, bool tryCast)
     {
-        // `tryCast` selects the TABLE, not the outcome: try_cast uses the ANSI table under both
+        // `tryCast` selects the table, not the outcome: try_cast uses the ANSI table under both
         // dialects, so an ANSI-only refusal is a legacy try_cast refusal too. Under a legacy
         // ordinary cast there is no refusal to report -- the answer is a null, which is a value
         // and not a diagnostic.
@@ -1271,20 +1183,18 @@ public sealed class SparkFunctionRegistry
         if (leftFamily == rightFamily)
             return true;
 
-        // A STRING is comparable with every family, in both dialects. WHICH operand then moves,
-        // and to what, is `ComparisonTarget`'s answer and not this one's.
+        // A string is comparable with every family, in both dialects. Which operand then moves,
+        // and to what, is `ComparisonTarget`'s answer.
         if (leftFamily == Family.Text || rightFamily == Family.Text)
             return true;
 
-        // #333: a boolean joins the numeric family, under the legacy dialect and for equality
-        // only. Every other cross-family pair is refused.
+        // A boolean joins the numeric family, under the legacy dialect and for equality only.
+        // Every other cross-family pair is refused.
         //
-        // THE FAMILY DECIDES, NOT `BooleanEqualityTarget`. That one answers a different question
-        // -- what to cast the boolean TO -- and it declines a Decimal256 because our own `Cast`
-        // cannot produce one, which is a limitation of ours rather than a rule of Spark's.
-        // Refusing here on its answer would turn `bl = wide256` from the null it answers today
-        // into an analysis refusal, which is the regression #345's review caught in the
-        // coercion and would simply reappear one layer up.
+        // The family decides, not `BooleanEqualityTarget`: that one declines a Decimal256
+        // because our own `Cast` cannot produce one, a limitation of ours rather than a rule of
+        // Spark's. Refusing on its answer would turn `bl = wide256` from a null answer into an
+        // analysis refusal.
         if (_options.Ansi)
             return false;
 
@@ -1316,20 +1226,20 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #280. Spark casts both operands of a comparison to their least common type and compares
-    /// the results, so once that type gives up scale — see
+    /// Spark casts both operands of a comparison to their least common type and compares the
+    /// results, so once that type gives up scale — see
     /// <see cref="SparkNumericTypes.ClampPreferringIntegralDigits"/> — the comparison is made on
-    /// ROUNDED values. Measured, <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c>
-    /// is TRUE, and <c>&gt;</c> over the same pair is FALSE: the common type is decimal(38,0)
-    /// and 1.005 rounds to 1 before either question is asked.
+    /// rounded values. <c>CAST(1.005 AS DECIMAL(4,3)) = CAST(1 AS DECIMAL(38,0))</c> is true and
+    /// <c>&gt;</c> over the same pair is false: the common type is decimal(38,0) and 1.005 rounds
+    /// to 1.
     /// </para>
     /// <para>
-    /// <b>An integral counts, and its WIDTH decides the answer.</b> An integral unifies as the
-    /// decimal that holds it, so it widens the common type's integer part and squeezes the
-    /// scale. Measured against <c>CAST(4E-32 AS DECIMAL(38,38))</c>, <c>= 0</c> is TRUE for an
-    /// <c>int</c> (common decimal(38,28), the value rounds away) and TRUE for a <c>bigint</c>
-    /// (decimal(38,18)) but FALSE for a <c>tinyint</c> (decimal(38,35), which still holds it).
-    /// Three answers from one comparison is why this cannot be special-cased to decimal pairs.
+    /// An integral counts, and its width decides the answer: it unifies as the decimal that holds
+    /// it, widening the common type's integer part and squeezing the scale. Against
+    /// <c>CAST(4E-32 AS DECIMAL(38,38))</c>, <c>= 0</c> is true for an <c>int</c> (common
+    /// decimal(38,28), the value rounds away) and for a <c>bigint</c> (decimal(38,18)) but false
+    /// for a <c>tinyint</c> (decimal(38,35), which still holds it). So this cannot be
+    /// special-cased to decimal pairs.
     /// </para>
     /// <para>
     /// Null whenever the common type keeps at least this operand's scale, which is the ordinary
@@ -1340,7 +1250,7 @@ public sealed class SparkFunctionRegistry
     private static IArrowType? LossyDecimalTarget(IArrowType operand, IArrowType other)
     {
         // Floating point is not exact and does not unify as a decimal -- a decimal against a
-        // double is compared as a double, which is a rule this must not intercept. #277.
+        // double is compared as a double, which is a rule this must not intercept.
         if (!SparkWideDecimals.IsExact(operand) || !SparkWideDecimals.IsExact(other))
             return null;
 
@@ -1361,20 +1271,19 @@ public sealed class SparkFunctionRegistry
     /// the pairwise one a comparison uses. The dialects reach it differently:
     /// </para>
     /// <list type="bullet">
-    ///   <item><b>ANSI</b> takes the members that are not strings, finds their common type, and
-    ///     applies the comparison rule to it — so <c>ns IN (1.5, 2)</c> resolves through
-    ///     <c>double</c> because a decimal and an int do, while <c>ns IN (1, 2)</c> resolves
-    ///     through <c>bigint</c>.</item>
-    ///   <item><b>The legacy dialect</b> promotes everything to STRING instead. That is what
-    ///     makes <c>a IN ('01')</c> false where <c>a = '01'</c> is true, and
-    ///     <c>d1 IN ('12.340')</c> false where the numbers are equal.</item>
+    ///   <item>ANSI takes the members that are not strings, finds their common type, and applies
+    ///     the comparison rule to it — so <c>ns IN (1.5, 2)</c> resolves through <c>double</c>
+    ///     because a decimal and an int do, while <c>ns IN (1, 2)</c> resolves through
+    ///     <c>bigint</c>.</item>
+    ///   <item>The legacy dialect promotes everything to STRING instead. That is what makes
+    ///     <c>a IN ('01')</c> false where <c>a = '01'</c> is true, and <c>d1 IN ('12.340')</c>
+    ///     false where the numbers are equal.</item>
     /// </list>
     /// <para>
-    /// Spark's string promotion excludes boolean and binary, and measured, it refuses those sets
-    /// outright rather than answering: <c>bl IN ('true')</c> and <c>bin IN ('A')</c> are
-    /// analysis errors under the legacy dialect and answers under ANSI. Refusing is not
-    /// reproduced here — this returns null, the set is compared as it stands, and the difference
-    /// is declared in <c>SparkEvaluationCorpusTests</c>.
+    /// Spark's string promotion excludes boolean and binary, and refuses those sets outright:
+    /// <c>bl IN ('true')</c> and <c>bin IN ('A')</c> are analysis errors under the legacy dialect
+    /// and answers under ANSI. This returns null for them; the refusal is
+    /// <see cref="CheckSetComparison"/>'s.
     /// </para>
     /// </remarks>
     public IArrowType? SetComparisonTarget(IReadOnlyList<IArrowType> memberTypes)
@@ -1388,8 +1297,8 @@ public sealed class SparkFunctionRegistry
 
         if (!anyString)
         {
-            // #299, as for a binary comparison: under the legacy dialect a set holding a float and
-            // an integral resolves FLOAT, so every member is rounded onto it. `CommonType` already
+            // As for a binary comparison: under the legacy dialect a set holding a float and an
+            // integral resolves FLOAT, so every member is rounded onto it. `CommonType` already
             // answers float for exactly that set; it is only returned when some member moves.
             if (common is FloatType)
             {
@@ -1402,22 +1311,18 @@ public sealed class SparkFunctionRegistry
                 return null;
             }
 
-            // #280. No string to promote, but a set of exact numerics still resolves through one
-            // type, and that type can give up scale. Measured,
-            // `CAST(1.005 AS DECIMAL(4,3)) IN (CAST(1 AS DECIMAL(38,0)))` is TRUE -- the same
-            // rounding a comparison against that operand does, which is what makes IN and `=`
-            // agree here even though they disagree over a string. Null unless some member
-            // actually loses scale, so an ordinary set is still compared as it stands.
+            // No string to promote, but a set of exact numerics still resolves through one type,
+            // and that type can give up scale: `CAST(1.005 AS DECIMAL(4,3)) IN
+            // (CAST(1 AS DECIMAL(38,0)))` is true, the same rounding `=` does. Null unless some
+            // member actually loses scale, so an ordinary set is compared as it stands.
             if (common is not Decimal128Type decimalCommon)
                 return null;
 
-            // EVERY member has to be one the exact-decimal path can actually move, not just the
-            // one that loses scale, because the caller casts them all. A decimal256 is the case
-            // that separates the two: `CommonType` reads its precision and scale happily and
-            // hands back a decimal128 common type, but `SparkWideDecimals` cannot read one, so
-            // returning a target here turns an answer into a throw. Measured before this guard:
-            // a decimal(38,38) column `IN` a decimal256(38,0) column threw where it used to
-            // answer. Bailing leaves the exact comparison, which is what the pair had before.
+            // Every member has to be one the exact-decimal path can move, not just the one that
+            // loses scale, because the caller casts them all. A decimal256 separates the two:
+            // `CommonType` reads its precision and scale and hands back a decimal128 common
+            // type, but `SparkWideDecimals` cannot read one, so returning a target would turn an
+            // answer into a throw. Bailing leaves the exact comparison.
             var anyRounds = false;
             foreach (var type in memberTypes)
             {
@@ -1433,8 +1338,8 @@ public sealed class SparkFunctionRegistry
 
         if (_options.Ansi)
         {
-            // A binary renders as text here for the same reason it does in a comparison, and
-            // measured it answers rather than refusing: `bin IN ('A')` is false under ANSI.
+            // A binary renders as text here as it does in a comparison, and answers rather than
+            // refusing: `bin IN ('A')` is false under ANSI.
             return common is BinaryType ? StringType.Default : StringComparisonTarget(common);
         }
 
@@ -1491,7 +1396,7 @@ public sealed class SparkFunctionRegistry
 
     /// <inheritdoc />
     /// <remarks>
-    /// The cast is the SAME one <c>CAST(...)</c> reaches, dialect and all, so a comparison and an
+    /// The cast is the same one <c>CAST(...)</c> reaches, dialect and all, so a comparison and an
     /// explicit cast cannot drift apart: <c>s = a</c> refuses exactly the strings
     /// <c>CAST(s AS BIGINT)</c> refuses.
     /// </remarks>
@@ -1511,16 +1416,14 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// One rule with one exception: the string takes the other operand's OWN type, and ANSI
-    /// widens a numeric one first — to <c>BIGINT</c> for every integral width, and to
-    /// <c>DOUBLE</c> for float, double and decimal alike. Boolean, date and timestamp take the
-    /// other side's type under both dialects; the dialects then differ only in what a malformed
-    /// value does, which is the ordinary raise-or-null split.
+    /// The string takes the other operand's own type, except that ANSI widens a numeric one first
+    /// — to <c>BIGINT</c> for every integral width, and to <c>DOUBLE</c> for float, double and
+    /// decimal alike. Boolean, date and timestamp take the other side's type under both dialects,
+    /// which then differ only in the ordinary raise-or-null split for a malformed value.
     /// </para>
     /// <para>
-    /// <b>The widening is not cosmetic, and it is the half the issue did not record.</b> Each of
-    /// these is one expression with two answers, measured against Spark 4.0 and pinned by the
-    /// <c>string-coercion</c> group of the corpus:
+    /// The widening is observable; each of these is one expression with two answers, pinned by
+    /// the <c>string-coercion</c> corpus group:
     /// </para>
     /// <list type="bullet">
     ///   <item><c>'32768' = sh</c> over a <c>smallint</c>: false under ANSI, where the string
@@ -1565,13 +1468,11 @@ public sealed class SparkFunctionRegistry
     /// <c>decimal(38,0)</c> can arrive as a <see cref="Decimal256Type"/> and the cast has a case
     /// only for <see cref="Decimal128Type"/>. Precision and scale are what it actually needs.
     /// <para>
-    /// <b>Past Spark's maximum precision there is no rule and no cast.</b> Parquet's decimal runs
-    /// wider than Spark's — <c>ArrowSchemaConverter</c> builds a <see cref="Decimal256Type"/> for
-    /// precision above 38 — and no Spark expression can name such a type, so nothing measured
-    /// says what comparing a string against one means. Handing it on would be worse than
-    /// declining: <see cref="Decimal128Type"/> does not validate its precision, so a
-    /// <c>decimal(50,0)</c> became a 16-byte decimal claiming fifty digits and the comparison
-    /// answered from it. Measured, before this returned null.
+    /// Past Spark's maximum precision there is no rule and no cast. Parquet's decimal runs wider
+    /// than Spark's — <c>ArrowSchemaConverter</c> builds a <see cref="Decimal256Type"/> for
+    /// precision above 38 — and no Spark expression can name such a type. Handing it on would be
+    /// worse than declining: <see cref="Decimal128Type"/> does not validate its precision, so a
+    /// <c>decimal(50,0)</c> would become a 16-byte decimal claiming fifty digits.
     /// </para>
     /// </remarks>
     private static IArrowType? LegacyTarget(IArrowType numeric)
@@ -1593,23 +1494,20 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The rule's whole content is in <c>SparkSpecialDatetimeValues</c>; what is here is where it
-    /// applies. <b>Both cast spellings, and no other function.</b> Spark's rule matches
+    /// The rule's content is in <c>SparkSpecialDatetimeValues</c>; this is where it applies: both
+    /// cast spellings, and no other function. Spark's rule matches
     /// <c>Cast(e, DateType | TimestampType | TimestampNTZType)</c>, and <c>try_cast</c> is a
-    /// <c>Cast</c> with a different eval mode rather than a node of its own, so it folds too --
-    /// measured, <c>try_cast('epoch' AS DATE)</c> is 1970-01-01 and not the null the name
-    /// suggests.
+    /// <c>Cast</c> with a different eval mode, so it folds too — <c>try_cast('epoch' AS DATE)</c>
+    /// is 1970-01-01.
     /// </para>
     /// <para>
-    /// <b>TIMESTAMP_NTZ is left out, not forgotten.</b> Spark's rule covers it with a third
-    /// conversion whose <c>now</c> and <c>today</c> resolve in local time rather than as
-    /// instants, and this library has no NTZ type to produce -- <c>ParseTypeName</c> refuses the
-    /// spelling outright. #349.
+    /// TIMESTAMP_NTZ is deliberately left out: Spark covers it with a third conversion whose
+    /// <c>now</c> and <c>today</c> resolve in local time, and this library has no NTZ type to
+    /// produce (<c>ParseTypeName</c> refuses the spelling).
     /// </para>
     /// <para>
-    /// <b>Null is returned for everything it does not recognise</b>, including a word that is not
-    /// in the vocabulary, so the cast still runs and the dialect still decides whether
-    /// <c>CAST('someday' AS DATE)</c> refuses or reads null.
+    /// Null is returned for everything it does not recognise, so the cast still runs and the
+    /// dialect decides whether <c>CAST('someday' AS DATE)</c> refuses or reads null.
     /// </para>
     /// </remarks>
     public IArrowArray? InvokeOverConstants(string name, IReadOnlyList<IArrowArray> args, int rowCount)
@@ -1680,35 +1578,30 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Three states, not two: <c>raising</c> is ANSI's cast, <c>legacy</c> is the non-ANSI
-    /// dialect's, and NEITHER is try_cast, which yields null whichever dialect is in force.
+    /// dialect's, and neither is try_cast, which yields null whichever dialect is in force.
     /// <para>
     /// Most targets null under both of the last two and take <paramref name="raising"/> alone.
-    /// Three read <paramref name="legacy"/>, and each reads it for a different reason:
-    /// <see cref="CastToIntegral"/>, because the legacy dialect WRAPS an overflow where
-    /// try_cast nulls it; <see cref="CastToBinary"/> and <see cref="CastToBoolean"/>, because
-    /// each has a SOURCE the legacy dialect alone accepts — an integral and a temporal
-    /// respectively — and try_cast type-checks as ANSI does, so both must refuse it with ansi
-    /// off as well. That is the whole reason the pair is three states rather than a bool.
+    /// Those that read <paramref name="legacy"/>: <see cref="CastToIntegral"/>, because the legacy
+    /// dialect wraps an overflow where try_cast nulls it; <see cref="CastToBinary"/> and
+    /// <see cref="CastToBoolean"/>, because each has a source only the legacy dialect accepts —
+    /// an integral and a temporal respectively — and try_cast type-checks as ANSI does;
+    /// <see cref="CastToString"/>, because the legacy dialect spells a decimal differently; and
+    /// the DATE-to-number refusal below.
     /// </para>
     /// </remarks>
     private IArrowArray Cast(IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
     {
-        // A `void` source is null at every row, so it is null at the target too -- whatever the
-        // target is, and in either dialect, since there is no value to be malformed. Answered here
-        // rather than in each CastToX because it is the same answer for all of them, and because
-        // two of those refuse a source they do not recognise: measured, `CAST(NULL AS BINARY)` is
-        // a binary null in Spark where CastToBinary would have said VOID cannot become one. #293.
+        // A `void` source is null at every row, so it is null at the target too, in either
+        // dialect. Answered here rather than in each CastToX because two of those refuse a source
+        // they do not recognise, where `CAST(NULL AS BINARY)` is a binary null in Spark.
         if (source.Data.DataType is NullType)
             return ArrowCompute.MakeNullArray(target, rowCount);
 
-        // A PROPERTY OF THE TWO TYPES, ASKED ONCE AND BEFORE THE ROW LOOP. The refusal this
-        // replaces was thrown from inside CastToIntegral after reading a value, which made the
-        // same expression refuse or answer depending on the batch: measured,
-        // `CAST(nullif(dt, dt) AS INT)` answered null where `CAST(dt AS INT)` threw. #332, #286.
-        //
-        // `legacy` is what separates the two outcomes, and it is exactly the right flag: it is
+        // A property of the two types, asked once before the row loop, so the same expression
+        // cannot refuse or answer depending on the batch: under ANSI,
+        // `CAST(nullif(dt, dt) AS INT)` must refuse just as `CAST(dt AS INT)` does. `legacy` is
         // false for try_cast as well as for an ANSI cast, which is the ANSI table applying in
-        // both -- see the `try_cast` case in Invoke for why one flag could not always do this.
+        // both.
         if (RefusesNumericReading(source.Data.DataType, target))
         {
             if (!legacy)
@@ -1749,16 +1642,14 @@ public sealed class SparkFunctionRegistry
     /// Casts to a calendar date, taking the date the instant falls on in the resolved timezone.
     /// </summary>
     /// <remarks>
-    /// This is where <see cref="SparkDialectOptions.TimeZone"/> is load-bearing rather than
-    /// decorative. The instant 2026-08-11T03:00Z is 2026-08-11 in UTC and 2026-08-10 in
-    /// America/Los_Angeles, so a generated column defined as <c>CAST(ts AS DATE)</c> stores a
-    /// different value depending on which zone resolves it. UTC is the fixed choice; see the
-    /// option for why it is not settable.
+    /// This is where <see cref="SparkDialectOptions.TimeZone"/> matters: the instant
+    /// 2026-08-11T03:00Z is 2026-08-11 in UTC and 2026-08-10 in America/Los_Angeles, so a
+    /// generated column defined as <c>CAST(ts AS DATE)</c> stores a different value depending on
+    /// which zone resolves it. UTC is the fixed choice; see the option for why it is not settable.
     /// <para>
     /// A STRING source is read by <see cref="SparkTemporalText.TryReadDate"/>, which is Spark's
-    /// own grammar and not <c>DateTimeOffset.TryParse</c>. #318, and worth reading before
-    /// assuming this accepts what a date parser usually accepts — <c>'08/11/2026'</c> is not a
-    /// date, and <c>'2026'</c> is.
+    /// own grammar and not <c>DateTimeOffset.TryParse</c>: <c>'08/11/2026'</c> is not a date,
+    /// and <c>'2026'</c> is.
     /// </para>
     /// </remarks>
     private IArrowArray CastToDate(IArrowArray source, int rowCount, bool raising)
@@ -1793,13 +1684,10 @@ public sealed class SparkFunctionRegistry
 
     private IArrowArray CastToTimestamp(IArrowArray source, int rowCount, bool raising)
     {
-        // A BOOLEAN IS NOT A NUMBER OF SECONDS, and it is the one source family that is not.
-        // Spark hands the flag's 1 straight to the microsecond field, so `CAST(true AS TIMESTAMP)`
-        // is the epoch plus ONE MICROSECOND -- measured on 4.0.1 with ansi off, which is the only
-        // dialect that allows the cast at all. Every integral source beside it really is seconds
-        // (`CAST(CAST(10 AS BIGINT) AS TIMESTAMP)` is 00:00:10 in both engines), so the two cannot
-        // share the numeric branch below. Answered off the column's TYPE rather than per row,
-        // because that is what it is a property of. #330.
+        // A boolean is not a number of seconds: Spark hands the flag's 1 straight to the
+        // microsecond field, so `CAST(true AS TIMESTAMP)` is the epoch plus one microsecond
+        // (Spark allows the cast only with ANSI off). Every integral source really is seconds,
+        // so the two cannot share the numeric branch below.
         if (source is BooleanArray booleans)
             return SparkArrays.BuildTimestamp(BooleanInstants(booleans, rowCount), rowCount);
 
@@ -1873,14 +1761,11 @@ public sealed class SparkFunctionRegistry
     /// Epoch seconds as whole microseconds, truncated rather than rounded.
     /// </summary>
     /// <remarks>
-    /// <b>Spark keeps the fraction, and it keeps it TOWARD ZERO.</b> Measured on 4.0.1, both
-    /// dialects: <c>CAST(CAST(1.9999999 AS DOUBLE) AS TIMESTAMP)</c> is <c>00:00:01.999999</c> and
-    /// not <c>00:00:02</c>, and <c>CAST(CAST(0.0000005 AS DOUBLE) AS TIMESTAMP)</c> is the epoch —
-    /// so sub-microsecond is dropped and nothing rounds up into the next tick. The negative side
-    /// is what makes the direction observable rather than cosmetic:
-    /// <c>CAST(CAST(-2.5 AS DOUBLE) AS TIMESTAMP)</c> is <c>23:59:57.5</c>, where truncating the
-    /// SECONDS (as this did before #329) landed on <c>23:59:58</c> — past the true instant rather
-    /// than short of it.
+    /// Spark keeps the fraction and truncates it toward zero, in both dialects:
+    /// <c>CAST(CAST(1.9999999 AS DOUBLE) AS TIMESTAMP)</c> is <c>00:00:01.999999</c>, and
+    /// <c>CAST(CAST(0.0000005 AS DOUBLE) AS TIMESTAMP)</c> is the epoch. On the negative side,
+    /// <c>CAST(CAST(-2.5 AS DOUBLE) AS TIMESTAMP)</c> is <c>23:59:57.5</c>; truncating the seconds
+    /// instead would land on <c>23:59:58</c>.
     /// <para>
     /// The multiplication cannot overflow: the caller has already bounded the value by
     /// <see cref="MaxEpochSecond"/>, so the product stays under 2.6e17 and well inside both
@@ -1904,8 +1789,8 @@ public sealed class SparkFunctionRegistry
     /// <summary>Casts a column to an integral type.</summary>
     /// <remarks>
     /// Under ANSI an overflow raises and the source type only decides the error class. With the
-    /// legacy dialect it decides the ANSWER, and there are four rules rather than one — see
-    /// <see cref="SparkIntegralCasts"/>, where each is measured. #243.
+    /// legacy dialect it decides the answer, and there are four rules rather than one — see
+    /// <see cref="SparkIntegralCasts"/>.
     /// </remarks>
     private IArrowArray CastToIntegral(
         IArrowArray source, IArrowType target, int rowCount, bool raising, bool legacy)
@@ -1914,10 +1799,9 @@ public sealed class SparkFunctionRegistry
         var described = SparkArrays.Describe(target);
         var family = SparkIntegralCasts.FamilyOf(source.Data.DataType);
 
-        // Every failure of a STRING source is CAST_INVALID_INPUT and never CAST_OVERFLOW, whether
-        // the text was malformed or merely too large. Measured, and it follows from the parse
-        // being what failed: Spark's integral parser does not read a value it cannot hold, so
-        // there is no overflow for it to report.
+        // Every failure of a string source is CAST_INVALID_INPUT and never CAST_OVERFLOW, whether
+        // the text was malformed or merely too large: Spark's integral parser does not read a
+        // value it cannot hold, so there is no overflow for it to report.
         SparkEvaluationException Refuse(string text) =>
             family == SparkIntegralCasts.Source.Text
                 ? SparkEvaluationException.InvalidCast(text, described)
@@ -1936,9 +1820,9 @@ public sealed class SparkFunctionRegistry
             }
 
             // Spark's integral parse is stricter than the one that produced this value: it takes
-            // a sign, digits and an optional point, and NO exponent -- so `CAST('1e3' AS BIGINT)`
+            // a sign, digits and an optional point, and no exponent -- so `CAST('1e3' AS BIGINT)`
             // fails where `CAST('1e3' AS DOUBLE)` is 1000. Both dialects refuse it; only what
-            // the failure looks like differs. #258.
+            // the failure looks like differs.
             var form = value.Value.FromString
                 ? SparkIntegralCasts.Classify(value.Value.Text)
                 : SparkIntegralCasts.TextForm.Integer;
@@ -1959,14 +1843,14 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            // A string carrying a decimal POINT is where the dialects part: ANSI refuses it, and
-            // the legacy dialect TRUNCATES toward zero and carries on to the range check below.
-            // Both measured — CAST('12.5' AS INT) is an error under ANSI and 12 without it,
-            // while CAST('300.5' AS TINYINT) is null because 300 does not fit rather than
-            // because of the fraction. try_cast takes ANSI's reading of the value and nulls it.
+            // A string carrying a decimal point is where the dialects part: ANSI refuses it, and
+            // the legacy dialect truncates toward zero and carries on to the range check below.
+            // CAST('12.5' AS INT) is an error under ANSI and 12 without it, while
+            // CAST('300.5' AS TINYINT) is null because 300 does not fit. try_cast takes ANSI's
+            // reading of the value and nulls it.
             //
             // The point, not the fraction: ANSI refuses '1.0', '0.0' and '10.' too, so asking
-            // whether the VALUE survives truncation accepted all three. #258.
+            // whether the value survives truncation would accept all three.
             if (!legacy && form == SparkIntegralCasts.TextForm.Fractional)
             {
                 if (!raising) continue;
@@ -2001,10 +1885,10 @@ public sealed class SparkFunctionRegistry
 
     private IArrowArray CastToFloatingPoint(IArrowArray source, IArrowType target, int rowCount, bool raising)
     {
-        // A NUMERIC source reaches a float directly, rounded once from its exact value (#299 for
-        // a bigint, #372 for a decimal), and without building the per-row cast input at all: that
-        // input carries the DOUBLE reading, which for a wide decimal is an exact conversion of
-        // its own that the float would only throw away.
+        // A numeric source reaches a float directly, rounded once from its exact value (a bigint
+        // or decimal narrowed through double could round twice), and without building the
+        // per-row cast input: that input carries the double reading, which for a wide decimal
+        // is an exact conversion of its own that the float would only throw away.
         if (target is FloatType && SparkNumericTypes.IsNumeric(source.Data.DataType))
         {
             var direct = new FloatArray.Builder();
@@ -2028,9 +1912,9 @@ public sealed class SparkFunctionRegistry
 
             // Java's floating-point literal takes a trailing type suffix, and Spark's parse is
             // Java's: CAST('1d' AS DOUBLE) is 1.0 and CAST('1.5f' AS FLOAT) is 1.5, where .NET
-            // reads neither. It attaches to a NUMERIC form only -- 'NaNd' and 'Infinityf' are
+            // reads neither. It attaches to a numeric form only -- 'NaNd' and 'Infinityf' are
             // refused -- and only a floating target takes it, CAST('1d' AS DECIMAL(20,4)) being
-            // an error. Measured; #258.
+            // an error.
             if (value is { IsNumeric: false, FromString: true })
             {
                 if (doubles is not null && SparkArrays.TryReadTypeSuffixed(value.Value.Text, out double suffixed))
@@ -2066,10 +1950,10 @@ public sealed class SparkFunctionRegistry
 
             doubles?.Append(value.Value.AsDouble);
 
-            // Rounded ONCE, from the text: Spark reads it with Float.parseFloat, and a double
-            // reading narrowed to float can land on the other side of a tie. #372. A numeric
-            // source never reaches here; what else does -- a boolean, a temporal -- is an integer
-            // well inside a double's exact range.
+            // Rounded once, from the text: Spark reads it with Float.parseFloat, and a double
+            // reading narrowed to float can land on the other side of a tie. A numeric source
+            // never reaches here; what else does -- a boolean, a temporal -- is an integer well
+            // inside a double's exact range.
             if (floats is not null)
             {
                 if (value.Value.FromString && SparkArrays.TryReadFloat(value.Value.Text, out var fromText))
@@ -2089,12 +1973,12 @@ public sealed class SparkFunctionRegistry
         if (SparkWideDecimals.IsExact(source.Data.DataType))
             return CastExactToDecimal(source, target, rowCount, raising);
 
-        // A string is the only other source that can spell a value past System.Decimal's ~7.9e28,
-        // and #174 measured what Spark does when one does, so it reads exactly too.
+        // A string is the only other source that can spell a value past System.Decimal's
+        // ~7.9e28, so it reads exactly too.
         if (source is StringArray strings)
             return CastStringToDecimal(strings, target, rowCount, raising);
 
-        // Floating point goes through its RENDERING, which is what Spark converts. #244.
+        // Floating point goes through its rendering, which is what Spark converts.
         if (source.Data.DataType is FloatType or DoubleType)
             return CastFloatingToDecimal(source, target, rowCount, raising);
 
@@ -2118,24 +2002,20 @@ public sealed class SparkFunctionRegistry
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, SparkArrays.Describe(target));
             }
 
-            // Both refusals below are NUMERIC_VALUE_OUT_OF_RANGE rather than CAST_OVERFLOW, which
-            // is what this used to report. Measured: a cast to a decimal names that condition
-            // whatever the source is — decimal, double, string or integer all reach it — while
-            // CAST_OVERFLOW belongs to casts targeting an integral type.
+            // Both refusals below are NUMERIC_VALUE_OUT_OF_RANGE rather than CAST_OVERFLOW: a cast
+            // to a decimal names that condition whatever the source is, while CAST_OVERFLOW
+            // belongs to casts targeting an integral type.
             if (value.Value.Exact is not { } exact)
             {
                 if (!raising) { builder.AppendNull(); continue; }
                 throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
 
-            // RANGE-CHECKED HERE RATHER THAN LEFT TO THE BUILDER, which is what #331 was: the
-            // builder's own check counts the digits of the value it is handed, and `Rescale` is
-            // `Math.Round`, which rounds TO a scale without PADDING to one. So a whole number
-            // arrived at scale 0 however deep the target's scale was, its digits were counted
-            // against the precision alone, and the scale's share of that precision was never
-            // charged for. `CAST(ts AS DECIMAL(10,2))` wrote 178645140000 into a vector declared
-            // to hold ten digits. Only when the two scales happened to coincide -- decimal(9,0)
-            // for a whole second -- did the builder catch anything.
+            // Range-checked here rather than left to the builder: the builder counts the digits
+            // of the value it is handed, and `Rescale` is `Math.Round`, which rounds to a scale
+            // without padding to one. A whole number would arrive at scale 0 however deep the
+            // target's scale, and the scale's share of the precision would never be charged --
+            // `CAST(ts AS DECIMAL(10,2))` would write 178645140000 into a ten-digit vector.
             var rounded = SparkArrays.Rescale(exact, target.Scale);
 
             if (!FitsPrecision(rounded, target))
@@ -2150,10 +2030,9 @@ public sealed class SparkFunctionRegistry
             }
             catch (OverflowException)
             {
-                // Kept behind the check rather than replaced by it. The check models Spark's
-                // range and the builder enforces Arrow's, and they are not the same rule --
-                // anything Arrow refuses that this does not model still has to become a refusal
-                // rather than escape as a bare BCL exception.
+                // Kept behind the check: the check models Spark's range and the builder enforces
+                // Arrow's, and anything Arrow refuses that this does not model still has to
+                // become a refusal rather than escape as a bare BCL exception.
                 if (!raising) { builder.AppendNull(); continue; }
                 throw SparkEvaluationException.NumericValueOutOfRange(value.Value.Text, target);
             }
@@ -2169,26 +2048,19 @@ public sealed class SparkFunctionRegistry
     /// <remarks>
     /// <para>
     /// A <c>decimal(p, s)</c> holds <c>p</c> digits of which <c>s</c> are fractional, so the
-    /// value must satisfy <c>|v| &lt; 10^(p-s)</c>. Measured on Spark 4.0.1 over a timestamp
-    /// (1786451400, ten digits) and a boolean, both dialects: <c>decimal(10,0)</c> and
-    /// <c>decimal(12,2)</c> answer, <c>decimal(10,2)</c> and <c>decimal(11,2)</c> do not, and
-    /// <c>CAST(true AS DECIMAL(1,1))</c> does not either — one does not fit a type whose every
-    /// digit is fractional, though <c>decimal(2,1)</c> holds it.
+    /// value must satisfy <c>|v| &lt; 10^(p-s)</c>. Over a timestamp (1786451400, ten digits),
+    /// <c>decimal(10,0)</c> and <c>decimal(12,2)</c> answer while <c>decimal(10,2)</c> and
+    /// <c>decimal(11,2)</c> do not; <c>CAST(true AS DECIMAL(1,1))</c> does not either, though
+    /// <c>decimal(2,1)</c> holds it.
     /// </para>
     /// <para>
-    /// <b>The ROUNDED value is the one measured</b>, because that is the order Spark works in:
-    /// a value is brought to the target's scale and the result is what has to fit.
+    /// The rounded value is the one checked, because that is the order Spark works in: a value is
+    /// brought to the target's scale and the result is what has to fit.
     /// </para>
     /// <para>
     /// Above 28 integer digits every <see cref="decimal"/> fits by construction — the type tops
-    /// out near 7.9e28 — and the bound itself would have no <see cref="decimal"/> form to compare
-    /// against, so it is answered without reaching for one.
-    /// </para>
-    /// <para>
-    /// The bound is read from <see cref="PowersOfTen"/> rather than multiplied up, because this
-    /// runs once per non-null row while the target it depends on is fixed for the whole cast:
-    /// building it in place cost up to 28 decimal multiplications a row to reach the same answer
-    /// every time.
+    /// out near 7.9e28 — and the bound would have no <see cref="decimal"/> form anyway. The bound
+    /// is read from <see cref="PowersOfTen"/> because this runs once per non-null row.
     /// </para>
     /// </remarks>
     private static bool FitsPrecision(decimal value, Decimal128Type target)
@@ -2228,30 +2100,19 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Spark converts the RENDERING, not the binary expansion.</b> It reaches a decimal through
+    /// Spark converts the rendering, not the binary expansion. It reaches a decimal through
     /// <c>BigDecimal.valueOf(d)</c>, which is <c>new BigDecimal(Double.toString(d))</c>, so the
     /// answer is the shortest decimal that round-trips the double rather than the exact binary
-    /// value. The float row of the corpus is the proof: <c>1e30f</c> widens to the double
-    /// 1.0000000150474662E30 and Spark answers those digits, where the exact value of the float
-    /// and the digits of <c>1e30</c> are both something else.
+    /// value: <c>1e30f</c> widens to the double 1.0000000150474662E30 and Spark answers those
+    /// digits. A <c>(decimal)double</c> conversion would be wrong both ways — it rounds to 15
+    /// significant digits where Spark keeps up to 17, and has no form at all past ~7.9e28.
     /// </para>
     /// <para>
-    /// This replaces a <see cref="decimal"/> conversion that was wrong in two directions. Past
-    /// <see cref="decimal"/>'s ~7.9e28 there was no exact form at all and the cast was REFUSED —
-    /// the gap #244 was filed for. Inside it, <c>(decimal)double</c> rounds to 15 significant
-    /// digits where Spark keeps up to 17, so it quietly lost digits: measured over ~1e6 doubles,
-    /// it disagreed with Spark's rendering on 93% of the values a decimal could hold at all.
-    /// </para>
-    /// <para>
-    /// <b>The JVM is part of the answer here, and #244 held the fix back until that was
-    /// measured.</b> <c>Double.toString</c> did not produce the shortest representation before
-    /// JDK 19, so a Spark on 17 and one on 21 do not agree. Measured against this corpus's JDK
-    /// over ~1e6 doubles: they differ on 2.4% of them — needing 17 or 18 digits where the
-    /// shortest form needs 16 or 17 — and on NONE of the 130,152 sampled past 7.9e28, which is
-    /// the whole of the range the refusal covered. So the fix lands where the JVM does not
-    /// matter, and shrinks the disagreement below it from 93% to that 2.4% band.
-    /// <c>java_version</c> now sits beside <c>conf</c> in the fixture, and the three corpus rows
-    /// that land in the band are declared differences rather than a remark.
+    /// The JVM is part of the answer: <c>Double.toString</c> did not produce the shortest
+    /// representation before JDK 19, so a Spark on 17 and one on 21 disagree on about 2.4% of
+    /// doubles (needing 17 or 18 digits where the shortest form needs 16 or 17), though on none
+    /// sampled past 7.9e28. The fixture records <c>java_version</c> beside <c>conf</c>, and the
+    /// corpus rows in that band are declared differences.
     /// </para>
     /// </remarks>
     private IArrowArray CastFloatingToDecimal(
@@ -2266,8 +2127,7 @@ public sealed class SparkFunctionRegistry
             if (SparkArrays.ReadDouble(source, i) is not { } value)
                 continue;
 
-            // NaN and the infinities yield NULL rather than raising, EVEN UNDER ANSI. Measured,
-            // and it is the one refusal on this path that is not an error.
+            // NaN and the infinities yield NULL rather than raising, even under ANSI.
             if (double.IsNaN(value) || double.IsInfinity(value))
                 continue;
 
@@ -2281,10 +2141,9 @@ public sealed class SparkFunctionRegistry
 
             if (!raising) continue;
 
-            // Every failure here is NUMERIC_VALUE_OUT_OF_RANGE, including the one a STRING source
-            // reports as NUMERIC_OUT_OF_SUPPORTED_RANGE: measured, CAST(1e39 AS DOUBLE) to a
-            // DECIMAL(38,0) names the first. The two sources reach the decimal by different
-            // routes and only the string one meets Spark's digit-count fast-fail.
+            // Every failure here is NUMERIC_VALUE_OUT_OF_RANGE, including the one a string source
+            // reports as NUMERIC_OUT_OF_SUPPORTED_RANGE: CAST(1e39 AS DOUBLE) to a DECIMAL(38,0)
+            // names the first. Only the string route meets Spark's digit-count fast-fail.
             throw SparkEvaluationException.NumericValueOutOfRange(text, target);
         }
 
@@ -2293,9 +2152,8 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Casts a string column to a decimal type, reading the text exactly.</summary>
     /// <remarks>
-    /// Three refusals with three different error classes, all measured rather than reasoned —
-    /// see <see cref="SparkDecimalText"/> for what each one is and why the middle one is not the
-    /// one anybody would have guessed.
+    /// Three refusals with three different error classes — see <see cref="SparkDecimalText"/>
+    /// for what each one is.
     /// </remarks>
     private IArrowArray CastStringToDecimal(
         StringArray source, Decimal128Type target, int rowCount, bool raising)
@@ -2364,12 +2222,11 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// Spark's analyzer wraps the argument in a CAST, which runs in the session's dialect, so the
-    /// conversion is the dialect's and not a fixed rendering: measured, <c>upper</c>,
-    /// <c>length</c>, <c>concat</c>, <c>||</c>, <c>LIKE</c> and the conditional family's string
-    /// coercion all see <c>0E-7</c> under legacy where they see <c>0.0000000</c> under ANSI.
-    /// Only a decimal needs converting here: every other source renders the same in both
-    /// dialects, and the functions read it through <see cref="SparkFunctions.ReadString"/>.
-    /// #325.
+    /// conversion is the dialect's and not a fixed rendering: <c>upper</c>, <c>length</c>,
+    /// <c>concat</c>, <c>||</c>, <c>LIKE</c> and the conditional family's string coercion all see
+    /// <c>0E-7</c> under legacy where they see <c>0.0000000</c> under ANSI. Only a decimal needs
+    /// converting here: every other source renders the same in both dialects, and the functions
+    /// read it through <see cref="SparkFunctions.ReadString"/>.
     /// </remarks>
     private IArrowArray AsText(IArrowArray argument) =>
         !_options.Ansi && argument is Decimal128Array
@@ -2400,12 +2257,12 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #370. The cast is the session's own, so a non-int argument answers what the cast answers:
-    /// a fraction truncates (<c>substring('abcdef', 2.7, 2)</c> is <c>bc</c>), a string reads by
+    /// The cast is the session's own, so a non-int argument answers what the cast answers: a
+    /// fraction truncates (<c>substring('abcdef', 2.7, 2)</c> is <c>bc</c>), a string reads by
     /// the integral text rule, and an out-of-range value raises <c>CAST_OVERFLOW</c> under ANSI
-    /// and wraps under legacy, where <c>substring('abcdef', 4294967298, 2)</c> is <c>bc</c>.
-    /// Measured, a <c>try_cast</c> around the call does not rescue the ANSI overflow, because the
-    /// cast that raises is the inner one.
+    /// and wraps under legacy, where <c>substring('abcdef', 4294967298, 2)</c> is <c>bc</c>. A
+    /// <c>try_cast</c> around the call does not rescue the ANSI overflow, because the cast that
+    /// raises is the inner one.
     /// </para>
     /// <para>
     /// Anything with no implicit cast to int is refused before a row is read, in both dialects:
@@ -2440,7 +2297,7 @@ public sealed class SparkFunctionRegistry
     /// <remarks>
     /// Cast over <paramref name="rowCount"/> rows and not over the array's own length. A literal
     /// evaluated over no rows carries one extra row so its type survives, and casting that row
-    /// would raise an ANSI overflow while only the TYPE was being asked for -- which Spark
+    /// would raise an ANSI overflow while only the type was being asked for -- which Spark
     /// resolves without raising.
     /// </remarks>
     private IArrowArray IntArgument(string name, int position, IArrowArray argument, int rowCount)
@@ -2474,13 +2331,12 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Casts a column to STRING.</summary>
     /// <remarks>
-    /// <b>A decimal is spelled differently by the legacy dialect</b>, which prints Java's
+    /// A decimal is spelled differently by the legacy dialect, which prints Java's
     /// <c>BigDecimal.toString</c>: <c>CAST(CAST(0 AS DECIMAL(10,7)) AS STRING)</c> is <c>0E-7</c>
-    /// there and <c>0.0000000</c> under ANSI. <paramref name="legacy"/> is exactly the right switch:
-    /// measured, <c>try_cast</c> prints plainly in BOTH dialects, and it is the one caller that
-    /// passes false under a legacy session. Every implicit conversion to string follows the cast,
-    /// so <c>concat</c>, <c>||</c>, <c>upper</c>, <c>length</c> and <c>LIKE</c> all see
-    /// <c>0E-7</c> under legacy. #325.
+    /// there and <c>0.0000000</c> under ANSI. The switch is <paramref name="legacy"/> because
+    /// <c>try_cast</c> prints plainly in both dialects, and it is the one caller that passes false
+    /// under a legacy session. Every implicit conversion to string follows the cast; see
+    /// <see cref="AsText(IArrowArray)"/>.
     /// </remarks>
     private static IArrowArray CastToString(IArrowArray source, int rowCount, bool legacy)
     {
@@ -2512,33 +2368,23 @@ public sealed class SparkFunctionRegistry
     /// <summary>Casts a column to BINARY, which only two source families reach.</summary>
     /// <remarks>
     /// <para>
-    /// <b>A string is a UTF-8 encode and a binary is the identity</b> — those two in both
-    /// dialects. Measured: <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, <c>CAST('' AS BINARY)</c> is
-    /// empty rather than null, and a null stays null. The reverse direction,
-    /// <c>CAST(bin AS STRING)</c>, already worked and is a UTF-8 DECODE that replaces what is not
-    /// valid, so <c>CAST(X'FF' AS STRING)</c> is U+FFFD — which means the round trip is not the
-    /// identity and the corpus carries both halves.
+    /// A string is a UTF-8 encode and a binary is the identity, in both dialects:
+    /// <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, <c>CAST('' AS BINARY)</c> is empty rather than
+    /// null. The reverse, <c>CAST(bin AS STRING)</c>, is a UTF-8 decode that replaces what is not
+    /// valid, so <c>CAST(X'FF' AS STRING)</c> is U+FFFD and the round trip is not the identity.
     /// </para>
     /// <para>
-    /// <b>An integral is the legacy dialect's ALONE, and this is the part #295 did not name.</b>
-    /// Measured on 4.0.3: with ansi off, <c>CAST(CAST(1 AS INT) AS BINARY)</c> is
-    /// <c>00000001</c> — big-endian, at the source type's own width, so a TINYINT gives one byte
-    /// and a BIGINT eight, and a negative value gives its two's complement (<c>CAST(-2 AS
-    /// SMALLINT)</c> is <c>FFFE</c>). With ANSI on the same cast is refused outright, as
-    /// <c>DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION</c>, whose whole content is "turn ANSI off".
-    /// </para>
-    /// <para>
-    /// <b>try_cast is refused too, under BOTH dialects</b>, which is why this keys on
-    /// <paramref name="legacy"/> rather than on <c>!raising</c>: measured,
-    /// <c>TRY_CAST(CAST(1 AS INT) AS BINARY)</c> is <c>CAST_WITHOUT_SUGGESTION</c> even with ansi
-    /// off, because try_cast type-checks as ANSI does. The three-state <c>raising</c>/
-    /// <paramref name="legacy"/> pair from #243 already distinguishes exactly those three callers.
+    /// An integral is accepted only with ANSI off: <c>CAST(CAST(1 AS INT) AS BINARY)</c> is
+    /// <c>00000001</c> — big-endian, at the source type's own width, two's complement for a
+    /// negative (<c>CAST(-2 AS SMALLINT)</c> is <c>FFFE</c>). With ANSI on it is refused as
+    /// <c>DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION</c>. try_cast refuses it under both dialects
+    /// (<c>CAST_WITHOUT_SUGGESTION</c>), because it type-checks as ANSI does, which is why this
+    /// keys on <paramref name="legacy"/> rather than on <c>!raising</c>.
     /// </para>
     /// <para>
     /// Everything else — float, double, decimal, boolean, date, timestamp — is refused in both
-    /// dialects, and refused as a TYPE error rather than a per-row one, which is what Spark does
-    /// with it. Same treatment as <c>SparkNumericTypes</c>'s "no common type", and deliberately
-    /// not a <see cref="SparkEvaluationException"/>: nothing here depends on the row's value.
+    /// dialects as a type error rather than a per-row one, as Spark does; deliberately not a
+    /// <see cref="SparkEvaluationException"/>, since nothing here depends on the row's value.
     /// </para>
     /// </remarks>
     private static IArrowArray CastToBinary(IArrowArray source, int rowCount, bool legacy)
@@ -2580,9 +2426,8 @@ public sealed class SparkFunctionRegistry
     /// <summary>An integral column as big-endian bytes at its own width, for the legacy dialect.</summary>
     private static IArrowArray CastIntegralToBinary(IArrowArray source, IArrowType type, int rowCount)
     {
-        // The WIDTH is the source type's, not the value's: 1 as a BIGINT is eight bytes and 1 as a
-        // TINYINT is one. Measured, and it is why this reads the declared type rather than
-        // shrinking to the significant bytes.
+        // The width is the source type's, not the value's: 1 as a BIGINT is eight bytes and 1 as
+        // a TINYINT is one.
         var width = type switch
         {
             Int8Type => 1,
@@ -2611,42 +2456,36 @@ public sealed class SparkFunctionRegistry
         return builder.Build();
     }
 
-    /// <summary>Casts to a boolean, which reads a string as a WORD and not as a number.</summary>
+    /// <summary>Casts to a boolean, which reads a string as a word and not as a number.</summary>
     /// <remarks>
-    /// The whole source matrix, because #314 was as much about which sources reach the
-    /// conversion as about what it reads:
+    /// The source matrix:
     /// <list type="bullet">
     /// <item><description>
-    /// A NUMBER is true when it is not zero. A BOOLEAN source arrives here as one, because
+    /// A number is true when it is not zero. A boolean source arrives here as one, because
     /// <see cref="SparkArrays.ReadForCast"/> renders it as 1 or 0, so the identity cast falls
-    /// out of the same branch rather than needing one of its own.
+    /// out of the same branch.
     /// </description></item>
     /// <item><description>
-    /// A STRING must be a word in <see cref="BooleanVocabulary"/>, and is refused otherwise.
+    /// A string must be a word in <see cref="BooleanVocabulary"/>, and is refused otherwise.
     /// </description></item>
     /// <item><description>
-    /// A TEMPORAL answers under the <paramref name="legacy"/> dialect ALONE, and the two
-    /// temporals answer differently: a DATE is null at every row and a TIMESTAMP is its
-    /// instant against the epoch. See the branch below.
+    /// A temporal answers only under the <paramref name="legacy"/> dialect: a DATE is null at
+    /// every row and a TIMESTAMP is its instant against the epoch.
     /// </description></item>
     /// <item><description>
-    /// A BINARY is refused in both dialects, and so is anything else.
+    /// A binary is refused in both dialects.
     /// </description></item>
     /// </list>
     /// <para>
-    /// <b>A numeric-looking STRING is not a number here.</b> Measured, <c>CAST(2 AS BOOLEAN)</c>
-    /// is true while <c>CAST('2' AS BOOLEAN)</c> is refused, so the string must not reach the
-    /// numeric branch — <see cref="SparkArrays.CastInput.FromString"/> is what keeps it out,
-    /// the same distinction that makes <c>CAST('12.5' AS INT)</c> refuse where
-    /// <c>CAST(12.5 AS INT)</c> truncates. <c>'1'</c> and <c>'0'</c> agree either way by luck:
-    /// they are in the vocabulary as text. This half is the one that answered WRONGLY rather than
-    /// loudly, which is what a numeric-looking string in a CHECK constraint would have hit.
+    /// A numeric-looking string is not a number here: <c>CAST(2 AS BOOLEAN)</c> is true while
+    /// <c>CAST('2' AS BOOLEAN)</c> is refused, so the string must not reach the numeric branch —
+    /// <see cref="SparkArrays.CastInput.FromString"/> keeps it out. (<c>'1'</c> and <c>'0'</c>
+    /// agree either way: they are in the vocabulary.)
     /// </para>
     /// <para>
-    /// <b>The two refusals are TYPE errors, for the whole column rather than per row</b>, which
-    /// is what Spark makes of them and the treatment <see cref="CastToBinary"/> gives its own.
-    /// The binary one is the load-bearing half: a binary RENDERS as text, so reading that
-    /// rendering as a word would make <c>CAST(X'74727565' AS BOOLEAN)</c> — the bytes of
+    /// The type refusals apply to the whole column rather than per row, as in
+    /// <see cref="CastToBinary"/>. The binary one matters: a binary renders as text, so reading
+    /// that rendering as a word would make <c>CAST(X'74727565' AS BOOLEAN)</c> — the bytes of
     /// "true" — answer true, where Spark refuses it at analysis.
     /// </para>
     /// </remarks>
@@ -2654,7 +2493,7 @@ public sealed class SparkFunctionRegistry
     {
         var type = source.Data.DataType;
 
-        // Asked of the TYPE. A StringArray derives from BinaryArray, which is the ordering hazard
+        // Asked of the type. A StringArray derives from BinaryArray, which is the ordering hazard
         // ReadForCast has to step around, but StringType does not derive from BinaryType.
         if (type is BinaryType)
         {
@@ -2672,8 +2511,8 @@ public sealed class SparkFunctionRegistry
                     + "spark.sql.ansi.enabled is false, and try_cast refuses it either way");
             }
 
-            // Measured with ansi off: a DATE is null at EVERY row -- Hive's answer, which Spark
-            // kept and commented as Hive's -- and a TIMESTAMP is its instant against the epoch.
+            // A DATE is null at every row -- Hive's answer, which Spark kept -- and a TIMESTAMP
+            // is its instant against the epoch.
             return SparkArrays.IsDateType(type)
                 ? ArrowCompute.MakeNullArray(BooleanType.Default, rowCount)
                 : TimestampToBoolean(source, rowCount);
@@ -2711,10 +2550,10 @@ public sealed class SparkFunctionRegistry
         return builder.Build();
     }
 
-    /// <summary>A timestamp as a boolean: true unless it IS the epoch.</summary>
+    /// <summary>A timestamp as a boolean: true unless it is the epoch.</summary>
     /// <remarks>
     /// Against the instant rather than against <see cref="SparkArrays.CastInput.AsDouble"/>,
-    /// which is whole epoch SECONDS. Spark tests the microseconds, so 1970-01-01 00:00:00.5 is
+    /// which is whole epoch seconds. Spark tests the microseconds, so 1970-01-01 00:00:00.5 is
     /// true where truncated seconds would call it false.
     /// </remarks>
     private static IArrowArray TimestampToBoolean(IArrowArray source, int rowCount)
@@ -2739,18 +2578,17 @@ public sealed class SparkFunctionRegistry
     /// The boolean Spark reads out of a string, or null when the text is not one of its words.
     /// </summary>
     /// <remarks>
-    /// <b>Spark accepts a SET of words where <c>bool.TryParse</c> knows two.</b> Measured in both
-    /// dialects: <c>t</c>, <c>true</c>, <c>y</c>, <c>yes</c> and <c>1</c> are true; <c>f</c>,
+    /// Spark accepts a set of words where <c>bool.TryParse</c> knows two, in both dialects:
+    /// <c>t</c>, <c>true</c>, <c>y</c>, <c>yes</c> and <c>1</c> are true; <c>f</c>,
     /// <c>false</c>, <c>n</c>, <c>no</c> and <c>0</c> are false; case does not matter, and
-    /// leading and trailing whitespace is trimmed — SPARK'S whitespace, which is
+    /// leading and trailing whitespace is trimmed — Spark's whitespace, which is
     /// <see cref="SparkText.TrimBounds"/> and not <see cref="string.Trim()"/>. Everything else is
     /// <c>CAST_INVALID_INPUT</c> under ANSI and null without it, and <c>try_cast</c> follows the
     /// same set, which is why the vocabulary lives in the conversion rather than in a dialect
-    /// branch above it. #314.
+    /// branch above it.
     /// <para>
-    /// The refusals carry as much of the rule as the acceptances: <c>on</c> and <c>off</c> are a
-    /// vocabulary other systems have and Spark does not, and a PREFIX of an accepted word is not
-    /// accepted — <c>tr</c> and <c>ye</c> are refused.
+    /// <c>on</c> and <c>off</c> are not accepted, and neither is a prefix of an accepted word
+    /// (<c>tr</c>, <c>ye</c>).
     /// </para>
     /// </remarks>
     private static bool? BooleanVocabulary(ReadOnlySpan<char> text)
@@ -2777,9 +2615,9 @@ public sealed class SparkFunctionRegistry
     /// <remarks>
     /// The whole conditional family goes through here - <c>coalesce</c>/<c>nvl</c>/<c>ifnull</c>,
     /// <c>if</c> and <c>CASE</c> - because they share one rule. <c>greatest</c>/<c>least</c> do
-    /// NOT: measured, they REFUSE a string against a number in both dialects
+    /// not: they refuse a string against a number in both dialects
     /// (<c>DATATYPE_MISMATCH.DATA_DIFF_TYPES</c>) where the family here coerces, so they keep
-    /// <see cref="UnifiedType"/> and its refusal. #278.
+    /// <see cref="UnifiedType"/> and its refusal.
     /// </remarks>
     private IArrowArray UnifyBranches(
         IReadOnlyList<IArrowArray> branches, bool[] nullLiterals, int[] choice, int rowCount)
@@ -2794,23 +2632,16 @@ public sealed class SparkFunctionRegistry
     /// A bare <c>NULL</c> is <c>void</c> in Spark and constrains nothing, so
     /// <c>coalesce(a, NULL)</c> is an <c>int</c>, and such a branch is left out of the fold.
     /// <para>
-    /// <b>Which branch that is comes from the TYPE</b>, through
-    /// <see cref="IConditionalArguments.IsNullLiteral"/>, rather than from noticing that a branch
-    /// came back all null. It has to: a branch no row selected is all null by construction once
-    /// the family stopped evaluating every branch, so a content test would swallow every unreached
-    /// branch and retype the result -- measured, a zero-row <c>coalesce(a, s)</c> would come back
-    /// <c>int</c> where Spark says <c>bigint</c>. That test was also wrong for a string column
-    /// that merely held nothing in this batch, which is #293; #279 is what made it unworkable.
-    /// Both are gone now that a bare NULL is materialised as a <c>void</c> column, and the
-    /// two entry points answer the same way rather than the eager one guessing.
+    /// Which branch that is comes from the type, through
+    /// <see cref="IConditionalArguments.IsNullLiteral"/>, never from noticing that a branch came
+    /// back all null: a branch no row selected is all null by construction, so a content test
+    /// would swallow every unreached branch and retype the result (a zero-row
+    /// <c>coalesce(a, s)</c> would come back <c>int</c> where Spark says <c>bigint</c>).
     /// </para>
     /// <para>
-    /// <b>A typed null is not one.</b> It carries its type and still constrains the result:
-    /// measured, <c>coalesce(CAST(NULL AS INT), '2')</c> is a <c>bigint</c> in Spark, not the
-    /// string that dropping the all-null int would give, and
-    /// <c>coalesce(CAST(NULL AS INT), CAST(NULL AS STRING), '7')</c> is a bigint too. Asking the
-    /// expression gets this right by construction, where the content test got it right only
-    /// because the placeholder happened to be spelled as a string.
+    /// A typed null is not a bare NULL. It carries its type and still constrains the result:
+    /// <c>coalesce(CAST(NULL AS INT), '2')</c> is a <c>bigint</c> in Spark, and so is
+    /// <c>coalesce(CAST(NULL AS INT), CAST(NULL AS STRING), '7')</c>.
     /// </para>
     /// </remarks>
     private IArrowType ConditionalType(IReadOnlyList<IArrowArray> branches, bool[] nullLiterals)
@@ -2826,9 +2657,8 @@ public sealed class SparkFunctionRegistry
             type = type is null ? candidate : UnifyBranchTypes(type, candidate);
         }
 
-        // Every branch was a bare NULL, so there is no type to unify to. Spark says `void` --
-        // measured, `coalesce(NULL, NULL)` and `CASE WHEN true THEN NULL ELSE NULL END` are both
-        // void -- where this used to say `string` because that is what the placeholder was. #293.
+        // Every branch was a bare NULL, so there is no type to unify to. Spark says `void`:
+        // `coalesce(NULL, NULL)` and `CASE WHEN true THEN NULL ELSE NULL END` are both void.
         return type ?? NullType.Default;
     }
 
@@ -2838,8 +2668,8 @@ public sealed class SparkFunctionRegistry
             return StringType.Default;
 
         // A `void` branch that reached here rather than being skipped -- a nested conditional
-        // whose every branch was a bare NULL, so the answer is void without being a LITERAL null.
-        // It still constrains nothing. #293.
+        // whose every branch was a bare NULL, so the answer is void without being a literal null.
+        // It still constrains nothing.
         if (left is NullType)
             return right;
 
@@ -2860,25 +2690,23 @@ public sealed class SparkFunctionRegistry
     /// What a string branch unifies with another type to, or null when Spark refuses the pair.
     /// </summary>
     /// <remarks>
-    /// <b>The two dialects choose OPPOSITE directions</b>, which is the whole difficulty. Under
-    /// ANSI the STRING moves to the other type; under the legacy dialect the OTHER TYPE moves to
-    /// string. Measured on 4.0.3: <c>coalesce(CAST(1 AS INT), '2')</c> is a <c>bigint</c> holding
-    /// 1 under ANSI and a <c>string</c> holding <c>'1'</c> under legacy. Same shape as #180/#259,
-    /// where a comparison picked different cast targets per dialect.
+    /// The two dialects choose opposite directions. Under ANSI the string moves to the other
+    /// type; under the legacy dialect the other type moves to string:
+    /// <c>coalesce(CAST(1 AS INT), '2')</c> is a <c>bigint</c> holding 1 under ANSI and a
+    /// <c>string</c> holding <c>'1'</c> under legacy.
     /// <para>
     /// ANSI widens rather than casting to the operand's own type: every integral width goes to
     /// <c>bigint</c> and every fractional one - float, double and decimal alike - to
     /// <c>double</c>. Boolean, binary, date and timestamp take the string directly.
     /// </para>
     /// <para>
-    /// The refusals are measured too, not a fallback. Legacy refuses a string against a boolean
-    /// and against a binary while ANSI answers both, so the null here is a real answer.
+    /// Legacy refuses a string against a boolean and against a binary while ANSI answers both,
+    /// so the null here is a real answer, not a fallback.
     /// </para>
     /// <para>
-    /// This is NOT <see cref="StringComparisonTarget"/>, though the ANSI halves agree. That one's
+    /// This is not <see cref="StringComparisonTarget"/>, though the ANSI halves agree. That one's
     /// legacy half moves the string to the number, the opposite of this one, and it excludes
-    /// binary because in a comparison it is the binary that moves. Two rules that look alike and
-    /// were measured apart.
+    /// binary because in a comparison it is the binary that moves.
     /// </para>
     /// </remarks>
     private IArrowType? ConditionalStringTarget(IArrowType other)
@@ -2898,10 +2726,8 @@ public sealed class SparkFunctionRegistry
         if (SparkNumericTypes.IsFloatingPoint(other) || SparkNumericTypes.IsDecimal(other))
             return DoubleType.Default;
 
-        // BINARY joins these as of #295, which built the cast and the Unify branch that were
-        // missing when #278 measured the rule and had to decline it. Measured: ANSI resolves
-        // `coalesce(X'00', '2')` to BINARY, moving the string into it as UTF-8, in either operand
-        // order -- `coalesce('2', X'00')` is binary too, holding 32.
+        // ANSI resolves `coalesce(X'00', '2')` to BINARY, moving the string into it as UTF-8,
+        // in either operand order -- `coalesce('2', X'00')` is binary too, holding 32.
         if (other is BooleanType or BinaryType or TimestampType || SparkArrays.IsDateType(other))
             return other;
 
@@ -2912,18 +2738,14 @@ public sealed class SparkFunctionRegistry
     /// Casts the string branches to the unified type, over the rows that actually select them.
     /// </summary>
     /// <remarks>
-    /// <b>Masked to the winning rows, which is the point.</b> Spark evaluates only the branch a
-    /// row chooses, so a string no row selects is never converted and never fails: measured,
-    /// <c>coalesce(CAST(1 AS INT), 'abc')</c> answers 1 under ANSI, while
-    /// <c>coalesce(CAST(NULL AS INT), 'abc')</c> raises <c>CAST_INVALID_INPUT</c> because there
-    /// the string IS chosen. Casting the column whole would fail the first one too.
+    /// Masked to the winning rows: Spark evaluates only the branch a row chooses, so a string no
+    /// row selects is never converted and never fails. <c>coalesce(CAST(1 AS INT), 'abc')</c>
+    /// answers 1 under ANSI, while <c>coalesce(CAST(NULL AS INT), 'abc')</c> raises
+    /// <c>CAST_INVALID_INPUT</c> because there the string is chosen.
     /// <para>
     /// Only the ANSI direction reaches the cast. Under legacy a string branch makes the unified
     /// type <c>string</c>, and <see cref="SparkFunctions.Unify"/> renders each branch itself.
-    /// </para>
-    /// <para>
-    /// The cast is the SAME one <c>CAST(...)</c> reaches, dialect and all, so the string rules
-    /// paid for in #174, #243 and #258 apply here without being restated.
+    /// The cast is the same one <c>CAST(...)</c> reaches, dialect and all.
     /// </para>
     /// </remarks>
     private IArrowArray[] CoerceBranches(
@@ -2982,23 +2804,22 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Half away from zero</b>, which is what <c>round</c> is; Spark spells the half-even one
-    /// <c>bround</c> and it is a different function. Measured on the inputs that tell them apart:
-    /// <c>round(2.5)</c> is 3, <c>round(-2.5)</c> is -3 and <c>round(1.45, 1)</c> is 1.5.
+    /// Half away from zero, which is what <c>round</c> is; Spark's half-even one is
+    /// <c>bround</c>. <c>round(2.5)</c> is 3, <c>round(-2.5)</c> is -3 and
+    /// <c>round(1.45, 1)</c> is 1.5.
     /// </para>
     /// <para>
-    /// <b>The result type depends on the source, and only the decimal one moves.</b> A double
-    /// stays a double and an integral type stays itself — <c>round(12345, -2)</c> is an
-    /// <c>int</c> holding 12300. A decimal(p,s) rounded to <c>d</c> becomes
-    /// decimal(p - s + s' + 1, s'), where s' is min(s, d), capped at 38. Measured:
-    /// decimal(10,2) goes to decimal(10,1) at d=1 and decimal(9,0) at d=0 — and, the shape that
-    /// is not obvious, to decimal(11,2) at d=5, because a scale WIDER than the value already has
-    /// leaves the scale alone and still widens the precision by one.
+    /// Only a decimal result type moves. A double stays a double and an integral type stays
+    /// itself — <c>round(12345, -2)</c> is an <c>int</c> holding 12300. A decimal(p,s) rounded to
+    /// <c>d</c> becomes decimal(p - s + s' + 1, s'), where s' is min(s, d), capped at 38:
+    /// decimal(10,2) goes to decimal(10,1) at d=1, decimal(9,0) at d=0, and decimal(11,2) at
+    /// d=5, because a scale wider than the value already has leaves the scale alone and still
+    /// widens the precision by one.
     /// </para>
     /// <para>
-    /// A negative scale on a DECIMAL is the one shape here that was not harvested; it takes the
-    /// integral rule of rounding to a multiple of a power of ten. Everything else on this path is
-    /// an answer from the corpus's <c>round-greatest-least</c> group.
+    /// A negative scale on a DECIMAL is the one shape here not taken from the corpus's
+    /// <c>round-greatest-least</c> group; it takes the integral rule of rounding to a multiple of
+    /// a power of ten.
     /// </para>
     /// </remarks>
     private IArrowArray Round(IReadOnlyList<IArrowArray> args, int rowCount)
@@ -3006,9 +2827,9 @@ public sealed class SparkFunctionRegistry
         var source = args[0];
         var scale = args.Count > 1 ? RoundScale(args[1], rowCount) : 0;
 
-        // A string argument is read as a DOUBLE, in both dialects -- measured, `round('1.5', 2)`
-        // is a double 1.5 under each. Only the failure differs, and the shared cast already knows
-        // it: ANSI raises on `round('abc', 2)` where legacy answers null. #278.
+        // A string argument is read as a double in both dialects -- `round('1.5', 2)` is a double
+        // 1.5 under each. Only the failure differs, and the shared cast already knows it: ANSI
+        // raises on `round('abc', 2)` where legacy answers null.
         if (source.Data.DataType is StringType)
         {
             source = Cast(
@@ -3025,9 +2846,7 @@ public sealed class SparkFunctionRegistry
             return RoundIntegral(source, scale, rowCount);
 
         // `round(NULL, 2)` resolves to a double in Spark, and a bare NULL reaches here as the
-        // `void` column the evaluator materialises one as. This used to test the CONTENT instead,
-        // and was dead code: the placeholder was spelled as a string, so the string branch above
-        // cast it to a double and nothing ever reached here. #293.
+        // `void` column the evaluator materialises one as.
         if (source.Data.DataType is NullType)
             return NullDoubles(rowCount);
 
@@ -3045,12 +2864,11 @@ public sealed class SparkFunctionRegistry
     /// The scale argument, which Spark requires to be a constant.
     /// </summary>
     /// <remarks>
-    /// <b>Measured:</b> <c>round(g, a)</c> is <c>DATATYPE_MISMATCH.NON_FOLDABLE_INPUT</c> — Spark
-    /// refuses a scale that is not foldable, so one that varies by row cannot come from an
-    /// expression it accepted. This registry sees materialised columns rather than the tree, so
-    /// it cannot check foldability; what it can see is a scale that actually differs between
-    /// rows, and refusing that keeps the answer fail-closed instead of silently using the first
-    /// row's scale for all of them. Raised in review of #255.
+    /// <c>round(g, a)</c> is <c>DATATYPE_MISMATCH.NON_FOLDABLE_INPUT</c> — Spark refuses a scale
+    /// that is not foldable. This registry sees materialised columns rather than the tree, so it
+    /// cannot check foldability; what it can see is a scale that actually differs between rows,
+    /// and refusing that keeps the answer fail-closed instead of silently using the first row's
+    /// scale for all of them.
     /// </remarks>
     private static int RoundScale(IArrowArray argument, int rowCount)
     {
@@ -3097,27 +2915,19 @@ public sealed class SparkFunctionRegistry
     /// Half away from zero at a decimal scale, leaving alone anything with no fraction to lose.
     /// </summary>
     /// <remarks>
-    /// NaN and the infinities pass through — measured, <c>round(NaN, 2)</c> is NaN — and so does
+    /// NaN and the infinities pass through — <c>round(NaN, 2)</c> is NaN — and so does
     /// a value scaled past 2^53, where a double has no fractional part left to round. That is
     /// what keeps <c>round(g, 20)</c> equal to <c>g</c> rather than turning it into an infinity.
     /// <para>
-    /// <b>A zero result is always a POSITIVE zero</b>, which is the half of #282 that runs the
-    /// other way. Spark rounds a double through <c>BigDecimal</c>, which has no negative zero at
-    /// all, so every answer that lands on zero comes back <c>+0.0</c> however the input was
-    /// signed: measured on 4.0.3, <c>round(-0.4D)</c>, <c>round(-0.04D, 1)</c> and
-    /// <c>round(-(0.0D), 1)</c> all render <c>0.0</c>, where IEEE rounding keeps the sign and
-    /// would render <c>-0.0</c>. Fixing unary minus without this would have TRADED one divergence
-    /// for another: <c>round(-(0.0D), 1)</c> agreed before only because the negation had already
-    /// lost the sign.
+    /// A zero result is always a positive zero. Spark rounds a double through
+    /// <c>BigDecimal</c>, which has no negative zero, so <c>round(-0.4D)</c>,
+    /// <c>round(-0.04D, 1)</c> and <c>round(-(0.0D), 1)</c> all render <c>0.0</c>, where IEEE
+    /// rounding keeps the sign and would render <c>-0.0</c>.
     /// </para>
     /// <para>
-    /// <b>A zero is answered before any scaling</b>, which is what makes that rule hold at a
-    /// scale whose power of ten is not a double. Above about 308 the factor overflows to an
-    /// infinity, and <c>0 * infinity</c> is NaN -- so a zero came back NaN, which is the same
-    /// value-out-of-nowhere the underflow guard below exists to prevent, at the other end of the
-    /// same range and for a positive zero as much as a negative one. Measured: Spark answers 0.0
-    /// for every scale an <c>Int</c> can hold. Raised in review of #282; it was wrong before it
-    /// too, and #285 measured only the underflow end.
+    /// A zero is answered before any scaling, which is what makes that rule hold at a scale whose
+    /// power of ten is not a double: above about 308 the factor overflows to an infinity, and
+    /// <c>0 * infinity</c> is NaN. Spark answers 0.0 for every scale an <c>Int</c> can hold.
     /// </para>
     /// </remarks>
     private static double RoundHalfUp(double value, int scale)
@@ -3125,18 +2935,17 @@ public sealed class SparkFunctionRegistry
         if (double.IsNaN(value) || double.IsInfinity(value))
             return value;
 
-        // BEFORE the scaling, not after it: a zero has no fraction to lose at any scale, and
-        // reaching the multiply at all is what turns it into a NaN. Both zeros answer the
-        // positive one, which is the BigDecimal rule the remarks above describe.
+        // Before the scaling, not after it: a zero has no fraction to lose at any scale, and
+        // reaching the multiply at all can turn it into a NaN. Both zeros answer the positive
+        // one, the BigDecimal rule the remarks describe.
         if (value == 0d)
             return 0d;
 
         var factor = Math.Pow(10, scale);
 
         // A scale below about -324 underflows the factor to zero, and dividing by it at the end
-        // would turn a rounded 0 into 0/0 = NaN -- a value out of nowhere, for an input that has
-        // a perfectly ordinary answer. Everything is nearer to zero than to the first multiple of
-        // a power of ten that large, so zero is that answer. #285.
+        // would turn a rounded 0 into 0/0 = NaN. Everything is nearer to zero than to the first
+        // multiple of a power of ten that large, so zero is the answer.
         if (factor == 0d)
             return 0d;
 
@@ -3147,7 +2956,7 @@ public sealed class SparkFunctionRegistry
 
         var rounded = Math.Round(scaled, MidpointRounding.AwayFromZero) / factor;
 
-        // `+ 0d` rather than a branch on the sign bit, because IEEE addition is what DEFINES the
+        // `+ 0d` rather than a branch on the sign bit, because IEEE addition defines the
         // sign of a zero sum: -0.0 + 0.0 is +0.0 under round-to-nearest, and +0.0 + 0.0 is +0.0.
         return rounded == 0d ? rounded + 0d : rounded;
     }
@@ -3173,10 +2982,10 @@ public sealed class SparkFunctionRegistry
 
             if (!exact || !SparkArrays.FitsIn(rounded, type))
             {
-                // Measured: `round(a, -1)` over INT_MIN reports ARITHMETIC_OVERFLOW rather than
-                // CAST_OVERFLOW — rounding is arithmetic here, not a conversion. And plain
-                // ARITHMETIC_OVERFLOW at EVERY width, including the narrow ones: unlike `a + b`,
-                // this does not report BINARY_ARITHMETIC_OVERFLOW for a TINYINT.
+                // `round(a, -1)` over INT_MIN reports ARITHMETIC_OVERFLOW rather than
+                // CAST_OVERFLOW — rounding is arithmetic here, not a conversion — and at every
+                // width: unlike `a + b`, this does not report BINARY_ARITHMETIC_OVERFLOW for a
+                // TINYINT.
                 if (_options.Ansi)
                 {
                     throw SparkEvaluationException.Overflow(
@@ -3184,12 +2993,11 @@ public sealed class SparkFunctionRegistry
                         $"rounding {value} to {scale} places overflows {SparkArrays.Describe(type)}");
                 }
 
-                // THE LEGACY DIALECT WRAPS, it does not null -- which is the half of #285 the
-                // issue did not name and the shape #243 already found for an integral cast.
-                // Measured: `round(CAST(127 AS TINYINT), -1)` is -126 with ansi off, the byte
-                // wrap of 130, and `round(9223372036854775807, -1)` is -9223372036854775806.
-                // `rounded` already carries the low 64 bits, so the wrap is the same narrowing an
-                // overflowing cast takes.
+                // The legacy dialect wraps, it does not null, as for an integral cast:
+                // `round(CAST(127 AS TINYINT), -1)` is -126, the byte wrap of 130, and
+                // `round(9223372036854775807, -1)` is -9223372036854775806. `rounded` already
+                // carries the low 64 bits, so the wrap is the same narrowing an overflowing cast
+                // takes.
                 values[i] = SparkArrays.Truncate(rounded, type);
                 continue;
             }
@@ -3204,20 +3012,16 @@ public sealed class SparkFunctionRegistry
     /// How many places a scale rounds to, negated in 64 bits and clamped.
     /// </summary>
     /// <remarks>
-    /// <b><paramref name="scale"/> is an <see cref="int"/>, so <c>-scale</c> overflows back to a
-    /// NEGATIVE for <see cref="int.MinValue"/></b> — and everything downstream then reads as
-    /// nonsense: the integral loop runs zero times and returns the value unrounded, and the
-    /// decimal path builds a <c>Decimal128Type</c> with a negative precision. Negating in 64 bits
-    /// and clamping fixes both and changes no answer, because past <paramref name="ceiling"/>
-    /// every value already rounds to zero.
+    /// <paramref name="scale"/> is an <see cref="int"/>, so <c>-scale</c> overflows back to a
+    /// negative for <see cref="int.MinValue"/>, which would leave the integral path unrounded and
+    /// give the decimal path a negative precision. Negating in 64 bits and clamping changes no
+    /// answer, because past <paramref name="ceiling"/> every value already rounds to zero.
     /// <para>
-    /// <b>There is no Spark behaviour to reproduce this far out</b>, only a crash to avoid.
-    /// Measured: <c>round(1, -2147483648)</c> is a bare <c>ArithmeticException: Underflow</c> with
-    /// no error class under the legacy dialect, and
-    /// <c>round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)</c> is one under both — uncaught JVM
-    /// exceptions rather than anything Spark defines. The scales that ARE defined still agree:
-    /// <c>round(1, -100)</c> is 0 and <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is a
-    /// decimal(38,0) holding 0.
+    /// There is no Spark behaviour to reproduce this far out: <c>round(1, -2147483648)</c> is a
+    /// bare <c>ArithmeticException: Underflow</c> under the legacy dialect, and
+    /// <c>round(CAST(12.34 AS DECIMAL(10,2)), -2147483647)</c> is one under both. The scales Spark
+    /// does define still agree: <c>round(1, -100)</c> is 0 and
+    /// <c>round(CAST(12.34 AS DECIMAL(10,2)), -39)</c> is a decimal(38,0) holding 0.
     /// </para>
     /// </remarks>
     private static int PlacesFor(int scale, int ceiling) =>
@@ -3229,26 +3033,21 @@ public sealed class SparkFunctionRegistry
     /// <remarks>
     /// <para>
     /// Returns the low 64 bits whether or not the exact answer fits them, and reports which
-    /// through <paramref name="exact"/>. Both halves are needed: ANSI raises on an overflow and
-    /// the legacy dialect WRAPS to the target's width, so a function that could only refuse would
-    /// leave the second dialect with nothing to return. #285.
+    /// through <paramref name="exact"/>: ANSI raises on an overflow and the legacy dialect wraps
+    /// to the target's width.
     /// </para>
     /// <para>
-    /// <b>Rounding at the top of the range is where the overflow lives</b>, and it used to be
-    /// invisible for a BIGINT: <c>9223372036854775807</c> rounds to <c>...810</c>, the addition
-    /// wrapped silently, and the <c>FitsIn</c> check that follows sees only a <c>long</c> — which
-    /// always fits a BIGINT. The narrower widths were caught because their arithmetic still had
-    /// room in a <see cref="long"/>; only the widest one did not.
+    /// <paramref name="exact"/> is the only overflow signal for a BIGINT:
+    /// <c>9223372036854775807</c> rounds to <c>...810</c>, the addition wraps, and the
+    /// <c>FitsIn</c> check that follows sees only a <c>long</c> — which always fits a BIGINT.
     /// </para>
     /// <para>
-    /// <b>The three <paramref name="places"/> bands are measured, not defensive.</b> At 19 the
-    /// step is 10^19, which no <see cref="long"/> holds, so the only answers are 0 and ±10^19 and
-    /// the second always overflows — but the TEST is exact, because half of 10^19 is 5e18 and
-    /// that does fit. Measured: <c>round(4999999999999999999, -19)</c> is 0 and
-    /// <c>round(5000000000000000000, -19)</c> is ARITHMETIC_OVERFLOW. At 20 and beyond, half the
-    /// step is past a long's ceiling altogether, so every value rounds to zero —
-    /// <c>round(9223372036854775807, -20)</c> is 0. The old code answered 0 for everything past
-    /// 18, which got the 19 band wrong in both dialects.
+    /// The three <paramref name="places"/> bands match Spark. At 19 the step is 10^19, which no
+    /// <see cref="long"/> holds, so the only answers are 0 and ±10^19 and the second always
+    /// overflows — but the test is exact, because half of 10^19 fits:
+    /// <c>round(4999999999999999999, -19)</c> is 0 and <c>round(5000000000000000000, -19)</c> is
+    /// ARITHMETIC_OVERFLOW. At 20 and beyond, half the step is past a long's ceiling, so every
+    /// value rounds to zero.
     /// </para>
     /// </remarks>
     private static long RoundToPowerOfTen(long value, int places, out bool exact)
@@ -3278,7 +3077,7 @@ public sealed class SparkFunctionRegistry
         for (var i = 0; i < places; i++) step *= 10;
 
         // Neither of these can overflow: |remainder| < step, and truncated is between value and
-        // zero. The step AWAY from zero below is the only part that can.
+        // zero. The step away from zero below is the only part that can.
         var remainder = value % step;
         var truncated = value - remainder;
 
@@ -3294,28 +3093,23 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>
-    /// <c>round</c> over a decimal, where a NEGATIVE scale rounds to a multiple of a power of ten.
+    /// <c>round</c> over a decimal, where a negative scale rounds to a multiple of a power of ten.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>A negative scale used to do nothing at all.</b> The result scale clamps to 0 either way,
-    /// so the old code rescaled to scale 0 and stopped — measured, <c>round(12.34, -1)</c> answered
-    /// 12 where Spark answers 10, and every negative scale answered the same as scale 0. #285.
+    /// The result scale clamps to 0 for any negative scale, but the value still rounds:
+    /// <c>round(12.34, -1)</c> is 10.
     /// </para>
     /// <para>
-    /// <b>The integral digits the type reserves are <c>max(p - s, places)</c>, not <c>p - s</c>.</b>
-    /// Measured, and the row that says so is the extreme one: <c>round(CAST(99 AS DECIMAL(2,0)),
-    /// -20)</c> resolves to <c>decimal(21,0)</c> — Spark sizes the type for a multiple of 10^20
-    /// even though no <c>decimal(2,0)</c> can reach one, and the answer is 0. The ordinary rows
-    /// agree with the old formula because <c>p - s</c> is the larger term there.
+    /// The integral digits the type reserves are <c>max(p - s, places)</c>, not <c>p - s</c>:
+    /// <c>round(CAST(99 AS DECIMAL(2,0)), -20)</c> resolves to <c>decimal(21,0)</c> — Spark sizes
+    /// the type for a multiple of 10^20 even though no <c>decimal(2,0)</c> can reach one.
     /// </para>
     /// <para>
-    /// <b>Both dialects RAISE on a decimal overflow here</b>, unlike the integral path beside it,
-    /// which raises under ANSI and wraps under legacy. Measured:
+    /// Both dialects raise on a decimal overflow here, unlike the integral path:
     /// <c>round(99999999999999999999999999999999999999, -1)</c> is
-    /// NUMERIC_VALUE_OUT_OF_RANGE.WITHOUT_SUGGESTION with ansi both on and off — and the
-    /// <c>WITHOUT_SUGGESTION</c> half of that name is Spark saying so itself, since the other
-    /// variant is the one that tells you to turn ANSI off.
+    /// NUMERIC_VALUE_OUT_OF_RANGE.WITHOUT_SUGGESTION with ANSI on and off (the other variant is
+    /// the one that suggests turning ANSI off).
     /// </para>
     /// </remarks>
     private IArrowArray RoundDecimal(IArrowArray source, Decimal128Type type, int scale, int rowCount)
@@ -3353,19 +3147,17 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>
-    /// <c>greatest</c> and <c>least</c> — the largest or smallest argument, SKIPPING nulls.
+    /// <c>greatest</c> and <c>least</c> — the largest or smallest argument, skipping nulls.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Nulls are skipped, not propagated</b>, which is the opposite of almost everything else
-    /// here: measured, <c>greatest(a, NULL)</c> is <c>a</c> and keeps <c>a</c>'s type, and only
-    /// <c>greatest(NULL, NULL)</c> is null. That makes this the same shape as <c>coalesce</c> —
-    /// choose an argument per row, then unify — rather than the same shape as arithmetic.
+    /// Nulls are skipped, not propagated: <c>greatest(a, NULL)</c> is <c>a</c> and keeps
+    /// <c>a</c>'s type, and only <c>greatest(NULL, NULL)</c> is null. That makes this the same
+    /// shape as <c>coalesce</c> — choose an argument per row, then unify.
     /// </para>
     /// <para>
-    /// <b>Two arguments at least.</b> <c>greatest(a)</c> is <c>WRONG_NUM_ARGS</c> in Spark, not
-    /// the identity, and so is <c>greatest()</c>. Measured, because accepting one would have been
-    /// the obvious reading.
+    /// Two arguments at least: <c>greatest(a)</c> is <c>WRONG_NUM_ARGS</c> in Spark, not the
+    /// identity, and so is <c>greatest()</c>.
     /// </para>
     /// </remarks>
     private IArrowArray Extreme(string name, IReadOnlyList<IArrowArray> args, int rowCount)
@@ -3373,23 +3165,15 @@ public sealed class SparkFunctionRegistry
         if (args.Count < 2)
             throw new ArgumentException($"{name} needs at least two arguments", nameof(args));
 
-        // Converted to the common type FIRST, so the comparison below is between two values of
+        // Converted to the common type first, so the comparison below is between two values of
         // one type rather than across a promotion. `greatest(d1, a)` is a decimal(12,2) in Spark,
         // and comparing the decimal against the raw int would be a different question.
         //
-        // A `void` argument is DROPPED rather than unified with. A bare NULL constrains nothing
-        // in Spark — measured, `greatest(a, NULL)` is an INT holding a — and dropping it changes
-        // no VALUE either, because a row that is null can never be the greatest or the least.
-        //
-        // THE TEST IS THE TYPE, NOT THE CONTENT, and that is #293. This used to drop any argument
-        // that held no value in this batch, which got two things wrong at once and in opposite
-        // directions. A real string column with no populated row was dropped, so `greatest(a, s)`
-        // ANSWERED an int over such a batch where Spark refuses it outright
-        // (DATATYPE_MISMATCH.DATA_DIFF_TYPES) — an answer that depended on what the batch
-        // happened to hold. And over NO rows the test was vacuous, since nothing can be anything
-        // else there, so it had to be suppressed entirely: a bare NULL then constrained the type
-        // it should not, and `greatest(a, NULL)` inside a branch no row reaches REFUSED instead
-        // of answering `a`. A void column is void at every row count, so both cases fall out.
+        // A `void` argument is dropped rather than unified with: a bare NULL constrains nothing
+        // in Spark, and a null row can never be the greatest or the least. The test is the type,
+        // not the content -- an all-null string column must still refuse `greatest(a, s)`
+        // (DATATYPE_MISMATCH.DATA_DIFF_TYPES), and a void column is void at every row count,
+        // including zero.
         var typed = args.Where(a => a.Data.DataType is not NullType).ToList();
 
         // Every argument was void, so there is no type to find and no value to pick. Spark types
@@ -3431,11 +3215,10 @@ public sealed class SparkFunctionRegistry
     /// <c>coalesce</c>/<c>nvl</c>/<c>ifnull</c> -- the first argument that is not null, per row.
     /// </summary>
     /// <remarks>
-    /// Written as a sweep per ARGUMENT rather than per row, which is what lets an argument be
-    /// evaluated once over exactly the rows still looking for a value. Spark evaluates them in the
-    /// same order and stops at the same place, one row at a time; measured,
-    /// <c>coalesce(a, z, CAST(s AS DOUBLE))</c> answers where <c>z</c> covers every row <c>a</c>
-    /// left null, and raises where it does not.
+    /// A sweep per argument rather than per row, so an argument is evaluated once over exactly
+    /// the rows still looking for a value. Spark evaluates them in the same order and stops at
+    /// the same place, one row at a time: <c>coalesce(a, z, CAST(s AS DOUBLE))</c> answers where
+    /// <c>z</c> covers every row <c>a</c> left null, and raises where it does not.
     /// </remarks>
     private IArrowArray Coalesce(IConditionalArguments args, int rowCount)
     {
@@ -3474,19 +3257,13 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>The comparison is <c>=</c>, not a private notion of equality.</b> Spark rewrites
+    /// The comparison is <c>=</c>, not a private notion of equality. Spark rewrites
     /// <c>nullif(a, b)</c> to <c>if(a = b, NULL, a)</c>, so the pair takes the ordinary
-    /// comparison coercion — and the trailing <c>a</c> is the UNCAST operand, which is why the
-    /// answer is built from <paramref name="args"/> rather than from what was compared. Measured:
-    /// <c>nullif(' 2', 1)</c> is the string <c>' 2'</c>, not the 2 it was compared through, and
-    /// <c>nullif(dt, '2026-08-11')</c> is a <c>date</c>.
-    /// </para>
-    /// <para>
-    /// Until #298 this compared a string operand AS TEXT, which is neither dialect's rule: it
-    /// answered <c>' 1'</c> for <c>nullif(' 1', 1)</c> where both dialects answer NULL, since
-    /// <c>' 1'</c> casts to the int 1 and only the rendering differs. Twenty-four corpus rows
-    /// moved — the string rows the issue named, and the temporal, boolean and #280 decimal rows
-    /// it did not, all of which the one coercion call answers.
+    /// comparison coercion — and the trailing <c>a</c> is the uncast operand, which is why the
+    /// answer is built from <paramref name="args"/> rather than from what was compared:
+    /// <c>nullif(' 2', 1)</c> is the string <c>' 2'</c>, and <c>nullif(dt, '2026-08-11')</c> is
+    /// a <c>date</c>. A string is not compared as text: <c>nullif(' 1', 1)</c> is NULL in both
+    /// dialects, since <c>' 1'</c> casts to the int 1.
     /// </para>
     /// <para>
     /// Compared in the operands' own terms once coerced, never as rendered text: a decimal(10,2)
@@ -3507,10 +3284,10 @@ public sealed class SparkFunctionRegistry
                 continue;
             }
 
-            // A null on EITHER side of the comparison makes it null, which is not true, so the
+            // A null on either side of the comparison makes it null, which is not true, so the
             // first operand comes back. The left one can be null here without `args[0]` being
             // null: under the legacy dialect a string the cast refuses becomes null, and
-            // measured, `nullif('abc', 1)` is then `'abc'`.
+            // `nullif('abc', 1)` is then `'abc'`.
             choice[row] = !SparkFunctions.IsNull(left, row)
                 && !SparkFunctions.IsNull(right, row)
                 && SparkFunctions.AreEqual(left, right, row)
@@ -3527,22 +3304,19 @@ public sealed class SparkFunctionRegistry
     /// <remarks>
     /// <para>
     /// The same two questions <c>ArrowRowEvaluator.CoerceOperands</c> asks of the comparison
-    /// operators, asked here because <c>nullif</c> reaches equality by a different road and so
-    /// never got the rule. Both operands are offered a target and at most one comes back with
-    /// one, except in #280's case — an exact numeric against another — where the least common
-    /// type can round BOTH.
+    /// operators, asked here because <c>nullif</c> reaches equality by a different road. Both
+    /// operands are offered a target and at most one comes back with one, except for an exact
+    /// numeric against another, where the least common type can round both.
     /// </para>
     /// <para>
-    /// What each target is belongs to <see cref="ComparisonTarget"/>, and the three rules it
-    /// carries all reach here: a string moves to the other operand's type, a BINARY against a
-    /// string is the pair where the binary moves and is rendered as text, and two exact numerics
-    /// round to their least common type. Measured, all three: <c>nullif('1.0', 1)</c> refuses
-    /// under ANSI and is NULL under legacy, <c>nullif(X'41', 'A')</c> is NULL, and
+    /// What each target is belongs to <see cref="ComparisonTarget"/>, and its rules all reach
+    /// here: <c>nullif('1.0', 1)</c> refuses under ANSI and is NULL under legacy,
+    /// <c>nullif(X'41', 'A')</c> is NULL, and
     /// <c>nullif(CAST(1.005 AS DECIMAL(4,3)), CAST(1 AS DECIMAL(38,0)))</c> is NULL.
     /// </para>
     /// <para>
     /// A <c>void</c> operand is left alone: it has no type to resolve a target through, and it
-    /// compares as null whatever sits opposite it. #293.
+    /// compares as null whatever sits opposite it.
     /// </para>
     /// </remarks>
     private (IArrowArray Left, IArrowArray Right) CoerceForEquality(
@@ -3554,24 +3328,22 @@ public sealed class SparkFunctionRegistry
         if (leftType is NullType || rightType is NullType)
             return (left, right);
 
-        // ANALYSED BEFORE THE ROW LOOP, because `nullif` reaches equality by a road
-        // `ArrowRowEvaluator` never travels: it is a function call, so the evaluator's own
-        // comparison check never sees the pair. Without this, `nullif(a, bl)` under ANSI ANSWERS
-        // over an empty or all-null batch and fails somewhere in `AreEqual` over any other --
-        // the refusal decided by the data, which is the defect #286 exists to remove rather than
-        // to relocate. The legacy dialect accepts the pair here exactly as it does for `=`,
-        // because `CheckComparison` carries #333's exception.
+        // Analysed before the row loop: `nullif` is a function call, so the evaluator's own
+        // comparison check never sees the pair. Without this, `nullif(a, bl)` under ANSI would
+        // answer over an empty or all-null batch and fail in `AreEqual` over any other -- a
+        // refusal decided by the data. The legacy dialect accepts the pair here exactly as it
+        // does for `=`, because `CheckComparison` carries the boolean-equality exception.
         var diagnostic = CheckComparison(ComparisonOperator.Equal, leftType, rightType);
         if (diagnostic is not null)
             throw new ExpressionAnalysisException(diagnostic);
 
-        // EQUAL, because that is the operator this site implements: `nullif(a, b)` is Spark's
-        // `if(a = b, NULL, a)`. Measured, the boolean rule reaches it — `nullif(a, bl)` resolves
-        // `int` and answers NULL on the row where a is 1 and bl is true. #333.
+        // Equal, because `nullif(a, b)` is Spark's `if(a = b, NULL, a)`. The boolean rule
+        // reaches it: under legacy `nullif(a, bl)` resolves `int` and answers NULL on the row
+        // where a is 1 and bl is true.
         var leftTarget = ComparisonTarget(ComparisonOperator.Equal, leftType, rightType);
         var rightTarget = ComparisonTarget(ComparisonOperator.Equal, rightType, leftType);
 
-        // Each operand is cast against the ORIGINAL other one, not against a coerced one: the
+        // Each operand is cast against the original other one, not against a coerced one: the
         // mask below reads only which rows the other side populates, and a cast cannot move a
         // null into or out of a row.
         return (
@@ -3581,10 +3353,10 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>Casts one operand of an equality, over the rows the other one populates.</summary>
     /// <remarks>
-    /// <b>A row whose other operand is null is not cast.</b> Spark's relational operators
-    /// evaluate nothing once an operand is null, so a malformed string sitting opposite one is
-    /// never read and never refused. Measured under ANSI: <c>nullif('abc', CAST(NULL AS INT))</c>
-    /// is <c>'abc'</c> and <c>'abc' = CAST(NULL AS INT)</c> is null, while
+    /// A row whose other operand is null is not cast. Spark's relational operators evaluate
+    /// nothing once an operand is null, so a malformed string sitting opposite one is never read
+    /// and never refused. Under ANSI, <c>nullif('abc', CAST(NULL AS INT))</c> is <c>'abc'</c> and
+    /// <c>'abc' = CAST(NULL AS INT)</c> is null, while
     /// <c>'abc' &lt;=&gt; CAST(NULL AS INT)</c> — which has no such short-circuit — raises
     /// <c>CAST_INVALID_INPUT</c>. Without the mask a batch mixing one such row with an ordinary
     /// one would refuse a comparison Spark answers.
@@ -3600,15 +3372,13 @@ public sealed class SparkFunctionRegistry
     /// or <paramref name="moving"/> itself when no row needs it.
     /// </summary>
     /// <remarks>
-    /// <b>Scanned before it is rebuilt, which is the point of splitting this out.</b> The
-    /// overwhelmingly common batch has no null opposite the string at all, and there the answer is
-    /// the operand as it stands — rebuilding it would allocate a builder and a fresh
-    /// <see cref="string"/> per row to reproduce what was already there. The scan reads null bits
-    /// and allocates nothing. The comparison evaluator's own <c>NulledWhere</c> takes the same
-    /// shape for the same reason.
+    /// Scanned before it is rebuilt: the common batch has no null opposite the string at all, and
+    /// the scan reads null bits and allocates nothing, where rebuilding would allocate a
+    /// <see cref="string"/> per row. The comparison evaluator's own <c>NulledWhere</c> takes the
+    /// same shape.
     /// <para>
-    /// Only a STRING is masked, because only a string cast can refuse. The numeric rounding #280
-    /// asks for cannot fail, so it has no refusal for a null opposite it to suppress.
+    /// Only a string is masked, because only a string cast can refuse; the exact-numeric rounding
+    /// cannot fail.
     /// </para>
     /// </remarks>
     private static IArrowArray NulledWhereOtherIsNull(
@@ -3666,24 +3436,21 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <c>if(x IS NOT NULL, a, b)</c>, and not merely by analogy: Spark rewrites it to exactly
-    /// that before resolution, and says so when the rewrite fails —
-    /// <c>nvl2(a, a, bin)</c> is refused as <c>Cannot resolve "(IF((a IS NOT NULL), a, bin))"</c>.
-    /// So it belongs in the short-circuiting family and unifies through <see cref="UnifyBranches"/>
-    /// like every other member; #308.
+    /// Spark rewrites it to <c>if(x IS NOT NULL, a, b)</c> before resolution, and says so when
+    /// the rewrite fails — <c>nvl2(a, a, bin)</c> is refused as
+    /// <c>Cannot resolve "(IF((a IS NOT NULL), a, bin))"</c>. So it belongs in the
+    /// short-circuiting family and unifies through <see cref="UnifyBranches"/>.
     /// </para>
     /// <para>
-    /// Two things separate it from <see cref="If"/>, both measured on 4.0.3. The first argument is
-    /// read for NULLNESS rather than for truth, so it is not required to be boolean and is not
-    /// required to be scalar either — <c>nvl2(bin, 1, 2)</c>, <c>nvl2(ts, 1, 2)</c> and
-    /// <c>nvl2(nested, a, 0)</c> all answer. And it takes no part in the result type:
-    /// <c>nvl2(s, a, a)</c> is an <c>int</c>, not a string.
+    /// Two things separate it from <see cref="If"/>. The first argument is read for nullness
+    /// rather than truth, so it need not be boolean or even scalar — <c>nvl2(bin, 1, 2)</c>,
+    /// <c>nvl2(ts, 1, 2)</c> and <c>nvl2(nested, a, 0)</c> all answer. And it takes no part in the
+    /// result type: <c>nvl2(s, a, a)</c> is an <c>int</c>, not a string.
     /// </para>
     /// <para>
-    /// The laziness is the whole point of the issue, and it runs in both directions.
-    /// <c>nvl2(s, 0, CAST(s AS INT))</c> answers <c>[0, null, 0]</c> over the corpus batch, where
-    /// the two rows that would raise never reach the cast; <c>nvl2(a, a, 1/0)</c> raises, because
-    /// the null row does reach it.
+    /// The laziness runs in both directions: <c>nvl2(s, 0, CAST(s AS INT))</c> answers
+    /// <c>[0, null, 0]</c> over the corpus batch, where the two rows that would raise never reach
+    /// the cast; <c>nvl2(a, a, 1/0)</c> raises, because the null row does reach it.
     /// </para>
     /// </remarks>
     private IArrowArray Nvl2(IConditionalArguments args, int rowCount)
@@ -3692,8 +3459,8 @@ public sealed class SparkFunctionRegistry
         for (var row = 0; row < rowCount; row++) everyRow[row] = true;
 
         // Over every row, and always: the first argument is what decides, so there is nothing to
-        // skip. Measured, `nvl2(CAST(t AS INT), 1, 2)` raises under ANSI even though neither
-        // branch is in any doubt.
+        // skip. `nvl2(CAST(t AS INT), 1, 2)` raises under ANSI even though neither branch is in
+        // any doubt.
         var subject = args.Evaluate(0, everyRow);
 
         var presentRows = new bool[rowCount];
@@ -3719,7 +3486,7 @@ public sealed class SparkFunctionRegistry
     /// count meaning a trailing ELSE.
     /// </summary>
     /// <remarks>
-    /// A CASE with no ELSE and no matching branch is null — measured,
+    /// A CASE with no ELSE and no matching branch is null —
     /// <c>CASE WHEN a &gt; 0 THEN 1 END</c> gives null where the condition fails.
     /// </remarks>
     private IArrowArray Case(IConditionalArguments args, int rowCount)
@@ -3732,7 +3499,7 @@ public sealed class SparkFunctionRegistry
         var branchCount = pairs + (hasElse ? 1 : 0);
 
         // The rows no WHEN has claimed yet. A later condition is evaluated only over these, which
-        // is Spark's own order: measured, the second WHEN of
+        // is Spark's own order: the second WHEN of
         // `CASE WHEN a > 0 THEN a WHEN CAST(s AS INT) > 0 THEN 2 ELSE 3 END` never runs on a batch
         // whose rows all satisfy the first, and does run -- and raises -- on one where a row
         // falls through.
@@ -3786,21 +3553,18 @@ public sealed class SparkFunctionRegistry
     }
 
     /// <summary>
-    /// Refuses a condition that is not boolean, BEFORE any row of it is read.
+    /// Refuses a condition that is not boolean, before any row of it is read.
     /// </summary>
     /// <remarks>
     /// <para>
     /// A non-boolean condition fails rather than being read as false. Spark rejects one outright
-    /// — <c>if(1, 1, 2)</c> is a DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE analysis error, measured
-    /// under both dialects — and treating it as false here would silently take the ELSE branch on
-    /// every row, a wrong answer that looks like a deliberate one.
+    /// — <c>if(1, 1, 2)</c> is a DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE analysis error in both
+    /// dialects — and treating it as false would silently take the ELSE branch on every row.
     /// </para>
     /// <para>
-    /// <b>Checked once, on the ARRAY, rather than per row.</b> The check is on the type and the
-    /// type does not vary by row, and asking it per row meant it was never asked at all over an
-    /// empty selection — which is how a conditional is typed when nothing reaches it (#307) and
-    /// how the operand of a folded <c>IS NULL</c> is typed (#319). Both made
-    /// <c>if(1, 1, 2)</c> answer where Spark refuses.
+    /// Checked once, on the array, rather than per row: a per-row check is never asked over an
+    /// empty selection, which is how a conditional is typed when nothing reaches it and how the
+    /// operand of a folded <c>IS NULL</c> is typed.
     /// </para>
     /// </remarks>
     private static BooleanArray RequireBooleanCondition(IArrowArray condition)

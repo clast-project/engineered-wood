@@ -7,25 +7,24 @@ namespace EngineeredWood.Expressions;
 
 /// <summary>
 /// Whether comparing a predicate's literal against a column's stored bound is a comparison Spark
-/// would make on ROUNDED values.
+/// would make on rounded values.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Spark compares two exact numerics by casting both to their least common type and comparing
-/// there (#280). When that type gives up scale, the comparison is of the rounded values, and it
-/// can be the opposite of the comparison of the real ones — <b>in the direction that drops
-/// rows</b>: pruning says a file cannot match while Spark says it does. Measured over a
-/// <c>decimal(38,38)</c> column holding 38 nines, where the common type is <c>decimal(38,37)</c>
-/// and the value rounds up to exactly 1: <c>d5 = 1</c>, <c>d5 &gt;= 1</c> and <c>d5 &lt; 1</c> are
-/// all inverted. #323.
+/// there. When that type gives up scale, the comparison is of the rounded values, and it can be
+/// the opposite of the comparison of the real ones — in the direction that drops rows: pruning
+/// says a file cannot match while Spark says it does. For a <c>decimal(38,38)</c> column holding
+/// 38 nines, the common type with <c>1</c> is <c>decimal(38,37)</c> and the value rounds up to
+/// exactly 1, so <c>d = 1</c>, <c>d &gt;= 1</c> and <c>d &lt; 1</c> are all inverted.
 /// </para>
 /// <para>
-/// <b>This does not reproduce the unification; it answers the narrower question of whether
-/// unification would round.</b> That question turns out to need much less than the common type
-/// does — in particular it does not need the column's DECLARED precision, which no statistics
-/// carrier reports and which #323 proposed to plumb through <see cref="IStatisticsAccessor{T}"/>
-/// as a breaking change to a public seam. The derivation is in <see cref="Rounds"/>, and
-/// <c>SparkDecimalRoundingTests</c> checks it against the real unification rather than trusting it.
+/// This does not reproduce the unification; it answers the narrower question of whether
+/// unification would round. That needs much less than the common type does — in particular not
+/// the column's declared precision, which no statistics carrier reports
+/// (<see cref="IStatisticsAccessor{T}"/> has no way to supply it). The derivation is in
+/// <see cref="Rounds"/>, and <c>SparkDecimalRoundingTests</c> checks it against the real
+/// unification.
 /// </para>
 /// </remarks>
 internal static class SparkDecimalRounding
@@ -36,8 +35,8 @@ internal static class SparkDecimalRounding
     /// <summary>
     /// Whether Spark's least common type for these two would round either side.
     /// </summary>
-    /// <param name="literal">The predicate's value, whose digits type it exactly (#281).</param>
-    /// <param name="bound">A column's stored minimum or maximum, whose DECLARED width is unknown.</param>
+    /// <param name="literal">The predicate's value, whose digits type it exactly.</param>
+    /// <param name="bound">A column's stored minimum or maximum, whose declared width is unknown.</param>
     /// <remarks>
     /// <para>
     /// Unification takes <c>scale = max(ls, cs)</c> and
@@ -48,34 +47,31 @@ internal static class SparkDecimalRounding
     /// below its own scale.
     /// </para>
     /// <para>
-    /// <b>The bound is rounded iff <c>li + cs &gt; 38</c>, and the column's own width does not
-    /// enter into it.</b> Rounding the bound needs <c>max(li, ci) &gt; 38 - cs</c>, and
+    /// The bound is rounded iff <c>li + cs &gt; 38</c>, and the column's own width does not
+    /// enter into it. Rounding the bound needs <c>max(li, ci) &gt; 38 - cs</c>, and
     /// <c>ci</c> can never reach that: a declared <c>decimal(cp, cs)</c> has
     /// <c>ci = cp - cs &lt;= 38 - cs</c>. Only the literal's integral digits can push it over,
     /// and those are known exactly.
     /// </para>
     /// <para>
-    /// <b>The literal is rounded iff <c>ci + ls &gt; 38</c>, which DOES need the column's
-    /// width</b> — so it is bounded instead. <c>ci &lt;= 38 - cs</c> makes it possible only when
-    /// <c>ls &gt; cs</c>, and that is the one case answered conservatively. It costs pruning only
-    /// where a predicate carries strictly more decimal places than the column's own bound, and not
-    /// at all for an integral column, whose width IS known from its kind.
+    /// The literal is rounded iff <c>ci + ls &gt; 38</c>, which does need the column's width, so
+    /// it is bounded instead. <c>ci &lt;= 38 - cs</c> makes it possible only when
+    /// <c>ls &gt; cs</c>, and that is the one case answered conservatively (see the final check in
+    /// the body). An integral column's width is known from its kind, so it is never affected.
     /// </para>
     /// </remarks>
     /// <param name="setMembership">
     /// Whether the literal is a member of an <c>IN</c> set rather than a binary comparison's
-    /// right-hand side. It changes how the literal is WIDTHED and nothing else: a set resolves one
-    /// type over all its members before the comparison rule runs, so an integral member counts for
-    /// its TYPE's width - <c>ns IN (1, 2)</c> resolves through bigint, which is
-    /// <c>decimal(20,0)</c> - where the same literal in <c>ns = 1</c> counts for its digits, which
-    /// is <c>decimal(1,0)</c> (#281). Twenty digits against a high-scale column is enough to force
-    /// the clamp where one digit is not.
+    /// right-hand side. It changes only how the literal is widened: a set resolves one type over
+    /// all its members before the comparison rule runs, so an integral member counts for its
+    /// type's width - <c>ns IN (1, 2)</c> resolves through bigint, which is <c>decimal(20,0)</c> -
+    /// where the same literal in <c>ns = 1</c> counts for its digits, <c>decimal(1,0)</c>. Twenty
+    /// digits against a high-scale column can force the clamp where one digit does not.
     /// </param>
     internal static bool Rounds(LiteralValue literal, LiteralValue bound, bool setMembership = false)
     {
-        // Two integrals share a scale of zero and can never round. Checked before anything is
-        // measured, because this runs for every statistics comparison a predicate makes and the
-        // overwhelming majority of them are not decimals at all.
+        // Two integrals share a scale of zero and can never round. Checked first because this
+        // runs for every statistics comparison and most of them involve no decimal at all.
         if (!IsExactDecimal(literal) && !IsExactDecimal(bound))
             return false;
 
@@ -108,10 +104,9 @@ internal static class SparkDecimalRounding
         if (boundWidest + literalScale <= MaxPrecision)
             return false;
 
-        // A decimal bound's declared width is unknown, and stopping here would refuse EVERY
-        // predicate carrying more decimal places than the column -- sound, and it gave up a
-        // quarter of all type pairs. So ask the narrower question instead: could the rounding
-        // change THIS comparison?
+        // A decimal bound's declared width is unknown. Refusing here would be sound but would
+        // refuse every predicate carrying more decimal places than the column, so ask the
+        // narrower question instead: could the rounding change this comparison?
         //
         // Whatever scale the literal is rounded to, it is never coarser than the bound's own (the
         // case where it would be is the one already refused above), so the literal moves by less
@@ -204,9 +199,9 @@ internal static class SparkDecimalRounding
     /// The integral digits and scale Spark would type this value at, or false if it is not exact.
     /// </summary>
     /// <param name="literalTyping">
-    /// How to width an integral. A LITERAL takes the digits it is written with — <c>1</c> is
-    /// <c>decimal(1,0)</c>, which is #281 — while a COLUMN takes its type's full width, so a
-    /// <c>bigint</c> is <c>decimal(20,0)</c> however small the value in it.
+    /// How to widen an integral. A literal takes the digits it is written with — <c>1</c> is
+    /// <c>decimal(1,0)</c> — while a column takes its type's full width, so a <c>bigint</c> is
+    /// <c>decimal(20,0)</c> however small the value in it.
     /// </param>
     /// <param name="digits">
     /// Integral digits, or -1 when the value is a decimal whose declared width is not knowable
@@ -230,7 +225,7 @@ internal static class SparkDecimalRounding
             {
                 var d = value.AsDecimal;
                 scale = DecimalScale(d);
-                // From the UNSCALED mantissa, as the high-precision branch does. Counting the
+                // From the unscaled mantissa, as the high-precision branch does. Counting the
                 // truncated integer part instead reports one digit for 0.1m where it has none,
                 // which turns a safe comparison against a decimal(38,38) bound into Unknown.
                 digits = literalTyping ? Math.Max(Digits(UnscaledMagnitude(d)) - scale, 0) : -1;
@@ -250,7 +245,7 @@ internal static class SparkDecimalRounding
         }
     }
 
-    /// <summary>The width Spark gives an integral COLUMN, from <c>DecimalType.forType</c>.</summary>
+    /// <summary>The width Spark gives an integral column, from <c>DecimalType.forType</c>.</summary>
     private static int IntegralWidth(LiteralValue.Kind kind) => kind switch
     {
         LiteralValue.Kind.Int32 or LiteralValue.Kind.UInt32 => 10,

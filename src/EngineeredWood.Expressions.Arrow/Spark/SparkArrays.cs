@@ -55,15 +55,14 @@ internal static class SparkArrays
         /// so <c>CAST(X'FF' AS STRING)</c> is U+FFFD. <see cref="System.Text.Encoding.UTF8"/>
         /// replaces on the same terms as Java's <c>new String(bytes, UTF_8)</c>.
         /// <para>
-        /// Deferred for the reason the numeric cell is — see <see cref="Text"/> and #251. The
-        /// cell is read once per row and its text is read only by a cast to string and by an
-        /// error message, so decoding here would allocate a string per row for every cast that
-        /// then refuses it. Holding the array rather than a copy of the bytes also keeps it
-        /// alive for the span <see cref="Render"/> takes.
+        /// Decoding is deferred for the reason <see cref="Text"/> gives: only a cast to string and
+        /// an error message read the text, so decoding here would allocate a string per row for
+        /// every cast that then refuses it. Holding the array rather than a copy of the bytes
+        /// also keeps it alive for the span <see cref="Render"/> takes.
         /// </para>
         /// <para>
-        /// <see cref="IsNumeric"/> is false, which is what makes every other cast refuse it: a
-        /// binary is not a number in Spark either, and reading its rendering as one would accept
+        /// <see cref="IsNumeric"/> is false, which makes every other cast refuse it: a binary is
+        /// not a number in Spark either, and reading its rendering as one would accept
         /// <c>CAST(X'3132' AS INT)</c> as 12.
         /// </para>
         /// </remarks>
@@ -90,27 +89,25 @@ internal static class SparkArrays
             // Trimmed once and shared: both parses want the same text, and this runs for every
             // row of every cast and comparison over a string column.
             //
-            // SPARK'S TRIM, NOT .NET'S, and the two sets cross rather than nest -- see
-            // SparkText.TrimBounds. Nothing downstream can undo the choice: .NET's number parser
-            // skips only 0x20 and 0x09-0x0D on its own, all of which this has already removed, so
-            // what it sees is exactly what Spark's parse would. The TEMPORAL parses are the
-            // exception and handle it themselves. #316.
+            // Spark's trim, not .NET's; the two sets cross rather than nest (see
+            // SparkText.TrimBounds). .NET's number parser skips only 0x20 and 0x09-0x0D on its
+            // own, all of which this has already removed, so it sees exactly what Spark's parse
+            // would. The temporal parses trim for themselves.
             //
-            // A SPAN where the runtime has span parses, which is net8.0 and net10.0; only the
-            // netstandard2.0 build takes the string, and only that build allocates for a PADDED
-            // cell -- an unpadded one hands back the original instance either way. The two
-            // TryParse calls below are the same source on both sides: `trimmed` is a string there
-            // and a ReadOnlySpan<char> here, and each binds to its own overload. Same trap as
-            // TryReadTypeSuffixed and DecodeUtf8 below.
+            // A span on net8.0 and net10.0; only the netstandard2.0 build takes the string, and
+            // only it allocates, for a padded cell. The two TryParse calls below are the same
+            // source on both sides: `trimmed` is a string there and a ReadOnlySpan<char> here, and
+            // each binds to its own overload -- the same trap as TryReadTypeSuffixed and
+            // DecodeUtf8 below.
 #if NETSTANDARD2_0
             var trimmed = SparkText.Trim(text);
 #else
             var trimmed = SparkText.Trim(text.AsSpan());
 #endif
-            // Through SparkDoubleText, not double.TryParse: .NET Framework REFUSES a magnitude too
-            // large to represent where .NET Core and Java both return an infinity, and the refusal
-            // does not stop at the double cast -- it goes through IsNumeric, so it decided the
-            // error class of every other numeric cast from this string too. #326.
+            // Through SparkDoubleText, not double.TryParse: .NET Framework refuses a magnitude too
+            // large to represent where .NET Core and Java both return an infinity, and through
+            // IsNumeric that refusal would decide the error class of every other numeric cast from
+            // this string too.
             IsNumeric = SparkDoubleText.TryParse(trimmed, out var asDouble);
             AsDouble = IsNumeric
                 ? WithSignOfZero(asDouble, trimmed.Length > 0 && trimmed[0] == '-')
@@ -136,10 +133,10 @@ internal static class SparkArrays
 
         /// <summary>Whether the value arrived as text rather than as a number.</summary>
         /// <remarks>
-        /// It changes what an integral cast accepts UNDER ANSI. A number truncates toward zero,
+        /// It changes what an integral cast accepts under ANSI. A number truncates toward zero,
         /// so <c>CAST(1.7 AS INT)</c> is 1, while a string must already be an integer and
-        /// <c>CAST('12.5' AS INT)</c> is refused rather than becoming 12. Both measured — but the
-        /// refusal is ANSI's alone: the legacy dialect truncates a string too, and answers 12.
+        /// <c>CAST('12.5' AS INT)</c> is refused. The legacy dialect truncates a string too, and
+        /// answers 12.
         /// </remarks>
         public bool FromString { get; }
 
@@ -149,20 +146,15 @@ internal static class SparkArrays
         /// The source rendered as Spark would render it, for error messages and casts to string.
         /// </summary>
         /// <remarks>
-        /// <b>Rendered on demand for a numeric source, which is what #251 was.</b> It used to be
-        /// formatted for every row of every cast, and only two things ever read it: a cast whose
-        /// target is a string, where it is the answer, and an error message, which fires on a row
-        /// that is being refused. <c>CAST(g AS INT)</c> over a million rows was formatting a
-        /// million doubles and discarding all of them — measured at 265 MB of the 1M-row cast's
-        /// allocation.
+        /// Rendered on demand for a numeric source. Only two things read it — a cast whose target
+        /// is a string, where it is the answer, and an error message on a row being refused — so
+        /// formatting it eagerly would format and discard a double per row: 265 MB of allocation
+        /// over a 1M-row <c>CAST(g AS INT)</c>.
         /// <para>
-        /// Nothing memoises it, because a <c>readonly struct</c> has nowhere to put the result.
-        /// That costs nothing: every path that reads it reads it once, on the row it is about to
-        /// refuse or convert.
-        /// </para>
-        /// <para>
-        /// Holding the array also keeps it alive across the deferral, which is what the span
-        /// taken inside <see cref="Render"/> needs — see <c>doc/arrow-span-lifetime.md</c>.
+        /// Nothing memoises it, because a <c>readonly struct</c> has nowhere to put the result;
+        /// every path that reads it reads it once. Holding the array keeps it alive across the
+        /// deferral, which the span taken inside <see cref="Render"/> needs — see
+        /// <c>doc/arrow-span-lifetime.md</c>.
         /// </para>
         /// </remarks>
         public string Text => _text ?? Render(_array!, _index, Exact);
@@ -183,9 +175,8 @@ internal static class SparkArrays
 
     public static long? ReadInt64(IArrowArray array, int index) => array switch
     {
-        // A bare NULL literal, which Spark types `void`. It is null at every row by construction
-        // and every reader here answers so rather than refusing: the alternative -- a type that
-        // reads as nothing -- is what #293 was, where the placeholder was spelled as a string.
+        // A bare NULL literal, which Spark types `void`: null at every row, and every reader here
+        // answers so rather than refusing.
         NullArray => null,
         Int8Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
@@ -198,23 +189,23 @@ internal static class SparkArrays
     /// <summary>A numeric cell as a <see cref="float"/>, rounded once.</summary>
     /// <remarks>
     /// <para>
-    /// <b>A bigint is converted directly, not through <see cref="ReadDouble"/>.</b> Rounding to 53
-    /// bits and then to 24 can land exactly on a tie the direct conversion does not see:
-    /// 2^60 + 2^36 + 1 is 2^60 + 2^37 as a float in Spark, which is Java's <c>(float) long</c>,
-    /// and 2^60 by way of a double. .NET's <c>(float) long</c> is correctly rounded on every
-    /// target framework -- checked over ten million random longs on .NET 10, and on this value
-    /// on .NET Framework. #299, which is what first sent a bigint to a float outside a CAST.
+    /// A bigint and a decimal are converted directly, not through <see cref="ReadDouble"/>.
+    /// Rounding to 53 bits and then to 24 can land exactly on a tie the direct conversion does not
+    /// see: 2^60 + 2^36 + 1 is 2^60 + 2^37 as a float in Spark (Java's <c>(float) long</c>), and
+    /// 2^60 by way of a double. .NET's <c>(float) long</c> is correctly rounded on every target
+    /// framework -- checked over ten million random longs on .NET 10, and on this value on .NET
+    /// Framework. A decimal rounds once from its exact value, as Java's
+    /// <c>BigDecimal.floatValue</c> does.
     /// </para>
     /// <para>
     /// The narrower integrals and a float are exact in a double, and a double rounds once
-    /// either way, so those keep the double route. A decimal still rounds twice.
+    /// either way, so those keep the double route.
     /// </para>
     /// </remarks>
     public static float? ReadFloat(IArrowArray array, int index) => array switch
     {
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index)!.Value,
 
-        // Once from the exact value, as Java's BigDecimal.floatValue does. #372.
         Decimal128Array a => a.IsNull(index)
             ? null
             : ScaledDecimal.ToSingle(Unscaled(a, index), ((Decimal128Type)a.Data.DataType).Scale),
@@ -228,7 +219,7 @@ internal static class SparkArrays
     /// </summary>
     /// <remarks>
     /// For a string <see cref="CastInput"/> has already decided is numeric; it holds only the
-    /// DOUBLE reading, and narrowing that would round twice. #372.
+    /// double reading, and narrowing that would round twice.
     /// </remarks>
     public static bool TryReadFloat(string text, out float value)
     {
@@ -256,14 +247,11 @@ internal static class SparkArrays
 
     /// <summary>A Decimal128 cell as the nearest <see cref="double"/>.</summary>
     /// <remarks>
-    /// Through the unscaled integer for EVERY width, not just the wide ones. This used to try
-    /// <c>(double)GetValue(index)</c> first and fall back on <see cref="OverflowException"/>,
-    /// which is two rounding rules -- and #202 measured BOTH of them wrong. <c>(double)decimal</c>
-    /// is an ulp off on 17.4% of the values it accepts, so the fallback was not a slower path to
-    /// the same answer; it was the only correct one.
-    /// <see cref="ScaledDecimal.ToDouble(System.Numerics.BigInteger, int)"/> now carries the whole
-    /// range, and its exact fast path covers the widths the old happy path was there to make
-    /// cheap.
+    /// Through the unscaled integer for every width, not only the wide ones: do not shortcut
+    /// through <c>(double)GetValue(index)</c>, because <c>(double)decimal</c> is an ulp off on
+    /// 17.4% of the values it accepts.
+    /// <see cref="ScaledDecimal.ToDouble(System.Numerics.BigInteger, int)"/> carries the whole
+    /// range, with an exact fast path for the ordinary narrow decimal.
     /// </remarks>
     private static double DecimalAsDouble(Decimal128Array array, int index) =>
         ScaledDecimal.ToDouble(Unscaled(array, index), ((Decimal128Type)array.Data.DataType).Scale);
@@ -278,10 +266,9 @@ internal static class SparkArrays
         GC.KeepAlive(array);
         return new System.Numerics.BigInteger(bytes);
 #else
-        // No ToArray: the span overload consumes the bytes inside the call, so the copy bought
-        // nothing that the KeepAlive below does not already buy. That matters now that EVERY
-        // decimal-to-double cast comes through here rather than only the wide ones -- it was an
-        // allocation per row.
+        // No ToArray: the span overload consumes the bytes inside the call, and the KeepAlive
+        // below already covers the span. Every decimal-to-double conversion comes through here,
+        // so a copy would be an allocation per row.
         var value = new System.Numerics.BigInteger(
             array.ValueBuffer.Span.Slice(index * 16, 16), isUnsigned: false, isBigEndian: false);
         GC.KeepAlive(array);
@@ -307,18 +294,16 @@ internal static class SparkArrays
     /// A floating-point value as an exact <see cref="decimal"/>, refusing when it has no such form.
     /// </summary>
     /// <remarks>
-    /// <b>Refuses with the same exception the Decimal128 route refuses with, and that is the whole
-    /// point.</b> A checked conversion from a double signals out-of-range by throwing
-    /// <see cref="OverflowException"/> where <see cref="ExactDecimal(Decimal128Array,int)"/> throws
-    /// <see cref="NotSupportedException"/> — so "this value has no exact <see cref="decimal"/>
-    /// form" had TWO signals, and <see cref="SparkFunctions.AreEqual"/> caught only one of them.
-    /// The other escaped the evaluator as a bare BCL exception. #290.
+    /// Refuses with the same exception as <see cref="ExactDecimal(Decimal128Array,int)"/>. A
+    /// checked conversion from a double signals out-of-range with
+    /// <see cref="OverflowException"/>, but callers such as <see cref="SparkFunctions.AreEqual"/>
+    /// catch only <see cref="NotSupportedException"/>, so letting it through would escape the
+    /// evaluator as a bare BCL exception.
     /// <para>
     /// Everything <see cref="decimal"/> cannot hold arrives here: a magnitude past its ceiling near
-    /// 7.9228e28, and every NaN and infinity, none of which has an exact form at all. Written as a
-    /// caught conversion rather than a range test because the boundary is <see cref="decimal"/>'s
-    /// own and a hand-written bound would have to be exact at it; the conversion already knows.
-    /// It costs an exception only on the values that had none anyway.
+    /// 7.9228e28, and every NaN and infinity. A caught conversion rather than a range test,
+    /// because the boundary is <see cref="decimal"/>'s own and the conversion already knows it
+    /// exactly; it costs an exception only on values that have no exact form anyway.
     /// </para>
     /// </remarks>
     private static decimal ExactDecimal(double value, IArrowArray array)
@@ -339,10 +324,10 @@ internal static class SparkArrays
     /// A Decimal128 cell as an exact <see cref="decimal"/>, refusing when it does not fit.
     /// </summary>
     /// <remarks>
-    /// Decimal arithmetic no longer runs through <see cref="decimal"/>: <c>SparkWideDecimals</c>
-    /// computes on the unscaled integer and covers Spark's full precision 38. This stays for the
+    /// Decimal arithmetic does not run through <see cref="decimal"/>: <c>SparkWideDecimals</c>
+    /// computes on the unscaled integer and covers Spark's full precision 38. This serves the
     /// callers that want a <see cref="decimal"/> specifically, where a value past decimal's
-    /// ceiling near 7.9e28 has no exact form at all.
+    /// ceiling near 7.9e28 has no exact form.
     /// <para>
     /// Refusing rather than rounding is load-bearing in both directions. It is what lets equality
     /// fall back to a double comparison when one side is a float and cannot be exact anyway, and
@@ -368,63 +353,51 @@ internal static class SparkArrays
     /// <summary>The Unix epoch, as the instant a Date32 counts days from.</summary>
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    /// <summary>The one ZONED timestamp type this evaluator ever produces.</summary>
+    /// <summary>The one zoned timestamp type this evaluator produces.</summary>
     /// <remarks>
-    /// Microseconds in UTC, which is what
-    /// <see cref="BuildTimestamp(DateTimeOffset?[], int)"/> builds — so a rule that
-    /// RESOLVES a zoned timestamp must name this instance and not construct its own.
-    /// <see cref="NaiveTimestamp"/> is the other half of the pair, and between them they are
-    /// still the only two timestamp types anything here produces: a source column's own type is
-    /// never passed through, only read for its zone. A source column
-    /// may well carry another unit or zone (Parquet writes milliseconds happily), and a
-    /// resolution that echoed the source's type back would promise a type the array it hands
-    /// over does not have. #311.
     /// <para>
-    /// <b>A naive timestamp has <see cref="NaiveTimestamp"/> for the same job</b>, and until #349
-    /// it did not: <see cref="BuildTimestamp(DateTimeOffset?[], int)"/> labelled every result UTC
-    /// whatever it read, so a
-    /// fold over two naive timestamps resolved <c>timestamp_ntz</c> and handed back a zoned
-    /// array. The value was never wrong — under the pinned UTC session zone a wall clock and an
-    /// instant are the same micros — but a Delta generated column writes its schema from the type
-    /// the array carries, so a naive column silently became a zoned one.
+    /// Microseconds in UTC, which is what <see cref="BuildTimestamp(DateTimeOffset?[], int)"/>
+    /// builds. A rule that resolves a zoned timestamp must name this instance rather than
+    /// construct its own or echo a source column's type: a source may carry another unit or zone
+    /// (Parquet writes milliseconds), and echoing it would promise a type the built array does not
+    /// have. With <see cref="NaiveTimestamp"/>, these are the only two timestamp types anything
+    /// here produces; a source column's type is only read for its zone.
     /// </para>
     /// <para>
     /// <c>ArrowRowEvaluator</c> spells the same type out for itself when it materialises a
-    /// <c>TIMESTAMP'…'</c> literal, and deliberately: it is registry-agnostic, and reaching into
-    /// the Spark namespace for a constant would couple the evaluator to the dialect it dispatches
-    /// to. The duplication is one line and the direction of the dependency is worth more.
+    /// <c>TIMESTAMP'…'</c> literal: it is registry-agnostic, and reaching into the Spark namespace
+    /// for a constant would couple it to the dialect it dispatches to.
     /// </para>
     /// </remarks>
     public static readonly TimestampType Timestamp = new(TimeUnit.Microsecond, "UTC");
 
-    /// <summary>The one NAIVE timestamp type this evaluator ever produces — Spark's TIMESTAMP_NTZ.</summary>
+    /// <summary>The one naive timestamp type this evaluator produces — Spark's TIMESTAMP_NTZ.</summary>
     /// <remarks>
     /// <para>
-    /// Microseconds with NO zone, which is how Delta's <c>SchemaConverter.FromDeltaPrimitive</c>
-    /// spells <c>timestamp_ntz</c> in Arrow and therefore the only shape one ever arrives in.
-    /// It exists for the reason <see cref="Timestamp"/> does: a rule that resolves a naive
-    /// timestamp must name this instance, so that the type it promises is the type
-    /// <see cref="BuildTimestamp(DateTimeOffset?[], int, TimestampType)"/> builds.
+    /// Microseconds with no zone, which is how Delta's <c>SchemaConverter</c> spells
+    /// <c>timestamp_ntz</c> in Arrow. A rule that resolves a naive timestamp must name this
+    /// instance and build with it through
+    /// <see cref="BuildTimestamp(DateTimeOffset?[], int, TimestampType)"/>. Under the pinned UTC
+    /// zone a naive and a zoned array hold the same micros, so only the label differs, but a
+    /// Delta generated column takes its schema from the array's type: a naive result labelled
+    /// UTC would silently turn a naive column into a zoned one.
     /// </para>
     /// <para>
-    /// <b>The two are not interchangeable to Spark, and the corpus cannot see the difference.</b>
-    /// Measured on 4.0.3: <c>coalesce(ntz, dt)</c> is <c>timestamp_ntz</c> while
-    /// <c>coalesce(ntz, ts)</c> is a ZONED timestamp — a naive operand promotes to zoned the
-    /// moment a zoned one is present, and stays naive otherwise. Under the pinned UTC session
-    /// zone both hold the same micros for the same wall clock, so only the TYPE tells them
-    /// apart; probed under <c>America/Los_Angeles</c>, <c>CAST(ntz AS TIMESTAMP)</c> reinterprets
-    /// the wall clock in the session zone exactly as a string cast does. #349.
+    /// The two are not interchangeable to Spark, and the corpus cannot see the difference:
+    /// <c>coalesce(ntz, dt)</c> is <c>timestamp_ntz</c> while <c>coalesce(ntz, ts)</c> is zoned —
+    /// a naive operand promotes to zoned once a zoned one is present. Under
+    /// <c>America/Los_Angeles</c>, <c>CAST(ntz AS TIMESTAMP)</c> reinterprets the wall clock in the
+    /// session zone exactly as a string cast does.
     /// </para>
     /// </remarks>
     public static readonly TimestampType NaiveTimestamp =
         new(TimeUnit.Microsecond, (string?)null);
 
-    /// <summary>A timestamp that CARRIES a zone, as opposed to Spark's TIMESTAMP_NTZ.</summary>
+    /// <summary>A timestamp that carries a zone, as opposed to Spark's TIMESTAMP_NTZ.</summary>
     /// <remarks>
-    /// <b>"Clearly zoned", not "not null".</b> A timestamp carrying an empty zone string — which
-    /// the Delta converter never produces and nothing here can rule out — reads as naive, because
-    /// the conservative direction is the one that cannot silently relabel a wall clock as an
-    /// instant. #348 introduced the test and #349 moved it here, where both callers can reach it.
+    /// An empty zone string — which the Delta converter never produces but nothing here rules
+    /// out — reads as naive, because that direction cannot silently relabel a wall clock as an
+    /// instant.
     /// </remarks>
     public static bool IsZonedTimestamp(IArrowType type) =>
         type is TimestampType timestamp && !string.IsNullOrEmpty(timestamp.Timezone);
@@ -452,8 +425,8 @@ internal static class SparkArrays
     /// <summary>Reads a value for casting, keeping strings as strings.</summary>
     public static CastInput? ReadForCast(IArrowArray array, int index)
     {
-        // FIRST, because a `void` column has no value at any row and every later branch would
-        // have to answer the same thing. #293.
+        // First, because a `void` column has no value at any row and every later branch would
+        // have to answer the same thing.
         if (array is NullArray)
             return null;
 
@@ -476,7 +449,7 @@ internal static class SparkArrays
         if (array is StringArray strings)
             return strings.IsNull(index) ? null : new CastInput(strings.GetString(index));
 
-        // AFTER the string case, deliberately: Apache.Arrow's StringArray derives from
+        // After the string case: Apache.Arrow's StringArray derives from
         // BinaryArray, so this pattern matches one too and would take its bytes instead of its
         // text. Every other cast refuses a binary, which is what CastInput.FromBinary encodes.
         if (array is BinaryArray binary)
@@ -496,17 +469,15 @@ internal static class SparkArrays
         // Only in-range values get an exact form; the rest travel as a double and are refused by
         // whichever cast needs exactness.
         //
-        // The bound is what makes an unguarded ReadDecimal safe here, and the two are a pair. The
-        // ONLY condition under which reading an exact decimal raises is a magnitude past
-        // System.Decimal's ceiling of ~7.9228e28, and this bound is stricter than that, so nothing
-        // that passes it can raise. Excess significant DIGITS do not raise — Decimal128Array
-        // rounds them to 28 and reports success. Loosen this bound and the exception becomes
-        // reachable again.
+        // The bound is what makes an unguarded ReadDecimal safe here. The only condition under
+        // which reading an exact decimal raises is a magnitude past System.Decimal's ceiling of
+        // ~7.9228e28, and this bound is stricter, so nothing that passes it can raise. Excess
+        // significant digits do not raise — Decimal128Array rounds them to 28 and reports
+        // success. Loosening this bound makes the exception reachable.
         //
-        // Both limits are why rendering no longer consults this value: it is null past the bound
-        // and quietly rounded inside it, so Render works from the buffer instead. What remains
-        // here serves the casts that need an exact System.Decimal specifically, and those refuse
-        // when it is null rather than rendering anything.
+        // Since the value is null past the bound and quietly rounded inside it, Render works from
+        // the buffer instead; this serves only the casts that need an exact System.Decimal, and
+        // those refuse when it is null.
         decimal? exact = asDouble.Value is >= -7.9e28 and <= 7.9e28
             ? ReadDecimal(array, index)
             : null;
@@ -516,17 +487,11 @@ internal static class SparkArrays
 
     /// <summary>Renders an instant the way Spark prints it.</summary>
     /// <remarks>
-    /// Measured: a timestamp prints as <c>2026-08-11 03:00:00</c> and a date as
-    /// <c>2026-08-11</c>, both in the resolved timezone.
-    /// <para>
-    /// <b>The sub-second is printed and its trailing zeros are not</b>, which is a rule of its
-    /// own rather than a fixed number of digits. Measured on 4.0.3:
+    /// A timestamp prints as <c>2026-08-11 03:00:00</c> and a date as <c>2026-08-11</c>, both in
+    /// the resolved timezone. The sub-second is printed without its trailing zeros:
     /// <c>.100000</c> prints as <c>.1</c>, <c>.010000</c> as <c>.01</c>, <c>.123400</c> as
-    /// <c>.1234</c>, <c>.000001</c> as <c>.000001</c> and <c>.000000</c> not at all. Until #318
-    /// the format string stopped at the seconds, so <c>CAST(ts AS STRING)</c> silently dropped
-    /// every fraction — a defect on the way OUT that a corpus row cannot tell apart from one in
-    /// the parse, which is why it is named here.
-    /// </para>
+    /// <c>.1234</c>, <c>.000001</c> as <c>.000001</c> and <c>.000000</c> not at all. A corpus row
+    /// cannot tell a fraction dropped here from one lost in the parse.
     /// </remarks>
     public static string RenderInstant(DateTimeOffset instant, bool isDate)
     {
@@ -571,13 +536,10 @@ internal static class SparkArrays
 
     /// <summary>Builds a microsecond timestamp array from instants, at <paramref name="type"/>.</summary>
     /// <remarks>
-    /// <b>The zone is a LABEL here and nothing else.</b> The micros written are the instants
-    /// handed in, whichever type is asked for, because under the pinned UTC session zone a naive
-    /// timestamp and a zoned one hold the same number for the same wall clock — so building a
-    /// <see cref="NaiveTimestamp"/> is the same array with a different name on it. That is
-    /// exactly the defect #349 gap 1 reported: the name was the part that was wrong. A
-    /// configurable session zone (#133) is what would make this a conversion rather than a
-    /// label, and it would have to be written then.
+    /// The zone is only a label here: the micros written are the instants handed in, whichever
+    /// type is asked for, because under the pinned UTC session zone a naive timestamp and a zoned
+    /// one hold the same number for the same wall clock. A configurable session zone (#133) would
+    /// make this a conversion rather than a label.
     /// </remarks>
     public static IArrowArray BuildTimestamp(
         DateTimeOffset?[] values, int rowCount, TimestampType type)
@@ -623,8 +585,8 @@ internal static class SparkArrays
     }
 
     /// <summary>
-    /// <see cref="TryReadTypeSuffixed(string, out double)"/> for a FLOAT target, rounded once from
-    /// the text rather than narrowed from the double reading. #372.
+    /// <see cref="TryReadTypeSuffixed(string, out double)"/> for a float target, rounded once from
+    /// the text rather than narrowed from the double reading.
     /// </summary>
     public static bool TryReadTypeSuffixed(string text, out float value)
     {
@@ -658,33 +620,29 @@ internal static class SparkArrays
         return (previous >= '0' && previous <= '9') || previous == '.';
     }
 
-    /// <summary>A float with the sign its TEXT carried; see the double overload.</summary>
+    /// <summary>A float with the sign its text carried; see the double overload.</summary>
     private static float WithSignOfZero(float value, bool negative) =>
         value == 0f && negative ? -0f : value;
 
     /// <summary>
-    /// A parsed value with the sign its TEXT carried, which only a zero can have lost.
+    /// A parsed value with the sign its text carried, which only a zero can have lost.
     /// </summary>
     /// <remarks>
-    /// <b>.NET Framework's number parser returns a POSITIVE zero for <c>"-0.0"</c></b>, where
-    /// .NET Core and Java both return the negative one. Measured: the netstandard2.0 build of
-    /// this library renders <c>CAST('-0.0' AS DOUBLE)</c> as <c>0.0</c> under net472 and as
-    /// <c>-0.0</c> under net10.0, against Spark's <c>-0.0</c> — so without this the answer
-    /// depended on which RUNTIME loaded the library, which is the same thing
-    /// <see cref="SparkFloatText.ShortestRoundTrip(double)"/> refuses for the digits. #282.
+    /// .NET Framework's number parser returns a positive zero for <c>"-0.0"</c>, where .NET Core
+    /// and Java both return the negative one; without this, <c>CAST('-0.0' AS DOUBLE)</c> renders
+    /// as <c>0.0</c> under net472 and <c>-0.0</c> under net10.0, against Spark's <c>-0.0</c>.
     /// <para>
-    /// Applied to every parse rather than only the netstandard2.0 one, because it is a no-op
-    /// wherever the parser already got it right: a leading <c>-</c> on text that reads as zero
-    /// means a negative zero on every runtime, and no other value can reach the branch. Reading
-    /// the SIGN off the text rather than off the parse is also the only thing available —
-    /// <c>-1e-400</c> underflows to a zero whose sign is not in the digits anywhere.
+    /// Applied to every parse because it is a no-op wherever the parser already got it right: a
+    /// leading <c>-</c> on text that reads as zero means a negative zero on every runtime. The sign
+    /// has to come from the text rather than the parse — <c>-1e-400</c> underflows to a zero whose
+    /// sign is not in the digits.
     /// </para>
     /// </remarks>
     private static double WithSignOfZero(double value, bool negative) =>
-        // `-0d` is a compile-time flip of the sign BIT, which is the value wanted. Not `0d - 0d`,
-        // which is a POSITIVE zero under round-to-nearest -- the same trap #282 fixes in
-        // SparkFunctionRegistry.Negate. NegativeZeroTests asserts the constant really is negative,
-        // since a reader cannot tell the two apart by looking.
+        // `-0d` is a compile-time flip of the sign bit. Not `0d - 0d`, which is a positive zero
+        // under round-to-nearest -- the same trap SparkFunctionRegistry.NegateFloating avoids.
+        // NegativeZeroTests asserts the constant really is negative, since a reader cannot tell
+        // the two apart by looking.
         value == 0d && negative ? -0d : value;
 
     /// <summary>UTF-8 with replacement, straight off the buffer where the runtime allows it.</summary>
@@ -705,16 +663,13 @@ internal static class SparkArrays
     /// <remarks>
     /// Floating point goes through <see cref="SparkFloatText"/>, which reproduces Java's own
     /// spelling — where the exponent starts, the digit that always follows the point, and an
-    /// unsigned exponent. Measured: every row of the corpus's <c>float-to-string</c> group is
-    /// exactly what <c>Double.toString</c> or <c>Float.toString</c> prints, and .NET's <c>"R"</c>
-    /// matched almost none of it. #248.
+    /// unsigned exponent. .NET's <c>"R"</c> matches almost none of the corpus's
+    /// <c>float-to-string</c> group.
     /// <para>
     /// A decimal renders from its unscaled integer and scale rather than from the
-    /// <see cref="decimal"/> exact form, because that form covers only part of the range: past
-    /// decimal's ceiling it is null, and inside the ceiling it silently rounds a value carrying
-    /// more than 28 significant digits. Rendering from the buffer is exact across all of
-    /// precision 38, and is byte-identical to the old rendering everywhere the old one was
-    /// correct — verified over signs, trailing zeros and every scale.
+    /// <see cref="decimal"/> exact form, which is null past decimal's ceiling and, inside it,
+    /// silently rounds a value carrying more than 28 significant digits. Rendering from the buffer
+    /// is exact across all of precision 38.
     /// </para>
     /// </remarks>
     private static string Render(IArrowArray array, int index, decimal? value) => array switch
@@ -729,7 +684,7 @@ internal static class SparkArrays
 
         // Integral arrays only, and their exact form is never null: the widest is Int64 at about
         // 9.2e18, far inside the bound that decides whether an exact form is taken at all. There
-        // is deliberately no placeholder string here — emitting one as a value is what #175 was.
+        // is deliberately no placeholder string here: it would be emitted as if it were the value.
         _ => value?.ToString(Invariant)
             ?? throw new NotSupportedException(
                 $"{array.Data.DataType.Name} reached Render with no exact value"),
@@ -808,16 +763,14 @@ internal static class SparkArrays
 
     /// <summary>The array as bytes, or a refusal naming the type that cannot be read as binary.</summary>
     /// <remarks>
-    /// <b>A <see cref="StringArray"/> passes this check, and that is the point rather than an
-    /// accident.</b> Apache.Arrow's StringArray derives from <see cref="BinaryArray"/> and its
-    /// value buffer already holds the UTF-8 — which IS Spark's string-to-binary cast, measured:
-    /// <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, and <c>CAST('' AS BINARY)</c> is empty bytes
-    /// rather than null. So the derivation that has to be guarded against everywhere else in this
-    /// file — where it would take a string's bytes when its TEXT was wanted — is here exactly what
-    /// is wanted, and no ordering is needed at all. #295.
+    /// A <see cref="StringArray"/> passes, deliberately: it derives from <see cref="BinaryArray"/>
+    /// and its value buffer already holds the UTF-8, which is Spark's string-to-binary
+    /// conversion — <c>CAST('é' AS BINARY)</c> is <c>C3A9</c>, and <c>CAST('' AS BINARY)</c> is
+    /// empty bytes rather than null. So the derivation guarded against elsewhere in this file,
+    /// where a string's text is wanted rather than its bytes, is exactly what is wanted here.
     /// <para>
-    /// Every other source type is refused, and by the CALLER rather than here, because the two
-    /// dialects disagree about integrals.
+    /// Every other source type is refused. The integral-to-binary cast, where the two dialects
+    /// disagree, is handled by the cast itself and does not come through here.
     /// </para>
     /// </remarks>
     private static BinaryArray AsBinary(IArrowArray array) =>
@@ -834,8 +787,8 @@ internal static class SparkArrays
     /// </remarks>
     public static void AppendBytes(BinaryArray.Builder builder, IArrowArray array, int index)
     {
-        // A `void` branch carries no bytes at any row, and is reachable here whenever the OTHER
-        // branch made the unified type binary -- `if(c, X'00', NULL)`. #293.
+        // A `void` branch carries no bytes at any row, and is reachable here whenever the other
+        // branch made the unified type binary -- `if(c, X'00', NULL)`.
         if (array is NullArray)
         {
             builder.AppendNull();
@@ -860,14 +813,12 @@ internal static class SparkArrays
     /// Orders one row of two binary columns the way Spark orders a binary column.
     /// </summary>
     /// <remarks>
-    /// <b>Unsigned, and measured rather than assumed</b>: <c>greatest(X'00', X'FF')</c> is
-    /// <c>FF</c> and <c>greatest(X'7F', X'80')</c> is <c>80</c>. A signed reading gets both
-    /// backwards, which is the mistake a port from Java invites — Java's <c>byte</c> is signed
-    /// where .NET's is not. A shorter array that is a prefix of a longer one sorts first:
-    /// <c>greatest(X'01', X'0100')</c> is <c>0100</c>.
+    /// Unsigned: <c>greatest(X'00', X'FF')</c> is <c>FF</c> and <c>greatest(X'7F', X'80')</c> is
+    /// <c>80</c>. A signed reading gets both backwards, which is the mistake a port from Java
+    /// invites — Java's <c>byte</c> is signed where .NET's is not. A shorter array that is a prefix
+    /// of a longer one sorts first: <c>greatest(X'01', X'0100')</c> is <c>0100</c>.
     /// <para>
-    /// Compares in place for the reason <see cref="AppendBytes"/> gives — this is a per-row call,
-    /// and materialising either side would allocate.
+    /// Compares in place for the reason <see cref="AppendBytes"/> gives.
     /// </para>
     /// </remarks>
     public static int CompareBytes(IArrowArray left, IArrowArray right, int index)
@@ -910,13 +861,11 @@ internal static class SparkArrays
         Decimal256Type d => $"DECIMAL({d.Precision},{d.Scale})",
 
         // Spark's name for the type of a bare NULL. Arrow calls it `null`, which would read as
-        // "no type at all" in an error message rather than as the type it is. #293.
+        // "no type at all" in an error message.
         NullType => "VOID",
 
-        // Spark has ONE date type and Arrow has two widths of it, so the fallback below spelled
-        // these "DATE32" and "DATE64" -- a type name no Spark user has ever seen. It reached every
-        // message this feeds, not only the cast refusal that found it: a date compared with a
-        // number is BINARY_OP_DIFF_TYPES, and it named the operand's type. #332.
+        // Spark has one date type and Arrow has two widths of it; the fallback below would spell
+        // them "DATE32" and "DATE64", which no Spark user has seen, in every message this feeds.
         Date32Type or Date64Type => "DATE",
 
         _ => type.Name.ToUpperInvariant(),

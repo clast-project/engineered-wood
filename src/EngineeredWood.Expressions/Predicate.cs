@@ -129,8 +129,8 @@ public sealed record SetPredicate(
 {
     /// <summary>A set over literal values, which is what most <c>IN</c> lists are.</summary>
     /// <remarks>
-    /// The list holds expressions so that <c>x IN (a, b)</c> can exist at all; this spelling
-    /// exists so that <c>x IN (1, 2)</c> does not have to say so twice.
+    /// A convenience that wraps each value in a <see cref="LiteralExpression"/>; the list itself
+    /// holds expressions so that <c>x IN (a, b)</c> can be represented.
     /// </remarks>
     public SetPredicate(Expression operand, IReadOnlyList<LiteralValue> values, SetOperator op)
         : this(operand, AsExpressions(values), op)
@@ -154,25 +154,21 @@ public sealed record SetPredicate(
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The list holds EXPRESSIONS, because <c>IN</c> takes them: <c>x IN (a, b)</c> is as
-    /// ordinary as <c>x IN (1, 2)</c>, and it cannot be rewritten as a disjunction of equalities
-    /// without changing its meaning. Spark resolves one type over the operand and the whole
-    /// list, where a disjunction resolves each pair on its own — measured, <c>a IN ('01')</c> is
-    /// false under the legacy dialect and <c>a = '01'</c> is true. #261.
+    /// The list holds expressions because <c>IN</c> takes them, and <c>x IN (a, b)</c> cannot be
+    /// rewritten as a disjunction of equalities without changing its meaning: Spark resolves one
+    /// type over the operand and the whole list, where a disjunction resolves each pair on its
+    /// own, so <c>a IN ('01')</c> is false under the legacy dialect and <c>a = '01'</c> is true.
     /// </para>
     /// <para>
-    /// Everything that reads the list as data rather than evaluating it — statistics pruning,
-    /// Lance's index pruning — needs the literal case and can do nothing with the rest, so this
-    /// is the shape they ask in. A list with an expression in it answers false and they fall
-    /// back to "no information", which is the same answer they already gave for a set they could
-    /// not use.
+    /// Consumers that read the list as data rather than evaluating it — statistics pruning, Bloom
+    /// filter probing, Lance's index pruning — can use only the literal case. A list with an
+    /// expression in it answers false and they fall back to "no information".
     /// </para>
     /// </remarks>
     public bool TryGetLiteralValues(out IReadOnlyList<LiteralValue> literals)
     {
-        // Asked first, so that a list this cannot answer for costs nothing. Its callers use it
-        // as a capability check -- pruning and Bloom probing ask before doing anything else --
-        // and a list holding a column is exactly the case that would have paid for the array.
+        // Checked before allocating: callers use this as a capability check, so a list that
+        // cannot answer should cost nothing.
         for (var i = 0; i < Values.Count; i++)
         {
             if (Values[i] is not LiteralExpression)

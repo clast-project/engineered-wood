@@ -8,12 +8,11 @@ namespace EngineeredWood.Expressions.Sql;
 /// uses a construct this parser does not support.
 /// </summary>
 /// <remarks>
-/// This is deliberately a distinct, quotable failure rather than a generic one. A Delta table can
-/// carry a CHECK constraint or generation expression that this parser does not understand, and
-/// the required behaviour there is to refuse the write with an explanation — the same
-/// fail-closed outcome the table already had — never to commit rows that were not validated. A
-/// caller that catches this and reports <see cref="Exception.Message"/> alongside
-/// <see cref="Expression"/> tells the user exactly which constraint stopped them and where.
+/// A distinct, quotable failure rather than a generic one. A Delta table can carry a CHECK
+/// constraint or generation expression that this parser does not understand, and the required
+/// behaviour there is to refuse the write with an explanation, never to commit rows that were not
+/// validated. <see cref="Exception.Message"/> and <see cref="Expression"/> together tell the user
+/// which constraint stopped them and where.
 /// </remarks>
 public sealed class SparkSqlParseException : Exception
 {

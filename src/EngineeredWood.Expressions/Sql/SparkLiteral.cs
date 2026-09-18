@@ -11,9 +11,9 @@ namespace EngineeredWood.Expressions.Sql;
 /// Turns literal token text into a typed <see cref="LiteralValue"/>.
 /// </summary>
 /// <remarks>
-/// This is the lowering the tokenizer deliberately does not do. It needs Spark's typing rules,
-/// and the rules are not guessable — every one below was measured into
-/// <c>Fixtures/spark-expression-corpus.json</c> rather than assumed.
+/// The tokenizer deliberately leaves this lowering here, because it needs Spark's typing rules.
+/// Those rules are not guessable; every one below was measured into
+/// <c>Fixtures/spark-expression-corpus.json</c>.
 /// </remarks>
 internal static class SparkLiteral
 {
@@ -21,18 +21,18 @@ internal static class SparkLiteral
     /// Types a numeric literal the way Spark does.
     /// </summary>
     /// <remarks>
-    /// The rule that surprises: a fractional literal is a DECIMAL, not a double. Spark types
-    /// <c>1.5</c> as <c>decimal(2,1)</c>, <c>.5</c> as <c>decimal(1,1)</c> and <c>1.</c> as
-    /// <c>decimal(1,0)</c> — only an exponent makes it a double, so <c>1e3</c> is
-    /// <c>double</c>. Integers take the narrowest of int then bigint, so <c>1</c> is an
-    /// <c>int</c> while <c>1000000000000</c> is a <c>bigint</c>.
+    /// A fractional literal is a DECIMAL, not a double: Spark types <c>1.5</c> as
+    /// <c>decimal(2,1)</c>, <c>.5</c> as <c>decimal(1,1)</c> and <c>1.</c> as
+    /// <c>decimal(1,0)</c>. Only an exponent makes it a double, so <c>1e3</c> is <c>double</c>.
+    /// Integers take the narrowest of int then bigint, so <c>1</c> is an <c>int</c> while
+    /// <c>1000000000000</c> is a <c>bigint</c>.
     /// <para>
-    /// <paramref name="negative"/> is a minus sign the parser folded into the literal, and it is
-    /// applied BEFORE the ladder, because Spark types the signed text: <c>-2147483648</c> is an
+    /// <paramref name="negative"/> is a minus sign the parser folded into the literal. It is
+    /// applied before the ladder because Spark types the signed text: <c>-2147483648</c> is an
     /// <c>int</c> and <c>-9223372036854775808</c> a <c>bigint</c>, though neither magnitude fits
-    /// the type its negation does. #303. A floating-point literal is the exception: it is negated
-    /// after parsing, so the range check keeps reading an unsigned mantissa, and a zero keeps
-    /// its sign -- <c>-1e-400</c> is <c>-0.0</c> to Spark. #282.
+    /// that type. A floating-point literal is negated after parsing instead, so the range check
+    /// reads an unsigned mantissa and a zero keeps its sign -- <c>-1e-400</c> is <c>-0.0</c> to
+    /// Spark.
     /// </para>
     /// </remarks>
     public static LiteralValue Number(string text, bool negative, string sql, int position)
@@ -66,7 +66,7 @@ internal static class SparkLiteral
                 return Decimal(signed, sql, position);
 
             // LiteralValue has no 8- or 16-bit integer kind, and silently widening to int would
-            // change how the value coerces and overflows. Refusing is the honest answer.
+            // change how the value coerces and overflows.
             case "Y":
             case "S":
                 throw new SparkSqlParseException(
@@ -88,7 +88,7 @@ internal static class SparkLiteral
             return LiteralValue.Of(asLong);
 
         // Spark's ladder does not stop at bigint: an integral literal too wide for one becomes a
-        // DECIMAL, which is why a 38-digit literal is a decimal(38,0) rather than an error. #173.
+        // DECIMAL, which is why a 38-digit literal is a decimal(38,0) rather than an error.
         return Decimal(signed, sql, position);
     }
 
@@ -102,10 +102,9 @@ internal static class SparkLiteral
     /// Unquotes one string literal, resolving Spark's backslash escapes.
     /// </summary>
     /// <remarks>
-    /// ONE literal, not a run of them. A doubled quote never appears inside a string token at
-    /// all — it closes one literal and opens the next — so joining the run belongs to
-    /// <see cref="SparkSqlParser"/>, which joins these results rather than the raw text. See
-    /// #179 and the <c>string-literals</c> group of the corpus.
+    /// One literal, not a run of them. A doubled quote never appears inside a string token — it
+    /// closes one literal and opens the next — so joining a run belongs to
+    /// <see cref="SparkSqlParser"/>, which joins the unquoted results rather than the raw text.
     /// </remarks>
     public static LiteralValue String(string text) => LiteralValue.Of(Unquote(text));
 
@@ -114,24 +113,21 @@ internal static class SparkLiteral
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Spark's table, and almost none of it was guessable. Every rule below is an answer in the
-    /// <c>string-literals</c> group of <c>Fixtures/spark-expression-corpus.json</c>, and three
-    /// of them contradict the obvious reading:
+    /// Spark's escape table, measured in the <c>string-literals</c> group of the corpus. Three
+    /// rules contradict the obvious reading:
     /// </para>
     /// <list type="bullet">
     /// <item><description>
-    ///   <b><c>\f</c> is not a form feed.</b> It is not in the table at all, so it is the letter
-    ///   <c>f</c> and <c>'a\fb'</c> is <c>afb</c>. Meanwhile <c>\Z</c>, which C does not have,
-    ///   IS in the table and is U+001A.
+    ///   <c>\f</c> is not a form feed. It is not in the table, so it is the letter <c>f</c> and
+    ///   <c>'a\fb'</c> is <c>afb</c>. <c>\Z</c>, which C does not have, is in the table and is
+    ///   U+001A.
     /// </description></item>
     /// <item><description>
-    ///   <b>An unrecognised escape DROPS its backslash</b> — <c>'a\qb'</c> is <c>aqb</c> —
-    ///   except for <c>\%</c> and <c>\_</c>, which keep it so a backslash stays usable in a LIKE
-    ///   pattern. The rule this replaces kept the backslash for every unrecognised escape: right
-    ///   for the one case it had been checked against, wrong for the rest.
+    ///   An unrecognised escape drops its backslash — <c>'a\qb'</c> is <c>aqb</c> — except for
+    ///   <c>\%</c> and <c>\_</c>, which keep it so a backslash stays usable in a LIKE pattern.
     /// </description></item>
     /// <item><description>
-    ///   <b>The octal escape stops at <c>\177</c>, not <c>\377</c>.</b> <c>'\101'</c> is
+    ///   The octal escape stops at <c>\177</c>, not <c>\377</c>. <c>'\101'</c> is
     ///   <c>A</c> while <c>'\200'</c> is the text <c>200</c>, so the first digit must be 0 or 1
     ///   and only ASCII is reachable. One octal digit is not an escape either: <c>'\7'</c> is
     ///   <c>7</c>, and <c>'\0'</c> is U+0000 only because the table has a <c>0</c> row.
@@ -146,12 +142,12 @@ internal static class SparkLiteral
     public static string Unquote(string text)
     {
         // The index of the closing quote, and the exclusive bound for everything below. Working
-        // against the ORIGINAL text rather than an unquoted copy is what keeps the escape path to
-        // a single allocation — the StringBuilder's result.
+        // against the original text rather than an unquoted copy keeps the escape path to a
+        // single allocation.
         var end = text.Length - 1;
 
-        // Nothing to resolve is the common case: it is every literal in a generated constraint,
-        // and there the substring is the answer rather than a working copy.
+        // No escapes is the common case (every literal in a generated constraint), and there the
+        // substring is the answer.
         if (text.IndexOf('\\', 1, end - 1) < 0)
             return text.Substring(1, end - 1);
 
@@ -226,15 +222,13 @@ internal static class SparkLiteral
     /// </summary>
     /// <remarks>
     /// Deliberately not <c>char.ConvertFromUtf32</c>, which refuses anything above U+10FFFF or
-    /// inside the surrogate range. Spark applies Java's surrogate formulas with no range check at
-    /// all, and the two measurements that pin it are the ones a range check would have refused:
-    /// <c>'\U00110000'</c> and <c>'\UFFFFFFFF'</c> are both ANSWERS, the second of them
-    /// U+D7BF followed by an unpaired low surrogate.
+    /// inside the surrogate range. Spark applies Java's surrogate formulas with no range check, so
+    /// <c>'\U00110000'</c> and <c>'\UFFFFFFFF'</c> are both answers, the second of them U+D7BF
+    /// followed by an unpaired low surrogate.
     /// <para>
-    /// The BMP test is an UNSIGNED shift, which is what keeps those two apart from
-    /// <c>'\U00000041'</c>: eight hex digits overflow a signed 32-bit accumulator, so
-    /// <c>\UFFFFFFFF</c> arrives here as -1, and a signed <c>&lt; 0x10000</c> test would take the
-    /// BMP branch for it and answer one character where Spark answers two.
+    /// The BMP test must be an unsigned shift: eight hex digits overflow a signed 32-bit
+    /// accumulator, so <c>\UFFFFFFFF</c> arrives here as -1, and a signed <c>&lt; 0x10000</c>
+    /// test would answer one character where Spark answers two.
     /// </para>
     /// </remarks>
     private static void AppendCodePoint(StringBuilder builder, int point)
@@ -260,9 +254,9 @@ internal static class SparkLiteral
     /// because the caller scans the original quoted text: without it, <c>'\u0041'</c> would be
     /// free to read its own closing quote as a digit position.
     /// <para>
-    /// Overflow is deliberate rather than guarded: eight digits do not fit a signed int, and the
-    /// wrapped value is exactly what <see cref="AppendCodePoint"/> needs. Digits are either case,
-    /// measured — <c>'\u004a'</c> is <c>J</c>.
+    /// Overflow is deliberate: eight digits do not fit a signed int, and the wrapped value is
+    /// exactly what <see cref="AppendCodePoint"/> needs. Digits are either case —
+    /// <c>'\u004a'</c> is <c>J</c>.
     /// </para>
     /// </remarks>
     private static bool TryHex(string text, int start, int count, int end, out int value)
@@ -292,13 +286,14 @@ internal static class SparkLiteral
     /// </summary>
     /// <remarks>
     /// Both date and timestamp become a <see cref="DateTimeOffset"/>, a date at UTC midnight.
-    /// That is how this library already surfaces date columns, so a literal and a column value
-    /// compare on the same footing, and unlike <c>DateOnly</c> it exists on every target
-    /// framework — a literal must not change type between net472 and net10.0.
-    ///
-    /// Reading a timestamp without an offset as UTC is the same policy choice recorded for the
-    /// function registry: Spark resolves it against the session timezone, EngineeredWood has no
-    /// session, and UTC is what the pinned configuration uses.
+    /// That is how this library surfaces date columns, so a literal and a column value compare on
+    /// the same footing, and unlike <c>DateOnly</c> it exists on every target framework — a
+    /// literal must not change type between net472 and net10.0.
+    /// <para>
+    /// A timestamp without an offset is read in <see cref="SparkTemporalText.SessionTimeZone"/>
+    /// (UTC), the same zone the casts use: Spark resolves it against the session timezone, and
+    /// EngineeredWood has no session.
+    /// </para>
     /// </remarks>
     public static LiteralValue Typed(string keyword, string quoted, string sql, int position)
     {
@@ -307,21 +302,16 @@ internal static class SparkLiteral
         if (keyword.Equals("X", StringComparison.OrdinalIgnoreCase))
             return LiteralValue.Of(ParseHex(text, sql, position));
 
-        // SPARK'S GRAMMAR, NOT .NET'S. A typed literal is read by `stringToDate` and
-        // `stringToTimestamp`, the same two functions the casts use, so it takes the same reader
-        // #318 gave them. `DateTimeOffset.TryParse` under InvariantCulture accepted `08/11/2026`
-        // as 11 August -- a different day to whoever wrote dd/MM -- and `2026/08/11`,
-        // `11 Aug 2026` and `2026-08 -11` besides, all refused by Spark; and it refused `2026`,
-        // `2026-08-11 extra` and `…12:30:00 UTC`, all read by Spark. A malformed literal is
-        // INVALID_TYPED_LITERAL, a PARSE error, so no dialect or try_cast softens it. #341.
+        // Spark's grammar, not .NET's. Spark reads a typed literal with `stringToDate` and
+        // `stringToTimestamp`, the same functions the casts use, so it takes the same reader
+        // (SparkTemporalText; see there for what `DateTimeOffset.TryParse` gets wrong). A
+        // malformed literal is INVALID_TYPED_LITERAL, a parse error, so no dialect or try_cast
+        // softens it.
         //
-        // THE SPECIAL WORDS COME FIRST, and that is Spark's order rather than a preference:
-        // `AstBuilder.visitTypeConstructor` tries `convertSpecialDate` before `stringToDate` and
-        // falls through to the grammar only when the text is not one of the five words. The one
-        // text both readers can see is a leading `T`, which starts the grammar's time-alone form
-        // AND satisfies the word reader's "begins with a letter" guard -- and it falls out of the
-        // word reader anyway, since `T` is not the vocabulary and what follows it is not a
-        // timezone. Measured: `TIMESTAMP'T12:30:00'` is still today at 12:30. #342.
+        // The special words come first, in Spark's order: `AstBuilder.visitTypeConstructor` tries
+        // `convertSpecialDate` before `stringToDate`. A leading `T` (the grammar's time-alone
+        // form) passes the word reader's "begins with a letter" guard but is not a word, so it
+        // falls through: `TIMESTAMP'T12:30:00'` is today at 12:30.
         var instant = keyword.Equals("DATE", StringComparison.OrdinalIgnoreCase)
             ? (SparkSpecialDatetimeValues.TryReadDate(text.AsSpan(), out var special) ? special
                 : SparkTemporalText.TryReadDate(text.AsSpan(), out var date) ? date
@@ -345,7 +335,7 @@ internal static class SparkLiteral
     /// <c>NumberStyles.HexNumber</c>. That style implies <c>AllowLeadingWhite</c> and
     /// <c>AllowTrailingWhite</c>, so it reads the pair <c>"A "</c> as <c>0x0A</c> and would let
     /// <c>X'A BC'</c> decode instead of being refused. It also avoids a two-character substring
-    /// per byte, which is what drew attention to the behaviour.
+    /// per byte.
     /// </remarks>
     private static byte[] ParseHex(string text, string sql, int position)
     {
@@ -388,30 +378,26 @@ internal static class SparkLiteral
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Not <c>decimal.TryParse</c>, and not because it refuses.</b> It refuses a literal too
-    /// LARGE for <see cref="decimal"/> — and it silently ROUNDS one that is merely too precise,
-    /// reporting success. Measured:
-    /// <c>0.12345678901234567890123456789012345678</c> comes back as
-    /// <c>0.1234567890123456789012345679</c> and <c>TryParse</c> returns true, so the literal was
-    /// quietly wrong rather than refused. Keying the fallback off a failed parse would have left
-    /// that half of #173 in place.
+    /// Not <c>decimal.TryParse</c>: besides refusing a literal too large for
+    /// <see cref="decimal"/>, it silently rounds one that is merely too precise and reports
+    /// success (<c>0.12345678901234567890123456789012345678</c> comes back as
+    /// <c>0.1234567890123456789012345679</c>). So a fallback keyed off a failed parse is not
+    /// enough; the digits must decide.
     /// </para>
     /// <para>
-    /// So the digits decide. The text is split into an unscaled integer and a scale — which is
-    /// what the rest of the pipeline speaks anyway, since #131 put arithmetic, casts, unification
-    /// and equality on exactly that pair — and <see cref="decimal"/> is used only where it is
-    /// EXACT: a scale it can carry, and an unscaled value inside its 96 bits.
+    /// The text is split into an unscaled integer and a scale, the pair the rest of the pipeline
+    /// uses, and <see cref="decimal"/> is used only where it is exact: a scale it can carry and
+    /// an unscaled value inside its 96 bits.
     /// </para>
     /// </remarks>
     private static LiteralValue Decimal(string text, string sql, int position)
     {
         var (unscaled, scale) = SplitDecimal(text, sql, position);
 
-        // Precision counts the SCALE as well as the digits, because a Spark decimal requires
-        // 0 <= scale <= precision <= 38: a value with a single significant digit is still too wide
-        // if its scale is. Measured — `1e-38BD` is a decimal(38,38) and `1e-39BD` is refused,
-        // by Spark's PARSER rather than at analysis, which is where this refuses too. Checking
-        // only the digit count let `1e-45BD` through as a scale-45 decimal no Spark type holds.
+        // Precision counts the scale as well as the digits, because a Spark decimal requires
+        // 0 <= scale <= precision <= 38: a value with one significant digit is still too wide if
+        // its scale is. `1e-38BD` is a decimal(38,38) and `1e-39BD` is refused by Spark's parser,
+        // as here. Checking only the digit count would admit `1e-45BD`, which no Spark type holds.
         var precision = Math.Max(Precision(unscaled), scale);
 
         if (precision > MaxPrecision)
@@ -438,10 +424,10 @@ internal static class SparkLiteral
     /// Splits literal text into the unscaled integer and scale that denote it exactly.
     /// </summary>
     /// <remarks>
-    /// An exponent is handled because it can reach here: the <c>BD</c> suffix is stripped before
-    /// the exponent check above, so <c>1e3BD</c> arrives as <c>1e3</c> asking to be a decimal.
-    /// A negative resulting scale is folded into the integer rather than kept, because a decimal
-    /// has no negative scale — <c>1e3BD</c> is 1000 at scale 0.
+    /// An exponent can reach here: <see cref="Number"/> strips the <c>BD</c> suffix before its
+    /// exponent check, so <c>1e3BD</c> arrives as <c>1e3</c> asking to be a decimal. A negative
+    /// resulting scale is folded into the integer, because a decimal has no negative scale —
+    /// <c>1e3BD</c> is 1000 at scale 0.
     /// </remarks>
     private static (BigInteger Unscaled, int Scale) SplitDecimal(string text, string sql, int position)
     {
@@ -512,18 +498,15 @@ internal static class SparkLiteral
     }
 
     /// <summary>
-    /// Reads a double LITERAL, which is the same question the cast asks of a column's text.
+    /// Reads a double literal, which is the same question the cast asks of a column's text.
     /// </summary>
     /// <remarks>
     /// Through <see cref="SparkDoubleText"/> rather than <c>double.TryParse</c>, because .NET
-    /// Framework's parser is not correctly rounded and reads about 1% of ordinary fifteen- and
-    /// sixteen-digit numbers as the double next door. A literal is not exempt from that:
-    /// <c>SELECT 49.0793458194787E0</c> is a DOUBLE in Spark, and it materialized different bits
-    /// per runtime exactly as <c>CAST('49.0793458194787' AS DOUBLE)</c> did. #350.
+    /// Framework's parser is not correctly rounded, and <c>SELECT 49.0793458194787E0</c> must
+    /// produce the same bits on every runtime, as <c>CAST('49.0793458194787' AS DOUBLE)</c> does.
     /// <para>
-    /// The overflow half of that type does not reach here — <see cref="RefuseOutOfRange"/> has
-    /// already refused a literal past a double's range on every framework, which is #287, so a
-    /// parse that fails at this point failed for some other reason and is still an error.
+    /// <see cref="RefuseOutOfRange"/> has already refused a literal past a double's range, so a
+    /// parse that fails here failed for some other reason and is still an error.
     /// </para>
     /// </remarks>
     private static double ParseDouble(string text, string sql, int position)
@@ -539,12 +522,9 @@ internal static class SparkLiteral
     /// Reads a float literal, rounded once from its text.
     /// </summary>
     /// <remarks>
-    /// Through <see cref="SparkDoubleText.TryParseSingle(string, out float)"/>. A float's SHORTEST
-    /// form is nine digits, and .NET Framework reads every such form right -- measured over
-    /// 100,000 random floats at six to nine digits -- which is why #350 left this alone. A literal
-    /// is not limited to the shortest form, though: beside a rounding tie, net472's parse was
-    /// wrong on a third of 8,400 longer spellings where .NET Core's was right on all of them.
-    /// #372.
+    /// Through <see cref="SparkDoubleText.TryParseSingle(string, out float)"/>. .NET Framework
+    /// reads a float's shortest (at most nine-digit) form correctly, but a literal is not limited
+    /// to that form, and beside a rounding tie net472 misreads about a third of longer spellings.
     /// </remarks>
     private static float ParseFloat(string text, string sql, int position)
     {
@@ -563,10 +543,10 @@ internal static class SparkLiteral
     /// <remarks>
     /// Spark states the bound as <c>1.7976931348623157E+308</c> in its own error text, which is
     /// <see cref="double.MaxValue"/> written in its shortest round-tripping form rather than the
-    /// exact 309-digit integer that value really is. Taking the same spelling is what makes the
-    /// boundary agree, because the comparison is against the literal EXACTLY: measured,
+    /// exact 309-digit integer that value really is. Taking the same spelling makes the boundary
+    /// agree, because the comparison is against the literal exactly:
     /// <c>1.79769313486231575e308</c> is refused although it rounds to
-    /// <see cref="double.MaxValue"/>. #287.
+    /// <see cref="double.MaxValue"/>.
     /// </remarks>
     private const string MaxDoubleDigits = "17976931348623157";
 
@@ -576,8 +556,8 @@ internal static class SparkLiteral
     /// <remarks>
     /// <c>3.4028234663852886E+38</c>, not the <c>3.4028235E38</c> that Java prints for
     /// <see cref="float.MaxValue"/> -- so <c>3.4028235e38F</c>, the ordinary spelling of the
-    /// largest float, is REFUSED while <c>3.4028234663852886e38F</c> is accepted. Measured, and
-    /// it is the row that says the bound is not "whatever survives the cast to float".
+    /// largest float, is refused while <c>3.4028234663852886e38F</c> is accepted. The bound is not
+    /// "whatever survives the cast to float".
     /// </remarks>
     private const string MaxFloatDigits = "34028234663852886";
 
@@ -585,30 +565,26 @@ internal static class SparkLiteral
 
     /// <summary>
     /// Refuses a floating-point literal whose exact value lies outside the type range, the way
-    /// Spark PARSER does.
+    /// Spark's parser does.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// #287. <c>1e400</c> is <c>INVALID_NUMERIC_LITERAL_RANGE</c> in Spark, refused before any
-    /// data is touched; we produced an infinity. The check is on the literal exact decimal TEXT
-    /// rather than on what the parse produces, which is the half that is easy to miss:
-    /// <c>3.4028234663852887e38F</c> and <c>1.79769313486231575e308</c> both round to a finite
-    /// value and are both refused.
+    /// <c>1e400</c> is <c>INVALID_NUMERIC_LITERAL_RANGE</c> in Spark, refused before any data is
+    /// touched. The check is on the literal's exact decimal text rather than on what the parse
+    /// produces: <c>3.4028234663852887e38F</c> and <c>1.79769313486231575e308</c> both round to a
+    /// finite value and are both refused.
     /// </para>
     /// <para>
-    /// <b>Only the magnitude is bounded, and only from above.</b> The issue reports
-    /// <c>1e-400</c> as the same gap at the other end and it is not one: Spark compares against
-    /// <c>[-MaxValue, MaxValue]</c>, and a value that underflows sits well inside that. Measured,
-    /// <c>1e-400</c> is <c>0.0D</c>, <c>1e-325</c> is <c>0.0D</c>, and <c>-1e-400</c> is
-    /// <c>-0.0D</c> -- Spark folds the sign into the literal there, which is why that row belongs
-    /// to #282 rather than here.
+    /// Only the magnitude is bounded, and only from above. Spark compares against
+    /// <c>[-MaxValue, MaxValue]</c>, and a value that underflows sits well inside that:
+    /// <c>1e-400</c> and <c>1e-325</c> are <c>0.0D</c>, and <c>-1e-400</c> is <c>-0.0D</c>.
     /// </para>
     /// <para>
     /// A zero mantissa is in range at every exponent: <c>0e400</c> is <c>0.0D</c>. An exponent
     /// that Java BigDecimal cannot carry as a scale is refused ahead of the comparison, which is
     /// why <c>0e2147483648</c> refuses where <c>0e400</c> does not -- and why the lower bound is
-    /// <c>-int.MaxValue</c> rather than <c>int.MinValue</c>, since it is the NEGATION that
-    /// overflows there and <c>1e-2147483648</c> is measured refusing.
+    /// <c>-int.MaxValue</c> rather than <c>int.MinValue</c>: it is the negation that overflows
+    /// there, and Spark refuses <c>1e-2147483648</c>.
     /// </para>
     /// </remarks>
     private static void RefuseOutOfRange(
@@ -631,10 +607,9 @@ internal static class SparkLiteral
     /// <c>0.&lt;digits&gt; x 10^exponent</c>, and a zero has no digits at all.
     /// </summary>
     /// <remarks>
-    /// The exponent is a <see cref="long"/>, and that is not decoration. <c>1e2147483647</c> is a
-    /// legal token whose normalised exponent is 2147483648, so accumulating it in an
-    /// <see cref="int"/> would wrap to <see cref="int.MinValue"/> and read the largest literal
-    /// expressible as the smallest -- accepting exactly what this exists to refuse.
+    /// The exponent must be a <see cref="long"/>. <c>1e2147483647</c> is a legal token whose
+    /// normalised exponent is 2147483648, so an <see cref="int"/> would wrap to
+    /// <see cref="int.MinValue"/> and read the largest expressible literal as the smallest.
     /// </remarks>
     private static (string Digits, long Exponent) Normalize(
         string text, string what, string sql, int position)
@@ -699,22 +674,13 @@ internal static class SparkLiteral
     /// range.
     /// </summary>
     /// <remarks>
-    /// Its own reason because the range one would be FALSE here, and visibly so: the literal that
-    /// reaches this most clearly is <c>0e2147483648</c>, which is numerically zero and in the
-    /// range of every type there is. It is refused for the spelling of its exponent alone. Raised
-    /// in review of #287.
-    /// <para>
-    /// The distinction is the oracle's too. Spark answers an out-of-range literal with
-    /// <c>INVALID_NUMERIC_LITERAL_RANGE</c>, naming the min and max it compared against, and
-    /// answers these with a plain <c>ParseException</c> out of <c>BigDecimal</c> instead --
-    /// measured on 4.0.3 for <c>1e2147483648</c>, <c>1e99999999999</c>, <c>1e-99999999999</c>,
-    /// <c>1e-2147483648</c> and <c>0e2147483648</c>. A caller quoting the reason into a refused
-    /// write should be able to tell a value that is too big from one nothing can spell.
-    /// </para>
-    /// <para>
-    /// Reached from the decimal path as well, where the wording was wrong in the same way and for
-    /// the same inputs -- <c>0e2147483648BD</c> is not out of range for a decimal either.
-    /// </para>
+    /// A separate reason because "out of range" would be false: <c>0e2147483648</c> is
+    /// numerically zero and in the range of every type, refused for the spelling of its exponent
+    /// alone. Spark draws the same line, answering an out-of-range literal with
+    /// <c>INVALID_NUMERIC_LITERAL_RANGE</c> and these (<c>1e2147483648</c>,
+    /// <c>1e-99999999999</c>, <c>0e2147483648</c>, ...) with a plain <c>ParseException</c> out
+    /// of <c>BigDecimal</c>. Also used by the decimal path, where <c>0e2147483648BD</c> is not
+    /// out of range either.
     /// </remarks>
     private static SparkSqlParseException ExponentOverflow(string text, string sql, int position) =>
         new($"'{text}' has an exponent no decimal scale can carry", sql, position);

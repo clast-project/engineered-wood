@@ -12,25 +12,15 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Casting a string to a decimal used to go through <see cref="decimal"/>, which stops near
-/// 7.9e28 where Spark decimals reach precision 38. After #131 every other route to a wide decimal
-/// — arithmetic, casts from a decimal or an integer, unification, equality — was on the unscaled
-/// integer already, and this was the one that was not, because what Spark does with an over-long
-/// string was unmeasured. #174 measured it; the <c>string-to-decimal</c> group of
-/// <c>Fixtures/spark-expression-corpus.json</c> is the record, and every rule below comes from
-/// there rather than from reasoning about Spark's integer behaviour.
+/// Spark decimals reach precision 38, past <see cref="decimal"/>'s ~7.9e28, so this parses to the
+/// unscaled integer. <see cref="decimal"/> would be wrong inside its range too:
+/// <c>decimal.TryParse</c> silently rounds a string of more than 28 significant digits, which
+/// makes <c>CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))</c> 1 and
+/// <c>CAST('5e-39' AS DECIMAL(38,38))</c> 0 where Spark rounds to 1e-38. The rules below come from
+/// the <c>string-to-decimal</c> group of <c>Fixtures/spark-expression-corpus.json</c>.
 /// </para>
 /// <para>
-/// <b>The ceiling was not only a refusal.</b> Two of the answers it got wrong were wrong VALUES,
-/// not refusals: <c>decimal.TryParse</c> accepts a string carrying more than 28 significant
-/// digits, silently rounds it, and reports success — so
-/// <c>CAST('1.0000000000000000000000000000001' AS DECIMAL(38,31))</c> returned 1 exactly, and
-/// <c>CAST('5e-39' AS DECIMAL(38,38))</c> returned 0 where Spark rounds to 1e-38. A magnitude
-/// check alone would not have caught either, because both are inside <see cref="decimal"/>'s
-/// range.
-/// </para>
-/// <para>
-/// <b>Three failures, three error classes</b>, and the third was not guessable from the other two:
+/// Three failures, three error classes:
 /// </para>
 /// <list type="table">
 /// <item>
@@ -40,10 +30,10 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// <item>
 ///   <term>more than 38 integral digits</term>
 ///   <description>
-///     <c>NUMERIC_OUT_OF_SUPPORTED_RANGE</c>, which no other path in this library reaches. It is
-///     a property of the STRING and not of the target: 39 nines and <c>'1e39'</c> both report it
-///     against <c>DECIMAL(38,0)</c>, while a 30-digit string against <c>DECIMAL(10,0)</c> — far
-///     wider than its target — reports the class below instead.
+///     <c>NUMERIC_OUT_OF_SUPPORTED_RANGE</c>, which no other cast reports. It is a property of
+///     the string and not of the target: 39 nines and <c>'1e39'</c> both report it against
+///     <c>DECIMAL(38,0)</c>, while a 30-digit string against <c>DECIMAL(10,0)</c> reports the
+///     class below.
 ///   </description>
 /// </item>
 /// <item>
@@ -52,19 +42,15 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </item>
 /// </list>
 /// <para>
-/// Rounding is HALF_UP, agreeing with the rest of this path rather than diverging from it:
-/// <c>'2.5'</c> to scale 0 is 3, <c>'-2.5'</c> is -3, and <c>'1.45'</c> to scale 1 is 1.5. All
-/// measured, because the corpus's own rounding group exists precisely because half-up and
-/// half-even disagree and only one of them is Spark's.
+/// Rounding is HALF_UP, as on the rest of the decimal path: <c>'2.5'</c> to scale 0 is 3,
+/// <c>'-2.5'</c> is -3, and <c>'1.45'</c> to scale 1 is 1.5.
 /// </para>
 /// <para>
-/// <b>Computed over <see cref="BigInteger"/> rather than <see cref="Int128"/>.</b> Unlike the
-/// arithmetic in <see cref="SparkWideDecimals"/>, whose operands both came out of a 128-bit Arrow
-/// buffer and so have a bounded intermediate, a string has no width at all: 38 integral digits
-/// against a scale-38 target needs 77 digits before rounding, which is already at the edge of a
-/// 256-bit mantissa, and nothing stops a caller writing more. The cost is irrelevant here — the
-/// path is parsing text either way — and the result narrows to <see cref="Int128"/> once the
-/// range check has proved it fits.
+/// Computed over <see cref="BigInteger"/> rather than <see cref="Int128"/> because, unlike the
+/// operands of <see cref="SparkWideDecimals"/>, which come out of a 128-bit Arrow buffer, a string
+/// has no bounded width: 38 integral digits against a scale-38 target need 77 digits before
+/// rounding, and nothing stops a caller writing more. The result narrows to
+/// <see cref="Int128"/> once the range check has proved it fits.
 /// </para>
 /// </remarks>
 internal static class SparkDecimalText
@@ -105,10 +91,10 @@ internal static class SparkDecimalText
         if (!TrySplit(text, out var digits, out var negative, out var exponent))
             return Result.Malformed;
 
-        // Spark's own check, and it is on the STRING: `numDigitsInIntegralPart` is a BigDecimal's
-        // precision less its scale, which for the value this parse produced is the length of
-        // `digits` plus the exponent. Zero counts as one digit, because a BigDecimal holding zero
-        // has precision 1 — which is why '0E40' reports too many digits and '0E-40' does not.
+        // Spark's own check, on the string rather than the target: `numDigitsInIntegralPart` is a
+        // BigDecimal's precision less its scale, which here is the length of `digits` plus the
+        // exponent. Zero counts as one digit because a BigDecimal holding zero has precision 1,
+        // so '0E40' reports too many digits and '0E-40' does not.
         var significant = digits.Length == 0 ? 1 : digits.Length;
         if (significant + exponent > SparkNumericTypes.MaxPrecision)
             return Result.TooManyDigits;
@@ -131,9 +117,9 @@ internal static class SparkDecimalText
         }
         else if (-shift > significant + 1)
         {
-            // Everything is below the target's last place, INCLUDING the digit that would decide
-            // the rounding — so the answer is zero without forming a divisor that a huge negative
-            // exponent would make absurd.
+            // Everything, including the digit that would decide the rounding, is below the
+            // target's last place, so the answer is zero without forming a divisor that a huge
+            // negative exponent would make absurd.
             result = BigInteger.Zero;
         }
         else
@@ -141,8 +127,8 @@ internal static class SparkDecimalText
             var divisor = BigInteger.Pow(Ten, (int)-shift);
             result = BigInteger.DivRem(mantissa, divisor, out var remainder);
 
-            // Half AWAY FROM ZERO, so the sign comes from the mantissa rather than from the
-            // quotient: -0.5 at scale 0 is -1, where the quotient alone is 0 and carries no sign.
+            // Half away from zero, so the sign comes from the mantissa rather than the quotient:
+            // -0.5 at scale 0 is -1, where the quotient alone is 0 and carries no sign.
             if (BigInteger.Abs(remainder) * 2 >= divisor)
                 result += mantissa.Sign;
         }
@@ -158,19 +144,17 @@ internal static class SparkDecimalText
     /// Splits decimal text into its unscaled digits, sign and base-10 exponent.
     /// </summary>
     /// <remarks>
-    /// This is Java's <c>BigDecimal</c> grammar, which is what Spark hands the string to, and not
-    /// .NET's <c>NumberStyles.Float</c>. They differ where it matters: measured, Spark accepts a
-    /// trailing point (<c>'42.'</c>), a leading point (<c>'.5'</c>), an explicit plus and
-    /// surrounding space, and refuses a thousands separator, an empty string and the words .NET's
-    /// parser reads as infinities and NaN.
+    /// This is Java's <c>BigDecimal</c> grammar, which Spark hands the string to, and not .NET's
+    /// <c>NumberStyles.Float</c>: Spark accepts a trailing point (<c>'42.'</c>), a leading point
+    /// (<c>'.5'</c>), an explicit plus and surrounding space, and refuses a thousands separator, an
+    /// empty string and the words .NET's parser reads as infinities and NaN.
     /// <para>
-    /// <b>The digits are Unicode-wide and the structure is not</b> — see <see cref="DigitValue"/>.
-    /// Every character this method compares literally — the sign, the point, the exponent marker —
-    /// must be ASCII, and each was measured on its own against a mantissa of digits Spark does
-    /// read: an ARABIC DECIMAL SEPARATOR (U+066B), a FULLWIDTH FULL STOP (U+FF0E), a MINUS SIGN
-    /// (U+2212), a FULLWIDTH PLUS SIGN (U+FF0B) and a FULLWIDTH LATIN CAPITAL LETTER E (U+FF25)
-    /// are all CAST_INVALID_INPUT. Scripts may be mixed freely, though: an ARABIC-INDIC DIGIT
-    /// THREE beside a DEVANAGARI DIGIT THREE reads as 33.
+    /// The digits are Unicode-wide (see <see cref="DigitValue"/>) but the structure is not: the
+    /// sign, the point and the exponent marker must be ASCII. An ARABIC DECIMAL SEPARATOR
+    /// (U+066B), a FULLWIDTH FULL STOP (U+FF0E), a MINUS SIGN (U+2212), a FULLWIDTH PLUS SIGN
+    /// (U+FF0B) and a FULLWIDTH LATIN CAPITAL LETTER E (U+FF25) are all CAST_INVALID_INPUT.
+    /// Scripts may be mixed: an ARABIC-INDIC DIGIT THREE beside a DEVANAGARI DIGIT THREE reads
+    /// as 33.
     /// </para>
     /// </remarks>
     private static bool TrySplit(string text, out string digits, out bool negative, out long exponent)
@@ -218,16 +202,15 @@ internal static class SparkDecimalText
                 i++;
             }
 
-            // The EXPONENT takes the wide digit set too -- only its marker and its sign are
-            // ASCII-bound. Measured: '1e<ARABIC-INDIC THREE>' to DECIMAL(10,2) is 1000.00.
+            // The exponent takes the wide digit set too; only its marker and sign are ASCII-bound.
+            // '1e<ARABIC-INDIC THREE>' to DECIMAL(10,2) is 1000.00.
             var exponentStart = i;
             long value = 0;
             int exponentDigit;
             while (i < end && (exponentDigit = DigitValue(text[i])) >= 0)
             {
-                // Clamped rather than overflowed. Java refuses an exponent outside `int`, and this
-                // stops before it can wrap; the clamp is far enough out that no value survives the
-                // digit check below either way.
+                // Stops accumulating once past `int`, so a long exponent cannot wrap; it is
+                // refused just below, as Java refuses an exponent outside `int`.
                 if (value <= int.MaxValue)
                     value = (value * 10) + exponentDigit;
 
@@ -254,16 +237,13 @@ internal static class SparkDecimalText
     /// </summary>
     /// <remarks>
     /// Leading zeros go because they are not part of a BigDecimal's precision, which the digit
-    /// check reads; TRAILING zeros stay, because they are — <c>1.00</c> has an unscaled value of
-    /// 100 and a precision of 3. An all-zero value returns the empty string and is counted as one
+    /// check reads; trailing zeros stay because they are: <c>1.00</c> has an unscaled value of 100
+    /// and a precision of 3. An all-zero value returns the empty string and is counted as one
     /// digit at the call site.
     /// <para>
-    /// <b>Digits are normalised to ASCII on the way in</b>, which is why this reads a VALUE rather
-    /// than comparing characters: <c>BigInteger.Parse</c> under
-    /// <see cref="NumberStyles.None"/> and the invariant culture reads <c>[0-9]</c> and nothing
-    /// else, so an ARABIC-INDIC DIGIT ZERO has to be recognised as a leading zero here and the
-    /// digits that survive have to be spelt in ASCII by the time they reach it. See
-    /// <see cref="DigitValue"/>.
+    /// Digits are normalised to ASCII on the way in, because <c>BigInteger.Parse</c> under
+    /// <see cref="NumberStyles.None"/> and the invariant culture reads only <c>[0-9]</c>. For the
+    /// same reason a leading zero is recognised by value, so an ARABIC-INDIC DIGIT ZERO counts.
     /// </para>
     /// </remarks>
     private static string StripLeadingZeros(
@@ -294,37 +274,31 @@ internal static class SparkDecimalText
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>A digit is not only <c>[0-9]</c> here.</b> Spark hands the string to Java's
-    /// <c>BigDecimal</c>, which reads whatever <c>Character.digit(c, 10)</c> reads — every BMP
-    /// character in Unicode category Nd — so an ARABIC-INDIC DIGIT THREE (U+0663) cast to
-    /// <c>DECIMAL(10,0)</c> is 3, and we refused it. #283.
+    /// Not only <c>[0-9]</c>: Spark hands the string to Java's <c>BigDecimal</c>, which reads
+    /// whatever <c>Character.digit(c, 10)</c> reads — every BMP character in Unicode category Nd —
+    /// so an ARABIC-INDIC DIGIT THREE (U+0663) cast to <c>DECIMAL(10,0)</c> is 3.
     /// </para>
     /// <para>
-    /// <b>The decimal target is the only one this is true of</b>, which is why the wide set lives
-    /// in this file rather than in the shared parse. Measured across every numeric target: INT,
-    /// BIGINT, SMALLINT, TINYINT, DOUBLE and FLOAT all answer CAST_INVALID_INPUT for the same
-    /// string, because their parses are <c>UTF8String.toLong</c> and <c>Double.parseDouble</c> and
-    /// both of those compare against <c>'0'</c>..<c>'9'</c>. So
-    /// <see cref="SparkIntegralCasts.Classify"/> keeps its ASCII digit test ON PURPOSE, and
-    /// widening it to match this would be a divergence rather than a fix.
+    /// The decimal target is the only one that reads the wide set, which is why it lives here
+    /// rather than in the shared parse. INT, BIGINT, SMALLINT, TINYINT, DOUBLE and FLOAT all answer
+    /// CAST_INVALID_INPUT for the same string, because their parses (<c>UTF8String.toLong</c> and
+    /// <c>Double.parseDouble</c>) compare against <c>'0'</c>..<c>'9'</c>. So
+    /// <see cref="SparkIntegralCasts.Classify"/> keeps its ASCII digit test on purpose.
     /// </para>
     /// <para>
-    /// <see cref="CharUnicodeInfo.GetDecimalDigitValue(char)"/> is that same set, MEASURED and not
-    /// assumed: dumping every BMP character each one accepts yields the identical 370 characters
-    /// carrying the identical values on JDK 17.0.20, .NET 10 and .NET Framework 4.7.2 — so the
-    /// netstandard2.0 build does not read a narrower Unicode table than the net10.0 one, which is
-    /// the shape of trap #202 hit.
+    /// <see cref="CharUnicodeInfo.GetDecimalDigitValue(char)"/> is the same set: every BMP
+    /// character each accepts is the identical 370 characters with identical values on JDK 17,
+    /// .NET 10 and .NET Framework 4.7.2, so the netstandard2.0 build does not read a narrower
+    /// Unicode table.
     /// </para>
     /// <para>
-    /// <b>Taking a <see cref="char"/> rather than a code point is the rule, not a shortcut.</b>
-    /// BigDecimal walks UTF-16 units, so a supplementary-plane digit is refused however plainly it
-    /// is one: measured, U+1D7D1 MATHEMATICAL BOLD DIGIT THREE — which <c>Character.isDigit(int)</c>
-    /// accepts — is CAST_INVALID_INPUT. Each half of its surrogate pair fails this test on its own,
-    /// which is exactly the answer wanted.
+    /// Taking a <see cref="char"/> rather than a code point matches Java: BigDecimal walks UTF-16
+    /// units, so U+1D7D1 MATHEMATICAL BOLD DIGIT THREE — which <c>Character.isDigit(int)</c>
+    /// accepts — is CAST_INVALID_INPUT, and each half of its surrogate pair fails this test.
     /// </para>
     /// <para>
     /// The ASCII case is answered before the table lookup because this runs once per character per
-    /// row, and all but a vanishing fraction of the strings that reach it are ASCII.
+    /// row and nearly every string is ASCII.
     /// </para>
     /// </remarks>
     private static int DigitValue(char c) =>
@@ -332,10 +306,10 @@ internal static class SparkDecimalText
 
     /// <summary>Narrows a value the range check has already proved fits 128 bits.</summary>
     /// <remarks>
-    /// Built from its two halves rather than converted, for the reason
-    /// <c>SparkWideDecimals.FromInt64</c> gives: the netstandard2.0 build takes
+    /// Built from its two halves rather than converted: the netstandard2.0 build takes
     /// <see cref="Int128"/> from database-decimal's polyfill, which carries a smaller surface than
-    /// the BCL type. The negative case is a two's complement by hand for the same reason.
+    /// the BCL type (as with <c>SparkWideDecimals.FromInt64</c>). The negative case is a two's
+    /// complement by hand for the same reason.
     /// </remarks>
     private static Int128 ToInt128(BigInteger value)
     {
