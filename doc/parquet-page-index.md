@@ -278,6 +278,15 @@ pages under both float orders, all-null pages, single-page chunks, and **both wr
 
 ### R-1. Parse and expose
 
+**Done (phase 5).** The model types and decoding landed in phase 1 (#392).
+`ParquetFileReader.ReadPageIndexAsync(rowGroup, columns)` takes leaf indices or column names. It
+merges the requested ranges across gaps of up to 64 KiB, which on a parquet-mr/EW layout is one
+request of one or two ranges, and decodes each index on first access. All page-index reads go
+through `ReadPageIndexBytesAsync`, the future decryption point. The 27 fixtures read back exactly
+what their footers locate. `floating_orders_nan_count` also confirms the TYPE_ORDER rule from a
+second writer: parquet-mr omits the ColumnIndex for a TYPE_ORDER chunk with an all-NaN page and
+keeps it, with `nan_counts`, under total order.
+
 - Model types for §1. Decode in `MetadataDecoder`, which then keeps ColumnChunk fields 4–7.
 - `ParquetFileReader.ReadPageIndexAsync(rowGroup, columns)` fetches the contiguous index
   region for the requested columns in one ranged read and decodes it lazily. Nothing is
