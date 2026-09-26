@@ -101,16 +101,8 @@ internal static class ColumnChunkReader
             var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
             pos += pageHeader.CompressedPageSize;
 
-            // Validate CRC-32C if present and validation is enabled.
-            if (validateCrc && pageHeader.Crc.HasValue)
-            {
-                uint expected = unchecked((uint)pageHeader.Crc.Value);
-                uint actual = ComputeCrc32C(pageData);
-                if (actual != expected)
-                    throw new ParquetFormatException(
-                        $"Page CRC-32C mismatch in column '{string.Join(".", column.Path)}': " +
-                        $"expected 0x{expected:X8}, got 0x{actual:X8}.");
-            }
+            if (validateCrc)
+                ValidateCrc(pageHeader.Crc, pageData, column);
 
             switch (pageHeader.Type)
             {
@@ -514,6 +506,8 @@ internal static class ColumnChunkReader
             var pageBytes = data.Slice((int)(located.Offset - dataBaseOffset), located.CompressedSize);
             var entry = PageMapBuilder.ResolveEntry(pageMap, p, pageBytes, column, columnMeta, out int headerSize);
             var pageData = pageBytes.Slice(headerSize);
+            if (validateCrc)
+                ValidateCrc(entry.Crc, pageData, column);
 
             if (entry.Type == PageType.DataPage)
             {
@@ -1367,6 +1361,23 @@ internal static class ColumnChunkReader
         {
             ArrayPool<int>.Shared.Return(indicesArray);
         }
+    }
+
+    /// <summary>
+    /// Refuses a page whose header records a CRC that <paramref name="pageData"/>, the page's bytes
+    /// after its header, does not match. A page without a CRC passes.
+    /// </summary>
+    internal static void ValidateCrc(int? crc, ReadOnlySpan<byte> pageData, ColumnDescriptor column)
+    {
+        if (crc is not { } recorded)
+            return;
+
+        uint expected = unchecked((uint)recorded);
+        uint actual = ComputeCrc32C(pageData);
+        if (actual != expected)
+            throw new ParquetFormatException(
+                $"Page CRC-32C mismatch in column '{string.Join(".", column.Path)}': " +
+                $"expected 0x{expected:X8}, got 0x{actual:X8}.");
     }
 
     private static uint ComputeCrc32C(ReadOnlySpan<byte> data)

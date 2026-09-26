@@ -24,7 +24,8 @@ internal readonly record struct PageMapEntry(
     Encoding DefinitionLevelEncoding,
     int RepetitionLevelsByteLength,
     int DefinitionLevelsByteLength,
-    bool IsCompressed);
+    bool IsCompressed,
+    int? Crc = null);
 
 /// <summary>
 /// Pre-scanned page layout for a single column chunk. Enables batched decoding
@@ -117,10 +118,15 @@ internal static class PageMapBuilder
     /// <param name="data">Raw bytes of the column chunk.</param>
     /// <param name="column">Column descriptor (levels, type, path).</param>
     /// <param name="columnMeta">Column chunk metadata (codec, num_values, etc.).</param>
+    /// <param name="validateCrc">
+    /// Whether to check the CRC of a dictionary or symbol-table page, which is decoded here. A data
+    /// page's CRC is recorded in its entry and checked when the page is decoded.
+    /// </param>
     public static ColumnPageMap Build(
         ReadOnlySpan<byte> data,
         ColumnDescriptor column,
-        ColumnMetaData columnMeta)
+        ColumnMetaData columnMeta,
+        bool validateCrc = false)
     {
         var pages = new List<PageMapEntry>();
         DictionaryDecoder? dictionary = null;
@@ -141,10 +147,14 @@ internal static class PageMapBuilder
             switch (pageHeader.Type)
             {
                 case PageType.DictionaryPage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
                     dictionary = DecodeDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
                 case PageType.SymbolTablePage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
                     symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
                     break;
 
@@ -195,6 +205,7 @@ internal static class PageMapBuilder
     /// <param name="rowCount">Rows in the row group.</param>
     /// <param name="column">A flat (non-repeated) column.</param>
     /// <param name="columnMeta">The chunk's metadata.</param>
+    /// <param name="validateCrc">Whether to check the CRC of a dictionary or symbol-table page in the prefix.</param>
     /// <returns>
     /// The map, or null when the index cannot describe this chunk's pages; the caller then scans the
     /// headers instead. The index is optional metadata, so one that cannot be right is ignored rather
@@ -208,7 +219,8 @@ internal static class PageMapBuilder
         OffsetIndex index,
         int rowCount,
         ColumnDescriptor column,
-        ColumnMetaData columnMeta)
+        ColumnMetaData columnMeta,
+        bool validateCrc = false)
     {
         // A repeated column's map counts values as well as rows, and the index records only rows.
         if (column.MaxRepetitionLevel > 0)
@@ -247,9 +259,13 @@ internal static class PageMapBuilder
             switch (pageHeader.Type)
             {
                 case PageType.DictionaryPage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
                     dictionary = DecodeDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
                 case PageType.SymbolTablePage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
                     symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
                     break;
                 case PageType.DataPage:
@@ -427,7 +443,8 @@ internal static class PageMapBuilder
                 DefinitionLevelEncoding: dph.DefinitionLevelEncoding,
                 RepetitionLevelsByteLength: 0,
                 DefinitionLevelsByteLength: 0,
-                IsCompressed: true);
+                IsCompressed: true,
+                Crc: pageHeader.Crc);
         }
 
         var v2h = pageHeader.DataPageHeaderV2!;
@@ -444,7 +461,8 @@ internal static class PageMapBuilder
             DefinitionLevelEncoding: Encoding.Rle,
             RepetitionLevelsByteLength: v2h.RepetitionLevelsByteLength,
             DefinitionLevelsByteLength: v2h.DefinitionLevelsByteLength,
-            IsCompressed: v2h.IsCompressed);
+            IsCompressed: v2h.IsCompressed,
+            Crc: pageHeader.Crc);
     }
 
     /// <summary>
