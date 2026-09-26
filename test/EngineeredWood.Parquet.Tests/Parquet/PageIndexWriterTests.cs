@@ -49,11 +49,24 @@ public class PageIndexWriterTests : IDisposable
     // ───── Default ─────
 
     [Fact]
-    public async Task Default_WritesNoPageIndex()
+    public async Task Default_WritesAPageIndex()
     {
-        Assert.False(ParquetWriteOptions.Default.WritePageIndex);
+        Assert.True(ParquetWriteOptions.Default.WritePageIndex);
 
         string path = await WriteAsync(MixedBatch(1000, nullable: true), ParquetWriteOptions.Default);
+
+        Assert.All(ReadFile(path).Metadata.RowGroups.SelectMany(rg => rg.Columns), c =>
+        {
+            Assert.NotNull(c.OffsetIndexOffset);
+            Assert.NotNull(c.ColumnIndexOffset);
+        });
+    }
+
+    [Fact]
+    public async Task TurnedOff_WritesNoPageIndex()
+    {
+        string path = await WriteAsync(MixedBatch(1000, nullable: true),
+            ParquetWriteOptions.Default with { WritePageIndex = false });
 
         Assert.All(ReadFile(path).Metadata.RowGroups.SelectMany(rg => rg.Columns), c =>
         {
@@ -119,6 +132,124 @@ public class PageIndexWriterTests : IDisposable
 
         // The buffered writer flushes everything it holds once it passes the limit: 3500 rows, then 3500.
         Assert.Equal(2 * 10, AssertIndexesAgreeWithFile(path, expectColumnIndexOnEveryChunk: true));
+    }
+
+    // ───── Chunk statistics from page bounds ─────
+
+    public static TheoryData<DataPageVersion, bool, bool> StatisticsCases()
+    {
+        var data = new TheoryData<DataPageVersion, bool, bool>();
+        foreach (var version in new[] { DataPageVersion.V1, DataPageVersion.V2 })
+        foreach (bool dictionary in new[] { true, false })
+        foreach (bool totalOrder in new[] { true, false })
+            data.Add(version, dictionary, totalOrder);
+        return data;
+    }
+
+    /// <summary>
+    /// With a page index, a column's chunk statistics are folded from its page bounds instead of
+    /// scanning the values again. They must be the statistics the scan gives, field for field.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(StatisticsCases))]
+    public async Task ChunkStatistics_AreIdenticalWithAndWithoutTheIndex(DataPageVersion version, bool dictionary, bool totalOrder)
+    {
+        var batch = StatisticsEdgeBatch();
+        var options = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = version,
+            DictionaryEnabled = dictionary,
+            DataPageSize = 512,
+            RowGroupMaxRows = 1500,
+            FloatingPointOrder = totalOrder ? FloatingPointColumnOrder.Ieee754TotalOrder : FloatingPointColumnOrder.TypeDefined,
+        };
+
+        var without = ReadFile(await WriteAsync(batch, options)).Metadata;
+        var with = ReadFile(await WriteAsync(batch, options with { WritePageIndex = true })).Metadata;
+
+        var before = without.RowGroups.SelectMany(rg => rg.Columns).ToList();
+        var after = with.RowGroups.SelectMany(rg => rg.Columns).ToList();
+        Assert.Equal(before.Count, after.Count);
+        for (int i = 0; i < before.Count; i++)
+        {
+            string name = string.Join(".", before[i].MetaData!.PathInSchema!);
+            var a = before[i].MetaData!.Statistics!;
+            var b = after[i].MetaData!.Statistics!;
+            Assert.True(a.Min.AsSpan().SequenceEqual(b.Min), $"{name}: min");
+            Assert.True(a.Max.AsSpan().SequenceEqual(b.Max), $"{name}: max");
+            Assert.True(a.MinValue.AsSpan().SequenceEqual(b.MinValue), $"{name}: min_value");
+            Assert.True(a.MaxValue.AsSpan().SequenceEqual(b.MaxValue), $"{name}: max_value");
+            Assert.True(a.NullCount == b.NullCount, $"{name}: null_count");
+            Assert.True(a.NanCount == b.NanCount, $"{name}: nan_count");
+            Assert.True(a.IsMinValueExact == b.IsMinValueExact, $"{name}: is_min_value_exact");
+            Assert.True(a.IsMaxValueExact == b.IsMaxValueExact, $"{name}: is_max_value_exact");
+            Assert.True(a.DistinctCount == b.DistinctCount, $"{name}: distinct_count");
+        }
+    }
+
+    /// <summary>
+    /// Every rule a folded bound could get wrong: strings over the 64-byte chunk limit (so truncation
+    /// and exactness flags), multibyte UTF-8, NaN mixed in, a column that is all NaN, -0 against +0
+    /// in different pages, unsigned and decimal order, booleans, repeated equal values, an all-null
+    /// column, and a nested leaf.
+    /// </summary>
+    private static RecordBatch StatisticsEdgeBatch()
+    {
+        const int rows = 4000;
+        var rng = new Random(4);
+        var longStrings = new StringArray.Builder();
+        var shortStrings = new StringArray.Builder();
+        var mixedNaN = new DoubleArray.Builder();
+        var allNaN = new FloatArray.Builder();
+        var zeros = new DoubleArray.Builder();
+        var unsigned = new UInt64Array.Builder();
+        var dec = new Decimal128Array.Builder(new Decimal128Type(18, 3));
+        var flags = new BooleanArray.Builder();
+        var ties = new Int32Array.Builder();
+        var nulls = new Int64Array.Builder();
+        var list = new ListArray.Builder(StringType.Default);
+        var listValues = (StringArray.Builder)list.ValueBuilder;
+
+        for (int i = 0; i < rows; i++)
+        {
+            longStrings.Append((i % 3 == 0 ? "é" : "z") + new string((char)('a' + rng.Next(26)), 60 + rng.Next(40)) + i);
+            if (i % 9 == 0) shortStrings.AppendNull(); else shortStrings.Append("s" + rng.Next(30));
+            mixedNaN.Append(i % 13 == 0 ? double.NaN : rng.NextDouble() * 200 - 100);
+            allNaN.Append(i % 2 == 0 ? float.NaN : -float.NaN);
+            zeros.Append(i < rows / 2 ? 0.0 : -0.0);
+            unsigned.Append(i % 2 == 0 ? (ulong)i : ulong.MaxValue - (ulong)i);
+            dec.Append((rng.Next(20000) - 10000) / 1000m);
+            if (i % 11 == 0) flags.AppendNull(); else flags.Append(i % 5 == 0);
+            ties.Append(i % 4 == 0 ? 7 : 3);
+            nulls.AppendNull();
+            list.Append();
+            for (int j = 0; j < i % 4; j++)
+                listValues.Append("item-" + rng.Next(1000));
+        }
+
+        var fields = new List<Field>
+        {
+            new("long_strings", StringType.Default, false),
+            new("short_strings", StringType.Default, true),
+            new("mixed_nan", DoubleType.Default, false),
+            new("all_nan", FloatType.Default, false),
+            new("zeros", DoubleType.Default, false),
+            new("unsigned", UInt64Type.Default, false),
+            new("dec", new Decimal128Type(18, 3), false),
+            new("flags", BooleanType.Default, true),
+            new("ties", Int32Type.Default, false),
+            new("nulls", Int64Type.Default, true),
+        };
+        var arrays = new List<IArrowArray>
+        {
+            longStrings.Build(), shortStrings.Build(), mixedNaN.Build(), allNaN.Build(), zeros.Build(),
+            unsigned.Build(), dec.Build(), flags.Build(), ties.Build(), nulls.Build(),
+        };
+        var listArray = list.Build();
+        fields.Add(new Field("list", listArray.Data.DataType, true));
+        arrays.Add(listArray);
+
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, rows);
     }
 
     // ───── Exact bounds ─────

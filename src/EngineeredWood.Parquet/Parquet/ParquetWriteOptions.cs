@@ -517,7 +517,7 @@ public sealed record ParquetWriteOptions
     /// <summary>
     /// Whether to write a page index — a ColumnIndex and an OffsetIndex per column chunk — so that
     /// readers such as DataFusion, Trino and parquet-mr can skip pages inside a row group. Default is
-    /// <see langword="false"/>.
+    /// <see langword="true"/>, as in parquet-mr and arrow-rs.
     /// </summary>
     /// <remarks>
     /// <para>The OffsetIndex locates every data page and is written for every column. The ColumnIndex
@@ -528,8 +528,11 @@ public sealed record ParquetWriteOptions
     /// page holds only NaNs.</para>
     /// <para>The indexes are written after the last row group, before the footer, and kept in memory
     /// until <c>CloseAsync</c>: a few bytes per page.</para>
+    /// <para>Measured cost at the default page size, over plain, dictionary, string-heavy and nested
+    /// schemas: write time within noise (at most +4%), allocations under +0.1%, files +0.01%; see
+    /// doc/parquet-page-index.md. Set <see langword="false"/> to omit them.</para>
     /// </remarks>
-    public bool WritePageIndex { get; init; }
+    public bool WritePageIndex { get; init; } = true;
 
     /// <summary>
     /// The longest BYTE_ARRAY bound, in bytes, that a page index records. Longer bounds are shortened:

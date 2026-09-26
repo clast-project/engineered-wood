@@ -10,10 +10,19 @@ if (args.Length > 0 && args[0].Equals("cloud", StringComparison.OrdinalIgnoreCas
     return;
 }
 
+#if NET8_0_OR_GREATER
+if (args.Length > 0 && args[0] is "pageindex-overhead" or "pageindex-child" or "pageindex-ab")
+{
+    Environment.ExitCode = await PageIndexOverhead.RunAsync(args);
+    return;
+}
+#endif
+
 BenchmarkSwitcher.FromTypes([
     typeof(MetadataReadBenchmarks),
     typeof(RowGroupReadBenchmarks),
     typeof(RowGroupWriteBenchmarks),
+    typeof(PageIndexWriteBenchmarks),
     typeof(DefaultWriteBenchmarks),
     typeof(DeltaBinaryPackedBenchmarks),
     typeof(DeltaByteArrayBenchmarks),

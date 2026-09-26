@@ -191,8 +191,8 @@ file; a per-column override can be added later if someone needs it.
   default 64; see W-3).
 - **Decided: page indexes are written by default, provided the memory and duration
   overhead is nominal.** parquet-mr and arrow-rs also default on; pyarrow defaults off.
-  - The writer lands with `WritePageIndex = false` (phase 3). Phase 4 measures the
-    overhead and flips the default in its own PR.
+  - The writer landed with `WritePageIndex = false` (phase 3, #399). Phase 4 measured the
+    overhead and turned the default on (below).
   - The measurement uses the Parquet write benchmarks with and without page indexes:
     wall-clock duration, allocated bytes and peak working set (BenchmarkDotNet's
     `MemoryDiagnoser`), over plain, dictionary, string-heavy and nested schemas, with
@@ -201,6 +201,34 @@ file; a per-column override can be added later if someone needs it.
   - The phase-4 PR records the numbers and the case for calling them nominal. If they are
     not, the default stays off until the cost is brought down, for example by deriving
     chunk statistics from the page statistics instead of computing both (W-2).
+- **Measured (phase 4): nominal, so the default is on.** 500,000 rows, net10.0, i9-12900K. The
+  plain, strings and nested writes were first +6% to +15% slower with the index at the
+  default page size. The cause was the second pass over the values: page bounds, then chunk
+  statistics. So chunk statistics are now folded from the page bounds when a page index is
+  written (`PageIndexCollector.ChunkStatistics`, byte-identical to the scan; see
+  `ChunkStatistics_AreIdenticalWithAndWithoutTheIndex`). With the fold, time is within noise.
+
+  Index cost, as the median of 25 alternating off/on rounds in one process
+  (`dotnet run -c Release -f net10.0 -- pageindex-ab`):
+
+  | Schema | 1 MiB pages, V1 / V2 | 8 KiB pages, V1 / V2 | Allocated, 1 MiB |
+  |---|---|---|---|
+  | plain | +0.1% / −6.0% (before fold +5.9% / +14.3%) | +12.7% / −7.2% | +0.02% |
+  | dictionary | +2.2% / +4.1% | +1.2% / +4.1% | +0.07% |
+  | strings | −3.2% / −1.9% (before +4.6% / +14.4%) | +8.2% / +14.5% | +0.03% |
+  | nested | +0.1% / +2.0% (before +12.8% / +11.1%) | +2.0% / +4.7% | +0.00% |
+
+  - **File size:** +0.01% at the default page size; +0.4% to +1.7% at 8 KiB.
+  - **Peak working set:** the median of 5 fresh processes per configuration
+    (`-- pageindex-overhead`) moves −15% to +9% in both directions, with no pattern. That is GC
+    heap sizing, which dominates the peak; the index itself holds a few bytes per page until
+    `CloseAsync`. There is no measurable cost within that ±10–20% noise floor.
+  - **BenchmarkDotNet** (`PageIndexWriteBenchmarks`) agrees, but its methods run one after the
+    other, so machine load that changes between them moves the ratio. The alternating run is
+    the one to trust. It has to run in process: the generated child project cannot build
+    through `build/StrongNameUnsignedReferences.targets`.
+  - **Small pages:** 8 KiB pages still cost up to +15%, for strings and plain. That is per-page
+    work (bounds, truncation, one index entry) and is not the default.
 - **Encryption:** when encryption lands, these two structures are module types 6/7. Route
   their bytes through one write helper and one read helper so there is one place to encrypt
   them (encryption plan D8).

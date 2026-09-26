@@ -37,6 +37,12 @@ internal sealed class PageIndexCollector
     private readonly List<long> _nanCounts = new();
     private long _firstRowIndex;
 
+    // The chunk's bounds, folded from the untruncated page bounds as the pages arrive, so the chunk
+    // statistics need not scan the values a second time. Strict comparisons keep the first of equal
+    // values, as the full scan does.
+    private byte[]? _chunkMin, _chunkMax, _firstNaN;
+    private long _chunkNanCount;
+
     /// <param name="writeColumnIndex">
     /// Whether the chunk may get a ColumnIndex at all; false for a column without statistics or of a
     /// type whose bounds are not ordered correctly. The OffsetIndex is written either way.
@@ -99,12 +105,46 @@ internal sealed class PageIndexCollector
             return;
         }
 
+        if (!nullPage)
+            Fold(bounds);
+
         _nullPages.Add(nullPage);
         _mins.Add(nullPage ? [] : Truncate(bounds.Min!, max: false));
         _maxes.Add(nullPage ? [] : Truncate(bounds.Max!, max: true));
         _nullCounts.Add(nullCount);
         if (_floatingPoint)
             _nanCounts.Add(nullPage ? 0 : bounds.NanCount);
+    }
+
+    /// <summary>
+    /// The chunk statistics, from the page bounds, or null when they do not cover the chunk and the
+    /// caller must scan: no ColumnIndex (so no bounds were kept), or no values at all.
+    /// </summary>
+    public Statistics? ChunkStatistics(int nonNullCount, int levelCount)
+    {
+        if (!WritesColumnIndex || nonNullCount == 0)
+            return null;
+
+        return StatisticsCollector.FromBounds(
+            _physicalType, _chunkMin, _chunkMax, _firstNaN, _chunkNanCount,
+            levelCount - nonNullCount, FloatingPointTotalOrder);
+    }
+
+    private void Fold(in PageBounds bounds)
+    {
+        _chunkNanCount += bounds.NanCount;
+
+        // A NaN bound is an all-NaN page under total order; it takes part only if nothing else does.
+        if (_floatingPoint && IsNaN(bounds.Min!))
+        {
+            _firstNaN ??= bounds.Min;
+            return;
+        }
+
+        if (_chunkMin is null || Compare(bounds.Min!, _chunkMin) < 0)
+            _chunkMin = bounds.Min;
+        if (_chunkMax is null || Compare(bounds.Max!, _chunkMax) > 0)
+            _chunkMax = bounds.Max;
     }
 
     /// <summary>The chunk's page index, with page offsets still relative to the chunk.</summary>
