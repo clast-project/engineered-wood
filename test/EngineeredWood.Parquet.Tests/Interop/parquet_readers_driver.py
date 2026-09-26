@@ -123,9 +123,36 @@ def cmd_read_digest(args):
     }
 
 
+def cmd_count_where(args):
+    """Counts the rows matching a SQL predicate, with the reader's own pushdown left ON.
+
+    This is the question statistics and page indexes answer: a reader that prunes on bounds EW wrote
+    wrongly returns fewer rows than one that reads everything. DuckDB ignores page indexes, so where
+    the two readers disagree on the same file and predicate, the pruning is the suspect.
+    A query the reader refuses is reported as a failure, like any other; the caller decides.
+    """
+    reader = args["reader"]
+    module, error = _import(reader)
+    if module is None:
+        return {"available": False, "error": error}
+
+    predicate = args["predicate"]
+    if reader == "duckdb":
+        count = module.sql(
+            f"SELECT count(*) FROM read_parquet(?) WHERE {predicate}", params=[args["path"]]).fetchone()[0]
+    else:
+        ctx = module.SessionContext()
+        ctx.register_parquet("t", args["path"])
+        table = ctx.sql(f"SELECT count(*) AS n FROM t WHERE {predicate}").to_arrow_table()
+        count = table.column("n")[0].as_py()
+
+    return {"available": True, "count": count, "version": getattr(module, "__version__", None)}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read_digest": cmd_read_digest,
+    "count_where": cmd_count_where,
 }
 
 

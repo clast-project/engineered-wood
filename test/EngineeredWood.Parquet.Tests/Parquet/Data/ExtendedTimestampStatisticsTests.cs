@@ -58,7 +58,7 @@ public class ExtendedTimestampStatisticsTests
         var stats = StatisticsCollector.Compute(
             Carrier(values), PhysicalType.FixedLenByteArray, ExtendedTimestamp.ByteWidth,
             defLevels: null, nonNullCount: values.Length, rowCount: values.Length,
-            floatingPointTotalOrder: false, extendedTimestamp: true);
+            floatingPointTotalOrder: false, order: StatisticsOrder.ExtendedTimestamp);
 
         return ((long)ExtendedTimestamp.Read(stats.MinValue!), (long)ExtendedTimestamp.Read(stats.MaxValue!));
     }
@@ -111,7 +111,7 @@ public class ExtendedTimestampStatisticsTests
         var stats = StatisticsCollector.Compute(
             Carrier(1, -1, 0), PhysicalType.FixedLenByteArray, ExtendedTimestamp.ByteWidth,
             defLevels: null, nonNullCount: 3, rowCount: 3,
-            floatingPointTotalOrder: false, extendedTimestamp: false);
+            floatingPointTotalOrder: false, order: StatisticsOrder.Default);
 
         // Unsigned lexicographic puts all-0xFF on top, so -1 comes back as the MAXIMUM.
         Assert.Equal(-1, (long)ExtendedTimestamp.Read(stats.MaxValue!));

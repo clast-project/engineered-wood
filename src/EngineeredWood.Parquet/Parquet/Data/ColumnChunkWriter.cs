@@ -183,6 +183,9 @@ internal static class ColumnChunkWriter
         bool extendedTimestamp = physicalType == PhysicalType.FixedLenByteArray
             && options.IsExtendedTimestampColumn(pathInSchema);
 
+        // Read off the Arrow type before the rewrites below replace it with the bytes that reach the file.
+        var statisticsOrder = StatisticsOrders.For(ValueType(array), physicalType, extendedTimestamp);
+
         // Only when the values are still timestamps. The buffered writer encodes at accumulation time --
         // its encoders dispatch on the Arrow type, so they have to see the carrier -- and then reaches
         // this method through its dictionary-fallback path with an array that is already twelve-byte.
@@ -244,10 +247,10 @@ internal static class ColumnChunkWriter
             var stats = dictResult != null && !isFloatingPoint
                 ? StatisticsCollector.ComputeFromDictEntries(
                     dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                    physicalType, typeLength, rowCount - nonNullCount, extendedTimestamp)
+                    physicalType, typeLength, rowCount - nonNullCount, statisticsOrder)
                 : StatisticsCollector.Compute(
                     array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                    floatingPointTotalOrder, extendedTimestamp);
+                    floatingPointTotalOrder, statisticsOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
@@ -538,8 +541,9 @@ internal static class ColumnChunkWriter
             : StatisticsCollector.ComputeFromDictEntries(
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
                 physicalType, typeLength, rowCount - nonNullCount,
-                physicalType == PhysicalType.FixedLenByteArray
-                    && options.IsExtendedTimestampColumn(pathInSchema));
+                StatisticsOrders.For(
+                    arrowType, physicalType,
+                    physicalType == PhysicalType.FixedLenByteArray && options.IsExtendedTimestampColumn(pathInSchema)));
 
         result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;
@@ -1766,9 +1770,9 @@ internal static class ColumnChunkWriter
     //
     // The real precondition is narrower than "this Arrow type is signed": it is that StatisticsCollector
     // compared these values with a TYPED comparator. It does that only for BOOLEAN/INT32/INT64/FLOAT/DOUBLE;
-    // every FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY column goes through SequenceCompareTo, i.e. unsigned
-    // lexicographic. So the physical type has to be part of the answer wherever an Arrow type can arrive on
-    // more than one physical width.
+    // BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY columns are compared as bytes (see StatisticsOrder), which is
+    // not the signed order the deprecated fields promise. So the physical type has to be part of the
+    // answer wherever an Arrow type can arrive on more than one physical width.
     // Internal rather than private so the gate can be pinned directly. The FIXED_LEN_BYTE_ARRAY answer is
     // latent until an Arrow TimestampType can map to that physical type, so there is no end-to-end write
     // that reaches it yet — a unit test is the only thing that keeps the fix from silently regressing.

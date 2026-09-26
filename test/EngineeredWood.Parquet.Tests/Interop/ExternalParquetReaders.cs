@@ -109,7 +109,35 @@ internal static class ExternalParquetReaders
                 result.TryGetProperty("version", out var v) ? v.GetString() : null));
     }
 
+    /// <summary>
+    /// Counts the rows of <paramref name="path"/> matching the SQL <paramref name="predicate"/>, with
+    /// the reader's statistics and page-index pruning left on. <see cref="CountOutcome.Count"/> is
+    /// null when the reader refused the query, and <see cref="CountOutcome.Error"/> says why.
+    /// </summary>
+    public static CountOutcome CountWhere(string reader, string path, string predicate)
+    {
+        var result = Driver.InvokeRaw("count_where", new { reader, path, predicate });
+
+        if (!result.GetProperty("ok").GetBoolean())
+        {
+            string error = result.TryGetProperty("error", out var e) ? e.GetString()! : "(no message)";
+            return new CountOutcome(Installed: true, Error: error, Count: null);
+        }
+
+        if (!result.TryGetProperty("available", out var available) || !available.GetBoolean())
+        {
+            return new CountOutcome(
+                Installed: false,
+                Error: result.TryGetProperty("error", out var a) ? a.GetString() : null,
+                Count: null);
+        }
+
+        return new CountOutcome(Installed: true, Error: null, Count: result.GetProperty("count").GetInt64());
+    }
+
     internal sealed record ReaderOutcome(bool Installed, string? Error, ReaderResult? Result);
+
+    internal sealed record CountOutcome(bool Installed, string? Error, long? Count);
 
     internal sealed record ReaderColumn(string Name, string Digest);
 
