@@ -87,10 +87,14 @@ public class WriterByteIdentityCorpus
         _output.WriteLine($"{manifest.Count} files written to {dir}");
     }
 
+    // Every option a default change could move is pinned, so that a manifest stays comparable across
+    // one: when WritePageIndex became the default, a corpus that followed Default stopped being able
+    // to show "unchanged with the index off". The page index has variants of its own below.
     private static readonly ParquetWriteOptions Base = ParquetWriteOptions.Default with
     {
         CreatedBy = CreatedBy,
         DataPageSize = 2048,
+        WritePageIndex = false,
     };
 
     private static IEnumerable<(string Name, ParquetWriteOptions Options)> FileWriterVariants()
@@ -143,6 +147,29 @@ public class WriterByteIdentityCorpus
             ColumnDictionaryEnabled = new Dictionary<string, bool> { ["i64"] = false },
         });
         yield return ("big-pages", Base with { DataPageSize = 1024 * 1024 });
+
+        // Page indexes: both page versions, dictionary on and off, several row groups, truncation at a
+        // custom limit and turned off, and the float order that changes NaN bounds.
+        yield return ("pageindex-v2", Base with { WritePageIndex = true });
+        yield return ("pageindex-v1-plain-crc", Base with
+        {
+            WritePageIndex = true,
+            DataPageVersion = DataPageVersion.V1,
+            DictionaryEnabled = false,
+            PageChecksumEnabled = true,
+        });
+        yield return ("pageindex-rowgroups-truncate8", Base with
+        {
+            WritePageIndex = true,
+            RowGroupMaxRows = 1500,
+            PageIndexTruncateLength = 8,
+        });
+        yield return ("pageindex-untruncated-totalorder", Base with
+        {
+            WritePageIndex = true,
+            PageIndexTruncateLength = null,
+            FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder,
+        });
     }
 
     private static IEnumerable<(string Name, ParquetWriteOptions Options)> BufferedWriterVariants()
@@ -162,6 +189,7 @@ public class WriterByteIdentityCorpus
         }
 
         yield return ("bloom", Base with { BloomFilterColumns = ["i32", "str_hi"], RowGroupMaxRows = 2500 });
+        yield return ("pageindex", Base with { WritePageIndex = true, RowGroupMaxRows = 2500 });
         yield return ("footer-inputs", Base with
         {
             KeyValueMetadata = [new EngineeredWood.Parquet.Metadata.KeyValue { Key = "k", Value = "v" }],
