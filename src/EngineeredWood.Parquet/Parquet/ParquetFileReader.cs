@@ -274,11 +274,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // failure into a success. Nested columns are excluded because the nested path decodes the whole
         // row group before slicing, so splitting does not help them (issue #157) — they still get the
         // NotSupportedException, which says so.
+        bool implicitBudget = false;
         if (batchSize is not > 0 && maxBytes is not > 0
             && !ctx.HasNestedColumns
             && HasChunkOverArrowLimit(ctx))
         {
             maxBytes = ImplicitLargeChunkBatchBytes;
+            implicitBudget = true;
         }
 
         // No delegation back to ReadRowGroupAsync when there is no batch limit: it would call
@@ -346,21 +348,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         // Multi-batch path (flat columns): build page maps, then read only the pages needed per batch.
         //
-        // Phase 1: Read each column chunk to scan page headers and build page maps.
-        //          The full column buffers are released after scanning.
+        // Phase 1: Build each column's page map, from its OffsetIndex where it has one, otherwise by
+        //          reading the whole chunk to scan its page headers.
         // Phase 2: For each batch, compute the file-level byte ranges for only the
         //          pages that overlap the target row range, read those, decode, yield.
-
-        var pageMaps = new ColumnPageMap[ctx.Count];
-        for (int i = 0; i < ctx.Count; i++)
-        {
-            using var buffer = await _file.ReadAsync(ctx.Ranges[i], cancellationToken)
-                .ConfigureAwait(false);
-            pageMaps[i] = PageMapBuilder.Build(
-                buffer.Memory.Span,
-                ctx.Columns[i],
-                ctx.Chunks[i].MetaData!);
-        }
+        //
+        // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
+        // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
+        var pageMaps = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, cancellationToken)
+            .ConfigureAwait(false);
 
         // Phase 2: yield batches, reading only the needed pages per batch.
         int rowsEmitted = 0;
@@ -459,10 +455,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken)
     {
         // Decode and assemble the entire row group once. The assembled arrays own their buffers, so
-        // the file buffers (and page maps, kept only for byte-budget sizing) can be released before
-        // any batch is yielded.
+        // the file buffers can be released before any batch is yielded. The page maps serve only the
+        // byte budget, so without one they are not built: counting the rows of a V1 page of a
+        // repeated column means decompressing it.
         RecordBatch full;
         ColumnPageMap[] pageMaps = new ColumnPageMap[ctx.Count];
+        bool needPageMaps = maxBytes is > 0;
 
         var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken).ConfigureAwait(false);
         try
@@ -470,8 +468,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             var results = new ColumnResult[ctx.Count];
             ForEachColumn(ctx.Count, i =>
             {
-                pageMaps[i] = PageMapBuilder.Build(
-                    buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                if (needPageMaps)
+                {
+                    pageMaps[i] = PageMapBuilder.Build(
+                        buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                }
+
                 results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
@@ -575,6 +577,127 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Builds the page map of each of a flat row group's columns. Where
+    /// <paramref name="useOffsetIndex"/> is set and a chunk has a usable OffsetIndex, the map comes
+    /// from that and the bytes before the first data page, so the data pages are not read. Every
+    /// other chunk is read whole to scan its page headers.
+    /// </summary>
+    private async ValueTask<ColumnPageMap[]> BuildPageMapsAsync(
+        RowGroupContext ctx, bool useOffsetIndex, CancellationToken cancellationToken)
+    {
+        var pageMaps = new ColumnPageMap?[ctx.Count];
+        if (useOffsetIndex)
+            await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, cancellationToken).ConfigureAwait(false);
+
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            if (pageMaps[i] is not null)
+                continue;
+
+            using var buffer = await _file.ReadAsync(ctx.Ranges[i], cancellationToken)
+                .ConfigureAwait(false);
+            pageMaps[i] = PageMapBuilder.Build(
+                buffer.Memory.Span,
+                ctx.Columns[i],
+                ctx.Chunks[i].MetaData!);
+        }
+
+        return pageMaps!;
+    }
+
+    /// <summary>
+    /// Fills in <paramref name="pageMaps"/> for each chunk whose OffsetIndex can describe its pages,
+    /// leaving null those without one, or with one that is unreadable or cannot be right. That
+    /// takes two reads in all: the indexes, then each chunk's bytes before its first data page (its
+    /// dictionary or FSST symbol table).
+    /// </summary>
+    /// <remarks>
+    /// The first data page is where the index puts it, not <see cref="ColumnMetaData.DataPageOffset"/>:
+    /// some writers leave <see cref="ColumnMetaData.DictionaryPageOffset"/> unset and point
+    /// <see cref="ColumnMetaData.DataPageOffset"/> at the dictionary page (alltypes_tiny_pages.parquet).
+    /// </remarks>
+    private async ValueTask BuildPageMapsFromOffsetIndexesAsync(
+        RowGroupContext ctx, ColumnPageMap?[] pageMaps, CancellationToken cancellationToken)
+    {
+        var columns = new List<int>(ctx.Count);
+        var indexRanges = new List<FileRange>(ctx.Count);
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var chunk = ctx.Chunks[i];
+
+            // Offsets into another file (#405); and a map must not be built for a repeated column.
+            if (chunk.FilePath is not null || ctx.Columns[i].MaxRepetitionLevel > 0)
+                continue;
+            if (chunk.OffsetIndexOffset is not { } offset || chunk.OffsetIndexLength is not { } length
+                || offset < 0 || length <= 0 || offset > _fileLength - length)
+            {
+                continue;
+            }
+
+            columns.Add(i);
+            indexRanges.Add(new FileRange(offset, length));
+        }
+
+        if (columns.Count == 0)
+            return;
+
+        var indexBytes = await ReadPageIndexBytesAsync(indexRanges, cancellationToken).ConfigureAwait(false);
+
+        var indexes = new OffsetIndex?[columns.Count];
+        var prefixRanges = new List<FileRange>(columns.Count);
+        for (int k = 0; k < columns.Count; k++)
+        {
+            var range = ctx.Ranges[columns[k]];
+            try
+            {
+                indexes[k] = MetadataDecoder.DecodeOffsetIndex(indexBytes[k]);
+            }
+            catch (ParquetFormatException)
+            {
+                continue;
+            }
+
+            if (indexes[k]!.PageLocations is not [var first, ..]
+                || first.Offset < range.Offset || first.Offset > range.Offset + range.Length)
+            {
+                indexes[k] = null;
+                continue;
+            }
+
+            if (first.Offset > range.Offset)
+                prefixRanges.Add(new FileRange(range.Offset, first.Offset - range.Offset));
+        }
+
+        var prefixes = prefixRanges.Count > 0
+            ? await _file.ReadRangesAsync(prefixRanges, cancellationToken).ConfigureAwait(false)
+            : [];
+        try
+        {
+            int nextPrefix = 0;
+            for (int k = 0; k < columns.Count; k++)
+            {
+                if (indexes[k] is not { } index)
+                    continue;
+
+                int i = columns[k];
+                var range = ctx.Ranges[i];
+                var prefix = index.PageLocations[0].Offset > range.Offset
+                    ? prefixes[nextPrefix++].Memory.Span
+                    : ReadOnlySpan<byte>.Empty;
+
+                pageMaps[i] = PageMapBuilder.BuildFromOffsetIndex(
+                    prefix, range.Offset, range.Offset + range.Length, index, ctx.RowCount,
+                    ctx.Columns[i], ctx.Chunks[i].MetaData!);
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < prefixes.Count; i++)
+                prefixes[i].Dispose();
+        }
     }
 
     /// <summary>

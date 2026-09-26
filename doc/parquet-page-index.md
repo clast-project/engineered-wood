@@ -362,7 +362,19 @@ and the caller still post-filters.
   `StatisticsEvaluator.EvaluateNaN`).
 - Repeated-column pruning.
 - Level histograms.
-- Using the OffsetIndex to build `PageMapBuilder`'s map without scanning headers.
+- ~~Using the OffsetIndex to build `PageMapBuilder`'s map without scanning headers.~~ Done,
+  ahead of phase 7 because it needs neither #55 nor the `PageReader`. The flat batched read
+  (`ReadRowGroupBatchesAsync` when a row group spans several batches) used to read every
+  chunk whole just to find its pages, then read the pages again per batch. It now reads the
+  OffsetIndexes and each chunk's dictionary or symbol-table prefix, two requests in all, and
+  decodes each page header from the page bytes it fetches anyway. Chunks without a usable
+  index still scan headers. An index that cannot tile its chunk is ignored. One that
+  disagrees with a page header is refused with a `ParquetFormatException`. The implicit
+  large-chunk budget keeps the header scan, because the index has no uncompressed page
+  sizes and that budget exists to stay under the Arrow limit. An explicit
+  `MaxBatchByteSize` scales each page's compressed size by the chunk's ratio instead.
+  Measured by `-- pagemap-ab`: with 500k rows and 1 MiB pages, a strings read reads half the
+  bytes and runs 28–32% faster, and a plain read is 8–11% faster at 64Ki-row batches.
 
 **Sequencing on the read side:** page pruning is only reachable from the table layer after
 #55 (per-read filters). `predicate-pushdown-design.md` already puts #55 and #57 ahead of

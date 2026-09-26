@@ -462,9 +462,14 @@ internal static class ColumnChunkReader
     /// <summary>
     /// Decodes a contiguous range of pages from a pre-scanned <see cref="ColumnPageMap"/>
     /// and returns the resulting Arrow array. Only the pages in
-    /// <c>[startPage..endPage]</c> (inclusive) are decompressed and decoded.
+    /// <c>[startPage..endPage]</c> (inclusive) are decompressed and decoded. Page offsets in the
+    /// page map are relative to the chunk, so <paramref name="dataBaseOffset"/> is subtracted from them.
     /// </summary>
-    /// <param name="data">Raw bytes of the column chunk.</param>
+    /// <param name="data">
+    /// Bytes of the column chunk from <paramref name="dataBaseOffset"/>, covering at least the pages
+    /// decoded.
+    /// </param>
+    /// <param name="dataBaseOffset">Offset of <paramref name="data"/> within the column chunk.</param>
     /// <param name="column">Column descriptor (type, levels, schema info).</param>
     /// <param name="columnMeta">Column chunk metadata (codec, num_values, etc.).</param>
     /// <param name="pageMap">Pre-scanned page map for this column chunk.</param>
@@ -474,88 +479,6 @@ internal static class ColumnChunkReader
     /// <param name="preserveDefLevels">
     /// If true, raw definition levels are returned for nested assembly.
     /// </param>
-    public static ColumnResult ReadColumnBatch(
-        ReadOnlySpan<byte> data,
-        ColumnDescriptor column,
-        ColumnMetaData columnMeta,
-        ColumnPageMap pageMap,
-        int startPage,
-        int endPage,
-        Field arrowField,
-        bool preserveDefLevels = false,
-        bool validateCrc = false)
-    {
-        bool isRepeated = column.MaxRepetitionLevel > 0;
-
-        int pageNumValues = pageMap.CumulativeValues[endPage + 1] - pageMap.CumulativeValues[startPage];
-        int pageRowCount = pageMap.CumulativeRows[endPage + 1] - pageMap.CumulativeRows[startPage];
-        int capacity = isRepeated ? pageNumValues : pageRowCount;
-
-        var byteArrayOutput = arrowField.DataType switch
-        {
-            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
-            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
-            _ => ByteArrayOutputKind.Default,
-        };
-
-        using var state = new ColumnBuildState(
-            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
-
-        for (int p = startPage; p <= endPage; p++)
-        {
-            var entry = pageMap.Pages[p];
-            var pageData = data.Slice(entry.Offset, entry.CompressedSize);
-
-            if (entry.Type == PageType.DataPage)
-            {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
-            }
-            else if (entry.Type == PageType.DataPageV2)
-            {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
-            }
-        }
-
-        int[]? defLevels = null;
-        if ((preserveDefLevels || isRepeated) && column.MaxDefinitionLevel > 0)
-        {
-            var src = state.DefLevelSpan;
-            defLevels = new int[src.Length];
-            for (int i = 0; i < src.Length; i++)
-                defLevels[i] = src[i];
-        }
-
-        int[]? repLevels = null;
-        if (isRepeated)
-        {
-            var src = state.RepLevelSpan;
-            repLevels = new int[src.Length];
-            for (int i = 0; i < src.Length; i++)
-                repLevels[i] = src[i];
-        }
-
-        EnsureFullRowCoverage(state, column, pageRowCount);
-
-        IArrowArray array;
-        if (isRepeated)
-        {
-            array = ArrowArrayBuilder.BuildDense(state, arrowField, pageNumValues);
-        }
-        else
-        {
-            array = ArrowArrayBuilder.Build(state, arrowField, pageRowCount);
-        }
-
-        return new ColumnResult(array, defLevels, repLevels);
-    }
-
-    /// <summary>
-    /// Like <see cref="ReadColumnBatch"/> but the <paramref name="data"/> buffer is a
-    /// sub-range of the column chunk starting at byte offset <paramref name="dataBaseOffset"/>
-    /// (the offset of the first page in the slice). Page offsets in the page map are
-    /// adjusted by subtracting this base.
-    /// </summary>
     public static ColumnResult ReadColumnBatchFromSlice(
         ReadOnlySpan<byte> data,
         long dataBaseOffset,
@@ -587,9 +510,10 @@ internal static class ColumnChunkReader
 
         for (int p = startPage; p <= endPage; p++)
         {
-            var entry = pageMap.Pages[p];
-            int localOffset = (int)(entry.Offset - dataBaseOffset);
-            var pageData = data.Slice(localOffset, entry.CompressedSize);
+            var located = pageMap.Pages[p];
+            var pageBytes = data.Slice((int)(located.Offset - dataBaseOffset), located.CompressedSize);
+            var entry = PageMapBuilder.ResolveEntry(pageMap, p, pageBytes, column, columnMeta, out int headerSize);
+            var pageData = pageBytes.Slice(headerSize);
 
             if (entry.Type == PageType.DataPage)
             {
