@@ -155,6 +155,7 @@ public class PageIndexWriterTests : IDisposable
     public async Task ChunkStatistics_AreIdenticalWithAndWithoutTheIndex(DataPageVersion version, bool dictionary, bool totalOrder)
     {
         var batch = StatisticsEdgeBatch();
+        // Explicitly off: the default is on, and the point is to compare the fold with the full scan.
         var options = ParquetWriteOptions.Default with
         {
             DataPageVersion = version,
@@ -162,9 +163,11 @@ public class PageIndexWriterTests : IDisposable
             DataPageSize = 512,
             RowGroupMaxRows = 1500,
             FloatingPointOrder = totalOrder ? FloatingPointColumnOrder.Ieee754TotalOrder : FloatingPointColumnOrder.TypeDefined,
+            WritePageIndex = false,
         };
 
         var without = ReadFile(await WriteAsync(batch, options)).Metadata;
+        Assert.All(without.RowGroups.SelectMany(rg => rg.Columns), c => Assert.Null(c.OffsetIndexOffset));
         var with = ReadFile(await WriteAsync(batch, options with { WritePageIndex = true })).Metadata;
 
         var before = without.RowGroups.SelectMany(rg => rg.Columns).ToList();

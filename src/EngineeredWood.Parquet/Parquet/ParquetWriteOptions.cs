@@ -529,8 +529,9 @@ public sealed record ParquetWriteOptions
     /// <para>The indexes are written after the last row group, before the footer, and kept in memory
     /// until <c>CloseAsync</c>: a few bytes per page.</para>
     /// <para>Measured cost at the default page size, over plain, dictionary, string-heavy and nested
-    /// schemas: write time within noise (at most +4%), allocations under +0.1%, files +0.01%; see
-    /// doc/parquet-page-index.md. Set <see langword="false"/> to omit them.</para>
+    /// schemas: write time within noise except nested columns (about +3% to +5%), allocations about
+    /// +0.1% at most, files +0.01%; see doc/parquet-page-index.md. Set <see langword="false"/> to
+    /// omit them.</para>
     /// </remarks>
     public bool WritePageIndex { get; init; } = true;
 

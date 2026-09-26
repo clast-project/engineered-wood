@@ -206,18 +206,25 @@ file; a per-column override can be added later if someone needs it.
   default page size. The cause was the second pass over the values: page bounds, then chunk
   statistics. So chunk statistics are now folded from the page bounds when a page index is
   written (`PageIndexCollector.ChunkStatistics`, byte-identical to the scan; see
-  `ChunkStatistics_AreIdenticalWithAndWithoutTheIndex`). With the fold, time is within noise.
+  `ChunkStatistics_AreIdenticalWithAndWithoutTheIndex`). With the fold, time is within noise,
+  except for nested columns (below).
 
   Index cost, as the median of 25 alternating off/on rounds in one process
-  (`dotnet run -c Release -f net10.0 -- pageindex-ab`):
+  (`dotnet run -c Release -f net10.0 -- pageindex-ab`). Each cell shows three separate runs;
+  even with alternating rounds, one run moves by up to ±10 points on this machine:
 
-  | Schema | 1 MiB pages, V1 / V2 | 8 KiB pages, V1 / V2 | Allocated, 1 MiB |
-  |---|---|---|---|
-  | plain | +0.1% / −6.0% (before fold +5.9% / +14.3%) | +12.7% / −7.2% | +0.02% |
-  | dictionary | +2.2% / +4.1% | +1.2% / +4.1% | +0.07% |
-  | strings | −3.2% / −1.9% (before +4.6% / +14.4%) | +8.2% / +14.5% | +0.03% |
-  | nested | +0.1% / +2.0% (before +12.8% / +11.1%) | +2.0% / +4.7% | +0.00% |
+  | Schema | 1 MiB pages, V1 | 1 MiB pages, V2 | 8 KiB pages, V1 / V2 | Allocated, 1 MiB |
+  |---|---|---|---|---|
+  | plain | +0.1 / −5.4 / −5.1% | −6.0 / −3.8 / +2.0% | +3% to +13% / −7% to +25% | +0.02% |
+  | dictionary | +2.2 / +0.9 / −2.1% | +4.1 / +1.2 / −1.2% | +1% to +5% / +4% | +0.1% |
+  | strings | −3.2 / −4.3 / +0.2% | −1.9 / +9.1 / −12.1% | +3% to +14% / +6% to +15% | +0.03% |
+  | nested | +0.1 / +4.2 / +4.9% | +2.0 / +4.5 / +6.7% | +2% to +8% / +5% to +7% | +0.01% |
 
+  Before the fold, one run at 1 MiB gave: plain +5.9% / +14.3%, strings +4.6% / +14.4%, and
+  nested +12.8% / +11.1%. Now plain, dictionary and strings center on zero. **Nested keeps a
+  small, consistent cost of about +3% to +5%.** That is per-page work the fold does not
+  remove: counting each page's rows over the repetition levels, and the dictionary-entry
+  bounds of its string field. Allocations are the median over the rounds and barely vary.
   - **File size:** +0.01% at the default page size; +0.4% to +1.7% at 8 KiB.
   - **Peak working set:** the median of 5 fresh processes per configuration
     (`-- pageindex-overhead`) moves −15% to +9% in both directions, with no pattern. That is GC
@@ -227,8 +234,9 @@ file; a per-column override can be added later if someone needs it.
     other, so machine load that changes between them moves the ratio. The alternating run is
     the one to trust. It has to run in process: the generated child project cannot build
     through `build/StrongNameUnsignedReferences.targets`.
-  - **Small pages:** 8 KiB pages still cost up to +15%, for strings and plain. That is per-page
-    work (bounds, truncation, one index entry) and is not the default.
+  - **Small pages:** 8 KiB pages still cost several percent, with runs up to +15% for strings
+    (and one +25% plain outlier). That is per-page work (bounds, truncation, one index entry)
+    and is not the default.
 - **Encryption:** when encryption lands, these two structures are module types 6/7. Route
   their bytes through one write helper and one read helper so there is one place to encrypt
   them (encryption plan D8).

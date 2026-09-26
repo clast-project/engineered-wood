@@ -295,7 +295,7 @@ internal static class PageIndexOverhead
     /// Duration and allocation ratios, with and without page indexes, from writes that alternate
     /// round by round in one process. BenchmarkDotNet runs the two methods one after the other, so
     /// load that comes and goes between them skews its ratio; alternating spreads any drift over both.
-    /// The median of the per-round ratios is reported.
+    /// Reported: the median of the per-round time ratios, and the medians of each side's allocations.
     /// </summary>
     private static async Task<int> RunInterleavedAsync(int rounds)
     {
@@ -313,7 +313,8 @@ internal static class PageIndexOverhead
                 var msOff = new List<double>();
                 var msOn = new List<double>();
                 var ratios = new List<double>();
-                long allocOff = 0, allocOn = 0;
+                var allocOff = new List<double>();
+                var allocOn = new List<double>();
 
                 for (int round = -3; round < rounds; round++)
                 {
@@ -329,14 +330,17 @@ internal static class PageIndexOverhead
                     msOff.Add(tOff);
                     msOn.Add(tOn);
                     ratios.Add(tOn / tOff);
-                    allocOff = aOff;
-                    allocOn = aOn;
+                    allocOff.Add(aOff);
+                    allocOn.Add(aOn);
                 }
+
+                double medianAllocOff = Median(allocOff);
+                double medianAllocOn = Median(allocOn);
 
                 Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                     $"| {schema} | {version} | {(pageSize == PageIndexWorkload.DefaultPageSize ? "1 MiB" : "8 KiB")} " +
                     $"| {Median(msOff):F1} | {Median(msOn):F1} | {(Median(ratios) - 1) * 100:+0.0;-0.0}% " +
-                    $"| {allocOff / 1048576.0:F2} | {allocOn / 1048576.0:F2} | {(allocOn - allocOff) * 100.0 / allocOff:+0.00;-0.00}% |"));
+                    $"| {medianAllocOff / 1048576.0:F2} | {medianAllocOn / 1048576.0:F2} | {(medianAllocOn - medianAllocOff) * 100.0 / medianAllocOff:+0.00;-0.00}% |"));
             }
         }
 
@@ -365,11 +369,18 @@ internal static class PageIndexOverhead
 
     private static Measurement Child(string schema, DataPageVersion version, int pageSize, bool index)
     {
-        var start = new ProcessStartInfo(Environment.ProcessPath!)
+        string host = Environment.ProcessPath!;
+        var start = new ProcessStartInfo(host)
         {
             RedirectStandardOutput = true,
             UseShellExecute = false,
         };
+
+        // Started as `dotnet app.dll` (or with no apphost), this process is the dotnet host, not the app;
+        // the child has to be told which app to run.
+        if (Path.GetFileNameWithoutExtension(host).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(typeof(PageIndexOverhead).Assembly.Location);
+
         foreach (string arg in new[] { "pageindex-child", schema, version.ToString(), pageSize.ToString(CultureInfo.InvariantCulture), index.ToString() })
             start.ArgumentList.Add(arg);
 
